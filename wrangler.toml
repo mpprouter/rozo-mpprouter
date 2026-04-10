@@ -1,0 +1,28 @@
+name = "mpprouter"
+main = "src/index.ts"
+compatibility_date = "2026-04-09"
+compatibility_flags = ["nodejs_compat"]
+account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
+
+[[kv_namespaces]]
+binding = "MPP_STORE"
+id = "b0fa51efc09e4e708c6bd5061b0663e0"
+
+# Public keys (not secrets, safe to commit)
+[vars]
+STELLAR_NETWORK = "stellar:pubnet"
+STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
+TEMPO_RPC_URL = "https://rpc.tempo.xyz"
+OPTIMISTIC_THRESHOLD = "0.05"
+RATE_LIMIT_MAX = "10"
+
+# Secrets (set via: wrangler secret put <NAME>)
+#
+# STELLAR_ROUTER_PUBLIC    — G... Router pool address (receives agent USDC)
+# STELLAR_GAS_SECRET       — S... Gas sponsor keypair (pays tx fees, low-value)
+# STELLAR_GAS_PUBLIC       — G... Gas sponsor address
+# TEMPO_ROUTER_PRIVATE_KEY — 0x... EVM key (pays merchants on Tempo)
+# TEMPO_ROUTER_ADDRESS     — 0x... EVM address
+#
+# Note: STELLAR_ROUTER_SECRET is NOT stored anywhere in the app.
+# The Router pool private key is managed offline by the operator.

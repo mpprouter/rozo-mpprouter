@@ -1,0 +1,12 @@
+todos
+internaldocs
+internaldoc/
+design
+node_modules/
+dist/
+.dev.vars
+.env
+.wrangler/
+data/
+*.db
+.DS_Store
