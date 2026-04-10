@@ -10,5 +10,6 @@ dist/
 data/
 *.db
 .DS_Store
+demo/
 
 CLAUDE.md

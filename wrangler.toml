@@ -13,6 +13,9 @@ id = "b0fa51efc09e4e708c6bd5061b0663e0"
 STELLAR_NETWORK = "stellar:pubnet"
 STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
 TEMPO_RPC_URL = "https://rpc.tempo.xyz"
+# UNUSED as of 2026-04-10. No code path reads this. See src/index.ts and
+# notes.md for context. Intended to skip Soroban simulation for sub-$0.05
+# charges; never implemented.
 OPTIMISTIC_THRESHOLD = "0.05"
 RATE_LIMIT_MAX = "10"
 

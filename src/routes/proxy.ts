@@ -6,12 +6,14 @@
  * 2. Parse Tempo challenge to learn amount/recipient
  * 3. Feed request through the mppx Stellar charge handler:
  *    - No credential → mppx returns a signed 402 challenge for the agent
- *    - Credential    → mppx verifies HMAC + signature (+ on-chain simulation
- *                      for amounts above OPTIMISTIC_THRESHOLD)
+ *    - Credential    → mppx verifies HMAC + on-chain Soroban simulation
+ *                      (the `OPTIMISTIC_THRESHOLD` env var is declared
+ *                      but not wired up — see notes.md)
  * 4. On verified payment, pay the merchant on Tempo via the mppx client
  * 5. Return merchant content to the agent with a Payment-Receipt header
  */
 
+import { Credential } from 'mppx'
 import { getRouteByPublicPath } from '../services/merchants'
 import { payMerchant } from '../mpp/tempo-client'
 import {
@@ -65,25 +67,93 @@ function forwardHeaders(
  *
  * Returns:
  *   - 'stellar'  → agent presented an MPP Payment credential with
- *                  method="stellar". Run mppx verification and pay the
- *                  Tempo merchant on the agent's behalf.
+ *                  challenge.method === "stellar". Run mppx verification
+ *                  and pay the Tempo merchant on the agent's behalf.
  *   - 'passthrough' → anything else. Forward the whole request including
  *                     Authorization to the merchant as-is. The router
  *                     does not touch this payment flow.
  *   - 'none'     → no Authorization header. Fall through to the default
  *                  Stellar 402 challenge flow so naive Stellar agents
  *                  learn what to pay.
+ *
+ * IMPORTANT: a prior version of this function parsed the header as if it
+ * contained RFC 9110 auth-params (`Payment id="...", method="stellar", …`).
+ * That is the `WWW-Authenticate` serialization format, not the
+ * `Authorization` format. Real mppx Credentials are serialized as a
+ * single base64url-encoded JSON blob after the `Payment ` prefix — see
+ * mppx/src/Credential.ts:131. The old regex never matched any real
+ * credential and therefore routed every Stellar payment through the
+ * passthrough path, which bypassed verification entirely. Always parse
+ * with `Credential.deserialize()` — mppx owns the wire format.
  */
 function classifyAuth(authHeader: string | null): 'stellar' | 'passthrough' | 'none' {
   if (!authHeader) return 'none'
   const trimmed = authHeader.trim()
   // Payment scheme uses the MPP "Payment" prefix. Anything else is
-  // definitely not a Stellar MPP credential.
+  // definitely not a Stellar MPP credential — forward untouched.
   if (!/^Payment\s+/i.test(trimmed)) return 'passthrough'
-  // Extract the method="..." field from the comma-separated params.
-  const methodMatch = trimmed.match(/method="([^"]+)"/i)
-  if (!methodMatch) return 'passthrough'
-  return methodMatch[1].toLowerCase() === 'stellar' ? 'stellar' : 'passthrough'
+  // Try to parse as a real mppx Credential. If it parses, the nested
+  // `challenge.method` field tells us the payment method unambiguously.
+  // If it doesn't parse, it's some non-mppx `Payment ...` scheme that
+  // happens to share the prefix (e.g. an unrelated x402 dialect) — hand
+  // it back to the merchant to interpret.
+  try {
+    const credential = Credential.deserialize(trimmed) as {
+      challenge?: { method?: string }
+    }
+    const method = credential.challenge?.method?.toLowerCase()
+    return method === 'stellar' ? 'stellar' : 'passthrough'
+  } catch {
+    return 'passthrough'
+  }
+}
+
+/**
+ * Stellar USDC has 7 decimals. Any merchant currency with more than 7
+ * decimals cannot be represented losslessly on the Stellar side, so we
+ * refuse to charge the agent rather than silently truncating.
+ */
+const STELLAR_USDC_DECIMALS = 7
+
+/**
+ * TIP-20 stablecoins on Tempo (pathUSD, USDC) are hard-coded at 6
+ * decimals — see node_modules/mppx/dist/tempo/internal/defaults.js.
+ * Merchants drop `decimals` from the wire format via a zod transform,
+ * so we have to assume this value unless the challenge explicitly
+ * overrides it. Revisit before adding non-Tempo upstreams. See notes.md.
+ */
+const TEMPO_DEFAULT_DECIMALS = 6
+
+/**
+ * Convert a base-unit integer amount (as a string) into a human-readable
+ * decimal string. Uses BigInt so there is no floating-point error.
+ *
+ * Examples:
+ *   baseUnitsToDecimalString("10000", 6)     === "0.01"
+ *   baseUnitsToDecimalString("1000000", 6)   === "1"
+ *   baseUnitsToDecimalString("1234567", 6)   === "1.234567"
+ *   baseUnitsToDecimalString("1", 6)         === "0.000001"
+ *   baseUnitsToDecimalString("0", 6)         === "0"
+ *
+ * Trailing zeros in the fractional part are stripped; a pure-integer
+ * result loses its decimal point entirely. This matches what the Stellar
+ * charge method's toBaseUnits() expects on the way back in.
+ */
+export function baseUnitsToDecimalString(amount: string, decimals: number): string {
+  if (!/^-?\d+$/.test(amount)) {
+    throw new Error(`baseUnitsToDecimalString: amount must be integer string, got ${amount}`)
+  }
+  if (!Number.isInteger(decimals) || decimals < 0) {
+    throw new Error(`baseUnitsToDecimalString: decimals must be non-negative integer, got ${decimals}`)
+  }
+  const negative = amount.startsWith('-')
+  const digits = negative ? amount.slice(1) : amount
+  if (decimals === 0) return negative ? `-${digits}` : digits
+  const padded = digits.padStart(decimals + 1, '0')
+  const whole = padded.slice(0, padded.length - decimals)
+  const frac = padded.slice(padded.length - decimals).replace(/0+$/, '')
+  const body = frac.length === 0 ? whole : `${whole}.${frac}`
+  return negative ? `-${body}` : body
 }
 
 /**
@@ -91,13 +161,22 @@ function classifyAuth(authHeader: string | null): 'stellar' | 'passthrough' | 'n
  *
  * Format: Payment id="...", realm="...", method="tempo", intent="charge",
  *         request="base64", expires="..."
- * The request is base64url-encoded JSON: { amount, currency, recipient, ... }
+ * The request is base64url-encoded JSON: { amount, currency, recipient,
+ * decimals, ... }
+ *
+ * Critical: Tempo emits `amount` in token base units (integer) together
+ * with a `decimals` field describing the token's decimal precision. The
+ * Stellar charge method, in contrast, expects `amount` as a human-readable
+ * decimal string and applies its own `toBaseUnits(amount, 7)` internally.
+ * Callers must convert between the two before forwarding — see
+ * baseUnitsToDecimalString above. Dropping `decimals` here was the source
+ * of the 1,000,000x overcharge bug.
  */
 function parseTempoChallenge(wwwAuth: string): {
   id: string
   realm: string
   intent: string
-  request: { amount: string; currency: string; recipient: string; [key: string]: any }
+  request: { amount: string; currency: string; recipient: string; decimals?: number; [key: string]: any }
   expires?: string
 } | null {
   try {
@@ -247,10 +326,60 @@ export async function handleProxy(
     body: hasBody ? requestBody : undefined,
   })
 
+  // Convert the merchant's base-unit amount into a decimal string for
+  // the Stellar charge method.
+  //
+  // Tempo TIP-20 tokens (pathUSD, USDC) are hard-coded at 6 decimals on
+  // the Tempo side — see node_modules/mppx/dist/tempo/internal/defaults.js
+  // which exports `decimals = 6` with the comment "All TIP-20 tokens on
+  // Tempo use 6 decimals, so there is no risk of mismatch." The merchant's
+  // wire format drops `decimals` during the zod transform in mppx's
+  // tempo.charge method, so the 402 challenge arrives with a base-unit
+  // integer amount but no explicit decimals field.
+  //
+  // We therefore assume TEMPO_DEFAULT_DECIMALS unless the challenge
+  // overrides it. If we ever start routing merchants on a chain where
+  // stablecoins use different precision (e.g. BNB Chain ERC-20 USDT/USDC
+  // use 18 decimals), this assumption MUST be revisited — see notes.md.
+  const merchantDecimals = typeof parsed.request.decimals === 'number'
+    ? parsed.request.decimals
+    : TEMPO_DEFAULT_DECIMALS
+  if (!Number.isInteger(merchantDecimals) || merchantDecimals < 0) {
+    return new Response(JSON.stringify({
+      error: 'Merchant challenge carried an invalid decimals field',
+      raw: parsed.request,
+    }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  if (merchantDecimals > STELLAR_USDC_DECIMALS) {
+    return new Response(JSON.stringify({
+      error: 'Merchant token precision exceeds Stellar USDC',
+      detail: `merchant decimals=${merchantDecimals}, stellar=${STELLAR_USDC_DECIMALS}. ` +
+        `See notes.md for chains that need explicit handling (e.g. BNB Chain ERC-20 = 18 decimals).`,
+    }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+  let stellarAmount: string
+  try {
+    stellarAmount = baseUnitsToDecimalString(parsed.request.amount, merchantDecimals)
+  } catch (err: any) {
+    return new Response(JSON.stringify({
+      error: 'Could not normalize merchant amount',
+      detail: err.message,
+    }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
   let verifyResult
   try {
     verifyResult = await mppx['stellar/charge']({
-      amount: parsed.request.amount,
+      amount: stellarAmount,
       currency: getStellarUsdcSac(env),
       recipient: getRouterStellarAddress(env),
       // Correlate the mppx challenge with the upstream merchant challenge

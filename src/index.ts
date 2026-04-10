@@ -41,6 +41,14 @@ export interface Env {
   MPP_SECRET_KEY: string
 
   // Config
+  //
+  // OPTIMISTIC_THRESHOLD (UNUSED, 2026-04-10): this env var is declared
+  // here and in wrangler.toml but no code path reads it. It was intended
+  // to skip on-chain Soroban simulation for small-value payments (below
+  // $0.05) so the agent doesn't wait for RPC round-trips on trivial
+  // charges. Never implemented. See notes.md → "OPTIMISTIC_THRESHOLD is
+  // declared but unused". Do not rely on it; either wire it up in
+  // createStellarPayment() or delete it before assuming any behavior.
   OPTIMISTIC_THRESHOLD: string
   RATE_LIMIT_MAX: string
 }
