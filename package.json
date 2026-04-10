@@ -2,6 +2,8 @@
   "name": "mpprouter",
   "version": "0.1.0",
   "private": true,
+  "author": "Shawn Yu",
+  "license": "BSD-2-Clause",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
