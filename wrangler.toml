@@ -23,6 +23,10 @@ RATE_LIMIT_MAX = "10"
 # STELLAR_GAS_PUBLIC       — G... Gas sponsor address
 # TEMPO_ROUTER_PRIVATE_KEY — 0x... EVM key (pays merchants on Tempo)
 # TEMPO_ROUTER_ADDRESS     — 0x... EVM address
+# MPP_SECRET_KEY           — random hex string used by mppx to HMAC-bind 402
+#                            challenges so returning credentials can be
+#                            verified statelessly. Rotate to invalidate all
+#                            outstanding challenges.
 #
 # Note: STELLAR_ROUTER_SECRET is NOT stored anywhere in the app.
 # The Router pool private key is managed offline by the operator.

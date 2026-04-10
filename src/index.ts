@@ -35,6 +35,11 @@ export interface Env {
   TEMPO_ROUTER_ADDRESS: string    // 0x... address
   TEMPO_RPC_URL: string
 
+  // HMAC key used by mppx to bind 402 challenges to their contents so
+  // that credentials presented back to us can be verified statelessly.
+  // Set via: wrangler secret put MPP_SECRET_KEY
+  MPP_SECRET_KEY: string
+
   // Config
   OPTIMISTIC_THRESHOLD: string
   RATE_LIMIT_MAX: string
