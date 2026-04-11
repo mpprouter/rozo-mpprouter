@@ -96,11 +96,15 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     method: 'POST',
     price: 'dynamic',
     paymentMethod: 'stellar',
-    // Stays on tempo.charge until scripts/open-channel.ts has
-    // installed the OpenRouter session channel. The operator flips
-    // this to 'tempo.session' as a separate commit + deploy after
-    // the on-chain open tx confirms. See session-support-plan.md §6.
-    upstreamPaymentMethod: 'tempo.charge',
+    // Flipped to tempo.session on 2026-04-11 after
+    // scripts/admin/open-tempo-channel.ts opened the $1 channel
+    // 0x278bf3c7bb88da8d20de75a2cf0f8aec94c00fd399a1be5ae53911b1d83fac75
+    // and persisted TempoChannelState to KV at
+    // `tempoChannel:openrouter_chat`. See v2-full-session-design.md §B.
+    // The router's payMerchantSession (src/mpp/tempo-client.ts)
+    // reads that KV entry on every request and signs a voucher
+    // off the stored cumulativeRaw high watermark.
+    upstreamPaymentMethod: 'tempo.session',
     network: 'stellar-mainnet',
     asset: 'USDC',
     publicPath: '/v1/services/openrouter/chat',
