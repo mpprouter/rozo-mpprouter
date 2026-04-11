@@ -64,7 +64,18 @@ X402_ENABLED = "true"
 # G... recipient address. Agent USDC lands here after settle.
 # Public key only — must NOT be a secret. Operators can rotate
 # this by flipping the value and restarting.
-STELLAR_X402_PAY_TO = "GCTGI65YXLLJJ2NWC6OJNHGZWE6HCMZLNODL4DUJ2NRYTKHMC2YMVDQL"
+#
+# Intentionally set to the SAME address as STELLAR_ROUTER_PUBLIC
+# (the mppx pool). Both the MPP `WWW-Authenticate` dialect and the
+# x402 `Payment-Required` dialect advertise this one address as
+# payTo, so a single Stellar account receives USDC from both
+# protocols. This keeps operator accounting simple — one pool,
+# one reconciliation. If you ever split these (e.g. isolate x402
+# funds into a separate account for independent risk control),
+# update this comment AND the two call sites:
+#   - src/mpp/stellar-server.ts:75  (getRouterStellarAddress)
+#   - src/mpp/stellar-x402-server.ts:436  (buildX402PaymentRequiredHeader)
+STELLAR_X402_PAY_TO = "GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB"
 
 # Secrets (set via: wrangler secret put <NAME>)
 #
