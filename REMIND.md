@@ -3,6 +3,37 @@
 > 这是给 operator 看的"我现在有哪些 channel、链上有多少钱、怎么充值"的速查表。
 > 也可以用作未来 skill 的 source material（一键化操作）。
 
+---
+
+## 0. 当前 session 模式只支持这 4 个 merchant (2026-04-11)
+
+```
+┌────────────────────┬──────────────────────────────────────┬───────────┬────────┐
+│ merchant id        │ public path                          │ mode      │ status │
+├────────────────────┼──────────────────────────────────────┼───────────┼────────┤
+│ openrouter_chat    │ /v1/services/openrouter/chat         │ session   │ ✅    │
+│ openai_chat        │ /v1/services/openai/chat             │ session   │ ✅    │
+│ gemini_generate    │ /v1/services/gemini/generate?model=X │ session   │ ✅    │
+│ tempo_rpc          │ /v1/services/tempo/rpc               │ session   │ ✅    │
+└────────────────────┴──────────────────────────────────────┴───────────┴────────┘
+```
+
+**任何不在上面这 4 个 merchant 的请求**：要么走 charge 路径（router 自动 fallback），要么 broken。完整状态在 `internaldocs/v2-todo.md` 顶部的 "STATE OF THE WORLD" section。
+
+`gemini_generate` 默认 model 是 `gemini-2.0-flash`；client 可以传 `?model=gemini-1.5-pro` override。`gemini-1.5-flash` 已经下线了，会 500。
+
+**catalog API**：上面的状态也通过 `GET /services` 和 `GET /v1/services/catalog` 暴露 — 每条路由有 `verified_mode` 字段（`'session'` / `'charge'` / `false`）和 `verified_note`（broken 时给出原因）。Agent 可以做 `?verified_mode=session` 客户端过滤。
+
+```bash
+# 看哪些路由真的可用
+curl -s https://mpprouter.eng3798.workers.dev/services | jq '.services[] | {id, verified_mode, verified_note}'
+
+# 只列出 session 模式可用的
+curl -s https://mpprouter.eng3798.workers.dev/services | jq '.services[] | select(.verified_mode == "session") | {id, public_path}'
+```
+
+---
+
 Router 同时扮演两个角色：
 
 ```

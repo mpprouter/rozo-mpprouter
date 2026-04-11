@@ -58,13 +58,40 @@ export interface PublicServiceRoute {
    */
   placeholderDefaults?: Record<string, string>
   /**
-   * Query params the router strips before forwarding to the
-   * merchant. Used for params that are router-internal (e.g.
-   * `?payment=channel&agent=G...` and the placeholder feeders).
-   * The hardcoded V2 strip-list is in `forwardSearchParams()`
-   * inside proxy.ts; this field is purely informational unless
-   * a route needs route-specific stripping.
+   * Verified end-to-end status. Operator-maintained flag set
+   * after a real client call (agent → router → merchant → 200)
+   * succeeded against this route on mainnet. The public catalog
+   * exposes this so agents can filter to only-working routes,
+   * and so the operator has a single place to track which
+   * merchants need attention.
+   *
+   * Values:
+   *   - `'session'`: route works end-to-end via tempo.session
+   *     (router uses payMerchantSession + KV channel state)
+   *   - `'charge'`: route works end-to-end via tempo.charge
+   *     (router uses payMerchant, no KV channel needed)
+   *   - `false`: route is registered (clients can hit it) but
+   *     a recent client test failed for a reason that ISN'T the
+   *     router's fault (merchant 5xx, deprecated upstream model,
+   *     unfunded session channel, etc.)
+   *   - omitted: untested / unknown. Treat as "best effort".
+   *
+   * Why a tristate instead of a boolean: we want clients to know
+   * the difference between "router-side session channel is open
+   * and works" vs "router-side charge fallback is the actual
+   * dispatch path", because the per-request latency profile is
+   * very different (charge = ~25s due to per-request settle,
+   * session = ~8s with off-chain voucher). Agents that care
+   * about latency budget choose accordingly.
    */
+  verifiedMode?: 'session' | 'charge' | false
+  /**
+   * Optional human-readable status note shown alongside
+   * `verifiedMode` in the public catalog. Use this to explain
+   * WHY a route is `verifiedMode: false` so an agent operator
+   * doesn't have to read the source.
+   */
+  verifiedNote?: string
 }
 
 export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
@@ -84,6 +111,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/parallel/search',
     upstreamHost: 'parallelmpp.dev',
     upstreamPath: '/api/search',
+    verifiedMode: 'charge',
   },
   {
     id: 'exa_search',
@@ -101,6 +129,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/exa/search',
     upstreamHost: 'exa.mpp.tempo.xyz',
     upstreamPath: '/search',
+    verifiedMode: 'charge',
   },
   {
     id: 'firecrawl_scrape',
@@ -118,6 +147,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/firecrawl/scrape',
     upstreamHost: 'firecrawl.mpp.tempo.xyz',
     upstreamPath: '/v1/scrape',
+    verifiedMode: 'charge',
   },
   {
     id: 'openrouter_chat',
@@ -143,6 +173,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/openrouter/chat',
     upstreamHost: 'openrouter.mpp.tempo.xyz',
     upstreamPath: '/v1/chat/completions',
+    verifiedMode: 'session',
   },
   // ─── 2026-04-11 Task A: 8 additional Tempo session merchants ──────
   // All routes added in one batch. Each merchant id MUST exactly
@@ -165,6 +196,8 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/anthropic/messages',
     upstreamHost: 'anthropic.mpp.tempo.xyz',
     upstreamPath: '/v1/messages',
+    verifiedMode: false,
+    verifiedNote: 'Merchant returns 500 on direct mppx call (verified bypassing router). Both /v1/messages and /v1/chat/completions endpoints fail upstream. Channel is open but unusable until anthropic merchant is fixed.',
   },
   {
     id: 'openai_chat',
@@ -182,6 +215,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/openai/chat',
     upstreamHost: 'openai.mpp.tempo.xyz',
     upstreamPath: '/v1/chat/completions',
+    verifiedMode: 'session',
   },
   {
     id: 'gemini_generate',
@@ -205,6 +239,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     // include gemini-1.5-pro, gemini-2.0-flash-exp, etc.
     upstreamPath: '/v1beta/models/{model}:generateContent',
     placeholderDefaults: { model: 'gemini-2.0-flash' },
+    verifiedMode: 'session',
   },
   {
     id: 'dune_execute',
@@ -224,6 +259,8 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     // mpp.dev/api/services. Earlier draft of v2-todo.md was wrong.
     upstreamHost: 'api.dune.com',
     upstreamPath: '/api/v1/sql/execute',
+    verifiedMode: false,
+    verifiedNote: 'Channel underfunded — Dune SQL execute charged $4 USDC initial probe charge but channel deposit was only $1. Cumulative > deposit, so the next voucher will be rejected. Needs a topup or a higher initial deposit.',
   },
   {
     id: 'modal_exec',
@@ -241,6 +278,8 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/modal/exec',
     upstreamHost: 'modal.mpp.tempo.xyz',
     upstreamPath: '/sandbox/exec',
+    verifiedMode: false,
+    verifiedNote: 'Merchant returns tempo.charge instead of session despite mpp.dev catalog. Router charge fallback fires correctly, but the modal forwarder rejects an empty {} body with 500. Need to find a body shape modal accepts.',
   },
   {
     id: 'alchemy_rpc',
@@ -260,6 +299,9 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     // not alchemy.mpp.tempo.xyz. Earlier draft was wrong.
     upstreamHost: 'mpp.alchemy.com',
     upstreamPath: '/eth-mainnet/v2',
+    // Alchemy actually serves tempo.charge despite mpp.dev claiming
+    // session. Router charge fallback handles this transparently.
+    verifiedMode: 'charge',
   },
   {
     id: 'tempo_rpc',
@@ -277,6 +319,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/tempo/rpc',
     upstreamHost: 'rpc.mpp.tempo.xyz',
     upstreamPath: '/',
+    verifiedMode: 'session',
   },
   {
     id: 'storage_upload',
@@ -294,6 +337,9 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     publicPath: '/v1/services/storage/upload',
     upstreamHost: 'storage.mpp.tempo.xyz',
     upstreamPath: '/upload',
+    // Storage serves tempo.charge for the multipart-init POST
+    // endpoint. Router charge fallback handles dispatch.
+    verifiedMode: 'charge',
   },
 ]
 
@@ -349,6 +395,36 @@ export interface PublicCatalogEntry {
       role: 'upstream'
     }
   }
+  /**
+   * Operator-verified end-to-end status. Indicates whether a real
+   * client call (agent → router → merchant → 200) has been observed
+   * for this route on mainnet, and which dispatch path the router
+   * takes when forwarding.
+   *
+   * Values:
+   *   - `'session'`: route works end-to-end via tempo.session.
+   *     Lower latency (~8s), uses an open KV channel.
+   *   - `'charge'`: route works end-to-end via tempo.charge.
+   *     Higher latency (~25s), per-request settle, no KV channel
+   *     needed.
+   *   - `false`: route is registered but a recent client test
+   *     failed for a reason that isn't the router's fault. See
+   *     `verified_note`. Agents that need a working route should
+   *     filter these out.
+   *   - omitted: untested or status unknown. Treat as best-effort.
+   *
+   * Why this is in the catalog: agents that care about latency
+   * budget can pre-filter to `verified_mode === 'session'`. Agents
+   * that just want anything that works can pre-filter to
+   * `verified_mode !== false`.
+   */
+  verified_mode?: 'session' | 'charge' | false
+  /**
+   * Operator note explaining a `verified_mode === false` status.
+   * Tells the agent operator WHY a route is broken so they don't
+   * have to read the source.
+   */
+  verified_note?: string
 }
 
 /**
@@ -364,29 +440,38 @@ function stellarIntentsFor(_route: PublicServiceRoute): Array<'charge' | 'channe
 }
 
 export function listPublicCatalog(): PublicCatalogEntry[] {
-  return PUBLIC_SERVICE_ROUTES.map(route => ({
-    id: route.id,
-    name: route.name,
-    category: route.category,
-    description: route.description,
-    public_path: route.publicPath,
-    method: route.method,
-    price: route.price,
-    payment_method: route.paymentMethod,
-    network: route.network,
-    asset: route.asset,
-    status: 'active',
-    docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
-    methods: {
-      stellar: {
-        intents: stellarIntentsFor(route),
+  return PUBLIC_SERVICE_ROUTES.map(route => {
+    const entry: PublicCatalogEntry = {
+      id: route.id,
+      name: route.name,
+      category: route.category,
+      description: route.description,
+      public_path: route.publicPath,
+      method: route.method,
+      price: route.price,
+      payment_method: route.paymentMethod,
+      network: route.network,
+      asset: route.asset,
+      status: 'active',
+      docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
+      methods: {
+        stellar: {
+          intents: stellarIntentsFor(route),
+        },
+        tempo: {
+          intents: [route.upstreamPaymentMethod === 'tempo.session' ? 'session' : 'charge'],
+          role: 'upstream' as const,
+        },
       },
-      tempo: {
-        intents: [route.upstreamPaymentMethod === 'tempo.session' ? 'session' : 'charge'],
-        role: 'upstream' as const,
-      },
-    },
-  }))
+    }
+    if (route.verifiedMode !== undefined) {
+      entry.verified_mode = route.verifiedMode
+    }
+    if (route.verifiedNote !== undefined) {
+      entry.verified_note = route.verifiedNote
+    }
+    return entry
+  })
 }
 
 export function getRouteByPublicPath(pathname: string, method: string): PublicServiceRoute | undefined {
