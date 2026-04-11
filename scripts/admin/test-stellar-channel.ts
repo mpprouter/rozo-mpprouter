@@ -133,14 +133,33 @@ async function main() {
     ],
   }
 
-  console.log(`→ POST ${ROUTER_URL}${ROUTE_PATH}`)
+  // V2 §6-D2 bootstrap hint: on the FIRST request the router has
+  // no Authorization header to look at, so it doesn't know we
+  // want stellar.channel mode. We advertise our intent + identity
+  // via URL query params:
+  //   ?payment=channel  → tells router to emit a stellar.channel
+  //                       402 (not the default stellar.charge)
+  //   &agent=G...       → tells router which agent we are, so it
+  //                       can look up the right channel contract
+  //                       in the `stellarAgent:<G>` KV index
+  // Once the 402 comes back and the mppx client signs a voucher
+  // the retry will carry Authorization: Payment <cred>, and the
+  // router will re-extract the agent from credential.source —
+  // the query param becomes redundant but stays on the URL
+  // because mppx preserves URL when retrying. That's fine; both
+  // lookups resolve to the same G and the same channel contract.
+  const urlWithHint = new URL(`${ROUTER_URL}${ROUTE_PATH}`)
+  urlWithHint.searchParams.set('payment', 'channel')
+  urlWithHint.searchParams.set('agent', agentG)
+
+  console.log(`→ POST ${urlWithHint.toString()}`)
   console.log(`  body: ${JSON.stringify(body)}`)
   console.log('')
 
   const start = Date.now()
   let response: Response
   try {
-    response = await fetch(`${ROUTER_URL}${ROUTE_PATH}`, {
+    response = await fetch(urlWithHint.toString(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

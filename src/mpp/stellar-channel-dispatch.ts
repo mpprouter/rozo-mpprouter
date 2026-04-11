@@ -171,34 +171,59 @@ export function createStellarChannelPayment(
  * Resolve the Stellar channel for an incoming request by walking
  * the two-step KV lookup:
  *
- *   1. Parse the agent's G address out of `credential.source`.
+ *   1. Get the agent's G address from either:
+ *        a) `credential.source` in the Authorization header
+ *           (the normal path once the voucher is signed), OR
+ *        b) an explicit `agentHint` (used on the FIRST request
+ *           of a new session, when the agent carries a URL
+ *           query param `?agent=G...` to bootstrap the dispatch
+ *           before any credential exists).
  *   2. Read `stellarAgent:<G>` → channel contract address.
  *   3. Read `stellarChannel:<C>` → full state (commitmentKey etc).
  *   4. Build a per-request Mppx with that channel + commitment key.
  *
- * Step 1 is completely out-of-band-free: the agent's identity is
- * a cryptographic property of the credential, so the router
- * learns it without any header / query param / client-side
- * protocol extension. See `extractAgentAccount` for the parser.
+ * Why two entry points: agents that only know `stellar.charge`
+ * would break if the router silently switched everyone to
+ * channel mode, so the router has to keep treating unhinted
+ * 'none' requests as charge. The `?payment=channel&agent=G...`
+ * query-param pair is an opt-in, no-auth bootstrap hint — the
+ * agent side gets to stay on stock `@stellar/mpp/channel/client`
+ * with zero SDK changes, and the router side gets enough info
+ * to build the right per-request Mppx for the FIRST 402.
+ *
+ * SECURITY NOTE: the agent-hint path does NOT authenticate the
+ * caller. A third party could pass `?agent=G_VICTIM` and trick
+ * the router into emitting a 402 bound to the victim's channel,
+ * then the caller would have to sign a valid voucher against
+ * that channel's commitmentKey to actually move money. Because
+ * the commitmentKey's ed25519 private key is ONLY known to the
+ * real agent, the third party cannot produce a valid voucher
+ * and the verify step fails. Net effect: `?agent=G...` leaks
+ * which agents the router knows about, nothing else. Acceptable
+ * for V2 dogfood.
  *
  * Throws `StellarChannelNotRegisteredError` if either KV lookup
- * misses. This bubbles up to proxy.ts which returns 402 with an
- * operator-facing hint.
+ * misses.
  */
 export async function resolveStellarChannelMppx(
   env: Env,
   authHeader: string | null,
+  agentHint?: string | null,
 ): Promise<{
   mppx: ReturnType<typeof createStellarChannelPayment>
   channelContract: string
   agentAccount: string
 }> {
-  const agentAccount = extractAgentAccount(authHeader)
+  const agentAccount = extractAgentAccount(authHeader) ?? agentHint ?? null
   if (!agentAccount) {
-    // Defense in depth: if classifyAuth let us through without
-    // extracting an agent, fail closed rather than leaking into
-    // a default channel.
-    throw new Error('No stellar.channel credential with parseable source in Authorization header')
+    throw new Error(
+      'No stellar.channel credential with parseable source in Authorization header and no ?agent= query hint',
+    )
+  }
+  // Validate G strkey shape on the hint path — extractAgentAccount
+  // already does this for the credential path via a regex.
+  if (!/^G[A-Z2-7]{55}$/.test(agentAccount)) {
+    throw new Error(`invalid Stellar G address: ${agentAccount}`)
   }
   const channelContract = await getChannelForAgent(env, agentAccount)
   if (!channelContract) {

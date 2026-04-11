@@ -113,6 +113,15 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
   },
 ]
 
+/**
+ * Public-catalog entry shape. The top-level fields match what
+ * V1 agents have depended on since `/v1/services/catalog` first
+ * shipped. The `methods` sub-object is a V2 addition that lets
+ * channel-aware clients discover which Stellar intent(s) a route
+ * accepts without probing the endpoint first. Its shape mirrors
+ * what `https://mpp.dev/api/services` already publishes for its
+ * upstream merchants (e.g. `methods.tempo.intents: ["session"]`).
+ */
 export interface PublicCatalogEntry {
   id: string
   name: string
@@ -121,11 +130,53 @@ export interface PublicCatalogEntry {
   public_path: string
   method: string
   price: string
+  /**
+   * Legacy flat field. V1 agents read this to know they should
+   * build a Stellar MPP client. V2 keeps it populated for
+   * backward compatibility — do not remove.
+   */
   payment_method: 'stellar'
   network: 'stellar-mainnet'
   asset: 'USDC'
   status: 'active'
   docs_url: string
+  /**
+   * V2 multi-intent discovery. Lists the Stellar MPP intents the
+   * router is willing to accept for this route. Channel-aware
+   * agents should prefer `"channel"` where available (lower
+   * latency, no per-request Soroban simulate). Agents that only
+   * know `"charge"` should keep using it — the router continues
+   * to honor both on the same public_path.
+   *
+   * For routes whose upstream also happens to be session-mode
+   * (`tempo.session` on the merchant side), this block also
+   * advertises the upstream's intents as informational metadata
+   * — it tells the operator (and curious agents) that the
+   * router is performing a charge↔session bridge. Agents do NOT
+   * need to care about the upstream half; router handles it.
+   */
+  methods: {
+    stellar: {
+      intents: Array<'charge' | 'channel'>
+    }
+    tempo?: {
+      intents: Array<'charge' | 'session'>
+      // upstream info only; agents never speak tempo directly
+      role: 'upstream'
+    }
+  }
+}
+
+/**
+ * Build the list of Stellar intents this route accepts. V2 default
+ * is both `charge` and `channel` on every route so channel-aware
+ * clients can discover the option. A future route-level override
+ * could disable channel on a per-route basis (e.g. if a merchant
+ * turns out to be too flaky under session-mode latency), but V2
+ * initial rollout is uniform.
+ */
+function stellarIntentsFor(_route: PublicServiceRoute): Array<'charge' | 'channel'> {
+  return ['charge', 'channel']
 }
 
 export function listPublicCatalog(): PublicCatalogEntry[] {
@@ -142,6 +193,15 @@ export function listPublicCatalog(): PublicCatalogEntry[] {
     asset: route.asset,
     status: 'active',
     docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
+    methods: {
+      stellar: {
+        intents: stellarIntentsFor(route),
+      },
+      tempo: {
+        intents: [route.upstreamPaymentMethod === 'tempo.session' ? 'session' : 'charge'],
+        role: 'upstream' as const,
+      },
+    },
   }))
 }
 

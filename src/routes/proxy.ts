@@ -286,7 +286,26 @@ export async function handleProxy(
   // forwarded as-is and whatever economic exchange happens is between
   // the agent and the merchant.
   const authHeader = request.headers.get('authorization')
-  const authKind = classifyAuth(authHeader)
+  const rawAuthKind = classifyAuth(authHeader)
+
+  // V2 §6-D2 query-param bootstrap: agents that want the stellar.channel
+  // flow on their FIRST request (before any credential has been signed)
+  // advertise their intent by passing `?payment=channel&agent=G...` in
+  // the URL. We upgrade authKind from 'none' to 'stellar.channel' when
+  // we see this pair, so the verify dispatch below builds a channel-
+  // bound Mppx for the initial 402.
+  //
+  // This is strictly additive: requests without the hint stay on the
+  // V1 charge path (including the working stellar.charge → tempo.session
+  // bridge from commit 9dbaba1). Requests with the hint but a wrong G
+  // get a clean 402 via StellarChannelNotRegisteredError. There is no
+  // silent mode switch.
+  const paymentHint = url.searchParams.get('payment')?.toLowerCase() ?? null
+  const agentHint = url.searchParams.get('agent')
+  let authKind: typeof rawAuthKind = rawAuthKind
+  if (authKind === 'none' && paymentHint === 'channel' && agentHint) {
+    authKind = 'stellar.channel'
+  }
 
   if (authKind === 'passthrough') {
     console.log(`[proxy] Non-Stellar credential — transparent passthrough to ${merchantHost}`)
@@ -351,7 +370,12 @@ export async function handleProxy(
   let channelContractForVerify: string | undefined
   try {
     if (authKind === 'stellar.channel') {
-      const resolved = await resolveStellarChannelMppx(env, authHeader)
+      // Pass agentHint so the first-request bootstrap path can
+      // resolve the agent's channel without a credential yet.
+      // Once the agent signs a voucher on the retry, the
+      // credential.source extraction will produce the same G
+      // and we'll converge on the same channel.
+      const resolved = await resolveStellarChannelMppx(env, authHeader, agentHint)
       mppx = resolved.mppx as any
       channelContractForVerify = resolved.channelContract
       console.log(
