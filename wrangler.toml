@@ -4,6 +4,26 @@ compatibility_date = "2026-04-09"
 compatibility_flags = ["nodejs_compat"]
 account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
 
+# Force @stellar/stellar-sdk and @stellar/stellar-base to their CJS
+# entry points, NOT the minified browser bundles.
+#
+# Without these aliases, esbuild's `browser: true` resolution (default
+# for Workers) picks `dist/stellar-sdk.min.js` and `dist/
+# stellar-base.min.js` — both of which inline their OWN copy of the
+# Transaction/TransactionBuilder classes. Meanwhile any direct
+# `require('@stellar/stellar-base')` from a sub-file (e.g.
+# `stellar-sdk/lib/rpc/transaction.js`) ends up resolving to the
+# CJS `lib/index.js` of stellar-base. Result: TWO copies of the
+# `Transaction` class in the bundle, `instanceof` fails across
+# them, and `assembleTransaction → TransactionBuilder.cloneFrom`
+# throws `TypeError: expected a 'Transaction', got: [object Object]`.
+#
+# Aliasing both packages to their CJS entry forces every import to
+# share one module instance.
+[alias]
+"@stellar/stellar-sdk" = "./node_modules/@stellar/stellar-sdk/lib/index.js"
+"@stellar/stellar-base" = "./node_modules/@stellar/stellar-base/lib/index.js"
+
 [[kv_namespaces]]
 binding = "MPP_STORE"
 id = "b0fa51efc09e4e708c6bd5061b0663e0"
@@ -29,17 +49,40 @@ RATE_LIMIT_MAX = "10"
 # See internaldocs/v2-todo.md#c and v2-session-session-done.md §5.1.
 XLM_USD_RATE = "0.1533"
 
+# ---------- x402 inbound over Stellar (Phase 1) ----------
+# Non-secret defaults for the stellar.x402 branch of the proxy.
+# The router runs an in-process x402 facilitator backed by
+# @x402/stellar/exact/facilitator, receives agent USDC on Stellar
+# mainnet at STELLAR_X402_PAY_TO, and pays the downstream merchant
+# from the existing Tempo pool. See src/mpp/stellar-x402-server.ts
+# and tasks/todo.md for design.
+#
+# Flip X402_ENABLED to "false" to disable the new branch entirely
+# (classifyAuth falls through to passthrough for non-mppx credentials).
+# No other changes required.
+X402_ENABLED = "true"
+# G... recipient address. Agent USDC lands here after settle.
+# Public key only — must NOT be a secret. Operators can rotate
+# this by flipping the value and restarting.
+STELLAR_X402_PAY_TO = "GCTGI65YXLLJJ2NWC6OJNHGZWE6HCMZLNODL4DUJ2NRYTKHMC2YMVDQL"
+
 # Secrets (set via: wrangler secret put <NAME>)
 #
-# STELLAR_ROUTER_PUBLIC    — G... Router pool address (receives agent USDC)
-# STELLAR_GAS_SECRET       — S... Gas sponsor keypair (pays tx fees, low-value)
-# STELLAR_GAS_PUBLIC       — G... Gas sponsor address
-# TEMPO_ROUTER_PRIVATE_KEY — 0x... EVM key (pays merchants on Tempo)
-# TEMPO_ROUTER_ADDRESS     — 0x... EVM address
-# MPP_SECRET_KEY           — random hex string used by mppx to HMAC-bind 402
-#                            challenges so returning credentials can be
-#                            verified statelessly. Rotate to invalidate all
-#                            outstanding challenges.
+# STELLAR_ROUTER_PUBLIC          — G... Router pool address (receives agent USDC via mppx)
+# STELLAR_GAS_SECRET             — S... Gas sponsor keypair (pays tx fees, low-value)
+# STELLAR_GAS_PUBLIC             — G... Gas sponsor address
+# STELLAR_X402_FACILITATOR_SECRET — S... Stellar x402 facilitator signer.
+#                                  Builds + submits Soroban invoke txs for
+#                                  the stellar.x402 branch's settle step.
+#                                  Can reuse STELLAR_GAS_SECRET — same
+#                                  account, different env var so operators
+#                                  can rotate them independently if wanted.
+# TEMPO_ROUTER_PRIVATE_KEY       — 0x... EVM key (pays merchants on Tempo)
+# TEMPO_ROUTER_ADDRESS           — 0x... EVM address
+# MPP_SECRET_KEY                 — random hex string used by mppx to HMAC-bind 402
+#                                  challenges so returning credentials can be
+#                                  verified statelessly. Rotate to invalidate all
+#                                  outstanding challenges.
 #
 # Note: STELLAR_ROUTER_SECRET is NOT stored anywhere in the app.
 # The Router pool private key is managed offline by the operator.

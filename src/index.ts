@@ -14,6 +14,7 @@
 import { handleProxy } from './routes/proxy'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
+import { handleX402Supported } from './routes/x402-supported'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -57,6 +58,31 @@ export interface Env {
   // operator update policy and internaldocs/v2-todo.md#c for context.
   // Stored as a string so wrangler.toml can carry it; parsed at use site.
   XLM_USD_RATE: string
+
+  // ---------- x402 inbound over Stellar (Phase 1) ----------
+  //
+  // Router acts as an x402 resource server + in-process facilitator
+  // on Stellar mainnet. Agents using any spec-compliant x402 client
+  // (e.g. @x402/stellar/exact/client) can hit the same /v1/services/*
+  // URLs; classifyAuth dispatches to the stellar.x402 branch only
+  // when the credential's payTo matches STELLAR_X402_PAY_TO AND
+  // X402_ENABLED is "true". See src/mpp/stellar-x402-server.ts.
+  //
+  // Runs parallel to the existing Stellar MPP (mppx) path — classifyAuth
+  // tries mppx first, then x402; unrecognized credentials fall through
+  // to the existing passthrough branch.
+  X402_ENABLED: string                     // "true" | "false" (default "true")
+  // G... recipient address — this is the account that actually
+  // receives agent USDC. Public key only; no signing from this
+  // account ever happens inside the router.
+  STELLAR_X402_PAY_TO: string
+  // S... facilitator signer. Builds + submits the on-chain Soroban
+  // invoke for settle. Shared with STELLAR_GAS_SECRET in .dev.vars
+  // by default (same "gas sponsor" account is used for both), but
+  // kept as a distinct env var so operators can rotate them
+  // independently if they want. Secret — set via `wrangler secret
+  // put STELLAR_X402_FACILITATOR_SECRET`.
+  STELLAR_X402_FACILITATOR_SECRET: string
 }
 
 export default {
@@ -69,7 +95,11 @@ export default {
       }
 
       if (url.pathname === '/services' || url.pathname === '/v1/services/catalog') {
-        return handleServices()
+        return handleServices(env)
+      }
+
+      if (url.pathname === '/x402/supported') {
+        return handleX402Supported(env)
       }
 
       if (url.pathname.startsWith('/v1/services/')) {
@@ -77,12 +107,16 @@ export default {
       }
 
       return new Response(
-        'MPP Router - Stellar to Tempo Payment Proxy\n\n' +
+        'MPP Router - Stellar + x402 Payment Proxy\n\n' +
         'Endpoints:\n' +
-        '  GET /health              - Pool status\n' +
-        '  GET /services            - Public service catalog\n' +
+        '  GET /health              - Pool status (Stellar + Tempo)\n' +
+        '  GET /services            - Public service catalog (all payment flavors)\n' +
         '  GET /v1/services/catalog - Versioned service catalog\n' +
+        '  GET /x402/supported      - Native x402 discovery (SupportedResponse shape)\n' +
         '  POST /v1/services/<service>/<operation> - Call a public service route\n\n' +
+        'Accepted auth schemes on the proxy routes:\n' +
+        '  - Stellar MPP (official mppx client)\n' +
+        '  - Stellar x402 (@x402/stellar/exact/client whose payTo = STELLAR_X402_PAY_TO)\n\n' +
         'Docs: https://apiserver.mpprouter.dev/docs/integration\n',
         { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       )

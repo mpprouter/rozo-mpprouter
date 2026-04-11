@@ -1,431 +1,197 @@
-export interface PublicServiceRoute {
-  id: string
-  service: string
-  operation: string
-  name: string
-  category: string
-  description: string
-  method: string
-  price: string
-  /**
-   * Which wallet type the AGENT uses to pay Router. Always 'stellar'
-   * for the current catalog; this is the value exposed on the public
-   * catalog JSON and is consumed by agent-side SDKs.
-   */
-  paymentMethod: 'stellar'
-  /**
-   * Which Tempo payment intent Router uses to pay the upstream
-   * merchant. Fixed-price merchants (Firecrawl, Exa, Parallel) use
-   * `tempo.charge` — a single-shot 402 settle per request. Dynamic-
-   * price merchants (OpenRouter) use `tempo.session` — a long-lived
-   * channel with streaming vouchers. This is an internal Router
-   * concern; agents never see it.
-   *
-   * Default `tempo.charge` keeps backward compatibility. OpenRouter
-   * is NOT flipped to `tempo.session` in the initial commit; the
-   * operator flips it after running `scripts/open-channel.ts`
-   * (see internaldocs/session-support-plan.md §6 step 11).
-   */
-  upstreamPaymentMethod: 'tempo.charge' | 'tempo.session'
-  network: 'stellar-mainnet'
-  asset: 'USDC'
-  publicPath: string
-  upstreamHost: string
-  /**
-   * Path on the upstream merchant. May contain `{placeholder}`
-   * tokens which the router substitutes from URL query params at
-   * request time. Currently only used by the gemini route to let
-   * clients pick a model: `/v1beta/models/{model}:generateContent`
-   * + query `?model=gemini-2.0-flash` → `/v1beta/models/gemini-2.0-flash:generateContent`.
-   *
-   * Why `{name}` syntax instead of `:name`: Gemini's literal
-   * upstream path contains `:generateContent` (a Google API
-   * convention), so a `:name` placeholder syntax would collide
-   * with literal colons. `{name}` is unambiguous and matches the
-   * OpenAPI/RFC 6570 conventions agents are familiar with.
-   *
-   * If a placeholder is referenced but missing from both the
-   * query and `placeholderDefaults`, the router emits 400. The
-   * substitution is whitelist-based — only values matching
-   * `[A-Za-z0-9._-]+` are allowed, so a malicious client cannot
-   * inject path traversal or query strings.
-   */
-  upstreamPath: string
-  /**
-   * Default values for `:placeholder` tokens in upstreamPath.
-   * Looked up by placeholder name when the request URL doesn't
-   * carry the corresponding query param.
-   */
-  placeholderDefaults?: Record<string, string>
-  /**
-   * Verified end-to-end status. Operator-maintained flag set
-   * after a real client call (agent → router → merchant → 200)
-   * succeeded against this route on mainnet. The public catalog
-   * exposes this so agents can filter to only-working routes,
-   * and so the operator has a single place to track which
-   * merchants need attention.
-   *
-   * Values:
-   *   - `'session'`: route works end-to-end via tempo.session
-   *     (router uses payMerchantSession + KV channel state)
-   *   - `'charge'`: route works end-to-end via tempo.charge
-   *     (router uses payMerchant, no KV channel needed)
-   *   - `false`: route is registered (clients can hit it) but
-   *     a recent client test failed for a reason that ISN'T the
-   *     router's fault (merchant 5xx, deprecated upstream model,
-   *     unfunded session channel, etc.)
-   *   - omitted: untested / unknown. Treat as "best effort".
-   *
-   * Why a tristate instead of a boolean: we want clients to know
-   * the difference between "router-side session channel is open
-   * and works" vs "router-side charge fallback is the actual
-   * dispatch path", because the per-request latency profile is
-   * very different (charge = ~25s due to per-request settle,
-   * session = ~8s with off-chain voucher). Agents that care
-   * about latency budget choose accordingly.
-   */
-  verifiedMode?: 'session' | 'charge' | false
-  /**
-   * Optional human-readable status note shown alongside
-   * `verifiedMode` in the public catalog. Use this to explain
-   * WHY a route is `verifiedMode: false` so an agent operator
-   * doesn't have to read the source.
-   */
-  verifiedNote?: string
-}
+/**
+ * Public service catalog for the MPP Router.
+ *
+ * History: this file used to contain a hand-typed list of 12
+ * routes (PUBLIC_SERVICE_ROUTES). It drifted relative to the
+ * upstream mpp.dev catalog, which now has 88 services and 832
+ * endpoints. As of 2026-04-12 the route table is generated from
+ * a frozen snapshot (`mpp-catalog-snapshot.json`) at module load
+ * time via `buildRoutesFromMppSnapshot`. The 12 historical
+ * route IDs and their `verifiedMode` operator-test results are
+ * preserved via `OPERATOR_OVERLAY` so existing client URL
+ * bookmarks (`/v1/services/parallel/search`) keep working
+ * unchanged.
+ *
+ * To refresh the snapshot:
+ *   npx tsx scripts/admin/refresh-mpp-snapshot.ts
+ *   git add src/services/mpp-catalog-snapshot.json
+ *   git commit -m "Refresh mpp.dev catalog snapshot YYYY-MM-DD"
+ *
+ * To add an operator-only override (verifiedMode, placeholder
+ * defaults, session-channel pre-provisioning), edit
+ * `OPERATOR_OVERLAY` below — keyed by `${serviceId}::${upstreamPath}`
+ * where the upstream path uses `{name}` placeholder syntax.
+ *
+ * The router used to be 12 routes for ~6 months. The instinct to
+ * read this file linearly to find a route is no longer practical
+ * with 800+ entries — use the `getRouteByPublicPath` helper or
+ * grep for `id:` if you really need to inspect a single entry.
+ */
 
-export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
-  {
-    id: 'parallel_search',
-    service: 'parallel',
-    operation: 'search',
-    name: 'Parallel Search',
-    category: 'search',
-    description: 'General web search routed through MPP Router.',
-    method: 'POST',
-    price: '$0.01/request',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.charge',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/parallel/search',
-    upstreamHost: 'parallelmpp.dev',
-    upstreamPath: '/api/search',
-    verifiedMode: 'charge',
-  },
-  {
-    id: 'exa_search',
-    service: 'exa',
-    operation: 'search',
-    name: 'Exa Search',
-    category: 'search',
-    description: 'AI-powered web search routed through MPP Router.',
-    method: 'POST',
-    price: '$0.005/request',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.charge',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/exa/search',
-    upstreamHost: 'exa.mpp.tempo.xyz',
-    upstreamPath: '/search',
-    verifiedMode: 'charge',
-  },
-  {
-    id: 'firecrawl_scrape',
-    service: 'firecrawl',
-    operation: 'scrape',
-    name: 'Firecrawl Scrape',
-    category: 'web',
-    description: 'Web page scraping routed through MPP Router.',
-    method: 'POST',
-    price: '$0.002/request',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.charge',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/firecrawl/scrape',
-    upstreamHost: 'firecrawl.mpp.tempo.xyz',
-    upstreamPath: '/v1/scrape',
-    verifiedMode: 'charge',
-  },
-  {
-    id: 'openrouter_chat',
-    service: 'openrouter',
-    operation: 'chat',
-    name: 'OpenRouter Chat',
-    category: 'ai',
-    description: 'Chat completions routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    // Flipped to tempo.session on 2026-04-11 after
-    // scripts/admin/open-tempo-channel.ts opened the $1 channel
-    // 0x278bf3c7bb88da8d20de75a2cf0f8aec94c00fd399a1be5ae53911b1d83fac75
-    // and persisted TempoChannelState to KV at
-    // `tempoChannel:openrouter_chat`. See v2-full-session-design.md §B.
-    // The router's payMerchantSession (src/mpp/tempo-client.ts)
-    // reads that KV entry on every request and signs a voucher
-    // off the stored cumulativeRaw high watermark.
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/openrouter/chat',
-    upstreamHost: 'openrouter.mpp.tempo.xyz',
-    upstreamPath: '/v1/chat/completions',
-    verifiedMode: 'session',
-  },
-  // ─── 2026-04-11 Task A: 8 additional Tempo session merchants ──────
-  // All routes added in one batch. Each merchant id MUST exactly
-  // match the key in scripts/admin/open-tempo-channel.ts MERCHANTS
-  // so that payMerchantSession reads the right tempoChannel:<id>
-  // KV record. See v2-todo.md#A and REMIND.md §3.
-  {
-    id: 'anthropic_messages',
-    service: 'anthropic',
-    operation: 'messages',
-    name: 'Anthropic Messages',
-    category: 'ai',
-    description: 'Anthropic Claude chat completions routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/anthropic/messages',
-    upstreamHost: 'anthropic.mpp.tempo.xyz',
-    upstreamPath: '/v1/messages',
-    verifiedMode: false,
-    verifiedNote: 'Merchant returns 500 on direct mppx call (verified bypassing router). Both /v1/messages and /v1/chat/completions endpoints fail upstream. Channel is open but unusable until anthropic merchant is fixed.',
-  },
-  {
-    id: 'openai_chat',
-    service: 'openai',
-    operation: 'chat',
-    name: 'OpenAI Chat',
-    category: 'ai',
-    description: 'OpenAI chat completions routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/openai/chat',
-    upstreamHost: 'openai.mpp.tempo.xyz',
-    upstreamPath: '/v1/chat/completions',
-    verifiedMode: 'session',
-  },
-  {
-    id: 'gemini_generate',
-    service: 'gemini',
-    operation: 'generate',
-    name: 'Google Gemini',
-    category: 'ai',
-    description: 'Google Gemini text generation routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/gemini/generate',
-    upstreamHost: 'gemini.mpp.tempo.xyz',
-    // 2026-04-11: clients pick the model via ?model=<name> query
-    // param. The router substitutes {model} in the upstream path.
-    // gemini-1.5-flash is deprecated upstream and returns 500;
-    // gemini-2.0-flash is the current default. Other valid values
-    // include gemini-1.5-pro, gemini-2.0-flash-exp, etc.
-    upstreamPath: '/v1beta/models/{model}:generateContent',
-    placeholderDefaults: { model: 'gemini-2.0-flash' },
-    verifiedMode: 'session',
-  },
-  {
-    id: 'dune_execute',
-    service: 'dune',
-    operation: 'execute',
-    name: 'Dune SQL Execute',
-    category: 'data',
-    description: 'Dune Analytics SQL queries routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/dune/execute',
-    // 2026-04-11: Dune lives at the actual api.dune.com domain per
-    // mpp.dev/api/services. Earlier draft of v2-todo.md was wrong.
-    upstreamHost: 'api.dune.com',
-    upstreamPath: '/api/v1/sql/execute',
-    verifiedMode: false,
-    verifiedNote: 'Channel underfunded — Dune SQL execute charged $4 USDC initial probe charge but channel deposit was only $1. Cumulative > deposit, so the next voucher will be rejected. Needs a topup or a higher initial deposit.',
-  },
-  {
-    id: 'modal_exec',
-    service: 'modal',
-    operation: 'exec',
-    name: 'Modal Sandbox',
-    category: 'compute',
-    description: 'Modal sandbox code execution routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/modal/exec',
-    upstreamHost: 'modal.mpp.tempo.xyz',
-    upstreamPath: '/sandbox/exec',
-    verifiedMode: false,
-    verifiedNote: 'Merchant returns tempo.charge instead of session despite mpp.dev catalog. Router charge fallback fires correctly, but the modal forwarder rejects an empty {} body with 500. Need to find a body shape modal accepts.',
-  },
-  {
-    id: 'alchemy_rpc',
-    service: 'alchemy',
-    operation: 'rpc',
-    name: 'Alchemy ETH RPC',
-    category: 'rpc',
-    description: 'Alchemy Ethereum mainnet JSON-RPC routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/alchemy/rpc',
-    // 2026-04-11: Alchemy lives at mpp.alchemy.com per mpp.dev catalog,
-    // not alchemy.mpp.tempo.xyz. Earlier draft was wrong.
-    upstreamHost: 'mpp.alchemy.com',
-    upstreamPath: '/eth-mainnet/v2',
-    // Alchemy actually serves tempo.charge despite mpp.dev claiming
-    // session. Router charge fallback handles this transparently.
-    verifiedMode: 'charge',
-  },
-  {
-    id: 'tempo_rpc',
-    service: 'tempo',
-    operation: 'rpc',
-    name: 'Tempo L2 RPC',
-    category: 'rpc',
-    description: 'Tempo L2 JSON-RPC routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/tempo/rpc',
-    upstreamHost: 'rpc.mpp.tempo.xyz',
-    upstreamPath: '/',
-    verifiedMode: 'session',
-  },
-  {
-    id: 'storage_upload',
-    service: 'storage',
-    operation: 'upload',
-    name: 'Object Storage Upload',
-    category: 'storage',
-    description: 'Object Storage upload routed through MPP Router.',
-    method: 'POST',
-    price: 'dynamic',
-    paymentMethod: 'stellar',
-    upstreamPaymentMethod: 'tempo.session',
-    network: 'stellar-mainnet',
-    asset: 'USDC',
-    publicPath: '/v1/services/storage/upload',
-    upstreamHost: 'storage.mpp.tempo.xyz',
-    upstreamPath: '/upload',
-    // Storage serves tempo.charge for the multipart-init POST
-    // endpoint. Router charge fallback handles dispatch.
-    verifiedMode: 'charge',
-  },
-]
+import mppSnapshot from './mpp-catalog-snapshot.json'
+import { buildRoutesFromMppSnapshot } from './build-routes'
+import type {
+  PublicServiceRoute,
+  PublicServiceRouteOverlay,
+  PublicCatalogEntry,
+} from './merchants-types'
+
+// Re-export types from `merchants-types.ts` so existing imports
+// like `import type { PublicServiceRoute } from './services/merchants'`
+// continue to work.
+export type {
+  PublicServiceRoute,
+  PublicServiceRouteOverlay,
+  PublicCatalogEntry,
+} from './merchants-types'
+
+// ---------------------------------------------------------------------
+// Operator overlay
+// ---------------------------------------------------------------------
 
 /**
- * Public-catalog entry shape. The top-level fields match what
- * V1 agents have depended on since `/v1/services/catalog` first
- * shipped. The `methods` sub-object is a V2 addition that lets
- * channel-aware clients discover which Stellar intent(s) a route
- * accepts without probing the endpoint first. Its shape mirrors
- * what `https://mpp.dev/api/services` already publishes for its
- * upstream merchants (e.g. `methods.tempo.intents: ["session"]`).
+ * Per-route operator-only overrides applied during route generation.
+ * Keyed by `${serviceId}::${upstreamPath}` where upstreamPath uses
+ * `{name}` placeholder syntax (the post-rewrite shape).
+ *
+ * Use this for:
+ * - Stable historical IDs / publicPaths so old client bookmarks work
+ * - verifiedMode flags from real end-to-end testing
+ * - Session-channel mode flips (when the operator has opened a KV
+ *   channel via `scripts/admin/open-tempo-channel.ts`)
+ * - placeholderDefaults for path-templated upstreams
+ *
+ * Each entry's session-mode flag MUST match a key in
+ * `scripts/admin/open-tempo-channel.ts MERCHANTS` so
+ * `payMerchantSession` reads the right `tempoChannel:<id>` KV record.
  */
-export interface PublicCatalogEntry {
-  id: string
-  name: string
-  category: string
-  description: string
-  public_path: string
-  method: string
-  price: string
-  /**
-   * Legacy flat field. V1 agents read this to know they should
-   * build a Stellar MPP client. V2 keeps it populated for
-   * backward compatibility — do not remove.
-   */
-  payment_method: 'stellar'
-  network: 'stellar-mainnet'
-  asset: 'USDC'
-  status: 'active'
-  docs_url: string
-  /**
-   * V2 multi-intent discovery. Lists the Stellar MPP intents the
-   * router is willing to accept for this route. Channel-aware
-   * agents should prefer `"channel"` where available (lower
-   * latency, no per-request Soroban simulate). Agents that only
-   * know `"charge"` should keep using it — the router continues
-   * to honor both on the same public_path.
-   *
-   * For routes whose upstream also happens to be session-mode
-   * (`tempo.session` on the merchant side), this block also
-   * advertises the upstream's intents as informational metadata
-   * — it tells the operator (and curious agents) that the
-   * router is performing a charge↔session bridge. Agents do NOT
-   * need to care about the upstream half; router handles it.
-   */
-  methods: {
-    stellar: {
-      intents: Array<'charge' | 'channel'>
-    }
-    tempo?: {
-      intents: Array<'charge' | 'session'>
-      // upstream info only; agents never speak tempo directly
-      role: 'upstream'
-    }
-  }
-  /**
-   * Operator-verified end-to-end status. Indicates whether a real
-   * client call (agent → router → merchant → 200) has been observed
-   * for this route on mainnet, and which dispatch path the router
-   * takes when forwarding.
-   *
-   * Values:
-   *   - `'session'`: route works end-to-end via tempo.session.
-   *     Lower latency (~8s), uses an open KV channel.
-   *   - `'charge'`: route works end-to-end via tempo.charge.
-   *     Higher latency (~25s), per-request settle, no KV channel
-   *     needed.
-   *   - `false`: route is registered but a recent client test
-   *     failed for a reason that isn't the router's fault. See
-   *     `verified_note`. Agents that need a working route should
-   *     filter these out.
-   *   - omitted: untested or status unknown. Treat as best-effort.
-   *
-   * Why this is in the catalog: agents that care about latency
-   * budget can pre-filter to `verified_mode === 'session'`. Agents
-   * that just want anything that works can pre-filter to
-   * `verified_mode !== false`.
-   */
-  verified_mode?: 'session' | 'charge' | false
-  /**
-   * Operator note explaining a `verified_mode === false` status.
-   * Tells the agent operator WHY a route is broken so they don't
-   * have to read the source.
-   */
-  verified_note?: string
+export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
+  // Parallel Search — first verified route, hand-tested 2026-04-11
+  'parallel::/api/search': {
+    id: 'parallel_search',
+    publicPath: '/v1/services/parallel/search',
+    verifiedMode: 'charge',
+  },
+  // Exa AI Search
+  'exa::/search': {
+    id: 'exa_search',
+    publicPath: '/v1/services/exa/search',
+    verifiedMode: 'charge',
+  },
+  // Firecrawl Scrape
+  'firecrawl::/v1/scrape': {
+    id: 'firecrawl_scrape',
+    publicPath: '/v1/services/firecrawl/scrape',
+    verifiedMode: 'charge',
+  },
+  // OpenRouter Chat — flipped to tempo.session 2026-04-11 after
+  // open-tempo-channel.ts opened the $1 channel
+  // 0x278bf3c7bb88da8d20de75a2cf0f8aec94c00fd399a1be5ae53911b1d83fac75
+  // and persisted TempoChannelState to KV at
+  // `tempoChannel:openrouter_chat`. payMerchantSession reads that
+  // KV entry on every request.
+  'openrouter::/v1/chat/completions': {
+    id: 'openrouter_chat',
+    publicPath: '/v1/services/openrouter/chat',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: 'session',
+  },
+  // Anthropic Messages — broken upstream
+  'anthropic::/v1/messages': {
+    id: 'anthropic_messages',
+    publicPath: '/v1/services/anthropic/messages',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant returns 500 on direct mppx call (verified bypassing router). ' +
+      'Both /v1/messages and /v1/chat/completions endpoints fail upstream. ' +
+      'Channel is open but unusable until anthropic merchant is fixed.',
+  },
+  // OpenAI Chat — verified session mode
+  'openai::/v1/chat/completions': {
+    id: 'openai_chat',
+    publicPath: '/v1/services/openai/chat',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: 'session',
+  },
+  // Google Gemini — uses {model} placeholder, defaults to gemini-2.0-flash
+  // The upstream path uses Google's `:generateContent` literal
+  // colon convention; the build step rewrites `:version` →
+  // `{version}` if mpp.dev publishes the templated form, but the
+  // operator override here pins both the public id and the model
+  // default for backward compat with old bookmarks.
+  'gemini::/{version}/models/*': {
+    id: 'gemini_generate',
+    publicPath: '/v1/services/gemini/generate',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: 'session',
+    placeholderDefaults: { version: 'v1beta', model: 'gemini-2.0-flash' },
+  },
+  // Dune SQL Execute — channel underfunded
+  'dune::/api/v1/sql/execute': {
+    id: 'dune_execute',
+    publicPath: '/v1/services/dune/execute',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: false,
+    verifiedNote:
+      'Channel underfunded — Dune SQL execute charged $4 USDC initial probe ' +
+      'charge but channel deposit was only $1. Cumulative > deposit, so the ' +
+      'next voucher will be rejected. Needs a topup or a higher initial deposit.',
+  },
+  // Modal Sandbox — body shape issue
+  'modal::/sandbox/exec': {
+    id: 'modal_exec',
+    publicPath: '/v1/services/modal/exec',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant returns tempo.charge instead of session despite mpp.dev catalog. ' +
+      'Router charge fallback fires correctly, but the modal forwarder rejects ' +
+      'an empty {} body with 500. Need to find a body shape modal accepts.',
+  },
+  // Alchemy Ethereum RPC — actually charge mode despite catalog
+  'alchemy::/{network}/v2': {
+    id: 'alchemy_rpc',
+    publicPath: '/v1/services/alchemy/rpc',
+    verifiedMode: 'charge',
+    placeholderDefaults: { network: 'eth-mainnet' },
+  },
+  // Tempo L2 RPC
+  'rpc::/': {
+    id: 'tempo_rpc',
+    publicPath: '/v1/services/tempo/rpc',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: 'session',
+  },
+  // Object Storage Upload — actually charge mode for multipart-init
+  'storage::/{key}': {
+    id: 'storage_upload',
+    publicPath: '/v1/services/storage/upload',
+    verifiedMode: 'charge',
+    placeholderDefaults: { key: 'upload' },
+  },
 }
+
+// ---------------------------------------------------------------------
+// Route table (generated from snapshot at module load)
+// ---------------------------------------------------------------------
+
+/**
+ * The full route table the router serves. Generated from
+ * `mpp-catalog-snapshot.json` + `OPERATOR_OVERLAY` at module load.
+ * Effectively immutable for the lifetime of the Worker isolate.
+ *
+ * Length is currently around 660 routes (88 services × ~7 paid POST
+ * endpoints each, after filtering out free/non-POST routes). Inspect
+ * counts at runtime via `PUBLIC_SERVICE_ROUTES.length` if you need
+ * to check.
+ */
+export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] =
+  buildRoutesFromMppSnapshot(mppSnapshot as any, OPERATOR_OVERLAY)
+
+// ---------------------------------------------------------------------
+// Catalog rendering
+// ---------------------------------------------------------------------
 
 /**
  * Build the list of Stellar intents this route accepts. V2 default
@@ -439,12 +205,51 @@ function stellarIntentsFor(_route: PublicServiceRoute): Array<'charge' | 'channe
   return ['charge', 'channel']
 }
 
-export function listPublicCatalog(): PublicCatalogEntry[] {
+/**
+ * Minimal env shape `listPublicCatalog` needs to decide whether to
+ * attach the `methods.stellar_x402` block. Typed as a subset rather
+ * than importing the full `Env` from `src/index.ts` to avoid a
+ * circular dependency (index.ts imports routes which eventually
+ * import this file).
+ */
+export type CatalogEnvView = {
+  X402_ENABLED?: string
+  STELLAR_NETWORK?: string
+  STELLAR_X402_PAY_TO?: string
+}
+
+/**
+ * USDC asset identifier for the Stellar x402 `asset` field in the
+ * public catalog. @x402/stellar's default parser treats USDC
+ * specially; this is advertised to clients so they know which
+ * Stellar token we accept.
+ */
+const STELLAR_X402_ASSET = 'USDC'
+
+export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
+  // Single place to decide stellar.x402 inclusion — don't scatter
+  // the check across every entry.
+  const stellarX402Block =
+    env?.X402_ENABLED === 'true' &&
+    env.STELLAR_NETWORK &&
+    env.STELLAR_X402_PAY_TO
+      ? {
+          scheme: 'exact' as const,
+          network: env.STELLAR_NETWORK,
+          pay_to: env.STELLAR_X402_PAY_TO,
+          asset: STELLAR_X402_ASSET,
+        }
+      : null
+
   return PUBLIC_SERVICE_ROUTES.map(route => {
     const entry: PublicCatalogEntry = {
       id: route.id,
       name: route.name,
-      category: route.category,
+      // Backward-compat: keep `category` (singular) populated
+      // with the first category for v1 clients that don't know
+      // about the array.
+      category: route.categories[0] ?? 'misc',
+      categories: route.categories,
       description: route.description,
       public_path: route.publicPath,
       method: route.method,
@@ -458,6 +263,10 @@ export function listPublicCatalog(): PublicCatalogEntry[] {
         stellar: {
           intents: stellarIntentsFor(route),
         },
+        // Only include `stellar_x402` when the feature flag is on —
+        // absent, not { enabled: false }, so existing mppx-only
+        // clients see byte-identical pre-x402 catalog shape.
+        ...(stellarX402Block ? { stellar_x402: stellarX402Block } : {}),
         tempo: {
           intents: [route.upstreamPaymentMethod === 'tempo.session' ? 'session' : 'charge'],
           role: 'upstream' as const,
@@ -474,12 +283,21 @@ export function listPublicCatalog(): PublicCatalogEntry[] {
   })
 }
 
-export function getRouteByPublicPath(pathname: string, method: string): PublicServiceRoute | undefined {
-  return PUBLIC_SERVICE_ROUTES.find(route => route.publicPath === pathname && route.method === method.toUpperCase())
+// ---------------------------------------------------------------------
+// Route lookup + path placeholder resolution
+// ---------------------------------------------------------------------
+
+export function getRouteByPublicPath(
+  pathname: string,
+  method: string,
+): PublicServiceRoute | undefined {
+  return PUBLIC_SERVICE_ROUTES.find(
+    route => route.publicPath === pathname && route.method === method.toUpperCase(),
+  )
 }
 
 /**
- * Whitelist for `:placeholder` substitution values. Restricts to
+ * Whitelist for `{placeholder}` substitution values. Restricts to
  * model-name-style identifiers so a client cannot inject path
  * traversal (`../`), query strings (`?`), or anchors (`#`).
  *
@@ -489,31 +307,6 @@ export function getRouteByPublicPath(pathname: string, method: string): PublicSe
  */
 const PLACEHOLDER_VALUE_PATTERN = /^[A-Za-z0-9._-]+$/
 
-/**
- * Substitute `{placeholder}` tokens in `route.upstreamPath` from a
- * URLSearchParams (request URL query). Falls back to per-route
- * defaults; throws when neither has a value, or when a value fails
- * validation. Returns the path with substitutions applied AND the
- * set of consumed param names so the proxy can strip them from the
- * forwarded query string.
- *
- * Substitution rule: `{name}` is replaced by the value of the
- * `name` query param, falling back to placeholderDefaults[name].
- * Curly-brace syntax is unambiguous — it does NOT collide with
- * literal colons in upstream paths like Google's
- * `/v1beta/models/{model}:generateContent`.
- *
- * Examples:
- *   resolveUpstreamPath('/v1beta/models/{model}:generateContent',
- *     route, new URLSearchParams('model=gemini-2.0-flash'))
- *     === { path: '/v1beta/models/gemini-2.0-flash:generateContent',
- *           consumed: new Set(['model']) }
- *
- *   resolveUpstreamPath('/v1beta/models/{model}:generateContent',
- *     route, new URLSearchParams())  // uses placeholderDefaults
- *     === { path: '/v1beta/models/gemini-2.0-flash:generateContent',
- *           consumed: new Set() }
- */
 export class UpstreamPathPlaceholderError extends Error {
   constructor(message: string) {
     super(message)
@@ -521,6 +314,14 @@ export class UpstreamPathPlaceholderError extends Error {
   }
 }
 
+/**
+ * Substitute `{placeholder}` tokens in `route.upstreamPath` from a
+ * URLSearchParams (request URL query). Falls back to per-route
+ * defaults; throws when neither has a value, or when a value fails
+ * validation. Returns the path with substitutions applied AND the
+ * set of consumed param names so the proxy can strip them from the
+ * forwarded query string.
+ */
 export function resolveUpstreamPath(
   route: Pick<PublicServiceRoute, 'upstreamPath' | 'placeholderDefaults' | 'id'>,
   searchParams: URLSearchParams,
@@ -537,13 +338,13 @@ export function resolveUpstreamPath(
       value = defaults[name]
     } else {
       throw new UpstreamPathPlaceholderError(
-        `Route ${route.id} requires :${name} placeholder but no value was supplied ` +
+        `Route ${route.id} requires {${name}} placeholder but no value was supplied ` +
           `(no ?${name}= query param and no default in placeholderDefaults).`,
       )
     }
     if (!PLACEHOLDER_VALUE_PATTERN.test(value)) {
       throw new UpstreamPathPlaceholderError(
-        `Route ${route.id} :${name} placeholder value ${JSON.stringify(value)} ` +
+        `Route ${route.id} {${name}} placeholder value ${JSON.stringify(value)} ` +
           `must match ${PLACEHOLDER_VALUE_PATTERN}`,
       )
     }

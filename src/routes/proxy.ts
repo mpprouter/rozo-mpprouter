@@ -34,6 +34,14 @@ import {
   resolveStellarChannelMppx,
   StellarChannelNotRegisteredError,
 } from '../mpp/stellar-channel-dispatch'
+import {
+  buildX402PaymentRequiredHeader,
+  checkAndReserveNonce,
+  isStellarX402ForThisRouter,
+  prepareStellarX402Inbound,
+  settleStellarX402,
+  verifyStellarX402WithFacilitator,
+} from '../mpp/stellar-x402-server'
 import type { Env } from '../index'
 
 /**
@@ -113,36 +121,49 @@ function forwardHeaders(
  * mppx/src/Credential.ts:131. Always parse with
  * `Credential.deserialize()` — mppx owns the wire format.
  */
-type AuthKind = 'stellar.charge' | 'stellar.channel' | 'passthrough' | 'none'
+type AuthKind =
+  | 'stellar.charge'
+  | 'stellar.channel'
+  | 'stellar.x402'
+  | 'passthrough'
+  | 'none'
 
-function classifyAuth(authHeader: string | null): AuthKind {
+function classifyAuth(authHeader: string | null, env: Env): AuthKind {
   if (!authHeader) return 'none'
   const trimmed = authHeader.trim()
   // Payment scheme uses the MPP "Payment" prefix. Anything else is
   // definitely not a Stellar MPP credential — forward untouched.
   if (!/^Payment\s+/i.test(trimmed)) return 'passthrough'
-  // Try to parse as a real mppx Credential. If it parses, the nested
-  // `challenge.method` field tells us the payment method unambiguously
-  // and `challenge.intent` tells us whether it's charge or channel.
-  // If it doesn't parse, it's some non-mppx `Payment ...` scheme that
-  // happens to share the prefix (e.g. an unrelated x402 dialect) — hand
-  // it back to the merchant to interpret.
+  // Try to parse as a real mppx Credential first. mppx credentials
+  // deserialize as `{ challenge: { method, intent, ... }, ... }`.
+  // x402 payloads deserialize as `{ x402Version, accepted, payload }`
+  // and will throw inside mppx's Credential.deserialize — so mppx
+  // failure is our "maybe x402?" trigger.
   try {
     const credential = Credential.deserialize(trimmed) as {
       challenge?: { method?: string; intent?: string }
     }
     const method = credential.challenge?.method?.toLowerCase()
-    if (method !== 'stellar') return 'passthrough'
-    const intent = credential.challenge?.intent?.toLowerCase()
-    if (intent === 'channel') return 'stellar.channel'
-    // Default for stellar.* credentials is charge. This matches V1
-    // behavior: any stellar credential without an explicit
-    // 'channel' intent takes the charge path. New intents added by
-    // future mppx versions will need explicit cases here.
-    return 'stellar.charge'
+    if (method === 'stellar') {
+      const intent = credential.challenge?.intent?.toLowerCase()
+      if (intent === 'channel') return 'stellar.channel'
+      // Default for stellar.* credentials is charge. This matches V1
+      // behavior: any stellar credential without an explicit
+      // 'channel' intent takes the charge path. New intents added by
+      // future mppx versions will need explicit cases here.
+      return 'stellar.charge'
+    }
+    // Parsed as mppx but non-Stellar method — fall through.
   } catch {
-    return 'passthrough'
+    // Not an mppx credential. Fall through to x402 check.
   }
+  // Stellar x402 (via @x402/core + @x402/stellar). Only claim the
+  // credential if its `payTo` matches STELLAR_X402_PAY_TO AND the
+  // feature flag is on. This makes dispatch opt-in per request so
+  // agents paying directly to some other Stellar recipient (not our
+  // router) stay in passthrough.
+  if (isStellarX402ForThisRouter(trimmed, env)) return 'stellar.x402'
+  return 'passthrough'
 }
 
 /**
@@ -339,6 +360,136 @@ function parseTempoChallenge(wwwAuth: string): {
   }
 }
 
+/**
+ * Shared merchant-pay step used by both the Stellar and x402 verify
+ * branches. Dispatches on the merchant's live 402 intent (`charge` vs
+ * `session`), calls `payMerchant` / `payMerchantSession`, and returns
+ * either a merchant body + response to be wrapped by the caller, or
+ * a fully-formed error `Response` if anything fell over.
+ *
+ * The caller is responsible for:
+ *   1. Running payment verification BEFORE calling this.
+ *   2. Wrapping the returned body in whatever receipt envelope their
+ *      verify path uses (mppx `verifyResult.withReceipt` for Stellar,
+ *      `X-Payment-Response` for x402).
+ *
+ * `forwardedHeaders` must be pre-computed by the caller so we don't
+ * have to reach back into the request here (keeps the helper pure).
+ */
+type MerchantPayResult =
+  | {
+      kind: 'ok'
+      body: string
+      contentType: string
+      merchantResponse: Response
+    }
+  | { kind: 'error'; response: Response }
+
+async function payMerchantAndGetBody(
+  env: Env,
+  ctx: ExecutionContext,
+  route: ReturnType<typeof getRouteByPublicPath> & {},
+  parsed: NonNullable<ReturnType<typeof parseTempoChallenge>>,
+  merchantUrl: string,
+  request: Request,
+  requestBody: string | undefined,
+): Promise<MerchantPayResult> {
+  // Dispatch on the merchant's ACTUAL intent (parsed.intent from the
+  // live 402), not the hardcoded route.upstreamPaymentMethod. See the
+  // long comment at the original inline site for why. Logic here is
+  // byte-identical to the pre-extract inline block from the Stellar
+  // path — the only thing we added is a different return shape.
+  const merchantIntent = parsed.intent.toLowerCase()
+  if (merchantIntent !== route.upstreamPaymentMethod.replace('tempo.', '')) {
+    console.log(
+      `[proxy] Note: route ${route.id} hardcoded as ${route.upstreamPaymentMethod} ` +
+        `but merchant returned intent=${merchantIntent}; following merchant.`,
+    )
+  }
+
+  let merchantResponse: Response
+  try {
+    if (merchantIntent === 'session') {
+      const sessionResult = await payMerchantSession(env, route.id, merchantUrl, {
+        method: request.method,
+        headers: forwardHeaders(request),
+        body: requestBody,
+      })
+      merchantResponse = sessionResult.response
+      if (merchantResponse.ok) {
+        const newCumulativeRaw = (
+          BigInt(sessionResult.channelBefore.cumulativeRaw) +
+          BigInt(parsed.request.amount)
+        ).toString()
+        ctx.waitUntil(
+          bumpCumulative(env, route.id, newCumulativeRaw).catch((err: any) => {
+            console.error(
+              `[proxy] post-2xx bumpCumulative failed for ${route.id}: ${err.message}`,
+            )
+          }),
+        )
+      }
+    } else {
+      merchantResponse = await payMerchant(env, merchantUrl, {
+        method: request.method,
+        headers: forwardHeaders(request),
+        body: requestBody,
+      })
+    }
+  } catch (err: any) {
+    if (err instanceof ChannelNotInstalledError) {
+      console.error(`[proxy] ${err.message}`)
+      return {
+        kind: 'error',
+        response: new Response(
+          JSON.stringify({
+            error: 'Router session channel not installed',
+            detail: err.message,
+            hint: 'Operator must run scripts/open-channel.ts before this merchant accepts session traffic.',
+          }),
+          {
+            status: 503,
+            headers: { 'Content-Type': 'application/json' },
+          },
+        ),
+      }
+    }
+    console.error(`[proxy] Tempo payment error: ${err.message}`)
+    return {
+      kind: 'error',
+      response: new Response(
+        JSON.stringify({
+          error: 'Merchant payment failed',
+          detail: err.message,
+        }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } },
+      ),
+    }
+  }
+
+  console.log(`[proxy] Merchant responded: ${merchantResponse.status}`)
+
+  if (!merchantResponse.ok) {
+    const errorBody = await merchantResponse.text()
+    console.error(`[proxy] Merchant error body: ${errorBody.substring(0, 200)}`)
+    return {
+      kind: 'error',
+      response: new Response(
+        JSON.stringify({
+          error: 'Merchant payment failed',
+          status: merchantResponse.status,
+          detail: errorBody.substring(0, 500),
+        }),
+        { status: 502, headers: { 'Content-Type': 'application/json' } },
+      ),
+    }
+  }
+
+  const contentType = merchantResponse.headers.get('content-type') || 'application/json'
+  const body = await merchantResponse.text()
+  return { kind: 'ok', body, contentType, merchantResponse }
+}
+
 export async function handleProxy(
   request: Request,
   env: Env,
@@ -419,8 +570,34 @@ export async function handleProxy(
   // the router itself issued via mppx. Any other credential type is
   // forwarded as-is and whatever economic exchange happens is between
   // the agent and the merchant.
-  const authHeader = request.headers.get('authorization')
-  const rawAuthKind = classifyAuth(authHeader)
+  // Credential header resolution. We accept two formats:
+  //
+  //   1. `Authorization: Payment <base64>` — the mppx and pre-x402
+  //      Stellar convention. This is what existing mppx clients
+  //      send, and what the router has always understood.
+  //
+  //   2. `Payment-Signature: <base64>` — x402 spec v2 header. Set
+  //      by @x402/core/client's `encodePaymentSignatureHeader()`.
+  //      No `Payment ` prefix; the header value is just the
+  //      base64-encoded JSON payload.
+  //
+  // When we find the x402 v2 header we synthesize a `Payment <b64>`
+  // string so the rest of the pipeline (classifyAuth,
+  // parseStellarX402Header, verifyStellarX402Inbound) stays on a
+  // single code path. No router code below this point has to know
+  // which header format the client used.
+  //
+  // See x402 core: node_modules/@x402/core/.../chunk-*/http/
+  // x402HTTPClient.mjs → encodePaymentSignatureHeader() which
+  // emits { "PAYMENT-SIGNATURE": <base64> } for V2 payloads.
+  let authHeader = request.headers.get('authorization')
+  if (!authHeader) {
+    const x402V2Header = request.headers.get('payment-signature')
+    if (x402V2Header) {
+      authHeader = `Payment ${x402V2Header.trim()}`
+    }
+  }
+  const rawAuthKind = classifyAuth(authHeader, env)
 
   // V2 §6-D2 query-param bootstrap: agents that want the stellar.channel
   // flow on their FIRST request (before any credential has been signed)
@@ -484,6 +661,203 @@ export async function handleProxy(
       headers: { 'Content-Type': 'application/json' },
     })
   }
+
+  // ---- stellar.x402 inbound dispatch branch -----------------------
+  // Handles agents carrying an @x402/core-compliant PaymentPayload
+  // whose payTo matches STELLAR_X402_PAY_TO and whose network is
+  // our STELLAR_NETWORK. Runs parallel to the mppx verify block
+  // below. See src/mpp/stellar-x402-server.ts for the full
+  // architecture; this branch is deliberately short — all the
+  // protocol work is delegated to the x402Facilitator singleton.
+  //
+  // Flow:
+  //   1. Parse merchant quote (Tempo 402, base units at 6 decimals),
+  //      convert to Stellar USDC 7-decimal base units (×10). The
+  //      agent signs at Stellar precision, so we must compare in
+  //      that space.
+  //   2. prepareStellarX402Inbound: decode payload, amount policy,
+  //      compute payload hash. Local-only — no RPC calls. Cheap.
+  //   3. checkAndReserveNonce: KV-level replay guard. MUST run
+  //      BEFORE the chain-side facilitator verify, because once a
+  //      payload's auth nonce is consumed on chain a replayed
+  //      simulate() fails with simulation_failed (which is the
+  //      wrong error to surface — the right one is "replay
+  //      detected").
+  //   4. verifyStellarX402WithFacilitator: facilitator.verify runs
+  //      Soroban simulate against the live network. RPC call. Only
+  //      reached for fresh payloads, never for replays.
+  //   5. Pay the downstream merchant via the shared
+  //      payMerchantAndGetBody helper (Tempo pool, unchanged).
+  //   6. ONLY on merchant 2xx: submit the agent's signed Soroban
+  //      invoke on chain. If this fails we log loudly but don't
+  //      hide the merchant response from the agent (they already
+  //      got served).
+  //   7. Return merchant body with X-Payment-* receipt headers.
+  //
+  // Merchant-decimals guard: Tempo USDC is 6 decimals; Stellar USDC
+  // is 7 decimals. We convert between them with a fixed ×10 factor.
+  // Any non-USDC-6 merchant would break this assumption — reject
+  // upfront.
+  if (authKind === 'stellar.x402') {
+    const merchantDecimalsX = typeof parsed.request.decimals === 'number'
+      ? parsed.request.decimals
+      : TEMPO_DEFAULT_DECIMALS
+    if (merchantDecimalsX !== 6) {
+      return new Response(JSON.stringify({
+        error: 'stellar.x402 branch only supports USDC-6 merchants',
+        detail: `merchant decimals=${merchantDecimalsX}, expected 6`,
+      }), { status: 502, headers: { 'Content-Type': 'application/json' } })
+    }
+    let merchantQuoteTempoBaseUnits: bigint
+    try {
+      merchantQuoteTempoBaseUnits = BigInt(parsed.request.amount)
+    } catch {
+      return new Response(JSON.stringify({
+        error: 'Merchant quote amount is not an integer base-unit string',
+        raw: parsed.request.amount,
+      }), { status: 502, headers: { 'Content-Type': 'application/json' } })
+    }
+    // Convert Tempo 6dp → Stellar 7dp (multiply by 10). This is the
+    // amount the agent should have signed at Stellar precision.
+    // Example: merchant quote $0.01 = 10_000 at 6dp = 100_000 at 7dp.
+    const merchantQuoteStellarBaseUnits = merchantQuoteTempoBaseUnits * 10n
+
+    if (!authHeader) {
+      // classifyAuth already guarantees this is non-null for
+      // stellar.x402, but make the invariant explicit for the type
+      // checker.
+      return new Response(JSON.stringify({ error: 'Internal: stellar.x402 without auth header' }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } })
+    }
+    // Phase A: local prepare (parse + amount policy + payload hash).
+    // No RPC calls. Cheap. Failures here mean the payload is
+    // structurally invalid or violates the overpay policy.
+    const prepared = await prepareStellarX402Inbound(
+      env,
+      authHeader,
+      merchantQuoteStellarBaseUnits,
+    )
+    if (!prepared.ok) {
+      console.log(`[proxy] stellar.x402 prepare rejected: ${prepared.reason}`)
+      return new Response(JSON.stringify({
+        error: 'stellar.x402 verification failed',
+        detail: prepared.reason,
+      }), {
+        status: prepared.statusCode,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // KV-level replay guard. MUST be checked BEFORE the chain-side
+    // facilitator verify — once a payload's auth nonce is consumed
+    // on chain, replaying it would fail with the chain-side
+    // `simulation_failed` error which is the wrong thing to surface
+    // to clients. KV reservation gives us a clean, fast,
+    // deterministic "replay detected" response.
+    const reserve = await checkAndReserveNonce(env, prepared.payloadHash)
+    if (!reserve.ok) {
+      console.log(
+        `[proxy] stellar.x402 replay rejected for payloadHash=${prepared.payloadHash}`,
+      )
+      return new Response(JSON.stringify({
+        error: 'stellar.x402 replay detected',
+        detail: 'This signed payload was already submitted to this router.',
+      }), { status: 402, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    // Phase B: chain-side verify via facilitator. Soroban simulate
+    // call. Only fresh payloads reach this step.
+    const facilitatorVerify = await verifyStellarX402WithFacilitator(
+      env,
+      prepared.payload,
+      prepared.requirements,
+    )
+    if (!facilitatorVerify.ok) {
+      console.log(
+        `[proxy] stellar.x402 facilitator verify rejected: ${facilitatorVerify.reason}`,
+      )
+      // Release the KV reservation — this payload didn't actually
+      // commit anything (chain rejected it). The agent might want
+      // to retry with a fresh signature.
+      ctx.waitUntil(reserve.release())
+      return new Response(JSON.stringify({
+        error: 'stellar.x402 verification failed',
+        detail: facilitatorVerify.reason,
+      }), {
+        status: facilitatorVerify.statusCode,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    // `verify` is the variable name used by the rest of this branch
+    // for backward-compatible logging — alias to the merged result.
+    const verify = prepared
+
+    console.log(
+      `[proxy] stellar.x402 verified for route ${route.id} payloadHash=${verify.payloadHash}`,
+    )
+
+    const payResult = await payMerchantAndGetBody(
+      env,
+      ctx,
+      route,
+      parsed,
+      merchantUrl,
+      request,
+      requestBody,
+    )
+    if (payResult.kind === 'error') {
+      // Merchant failed — release the nonce so the agent can retry
+      // with the same payload (they haven't been charged yet because
+      // we haven't submitted the settle tx).
+      ctx.waitUntil(reserve.release())
+      return payResult.response
+    }
+
+    // Merchant 2xx — now submit the agent's signed Soroban invoke
+    // on chain. Failures here are logged loudly but do NOT hide
+    // merchant content from the agent: they already got served,
+    // router has committed to the cost, and we don't want to
+    // confuse them with a 500 after a successful upstream call.
+    const settle = await settleStellarX402(env, verify.payload, verify.requirements)
+    if (!settle.success) {
+      console.error(
+        `[proxy] stellar.x402 SETTLE FAILED after merchant 2xx for ${route.id}: ` +
+          `${settle.errorReason ?? ''} ${settle.errorMessage ?? ''}`,
+      )
+      // Do NOT release the nonce reservation — we DID verify and we
+      // DID pay the merchant, so the agent cannot safely re-use the
+      // same authorization. The KV entry expires on its TTL.
+    } else {
+      console.log(
+        `[proxy] stellar.x402 settled for ${route.id}: tx=${settle.transaction ?? 'n/a'}`,
+      )
+    }
+
+    // Idempotency cache + payment log, same shape as the Stellar mppx path.
+    ctx.waitUntil((async () => {
+      console.log(
+        `[payment] route=${route.id} method=stellar.x402 merchant=${merchantHost} upstreamPath=${upstreamPath}`,
+      )
+      if (requestId) {
+        await env.MPP_STORE.put(`idempotency:${requestId}`, payResult.body, { expirationTtl: 86400 })
+      }
+    })())
+
+    const headers: Record<string, string> = {
+      'Content-Type': payResult.contentType,
+    }
+    if (settle.transaction) headers['X-Payment-Tx'] = settle.transaction
+    headers['X-Payment-Method'] = 'stellar.x402'
+    if (!settle.success) {
+      headers['X-Payment-Settle-Status'] = 'failed'
+      if (settle.errorReason) headers['X-Payment-Settle-Reason'] = settle.errorReason
+    } else {
+      headers['X-Payment-Settle-Status'] = 'settled'
+    }
+    return new Response(payResult.body, { status: 200, headers })
+  }
+  // ---- end stellar.x402 branch ------------------------------------
 
   // 2. Run the request through the Stellar mppx handler. This is the
   // critical verification step: without a valid, HMAC-bound credential
@@ -708,6 +1082,47 @@ export async function handleProxy(
     // Durable Object. For now, the mppx store is the authoritative
     // replay guard and the window is small enough that the economic
     // loss is bounded to a single concurrent duplicate.
+    //
+    // Dual-format 402 injection: when X402_ENABLED, we add a
+    // standard x402 `Payment-Required` header to the same response
+    // so vanilla x402 clients (which call
+    // `x402HTTPClient.getPaymentRequiredResponse`) can read the
+    // challenge without parsing the mppx-flavored
+    // `WWW-Authenticate` format. mppx clients ignore the new
+    // header and keep using `WWW-Authenticate` exactly as before.
+    // The merchant amount comes from `parsed.request.amount`
+    // (Tempo USDC 6dp) and gets converted to Stellar 7dp inside
+    // `buildX402PaymentRequiredHeader` (×10).
+    //
+    // This injection only fires on the FIRST probe (no credential
+    // / failed credential). Subsequent retries with a valid
+    // credential never reach this code.
+    let merchantQuoteTempo: bigint | null = null
+    try {
+      merchantQuoteTempo = BigInt(parsed.request.amount)
+    } catch {
+      merchantQuoteTempo = null
+    }
+    if (merchantQuoteTempo !== null) {
+      const x402HeaderValue = buildX402PaymentRequiredHeader(
+        env,
+        merchantQuoteTempo,
+        request.url,
+      )
+      if (x402HeaderValue) {
+        // Clone the mppx Response so we can add headers without
+        // mutating the original (which is owned by the mppx
+        // verify result and may be referenced elsewhere).
+        const mppxChallenge = verifyResult.challenge
+        const newHeaders = new Headers(mppxChallenge.headers)
+        newHeaders.set('Payment-Required', x402HeaderValue)
+        return new Response(mppxChallenge.body, {
+          status: mppxChallenge.status,
+          statusText: mppxChallenge.statusText,
+          headers: newHeaders,
+        })
+      }
+    }
     return verifyResult.challenge
   }
 
@@ -740,102 +1155,17 @@ export async function handleProxy(
   // clear message so the operator notices and runs
   // `scripts/admin/open-tempo-channel.ts` before agent traffic
   // builds up.
-  const merchantIntent = parsed.intent.toLowerCase()
-  if (merchantIntent !== route.upstreamPaymentMethod.replace('tempo.', '')) {
-    console.log(
-      `[proxy] Note: route ${route.id} hardcoded as ${route.upstreamPaymentMethod} ` +
-        `but merchant returned intent=${merchantIntent}; following merchant.`,
-    )
-  }
-  let merchantResponse: Response
-  try {
-    if (merchantIntent === 'session') {
-      const sessionResult = await payMerchantSession(env, route.id, merchantUrl, {
-        method: request.method,
-        headers: forwardHeaders(request),
-        body: requestBody,
-      })
-      merchantResponse = sessionResult.response
-      // §5 Rule 2: bump KV cumulative ONLY after a 2xx upstream
-      // response. The `onChannelUpdate` callback inside
-      // payMerchantSession also bumps KV as a safety net — the
-      // monotone max() in bumpCumulative makes the second write
-      // idempotent, so double-bumping is a no-op, and the explicit
-      // post-2xx bump here is the authoritative commit point.
-      //
-      // On non-2xx we intentionally do NOT call bumpCumulative
-      // from the proxy side, but if mppx already fired
-      // onChannelUpdate during sign then KV may already be ahead.
-      // That's an accepted residual window — see the
-      // "Residual window" note in §5.
-      if (merchantResponse.ok) {
-        const newCumulativeRaw = (
-          BigInt(sessionResult.channelBefore.cumulativeRaw) +
-          BigInt(parsed.request.amount)
-        ).toString()
-        // Fire-and-forget: if the bump fails (e.g. KV throttling),
-        // onChannelUpdate has almost certainly already done the
-        // same write and the next request will read the right
-        // high watermark anyway. Don't fail the agent's response
-        // over a bookkeeping miss.
-        ctx.waitUntil(
-          bumpCumulative(env, route.id, newCumulativeRaw).catch((err: any) => {
-            console.error(
-              `[proxy] post-2xx bumpCumulative failed for ${route.id}: ${err.message}`,
-            )
-          }),
-        )
-      }
-    } else {
-      merchantResponse = await payMerchant(env, merchantUrl, {
-        method: request.method,
-        headers: forwardHeaders(request),
-        body: requestBody,
-      })
-    }
-  } catch (err: any) {
-    if (err instanceof ChannelNotInstalledError) {
-      console.error(`[proxy] ${err.message}`)
-      return new Response(
-        JSON.stringify({
-          error: 'Router session channel not installed',
-          detail: err.message,
-          hint: 'Operator must run scripts/open-channel.ts before this merchant accepts session traffic.',
-        }),
-        {
-          status: 503,
-          headers: { 'Content-Type': 'application/json' },
-        },
-      )
-    }
-    console.error(`[proxy] Tempo payment error: ${err.message}`)
-    return new Response(JSON.stringify({
-      error: 'Merchant payment failed',
-      detail: err.message,
-    }), {
-      status: 502,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  }
-
-  console.log(`[proxy] Merchant responded: ${merchantResponse.status}`)
-
-  if (!merchantResponse.ok) {
-    const errorBody = await merchantResponse.text()
-    console.error(`[proxy] Merchant error body: ${errorBody.substring(0, 200)}`)
-    return new Response(JSON.stringify({
-      error: 'Merchant payment failed',
-      status: merchantResponse.status,
-      detail: errorBody.substring(0, 500),
-    }), {
-      status: 502,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  }
-
-  // 5. Return merchant content to the agent with a Payment-Receipt header.
-  const contentType = merchantResponse.headers.get('content-type') || 'application/json'
-  const body = await merchantResponse.text()
+  const payResult = await payMerchantAndGetBody(
+    env,
+    ctx,
+    route,
+    parsed,
+    merchantUrl,
+    request,
+    requestBody,
+  )
+  if (payResult.kind === 'error') return payResult.response
+  const { body, contentType } = payResult
 
   // Async tasks: broadcast Stellar tx (handled by mppx store), log, cache idempotency
   ctx.waitUntil((async () => {
