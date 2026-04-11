@@ -19,6 +19,16 @@ TEMPO_RPC_URL = "https://rpc.tempo.xyz"
 OPTIMISTIC_THRESHOLD = "0.05"
 RATE_LIMIT_MAX = "10"
 
+# 2026-04-11 fixed XLM/USD rate, operator-updated. Sets the conversion
+# ratio for XLM-denominated Stellar channels so the router stays solvent
+# in its cross-asset broker role: agent pays N/XLM_USD_RATE XLM on the
+# Stellar side, router pays N USDC on the Tempo side, broker net ≈ 0.
+# Update this whenever XLM price moves materially (>5% in either
+# direction) and `wrangler deploy` to roll forward. Only XLM channels
+# are affected — USDC SAC channels (like agent2) ignore this value.
+# See internaldocs/v2-todo.md#c and v2-session-session-done.md §5.1.
+XLM_USD_RATE = "0.1533"
+
 # Secrets (set via: wrangler secret put <NAME>)
 #
 # STELLAR_ROUTER_PUBLIC    — G... Router pool address (receives agent USDC)

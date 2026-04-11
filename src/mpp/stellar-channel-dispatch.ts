@@ -213,6 +213,14 @@ export async function resolveStellarChannelMppx(
   mppx: ReturnType<typeof createStellarChannelPayment>
   channelContract: string
   agentAccount: string
+  /**
+   * Stellar SAC contract address of the asset the channel was opened
+   * against (native XLM SAC or Circle USDC SAC). Surfaced so the proxy
+   * can decide whether to apply the XLM/USD FX conversion at
+   * voucher-signing time. See `XLM_USD_RATE` in wrangler.toml and
+   * internaldocs/v2-todo.md#c.
+   */
+  channelCurrency: string
 }> {
   const agentAccount = extractAgentAccount(authHeader) ?? agentHint ?? null
   if (!agentAccount) {
@@ -246,5 +254,6 @@ export async function resolveStellarChannelMppx(
     mppx,
     channelContract,
     agentAccount: state.agentAccount,
+    channelCurrency: state.currency,
   }
 }

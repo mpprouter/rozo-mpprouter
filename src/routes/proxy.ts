@@ -172,6 +172,104 @@ const TEMPO_DEFAULT_DECIMALS = 6
  * result loses its decimal point entirely. This matches what the Stellar
  * charge method's toBaseUnits() expects on the way back in.
  */
+/**
+ * Stellar mainnet native XLM Soroban Asset Contract (SAC) address.
+ * Soroban contracts refer to native XLM via this specific SAC instance,
+ * not the string "native" (that would be a Stellar account alias).
+ *
+ * Verify with: `stellar contract id asset --asset native --network mainnet`
+ *
+ * Used by `convertUsdcToXlm` below to decide whether a Stellar channel
+ * is XLM-denominated and therefore needs the FX conversion. USDC SAC
+ * channels (e.g. agent2's CAYS2LBU…) bypass the conversion entirely.
+ */
+export const STELLAR_NATIVE_XLM_SAC = 'CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA'
+
+/**
+ * Convert a USDC-denominated decimal amount string into the equivalent
+ * XLM amount string at a fixed XLM/USD rate, with rounding UP at the
+ * Stellar USDC precision (7 decimals) so the router never undercharges
+ * the agent on a sub-stroop fractional remainder.
+ *
+ * Why round UP, not nearest:
+ *   The router is the broker. Every voucher is a promise that the agent
+ *   will eventually pay this much XLM. If we rounded down, the agent
+ *   would pay strictly less XLM than the merchant's USDC cost, and
+ *   over many requests the router would slowly bleed value (the FX
+ *   gap from internaldocs/v2-session-session-done.md §5.1 in
+ *   miniature). Rounding up errs in the router's favor by at most one
+ *   stroop (1e-7 XLM ≈ 1e-8 USD at 0.11 rate), well below the
+ *   per-request precision the agent can observe. Document this
+ *   prominently because reversing the rounding direction would be a
+ *   silent broker loss.
+ *
+ * Examples (rate=0.11):
+ *   convertUsdcToXlm("0.00075", 0.11) === "0.0068182"
+ *     # raw: 0.00075/0.11 = 0.006818181818..., rounded up to 7dp.
+ *   convertUsdcToXlm("0.000001", 0.11) === "0.0000091"
+ *     # raw: 9.0909e-6, rounded up.
+ *   convertUsdcToXlm("0", 0.11) === "0"
+ *
+ * @param usdcAmount  decimal string (e.g. "0.00075"), already normalized
+ *                    by baseUnitsToDecimalString from merchant base units
+ * @param rate        XLM/USD rate as a positive finite number, e.g. 0.11
+ *                    means 1 XLM = $0.11
+ * @returns           decimal string suitable for the Stellar charge/channel
+ *                    `amount` field at 7-decimal precision
+ *
+ * @throws if rate <= 0, not finite, or NaN
+ * @throws if usdcAmount is not a valid decimal string
+ */
+export function convertUsdcToXlm(usdcAmount: string, rate: number): string {
+  if (!Number.isFinite(rate) || rate <= 0) {
+    throw new Error(`convertUsdcToXlm: rate must be a positive finite number, got ${rate}`)
+  }
+  if (!/^-?\d+(\.\d+)?$/.test(usdcAmount)) {
+    throw new Error(`convertUsdcToXlm: usdcAmount must be a decimal string, got ${usdcAmount}`)
+  }
+  // Use BigInt to do the math at 7-decimal precision exactly. We avoid
+  // Number/parseFloat because USDC base unit is 1e-7 XLM and a naive
+  // float multiply at $1+ amounts would silently lose the bottom
+  // stroop. Strategy:
+  //   1. parse usdcAmount into base units at 7 decimals (Stellar precision)
+  //   2. compute baseUsdc / rate as a rational, scaled to 7 decimals
+  //   3. round UP and emit as a decimal string via baseUnitsToDecimalString
+  //
+  // For step 2 we represent rate as a scaled BigInt: rate * 1e9 rounded
+  // to nearest. 1e9 of headroom keeps us well under JS Number precision
+  // (rate is ≤ ~10 USD/XLM in any realistic scenario) and gives
+  // sub-stroop accuracy in the quotient.
+  const STELLAR_DECIMALS = 7
+  const RATE_SCALE = 1_000_000_000 // 1e9
+  // Convert usdc decimal string to base units at STELLAR_DECIMALS.
+  const negative = usdcAmount.startsWith('-')
+  const unsigned = negative ? usdcAmount.slice(1) : usdcAmount
+  const dotIdx = unsigned.indexOf('.')
+  let intPart = dotIdx === -1 ? unsigned : unsigned.slice(0, dotIdx)
+  let fracPart = dotIdx === -1 ? '' : unsigned.slice(dotIdx + 1)
+  if (fracPart.length > STELLAR_DECIMALS) {
+    throw new Error(
+      `convertUsdcToXlm: usdcAmount has more than ${STELLAR_DECIMALS} fractional digits (${usdcAmount}); ` +
+        `cannot represent losslessly at Stellar precision`,
+    )
+  }
+  fracPart = fracPart.padEnd(STELLAR_DECIMALS, '0')
+  const usdcBaseUnits = BigInt(intPart || '0') * BigInt(10 ** STELLAR_DECIMALS) + BigInt(fracPart || '0')
+  if (usdcBaseUnits === 0n) return '0'
+  const rateScaled = BigInt(Math.round(rate * RATE_SCALE))
+  if (rateScaled <= 0n) {
+    throw new Error(`convertUsdcToXlm: scaled rate underflowed to 0 (rate=${rate})`)
+  }
+  // xlmBaseUnits = usdcBaseUnits * RATE_SCALE / rateScaled, rounded UP
+  const numerator = usdcBaseUnits * BigInt(RATE_SCALE)
+  let xlmBaseUnits = numerator / rateScaled
+  if (numerator % rateScaled !== 0n) {
+    xlmBaseUnits += 1n // round up
+  }
+  const result = baseUnitsToDecimalString(xlmBaseUnits.toString(), STELLAR_DECIMALS)
+  return negative ? `-${result}` : result
+}
+
 export function baseUnitsToDecimalString(amount: string, decimals: number): string {
   if (!/^-?\d+$/.test(amount)) {
     throw new Error(`baseUnitsToDecimalString: amount must be integer string, got ${amount}`)
@@ -368,6 +466,7 @@ export async function handleProxy(
   //     internaldocs/v2-stellar-channel-notes.md §N2.
   let mppx: Awaited<ReturnType<typeof resolveStellarChannelMppx>>['mppx']
   let channelContractForVerify: string | undefined
+  let channelCurrencyForVerify: string | undefined
   try {
     if (authKind === 'stellar.channel') {
       // Pass agentHint so the first-request bootstrap path can
@@ -378,8 +477,9 @@ export async function handleProxy(
       const resolved = await resolveStellarChannelMppx(env, authHeader, agentHint)
       mppx = resolved.mppx as any
       channelContractForVerify = resolved.channelContract
+      channelCurrencyForVerify = resolved.channelCurrency
       console.log(
-        `[proxy] Stellar channel dispatch for ${resolved.channelContract} (agent=${resolved.agentAccount})`,
+        `[proxy] Stellar channel dispatch for ${resolved.channelContract} (agent=${resolved.agentAccount}, currency=${resolved.channelCurrency})`,
       )
     } else {
       mppx = createStellarPayment(env) as any
@@ -492,8 +592,43 @@ export async function handleProxy(
       if (!channelContractForVerify) {
         throw new Error('Internal: stellar.channel authKind without resolved contract')
       }
+      // FX conversion: if the channel was opened against native XLM
+      // (instead of USDC SAC), the merchant's USDC-denominated
+      // amount has to be re-priced into XLM at a fixed rate before
+      // the agent signs a voucher. Otherwise the router silently
+      // bleeds value as a broker because 1 stroop XLM ≠ 1 base unit
+      // USDC. USDC SAC channels (e.g. agent2's CAYS2LBU…) need no
+      // conversion. See internaldocs/v2-todo.md#c and
+      // v2-session-session-done.md §5.1 for the broker math.
+      let channelAmount = stellarAmount
+      if (channelCurrencyForVerify === STELLAR_NATIVE_XLM_SAC) {
+        const rate = parseFloat(env.XLM_USD_RATE)
+        if (!Number.isFinite(rate) || rate <= 0) {
+          return new Response(JSON.stringify({
+            error: 'XLM_USD_RATE misconfigured',
+            detail: `Worker env XLM_USD_RATE must be a positive number, got ${env.XLM_USD_RATE}`,
+          }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        try {
+          channelAmount = convertUsdcToXlm(stellarAmount, rate)
+        } catch (err: any) {
+          return new Response(JSON.stringify({
+            error: 'Could not convert USDC amount to XLM',
+            detail: err.message,
+          }), {
+            status: 502,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        console.log(
+          `[proxy] XLM channel: converted ${stellarAmount} USDC -> ${channelAmount} XLM at rate ${rate}`,
+        )
+      }
       verifyResult = await (mppx as any)['stellar/channel']({
-        amount: stellarAmount,
+        amount: channelAmount,
         channel: channelContractForVerify,
         methodDetails: {
           reference: parsed.id,

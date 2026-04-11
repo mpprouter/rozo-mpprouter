@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { baseUnitsToDecimalString } from '../src/routes/proxy'
+import { baseUnitsToDecimalString, convertUsdcToXlm } from '../src/routes/proxy'
 
 describe('baseUnitsToDecimalString', () => {
   it('converts $0.01 at 6 decimals (the real-world parallel_search case)', () => {
@@ -85,5 +85,69 @@ describe('baseUnitsToDecimalString', () => {
     // Not expected in the production path, but the helper is pure and
     // should not silently corrupt a negative value.
     expect(baseUnitsToDecimalString('-10000', 6)).toBe('-0.01')
+  })
+})
+
+/**
+ * V2.1 FX gap fix: agents on XLM-denominated channels (agent1, agent3)
+ * pay XLM for merchant USDC charges. The router converts at a fixed
+ * XLM/USD rate stored in env. Rounding is UP at 7dp so the router
+ * never silently bleeds value as a broker.
+ *
+ * See internaldocs/v2-todo.md#c and the convertUsdcToXlm jsdoc for
+ * the rounding-direction rationale.
+ */
+describe('convertUsdcToXlm', () => {
+  it('converts the canonical openrouter quantum at rate 0.1533', () => {
+    // 0.00075 USDC at 0.1533 USD/XLM = 0.0048923677756... XLM
+    // Rounded UP at 7 decimals = 0.0048924
+    expect(convertUsdcToXlm('0.00075', 0.1533)).toBe('0.0048924')
+  })
+
+  it('converts the canonical openrouter quantum at the legacy 0.11 rate', () => {
+    // 0.00075 / 0.11 = 0.006818181818... → up to 7dp = 0.0068182
+    // This locks the doc example in v2-todo.md#c so the doc and code
+    // do not drift.
+    expect(convertUsdcToXlm('0.00075', 0.11)).toBe('0.0068182')
+  })
+
+  it('rounds UP one stroop on inexact quotients (broker safety)', () => {
+    // 1 USDC base unit (0.0000001 USDC) / 0.1533
+    // = 6.5231e-7 in XLM-base-unit terms → 7 base units after round-up
+    // = 0.0000007 XLM
+    expect(convertUsdcToXlm('0.0000001', 0.1533)).toBe('0.0000007')
+  })
+
+  it('preserves zero through the conversion', () => {
+    expect(convertUsdcToXlm('0', 0.1533)).toBe('0')
+    expect(convertUsdcToXlm('0.0000000', 0.1533)).toBe('0')
+  })
+
+  it('handles whole-USDC amounts at rate 0.1533', () => {
+    // 1 USDC / 0.1533 = 6.522505... XLM → up to 7dp = 6.5230594
+    // 1e7 / 153300000 = 0.06523... wait let me recompute via base units:
+    // usdcBase = 10000000 (1 USDC at 7dp)
+    // numerator = 1e16
+    // xlm base = 1e16 / 153300000 = 65,231,572.7332... → up = 65231573
+    // = 6.5231573 XLM
+    expect(convertUsdcToXlm('1', 0.1533)).toBe('6.5231573')
+  })
+
+  it('rejects non-positive or non-finite rates', () => {
+    expect(() => convertUsdcToXlm('0.001', 0)).toThrow()
+    expect(() => convertUsdcToXlm('0.001', -0.1)).toThrow()
+    expect(() => convertUsdcToXlm('0.001', NaN)).toThrow()
+    expect(() => convertUsdcToXlm('0.001', Infinity)).toThrow()
+  })
+
+  it('rejects malformed amount strings', () => {
+    expect(() => convertUsdcToXlm('abc', 0.1533)).toThrow()
+    expect(() => convertUsdcToXlm('', 0.1533)).toThrow()
+    expect(() => convertUsdcToXlm('0.0.1', 0.1533)).toThrow()
+  })
+
+  it('rejects amounts with more fractional precision than Stellar supports', () => {
+    // 8 fractional digits would lose data at the 7-decimal boundary.
+    expect(() => convertUsdcToXlm('0.00000001', 0.1533)).toThrow()
   })
 })

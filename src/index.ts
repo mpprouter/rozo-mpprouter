@@ -51,6 +51,12 @@ export interface Env {
   // createStellarPayment() or delete it before assuming any behavior.
   OPTIMISTIC_THRESHOLD: string
   RATE_LIMIT_MAX: string
+
+  // Fixed XLM/USD rate used to convert merchant USDC amounts into XLM
+  // for XLM-denominated Stellar channels. See wrangler.toml for the
+  // operator update policy and internaldocs/v2-todo.md#c for context.
+  // Stored as a string so wrangler.toml can carry it; parsed at use site.
+  XLM_USD_RATE: string
 }
 
 export default {
