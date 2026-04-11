@@ -110,7 +110,18 @@ function kvGet(key: string): string | null {
     return out.length > 0 ? out : null
   } catch (err: any) {
     const stderr = err.stderr?.toString?.() ?? ''
-    if (stderr.includes('not found') || stderr.includes('Value not found')) {
+    // Multiple shapes for "key doesn't exist":
+    //   - Older wrangler prints "Value not found" to stderr
+    //   - Newer wrangler proxies a Cloudflare API 404 with the
+    //     string "404: Not Found" embedded in the error message
+    //   - We also accept a generic "not found" substring as a
+    //     belt-and-suspenders fallback
+    if (
+      stderr.includes('Value not found') ||
+      stderr.includes('404: Not Found') ||
+      stderr.includes('not found') ||
+      err.message?.includes('404')
+    ) {
       return null
     }
     throw new Error(`wrangler kv get failed for ${key}: ${err.message}\n${stderr}`)
@@ -341,18 +352,73 @@ async function main() {
   }
   console.log('')
 
-  // Stellar channels — §6 stretch, not yet deployed
+  // Stellar channels — V2 §6. Reads from BOTH the operator
+  // sidecar metadata (`stellarChannel:*`) and mppx's own
+  // cumulative tracking (`stellar:channel:cumulative:*`) so the
+  // operator sees one row per channel with {deposit, cumulative,
+  // remaining}. The two prefixes deliberately don't collide —
+  // see v2-stellar-channel-notes.md §N4.
   console.log('--- Stellar channels (agent → router) ---')
-  const stellarKeys = kvList('stellarChannel:')
-  if (stellarKeys.length === 0) {
-    console.log('  (V2 §6 not yet deployed — none expected)')
+  const stellarMetaKeys = kvList('stellarChannel:')
+  if (stellarMetaKeys.length === 0) {
+    console.log('  (no channels registered)')
   } else {
-    // Forward-compat: if anyone hand-writes a stellarChannel entry
-    // before §6 ships, show it.
-    for (const key of stellarKeys) {
-      const raw = kvGet(key) ?? '(empty)'
-      console.log(`  ${key}: ${raw.slice(0, 100)}`)
+    console.log(
+      '  agent G...            channel C...      deposit     cumulative  remaining',
+    )
+    let totalDepositRaw = 0n
+    let totalCumulativeRaw = 0n
+    for (const key of stellarMetaKeys.sort()) {
+      const channelContract = key.slice('stellarChannel:'.length)
+      const raw = kvGet(key)
+      if (!raw) {
+        console.log(`  (empty value for ${channelContract})`)
+        continue
+      }
+      type StellarState = {
+        channelContract: string
+        commitmentKey: string
+        agentAccount: string
+        currency: string
+        network: string
+        depositRaw: string
+        openedAt: string
+      }
+      let state: StellarState
+      try {
+        state = JSON.parse(raw) as StellarState
+      } catch (err: any) {
+        console.log(`  ${channelContract} (parse error: ${err.message})`)
+        continue
+      }
+      // Cumulative lives under mppx's own key. Read it separately.
+      // If absent (no vouchers yet), treat as 0.
+      const cumulativeRaw = kvGet(`stellar:channel:cumulative:${channelContract}`)
+      let cumulative = 0n
+      if (cumulativeRaw) {
+        try {
+          const parsed = JSON.parse(cumulativeRaw) as { amount?: string }
+          if (parsed.amount) cumulative = BigInt(parsed.amount)
+        } catch {
+          // corrupt, show as 0
+        }
+      }
+      const deposit = BigInt(state.depositRaw)
+      const remaining = deposit - cumulative
+      totalDepositRaw += deposit
+      totalCumulativeRaw += cumulative
+      // Stellar native XLM and USDC SAC both use 7 decimals.
+      const fmtLen = 10
+      console.log(
+        `  ${shortHex(state.agentAccount, 8, 4).padEnd(20)} ${shortHex(state.channelContract, 8, 4).padEnd(14)} ` +
+          `${formatUnits(deposit, 7).padStart(fmtLen)}  ${formatUnits(cumulative, 7).padStart(fmtLen)}  ` +
+          `${formatUnits(remaining, 7).padStart(fmtLen)}`,
+      )
     }
+    console.log(
+      `  ${'TOTAL'.padEnd(20)} ${`${stellarMetaKeys.length} channels`.padEnd(14)} ` +
+        `${formatUnits(totalDepositRaw, 7).padStart(10)}  ${formatUnits(totalCumulativeRaw, 7).padStart(10)}`,
+    )
   }
   console.log('')
 
@@ -363,7 +429,7 @@ async function main() {
   console.log(`  Stellar pool:          ${stellarUsdc}`)
   console.log(`  Tempo pool:            ${tempoUsdc}`)
   console.log(`  Tempo channels open:   ${tempoKeys.length}`)
-  console.log(`  Stellar channels open: ${stellarKeys.length}`)
+  console.log(`  Stellar channels open: ${stellarMetaKeys.length}`)
   console.log('')
   console.log('(Net position math lands in V2.1 when we parse the pool')
   console.log(' strings back to bigint. For now: eyeball that pool +')

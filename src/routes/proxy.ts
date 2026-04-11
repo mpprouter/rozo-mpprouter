@@ -26,6 +26,10 @@ import {
   getRouterStellarAddress,
   getStellarUsdcSac,
 } from '../mpp/stellar-server'
+import {
+  resolveStellarChannelMppx,
+  StellarChannelNotRegisteredError,
+} from '../mpp/stellar-channel-dispatch'
 import type { Env } from '../index'
 
 /**
@@ -66,48 +70,72 @@ function forwardHeaders(
 }
 
 /**
- * Inspect an Authorization header and decide whether it is a Stellar MPP
- * credential that we should verify + represent, or some other auth scheme
- * (Bearer, Basic, EVM x402, SIWX, etc.) that we should forward untouched.
+ * Inspect an Authorization header and decide how the router should
+ * treat the credential.
  *
  * Returns:
- *   - 'stellar'  → agent presented an MPP Payment credential with
- *                  challenge.method === "stellar". Run mppx verification
- *                  and pay the Tempo merchant on the agent's behalf.
- *   - 'passthrough' → anything else. Forward the whole request including
- *                     Authorization to the merchant as-is. The router
- *                     does not touch this payment flow.
- *   - 'none'     → no Authorization header. Fall through to the default
- *                  Stellar 402 challenge flow so naive Stellar agents
- *                  learn what to pay.
+ *   - 'stellar.charge'  → agent presented a Stellar MPP credential
+ *                         with intent="charge" (V1, single-shot USDC
+ *                         payment). Run the charge verify path and
+ *                         pay the Tempo merchant on the agent's
+ *                         behalf.
+ *   - 'stellar.channel' → agent presented a Stellar MPP credential
+ *                         with intent="channel" (V2 §6, long-lived
+ *                         payment channel voucher). Run the channel
+ *                         dispatch path which looks up the
+ *                         channel's sidecar metadata in KV and
+ *                         builds a per-request Mppx instance.
+ *   - 'passthrough'     → anything else — non-Stellar MPP, Bearer,
+ *                         Basic, EVM x402, SIWX, unrelated Payment
+ *                         schemes. Forward untouched; the router
+ *                         does not settle these.
+ *   - 'none'            → no Authorization header. Fall through to
+ *                         the default Stellar 402 challenge flow so
+ *                         naive Stellar agents learn what to pay.
  *
- * IMPORTANT: a prior version of this function parsed the header as if it
- * contained RFC 9110 auth-params (`Payment id="...", method="stellar", …`).
- * That is the `WWW-Authenticate` serialization format, not the
- * `Authorization` format. Real mppx Credentials are serialized as a
- * single base64url-encoded JSON blob after the `Payment ` prefix — see
- * mppx/src/Credential.ts:131. The old regex never matched any real
- * credential and therefore routed every Stellar payment through the
- * passthrough path, which bypassed verification entirely. Always parse
- * with `Credential.deserialize()` — mppx owns the wire format.
+ * History: V1 returned just `'stellar'` without distinguishing
+ * intent. V2 splits `'stellar'` into `'stellar.charge'` vs
+ * `'stellar.channel'` so the proxy can route each to the right
+ * verify handler. Critically, both intents carry
+ * `challenge.method === "stellar"`, so the intent field is the
+ * ONLY way to tell them apart from the credential wire format.
+ *
+ * IMPORTANT: a pre-V1 draft of this function parsed the header as
+ * if it contained RFC 9110 auth-params (`Payment id="...",
+ * method="stellar", ...`). That is the `WWW-Authenticate`
+ * serialization format, not the `Authorization` format. Real mppx
+ * Credentials are serialized as a single base64url-encoded JSON
+ * blob after the `Payment ` prefix — see
+ * mppx/src/Credential.ts:131. Always parse with
+ * `Credential.deserialize()` — mppx owns the wire format.
  */
-function classifyAuth(authHeader: string | null): 'stellar' | 'passthrough' | 'none' {
+type AuthKind = 'stellar.charge' | 'stellar.channel' | 'passthrough' | 'none'
+
+function classifyAuth(authHeader: string | null): AuthKind {
   if (!authHeader) return 'none'
   const trimmed = authHeader.trim()
   // Payment scheme uses the MPP "Payment" prefix. Anything else is
   // definitely not a Stellar MPP credential — forward untouched.
   if (!/^Payment\s+/i.test(trimmed)) return 'passthrough'
   // Try to parse as a real mppx Credential. If it parses, the nested
-  // `challenge.method` field tells us the payment method unambiguously.
+  // `challenge.method` field tells us the payment method unambiguously
+  // and `challenge.intent` tells us whether it's charge or channel.
   // If it doesn't parse, it's some non-mppx `Payment ...` scheme that
   // happens to share the prefix (e.g. an unrelated x402 dialect) — hand
   // it back to the merchant to interpret.
   try {
     const credential = Credential.deserialize(trimmed) as {
-      challenge?: { method?: string }
+      challenge?: { method?: string; intent?: string }
     }
     const method = credential.challenge?.method?.toLowerCase()
-    return method === 'stellar' ? 'stellar' : 'passthrough'
+    if (method !== 'stellar') return 'passthrough'
+    const intent = credential.challenge?.intent?.toLowerCase()
+    if (intent === 'channel') return 'stellar.channel'
+    // Default for stellar.* credentials is charge. This matches V1
+    // behavior: any stellar credential without an explicit
+    // 'channel' intent takes the charge path. New intents added by
+    // future mppx versions will need explicit cases here.
+    return 'stellar.charge'
   } catch {
     return 'passthrough'
   }
@@ -306,12 +334,52 @@ export async function handleProxy(
 
   // 2. Run the request through the Stellar mppx handler. This is the
   // critical verification step: without a valid, HMAC-bound credential
-  // whose echoed challenge matches the same amount/currency/recipient,
-  // mppx returns a 402 challenge here and we never reach payMerchant.
-  let mppx: ReturnType<typeof createStellarPayment>
+  // whose echoed challenge matches the same amount/currency/recipient
+  // (charge) or channel (channel), mppx returns a 402 challenge here
+  // and we never reach payMerchant.
+  //
+  // Dispatch branches on authKind:
+  //   - 'stellar.charge' / 'none': use the shared-instance charge Mppx
+  //     from createStellarPayment(env). This is the V1 path, unchanged.
+  //   - 'stellar.channel': use a per-request Mppx from
+  //     resolveStellarChannelMppx() which reads the channel metadata
+  //     from KV (`stellarChannel:<contract>`) and constructs a fresh
+  //     Mppx instance bound to that specific channel + its
+  //     commitmentKey. See src/mpp/stellar-channel-dispatch.ts and
+  //     internaldocs/v2-stellar-channel-notes.md §N2.
+  let mppx: Awaited<ReturnType<typeof resolveStellarChannelMppx>>['mppx']
+  let channelContractForVerify: string | undefined
   try {
-    mppx = createStellarPayment(env)
+    if (authKind === 'stellar.channel') {
+      const resolved = await resolveStellarChannelMppx(env, authHeader)
+      mppx = resolved.mppx as any
+      channelContractForVerify = resolved.channelContract
+      console.log(
+        `[proxy] Stellar channel dispatch for ${resolved.channelContract} (agent=${resolved.agentAccount})`,
+      )
+    } else {
+      mppx = createStellarPayment(env) as any
+    }
   } catch (err: any) {
+    if (err instanceof StellarChannelNotRegisteredError) {
+      // Agent is unknown to the router — either they never
+      // deployed a channel, or the operator never registered
+      // it. 402 with a pointer to the register script, not 500:
+      // the request is well-formed and we want the operator to
+      // notice quickly.
+      console.error(`[proxy] ${err.message}`)
+      return new Response(
+        JSON.stringify({
+          error: 'Router does not recognize this agent',
+          detail: err.message,
+          hint: 'Deploy a Stellar channel contract and run scripts/admin/register-stellar-channel.ts before first use.',
+        }),
+        {
+          status: 402,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      )
+    }
     console.error(`[proxy] Failed to initialize Stellar payment handler: ${err.message}`)
     return new Response(JSON.stringify({
       error: 'Router payment handler misconfigured',
@@ -381,19 +449,45 @@ export async function handleProxy(
     })
   }
 
+  // Dispatch the actual verify on authKind. Both the charge and the
+  // channel paths are HMAC-bound challenge verifications that return
+  // a Method.Server output with `.status`, `.challenge`, and
+  // `.withReceipt`, so downstream code can treat them uniformly.
+  //
+  // The shape of the arguments differs slightly:
+  //   - charge:  { amount, currency, recipient, meta }
+  //   - channel: { amount, channel, methodDetails }
+  // The channel path doesn't take currency + recipient because those
+  // are baked into the on-chain channel contract at deploy time.
   let verifyResult
   try {
-    verifyResult = await mppx['stellar/charge']({
-      amount: stellarAmount,
-      currency: getStellarUsdcSac(env),
-      recipient: getRouterStellarAddress(env),
-      // Correlate the mppx challenge with the upstream merchant challenge
-      // so we can reconcile payments after the fact.
-      meta: {
-        upstreamChallengeId: parsed.id,
-        route: route.id,
-      },
-    })(mppxInput)
+    if (authKind === 'stellar.channel') {
+      // Should not happen — if we got to this branch, resolve already
+      // set channelContractForVerify. Defensive check for the type
+      // narrowing below.
+      if (!channelContractForVerify) {
+        throw new Error('Internal: stellar.channel authKind without resolved contract')
+      }
+      verifyResult = await (mppx as any)['stellar/channel']({
+        amount: stellarAmount,
+        channel: channelContractForVerify,
+        methodDetails: {
+          reference: parsed.id,
+        },
+      })(mppxInput)
+    } else {
+      verifyResult = await (mppx as any)['stellar/charge']({
+        amount: stellarAmount,
+        currency: getStellarUsdcSac(env),
+        recipient: getRouterStellarAddress(env),
+        // Correlate the mppx challenge with the upstream merchant challenge
+        // so we can reconcile payments after the fact.
+        meta: {
+          upstreamChallengeId: parsed.id,
+          route: route.id,
+        },
+      })(mppxInput)
+    }
   } catch (err: any) {
     console.error(`[proxy] Stellar verify threw: ${err.message}`)
     return new Response(JSON.stringify({
