@@ -8,6 +8,20 @@
  * Verification uses mppx's HMAC-bound challenge flow so that credentials
  * presented by agents must echo a challenge that was actually issued by
  * this router with matching amount/currency/recipient.
+ *
+ * V1 session support note (2026-04-10): the agent-side method list
+ * stays at `stellar.charge` only. The original session-support-plan
+ * assumed we could register `stellar.channel` alongside `stellar.charge`
+ * with the same `recipient`/`network` boilerplate as a "free" upgrade,
+ * but `@stellar/mpp/channel/server`'s `channel()` method actually
+ * requires a per-channel contract address (`channel: string`) and a
+ * per-channel `commitmentKey`, one instance per agent channel. That
+ * pattern cannot be expressed in a single Mppx.create() call at cold
+ * start — it would need a per-request factory, which is the
+ * `KVStellarChannelManager` we explicitly scoped out. For V1 the
+ * router stays single-shot stellar.charge on the agent side; the
+ * real win from this branch is the Tempo-side tempo.session support
+ * for OpenRouter. Agent-side streaming is V2 — see §9 wishlist.
  */
 
 import { stellar } from '@stellar/mpp/charge/server'

@@ -15,7 +15,12 @@
 
 import { Credential } from 'mppx'
 import { getRouteByPublicPath } from '../services/merchants'
-import { payMerchant } from '../mpp/tempo-client'
+import {
+  ChannelNotInstalledError,
+  payMerchant,
+  payMerchantSession,
+} from '../mpp/tempo-client'
+import { bumpCumulative } from '../mpp/channel-store'
 import {
   createStellarPayment,
   getRouterStellarAddress,
@@ -419,16 +424,84 @@ export async function handleProxy(
 
   console.log(`[proxy] Stellar payment verified for route ${route.id}`)
 
-  // 4. Pay the merchant from the Tempo pool. The mppx client handles the
-  // full 402 dance with the Tempo merchant.
+  // 4. Pay the merchant from the Tempo pool.
+  //
+  // Dispatch on the merchant's upstream payment method. Fixed-price
+  // merchants (Firecrawl, Exa, Parallel) go through `tempo.charge` —
+  // a single-shot 402 settle per request. Dynamic-price merchants
+  // (OpenRouter) go through `tempo.session` — a long-lived payment
+  // channel with streaming cumulative vouchers. The mppx client
+  // handles the full 402 dance in both cases; the difference is
+  // that the session path needs to read + write channel state in
+  // KV and enforce the commit-after-2xx ordering from §5 of
+  // internaldocs/session-support-plan.md.
+  //
+  // IMPORTANT: an `upstreamPaymentMethod` of `tempo.session` on a
+  // merchant whose KV channel has not been opened yet raises
+  // `ChannelNotInstalledError`. We surface that as a 503 with a
+  // clear message so the operator notices and runs
+  // `scripts/open-channel.ts` before agent traffic builds up.
   let merchantResponse: Response
   try {
-    merchantResponse = await payMerchant(env, merchantUrl, {
-      method: request.method,
-      headers: forwardHeaders(request),
-      body: requestBody,
-    })
+    if (route.upstreamPaymentMethod === 'tempo.session') {
+      const sessionResult = await payMerchantSession(env, route.id, merchantUrl, {
+        method: request.method,
+        headers: forwardHeaders(request),
+        body: requestBody,
+      })
+      merchantResponse = sessionResult.response
+      // §5 Rule 2: bump KV cumulative ONLY after a 2xx upstream
+      // response. The `onChannelUpdate` callback inside
+      // payMerchantSession also bumps KV as a safety net — the
+      // monotone max() in bumpCumulative makes the second write
+      // idempotent, so double-bumping is a no-op, and the explicit
+      // post-2xx bump here is the authoritative commit point.
+      //
+      // On non-2xx we intentionally do NOT call bumpCumulative
+      // from the proxy side, but if mppx already fired
+      // onChannelUpdate during sign then KV may already be ahead.
+      // That's an accepted residual window — see the
+      // "Residual window" note in §5.
+      if (merchantResponse.ok) {
+        const newCumulativeRaw = (
+          BigInt(sessionResult.channelBefore.cumulativeRaw) +
+          BigInt(parsed.request.amount)
+        ).toString()
+        // Fire-and-forget: if the bump fails (e.g. KV throttling),
+        // onChannelUpdate has almost certainly already done the
+        // same write and the next request will read the right
+        // high watermark anyway. Don't fail the agent's response
+        // over a bookkeeping miss.
+        ctx.waitUntil(
+          bumpCumulative(env, route.id, newCumulativeRaw).catch((err: any) => {
+            console.error(
+              `[proxy] post-2xx bumpCumulative failed for ${route.id}: ${err.message}`,
+            )
+          }),
+        )
+      }
+    } else {
+      merchantResponse = await payMerchant(env, merchantUrl, {
+        method: request.method,
+        headers: forwardHeaders(request),
+        body: requestBody,
+      })
+    }
   } catch (err: any) {
+    if (err instanceof ChannelNotInstalledError) {
+      console.error(`[proxy] ${err.message}`)
+      return new Response(
+        JSON.stringify({
+          error: 'Router session channel not installed',
+          detail: err.message,
+          hint: 'Operator must run scripts/open-channel.ts before this merchant accepts session traffic.',
+        }),
+        {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      )
+    }
     console.error(`[proxy] Tempo payment error: ${err.message}`)
     return new Response(JSON.stringify({
       error: 'Merchant payment failed',

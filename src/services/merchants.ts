@@ -7,7 +7,26 @@ export interface PublicServiceRoute {
   description: string
   method: string
   price: string
+  /**
+   * Which wallet type the AGENT uses to pay Router. Always 'stellar'
+   * for the current catalog; this is the value exposed on the public
+   * catalog JSON and is consumed by agent-side SDKs.
+   */
   paymentMethod: 'stellar'
+  /**
+   * Which Tempo payment intent Router uses to pay the upstream
+   * merchant. Fixed-price merchants (Firecrawl, Exa, Parallel) use
+   * `tempo.charge` — a single-shot 402 settle per request. Dynamic-
+   * price merchants (OpenRouter) use `tempo.session` — a long-lived
+   * channel with streaming vouchers. This is an internal Router
+   * concern; agents never see it.
+   *
+   * Default `tempo.charge` keeps backward compatibility. OpenRouter
+   * is NOT flipped to `tempo.session` in the initial commit; the
+   * operator flips it after running `scripts/open-channel.ts`
+   * (see internaldocs/session-support-plan.md §6 step 11).
+   */
+  upstreamPaymentMethod: 'tempo.charge' | 'tempo.session'
   network: 'stellar-mainnet'
   asset: 'USDC'
   publicPath: string
@@ -26,6 +45,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     method: 'POST',
     price: '$0.01/request',
     paymentMethod: 'stellar',
+    upstreamPaymentMethod: 'tempo.charge',
     network: 'stellar-mainnet',
     asset: 'USDC',
     publicPath: '/v1/services/parallel/search',
@@ -42,6 +62,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     method: 'POST',
     price: '$0.005/request',
     paymentMethod: 'stellar',
+    upstreamPaymentMethod: 'tempo.charge',
     network: 'stellar-mainnet',
     asset: 'USDC',
     publicPath: '/v1/services/exa/search',
@@ -58,6 +79,7 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     method: 'POST',
     price: '$0.002/request',
     paymentMethod: 'stellar',
+    upstreamPaymentMethod: 'tempo.charge',
     network: 'stellar-mainnet',
     asset: 'USDC',
     publicPath: '/v1/services/firecrawl/scrape',
@@ -74,6 +96,11 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     method: 'POST',
     price: 'dynamic',
     paymentMethod: 'stellar',
+    // Stays on tempo.charge until scripts/open-channel.ts has
+    // installed the OpenRouter session channel. The operator flips
+    // this to 'tempo.session' as a separate commit + deploy after
+    // the on-chain open tx confirms. See session-support-plan.md §6.
+    upstreamPaymentMethod: 'tempo.charge',
     network: 'stellar-mainnet',
     asset: 'USDC',
     publicPath: '/v1/services/openrouter/chat',

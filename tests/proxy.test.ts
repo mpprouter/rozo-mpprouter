@@ -62,11 +62,27 @@ function requireVar(vars: Record<string, string>, name: string): string {
 // the unauthorized paths. The real implementation depends on viem and
 // would actually spend funds if invoked. Use vi.hoisted so the spy
 // survives the top-of-file hoist that vi.mock applies.
-const { payMerchantSpy } = vi.hoisted(() => ({
+//
+// The mock also stubs `payMerchantSession` and `ChannelNotInstalledError`
+// so proxy.ts's session-path imports resolve at module load time. These
+// tests only exercise the charge path (Parallel), so the session stub is
+// a never-called safety net; tests that exercise the session path live
+// in tests/proxy-session.test.ts with their own mock.
+const { payMerchantSpy, payMerchantSessionSpy } = vi.hoisted(() => ({
   payMerchantSpy: vi.fn(async () => new Response('{"ok":true}', { status: 200 })),
+  payMerchantSessionSpy: vi.fn(async () => {
+    throw new Error('payMerchantSession should not be called from tests/proxy.test.ts')
+  }),
 }))
 vi.mock('../src/mpp/tempo-client', () => ({
   payMerchant: payMerchantSpy,
+  payMerchantSession: payMerchantSessionSpy,
+  ChannelNotInstalledError: class ChannelNotInstalledError extends Error {
+    constructor(public readonly merchantId: string) {
+      super(`no channel for ${merchantId}`)
+      this.name = 'ChannelNotInstalledError'
+    }
+  },
 }))
 
 import { handleProxy } from '../src/routes/proxy'
