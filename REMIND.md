@@ -5,6 +5,41 @@
 
 ---
 
+## API base URL
+
+**Canonical**: `https://apiserver.mpprouter.dev`
+
+This is the public custom domain that fronts the Cloudflare Worker.
+All agent integrations, docs, and external links should use this
+URL — NOT the internal `mpprouter.eng3798.workers.dev` workers.dev
+default domain (which is what `wrangler deploy` prints, and what
+operator scripts in this repo currently default to via
+`ROUTER_URL`).
+
+Both URLs route to the same worker:
+
+```bash
+# Production custom domain — give this to agents/users
+curl -s https://apiserver.mpprouter.dev/services
+
+# Internal workers.dev — what wrangler deploy prints
+curl -s https://mpprouter.eng3798.workers.dev/services
+
+# Both return identical content with the same Worker version
+```
+
+The `base_url` field returned by `/services` is hardcoded to
+`https://apiserver.mpprouter.dev` (see `src/routes/services.ts`)
+so even if an agent first finds the worker via the workers.dev
+URL, the catalog directs them to the canonical domain.
+
+The mppx HMAC realm in `src/mpp/stellar-server.ts` and
+`src/mpp/stellar-channel-dispatch.ts` is also `apiserver.mpprouter.dev`,
+so credentials issued under either hostname verify against the
+same realm string.
+
+---
+
 ## 0. 当前 session 模式只支持这 4 个 merchant (2026-04-11)
 
 ```
@@ -26,10 +61,10 @@
 
 ```bash
 # 看哪些路由真的可用
-curl -s https://mpprouter.eng3798.workers.dev/services | jq '.services[] | {id, verified_mode, verified_note}'
+curl -s https://apiserver.mpprouter.dev/services | jq '.services[] | {id, verified_mode, verified_note}'
 
 # 只列出 session 模式可用的
-curl -s https://mpprouter.eng3798.workers.dev/services | jq '.services[] | select(.verified_mode == "session") | {id, public_path}'
+curl -s https://apiserver.mpprouter.dev/services | jq '.services[] | select(.verified_mode == "session") | {id, public_path}'
 ```
 
 ---
