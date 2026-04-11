@@ -107,6 +107,7 @@ type Args = {
   wasm: string
   token: string
   wasmHash: string | undefined
+  agentEnvKey: string
   dryRun: boolean
 }
 
@@ -120,6 +121,11 @@ function parseArgs(argv: string[]): Args {
     // with an already-uploaded WASM hash. Useful on retry after a
     // deploy failure — avoids paying the upload gas again.
     wasmHash: process.env.WASM_HASH,
+    // Which env var in stellar-mpp-sdk/.env.dev holds the agent
+    // secret. Defaults to MAINNET_PAYER_SECRET for the original
+    // dogfood agent, but the multi-agent bootstrap flow overrides
+    // to AGENT2_SECRET / AGENT3_SECRET.
+    agentEnvKey: 'MAINNET_PAYER_SECRET',
     dryRun: false,
   }
   for (let i = 0; i < args.length; i++) {
@@ -132,6 +138,8 @@ function parseArgs(argv: string[]): Args {
       out.wasmHash = args[++i]
     } else if (a === '--token') {
       out.token = args[++i]
+    } else if (a === '--agent-env') {
+      out.agentEnvKey = args[++i]
     } else if (a === '--dry-run') {
       out.dryRun = true
     }
@@ -210,13 +218,15 @@ function kvPut(key: string, value: string): void {
 async function main() {
   const args = parseArgs(process.argv)
 
-  // Load MAINNET_PAYER_SECRET from stellar-mpp-sdk/.env.dev (the
-  // dogfood account we use for PAY=1 tests).
+  // Load agent secret from stellar-mpp-sdk/.env.dev. Default is
+  // MAINNET_PAYER_SECRET (the original dogfood account); the
+  // --agent-env flag lets the multi-agent flow point at
+  // AGENT2_SECRET / AGENT3_SECRET for parallel channels.
   const envDevPath = '/Users/happyfish/workspace/stellar/stellar-mpp-sdk/.env.dev'
   const envVars = loadEnvFile(envDevPath)
-  const agentSecret = envVars.MAINNET_PAYER_SECRET
+  const agentSecret = envVars[args.agentEnvKey]
   if (!agentSecret) {
-    throw new Error(`MAINNET_PAYER_SECRET not found in ${envDevPath}`)
+    throw new Error(`${args.agentEnvKey} not found in ${envDevPath}`)
   }
 
   // Load router public key from rozo-mpprouter/.dev.vars.

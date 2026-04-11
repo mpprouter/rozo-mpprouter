@@ -79,12 +79,19 @@ async function main() {
   const envDevPath =
     '/Users/happyfish/workspace/stellar/stellar-mpp-sdk/.env.dev'
   const envVars = loadEnvFile(envDevPath)
-  const agentSecret = envVars.MAINNET_PAYER_SECRET
+
+  // Which agent to run the test as. Defaults to the original
+  // dogfood agent (MAINNET_PAYER) for backwards compatibility;
+  // the multi-agent test flow sets AGENT_ENV=AGENT2_SECRET or
+  // AGENT3_SECRET to run as a different agent.
+  const agentEnvKey = process.env.AGENT_ENV ?? 'MAINNET_PAYER_SECRET'
+  const agentSecret = envVars[agentEnvKey]
   if (!agentSecret) {
-    throw new Error(`MAINNET_PAYER_SECRET not in ${envDevPath}`)
+    throw new Error(`${agentEnvKey} not in ${envDevPath}`)
   }
   const keypair = Keypair.fromSecret(agentSecret)
   const agentG = keypair.publicKey()
+  console.log(`  (using ${agentEnvKey} from ${envDevPath})`)
 
   console.log('═══════════════════════════════════════════════════════')
   console.log('  Stellar channel → Tempo session — full session+session E2E')
