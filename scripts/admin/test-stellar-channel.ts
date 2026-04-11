@@ -49,7 +49,36 @@ import { stellar } from '@stellar/mpp/channel/client'
 
 const ROUTER_URL =
   process.env.ROUTER_URL ?? 'https://mpprouter.eng3798.workers.dev'
-const ROUTE_PATH = '/v1/services/openrouter/chat'
+
+/**
+ * Public router path to hit. Defaults to the original openrouter
+ * dogfood path so existing test invocations keep working. The
+ * 8-merchant batch (Task A) overrides this via env to test
+ * anthropic_messages, openai_chat, gemini_generate, dune_execute,
+ * modal_exec, alchemy_rpc, tempo_rpc, storage_upload.
+ */
+const ROUTE_PATH = process.env.ROUTE_PATH ?? '/v1/services/openrouter/chat'
+
+/**
+ * JSON request body to send to the merchant. Defaults to a tiny
+ * OpenRouter chat completion shape so the original openrouter test
+ * still works. For other merchants the caller MUST set REQUEST_BODY
+ * to a body that the merchant accepts (or the merchant will return
+ * a 4xx instead of a 200 even though the channel/voucher work).
+ *
+ * Examples (single line, no newlines, valid JSON):
+ *   REQUEST_BODY='{"model":"claude-3-5-sonnet-latest","max_tokens":1,
+ *                  "messages":[{"role":"user","content":"hi"}]}'
+ *   REQUEST_BODY='{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber",
+ *                  "params":[]}'
+ */
+const DEFAULT_REQUEST_BODY = JSON.stringify({
+  model: 'openai/gpt-4o-mini',
+  messages: [
+    { role: 'user', content: 'Say "session hello" in 5 words.' },
+  ],
+})
+const REQUEST_BODY_RAW = process.env.REQUEST_BODY ?? DEFAULT_REQUEST_BODY
 
 function loadEnvFile(path: string): Record<string, string> {
   if (!existsSync(path)) {
@@ -133,11 +162,16 @@ async function main() {
     ],
   })
 
-  const body = {
-    model: 'openai/gpt-4o-mini',
-    messages: [
-      { role: 'user', content: 'Say "session hello" in 5 words.' },
-    ],
+  // Parse the request body now (not at module load time) so a
+  // malformed REQUEST_BODY env shows a clear error to the operator.
+  let body: unknown
+  try {
+    body = JSON.parse(REQUEST_BODY_RAW)
+  } catch (err: any) {
+    throw new Error(
+      `REQUEST_BODY is not valid JSON: ${err.message}\n` +
+        `value: ${REQUEST_BODY_RAW.slice(0, 200)}`,
+    )
   }
 
   // V2 §6-D2 bootstrap hint: on the FIRST request the router has

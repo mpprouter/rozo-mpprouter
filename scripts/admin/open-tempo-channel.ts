@@ -100,7 +100,7 @@ type SessionMerchant = {
    * merchant's session endpoints.
    */
   probePath: string
-  probeMethod: 'GET' | 'POST'
+  probeMethod: 'GET' | 'POST' | 'PUT'
   /**
    * A minimal body that satisfies the endpoint's input contract
    * enough to trigger a 402. For chat endpoints this is a tiny
@@ -159,7 +159,11 @@ const MERCHANTS: Record<string, SessionMerchant> = {
   dune_execute: {
     id: 'dune_execute',
     name: 'Dune',
-    serviceUrl: 'https://dune.mpp.tempo.xyz',
+    // 2026-04-11: mpp.dev/api/services lists Dune at the actual
+    // api.dune.com host, NOT at dune.mpp.tempo.xyz. The earlier
+    // v2-todo.md draft was wrong; verified by curling
+    // https://mpp.dev/api/services and inspecting `dune.serviceUrl`.
+    serviceUrl: 'https://api.dune.com',
     probePath: '/api/v1/sql/execute',
     probeMethod: 'POST',
     probeBody: { query: 'SELECT 1' },
@@ -168,14 +172,22 @@ const MERCHANTS: Record<string, SessionMerchant> = {
     id: 'modal_exec',
     name: 'Modal',
     serviceUrl: 'https://modal.mpp.tempo.xyz',
-    probePath: '/sandbox/exec',
+    // 2026-04-11: /sandbox/exec returned a `tempo.charge` 402 — that
+    // endpoint is per-call charge, not session. The session-bearing
+    // endpoint per mpp.dev catalog is /sandbox/create (which opens
+    // a long-lived sandbox + bills via session voucher). Probe via
+    // /sandbox/create instead so the session 402 fires.
+    probePath: '/sandbox/create',
     probeMethod: 'POST',
     probeBody: {},
   },
   alchemy_rpc: {
     id: 'alchemy_rpc',
     name: 'Alchemy',
-    serviceUrl: 'https://alchemy.mpp.tempo.xyz',
+    // 2026-04-11: mpp.dev/api/services lists Alchemy at mpp.alchemy.com,
+    // NOT at alchemy.mpp.tempo.xyz. Path is /:network/v2 — eth-mainnet
+    // is the network we use for the probe.
+    serviceUrl: 'https://mpp.alchemy.com',
     probePath: '/eth-mainnet/v2',
     probeMethod: 'POST',
     probeBody: { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] },
@@ -192,9 +204,14 @@ const MERCHANTS: Record<string, SessionMerchant> = {
     id: 'storage_upload',
     name: 'Object Storage',
     serviceUrl: 'https://storage.mpp.tempo.xyz',
-    probePath: '/upload',
-    probeMethod: 'POST',
-    probeBody: { size: 1024 },
+    // 2026-04-11: mpp.dev catalog shows storage uses PUT /:key for
+    // upload, GET /:key for download, DELETE /:key for delete.
+    // No POST endpoint exists. Probe with a tiny PUT — the
+    // merchant emits a session 402 BEFORE actually running the
+    // upload, so the body content doesn't matter.
+    probePath: '/probe-mpprouter-open',
+    probeMethod: 'PUT',
+    probeBody: { probe: true },
   },
 }
 
