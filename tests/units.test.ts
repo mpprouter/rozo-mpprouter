@@ -16,6 +16,10 @@
 
 import { describe, it, expect } from 'vitest'
 import { baseUnitsToDecimalString, convertUsdcToXlm } from '../src/routes/proxy'
+import {
+  resolveUpstreamPath,
+  UpstreamPathPlaceholderError,
+} from '../src/services/merchants'
 
 describe('baseUnitsToDecimalString', () => {
   it('converts $0.01 at 6 decimals (the real-world parallel_search case)', () => {
@@ -149,5 +153,85 @@ describe('convertUsdcToXlm', () => {
   it('rejects amounts with more fractional precision than Stellar supports', () => {
     // 8 fractional digits would lose data at the 7-decimal boundary.
     expect(() => convertUsdcToXlm('0.00000001', 0.1533)).toThrow()
+  })
+})
+
+/**
+ * Per-route :placeholder substitution. Lets gemini accept ?model=
+ * via the public router URL while keeping the upstream path
+ * structurally pinned in merchants.ts. Also tested negatively to
+ * make sure no path traversal can leak through.
+ */
+describe('resolveUpstreamPath', () => {
+  const geminiRoute = {
+    id: 'gemini_generate',
+    upstreamPath: '/v1beta/models/{model}:generateContent',
+    placeholderDefaults: { model: 'gemini-2.0-flash' },
+  }
+
+  it('substitutes :model from query param', () => {
+    const params = new URLSearchParams('model=gemini-1.5-pro&other=keep')
+    const result = resolveUpstreamPath(geminiRoute, params)
+    expect(result.path).toBe('/v1beta/models/gemini-1.5-pro:generateContent')
+    expect(result.consumed.has('model')).toBe(true)
+    // unrelated params not consumed
+    expect(result.consumed.has('other')).toBe(false)
+  })
+
+  it('falls back to placeholderDefaults when query is missing', () => {
+    const params = new URLSearchParams()
+    const result = resolveUpstreamPath(geminiRoute, params)
+    expect(result.path).toBe('/v1beta/models/gemini-2.0-flash:generateContent')
+    // default usage does NOT count as a consumed query param
+    expect(result.consumed.size).toBe(0)
+  })
+
+  it('handles paths with no placeholders unchanged', () => {
+    const route = {
+      id: 'static_route',
+      upstreamPath: '/v1/messages',
+    }
+    const result = resolveUpstreamPath(route, new URLSearchParams('foo=bar'))
+    expect(result.path).toBe('/v1/messages')
+    expect(result.consumed.size).toBe(0)
+  })
+
+  it('rejects path traversal attempts in placeholder values', () => {
+    const params = new URLSearchParams('model=../../etc/passwd')
+    expect(() => resolveUpstreamPath(geminiRoute, params)).toThrow(UpstreamPathPlaceholderError)
+  })
+
+  it('rejects placeholder values containing slashes', () => {
+    const params = new URLSearchParams('model=foo/bar')
+    expect(() => resolveUpstreamPath(geminiRoute, params)).toThrow(UpstreamPathPlaceholderError)
+  })
+
+  it('rejects placeholder values with query strings', () => {
+    const params = new URLSearchParams('model=foo?evil=1')
+    expect(() => resolveUpstreamPath(geminiRoute, params)).toThrow(UpstreamPathPlaceholderError)
+  })
+
+  it('throws when a placeholder is required but no value/default exists', () => {
+    const route = {
+      id: 'no_default',
+      upstreamPath: '/api/{version}/things',
+    }
+    expect(() => resolveUpstreamPath(route, new URLSearchParams())).toThrow(UpstreamPathPlaceholderError)
+  })
+
+  it('preserves literal colons that are NOT placeholder boundaries', () => {
+    // ':generateContent' is literal — only '{model}' is replaced.
+    // This is the gemini-style path that previously broke a `:name`
+    // syntax design.
+    const params = new URLSearchParams('model=test')
+    const result = resolveUpstreamPath(geminiRoute, params)
+    expect(result.path).toContain(':generateContent')
+    expect(result.path).toBe('/v1beta/models/test:generateContent')
+  })
+
+  it('allows hyphens, dots, underscores, alphanumerics in placeholder values', () => {
+    const params = new URLSearchParams('model=gemini-2.0-flash_exp.v1')
+    const result = resolveUpstreamPath(geminiRoute, params)
+    expect(result.path).toBe('/v1beta/models/gemini-2.0-flash_exp.v1:generateContent')
   })
 })

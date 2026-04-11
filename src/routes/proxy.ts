@@ -14,7 +14,11 @@
  */
 
 import { Credential } from 'mppx'
-import { getRouteByPublicPath } from '../services/merchants'
+import {
+  getRouteByPublicPath,
+  resolveUpstreamPath,
+  UpstreamPathPlaceholderError,
+} from '../services/merchants'
 import {
   ChannelNotInstalledError,
   payMerchant,
@@ -354,8 +358,40 @@ export async function handleProxy(
   }
 
   const merchantHost = route.upstreamHost
-  const upstreamPath = route.upstreamPath
-  const merchantUrl = buildMerchantUrl(merchantHost, upstreamPath, url.search)
+  // Resolve `:placeholder` tokens in route.upstreamPath from the
+  // URL query (e.g. ?model=gemini-2.0-flash for the gemini route).
+  // Falls back to per-route defaults. Strips consumed params from
+  // the forwarded query so the merchant doesn't see them.
+  let upstreamPath: string
+  let consumedQueryParams: Set<string>
+  try {
+    const resolved = resolveUpstreamPath(route, url.searchParams)
+    upstreamPath = resolved.path
+    consumedQueryParams = resolved.consumed
+  } catch (err: any) {
+    if (err instanceof UpstreamPathPlaceholderError) {
+      return new Response(JSON.stringify({
+        error: 'Bad upstream path placeholder',
+        detail: err.message,
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    throw err
+  }
+  // Build the forwarded query string. Strip both:
+  //   - placeholder feeders consumed by resolveUpstreamPath
+  //   - router-internal params (?payment=channel&agent=G...) — see §6-D2
+  const forwardedSearch = (() => {
+    const params = new URLSearchParams(url.search)
+    for (const name of consumedQueryParams) params.delete(name)
+    params.delete('payment')
+    params.delete('agent')
+    const s = params.toString()
+    return s.length > 0 ? `?${s}` : ''
+  })()
+  const merchantUrl = buildMerchantUrl(merchantHost, upstreamPath, forwardedSearch)
 
   // Idempotency check — return cached result on repeat POSTs with same id.
   const requestId = request.headers.get('x-request-id')
@@ -679,24 +715,41 @@ export async function handleProxy(
 
   // 4. Pay the merchant from the Tempo pool.
   //
-  // Dispatch on the merchant's upstream payment method. Fixed-price
-  // merchants (Firecrawl, Exa, Parallel) go through `tempo.charge` —
-  // a single-shot 402 settle per request. Dynamic-price merchants
-  // (OpenRouter) go through `tempo.session` — a long-lived payment
-  // channel with streaming cumulative vouchers. The mppx client
-  // handles the full 402 dance in both cases; the difference is
-  // that the session path needs to read + write channel state in
-  // KV and enforce the commit-after-2xx ordering from §5 of
-  // internaldocs/session-support-plan.md.
+  // Dispatch on the merchant's ACTUAL intent (parsed.intent from
+  // the live 402), not the hardcoded route.upstreamPaymentMethod.
+  // This lets the router auto-adapt when:
+  //   - A merchant flips between charge and session over time
+  //   - mpp.dev catalog claims session intent but the merchant
+  //     actually serves charge (modal, alchemy, storage as of
+  //     2026-04-11 fall in this bucket)
+  //   - Same merchant has different intents on different routes
   //
-  // IMPORTANT: an `upstreamPaymentMethod` of `tempo.session` on a
-  // merchant whose KV channel has not been opened yet raises
+  // The hardcoded `route.upstreamPaymentMethod` becomes a HINT for
+  // operators (do we expect to need a session channel here?) but
+  // is no longer the dispatch criterion. v2-todo.md#A-followup.
+  //
+  // Fixed-price merchants (Firecrawl, Exa, Parallel) emit `charge`,
+  // dynamic merchants (OpenRouter, OpenAI) emit `session`. The
+  // mppx client handles the full 402 dance in both cases; the
+  // difference is that the session path needs to read + write
+  // channel state in KV and enforce the commit-after-2xx ordering
+  // from §5 of internaldocs/session-support-plan.md.
+  //
+  // IMPORTANT: a session intent without an opened KV channel raises
   // `ChannelNotInstalledError`. We surface that as a 503 with a
   // clear message so the operator notices and runs
-  // `scripts/open-channel.ts` before agent traffic builds up.
+  // `scripts/admin/open-tempo-channel.ts` before agent traffic
+  // builds up.
+  const merchantIntent = parsed.intent.toLowerCase()
+  if (merchantIntent !== route.upstreamPaymentMethod.replace('tempo.', '')) {
+    console.log(
+      `[proxy] Note: route ${route.id} hardcoded as ${route.upstreamPaymentMethod} ` +
+        `but merchant returned intent=${merchantIntent}; following merchant.`,
+    )
+  }
   let merchantResponse: Response
   try {
-    if (route.upstreamPaymentMethod === 'tempo.session') {
+    if (merchantIntent === 'session') {
       const sessionResult = await payMerchantSession(env, route.id, merchantUrl, {
         method: request.method,
         headers: forwardHeaders(request),

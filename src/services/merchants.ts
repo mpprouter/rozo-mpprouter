@@ -31,7 +31,40 @@ export interface PublicServiceRoute {
   asset: 'USDC'
   publicPath: string
   upstreamHost: string
+  /**
+   * Path on the upstream merchant. May contain `{placeholder}`
+   * tokens which the router substitutes from URL query params at
+   * request time. Currently only used by the gemini route to let
+   * clients pick a model: `/v1beta/models/{model}:generateContent`
+   * + query `?model=gemini-2.0-flash` → `/v1beta/models/gemini-2.0-flash:generateContent`.
+   *
+   * Why `{name}` syntax instead of `:name`: Gemini's literal
+   * upstream path contains `:generateContent` (a Google API
+   * convention), so a `:name` placeholder syntax would collide
+   * with literal colons. `{name}` is unambiguous and matches the
+   * OpenAPI/RFC 6570 conventions agents are familiar with.
+   *
+   * If a placeholder is referenced but missing from both the
+   * query and `placeholderDefaults`, the router emits 400. The
+   * substitution is whitelist-based — only values matching
+   * `[A-Za-z0-9._-]+` are allowed, so a malicious client cannot
+   * inject path traversal or query strings.
+   */
   upstreamPath: string
+  /**
+   * Default values for `:placeholder` tokens in upstreamPath.
+   * Looked up by placeholder name when the request URL doesn't
+   * carry the corresponding query param.
+   */
+  placeholderDefaults?: Record<string, string>
+  /**
+   * Query params the router strips before forwarding to the
+   * merchant. Used for params that are router-internal (e.g.
+   * `?payment=channel&agent=G...` and the placeholder feeders).
+   * The hardcoded V2 strip-list is in `forwardSearchParams()`
+   * inside proxy.ts; this field is purely informational unless
+   * a route needs route-specific stripping.
+   */
 }
 
 export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
@@ -165,7 +198,13 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] = [
     asset: 'USDC',
     publicPath: '/v1/services/gemini/generate',
     upstreamHost: 'gemini.mpp.tempo.xyz',
-    upstreamPath: '/v1beta/models/gemini-1.5-flash:generateContent',
+    // 2026-04-11: clients pick the model via ?model=<name> query
+    // param. The router substitutes {model} in the upstream path.
+    // gemini-1.5-flash is deprecated upstream and returns 500;
+    // gemini-2.0-flash is the current default. Other valid values
+    // include gemini-1.5-pro, gemini-2.0-flash-exp, etc.
+    upstreamPath: '/v1beta/models/{model}:generateContent',
+    placeholderDefaults: { model: 'gemini-2.0-flash' },
   },
   {
     id: 'dune_execute',
@@ -352,4 +391,78 @@ export function listPublicCatalog(): PublicCatalogEntry[] {
 
 export function getRouteByPublicPath(pathname: string, method: string): PublicServiceRoute | undefined {
   return PUBLIC_SERVICE_ROUTES.find(route => route.publicPath === pathname && route.method === method.toUpperCase())
+}
+
+/**
+ * Whitelist for `:placeholder` substitution values. Restricts to
+ * model-name-style identifiers so a client cannot inject path
+ * traversal (`../`), query strings (`?`), or anchors (`#`).
+ *
+ * If you need to widen this for a future placeholder type (e.g.
+ * an arbitrary network id with `/` in it), do it per-placeholder
+ * with a route-specific override, NOT by relaxing this regex.
+ */
+const PLACEHOLDER_VALUE_PATTERN = /^[A-Za-z0-9._-]+$/
+
+/**
+ * Substitute `{placeholder}` tokens in `route.upstreamPath` from a
+ * URLSearchParams (request URL query). Falls back to per-route
+ * defaults; throws when neither has a value, or when a value fails
+ * validation. Returns the path with substitutions applied AND the
+ * set of consumed param names so the proxy can strip them from the
+ * forwarded query string.
+ *
+ * Substitution rule: `{name}` is replaced by the value of the
+ * `name` query param, falling back to placeholderDefaults[name].
+ * Curly-brace syntax is unambiguous — it does NOT collide with
+ * literal colons in upstream paths like Google's
+ * `/v1beta/models/{model}:generateContent`.
+ *
+ * Examples:
+ *   resolveUpstreamPath('/v1beta/models/{model}:generateContent',
+ *     route, new URLSearchParams('model=gemini-2.0-flash'))
+ *     === { path: '/v1beta/models/gemini-2.0-flash:generateContent',
+ *           consumed: new Set(['model']) }
+ *
+ *   resolveUpstreamPath('/v1beta/models/{model}:generateContent',
+ *     route, new URLSearchParams())  // uses placeholderDefaults
+ *     === { path: '/v1beta/models/gemini-2.0-flash:generateContent',
+ *           consumed: new Set() }
+ */
+export class UpstreamPathPlaceholderError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'UpstreamPathPlaceholderError'
+  }
+}
+
+export function resolveUpstreamPath(
+  route: Pick<PublicServiceRoute, 'upstreamPath' | 'placeholderDefaults' | 'id'>,
+  searchParams: URLSearchParams,
+): { path: string; consumed: Set<string> } {
+  const consumed = new Set<string>()
+  const defaults = route.placeholderDefaults ?? {}
+  const path = route.upstreamPath.replace(/\{([A-Za-z0-9_]+)\}/g, (_match, name: string) => {
+    const fromQuery = searchParams.get(name)
+    let value: string | undefined
+    if (fromQuery !== null) {
+      value = fromQuery
+      consumed.add(name)
+    } else if (Object.prototype.hasOwnProperty.call(defaults, name)) {
+      value = defaults[name]
+    } else {
+      throw new UpstreamPathPlaceholderError(
+        `Route ${route.id} requires :${name} placeholder but no value was supplied ` +
+          `(no ?${name}= query param and no default in placeholderDefaults).`,
+      )
+    }
+    if (!PLACEHOLDER_VALUE_PATTERN.test(value)) {
+      throw new UpstreamPathPlaceholderError(
+        `Route ${route.id} :${name} placeholder value ${JSON.stringify(value)} ` +
+          `must match ${PLACEHOLDER_VALUE_PATTERN}`,
+      )
+    }
+    return value
+  })
+  return { path, consumed }
 }
