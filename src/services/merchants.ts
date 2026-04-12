@@ -196,28 +196,20 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] =
 // ---------------------------------------------------------------------
 
 /**
- * Build the list of Stellar intents this route accepts based on
- * its actual upstream capabilities:
+ * Build the list of Stellar intents this route accepts.
+ *
+ * Simplified 2026-04-12: all routes advertise only `charge`.
+ * Session/channel complexity is removed — the router handles
+ * the upstream session dance internally when needed. Agents
+ * always pay via single-shot charge.
  *
  * - `verifiedMode === false`: route is known-broken, don't advertise
  *   any stellar intents so agents won't send money into a black hole.
- * - `upstreamPaymentMethod === 'tempo.session'`: upstream only accepts
- *   session/channel mode. Advertising `charge` would let an agent pay
- *   via charge, but the upstream would reject the request — the agent
- *   loses money. Only `channel` is safe.
- * - All other routes (charge-capable upstreams): advertise both
- *   `charge` and `channel`. Channel-mode agents can still use
- *   charge-mode upstreams (the router handles the conversion).
+ * - All other routes: advertise `charge` only.
  */
-function stellarIntentsFor(route: PublicServiceRoute): Array<'charge' | 'channel'> {
-  // Broken routes: no stellar intents at all
+function stellarIntentsFor(route: PublicServiceRoute): Array<'charge'> {
   if (route.verifiedMode === false) return []
-
-  // Session-only upstream: only channel works (charge would eat money and 404)
-  if (route.upstreamPaymentMethod === 'tempo.session') return ['channel']
-
-  // Charge-capable upstream: both intents are safe
-  return ['charge', 'channel']
+  return ['charge']
 }
 
 /**
@@ -273,7 +265,10 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
       payment_method: route.paymentMethod,
       network: route.network,
       asset: route.asset,
-      status: 'active',
+      status: route.docs?.llmsTxt ? 'active' : 'limited',
+      ...(route.docs?.llmsTxt ? {} : {
+        status_note: 'llms_txt not available — use with caution; agents may not know how to construct request bodies.',
+      }),
       docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
       methods: {
         // Only include `stellar` when the route has usable intents —
@@ -284,7 +279,7 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
         // for a route where stellar is disabled.
         ...(stellarIntents.length > 0 && stellarX402Block ? { stellar_x402: stellarX402Block } : {}),
         tempo: {
-          intents: [route.upstreamPaymentMethod === 'tempo.session' ? 'session' : 'charge'],
+          intents: ['charge'] as Array<'charge' | 'session'>,
           role: 'upstream' as const,
         },
       },

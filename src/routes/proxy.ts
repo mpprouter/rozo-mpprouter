@@ -42,6 +42,8 @@ import {
   settleStellarX402,
   verifyStellarX402WithFacilitator,
 } from '../mpp/stellar-x402-server'
+import { sendDingTalkAlert } from '../utils/dingtalk'
+import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
 import type { Env } from '../index'
 
 /**
@@ -660,6 +662,51 @@ export async function handleProxy(
       status: 502,
       headers: { 'Content-Type': 'application/json' },
     })
+  }
+
+  // ---- Tempo pool balance pre-flight check -------------------------
+  // Before accepting the agent's Stellar payment, verify the Router's
+  // Tempo wallet has enough USDC.e to cover the merchant quote. If
+  // not, return 503 so the agent doesn't pay and get nothing back.
+  // Also fire a DingTalk alert when the pool is below 5 USDC.
+  const merchantQuoteBaseUnits = (() => {
+    try { return BigInt(parsed.request.amount) } catch { return null }
+  })()
+  if (merchantQuoteBaseUnits !== null) {
+    const tempoBalance = await getTempoUsdcBalance(env.TEMPO_RPC_URL, env.TEMPO_ROUTER_ADDRESS)
+    if (tempoBalance !== null) {
+      // Fire DingTalk alert if balance < 5 USDC (fire-and-forget)
+      if (tempoBalance < LOW_BALANCE_THRESHOLD && env.DINGTALK_ACCESS_TOKEN) {
+        const balanceStr = (Number(tempoBalance) / 1_000_000).toFixed(2)
+        ctx.waitUntil(
+          sendDingTalkAlert(
+            env.DINGTALK_ACCESS_TOKEN,
+            `[MPP Router] ⚠️ Tempo pool low balance: ${balanceStr} USDC\n` +
+            `Address: ${env.TEMPO_ROUTER_ADDRESS}\n` +
+            `Threshold: 5 USDC\n` +
+            `Action needed: top up the Tempo pool to avoid service disruption.`,
+          ),
+        )
+      }
+      // Reject if balance can't cover this request
+      if (tempoBalance < merchantQuoteBaseUnits) {
+        const balanceStr = (Number(tempoBalance) / 1_000_000).toFixed(2)
+        const quoteStr = (Number(merchantQuoteBaseUnits) / 1_000_000).toFixed(4)
+        console.error(
+          `[proxy] Tempo pool insufficient: balance=${balanceStr} USDC, quote=${quoteStr} USDC, route=${route.id}`,
+        )
+        return new Response(JSON.stringify({
+          error: 'Router temporarily unable to serve this route',
+          detail: `Tempo pool balance (${balanceStr} USDC) is insufficient for merchant quote (${quoteStr} USDC). Please try again later.`,
+        }), {
+          status: 503,
+          headers: {
+            'Content-Type': 'application/json',
+            'Retry-After': '300',
+          },
+        })
+      }
+    }
   }
 
   // ---- stellar.x402 inbound dispatch branch -----------------------

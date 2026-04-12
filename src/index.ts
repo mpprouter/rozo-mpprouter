@@ -83,6 +83,10 @@ export interface Env {
   // independently if they want. Secret — set via `wrangler secret
   // put STELLAR_X402_FACILITATOR_SECRET`.
   STELLAR_X402_FACILITATOR_SECRET: string
+
+  // DingTalk webhook token for operational alerts (low balance, etc.)
+  // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
+  DINGTALK_ACCESS_TOKEN?: string
 }
 
 export default {

@@ -164,7 +164,8 @@ export interface PublicCatalogEntry {
   payment_method: 'stellar'
   network: 'stellar-mainnet'
   asset: 'USDC'
-  status: 'active'
+  status: 'active' | 'limited'
+  status_note?: string
   docs_url: string
   /**
    * V2 multi-intent discovery. Lists the Stellar MPP intents the
@@ -176,7 +177,7 @@ export interface PublicCatalogEntry {
    */
   methods: {
     stellar?: {
-      intents: Array<'charge' | 'channel'>
+      intents: Array<'charge'>
     }
     stellar_x402?: {
       scheme: 'exact'
