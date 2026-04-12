@@ -123,10 +123,40 @@ for results when available.
 
 ---
 
+## Smoke Test Results (2026-04-12)
+
+Ran 6 end-to-end tests against live `apiserver.mpprouter.dev` using
+two different 402 client libraries to verify both wire formats work.
+
+Agent: `GAN3YSPDH5VW7YFJJFUJH7LIYTJBWGH3GJMKOG6FP5RKHXGNMPX44UYY`
+
+### MPP charge (mppx/client + @stellar/mpp/charge/client)
+
+| Service | Price | Status | HTTP | Time | Response |
+|---|---|---|---|---|---|
+| exa_search | $0.005 | ✅ SUCCESS | 200 | 38,156ms | Exa results for "ROZO.ai cross-chain crypto payment protocol" |
+| firecrawl_scrape | $0.002 | ✅ SUCCESS | 200 | 28,696ms | Scraped rozo.ai homepage markdown |
+| parallel_search | $0.010 | ✅ SUCCESS | 200 | 21,704ms | Parallel results for "ROZO AI cross-chain USDC payments Stellar" |
+
+### x402 exact (@x402/core/client + @x402/stellar/exact/client)
+
+| Service | Price | Status | HTTP | Time | Response |
+|---|---|---|---|---|---|
+| exa_search | $0.005 | ✅ SUCCESS | 200 | 35,652ms | Same query, x402 Payment-Required dialect |
+| firecrawl_scrape | $0.002 | ✅ SUCCESS | 200 | 34,101ms | Same scrape, x402 path |
+| parallel_search | $0.010 | ✅ SUCCESS | 200 | 18,143ms | Same query, x402 path |
+
+**6/6 passed.** Total cost: ~$0.034 USDC.
+
+Full logs: `rozoskilltest/smoke-test-charge-log.md`, `rozoskilltest/smoke-test-x402-log.md`
+
+---
+
 ## Changelog
 
 | Date | Who | Change |
 |---|---|---|
+| 2026-04-12 | muggledev | Smoke test 6/6 passed (3 mppx charge + 3 x402 exact). Deployed `stellarIntentsFor` fix to production |
 | 2026-04-12 | muggledev | Created doc. Fixed `stellarIntentsFor` to respect upstream mode. Added `upstreamPaymentMethod: 'tempo.charge'` override for alchemy_rpc |
 | 2026-04-11 | muggledev | Initial `verifiedMode` overlay for 12 services (5 charge, 4 session, 3 broken) |
 | 2026-04-10 | muggledev | First service catalog shipped with `parallel_search` as test service |
