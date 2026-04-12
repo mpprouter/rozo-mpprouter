@@ -289,6 +289,13 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
         },
       },
     }
+    if (route.docs) {
+      entry.docs = {
+        ...(route.docs.homepage ? { homepage: route.docs.homepage } : {}),
+        ...(route.docs.llmsTxt ? { llms_txt: route.docs.llmsTxt } : {}),
+        ...(route.docs.apiReference ? { api_reference: route.docs.apiReference } : {}),
+      }
+    }
     if (route.verifiedMode !== undefined) {
       entry.verified_mode = route.verifiedMode
     }

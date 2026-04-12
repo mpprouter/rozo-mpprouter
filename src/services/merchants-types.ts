@@ -74,6 +74,12 @@ export interface PublicServiceRoute {
    * carry the corresponding query param.
    */
   placeholderDefaults?: Record<string, string>
+  /** Upstream service docs URLs from mpp.dev catalog */
+  docs?: {
+    homepage?: string
+    llmsTxt?: string
+    apiReference?: string
+  }
   /**
    * Verified end-to-end status. Operator-maintained flag set
    * after a real client call (agent → router → merchant → 200)
@@ -182,6 +188,14 @@ export interface PublicCatalogEntry {
       intents: Array<'charge' | 'session'>
       role: 'upstream'
     }
+  }
+  /** Upstream API documentation links. Clients should read these
+   * (especially llms_txt) to learn the request body format — the
+   * router forwards bodies as-is without transformation. */
+  docs?: {
+    homepage?: string
+    llms_txt?: string
+    api_reference?: string
   }
   verified_mode?: 'session' | 'charge' | false
   verified_note?: string

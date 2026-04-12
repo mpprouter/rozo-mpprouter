@@ -60,7 +60,7 @@ interface MppService {
   categories?: string[]
   tags?: string[]
   status?: string
-  docs?: { homepage?: string; llmsTxt?: string }
+  docs?: { homepage?: string; llmsTxt?: string; apiReference?: string }
   methods?: {
     tempo?: { intents?: string[]; assets?: string[] }
   }
@@ -305,6 +305,7 @@ export function buildRoutesFromMppSnapshot(
         publicPath: dedupedPublicPath,
         upstreamHost,
         upstreamPath,
+        ...(service.docs ? { docs: service.docs } : {}),
       }
       const overlayKey = `${service.id}::${upstreamPath}`
       const overlayEntry = overlay[overlayKey]
