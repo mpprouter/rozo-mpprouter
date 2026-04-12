@@ -9,12 +9,20 @@
  *   GET      /health                        — Pool status
  *   GET      /services                      — Public service catalog
  *   GET      /v1/services/catalog           — Versioned public service catalog
+ *   GET      /v1/services/search            — Search/filter catalog
+ *   GET      /llms.txt                      — LLM-readable router description
+ *   GET      /openapi.json                  — OpenAPI 3.1 spec
+ *   GET      /.well-known/ai-plugin.json    — AI plugin manifest
  */
 
 import { handleProxy } from './routes/proxy'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
+import { handleSearch } from './routes/search'
 import { handleX402Supported } from './routes/x402-supported'
+import { handleLlmsTxt } from './routes/llms-txt'
+import { handleOpenApi } from './routes/openapi'
+import { handleAiPlugin } from './routes/ai-plugin'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -98,8 +106,24 @@ export default {
         return handleHealth(env)
       }
 
+      if (url.pathname === '/llms.txt') {
+        return handleLlmsTxt()
+      }
+
+      if (url.pathname === '/openapi.json') {
+        return handleOpenApi()
+      }
+
+      if (url.pathname === '/.well-known/ai-plugin.json') {
+        return handleAiPlugin()
+      }
+
       if (url.pathname === '/services' || url.pathname === '/v1/services/catalog') {
         return handleServices(env)
+      }
+
+      if (url.pathname === '/v1/services/search') {
+        return handleSearch(url, env)
       }
 
       if (url.pathname === '/x402/supported') {
@@ -113,15 +137,16 @@ export default {
       return new Response(
         'MPP Router - Stellar + x402 Payment Proxy\n\n' +
         'Endpoints:\n' +
-        '  GET /health              - Pool status (Stellar + Tempo)\n' +
-        '  GET /services            - Public service catalog (all payment flavors)\n' +
-        '  GET /v1/services/catalog - Versioned service catalog\n' +
-        '  GET /x402/supported      - Native x402 discovery (SupportedResponse shape)\n' +
-        '  POST /v1/services/<service>/<operation> - Call a public service route\n\n' +
-        'Accepted auth schemes on the proxy routes:\n' +
-        '  - Stellar MPP (official mppx client)\n' +
-        '  - Stellar x402 (@x402/stellar/exact/client whose payTo = STELLAR_X402_PAY_TO)\n\n' +
-        'Docs: https://apiserver.mpprouter.dev/docs/integration\n',
+        '  GET /health                          - Pool status\n' +
+        '  GET /services                        - Public service catalog\n' +
+        '  GET /v1/services/catalog             - Versioned service catalog\n' +
+        '  GET /v1/services/search              - Search/filter catalog\n' +
+        '  GET /x402/supported                  - x402 discovery\n' +
+        '  GET /llms.txt                        - LLM-readable description\n' +
+        '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +
+        '  GET /.well-known/ai-plugin.json      - AI plugin manifest\n' +
+        '  POST /v1/services/<service>/<op>     - Call a paid service\n\n' +
+        'Docs: https://mpprouter.dev\n',
         { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       )
     } catch (error: any) {
