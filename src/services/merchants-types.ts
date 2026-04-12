@@ -169,7 +169,7 @@ export interface PublicCatalogEntry {
    * recipient + asset, present only when `X402_ENABLED=true`.
    */
   methods: {
-    stellar: {
+    stellar?: {
       intents: Array<'charge' | 'channel'>
     }
     stellar_x402?: {

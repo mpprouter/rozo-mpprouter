@@ -150,9 +150,11 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'an empty {} body with 500. Need to find a body shape modal accepts.',
   },
   // Alchemy Ethereum RPC — actually charge mode despite catalog
+  // (mpp.dev lists tempo.session, but the merchant accepts charge)
   'alchemy::/{network}/v2': {
     id: 'alchemy_rpc',
     publicPath: '/v1/services/alchemy/rpc',
+    upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
     placeholderDefaults: { network: 'eth-mainnet' },
   },
@@ -194,14 +196,27 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] =
 // ---------------------------------------------------------------------
 
 /**
- * Build the list of Stellar intents this route accepts. V2 default
- * is both `charge` and `channel` on every route so channel-aware
- * clients can discover the option. A future route-level override
- * could disable channel on a per-route basis (e.g. if a merchant
- * turns out to be too flaky under session-mode latency), but V2
- * initial rollout is uniform.
+ * Build the list of Stellar intents this route accepts based on
+ * its actual upstream capabilities:
+ *
+ * - `verifiedMode === false`: route is known-broken, don't advertise
+ *   any stellar intents so agents won't send money into a black hole.
+ * - `upstreamPaymentMethod === 'tempo.session'`: upstream only accepts
+ *   session/channel mode. Advertising `charge` would let an agent pay
+ *   via charge, but the upstream would reject the request — the agent
+ *   loses money. Only `channel` is safe.
+ * - All other routes (charge-capable upstreams): advertise both
+ *   `charge` and `channel`. Channel-mode agents can still use
+ *   charge-mode upstreams (the router handles the conversion).
  */
-function stellarIntentsFor(_route: PublicServiceRoute): Array<'charge' | 'channel'> {
+function stellarIntentsFor(route: PublicServiceRoute): Array<'charge' | 'channel'> {
+  // Broken routes: no stellar intents at all
+  if (route.verifiedMode === false) return []
+
+  // Session-only upstream: only channel works (charge would eat money and 404)
+  if (route.upstreamPaymentMethod === 'tempo.session') return ['channel']
+
+  // Charge-capable upstream: both intents are safe
   return ['charge', 'channel']
 }
 
@@ -242,6 +257,7 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
       : null
 
   return PUBLIC_SERVICE_ROUTES.map(route => {
+    const stellarIntents = stellarIntentsFor(route)
     const entry: PublicCatalogEntry = {
       id: route.id,
       name: route.name,
@@ -260,13 +276,13 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
       status: 'active',
       docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
       methods: {
-        stellar: {
-          intents: stellarIntentsFor(route),
-        },
-        // Only include `stellar_x402` when the feature flag is on —
-        // absent, not { enabled: false }, so existing mppx-only
-        // clients see byte-identical pre-x402 catalog shape.
-        ...(stellarX402Block ? { stellar_x402: stellarX402Block } : {}),
+        // Only include `stellar` when the route has usable intents —
+        // broken routes (verifiedMode === false) get no stellar block.
+        ...(stellarIntents.length > 0 ? { stellar: { intents: stellarIntents } } : {}),
+        // Only include `stellar_x402` when the feature flag is on AND
+        // the route has stellar intents — don't advertise x402 payment
+        // for a route where stellar is disabled.
+        ...(stellarIntents.length > 0 && stellarX402Block ? { stellar_x402: stellarX402Block } : {}),
         tempo: {
           intents: [route.upstreamPaymentMethod === 'tempo.session' ? 'session' : 'charge'],
           role: 'upstream' as const,
