@@ -24,6 +24,56 @@ Activate when the user asks to:
 - Look up pricing or docs for a specific service
 - Search for services by category or keyword
 
+## Don't have a Stellar wallet yet?
+
+Discovery itself is free, but to **call** a service you need a Stellar
+USDC wallet that speaks the 402 payment flow. Use the companion skill:
+
+> **`stellar-agent-wallet-skill`** —
+> https://github.com/mpprouter/stellar-agent-wallet-skill
+
+Install it, then run `npx tsx skills/onboard/run.ts` from that skill to
+generate a key, check balances, add the USDC trustline, and (optionally)
+swap XLM→USDC. Once onboard shows all green, come back to this skill.
+
+## How to use
+
+1. **Read this SKILL.md first** so the agent knows the catalog shape,
+   the `public_path` / `method` fields, and the 402 payment contract.
+2. **Search the catalog** with `/v1/services/search?q=...` or get the
+   full list with `/v1/services/catalog`.
+3. **Read the picked service's `docs.llms_txt`** to learn the request
+   body shape — the router forwards bodies as-is.
+4. **Hand off to `stellar-agent-wallet-skill`'s `pay-per-call`** with
+   the URL, method, and body. It handles 402 → sign → retry.
+
+## Example run
+
+```bash
+# 1. Search for a web-search service
+curl -s "https://apiserver.mpprouter.dev/v1/services/search?q=search&status=active&limit=3" \
+  | jq '.services[] | {id, public_path, method, price, docs}'
+
+# → picks e.g. parallel_search:
+# {
+#   "id": "parallel_search",
+#   "public_path": "/v1/services/parallel/search",
+#   "method": "POST",
+#   "price": "$0.010/request",
+#   "docs": { "llms_txt": "https://parallel.ai/docs/llms.txt" }
+# }
+
+# 2. Read the upstream docs to learn the body shape
+curl -s https://parallel.ai/docs/llms.txt | head -40
+
+# 3. Call it via stellar-agent-wallet-skill (installed separately)
+npx tsx skills/pay-per-call/run.ts \
+  "https://apiserver.mpprouter.dev/v1/services/parallel/search" \
+  --method POST \
+  --body '{"query": "Summarize https://stripe.com/docs"}'
+# → 402 Payment Required → signs with Stellar USDC → retries → returns result
+```
+
 ## How it works
 
 ### 1. Search services
