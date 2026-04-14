@@ -32,10 +32,6 @@ USDC wallet that speaks the 402 payment flow. Use the companion skill:
 > **`stellar-agent-wallet-skill`** —
 > https://github.com/mpprouter/stellar-agent-wallet-skill
 
-Install it, then run `npx tsx skills/onboard/run.ts` from that skill to
-generate a key, check balances, add the USDC trustline, and (optionally)
-swap XLM→USDC. Once onboard shows all green, come back to this skill.
-
 ## How to use
 
 1. **Read this SKILL.md first** so the agent knows the catalog shape,
