@@ -15,6 +15,7 @@
 
 import { Credential } from 'mppx'
 import {
+  getAllowedMethodsForPath,
   getRouteByPublicPath,
   resolveUpstreamPath,
   UpstreamPathPlaceholderError,
@@ -44,6 +45,7 @@ import {
 } from '../mpp/stellar-x402-server'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
+import { extractStellarAddress, type JobAuthRecord } from './job-status'
 import type { Env } from '../index'
 
 /**
@@ -384,6 +386,8 @@ type MerchantPayResult =
       body: string
       contentType: string
       merchantResponse: Response
+      /** HTTP status from merchant — 200 for sync, 202 for async jobs */
+      merchantStatus: number
     }
   | { kind: 'error'; response: Response }
 
@@ -471,7 +475,8 @@ async function payMerchantAndGetBody(
 
   console.log(`[proxy] Merchant responded: ${merchantResponse.status}`)
 
-  if (!merchantResponse.ok) {
+  // Accept 2xx responses (including 202 for async jobs)
+  if (!merchantResponse.ok && merchantResponse.status !== 202) {
     const errorBody = await merchantResponse.text()
     console.error(`[proxy] Merchant error body: ${errorBody.substring(0, 200)}`)
     return {
@@ -489,7 +494,85 @@ async function payMerchantAndGetBody(
 
   const contentType = merchantResponse.headers.get('content-type') || 'application/json'
   const body = await merchantResponse.text()
-  return { kind: 'ok', body, contentType, merchantResponse }
+  return { kind: 'ok', body, contentType, merchantResponse, merchantStatus: merchantResponse.status }
+}
+
+/**
+ * If the merchant returned 202, extract the job ID from the response body,
+ * store a jobAuth record in KV so the agent can poll later, and build a
+ * 202 response with an X-Job-Poll-Url header.
+ *
+ * Returns null if the merchant status is not 202.
+ */
+async function handleAsyncJob(
+  env: Env,
+  payResult: MerchantPayResult & { kind: 'ok' },
+  route: ReturnType<typeof getRouteByPublicPath> & {},
+  authHeader: string | null,
+  requestUrl: URL,
+): Promise<Response | null> {
+  if (payResult.merchantStatus !== 202) return null
+
+  // Try to extract a job ID from the response body
+  let jobId: string | undefined
+  try {
+    const parsed = JSON.parse(payResult.body)
+    jobId = parsed.jobId ?? parsed.job_id ?? parsed.id
+  } catch {
+    // Not JSON or no job ID — return the 202 as-is
+  }
+
+  if (!jobId) {
+    // No identifiable job ID — return raw 202 without poll URL
+    return new Response(payResult.body, {
+      status: 202,
+      headers: { 'Content-Type': payResult.contentType },
+    })
+  }
+
+  // Extract agent Stellar address for ownership binding
+  const stellarAddress = extractStellarAddress(authHeader)
+
+  // Derive the upstream job polling path from the merchant host
+  const merchantHost = new URL(`https://${route.id}`).hostname
+  const upstreamHost = route.id.split('_')[0] // e.g. "stablestudio" from "stablestudio_video_wan-2.6"
+
+  // Resolve the actual upstream host from the route
+  const routeInfo = getRouteByPublicPath(
+    requestUrl.pathname,
+    'POST',
+  )
+  const actualHost = routeInfo
+    ? routeInfo.upstreamHost
+    : `${upstreamHost}.dev`
+
+  const record: JobAuthRecord = {
+    stellarAddress: stellarAddress || 'unknown',
+    serviceId: route.id,
+    upstreamHost: actualHost,
+    upstreamJobPath: `/api/jobs/${jobId}`,
+    paidAt: new Date().toISOString(),
+  }
+
+  // Store with 24h TTL
+  await env.MPP_STORE.put(`jobAuth:${jobId}`, JSON.stringify(record), {
+    expirationTtl: 86400,
+  })
+
+  console.log(`[proxy] Async job ${jobId} stored for agent ${stellarAddress ?? 'unknown'} (route=${route.id})`)
+
+  // Build the poll URL relative to the router
+  const service = requestUrl.pathname.split('/')[3] // /v1/services/<service>/<op>
+  const pollPath = `/v1/services/${service}/jobs/${jobId}`
+  const pollUrl = `${requestUrl.origin}${pollPath}`
+
+  const headers: Record<string, string> = {
+    'Content-Type': payResult.contentType,
+    'X-Job-Poll-Url': pollUrl,
+    'X-Job-Id': jobId,
+  }
+
+  return new Response(payResult.body, { status: 202, headers })
 }
 
 export async function handleProxy(
@@ -501,6 +584,22 @@ export async function handleProxy(
 
   const route = resolveRoute(url, request.method)
   if (!route) {
+    const allowedMethods = getAllowedMethodsForPath(url.pathname)
+    if (allowedMethods.length > 0) {
+      return new Response(JSON.stringify({
+        error: 'Method not allowed for this service route',
+        path: url.pathname,
+        method: request.method,
+        allowed_methods: allowedMethods,
+        hint: `Retry with ${allowedMethods.join(' or ')}. The catalog 'method' field is authoritative — see GET /v1/services/catalog.`,
+      }), {
+        status: 405,
+        headers: {
+          'Content-Type': 'application/json',
+          'Allow': allowedMethods.join(', '),
+        },
+      })
+    }
     return new Response(JSON.stringify({
       error: 'Unknown public service route',
       hint: 'Use GET /v1/services/catalog for the list of supported public routes',
@@ -861,6 +960,20 @@ export async function handleProxy(
       return payResult.response
     }
 
+    // Check for async 202 — store job auth and return early with poll URL
+    const asyncResponse = await handleAsyncJob(env, payResult, route, authHeader, url)
+    if (asyncResponse) {
+      // Still need to settle the x402 payment — agent paid, merchant accepted
+      const settle = await settleStellarX402(env, verify.payload, verify.requirements)
+      if (!settle.success) {
+        console.error(
+          `[proxy] stellar.x402 SETTLE FAILED (async 202) for ${route.id}: ` +
+            `${settle.errorReason ?? ''} ${settle.errorMessage ?? ''}`,
+        )
+      }
+      return asyncResponse
+    }
+
     // Merchant 2xx — now submit the agent's signed Soroban invoke
     // on chain. Failures here are logged loudly but do NOT hide
     // merchant content from the agent: they already got served,
@@ -1212,6 +1325,11 @@ export async function handleProxy(
     requestBody,
   )
   if (payResult.kind === 'error') return payResult.response
+
+  // Check for async 202 — store job auth and return early with poll URL
+  const asyncResponse = await handleAsyncJob(env, payResult, route, authHeader, url)
+  if (asyncResponse) return asyncResponse
+
   const { body, contentType } = payResult
 
   // Async tasks: broadcast Stellar tx (handled by mppx store), log, cache idempotency

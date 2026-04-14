@@ -315,6 +315,21 @@ export function getRouteByPublicPath(
 }
 
 /**
+ * Return every method registered for `pathname`, regardless of HTTP
+ * method. Used by the proxy to distinguish "path doesn't exist" (→ 400)
+ * from "path exists but wrong method" (→ 405 with allowed_methods),
+ * so agents that default to GET get an actionable hint instead of a
+ * misleading 'Unknown public service route' error.
+ */
+export function getAllowedMethodsForPath(pathname: string): string[] {
+  const methods = new Set<string>()
+  for (const route of PUBLIC_SERVICE_ROUTES) {
+    if (route.publicPath === pathname) methods.add(route.method)
+  }
+  return [...methods]
+}
+
+/**
  * Whitelist for `{placeholder}` substitution values. Restricts to
  * model-name-style identifiers so a client cannot inject path
  * traversal (`../`), query strings (`?`), or anchors (`#`).

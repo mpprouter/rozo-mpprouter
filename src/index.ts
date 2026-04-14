@@ -6,6 +6,7 @@
  *
  * Endpoints:
  *   POST     /v1/services/<service>/<operation> — Core proxy
+ *   GET      /v1/services/<service>/jobs/<id> — Poll async job status
  *   GET      /health                        — Pool status
  *   GET      /services                      — Public service catalog
  *   GET      /v1/services/catalog           — Versioned public service catalog
@@ -16,6 +17,7 @@
  */
 
 import { handleProxy } from './routes/proxy'
+import { handleJobStatus } from './routes/job-status'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleSearch } from './routes/search'
@@ -130,6 +132,12 @@ export default {
         return handleX402Supported(env)
       }
 
+      // Async job polling — must match before the catch-all proxy route
+      const jobMatch = url.pathname.match(/^\/v1\/services\/([^/]+)\/jobs\/([^/]+)$/)
+      if (jobMatch && request.method === 'GET') {
+        return handleJobStatus(request, env, jobMatch[1], jobMatch[2])
+      }
+
       if (url.pathname.startsWith('/v1/services/')) {
         return handleProxy(request, env, ctx)
       }
@@ -145,7 +153,8 @@ export default {
         '  GET /llms.txt                        - LLM-readable description\n' +
         '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +
         '  GET /.well-known/ai-plugin.json      - AI plugin manifest\n' +
-        '  POST /v1/services/<service>/<op>     - Call a paid service\n\n' +
+        '  POST /v1/services/<service>/<op>     - Call a paid service\n' +
+        '  GET  /v1/services/<svc>/jobs/<id>   - Poll async job status\n\n' +
         'Docs: https://mpprouter.dev\n',
         { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       )
