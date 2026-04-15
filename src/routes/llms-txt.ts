@@ -23,6 +23,17 @@ pays the underlying merchant on Tempo. Services include OpenAI,
 OpenRouter, Anthropic, fal.ai, Replicate, Exa, Firecrawl, Perplexity,
 Stability AI, Suno, Grok, Brave Search, Alchemy, and more.
 
+## Don't have a Stellar wallet yet?
+
+Discovery is free, but **calling** a service requires a Stellar USDC
+wallet that speaks the 402 payment flow. Install the companion skill:
+
+  stellar-agent-wallet-skill —
+  https://github.com/mpprouter/stellar-agent-wallet-skill
+
+It handles wallet creation, USDC trustline, and the 402 → sign → retry
+loop for both x402 v2 and legacy mppx.
+
 ## Discovery endpoints
 
 GET /v1/services/catalog      — Full catalog (489 entries)
