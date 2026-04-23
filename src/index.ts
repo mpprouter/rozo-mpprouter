@@ -17,7 +17,7 @@
  */
 
 import { handleProxy } from './routes/proxy'
-import { handleJobStatus } from './routes/job-status'
+import { handleJobStatus, handleJobChallenge } from './routes/job-status'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleSearch } from './routes/search'
@@ -132,7 +132,15 @@ export default {
         return handleX402Supported(env)
       }
 
-      // Async job polling — must match before the catch-all proxy route
+      // Async job polling — must match before the catch-all proxy route.
+      // Challenge endpoint MUST come first (it's a longer suffix than the
+      // base job-status path). Both are GET-only.
+      const jobChallengeMatch = url.pathname.match(
+        /^\/v1\/services\/([^/]+)\/jobs\/([^/]+)\/challenge$/,
+      )
+      if (jobChallengeMatch && request.method === 'GET') {
+        return handleJobChallenge(request, env, jobChallengeMatch[1], jobChallengeMatch[2])
+      }
       const jobMatch = url.pathname.match(/^\/v1\/services\/([^/]+)\/jobs\/([^/]+)$/)
       if (jobMatch && request.method === 'GET') {
         return handleJobStatus(request, env, jobMatch[1], jobMatch[2])
@@ -154,7 +162,8 @@ export default {
         '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +
         '  GET /.well-known/ai-plugin.json      - AI plugin manifest\n' +
         '  POST /v1/services/<service>/<op>     - Call a paid service\n' +
-        '  GET  /v1/services/<svc>/jobs/<id>   - Poll async job status\n\n' +
+        '  GET  /v1/services/<svc>/jobs/<id>/challenge - Get ownership nonce\n' +
+        '  GET  /v1/services/<svc>/jobs/<id>   - Poll async job (signed)\n\n' +
         'Docs: https://mpprouter.dev\n',
         { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       )

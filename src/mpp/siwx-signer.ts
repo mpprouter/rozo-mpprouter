@@ -17,6 +17,8 @@ interface SiwxChallenge {
   nonce: string
   issuedAt: string
   expirationTime: string
+  /** CAIP-2 chain id from the challenge (e.g. "eip155:8453"). */
+  chainId?: string
 }
 
 /**
@@ -36,13 +38,23 @@ function parseSiwxChallenge(body: unknown): SiwxChallenge | null {
     nonce: ext.nonce,
     issuedAt: ext.issuedAt,
     expirationTime: ext.expirationTime,
+    chainId: typeof ext.chainId === 'string' ? ext.chainId : undefined,
   }
 }
 
 /**
  * Build the EIP-4361 (SIWE) message text from a SIWX challenge.
+ *
+ * Note: EIP-4361 requires `Chain ID` to be the numeric chain id only
+ * (e.g. `8453`), NOT the CAIP-2 form (`eip155:8453`). Servers verifying
+ * the signature reconstruct the message with the numeric form, so if
+ * we include the `eip155:` prefix the signature will not match and the
+ * server returns `siwx_invalid_signature`.
  */
 function buildSiweMessage(challenge: SiwxChallenge, address: string): string {
+  const numericChainId = challenge.chainId
+    ? challenge.chainId.replace(/^eip155:/, '')
+    : '8453'
   return [
     `${challenge.domain} wants you to sign in with your Ethereum account:`,
     address,
@@ -51,7 +63,7 @@ function buildSiweMessage(challenge: SiwxChallenge, address: string): string {
     '',
     `URI: ${challenge.uri}`,
     `Version: 1`,
-    `Chain ID: eip155:8453`,
+    `Chain ID: ${numericChainId}`,
     `Nonce: ${challenge.nonce}`,
     `Issued At: ${challenge.issuedAt}`,
     `Expiration Time: ${challenge.expirationTime}`,
@@ -94,7 +106,7 @@ export async function fetchWithSiwx(
     statement: challenge.statement || 'Sign in to verify your wallet identity',
     uri: challenge.uri,
     version: '1',
-    chainId: 'eip155:8453',
+    chainId: challenge.chainId || 'eip155:8453',
     type: 'eip191',
     nonce: challenge.nonce,
     issuedAt: challenge.issuedAt,

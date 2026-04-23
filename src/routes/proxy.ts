@@ -498,11 +498,18 @@ async function payMerchantAndGetBody(
 }
 
 /**
- * If the merchant returned 202, extract the job ID from the response body,
- * store a jobAuth record in KV so the agent can poll later, and build a
- * 202 response with an X-Job-Poll-Url header.
+ * If the merchant returned an async job (either HTTP 202, or HTTP 200
+ * with a pending-status body containing a job id), extract the job ID,
+ * store a jobAuth record in KV so the agent can poll later, and build
+ * a response with an X-Job-Poll-Url header.
  *
- * Returns null if the merchant status is not 202.
+ * Why 200+jobId is also async: some merchants (StableStudio
+ * Nano-Banana-Pro, etc.) accept the payment, enqueue the work, and
+ * return 200 with `{ jobId, status: "queued" | "pending" | ... }`
+ * instead of the canonical 202. Treating those as sync leaves no
+ * `jobAuth:<id>` record and the agent gets 404 when they poll.
+ *
+ * Returns null if the response does not look like an async job.
  */
 async function handleAsyncJob(
   env: Env,
@@ -511,43 +518,59 @@ async function handleAsyncJob(
   authHeader: string | null,
   requestUrl: URL,
 ): Promise<Response | null> {
-  if (payResult.merchantStatus !== 202) return null
-
-  // Try to extract a job ID from the response body
+  // Try to extract a job ID from the response body (both 202 and 200 paths).
   let jobId: string | undefined
+  let bodyStatus: string | undefined
   try {
     const parsed = JSON.parse(payResult.body)
     jobId = parsed.jobId ?? parsed.job_id ?? parsed.id
+    bodyStatus = typeof parsed.status === 'string' ? parsed.status.toLowerCase() : undefined
   } catch {
-    // Not JSON or no job ID — return the 202 as-is
+    // Not JSON — cannot be an async job
   }
 
+  const PENDING_STATUSES = new Set([
+    'queued', 'pending', 'running', 'processing', 'in_progress', 'in-progress',
+  ])
+  const isAsync =
+    payResult.merchantStatus === 202 ||
+    (payResult.merchantStatus === 200 && !!jobId && (bodyStatus === undefined || PENDING_STATUSES.has(bodyStatus)))
+
+  if (!isAsync) return null
+
   if (!jobId) {
-    // No identifiable job ID — return raw 202 without poll URL
+    // Merchant returned 202 with no identifiable job id — pass through as-is.
     return new Response(payResult.body, {
       status: 202,
       headers: { 'Content-Type': payResult.contentType },
     })
   }
 
-  // Extract agent Stellar address for ownership binding
+  // Extract agent Stellar address for ownership binding. If we can't
+  // pin the job to a G address, we also cannot verify ownership on
+  // poll — so refuse to create an unbound record rather than store
+  // 'unknown' (which would be unclaimable forever).
   const stellarAddress = extractStellarAddress(authHeader)
+  if (!stellarAddress) {
+    console.error(
+      `[proxy] Async job from ${route.id} without a Stellar credential — cannot bind ownership, rejecting.`,
+    )
+    return new Response(
+      JSON.stringify({
+        error: 'Async jobs require a Stellar payment credential to bind ownership',
+      }),
+      { status: 401, headers: { 'Content-Type': 'application/json' } },
+    )
+  }
 
-  // Derive the upstream job polling path from the merchant host
-  const merchantHost = new URL(`https://${route.id}`).hostname
-  const upstreamHost = route.id.split('_')[0] // e.g. "stablestudio" from "stablestudio_video_wan-2.6"
-
-  // Resolve the actual upstream host from the route
-  const routeInfo = getRouteByPublicPath(
-    requestUrl.pathname,
-    'POST',
-  )
+  // Resolve the upstream host from the route table.
+  const routeInfo = getRouteByPublicPath(requestUrl.pathname, 'POST')
   const actualHost = routeInfo
     ? routeInfo.upstreamHost
-    : `${upstreamHost}.dev`
+    : `${route.id.split('_')[0]}.dev`
 
   const record: JobAuthRecord = {
-    stellarAddress: stellarAddress || 'unknown',
+    stellarAddress,
     serviceId: route.id,
     upstreamHost: actualHost,
     upstreamJobPath: `/api/jobs/${jobId}`,
@@ -559,7 +582,7 @@ async function handleAsyncJob(
     expirationTtl: 86400,
   })
 
-  console.log(`[proxy] Async job ${jobId} stored for agent ${stellarAddress ?? 'unknown'} (route=${route.id})`)
+  console.log(`[proxy] Async job ${jobId} stored for agent ${stellarAddress} (route=${route.id})`)
 
   // Build the poll URL relative to the router
   const service = requestUrl.pathname.split('/')[3] // /v1/services/<service>/<op>
