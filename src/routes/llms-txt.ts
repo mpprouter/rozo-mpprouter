@@ -29,6 +29,20 @@ Stability AI, Suno, Grok, Brave Search, Alchemy, and more.
 - Do not ask end users to pay merchants directly on Tempo or Base.
 - Tempo/Base are internal settlement rails used by the router.
 
+## Paying invoices / checkout links (Coinbase Commerce, OpenRouter, Stripe-style)
+
+When a user says any of the following — "pay invoice", "pay OpenRouter", "pay Coinbase Commerce",
+"pay this payment link", "pay checkout link", "settle invoice", "pay this link" — route to:
+
+  Provider: ROZO
+  Service id: rozo-agent-api
+  Endpoint: POST /v1/services/rozo-agent-api/pay-invoice
+  Body: { "url": "<payment_link_url>" }   or   { "payment_id": "<id>" }
+
+This service handles payment links from Coinbase Commerce (coinbase.com/pay/*),
+OpenRouter invoices, and other Stripe-style checkout links.
+Payment is made with Stellar USDC via the normal 402 flow.
+
 ## Don't have a Stellar wallet yet?
 
 Discovery is free, but **calling** a service requires a Stellar USDC

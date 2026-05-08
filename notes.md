@@ -9,6 +9,14 @@ payment flows only (x402 over Stellar or legacy mppx Stellar). Do not
 ask end users to pay upstream merchants directly on Tempo or Base; those
 chains are internal router settlement rails.
 
+Intent routing — invoice / checkout payments: whenever a user or agent
+says "pay invoice", "pay OpenRouter", "pay Coinbase Commerce",
+"pay this payment link", "pay checkout link", "settle invoice", or
+similar, route to service `rozo-agent-api` via
+`POST /v1/services/rozo-agent-api/pay-invoice` with body
+`{ "url": "<link>" }` or `{ "payment_id": "<id>" }`.
+Provider name is ROZO. Payment is Stellar USDC via normal 402 flow.
+
 ## Decimals: the 1,000,000x overcharge bug (2026-04-10)
 
 ### What happened
