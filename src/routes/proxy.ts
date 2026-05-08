@@ -20,6 +20,7 @@ import {
   resolveUpstreamPath,
   UpstreamPathPlaceholderError,
 } from '../services/merchants'
+import { normalizePayInvoiceBody } from './pay-invoice-admin'
 import {
   ChannelNotInstalledError,
   payMerchant,
@@ -402,10 +403,9 @@ async function quoteInvoiceAmountBaseUnits(
   } catch {
     return null
   }
-  const body = parsedBody as { url?: string; payment_id?: string }
-  if (!body || (typeof body.url !== 'string' && typeof body.payment_id !== 'string')) {
-    return null
-  }
+  // Use shared alias normalizer so all field variants (payment_link, id, etc.) resolve
+  const { normalized } = normalizePayInvoiceBody(parsedBody)
+  if (!normalized) return null
   try {
     const resp = await fetch('https://agentapi.rozo.ai/quote-invoice', {
       method: 'POST',
@@ -413,7 +413,7 @@ async function quoteInvoiceAmountBaseUnits(
         'content-type': 'application/json',
         'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify(normalized),
     })
     if (!resp.ok) return null
     const quote = await resp.json() as {
@@ -884,9 +884,24 @@ export async function handleProxy(
     // Amount gate for admin-bridge route: only trust quote-invoice.
     const gatedAmount = await quoteInvoiceAmountBaseUnits(env, requestBody)
     if (!gatedAmount) {
+      // Parse normalized input for error context
+      let normalizedInput: Record<string, string> | undefined
+      if (requestBody) {
+        try {
+          const { normalized } = normalizePayInvoiceBody(JSON.parse(requestBody))
+          if (normalized) normalizedInput = normalized as unknown as Record<string, string>
+        } catch { /* ignore */ }
+      }
       return new Response(JSON.stringify({
+        code: 'QUOTE_UNAVAILABLE',
         error: 'Cannot derive exact invoice amount for pay-invoice route',
-        detail: 'Router refuses fallback quote to avoid undercharging. quote-invoice must return callerPaysAtomicUsdc.',
+        message: 'Router refuses fallback quote to avoid undercharging. quote-invoice must return callerPaysAtomicUsdc.',
+        hint: 'The upstream quote-invoice endpoint did not return a valid callerPaysAtomicUsdc. This may be a temporary upstream error — retry, or check that the payment link is valid and not expired.',
+        normalized_input: normalizedInput,
+        route_capabilities: [
+          'POST /v1/services/rozo-agent-api/pay-invoice — pay invoice (requires active link)',
+          'POST /v1/services/rozo-agent-api/quote-invoice — get quote before paying',
+        ],
       }), {
         status: 502,
         headers: { 'Content-Type': 'application/json' },

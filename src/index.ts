@@ -25,7 +25,7 @@ import { handleX402Supported } from './routes/x402-supported'
 import { handleLlmsTxt } from './routes/llms-txt'
 import { handleOpenApi } from './routes/openapi'
 import { handleAiPlugin } from './routes/ai-plugin'
-import { handleAdminPayInvoice } from './routes/pay-invoice-admin'
+import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-admin'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -143,6 +143,13 @@ export default {
           status: 404,
           headers: { 'Content-Type': 'application/json' },
         })
+      }
+
+      // Public quote-invoice endpoint — mirrors pay-invoice input contract but
+      // returns the amount quote without charging. Exposed alongside pay-invoice
+      // so clients can self-quote before committing to payment.
+      if (url.pathname === '/v1/services/rozo-agent-api/quote-invoice') {
+        return handleQuoteInvoice(request, env)
       }
 
       // Async job polling — must match before the catch-all proxy route.
