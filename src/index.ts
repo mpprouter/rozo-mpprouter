@@ -25,6 +25,7 @@ import { handleX402Supported } from './routes/x402-supported'
 import { handleLlmsTxt } from './routes/llms-txt'
 import { handleOpenApi } from './routes/openapi'
 import { handleAiPlugin } from './routes/ai-plugin'
+import { handleAdminPayInvoice } from './routes/pay-invoice-admin'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -93,6 +94,7 @@ export interface Env {
   // independently if they want. Secret — set via `wrangler secret
   // put STELLAR_X402_FACILITATOR_SECRET`.
   STELLAR_X402_FACILITATOR_SECRET: string
+  PAYINVOICE_ADMIN_SECRET: string
 
   // DingTalk webhook token for operational alerts (low balance, etc.)
   // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
@@ -132,6 +134,10 @@ export default {
         return handleX402Supported(env)
       }
 
+      if (url.pathname === '/admin/pay-invoice') {
+        return handleAdminPayInvoice(request, env)
+      }
+
       // Async job polling — must match before the catch-all proxy route.
       // Challenge endpoint MUST come first (it's a longer suffix than the
       // base job-status path). Both are GET-only.
@@ -158,6 +164,7 @@ export default {
         '  GET /v1/services/catalog             - Versioned service catalog\n' +
         '  GET /v1/services/search              - Search/filter catalog\n' +
         '  GET /x402/supported                  - x402 discovery\n' +
+        '  POST /admin/pay-invoice              - admin bypass invoice unlock\n' +
         '  GET /llms.txt                        - LLM-readable description\n' +
         '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +
         '  GET /.well-known/ai-plugin.json      - AI plugin manifest\n' +
