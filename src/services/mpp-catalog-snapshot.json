@@ -2,6 +2,47 @@
   "version": 1,
   "services": [
     {
+      "id": "rozo-agent-api",
+      "name": "Rozo Agent API",
+      "serviceUrl": "https://agentapi.rozo.ai",
+      "url": "https://agentapi.rozo.ai",
+      "description": "Agentic payment for online checkout. Pay Coinbase Payment Links (Coinbase Payments) and similar checkout invoices, including Stripe-style pay links, with your agents.",
+      "categories": [
+        "AI",
+        "crypto",
+        "utility",
+        "OpenRouter",
+        "CoinbaseCommerce"
+      ],
+      "status": "active",
+      "docs": {
+        "homepage": "https://agentapi.rozo.ai/openapi.json",
+        "apiReference": "https://agentapi.rozo.ai/openapi.json"
+      },
+      "methods": {
+        "tempo": {
+          "intents": [
+            "charge"
+          ]
+        }
+      },
+      "endpoints": [
+        {
+          "method": "POST",
+          "path": "/pay-invoice",
+          "description": "Pay a Coinbase Payment Link (Coinbase Payments / Stripe-style invoice link)",
+          "payment": {
+            "intent": "charge",
+            "method": "tempo",
+            "currency": "usd",
+            "decimals": 6,
+            "description": "Dynamic invoice amount from 402 challenge",
+            "amount": "10000"
+          }
+        }
+      ]
+    },
+    {
       "id": "agentmail",
       "name": "AgentMail",
       "url": "https://mpp.api.agentmail.to",

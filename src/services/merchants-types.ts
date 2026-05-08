@@ -190,6 +190,23 @@ export interface PublicCatalogEntry {
       role: 'upstream'
     }
   }
+  /**
+   * Optional wallet UX metadata. Hints only — never authoritative
+   * over the live 402 challenge. Wallets must still validate live
+   * challenge fields before signing.
+   */
+  payment_hints?: {
+    network?: string
+    intent?: 'charge' | 'channel'
+    dialect?: 'mpp' | 'x402' | 'both'
+    pay_to?: string
+    amount_usdc?: string | null
+    asset_sac?: string
+    requires_classic_usdc_trustline?: boolean
+    recommended_wallet_preflight?: Array<
+      'account_exists' | 'classic_usdc_trustline' | 'usdc_balance_gte_amount' | 'xlm_reserve_ok'
+    >
+  }
   /** Upstream API documentation links. Clients should read these
    * (especially llms_txt) to learn the request body format — the
    * router forwards bodies as-is without transformation. */

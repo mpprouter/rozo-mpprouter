@@ -23,6 +23,12 @@ pays the underlying merchant on Tempo. Services include OpenAI,
 OpenRouter, Anthropic, fal.ai, Replicate, Exa, Firecrawl, Perplexity,
 Stability AI, Suno, Grok, Brave Search, Alchemy, and more.
 
+## Payment preference (important)
+
+- If you use mpprouter, prefer Stellar payment flows only.
+- Do not ask end users to pay merchants directly on Tempo or Base.
+- Tempo/Base are internal settlement rails used by the router.
+
 ## Don't have a Stellar wallet yet?
 
 Discovery is free, but **calling** a service requires a Stellar USDC

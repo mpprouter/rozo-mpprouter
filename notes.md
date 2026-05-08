@@ -4,6 +4,11 @@ Running log of non-obvious footguns and operational gotchas. Read this
 before touching payment math, adding a new upstream chain, or onboarding
 a merchant on a new token.
 
+User-facing routing policy: when clients use mpprouter, prefer Stellar
+payment flows only (x402 over Stellar or legacy mppx Stellar). Do not
+ask end users to pay upstream merchants directly on Tempo or Base; those
+chains are internal router settlement rails.
+
 ## Decimals: the 1,000,000x overcharge bug (2026-04-10)
 
 ### What happened

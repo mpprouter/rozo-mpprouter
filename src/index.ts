@@ -95,6 +95,7 @@ export interface Env {
   // put STELLAR_X402_FACILITATOR_SECRET`.
   STELLAR_X402_FACILITATOR_SECRET: string
   PAYINVOICE_ADMIN_SECRET: string
+  ADMIN_ENDPOINT_ENABLED?: string
 
   // DingTalk webhook token for operational alerts (low balance, etc.)
   // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
@@ -135,7 +136,13 @@ export default {
       }
 
       if (url.pathname === '/admin/pay-invoice') {
-        return handleAdminPayInvoice(request, env)
+        if (env.ADMIN_ENDPOINT_ENABLED === 'true') {
+          return handleAdminPayInvoice(request, env)
+        }
+        return new Response(JSON.stringify({ error: 'Not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        })
       }
 
       // Async job polling — must match before the catch-all proxy route.
@@ -164,7 +171,6 @@ export default {
         '  GET /v1/services/catalog             - Versioned service catalog\n' +
         '  GET /v1/services/search              - Search/filter catalog\n' +
         '  GET /x402/supported                  - x402 discovery\n' +
-        '  POST /admin/pay-invoice              - admin bypass invoice unlock\n' +
         '  GET /llms.txt                        - LLM-readable description\n' +
         '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +
         '  GET /.well-known/ai-plugin.json      - AI plugin manifest\n' +

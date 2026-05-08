@@ -223,6 +223,7 @@ export type CatalogEnvView = {
   X402_ENABLED?: string
   STELLAR_NETWORK?: string
   STELLAR_X402_PAY_TO?: string
+  STELLAR_ROUTER_PUBLIC?: string
 }
 
 /**
@@ -232,6 +233,37 @@ export type CatalogEnvView = {
  * Stellar token we accept.
  */
 const STELLAR_X402_ASSET = 'USDC'
+const STELLAR_USDC_SAC_BY_NETWORK: Record<string, string> = {
+  'stellar:pubnet': 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75',
+  'stellar:testnet': 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+}
+
+const RECOMMENDED_WALLET_PREFLIGHT: Array<
+  'account_exists' | 'classic_usdc_trustline' | 'usdc_balance_gte_amount' | 'xlm_reserve_ok'
+> = [
+  'account_exists',
+  'classic_usdc_trustline',
+  'usdc_balance_gte_amount',
+  'xlm_reserve_ok',
+]
+
+function parseFixedUsdPrice(price: string): string | null {
+  const m = /^\$([0-9]+(?:\.[0-9]+)?)\/request$/.exec(price.trim())
+  if (!m) return null
+  return m[1]
+}
+
+function toStellarUsdc7(amountDecimal: string): string | null {
+  if (!/^\d+(?:\.\d+)?$/.test(amountDecimal)) return null
+  const [whole, fracRaw = ''] = amountDecimal.split('.')
+  if (fracRaw.length > 7) return null
+  return `${whole}.${fracRaw.padEnd(7, '0')}`
+}
+
+function getUsdcSacForNetwork(network?: string): string | undefined {
+  if (!network) return undefined
+  return STELLAR_USDC_SAC_BY_NETWORK[network] ?? STELLAR_USDC_SAC_BY_NETWORK['stellar:pubnet']
+}
 
 export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
   // Single place to decide stellar.x402 inclusion — don't scatter
@@ -283,6 +315,34 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
           role: 'upstream' as const,
         },
       },
+    }
+    if (stellarIntents.length > 0) {
+      const dialect: 'mpp' | 'both' =
+        stellarX402Block ? 'both' : 'mpp'
+      const mppPayTo = env?.STELLAR_ROUTER_PUBLIC
+      const x402PayTo = env?.STELLAR_X402_PAY_TO
+      let payTo: string | undefined
+      if (dialect === 'mpp') {
+        payTo = mppPayTo
+      } else if (mppPayTo && x402PayTo && mppPayTo === x402PayTo) {
+        // Only expose a single pay_to for "both" when they are
+        // actually the same address. Otherwise omit to avoid guessing.
+        payTo = mppPayTo
+      }
+
+      const fixedUsd = parseFixedUsdPrice(route.price)
+      const amountUsdc = fixedUsd ? toStellarUsdc7(fixedUsd) : null
+      const paymentHints: NonNullable<PublicCatalogEntry['payment_hints']> = {
+        network: env?.STELLAR_NETWORK,
+        intent: stellarIntents[0] === 'charge' ? 'charge' : 'channel',
+        dialect,
+        ...(payTo ? { pay_to: payTo } : {}),
+        ...(amountUsdc ? { amount_usdc: amountUsdc } : {}),
+        ...(env?.STELLAR_NETWORK ? { asset_sac: getUsdcSacForNetwork(env.STELLAR_NETWORK) } : {}),
+        requires_classic_usdc_trustline: true,
+        recommended_wallet_preflight: RECOMMENDED_WALLET_PREFLIGHT,
+      }
+      entry.payment_hints = paymentHints
     }
     if (route.docs) {
       entry.docs = {

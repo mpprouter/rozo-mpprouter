@@ -364,6 +364,69 @@ function parseTempoChallenge(wwwAuth: string): {
   }
 }
 
+function isRozoPayInvoiceRoute(route: {
+  service?: string
+  operation?: string
+  upstreamHost?: string
+  upstreamPath?: string
+}): boolean {
+  return (
+    route.service === 'rozo-agent-api' &&
+    route.operation === 'pay-invoice' &&
+    route.upstreamHost === 'agentapi.rozo.ai' &&
+    route.upstreamPath === '/pay-invoice'
+  )
+}
+
+function parseX402AmountFromBody(bodyText: string): string | null {
+  try {
+    const parsed = JSON.parse(bodyText) as {
+      accepts?: Array<{ maxAmountRequired?: string }>
+    }
+    const amount = parsed.accepts?.[0]?.maxAmountRequired
+    if (!amount || !/^\d+$/.test(amount)) return null
+    return amount
+  } catch {
+    return null
+  }
+}
+
+async function quoteInvoiceAmountBaseUnits(
+  env: Env,
+  requestBody: string | undefined,
+): Promise<string | null> {
+  if (!requestBody || !env.PAYINVOICE_ADMIN_SECRET) return null
+  let parsedBody: unknown
+  try {
+    parsedBody = JSON.parse(requestBody)
+  } catch {
+    return null
+  }
+  const body = parsedBody as { url?: string; payment_id?: string }
+  if (!body || (typeof body.url !== 'string' && typeof body.payment_id !== 'string')) {
+    return null
+  }
+  try {
+    const resp = await fetch('https://agentapi.rozo.ai/quote-invoice', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
+      },
+      body: JSON.stringify(body),
+    })
+    if (!resp.ok) return null
+    const quote = await resp.json() as {
+      quote?: { callerPaysAtomicUsdc?: string }
+    }
+    const atomic = quote.quote?.callerPaysAtomicUsdc
+    if (!atomic || !/^\d+$/.test(atomic)) return null
+    return atomic
+  } catch {
+    return null
+  }
+}
+
 /**
  * Shared merchant-pay step used by both the Stellar and x402 verify
  * branches. Dispatches on the merchant's live 402 intent (`charge` vs
@@ -400,6 +463,50 @@ async function payMerchantAndGetBody(
   request: Request,
   requestBody: string | undefined,
 ): Promise<MerchantPayResult> {
+  // Special bridge: user still pays Router via Stellar/x402 API path,
+  // but Router settles this merchant via admin-secret upstream call.
+  if (isRozoPayInvoiceRoute(route) && env.PAYINVOICE_ADMIN_SECRET) {
+    let merchantResponse: Response
+    try {
+      const headers = new Headers(forwardHeaders(request))
+      headers.set('x-admin-secret', env.PAYINVOICE_ADMIN_SECRET)
+      if (!headers.get('content-type')) headers.set('content-type', 'application/json')
+      merchantResponse = await fetch(merchantUrl, {
+        method: request.method,
+        headers,
+        body: requestBody,
+      })
+    } catch (err: any) {
+      return {
+        kind: 'error',
+        response: new Response(
+          JSON.stringify({
+            error: 'Merchant admin payment failed',
+            detail: err.message,
+          }),
+          { status: 502, headers: { 'Content-Type': 'application/json' } },
+        ),
+      }
+    }
+
+    const contentType = merchantResponse.headers.get('content-type') || 'application/json'
+    const body = await merchantResponse.text()
+    if (!merchantResponse.ok && merchantResponse.status !== 202) {
+      return {
+        kind: 'error',
+        response: new Response(
+          JSON.stringify({
+            error: 'Merchant admin payment failed',
+            status: merchantResponse.status,
+            detail: body.substring(0, 500),
+          }),
+          { status: 502, headers: { 'Content-Type': 'application/json' } },
+        ),
+      }
+    }
+    return { kind: 'ok', body, contentType, merchantResponse, merchantStatus: merchantResponse.status }
+  }
+
   // Dispatch on the merchant's ACTUAL intent (parsed.intent from the
   // live 402), not the hardcoded route.upstreamPaymentMethod. See the
   // long comment at the original inline site for why. Logic here is
@@ -766,7 +873,48 @@ export async function handleProxy(
   }
 
   const wwwAuth = probeResponse.headers.get('www-authenticate')
-  if (!wwwAuth) {
+  let parsed: ReturnType<typeof parseTempoChallenge> = null
+  if (wwwAuth) {
+    parsed = parseTempoChallenge(wwwAuth)
+  } else if (isRozoPayInvoiceRoute(route)) {
+    // rozo-agent-api emits x402 JSON 402 (no WWW-Authenticate).
+    const rawBody = await probeResponse.text()
+    const x402Amount = parseX402AmountFromBody(rawBody)
+
+    // Amount gate for admin-bridge route: only trust quote-invoice.
+    const gatedAmount = await quoteInvoiceAmountBaseUnits(env, requestBody)
+    if (!gatedAmount) {
+      return new Response(JSON.stringify({
+        error: 'Cannot derive exact invoice amount for pay-invoice route',
+        detail: 'Router refuses fallback quote to avoid undercharging. quote-invoice must return callerPaysAtomicUsdc.',
+      }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+
+    const finalAmount = (() => {
+      if (!x402Amount) return gatedAmount
+      try {
+        // Safe-side max gate: never charge less than either source.
+        return BigInt(gatedAmount) > BigInt(x402Amount) ? gatedAmount : x402Amount
+      } catch {
+        return gatedAmount
+      }
+    })()
+
+    parsed = {
+      id: `x402-${Date.now()}`,
+      realm: merchantHost,
+      intent: 'charge',
+      request: {
+        amount: finalAmount,
+        currency: 'usd',
+        decimals: 6,
+        recipient: 'router-admin-bypass',
+      },
+    }
+  } else {
     return new Response(JSON.stringify({
       error: 'Merchant returned 402 without WWW-Authenticate header',
     }), {
@@ -775,7 +923,6 @@ export async function handleProxy(
     })
   }
 
-  const parsed = parseTempoChallenge(wwwAuth)
   if (!parsed) {
     return new Response(JSON.stringify({
       error: 'Could not parse merchant challenge',
