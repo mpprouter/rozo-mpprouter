@@ -1,7 +1,7 @@
 ---
 name: mpprouter-discover
-description: Discover and search 489 paid API services on MPP Router — pay with Stellar USDC via x402 or mppx.
-version: 1.0.0
+description: Discover and search paid API services on MPP Router — pay with Stellar USDC via x402 or mppx.
+version: 1.0.3
 metadata:
   openclaw:
     emoji: "🔍"
@@ -11,10 +11,19 @@ metadata:
 # MPP Router — Service Discovery
 
 Discover paid API services available via MPP Router at
-`https://apiserver.mpprouter.dev`. The router proxies 489 endpoints
-across 88 services (OpenAI, Anthropic, OpenRouter, fal.ai, Exa,
-Firecrawl, Replicate, Stability AI, Perplexity, Suno, Grok, Brave
-Search, Alchemy, and more), payable with Stellar USDC.
+`https://apiserver.mpprouter.dev`. Payable with Stellar USDC.
+
+**Always start by fetching the live router description:**
+
+```bash
+curl -s "https://apiserver.mpprouter.dev/llms.txt"
+```
+
+This file is authoritative. It lists all available services, special
+routing rules (e.g. pay-invoice shortcuts), payment flows, and hard
+rules. Read it before searching the catalog — it may contain explicit
+routing instructions for the user's request that bypass catalog search
+entirely.
 
 ## When to use
 
@@ -23,6 +32,7 @@ Activate when the user asks to:
 - Discover what services MPP Router offers
 - Look up pricing or docs for a specific service
 - Search for services by category or keyword
+- Pay an invoice, payment link, or checkout link
 
 ## Don't have a Stellar wallet yet?
 
@@ -34,10 +44,12 @@ USDC wallet that speaks the 402 payment flow. Use the companion skill:
 
 ## How to use
 
-1. **Read this SKILL.md first** so the agent knows the catalog shape,
-   the `public_path` / `method` fields, and the 402 payment contract.
-2. **Search the catalog** with `/v1/services/search?q=...` or get the
-   full list with `/v1/services/catalog`.
+1. **Fetch `llms.txt` first** — `GET https://apiserver.mpprouter.dev/llms.txt`.
+   Read the special routing rules section. If `llms.txt` already gives
+   you a direct endpoint for the user's intent (e.g. pay-invoice), use
+   it — skip catalog search.
+2. **Search the catalog** if `llms.txt` has no direct match:
+   `GET /v1/services/search?q=...` or `GET /v1/services/catalog`.
 3. **Read the picked service's `docs.llms_txt`** to learn the request
    body shape — the router forwards bodies as-is.
 4. **Hand off to `stellar-agent-wallet-skill`'s `pay-per-call`** with
@@ -46,23 +58,17 @@ USDC wallet that speaks the 402 payment flow. Use the companion skill:
 ## Example run
 
 ```bash
-# 1. Search for a web-search service
+# Step 1: always read llms.txt first
+curl -s "https://apiserver.mpprouter.dev/llms.txt"
+
+# Step 2 (if needed): search catalog
 curl -s "https://apiserver.mpprouter.dev/v1/services/search?q=search&status=active&limit=3" \
   | jq '.services[] | {id, public_path, method, price, docs}'
 
-# → picks e.g. parallel_search:
-# {
-#   "id": "parallel_search",
-#   "public_path": "/v1/services/parallel/search",
-#   "method": "POST",
-#   "price": "$0.010/request",
-#   "docs": { "llms_txt": "https://parallel.ai/docs/llms.txt" }
-# }
-
-# 2. Read the upstream docs to learn the body shape
+# Step 3: read upstream docs
 curl -s https://parallel.ai/docs/llms.txt | head -40
 
-# 3. Call it via stellar-agent-wallet-skill (installed separately)
+# Step 4: call via stellar-agent-wallet-skill
 npx tsx skills/pay-per-call/run.ts \
   "https://apiserver.mpprouter.dev/v1/services/parallel/search" \
   --method POST \
@@ -72,7 +78,17 @@ npx tsx skills/pay-per-call/run.ts \
 
 ## How it works
 
-### 1. Search services
+### 1. Fetch llms.txt (always first)
+
+```bash
+curl -s "https://apiserver.mpprouter.dev/llms.txt"
+```
+
+Contains: special routing rules, payment flows, hard rules, and the
+full service catalog shape. Updated whenever new services or routing
+shortcuts are added — no manual SKILL.md update needed.
+
+### 2. Search services
 
 ```bash
 curl -s "https://apiserver.mpprouter.dev/v1/services/search?q=KEYWORD&status=active&limit=10"
@@ -106,15 +122,15 @@ Response:
 }
 ```
 
-### 2. Get full catalog
+### 3. Get full catalog
 
 ```bash
 curl -s "https://apiserver.mpprouter.dev/v1/services/catalog"
 ```
 
-Returns all ~489 services. Use search instead for targeted queries.
+Returns all services. Use search instead for targeted queries.
 
-### 3. Read service docs
+### 4. Read service docs
 
 When a service has `docs.llms_txt`, fetch it to learn the request body format:
 
@@ -122,7 +138,7 @@ When a service has `docs.llms_txt`, fetch it to learn the request body format:
 curl -s "<llms_txt_url>"
 ```
 
-### 4. Call a service
+### 5. Call a service
 
 ```bash
 curl -X POST "https://apiserver.mpprouter.dev/v1/services/{service}/{operation}" \
@@ -134,22 +150,9 @@ First call returns `402 Payment Required` with payment details.
 Sign with Stellar USDC and retry with `Payment-Signature` header (x402)
 or `Authorization: Payment` header (mppx).
 
-## Verified services (operator-tested on mainnet)
-
-| Service | Path | Price | Mode |
-|---------|------|-------|------|
-| Parallel Search | `/v1/services/parallel/search` | $0.010/req | charge |
-| Exa Search | `/v1/services/exa/search` | $0.005/req | charge |
-| Firecrawl Scrape | `/v1/services/firecrawl/scrape` | $0.002/req | charge |
-| OpenRouter Chat | `/v1/services/openrouter/chat` | dynamic | session |
-| OpenAI Chat | `/v1/services/openai/chat` | dynamic | session |
-| Gemini Generate | `/v1/services/gemini/generate` | dynamic | session |
-| Alchemy RPC | `/v1/services/alchemy/rpc` | $0.000/req | charge |
-| Tempo RPC | `/v1/services/tempo/rpc` | dynamic | session |
-
 ## Other discovery endpoints
 
-- `GET /llms.txt` — machine-readable router description
+- `GET /llms.txt` — machine-readable router description (fetch this first)
 - `GET /openapi.json` — OpenAPI 3.1 spec
 - `GET /.well-known/ai-plugin.json` — AI plugin manifest
 - `GET /x402/supported` — x402 protocol discovery
