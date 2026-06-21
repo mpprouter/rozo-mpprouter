@@ -120,11 +120,25 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // `{version}` if mpp.dev publishes the templated form, but the
   // operator override here pins both the public id and the model
   // default for backward compat with old bookmarks.
+  //
+  // verifiedMode false — real-money E2E 2026-06-22: after re-opening the
+  // session channel (descriptor now captured, payment layer OK — the old
+  // `descriptor required for TIP-1034` error is GONE), the merchant
+  // returns 502/status:404. Root cause: upstream path is
+  // `/{version}/models/*` and `resolveUpstreamPath` does not substitute
+  // the literal `*` wildcard, so we forward `/v1beta/models/*` instead of
+  // `/v1beta/models/gemini-2.0-flash:generateContent`. Needs a proper
+  // upstreamPath override (overlay can't override upstreamPath today).
+  // The PAYMENT path (session voucher + descriptor) is verified working.
   'gemini::/{version}/models/*': {
     id: 'gemini_generate',
     publicPath: '/v1/services/gemini/generate',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
+    verifiedMode: false,
+    verifiedNote:
+      'Payment/session layer OK after channel re-open (descriptor captured). ' +
+      'Blocked on upstream model path: `/{version}/models/*` wildcard is not ' +
+      'substituted, so merchant 404s. Needs upstreamPath override support.',
     placeholderDefaults: { version: 'v1beta', model: 'gemini-2.0-flash' },
   },
   // Dune SQL Execute — channel underfunded
@@ -164,6 +178,56 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/tempo/rpc',
     upstreamPaymentMethod: 'tempo.session',
     verifiedMode: 'session',
+  },
+  // DeepSeek Chat — OpenAI-compatible chat completions, tempo.charge.
+  // Stable publicPath so agents don't hit the auto-slugged
+  // `/deepseek/deepseek_chat`. Price is dynamic (~$0.004–$0.025).
+  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+  // LLM completion (model deepseek-v4-flash) through the full chain.
+  'deepseek::/deepseek/chat': {
+    id: 'deepseek_chat',
+    publicPath: '/v1/services/deepseek/chat',
+    upstreamPaymentMethod: 'tempo.charge',
+    verifiedMode: 'charge',
+  },
+  // Groq Chat — OpenAI-compatible, very fast inference, tempo.charge.
+  // Price dynamic ($0.005–$0.10 by model/tokens).
+  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+  // llama-3.1-8b-instant completion through the full chain.
+  'groq::/groq/chat': {
+    id: 'groq_chat',
+    publicPath: '/v1/services/groq/chat',
+    upstreamPaymentMethod: 'tempo.charge',
+    verifiedMode: 'charge',
+  },
+  // CoinGecko Simple Price — flat $0.06/request, tempo.charge. Cheapest
+  // representative data endpoint; the other 15 coingecko routes keep
+  // their auto-generated paths.
+  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+  // price (bitcoin/usd) through the full chain.
+  'coingecko::/coingecko/simple-price': {
+    id: 'coingecko_simple_price',
+    publicPath: '/v1/services/coingecko/simple-price',
+    upstreamPaymentMethod: 'tempo.charge',
+    verifiedMode: 'charge',
+  },
+  // QuickNode JSON-RPC — $0.001/request, tempo.charge. Upstream path is
+  // `/{network}`; QuickNode uses `<chain>-mainnet` naming, so default to
+  // `ethereum-mainnet` (NOT alchemy's `eth-mainnet`, which 404s
+  // `unsupported_network`). Pass ?network=base-mainnet / solana-mainnet
+  // / etc to target another QuickNode-supported network.
+  // verifiedMode false — real-money E2E 2026-06-22: we paid OK but the
+  // QuickNode merchant returned 502/5xx (merchant-side, like alchemy).
+  'quicknode::/{network}': {
+    id: 'quicknode_rpc',
+    publicPath: '/v1/services/quicknode/rpc',
+    upstreamPaymentMethod: 'tempo.charge',
+    placeholderDefaults: { network: 'ethereum-mainnet' },
+    verifiedMode: false,
+    verifiedNote:
+      'We paid OK (charge) but QuickNode merchant returned 502/5xx on ' +
+      'ethereum-mainnet eth_blockNumber. Merchant-side, same pattern as alchemy. ' +
+      'Re-verify when QuickNode upstream is fixed.',
   },
   // Object Storage Upload — actually charge mode for multipart-init
   'storage::/{key}': {
