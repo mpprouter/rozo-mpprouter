@@ -362,10 +362,17 @@ async function main() {
   // that includes the full TIP-1034 `descriptor`. We capture the
   // stored channel there so the KV write below can include it.
   //
-  // `maxDeposit: depositUsdc` tells the manager to cap auto-opens
-  // at this amount. Since no `suggestedDeposit` from the server will
-  // undercut it (fresh channel), the manager falls back to maxDeposit
-  // and opens for exactly `depositUsdc`.
+  // `maxDeposit` is the manager's HARD cap for both the initial open AND
+  // any later topUp(). When resuming an existing channel whose cumulative is
+  // already non-zero, a topUp to `cumulative + --deposit headroom` can exceed
+  // a cap set to just `--deposit`, and the topUp is rejected ("exceeds local
+  // maxDeposit"). So we set the cap to `--deposit` PLUS a 1 USDC buffer that
+  // comfortably covers any existing cumulative (these channels carry only a
+  // few thousand base units). This only RAISES the ceiling; the actual
+  // on-chain deposit is still driven by the open/topUp amounts below.
+  const maxDepositRaw = toBaseUnits(depositUsdc, 6) + toBaseUnits('1', 6)
+  const maxDepositUsdc = (Number(maxDepositRaw) / 1e6).toString()
+
   let capturedStored: {
     descriptor: PersistedChannelState['descriptor']
     cumulativeAmount: string
@@ -377,7 +384,7 @@ async function main() {
     account,
     client,
     decimals: 6,
-    maxDeposit: depositUsdc,
+    maxDeposit: maxDepositUsdc,
     sessionStore: {
       get() {
         // Fresh open — no prior channel to resume from.
@@ -435,6 +442,29 @@ async function main() {
   console.log(`     channelId:      ${sm.channelId}`)
   console.log(`     cumulative:     ${sm.cumulative}`)
 
+  // When RESUMING an existing on-chain channel, the prior cumulative may
+  // already be at/near the on-chain deposit, leaving no headroom for new
+  // vouchers (merchant rejects with "amount exceeds deposit"). Top up the
+  // on-chain deposit so that deposit >= cumulative + the requested headroom.
+  // `--deposit N` is treated as the desired FREE headroom above the current
+  // cumulative. topUp() broadcasts a real on-chain Tempo L2 deposit tx.
+  const desiredHeadroomRaw = toBaseUnits(depositUsdc, 6)
+  const requiredDepositRaw = BigInt(sm.cumulative) + desiredHeadroomRaw
+  const currentDepositRaw = BigInt(capturedStored?.deposit ?? '0')
+  if (currentDepositRaw < requiredDepositRaw) {
+    const topUpRaw = requiredDepositRaw - currentDepositRaw
+    console.log(
+      `  ↑ Topping up on-chain deposit by ${topUpRaw} base units ` +
+        `(current deposit ${currentDepositRaw} < required ${requiredDepositRaw}) ...`,
+    )
+    try {
+      await sm.topUp(topUpRaw)
+      console.log(`  ✅ Top-up broadcast; on-chain deposit now covers cumulative + headroom`)
+    } catch (err: any) {
+      console.error(`  ⚠️ topUp failed: ${err.message} — voucher headroom may be insufficient`)
+    }
+  }
+
   // Extract what we need from the SessionManager state + the
   // probe challenge. SessionManager doesn't expose escrowContract
   // on its public surface, but the probe response carries a
@@ -459,13 +489,17 @@ async function main() {
     currency: '0x20c000000000000000000000b9537d11c60e8b50',
     chainId,
     authorizedSigner: account.address,
-    // Use the cumulative the manager reported via sessionStore.set()
-    // (authoritative: what the channel actually opened at). Fall back
-    // to sm.cumulative for safety.
+    // Cumulative the manager reported via sessionStore.set() — the amount
+    // already authorized on this channel (0 for a truly fresh channel, or
+    // the prior watermark when resuming an existing on-chain channel).
     cumulativeRaw: capturedStored?.cumulativeAmount ?? sm.cumulative.toString(),
-    // Deposit reported by the stored channel is already in raw units.
-    // Fall back to our own conversion if sessionStore.set() didn't fire.
-    depositRaw: capturedStored?.deposit ?? toBaseUnits(depositUsdc, 6).toString(),
+    // Deposit reflects the on-chain channel deposit AFTER the top-up above:
+    // cumulative + the requested `--deposit` headroom. We must NOT use the
+    // manager's sessionStore.set() echo (it can report a stale figure equal
+    // to the current cumulative, leaving ZERO voucher headroom → every
+    // voucher fails "amount exceeds deposit"). `requiredDepositRaw` is what
+    // the channel now holds on-chain after topUp().
+    depositRaw: requiredDepositRaw.toString(),
     openedAt: new Date().toISOString(),
     // TIP-1034 descriptor captured via sessionStore.set() — required by
     // the Worker's TIP-1034 session method to produce manual vouchers.
