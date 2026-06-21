@@ -26,6 +26,7 @@ import { handleLlmsTxt } from './routes/llms-txt'
 import { handleOpenApi } from './routes/openapi'
 import { handleAiPlugin } from './routes/ai-plugin'
 import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-admin'
+import { handleAdminSeedStore } from './routes/admin-seed-store'
 import { handleCreateInvoice } from './routes/create-invoice'
 // P1-3: export DO class so wrangler can bind it via [[durable_objects.bindings]]
 export { AtomicStoreDO } from './mpp/atomic-store-do'
@@ -176,6 +177,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
           status: 404,
           headers: { 'Content-Type': 'application/json' },
         })
+      }
+
+      // One-time migration: seed absent DO keys from KV-captured values.
+      // Non-destructive — DO /seed never overwrites an existing key.
+      // Gated by x-admin-secret (same as /admin/pay-invoice).
+      if (url.pathname === '/admin/seed-atomic-store') {
+        return handleAdminSeedStore(request, env)
       }
 
       // Public quote-invoice endpoint — mirrors pay-invoice input contract but

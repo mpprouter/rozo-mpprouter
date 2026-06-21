@@ -88,6 +88,10 @@ export class AtomicStoreDO implements DurableObject {
       return this.handleCommit(body)
     }
 
+    if (url.pathname === '/seed') {
+      return this.handleSeed(body)
+    }
+
     return new Response('Not Found', { status: 404 })
   }
 
@@ -176,6 +180,54 @@ export class AtomicStoreDO implements DurableObject {
     }
     return Response.json(resp)
   }
+
+  // -------------------------------------------------------------------------
+  // /seed handler — one-time migration helper
+  // -------------------------------------------------------------------------
+  //
+  // Semantics: idempotent + non-destructive.
+  //   • Reads v:<key> inside a transaction.
+  //   • If the key ALREADY EXISTS → returns { seeded: false, reason: 'exists' }
+  //     WITHOUT writing anything. The live payment path may have already
+  //     written this key; we must never clobber it.
+  //   • If the key is ABSENT → writes v:<key>=value and n:<key>=1 atomically,
+  //     returns { seeded: true }.
+  //
+  // Using storage.transaction() ensures the read+conditional-write is crash-
+  // safe: if the DO dies after the put but before the version write the txn
+  // rolls back and the next /seed call re-checks from a clean state.
+  //
+  // Called exclusively from the Worker-side admin route — never from the
+  // public internet (the DO is not directly reachable externally).
+
+  private async handleSeed(body: unknown): Promise<Response> {
+    if (!isSeedBody(body)) {
+      return new Response('Bad Request: expected { key: string, value: string }', { status: 400 })
+    }
+    const { key, value } = body
+
+    let seeded = false
+
+    await this.storage.transaction(async (txn) => {
+      const existing = await txn.get<string>(`v:${key}`)
+      if (existing !== undefined && existing !== null) {
+        // Key already present — do nothing, leave live state untouched.
+        return
+      }
+      // Key is absent — safe to write the migrated value.
+      // We start version at 1 (matching what a first /commit with
+      // expectedVersion=0 would produce) so subsequent update() calls
+      // work without any special-casing.
+      await txn.put(`v:${key}`, value)
+      await txn.put(`n:${key}`, 1)
+      seeded = true
+    })
+
+    const resp: SeedResponse = seeded
+      ? { seeded: true }
+      : { seeded: false, reason: 'exists' }
+    return Response.json(resp)
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -224,4 +276,18 @@ function isCommitBody(x: unknown): x is CommitBody {
   if (o.op !== 'set' && o.op !== 'delete') return false
   if (o.op === 'set' && typeof o.value !== 'string') return false
   return true
+}
+
+// /seed types
+
+export type SeedResponse =
+  | { seeded: true }
+  | { seeded: false; reason: 'exists' }
+
+type SeedBody = { key: string; value: string }
+
+function isSeedBody(x: unknown): x is SeedBody {
+  if (typeof x !== 'object' || x === null) return false
+  const o = x as Record<string, unknown>
+  return typeof o.key === 'string' && typeof o.value === 'string'
 }
