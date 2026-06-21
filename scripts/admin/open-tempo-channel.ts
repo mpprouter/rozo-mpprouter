@@ -285,8 +285,8 @@ type PersistedChannelState = {
   openedAt: string
   lastVoucherAt?: string
   /**
-   * TIP-1034 channel descriptor — persisted from the `onChannelUpdate`
-   * callback's `entry.descriptor` so the Worker can produce manual-mode
+   * TIP-1034 channel descriptor — persisted from the `sessionStore.set()`
+   * callback's `channel.descriptor` so the Worker can produce manual-mode
    * vouchers without re-querying the chain. Required by mppx 0.7.0+
    * when the merchant advertises `sessionProtocol: 'v2'`.
    */
@@ -355,28 +355,47 @@ async function main() {
   // `.channelId`, `.cumulative`, `.opened`) is accessed via
   // `tempo.session.manager(...)`.
   //
-  // We capture the TIP-1034 `descriptor` from the `onChannelUpdate`
-  // callback — it is produced by `createOpenPayload` during the
-  // auto-open and contains the struct needed by the Worker to sign
-  // manual-mode vouchers (see src/mpp/channel-store.ts).
+  // mppx 0.7.0 dropped the `onChannelUpdate` parameter from
+  // `tempo.session.manager()`. The correct hook is `sessionStore`:
+  // the manager calls `sessionStore.set(channel)` whenever the
+  // channel is opened or updated, passing a `StoredSessionChannel`
+  // that includes the full TIP-1034 `descriptor`. We capture the
+  // stored channel there so the KV write below can include it.
   //
   // `maxDeposit: depositUsdc` tells the manager to cap auto-opens
   // at this amount. Since no `suggestedDeposit` from the server will
   // undercut it (fresh channel), the manager falls back to maxDeposit
   // and opens for exactly `depositUsdc`.
-  let capturedDescriptor: PersistedChannelState['descriptor'] | undefined
+  let capturedStored: {
+    descriptor: PersistedChannelState['descriptor']
+    cumulativeAmount: string
+    deposit: string
+    escrow: string
+  } | undefined
 
   const sm = tempo.session.manager({
     account,
     client,
     decimals: 6,
     maxDeposit: depositUsdc,
-    onChannelUpdate(entry: any) {
-      // Capture the descriptor once the channel opens. `entry.descriptor`
-      // is populated by `createOpenPayload` in the TIP-1034 session.
-      if (entry?.descriptor && typeof entry.descriptor === 'object') {
-        capturedDescriptor = entry.descriptor as PersistedChannelState['descriptor']
-      }
+    sessionStore: {
+      get() {
+        // Fresh open — no prior channel to resume from.
+        return null
+      },
+      set(channel) {
+        // Called by the manager when the channel is opened (and on
+        // subsequent voucher updates). `channel.descriptor` is the
+        // full TIP-1034 ChannelDescriptor required by the Worker to
+        // produce manual-mode vouchers (see src/mpp/tempo-client.ts).
+        capturedStored = {
+          descriptor: channel.descriptor as PersistedChannelState['descriptor'],
+          cumulativeAmount: channel.cumulativeAmount,
+          deposit: channel.deposit,
+          escrow: channel.escrow,
+        }
+        console.log('  ✅ descriptor captured via sessionStore.set()')
+      },
     },
   })
 
@@ -427,25 +446,34 @@ async function main() {
   const payee = methodDetails.recipient ?? challengeFromProbe?.request?.recipient ?? ''
   const chainId = methodDetails.chainId ?? 0
 
+  // Prefer escrowContract from the probe challenge; fall back to the
+  // escrow address reported by the session manager's stored channel.
+  const resolvedEscrow = escrowContract || capturedStored?.escrow || ''
+
   const state: PersistedChannelState = {
     channelId: sm.channelId as string,
-    escrowContract,
+    escrowContract: resolvedEscrow,
     payee,
     // Canonical Tempo USDC asset handle — verified the same for
     // all 9 session merchants on 2026-04-11 via mpp.dev/api/services.
     currency: '0x20c000000000000000000000b9537d11c60e8b50',
     chainId,
     authorizedSigner: account.address,
-    cumulativeRaw: sm.cumulative.toString(),
-    depositRaw: toBaseUnits(depositUsdc, 6).toString(),
+    // Use the cumulative the manager reported via sessionStore.set()
+    // (authoritative: what the channel actually opened at). Fall back
+    // to sm.cumulative for safety.
+    cumulativeRaw: capturedStored?.cumulativeAmount ?? sm.cumulative.toString(),
+    // Deposit reported by the stored channel is already in raw units.
+    // Fall back to our own conversion if sessionStore.set() didn't fire.
+    depositRaw: capturedStored?.deposit ?? toBaseUnits(depositUsdc, 6).toString(),
     openedAt: new Date().toISOString(),
-    // TIP-1034 descriptor captured from onChannelUpdate — required by
+    // TIP-1034 descriptor captured via sessionStore.set() — required by
     // the Worker's TIP-1034 session method to produce manual vouchers.
-    ...(capturedDescriptor ? { descriptor: capturedDescriptor } : {}),
+    ...(capturedStored?.descriptor ? { descriptor: capturedStored.descriptor } : {}),
   }
 
   if (!state.escrowContract) {
-    console.warn('  ⚠️  escrowContract not captured from probe challenge.')
+    console.warn('  ⚠️  escrowContract not captured from probe challenge or sessionStore.')
     console.warn('      Router voucher signing WILL fail without this field.')
     console.warn('      Hand-fill via `wrangler kv key put` before flipping the route.')
   }
@@ -454,13 +482,11 @@ async function main() {
     console.warn('      shows blank in inspect-channels.ts.')
   }
   if (!state.descriptor) {
-    console.warn('  ⚠️  TIP-1034 descriptor not captured from onChannelUpdate.')
+    console.warn('  ⚠️  TIP-1034 descriptor not captured via sessionStore.')
     console.warn('      This means the merchant may be using v1 protocol, or')
-    console.warn('      the open sequence did not fire onChannelUpdate.')
+    console.warn('      sessionStore.set() was not called during the open sequence.')
     console.warn('      v2 merchants (anthropic, openai, gemini, openrouter) REQUIRE')
     console.warn('      descriptor in KV for the Worker to produce manual vouchers.')
-  } else {
-    console.log('  ✅ TIP-1034 descriptor captured from onChannelUpdate.')
   }
 
   // Persist to KV

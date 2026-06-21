@@ -52,9 +52,9 @@ export type TempoChannelState = {
    *          payer, salt, token }
    *
    * Populated at channel open by `scripts/admin/open-tempo-channel.ts`
-   * from the `onChannelUpdate` callback's `entry.descriptor`. Absent
-   * on channels opened with pre-0.7.0 mppx — those channels must be
-   * re-opened before the TIP-1034 session path can serve vouchers.
+   * via the `sessionStore.set(channel)` callback (mppx 0.7.0 API).
+   * Absent on channels opened with pre-0.7.0 mppx — those channels
+   * must be re-opened before the TIP-1034 session path can serve vouchers.
    */
   descriptor?: {
     authorizedSigner: `0x${string}`
