@@ -26,9 +26,18 @@ import { handleLlmsTxt } from './routes/llms-txt'
 import { handleOpenApi } from './routes/openapi'
 import { handleAiPlugin } from './routes/ai-plugin'
 import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-admin'
+import { handleCreateInvoice } from './routes/create-invoice'
+// P1-3: export DO class so wrangler can bind it via [[durable_objects.bindings]]
+export { AtomicStoreDO } from './mpp/atomic-store-do'
+import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
+import { handlePreflight, withCors } from './utils/cors'
 
 export interface Env {
   MPP_STORE: KVNamespace
+  // P1-3: Durable Object namespace for the linearizable CAS store.
+  // Replaces the non-atomic KV-based update() in the mppx Store adapter.
+  // Bound via [[durable_objects.bindings]] in wrangler.toml.
+  ATOMIC_STORE: DurableObjectNamespace
 
   // Stellar Router Pool (receives agent USDC payments)
   // Secret NOT in env — operator manages offline. Only public key needed.
@@ -97,6 +106,23 @@ export interface Env {
   PAYINVOICE_ADMIN_SECRET: string
   ADMIN_ENDPOINT_ENABLED?: string
 
+  // Rozo Intents API key for creating discounted payment intents from
+  // Coinbase Payment Links via POST /v1/services/rozo-agent-api/create-invoice.
+  // Set via: wrangler secret put ROZO_INTENTS_API_KEY
+  ROZO_INTENTS_API_KEY: string
+
+  // Rozo webhook signing secret. Used to verify HMAC-SHA256 on
+  // POST /v1/services/rozo-agent-api/webhook.
+  // Set via: wrangler secret put ROZO_WEBHOOK_SECRET
+  ROZO_WEBHOOK_SECRET: string
+
+  // Optional paid Base RPC (Alchemy / QuickNode / Infura) used as the
+  // primary endpoint for funder balance checks. Falls back to public
+  // Base RPCs on failure. CF Workers can't reach mainnet.base.org
+  // reliably, so this is effectively required in production.
+  // Set via: wrangler secret put BASE_RPC_URL
+  BASE_RPC_URL?: string
+
   // DingTalk webhook token for operational alerts (low balance, etc.)
   // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
   DINGTALK_ACCESS_TOKEN?: string
@@ -104,6 +130,13 @@ export interface Env {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    if (request.method === 'OPTIONS') return handlePreflight(request)
+    const response = await route(request, env, ctx)
+    return withCors(request, response)
+  },
+}
+
+async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
 
     try {
@@ -152,6 +185,26 @@ export default {
         return handleQuoteInvoice(request, env)
       }
 
+      // Public create-invoice endpoint — quotes a Coinbase Payment Link,
+      // applies the router's discount (max $5 off, capped at ~4.76%), and
+      // creates a Rozo intent so the caller can pay the discounted amount.
+      if (url.pathname === '/v1/services/rozo-agent-api/create-invoice') {
+        return handleCreateInvoice(request, env)
+      }
+
+      // Rozo webhook receiver — verifies HMAC, dedupes by event_id,
+      // checks funder balance, triggers agentapi/pay-invoice to settle
+      // the underlying Coinbase Payment Link.
+      if (url.pathname === '/v1/services/rozo-agent-api/webhook') {
+        return handleRozoWebhook(request, env)
+      }
+
+      // Public invoice status — accepts pl_* or Rozo paymentId, returns
+      // caller-safe state (router KV + Rozo reconciliation).
+      if (url.pathname === '/v1/services/rozo-agent-api/invoice-status') {
+        return handleInvoiceStatus(request, env)
+      }
+
       // Async job polling — must match before the catch-all proxy route.
       // Challenge endpoint MUST come first (it's a longer suffix than the
       // base job-status path). Both are GET-only.
@@ -194,5 +247,4 @@ export default {
         headers: { 'Content-Type': 'application/json' },
       })
     }
-  },
 }

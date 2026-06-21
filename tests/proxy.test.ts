@@ -13,6 +13,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { Credential } from 'mppx'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 /**
  * Load secrets from .dev.vars (Wrangler's local secrets file, gitignored).
@@ -107,6 +108,8 @@ function makeEnv(): Env {
 
   return {
     MPP_STORE,
+    // P1-3: in-process DO mock so doAtomicParams() works in tests without CF runtime.
+    ATOMIC_STORE: makeAtomicStoreMock(),
     STELLAR_ROUTER_PUBLIC: requireVar(vars, 'STELLAR_ROUTER_PUBLIC'),
     STELLAR_GAS_SECRET: requireVar(vars, 'STELLAR_GAS_SECRET'),
     STELLAR_GAS_PUBLIC: requireVar(vars, 'STELLAR_GAS_PUBLIC'),

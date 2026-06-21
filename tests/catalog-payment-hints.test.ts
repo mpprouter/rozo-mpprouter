@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 import { listPublicCatalog, PUBLIC_SERVICE_ROUTES } from '../src/services/merchants'
 import { handleProxy } from '../src/routes/proxy'
 import type { Env } from '../src/index'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 function loadDevVars(): Record<string, string> {
   const path = resolve(__dirname, '..', '.dev.vars')
@@ -50,6 +51,8 @@ function makeEnv(): Env {
   const vars = loadDevVars()
   return {
     MPP_STORE,
+    // P1-3: in-process DO mock so doAtomicParams() works in tests without CF runtime.
+    ATOMIC_STORE: makeAtomicStoreMock(),
     STELLAR_ROUTER_PUBLIC: requireVar(vars, 'STELLAR_ROUTER_PUBLIC'),
     STELLAR_GAS_SECRET: requireVar(vars, 'STELLAR_GAS_SECRET'),
     STELLAR_GAS_PUBLIC: requireVar(vars, 'STELLAR_GAS_PUBLIC'),

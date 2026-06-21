@@ -28,6 +28,28 @@ account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
 binding = "MPP_STORE"
 id = "b0fa51efc09e4e708c6bd5061b0663e0"
 
+# P1-3: Durable Object for linearizable CAS (mppx replay + cumulative).
+# The AtomicStoreDO class is exported from src/index.ts (re-exported from
+# src/mpp/atomic-store-do.ts). wrangler requires the class export to be
+# reachable from the Worker `main` entry point — it is, via the re-export.
+#
+# On first deploy, wrangler creates the DO class automatically via the
+# migration below. No manual provisioning needed.
+#
+# IMPORTANT: See "REMAINING FOR HUMAN" in the P1-3 task for the channel
+# cumulative migration concern before cutting over.
+[[durable_objects.bindings]]
+name = "ATOMIC_STORE"
+class_name = "AtomicStoreDO"
+
+# Migration: create the AtomicStoreDO class on first deploy.
+# wrangler requires at least one [[migrations]] entry to provision a new DO.
+# The `tag` must be unique and is recorded in the DO's migration history.
+# Only add new tags here; never modify or remove existing entries once deployed.
+[[migrations]]
+tag = "v1"
+new_classes = ["AtomicStoreDO"]
+
 # Public keys (not secrets, safe to commit)
 [vars]
 STELLAR_NETWORK = "stellar:pubnet"
