@@ -11,8 +11,8 @@
     "test": "vitest"
   },
   "dependencies": {
-    "@stellar/mpp": "^0.4.0",
-    "@stellar/stellar-sdk": "^14.6.1",
+    "@stellar/mpp": "0.7.0",
+    "@stellar/stellar-sdk": "^15.1.0",
     "@x402/core": "^2.9.0",
     "@x402/stellar": "^2.9.0",
     "mppx": "0.7.0",

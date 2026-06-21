@@ -45,6 +45,7 @@ import { Mppx, Store } from 'mppx/server'
 import { Credential } from 'mppx'
 import { getChannelForAgent, getStellarChannel } from './stellar-channel-store'
 import type { Env } from '../index'
+import { kvAtomicParams } from './kv-atomic-store'
 
 /**
  * Error thrown when a `stellar.channel` credential's source
@@ -134,12 +135,14 @@ export function createStellarChannelPayment(
   channelContract: string,
   commitmentKey: string,
 ) {
-  // Shared store — mppx uses its own `stellar:channel:cumulative:*`
-  // and `stellar:channel:challenge:*` key prefixes under this
-  // store, which DO NOT collide with our `stellarChannel:*`
-  // sidecar metadata or the existing `tempoChannel:*` /
-  // `idempotency:*` keys. See internaldocs/v2-stellar-channel-notes.md §N4.
-  const store = Store.cloudflare(env.MPP_STORE)
+  // Store.cloudflare with AtomicParameters produces Store.AtomicStore,
+  // required by @stellar/mpp 0.7.0 channel constructor for replay protection.
+  // mppx uses its own `stellar:channel:cumulative:*` and
+  // `stellar:channel:challenge:*` key prefixes which DO NOT collide with our
+  // `stellarChannel:*` sidecar metadata or `tempoChannel:*` / `idempotency:*`
+  // keys. See internaldocs/v2-stellar-channel-notes.md §N4 and
+  // src/mpp/kv-atomic-store.ts for the single-isolate safety model.
+  const store = Store.cloudflare(kvAtomicParams(env.MPP_STORE))
 
   const method = stellar.channel({
     channel: channelContract,
