@@ -169,3 +169,18 @@ P1-2、P1-3 的**代码逻辑 codex 三轮没再挑出资金错误**(CAS 实现�
 3. 找 merchant 侧重置/补充这几个 channel 的链上 deposit。
 
 **核心结论**:Router 代码侧的 TIP-1034 + opaque + CAS 修复**全部正确且已上生产**;e2e 卡在测试 channel 的链上资金状态(运营/merchant 层),非代码缺陷。
+
+---
+
+## ✅✅ 真金 E2E 成功(2026-06-21)
+
+**EXA(charge 模式)完整端到端通过:**
+- inbound Stellar USDC 付款成功 → pool
+- `Payment-Receipt: status=success`
+- 下游 merchant(Exa)真实返回搜索结果(HTTP 200,costDollars 0.007)
+- txhash reference: `ec655e47763e031d69cc362831aee0610b8495c8beda65c7f1b4250d45242b2a`
+
+**这验证了完整支付链路健康**:客户付 USDC → Router(opaque 修复)→ DO CAS 验证 → 下游 Tempo charge → merchant 返回。
+
+charge 模式(exa/firecrawl/parallel/storage)不依赖 session channel deposit,**直接可用**。
+session 模式(anthropic/openai/openrouter)代码已全部修好(descriptor+opaque+CAS),仅卡在旧测试 channel 的链上 deposit 耗尽(需 topUp 或换账号开新 channel,运营层,非代码缺陷)。
