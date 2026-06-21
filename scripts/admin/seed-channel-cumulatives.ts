@@ -57,7 +57,11 @@ const REPO_ROOT = resolve(__dirname, '..', '..')
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const CUMULATIVE_PREFIX = 'stellar:channel:cumulative:'
+// Default migrates channel cumulative watermarks. Override via SEED_PREFIX to
+// migrate other replay/state prefixes during cutover — e.g.
+// SEED_PREFIX='stellar:charge:challenge:' backfills charge replay keys so an
+// in-TTL already-used challenge can't pass the fresh DO's empty replay check.
+const CUMULATIVE_PREFIX = process.env.SEED_PREFIX ?? 'stellar:channel:cumulative:'
 const DEFAULT_WORKER_URL = 'https://mpprouter.rozo.ai'
 
 // ── .dev.vars loader (same as inspect-channels.ts) ───────────────────────────
