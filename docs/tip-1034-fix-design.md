@@ -135,3 +135,37 @@ P1-2、P1-3 的**代码逻辑 codex 三轮没再挑出资金错误**(CAS 实现�
 1. 深挖 opaque 根因(mppx 0.7 inbound challenge 重生成);或
 2. 回滚到 5/23 版本(放弃本次升级,回到 descriptor 坏但 inbound 稳的状态);或
 3. 保持部署(生产无真实流量,不流血),把 opaque 当独立 bug 排期。
+
+---
+
+## E2E 完整进展 + 最终 blocker(2026-06-21,深度排查后)
+
+部署后真金 e2e 逐层推进,连续定位并修复 6 个真实问题:
+
+| # | 问题 | 修复 | 验证 |
+|---|---|---|---|
+| 1 | outbound voucher 缺 TIP-1034 descriptor | sessionStore 捕获(P1-2) | ✅ 错误从 descriptor-required 消失 |
+| 2 | inbound charge opaque 不匹配(meta 含每请求变化的 parsed.id) | meta 只留 route.id(`proxy.ts`) | ✅ opaque 错误消失,inbound 收款通过 |
+| 3 | channel depositRaw 取 manager 快照(=cumulative,零余量) | depositRaw 用 cumulative+headroom | ✅ KV 余量正确 |
+| 4 | topUp 撞 maxDeposit 上限 | maxDeposit = deposit+1USDC buffer | ✅ 不再撞顶 |
+| 5 | manager resume 旧 channel | bootstrap:false | ⚠️ channelId 确定性派生,仍同一个 |
+| 6 | topUp 走 merchant 402 失败 | (未解决) | ❌ **最终 blocker** |
+
+### 最终 blocker:链上 channel deposit 耗尽 + topUp 走不通
+- 错误一路推进到:`session/amount-exceeds-deposit: voucher amount exceeds on-chain deposit`(merchant 链上检查)。
+- **根因**:这些 session channel 是旧测试遗留,**链上真实 deposit 已耗尽**。补充 deposit 的 `topUp()` 要走 merchant 的 402 付费流程,在 admin 脚本环境下返回 402 失败。
+- ⚠️ **数据陷阱**:`inspect-channels.ts` 的 deposit/cumulative 列读的是 **KV 镜像(乐观写入值)**,不是链上真值;脚本乐观写了 depositRaw=1000750 但 topUp 没兑现 → KV 看着有空间,merchant 按真实链上 deposit 拒绝。判断链上 deposit 必须读链不读 KV。
+
+### ✅ 已确认生效(铁证)
+- **inbound 收款修复(opaque)**:部署后 charge 付款不再报 opaque,inbound USDC 成功进 pool。
+- **descriptor 捕获**:open channel 时 `✅ descriptor captured via sessionStore.set()`,KV 有完整 descriptor。
+- **DO CAS + 迁移**:3 个 cumulative 已 seed,幂等验证过。
+- 所有代码改动 tsc clean,166 测试过,codex 4 轮无 P0。
+
+### 剩余给人/老板:让 e2e 真正 200 返回
+需要一个**链上 deposit 充足的 session channel**。选项:
+1. 用一个**全新 Stellar/Tempo 账号**开全新 channel(channelId 由 payer 派生,换账号才得新 channel + 新链上 deposit)。
+2. 修 `topUp` 让它在 admin 环境能真正向 merchant 完成 402 付费充值(需排查 merchant topUp 的 402 凭证要求)。
+3. 找 merchant 侧重置/补充这几个 channel 的链上 deposit。
+
+**核心结论**:Router 代码侧的 TIP-1034 + opaque + CAS 修复**全部正确且已上生产**;e2e 卡在测试 channel 的链上资金状态(运营/merchant 层),非代码缺陷。
