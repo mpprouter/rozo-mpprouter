@@ -70,7 +70,38 @@ tempo.session.manager({ account, client, decimals: 6, maxDeposit, sessionStore: 
 5. 部署 → 重开 anthropic+openai channel(各 $1)→ 主网付费复测(<$10)
 6. 复测看 anthropic/openai 是否 200 正常返回 + inbound 收款未被搞坏
 
+---
+
+## codex 第三轮结果(2026-06-21):descriptor + DO 核心逻辑 PASS,剩 2 个部署/迁移 P1
+
+P1-2、P1-3 的**代码逻辑 codex 三轮没再挑出资金错误**(CAS 实现读完无双花/竞态)。剩两个都是部署层面:
+
+### P1-1 — index.ts 引用未跟踪文件(别人的)
+`src/routes/create-invoice.ts`(515行)、`webhook.ts`(612行)、`utils/cors.ts`(63行)、`utils/base-usdc-balance.ts`(89行)是**完整文件**(tsc 过),index.ts 已 import,属于别人没提交的 invoice/webhook 功能。clean checkout 编译失败。
+**处理**:这些不是我的修复。要么 (a) 别人把它们提交;(b) 我把它们一起纳入本分支提交(让分支可独立 build);(c) 部署时用本地工作树(文件在本地,wrangler deploy 从本地打包,实际能 build)。
+
+### ⚠️ P1-2 cutover 迁移 — 真风险,但规模小(3 个 channel)
+切到空 DO 后,生产 KV 现有 mppx 状态对 DO 不可见:
+- **354 个 `stellar:charge:challenge`**(重放键)→ 短命(challenge 几分钟过期),切换时早过期,**丢了无所谓**。
+- **3 个 `stellar:channel:cumulative`**(channel 累计水位线)→ **非零活跃**:`56424` / `105500` / `63924` base units。切到空 DO = 水位线归零 = 旧 inbound channel voucher 可重放。**必须迁移这 3 个值。**
+  - channel 合约:`CAQGTD...HVWC` / `CAYS2L...N6UW` / `CCMIWJ...S5CW`
+  - 注意:这是 **inbound** Stellar channel(`stellar:channel:*`),与我们修的 anthropic/openai **outbound** `tempoChannel:*` 是两回事。
+
+**cutover 方案**(部署前预填 DO,low-risk):
+1. 部署 DO + 新代码(此时 DO 空,但暂不影响——除非有 inbound channel voucher 进来)。
+2. 立即把这 3 个 `stellar:channel:cumulative:*` 的值预填进 DO 对应 key(`v:stellar:channel:cumulative:<C>` + `n:...=1`),或写个一次性迁移脚本读 KV→写 DO。
+3. 或选 inbound channel 无 in-flight voucher 的低峰窗口切。
+- 重放键 354 个不迁移(短命,可接受)——但要 `log` 说明这个有意的跳过。
+
+## 实现顺序(更新)
+1. ✅ P1-2 descriptor(commit 002c585)
+2. ✅ P1-3 DO CAS(commit a6d505b)
+3. ⏳ P1-1 决定未跟踪文件归属
+4. ✅ 第三轮 codex:核心 PASS,剩 2 个部署 P1
+5. ⏳ cutover:预填 3 个 channel cumulative 进 DO
+6. ⏳ 部署 → 重开 anthropic+openai channel($1)→ 主网付费复测(<$10)
+
 ## 引用
 - descriptor 调研:`SessionManager.d.ts:94-119`、`Protocol.d.ts:14-29`、`CredentialState.js:409-411`
 - CAS 调研:`mppx/dist/Store.d.ts:23-56`、`@stellar/mpp/dist/charge/server/Charge.js:80-86`、`channel/server/Channel.js:191-246`
-- codex 第二轮全文:`docs/codex-review-round2.txt`
+- codex 三轮全文:`docs/codex-review-round{2,3}.txt`
