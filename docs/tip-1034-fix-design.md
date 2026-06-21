@@ -105,3 +105,33 @@ P1-2、P1-3 的**代码逻辑 codex 三轮没再挑出资金错误**(CAS 实现�
 - descriptor 调研:`SessionManager.d.ts:94-119`、`Protocol.d.ts:14-29`、`CredentialState.js:409-411`
 - CAS 调研:`mppx/dist/Store.d.ts:23-56`、`@stellar/mpp/dist/charge/server/Charge.js:80-86`、`channel/server/Channel.js:191-246`
 - codex 三轮全文:`docs/codex-review-round{2,3}.txt`
+
+---
+
+## ⚠️ E2E 复测发现新 blocker(2026-06-21 部署后)
+
+部署成功(version `0f7de19f`)+ 迁移 3 个 cumulative + 重开 anthropic/openai channel(**descriptor 这次真捕获到了**,P1-2 验证生效)后,真金 e2e 复测撞到一个**新的、独立的 inbound bug**:
+
+```
+402 invalid-challenge: "credential opaque does not match this route's requirements"
+```
+
+### 关键事实
+- **错误变了**:从修复前的 `descriptor required for TIP-1034`(下游 outbound)→ 现在 `opaque does not match`(inbound charge 验证)。**说明 descriptor 修复生效了**,卡点前移到 inbound。
+- **不是客户端版本问题**:把测试 skill 的 mppx 也升到 0.7.0(+viem)后,**依旧报 opaque**。
+- **根源**:mppx 0.7.0 `server/Mppx.js` 的 `getChallengeBindingMismatch` → `opaqueValuesMatch(expectedChallenge.meta, actualChallenge.meta)`。服务端**签发 challenge 时生成的 opaque/meta ↔ 验证时重新生成的 opaque 不一致**。这是 0.7.0 内部 challenge 重生成(stableBinding/meta)机制,我们升级 @stellar/mpp+mppx 后未对齐。
+- 我们 charge server(`stellar-server.ts`)只传 `recipient`+`store`,没显式传 opaque → opaque 是 0.7.0 内部生成的。
+
+### 生产影响:极小(但需处理)
+- `wrangler tail` 12s 无真实 charge 流量撞此错 → 与"MPP Router 真实使用≈$0"一致,**没有正在伤害真实客户**。
+- 旧版本(5/23)可回滚。
+
+### 状态
+- ✅ descriptor(P1-2)、DO CAS(P1-3)、迁移、seed —— 全部部署生效。
+- ✅ descriptor 修复**已用真金验证前移了卡点**(铁证)。
+- ❌ inbound charge 的 opaque 不匹配 = 新 blocker,在 mppx 0.7 inbound 路径,需要单独定位(challenge 签发 vs 验证两次生成 meta 的差异)。
+
+### 待决策
+1. 深挖 opaque 根因(mppx 0.7 inbound challenge 重生成);或
+2. 回滚到 5/23 版本(放弃本次升级,回到 descriptor 坏但 inbound 稳的状态);或
+3. 保持部署(生产无真实流量,不流血),把 opaque 当独立 bug 排期。
