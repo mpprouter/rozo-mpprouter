@@ -284,6 +284,21 @@ type PersistedChannelState = {
   depositRaw: string
   openedAt: string
   lastVoucherAt?: string
+  /**
+   * TIP-1034 channel descriptor — persisted from the `onChannelUpdate`
+   * callback's `entry.descriptor` so the Worker can produce manual-mode
+   * vouchers without re-querying the chain. Required by mppx 0.7.0+
+   * when the merchant advertises `sessionProtocol: 'v2'`.
+   */
+  descriptor?: {
+    authorizedSigner: string
+    expiringNonceHash: string
+    operator: string
+    payee: string
+    payer: string
+    salt: string
+    token: string
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -334,24 +349,35 @@ async function main() {
     account,
   })
 
-  // tempo.session in mppx/client is `sessionManager` (the
-  // auto-mode orchestrator) — NOT the manual-mode `session()`
-  // from the raw Session.js file. SessionManager has its own
-  // `.fetch()`, `.open()`, and state getters (`.channelId`,
-  // `.cumulative`, `.opened`). It is NOT a Method.Client and
-  // must NOT be passed through Mppx.create.
+  // In mppx 0.7.0, `tempo.session` is the TIP-1034 session METHOD
+  // (a Method.Client factory for use with Mppx.create), NOT a
+  // SessionManager. The auto-mode orchestrator (which has `.fetch()`,
+  // `.channelId`, `.cumulative`, `.opened`) is accessed via
+  // `tempo.session.manager(...)`.
   //
-  // `maxDeposit: depositUsdc` tells the underlying session plugin
-  // to cap auto-opens at this amount. Since no `suggestedDeposit`
-  // from the server will undercut it (we're opening a fresh
-  // channel), the plugin falls back to maxDeposit and opens for
-  // exactly `depositUsdc`. See node_modules/mppx/dist/tempo/client/
-  // Session.js:100-108 for the fallback chain.
-  const sm = tempo.session({
+  // We capture the TIP-1034 `descriptor` from the `onChannelUpdate`
+  // callback — it is produced by `createOpenPayload` during the
+  // auto-open and contains the struct needed by the Worker to sign
+  // manual-mode vouchers (see src/mpp/channel-store.ts).
+  //
+  // `maxDeposit: depositUsdc` tells the manager to cap auto-opens
+  // at this amount. Since no `suggestedDeposit` from the server will
+  // undercut it (fresh channel), the manager falls back to maxDeposit
+  // and opens for exactly `depositUsdc`.
+  let capturedDescriptor: PersistedChannelState['descriptor'] | undefined
+
+  const sm = tempo.session.manager({
     account,
     client,
     decimals: 6,
     maxDeposit: depositUsdc,
+    onChannelUpdate(entry: any) {
+      // Capture the descriptor once the channel opens. `entry.descriptor`
+      // is populated by `createOpenPayload` in the TIP-1034 session.
+      if (entry?.descriptor && typeof entry.descriptor === 'object') {
+        capturedDescriptor = entry.descriptor as PersistedChannelState['descriptor']
+      }
+    },
   })
 
   // Probe the merchant. sm.fetch() handles the 402 → auto-open →
@@ -413,6 +439,9 @@ async function main() {
     cumulativeRaw: sm.cumulative.toString(),
     depositRaw: toBaseUnits(depositUsdc, 6).toString(),
     openedAt: new Date().toISOString(),
+    // TIP-1034 descriptor captured from onChannelUpdate — required by
+    // the Worker's TIP-1034 session method to produce manual vouchers.
+    ...(capturedDescriptor ? { descriptor: capturedDescriptor } : {}),
   }
 
   if (!state.escrowContract) {
@@ -423,6 +452,15 @@ async function main() {
   if (!state.payee) {
     console.warn('  ⚠️  payee not captured. Not used by voucher signing but')
     console.warn('      shows blank in inspect-channels.ts.')
+  }
+  if (!state.descriptor) {
+    console.warn('  ⚠️  TIP-1034 descriptor not captured from onChannelUpdate.')
+    console.warn('      This means the merchant may be using v1 protocol, or')
+    console.warn('      the open sequence did not fire onChannelUpdate.')
+    console.warn('      v2 merchants (anthropic, openai, gemini, openrouter) REQUIRE')
+    console.warn('      descriptor in KV for the Worker to produce manual vouchers.')
+  } else {
+    console.log('  ✅ TIP-1034 descriptor captured from onChannelUpdate.')
   }
 
   // Persist to KV

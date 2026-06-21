@@ -15,9 +15,9 @@
     "@stellar/stellar-sdk": "^14.6.1",
     "@x402/core": "^2.9.0",
     "@x402/stellar": "^2.9.0",
-    "mppx": "latest",
+    "mppx": "0.7.0",
     "tsx": "^4.21.0",
-    "viem": "^2"
+    "viem": "^2.51.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4",
