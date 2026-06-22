@@ -44,6 +44,28 @@ export type TempoChannelState = {
    */
   authorizedSigner: `0x${string}`
   /**
+   * TIP-1034 channel descriptor — the struct that uniquely identifies
+   * this channel on-chain. Required by the mppx 0.7.0 TIP-1034
+   * session method when building manual-mode voucher credentials.
+   *
+   * Shape: { authorizedSigner, expiringNonceHash, operator, payee,
+   *          payer, salt, token }
+   *
+   * Populated at channel open by `scripts/admin/open-tempo-channel.ts`
+   * via the `sessionStore.set(channel)` callback (mppx 0.7.0 API).
+   * Absent on channels opened with pre-0.7.0 mppx — those channels
+   * must be re-opened before the TIP-1034 session path can serve vouchers.
+   */
+  descriptor?: {
+    authorizedSigner: `0x${string}`
+    expiringNonceHash: `0x${string}`
+    operator: `0x${string}`
+    payee: `0x${string}`
+    payer: `0x${string}`
+    salt: `0x${string}`
+    token: `0x${string}`
+  }
+  /**
    * Cumulative voucher amount in TOKEN BASE UNITS as a decimal
    * string (not hex, not scientific). Monotone: never decreases.
    * Every successful upstream 2xx response bumps this by the

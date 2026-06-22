@@ -45,6 +45,7 @@ import { Mppx, Store } from 'mppx/server'
 import { Credential } from 'mppx'
 import { getChannelForAgent, getStellarChannel } from './stellar-channel-store'
 import type { Env } from '../index'
+import { doAtomicParams } from './kv-atomic-store'
 
 /**
  * Error thrown when a `stellar.channel` credential's source
@@ -134,12 +135,15 @@ export function createStellarChannelPayment(
   channelContract: string,
   commitmentKey: string,
 ) {
-  // Shared store — mppx uses its own `stellar:channel:cumulative:*`
-  // and `stellar:channel:challenge:*` key prefixes under this
-  // store, which DO NOT collide with our `stellarChannel:*`
-  // sidecar metadata or the existing `tempoChannel:*` /
-  // `idempotency:*` keys. See internaldocs/v2-stellar-channel-notes.md §N4.
-  const store = Store.cloudflare(env.MPP_STORE)
+  // Store.cloudflare with AtomicParameters produces Store.AtomicStore,
+  // required by @stellar/mpp 0.7.0 channel constructor for replay protection
+  // and cumulative monotonicity. The DO-backed doAtomicParams provides TRUE
+  // linearizable CAS — see src/mpp/kv-atomic-store.ts for the race proof.
+  // mppx uses `stellar:channel:cumulative:*` and `stellar:channel:challenge:*`
+  // key prefixes which do NOT collide with our `stellarChannel:*` sidecar
+  // metadata or `tempoChannel:*` / `idempotency:*` KV keys.
+  // See internaldocs/v2-stellar-channel-notes.md §N4.
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
 
   const method = stellar.channel({
     channel: channelContract,

@@ -24,7 +24,7 @@
  * request, and the charge path should not pay that overhead.
  */
 
-import { Mppx, tempo, session as tempoSession } from 'mppx/client'
+import { Mppx, tempo, sessionLegacy as legacySession } from 'mppx/client'
 import { privateKeyToAccount } from 'viem/accounts'
 import type { Env } from '../index'
 import {
@@ -36,17 +36,31 @@ import {
 /**
  * Minimal shape of the ChannelEntry that mppx passes to the
  * `onChannelUpdate` callback. Defined here rather than imported
- * from `mppx/dist/tempo/client/ChannelOps.js` because that path
- * is a non-public internal module (see session-support-plan.md
- * §8 risks). If a future mppx release moves or renames the type
- * we only need to update this local stub, not a deep import path.
+ * from mppx internals because that path is a non-public internal
+ * module (see session-support-plan.md §8 risks). If a future mppx
+ * release moves or renames the type we only need to update this
+ * local stub, not a deep import path.
+ *
+ * In mppx 0.7.0 the TIP-1034 session path includes `descriptor` on
+ * the entry (shape: { authorizedSigner, expiringNonceHash, operator,
+ * payee, payer, salt, token }). The legacy session entry does not
+ * include it. We declare it optional so both paths share this type.
  */
 type ChannelEntryLike = {
   channelId: `0x${string}`
   cumulativeAmount: bigint
-  escrowContract: `0x${string}`
+  escrowContract?: `0x${string}`
   chainId: number
   opened: boolean
+  descriptor?: {
+    authorizedSigner: `0x${string}`
+    expiringNonceHash: `0x${string}`
+    operator: `0x${string}`
+    payee: `0x${string}`
+    payer: `0x${string}`
+    salt: `0x${string}`
+    token: `0x${string}`
+  }
 }
 
 /**
@@ -101,26 +115,40 @@ function createTempoClientInternal(
 ) {
   const account = privateKeyToAccount(env.TEMPO_ROUTER_PRIVATE_KEY as `0x${string}`)
 
-  // Two methods registered:
+  // Three methods registered:
   //
   // 1. `tempo.charge` — single-shot intent, unchanged.
-  // 2. `session` (the raw manual-mode `session()` from
-  //    `mppx/dist/tempo/client/Session.js`, re-exported at the
-  //    top level of `mppx/client` as `session`). We deliberately
-  //    do NOT use `tempo.session` because that alias actually
-  //    resolves to `sessionManager` — the AUTO-mode orchestrator
-  //    that would try to open channels itself whenever it sees
-  //    a 402. Manual mode is what lets us pre-open the channel
-  //    via `scripts/open-channel.ts` and then feed per-request
-  //    voucher context through `onChallenge`.
   //
-  // No `deposit` parameter on the session method — its presence
-  // is what flips the method into auto mode. Leaving it unset
-  // keeps us in manual mode.
+  // 2. `tempo.session(...)` (TIP-1034, `sessionMethod` in 0.7.0) — handles
+  //    merchants that advertise `sessionProtocol: 'v2'` in their 402
+  //    challenge. This is what anthropic, openai, gemini, openrouter now
+  //    send. In manual mode (no `deposit` param), mppx dispatches on
+  //    `canHandleChallenge` → v2 → this method, then calls `onChallenge`
+  //    where we supply `{action, channelId, cumulativeAmountRaw, descriptor}`.
+  //    The `descriptor` field is required by TIP-1034 — absent in 0.4.12,
+  //    the root cause of the bug.
+  //
+  // 3. `legacySession(...)` (legacy contract-backed session, was `session`
+  //    in 0.4.12, now re-exported as `sessionLegacy` in 0.7.0) — handles
+  //    merchants that advertise `sessionProtocol: 'v1'` or omit it. Provides
+  //    backward compatibility for any merchant still on the old protocol.
+  //    Its manual-mode context does NOT require `descriptor`.
+  //
+  // mppx dispatches on `canHandleChallenge` to pick the right method:
+  //   v2 challenge → tempo.session (TIP-1034)
+  //   v1 / absent  → legacySession
+  //
+  // No `deposit` parameter on either session method — that parameter is
+  // what flips them into auto mode. Leaving it unset keeps us in manual
+  // mode where our `onChallenge` hook controls every voucher.
   const mppx = Mppx.create({
     methods: [
       tempo.charge({ account }),
-      tempoSession({
+      tempo.session({
+        account,
+        onChannelUpdate: opts.onChannelUpdate,
+      }),
+      legacySession({
         account,
         onChannelUpdate: opts.onChannelUpdate as any,
       }),
@@ -212,8 +240,7 @@ export async function payMerchantSession(
     onChallenge: async (challenge, { createCredential }) => {
       // Session challenge request shape (after the zod transform
       // in tempo.session's request schema): amount is a base-unit
-      // string like "10000" for $0.01 at 6 decimals. See
-      // node_modules/mppx/dist/tempo/client/Session.d.ts.
+      // string like "10000" for $0.01 at 6 decimals.
       const delta = (challenge as any).request?.amount as string | undefined
       if (!delta || !/^\d+$/.test(delta)) {
         throw new Error(
@@ -222,14 +249,24 @@ export async function payMerchantSession(
       }
       const newCumulativeRaw = addRaw(channel.cumulativeRaw, delta)
       // Manual-mode context: tell mppx "sign a voucher action on
-      // channel X at the new cumulative". mppx reads this in
-      // Session.js's client handler and produces the credential
-      // payload (voucher type, signed by `authorizedSigner` or
-      // the root account).
+      // channel X at the new cumulative".
+      //
+      // For TIP-1034 (v2) merchants, `descriptor` is REQUIRED in the
+      // context — the TIP-1034 session method (`tempo.session`) needs
+      // it to derive the on-chain channel ID and sign the voucher.
+      // `descriptor` is captured at channel open time by
+      // `scripts/admin/open-tempo-channel.ts` via `onChannelUpdate`
+      // and stored in KV alongside `channelId` and `cumulativeRaw`.
+      //
+      // For legacy (v1) merchants, `descriptor` is absent from KV
+      // entries opened with pre-0.7.0 mppx. The `legacySession` method
+      // handles their challenges without requiring `descriptor`.
+      // Including it when present is harmless; legacySession ignores it.
       return createCredential({
         action: 'voucher',
         channelId: channel.channelId,
         cumulativeAmountRaw: newCumulativeRaw,
+        ...(channel.descriptor ? { descriptor: channel.descriptor } : {}),
       } as any)
     },
     onChannelUpdate: async (entry: ChannelEntryLike) => {

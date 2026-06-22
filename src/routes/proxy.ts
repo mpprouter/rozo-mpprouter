@@ -1394,10 +1394,19 @@ export async function handleProxy(
         amount: stellarAmount,
         currency: getStellarUsdcSac(env),
         recipient: getRouterStellarAddress(env),
-        // Correlate the mppx challenge with the upstream merchant challenge
-        // so we can reconcile payments after the fact.
+        // `meta` is server-defined correlation data that mppx 0.7 binds into
+        // the challenge `opaque` and re-checks at verify time (it MUST be
+        // identical between issue and verify, or the credential is rejected
+        // with "credential opaque does not match this route's requirements").
+        // So meta may ONLY contain values that are stable across the two 402
+        // round-trips for the same payment. `route.id` is stable; the upstream
+        // merchant challenge id (`parsed.id`) is NOT — the merchant issues a
+        // fresh challenge id on every probe, so putting it here made the
+        // verify-time opaque diverge from the issue-time opaque and broke all
+        // charge payments after the mppx 0.4->0.7 upgrade. Reconciliation with
+        // the upstream challenge is done elsewhere (the proxy logs/links the
+        // ids per request); it must not ride in the HMAC-bound opaque.
         meta: {
-          upstreamChallengeId: parsed.id,
           route: route.id,
         },
       })(mppxInput)

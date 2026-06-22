@@ -27,6 +27,7 @@
 import { stellar } from '@stellar/mpp/charge/server'
 import { Mppx, Store } from 'mppx/server'
 import type { Env } from '../index'
+import { doAtomicParams } from './kv-atomic-store'
 
 /**
  * Stellar USDC SAC contract addresses, keyed by network id.
@@ -48,7 +49,11 @@ export function getStellarUsdcSac(env: Env): string {
  * (credential verified).
  */
 export function createStellarPayment(env: Env) {
-  const store = Store.cloudflare(env.MPP_STORE)
+  // Store.cloudflare with AtomicParameters produces Store.AtomicStore,
+  // which @stellar/mpp 0.7.0 requires for replay protection (update() CAS).
+  // The DO-backed doAtomicParams provides TRUE linearizable CAS — see
+  // src/mpp/kv-atomic-store.ts for the full race-safety proof.
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
 
   const method = stellar({
     currency: getStellarUsdcSac(env),
