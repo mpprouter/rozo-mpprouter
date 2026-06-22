@@ -207,6 +207,21 @@ const spec = {
           price: { type: 'string' },
           status: { type: 'string', enum: ['active', 'limited'] },
           status_note: { type: 'string' },
+          payment_status: {
+            type: 'string',
+            enum: ['verified', 'untested', 'unavailable'],
+            description:
+              'Payment availability tier (orthogonal to status): "verified" = operator-tested and chargeable; ' +
+              '"untested" = listed but not yet verified, not chargeable; "unavailable" = known-broken, not chargeable.',
+          },
+          payment_enabled: {
+            type: 'boolean',
+            description: 'True iff the route is chargeable (payment_status === "verified"). Mirrors presence of methods.stellar.',
+          },
+          payment_status_note: {
+            type: 'string',
+            description: 'Explanation for untested/unavailable routes. Omitted when verified.',
+          },
           docs: {
             type: 'object',
             properties: {

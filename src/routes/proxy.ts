@@ -739,6 +739,33 @@ export async function handleProxy(
     })
   }
 
+  // SECURITY GATE (2026-06-22): only operator-verified routes are
+  // chargeable. The catalog opt-IN flip (stellarIntentsFor) stops HONEST
+  // clients reading /v1/services/catalog from paying an unverified route,
+  // but it does NOT stop an attacker — or anyone holding a stale snapshot
+  // — from POSTing directly to an ugly/untested path. Without this gate
+  // such a request would proceed straight to charge + a downstream Tempo
+  // payment into a route we've never verified (a real money-loss / abuse
+  // surface). So we refuse here, after route resolution but BEFORE any
+  // payment work, for any route whose verifiedMode isn't 'charge'/'session'.
+  //
+  // The refusal is intentionally generic — no merchant host, channel id,
+  // or internal reason — so it doesn't help an attacker probe the fleet.
+  if (route.verifiedMode !== 'charge' && route.verifiedMode !== 'session') {
+    // Keep the body deliberately bland — no merchant host, channel id,
+    // or verification-state reason — so it doesn't help an attacker
+    // distinguish "untested" from "known-broken" or map the fleet. The
+    // catalog (GET /v1/services/catalog, payment_status field) is the
+    // single place that explains which routes are chargeable.
+    return new Response(JSON.stringify({
+      error: 'Route not enabled for payment',
+      hint: 'See GET /v1/services/catalog for the set of routes that accept payment.',
+    }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
   const merchantHost = route.upstreamHost
   // Resolve `:placeholder` tokens in route.upstreamPath from the
   // URL query (e.g. ?model=gemini-2.0-flash for the gemini route).

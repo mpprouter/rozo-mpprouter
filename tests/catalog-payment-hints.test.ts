@@ -89,16 +89,25 @@ function decodeRequestFromWwwAuthenticate(www: string): any {
 }
 
 describe('catalog payment_hints metadata', () => {
-  it('keeps existing catalog fields and adds optional payment_hints', () => {
+  it('keeps existing catalog fields and adds optional payment_hints on a verified route', () => {
     const env = makeEnv()
     const items = listPublicCatalog(env)
-    const item = items[0]
+    // Pick a known operator-verified route. After the 2026-06-22 opt-IN
+    // flip, items[0] (snapshot order) is typically an UNVERIFIED route
+    // with no stellar block / payment_hints, so assert against a stable
+    // verified route instead.
+    const item = items.find(i => i.id === 'parallel_search')!
+    expect(item).toBeDefined()
 
     expect(item.id).toBeTypeOf('string')
     expect(item.public_path).toMatch(/^\/v1\/services\//)
     expect(item.method).toBe('POST')
     expect(item.payment_method).toBe('stellar')
     expect(item.methods.tempo.intents).toEqual(['charge'])
+    expect(item.methods.stellar).toBeDefined()
+    expect(item.payment_status).toBe('verified')
+    expect(item.payment_enabled).toBe(true)
+    expect(item.payment_status_note).toBeUndefined()
     expect(item.payment_hints).toBeDefined()
   })
 

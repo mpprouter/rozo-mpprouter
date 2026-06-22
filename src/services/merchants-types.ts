@@ -166,6 +166,37 @@ export interface PublicCatalogEntry {
   asset: 'USDC'
   status: 'active' | 'limited'
   status_note?: string
+  /**
+   * Payment availability tier — orthogonal to `status` (which is about
+   * docs availability, i.e. `llms_txt` present). Driven by the
+   * operator's `verifiedMode` flag, NOT by mpp.dev:
+   *
+   *   - `'verified'`    — operator verified the full agent → router →
+   *                       merchant chain with real money. Has a
+   *                       `methods.stellar` block and is chargeable.
+   *   - `'untested'`    — route exists upstream but we haven't verified
+   *                       it. NO `methods.stellar` block; not chargeable.
+   *                       Visible so it can be discovered + promoted.
+   *   - `'unavailable'` — known-broken (merchant 5xx / bad path). NO
+   *                       `methods.stellar` block; not chargeable.
+   *
+   * Added 2026-06-22 so docs availability (`status`) and payment
+   * verification don't collide on a single overloaded field.
+   */
+  payment_status: 'verified' | 'untested' | 'unavailable'
+  /**
+   * Convenience boolean mirroring `payment_status === 'verified'`.
+   * True iff the route advertises a `methods.stellar` block and the
+   * proxy will accept a charge for it. Agents can gate on this without
+   * string-matching `payment_status`.
+   */
+  payment_enabled: boolean
+  /**
+   * Human-readable explanation for `untested` / `unavailable` routes so
+   * a client (or operator) gets an actionable signal instead of silently
+   * 404ing/4xx-ing on a later call. Omitted for `verified` routes.
+   */
+  payment_status_note?: string
   docs_url: string
   /**
    * V2 multi-intent discovery. Lists the Stellar MPP intents the
