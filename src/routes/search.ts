@@ -9,7 +9,9 @@
  *   ?offset=0            — pagination offset
  *
  * Returns the same entry shape as the full catalog, but filtered.
- * Runs in-memory against the pre-built route table (~489 entries).
+ * Runs in-memory against the pre-built route table (~500 entries; the
+ * exact count drifts with the snapshot — check PUBLIC_SERVICE_ROUTES.length
+ * rather than trusting this comment).
  */
 
 import { listPublicCatalog, type CatalogEnvView } from '../services/merchants'

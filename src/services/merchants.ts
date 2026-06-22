@@ -247,10 +247,12 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
  * `mpp-catalog-snapshot.json` + `OPERATOR_OVERLAY` at module load.
  * Effectively immutable for the lifetime of the Worker isolate.
  *
- * Length is currently around 660 routes (88 services × ~7 paid POST
- * endpoints each, after filtering out free/non-POST routes). Inspect
- * counts at runtime via `PUBLIC_SERVICE_ROUTES.length` if you need
- * to check.
+ * Length drifts with the snapshot (88 services × a handful of paid POST
+ * endpoints each, after filtering out free/non-POST routes). Do NOT
+ * hardcode a count here — inspect `PUBLIC_SERVICE_ROUTES.length` at
+ * runtime. Only a small operator-verified subset (those carrying
+ * `verifiedMode: 'charge' | 'session'`) is actually chargeable; the rest
+ * are listed as `payment_status: "untested"` and carry no stellar block.
  */
 export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] =
   buildRoutesFromMppSnapshot(mppSnapshot as any, OPERATOR_OVERLAY)
@@ -262,18 +264,36 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] =
 /**
  * Build the list of Stellar intents this route accepts.
  *
- * Simplified 2026-04-12: all routes advertise only `charge`.
- * Session/channel complexity is removed — the router handles
- * the upstream session dance internally when needed. Agents
- * always pay via single-shot charge.
+ * Opt-IN honesty (2026-06-22): a route only advertises a payable
+ * `charge` intent once the operator has verified it end-to-end with
+ * real money (`verifiedMode === 'charge' | 'session'`). Previously this
+ * was opt-OUT — every route advertised `charge` unless explicitly
+ * marked `verifiedMode: false` — which meant the catalog promised
+ * hundreds of unverified routes as payable, most of which 404 or 502
+ * (the Argens "most providers broken" report). Now:
  *
- * - `verifiedMode === false`: route is known-broken, don't advertise
- *   any stellar intents so agents won't send money into a black hole.
- * - All other routes: advertise `charge` only.
+ * - `verifiedMode === 'charge' | 'session'`: operator-verified →
+ *   advertise `charge`. (Both upstream modes are paid by the agent via
+ *   single-shot Stellar charge; the router handles the upstream session
+ *   dance internally.)
+ * - `verifiedMode === false`: known-broken → no intents, so agents
+ *   won't send money into a black hole.
+ * - `verifiedMode === undefined`: untested → no intents. The route is
+ *   still LISTED in the catalog (so it can be discovered and promoted)
+ *   but carries no `methods.stellar` block and `payment_status:
+ *   "untested"`, so no agent sends money into an unverified route.
+ *
+ * This is paired with a server-side gate in `src/routes/proxy.ts` that
+ * refuses to charge for any route whose `verifiedMode` isn't
+ * 'charge'/'session' — hiding a route from the catalog alone does not
+ * stop a direct POST to an ugly/stale path, so the proxy gate is the
+ * actual security control. Keep the two in sync.
  */
 function stellarIntentsFor(route: PublicServiceRoute): Array<'charge'> {
-  if (route.verifiedMode === false) return []
-  return ['charge']
+  if (route.verifiedMode === 'charge' || route.verifiedMode === 'session') {
+    return ['charge']
+  }
+  return []
 }
 
 /**
@@ -346,6 +366,30 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
 
   return PUBLIC_SERVICE_ROUTES.map(route => {
     const stellarIntents = stellarIntentsFor(route)
+    // Payment availability tier — orthogonal to docs `status`. Driven
+    // by verifiedMode, kept in lockstep with stellarIntentsFor (which
+    // only advertises `charge` for the verified tier) and the proxy
+    // execution gate.
+    const paymentTier: Pick<
+      PublicCatalogEntry,
+      'payment_status' | 'payment_enabled' | 'payment_status_note'
+    > =
+      route.verifiedMode === 'charge' || route.verifiedMode === 'session'
+        ? { payment_status: 'verified', payment_enabled: true }
+        : route.verifiedMode === false
+          ? {
+              payment_status: 'unavailable',
+              payment_enabled: false,
+              payment_status_note:
+                route.verifiedNote ??
+                'Route is known-broken (merchant error or bad upstream path) and is not chargeable.',
+            }
+          : {
+              payment_status: 'untested',
+              payment_enabled: false,
+              payment_status_note:
+                'Route exists upstream but has not been verified end-to-end by the operator; not chargeable yet.',
+            }
     const entry: PublicCatalogEntry = {
       id: route.id,
       name: route.name,
@@ -365,6 +409,7 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
       ...(route.docs?.llmsTxt ? {} : {
         status_note: 'llms_txt not available — use with caution; agents may not know how to construct request bodies.',
       }),
+      ...paymentTier,
       docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
       methods: {
         // Only include `stellar` when the route has usable intents —
