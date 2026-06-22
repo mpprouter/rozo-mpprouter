@@ -1,0 +1,55 @@
+name: CI
+
+# Runs on every PR into main and on pushes to main. The whole point of
+# this workflow is to make a BROKEN BUILD impossible to merge: it checks
+# out only committed files (no local untracked files to mask a missing
+# import), installs deps, type-checks, and runs the test suite. If
+# someone adds `import { x } from './new-file'` to index.ts but forgets
+# to commit `new-file.ts`, `tsc --noEmit` fails here and the PR is
+# blocked — exactly the failure mode that slipped into main on 2026-06-22.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (committed files only)
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # `npm ci` installs strictly from package-lock.json — reproducible,
+      # and fails if lockfile and package.json drift.
+      - name: Install dependencies
+        run: npm ci
+
+      # Type-check the whole project. This is the guard that catches a
+      # committed import pointing at an uncommitted file.
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npx vitest run
+
+      # Validate the Worker actually bundles (catches build-time issues
+      # tsc alone can miss, e.g. a route file that imports a server-only
+      # module). --dry-run does not publish anything. Non-blocking: it can
+      # fail on account/credential checks in CI even when the bundle is
+      # fine, so tsc + vitest above are the hard gate and this is advisory.
+      - name: Wrangler build (dry-run, no publish)
+        continue-on-error: true
+        run: npx wrangler deploy --dry-run
