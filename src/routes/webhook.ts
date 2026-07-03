@@ -172,6 +172,99 @@ async function bumpReserved(env: Env, deltaAtomic: bigint): Promise<void> {
   )
 }
 
+// ── Invoice failure ops alerts (DingTalk) ────────────────────────────────
+//
+// Reuses the same sendDingTalkAlert transport as the Tempo low-balance
+// alert in proxy.ts. Both terminal-ish failure states of the fulfillment
+// state machine (`failed_insufficient_balance`, `failed_pay_invoice`)
+// fire an ops ping so a human can top up / investigate and replay the
+// webhook. Alerting is strictly best-effort: it must never break the
+// payment path (see sendInvoiceFailureAlert).
+
+// Masks blockchain addresses to first-6 + last-4 so alert payloads never
+// carry a full address (EVM 0x…, Stellar G/C…, Solana-style base58).
+export function maskAddresses(text: string): string {
+  return text
+    .replace(/0x[a-fA-F0-9]{40}/g, (m) => `${m.slice(0, 6)}…${m.slice(-4)}`)
+    .replace(/\b[GC][A-Z2-7]{55}\b/g, (m) => `${m.slice(0, 6)}…${m.slice(-4)}`)
+    .replace(/\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g, (m) => `${m.slice(0, 6)}…${m.slice(-4)}`)
+}
+
+export interface InvoiceFailureAlertParams {
+  kind: 'failed_insufficient_balance' | 'failed_pay_invoice'
+  plId: string
+  invoiceAtomic: bigint | null
+  funderBalanceAtomic: bigint | null
+  availableAtomic?: bigint | null
+  failureReason: string
+  detail?: string
+}
+
+function fmtUsdcAtomic(atomic: bigint | null | undefined): string {
+  if (atomic === null || atomic === undefined) return '?'
+  return (Number(atomic) / 1e6).toFixed(2)
+}
+
+export function buildInvoiceFailureAlert(params: InvoiceFailureAlertParams): string {
+  const funderMasked = maskAddresses(FUNDER_WALLET)
+  const headline =
+    params.kind === 'failed_insufficient_balance'
+      ? '🚨 Invoice fulfillment BLOCKED: insufficient funder balance'
+      : '🚨 Invoice fulfillment FAILED: pay-invoice call did not succeed'
+  const action =
+    params.kind === 'failed_insufficient_balance'
+      ? 'Caller already paid — top up the funder wallet, then replay the webhook.'
+      : 'Caller already paid — investigate, then replay the webhook.'
+  const lines = [
+    `[MPP Router] ${headline}`,
+    `Invoice: ${params.plId} (${fmtUsdcAtomic(params.invoiceAtomic)} USDC)`,
+    `Funder ${funderMasked}: balance ${fmtUsdcAtomic(params.funderBalanceAtomic)} USDC` +
+      (params.availableAtomic !== undefined
+        ? `, available ${fmtUsdcAtomic(params.availableAtomic)} USDC`
+        : ''),
+    `Reason: ${params.failureReason}`,
+  ]
+  if (params.detail) {
+    // Mask BEFORE truncating so the slice can never cut a full address
+    // in a way that leaves most of it exposed.
+    lines.push(`Detail: ${maskAddresses(params.detail).slice(0, 300)}`)
+  }
+  lines.push(`At: ${new Date().toISOString()}`)
+  lines.push(action)
+  // Final defensive pass over the whole message (idempotent on already-
+  // masked forms — the `…` breaks every pattern).
+  return maskAddresses(lines.join('\n'))
+}
+
+// Never throws. Missing token degrades to a structured warn log so the
+// gap is still observable in `wrangler tail`.
+export async function sendInvoiceFailureAlert(
+  env: Env,
+  params: InvoiceFailureAlertParams,
+): Promise<void> {
+  try {
+    if (!env.DINGTALK_ACCESS_TOKEN) {
+      console.warn(
+        `[webhook] invoice failure alert SKIPPED (DINGTALK_ACCESS_TOKEN not set): ` +
+          JSON.stringify({
+            alert: 'invoice_failure',
+            kind: params.kind,
+            pl_id: params.plId,
+            reason: params.failureReason,
+          }),
+      )
+      return
+    }
+    await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, buildInvoiceFailureAlert(params))
+  } catch (err) {
+    console.warn(
+      `[webhook] invoice failure alert error (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+  }
+}
+
 async function callAgentApiPayInvoice(
   env: Env,
   plId: string,
@@ -381,18 +474,15 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
       rec.failureReason = `funder balance ${balance} (avail ${available}) < invoice ${invoiceAtomic}`
       // Ops alert: the caller HAS paid (payout landed) but we can't settle
       // the Coinbase link. Awaited — handleRozoWebhook has no ctx.waitUntil,
-      // and sendDingTalkAlert never throws.
-      if (env.DINGTALK_ACCESS_TOKEN) {
-        await sendDingTalkAlert(
-          env.DINGTALK_ACCESS_TOKEN,
-          `[MPP Router] 🚨 Invoice fulfillment BLOCKED: insufficient funder balance\n` +
-            `Invoice: ${plId} (${(Number(invoiceAtomic) / 1e6).toFixed(2)} USDC)\n` +
-            `Funder ${FUNDER_WALLET.slice(0, 6)}…${FUNDER_WALLET.slice(-4)}: ` +
-            `balance ${balance !== null ? (Number(balance) / 1e6).toFixed(2) : '?'} USDC, ` +
-            `available ${available !== null ? (Number(available) / 1e6).toFixed(2) : '?'} USDC\n` +
-            `Caller already paid — top up the funder wallet, then replay the webhook.`,
-        )
-      }
+      // and sendInvoiceFailureAlert never throws.
+      await sendInvoiceFailureAlert(env, {
+        kind: 'failed_insufficient_balance',
+        plId,
+        invoiceAtomic,
+        funderBalanceAtomic: balance,
+        availableAtomic: available,
+        failureReason: rec.failureReason,
+      })
     }
     await saveRecord(env, plId, rec)
     return json(200, {
@@ -443,15 +533,15 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
     })
     // Ops alert: caller paid but the Coinbase settlement call failed —
     // terminal state, needs a human (fix cause, then replay webhook).
-    if (env.DINGTALK_ACCESS_TOKEN) {
-      await sendDingTalkAlert(
-        env.DINGTALK_ACCESS_TOKEN,
-        `[MPP Router] 🚨 Invoice fulfillment FAILED: agentapi pay-invoice returned ${payResult.status}\n` +
-          `Invoice: ${plId}\n` +
-          `Detail: ${JSON.stringify(payResult.body).slice(0, 300)}\n` +
-          `Caller already paid — investigate, then replay the webhook.`,
-      )
-    }
+    // Awaited — no ctx.waitUntil here; sendInvoiceFailureAlert never throws.
+    await sendInvoiceFailureAlert(env, {
+      kind: 'failed_pay_invoice',
+      plId,
+      invoiceAtomic,
+      funderBalanceAtomic: balance,
+      failureReason: rec.failureReason,
+      detail: JSON.stringify(payResult.body),
+    })
   }
   await saveRecord(env, plId, rec)
 
