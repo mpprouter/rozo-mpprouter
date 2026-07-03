@@ -104,6 +104,26 @@ export interface PublicServiceRoute {
    * have to read the source.
    */
   verifiedNote?: string
+  /**
+   * Per-mode real-money verification, operator-maintained (carried in the
+   * overlay). Independent of `verifiedMode` (which is a single legacy enum):
+   * a route's downstream merchant may accept charge, session, or both, and
+   * we may have verified one mode but not the other.
+   *
+   *   - `true`  — we ran a real-money test in this mode and it worked.
+   *   - `false` — we tested this mode and it failed.
+   *   - `null` / omitted — this mode is N/A for the route, or we have never
+   *     tested it in this mode. (Distinct from `false`.)
+   *
+   * `*VerifiedAt` is the ISO timestamp of that verification (null/omitted
+   * when not verified). Rendered to the catalog as `charge_rozo_verified` /
+   * `charge_rozo_verified_at` / `session_rozo_verified` /
+   * `session_rozo_verified_at`.
+   */
+  chargeVerified?: boolean | null
+  chargeVerifiedAt?: string | null
+  sessionVerified?: boolean | null
+  sessionVerifiedAt?: string | null
 }
 
 /**
@@ -130,6 +150,12 @@ export interface PublicServiceRouteOverlay {
   verifiedNote?: string
   placeholderDefaults?: Record<string, string>
   upstreamPaymentMethod?: 'tempo.charge' | 'tempo.session'
+  /** Per-mode real-money verification flags + timestamps. See
+   * PublicServiceRoute.chargeVerified for semantics. */
+  chargeVerified?: boolean | null
+  chargeVerifiedAt?: string | null
+  sessionVerified?: boolean | null
+  sessionVerifiedAt?: string | null
 }
 
 /**
@@ -169,34 +195,44 @@ export interface PublicCatalogEntry {
   /**
    * Payment availability tier — orthogonal to `status` (which is about
    * docs availability, i.e. `llms_txt` present). Driven by the
-   * operator's `verifiedMode` flag, NOT by mpp.dev:
+   * operator's `verifiedMode` flag, NOT by mpp.dev. Updated 2026-06-23
+   * (Option A): unverified routes are PAYABLE again; only confirmed-broken
+   * routes are blocked.
    *
    *   - `'verified'`    — operator verified the full agent → router →
-   *                       merchant chain with real money. Has a
-   *                       `methods.stellar` block and is chargeable.
-   *   - `'untested'`    — route exists upstream but we haven't verified
-   *                       it. NO `methods.stellar` block; not chargeable.
-   *                       Visible so it can be discovered + promoted.
-   *   - `'unavailable'` — known-broken (merchant 5xx / bad path). NO
-   *                       `methods.stellar` block; not chargeable.
-   *
-   * Added 2026-06-22 so docs availability (`status`) and payment
-   * verification don't collide on a single overloaded field.
+   *                       merchant chain with real money. Chargeable.
+   *   - `'available'`   — route exists upstream and is chargeable, but we
+   *                       have NOT verified it end-to-end. Payable; the
+   *                       client decides its own risk via the
+   *                       `*_rozo_verified` fields.
+   *   - `'unavailable'` — known-broken (we real-money tested it and it
+   *                       failed: merchant 5xx / bad path). NOT chargeable;
+   *                       the proxy gate refuses it.
    */
-  payment_status: 'verified' | 'untested' | 'unavailable'
+  payment_status: 'verified' | 'available' | 'unavailable'
   /**
-   * Convenience boolean mirroring `payment_status === 'verified'`.
-   * True iff the route advertises a `methods.stellar` block and the
-   * proxy will accept a charge for it. Agents can gate on this without
+   * Convenience boolean: true iff the proxy will accept a charge for this
+   * route (i.e. `payment_status !== 'unavailable'`). Both `verified` and
+   * `available` routes are payable. Agents can gate on this without
    * string-matching `payment_status`.
    */
   payment_enabled: boolean
   /**
-   * Human-readable explanation for `untested` / `unavailable` routes so
-   * a client (or operator) gets an actionable signal instead of silently
-   * 404ing/4xx-ing on a later call. Omitted for `verified` routes.
+   * Human-readable explanation for `available` / `unavailable` routes so
+   * a client (or operator) gets an actionable signal. Omitted for
+   * `verified` routes.
    */
   payment_status_note?: string
+  /**
+   * Per-mode operator verification, surfaced so a paying agent can see
+   * exactly what WE have vetted vs what is best-effort. See
+   * PublicServiceRoute.chargeVerified for the true/false/null semantics
+   * (null = N/A for this mode or never tested in it).
+   */
+  charge_rozo_verified: boolean | null
+  charge_rozo_verified_at: string | null
+  session_rozo_verified: boolean | null
+  session_rozo_verified_at: string | null
   docs_url: string
   /**
    * V2 multi-intent discovery. Lists the Stellar MPP intents the

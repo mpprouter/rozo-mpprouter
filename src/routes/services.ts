@@ -28,12 +28,27 @@ export function handleServices(env: Env): Response {
     })
   }
 
+  const services = listPublicCatalog(env)
+
+  // Top-level payment summary so a client (and operators) can see fleet
+  // health at a glance without walking every entry: how many routes the
+  // router will accept payment for, and how many of those we've actually
+  // real-money verified vs are payable-but-unverified.
+  const summary = {
+    total: services.length,
+    payable: services.filter(s => s.payment_enabled).length,
+    verified: services.filter(s => s.payment_status === 'verified').length,
+    available_unverified: services.filter(s => s.payment_status === 'available').length,
+    unavailable: services.filter(s => s.payment_status === 'unavailable').length,
+  }
+
   return new Response(JSON.stringify({
     version: 1,
     base_url: 'https://apiserver.mpprouter.dev',
     generated_at: new Date().toISOString(),
     supported_payment_methods: supportedPaymentMethods,
-    services: listPublicCatalog(env),
+    summary,
+    services,
   }, null, 2), {
     headers: { 'Content-Type': 'application/json' },
   })

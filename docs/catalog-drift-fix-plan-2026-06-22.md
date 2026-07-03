@@ -63,7 +63,106 @@ Evidence: `coingecko/coingecko/simple-price` → 400 "Unknown public service rou
 
 ---
 
-## The fix (ours)
+## The fix (ours) — v2 (2026-06-22, supersedes the hard-gate approach below)
+
+### Why v2: the hard gate (PR #2) was too aggressive
+
+PR #2 shipped an opt-IN model that (a) only advertised the ~11 manually-overlaid routes and
+(b) added a proxy execution gate returning `"Route not enabled for payment"` for everything
+else. Result in production: catalog advertises 11, **485 routes return "Route not enabled
+for payment"** — including services Argens and his users had tested and were actually using.
+We over-corrected: we treated "we haven't verified it" as "nobody may pay it", and封死了
+真实在用的服务。
+
+**Founder decision (2026-06-22): drop the hard gate. All routes stay payable by default.
+Mark trust honestly with two fields instead of gating.**
+
+### The actual safety basis (why "all payable" is safe)
+
+Traced `src/routes/proxy.ts` (stellar.x402 branch, ~line 1047-1052): the router pays the
+downstream merchant from **our own Tempo pool FIRST**, and **only submits the customer's
+signed on-chain payment after the merchant returns 2xx** ("ONLY on merchant 2xx: submit the
+agent's signed Soroban invoke on chain"). So if an unverified route's merchant is broken
+(502), the customer's USDC authorization is never submitted → **the customer does not lose
+money**. The downstream-first ordering is the real protection, not the catalog gate.
+Therefore advertising an unverified route as payable does NOT endanger customer funds. The
+only exposure is our own pool float, which is operational and bounded.
+
+(Confirm this ordering also holds on the mppx `stellar.charge` branch during implementation,
+not just the x402 branch — see `payMerchantAndGetBody` and the charge verify path. If charge
+settles the customer BEFORE merchant 2xx, fix the ordering; do NOT reintroduce a blanket
+gate.)
+
+### Decision: per-mode trust fields, no gate (FINAL — founder-locked 2026-06-22)
+
+A route's payment mode (charge vs session) is decided by the downstream merchant; some
+support only one. Verification status differs per mode (we can batch-verify charge cheaply;
+session needs a channel per merchant). So track trust **per mode**, 4 fields:
+
+| field | type | meaning |
+|---|---|---|
+| `charge_rozo_verified` | `boolean \| null` | charge mode real-money verified? `null` = N/A or never tested in charge |
+| `charge_rozo_verified_at` | `string \| null` | ISO timestamp of charge verification |
+| `session_rozo_verified` | `boolean \| null` | session mode real-money verified? `null` = N/A or never tested in session |
+| `session_rozo_verified_at` | `string \| null` | ISO timestamp of session verification |
+
+`null` semantics: route does not use this mode / we have never touched it in this mode.
+Distinct from `false` (tested, broken) and `true` (tested, works). The fields ALWAYS appear
+on every entry (clients don't have to handle missing keys); inapplicable ones are `null`.
+
+These must be backed by per-mode overlay data, NOT the single `verifiedMode` enum. Extend
+`OPERATOR_OVERLAY` entries to carry per-mode verification (e.g. `chargeVerified` /
+`chargeVerifiedAt` / `sessionVerified` / `sessionVerifiedAt`, or a `verified: {charge, session}`
+sub-object) and render the 4 catalog fields from it. Keep the legacy `verifiedMode` working
+during migration or migrate all readers together.
+
+Payability rule (no blanket gate):
+- **Default = payable.** A route with no verification (`null`/`false`) is still payable and
+  still advertises stellar. The client reads the 4 fields and decides its own risk.
+- **Only confirmed-broken stays non-payable.** A route we real-money-tested and found broken
+  (the old `verifiedMode: false` cases — quicknode/gemini/nansen-style) is the ONLY thing
+  that stays non-payable, so customers don't repeatedly hit known-dead services.
+
+Verified set today (mark `charge_rozo_verified: true` with a timestamp): the 11 currently
+advertised (exa, firecrawl, openai, openrouter, parallel, alchemy, tempo, storage, coingecko,
+deepseek, groq). openrouter/openai were verified via session — set the session_ pair for
+those, charge_ for the charge ones, per what was actually tested.
+
+### charge vs session verification strategy (founder note)
+
+- **charge**: stateless, single-shot. We can batch-verify almost all charge routes cheaply
+  (probe → small real-money charge). Goal: mark the bulk of working charge routes
+  `rozo_verified: true`.
+- **session**: requires opening a Tempo channel + descriptor/deposit state per merchant.
+  Expensive to verify. Only the few we've opened channels for get `rozo_verified: true`;
+  the rest stay `false` (payable, unverified) until individually verified.
+
+### Tactical fixes on top
+
+1. **Path de-dupe** stays: clean overlay paths (coingecko/groq/quicknode/deepseek `chat`/
+   `simple-price`/`rpc`) are the verified ones; the ugly auto-paths remain payable-unverified.
+
+2. **oxylabs**: probes as charge. Verify with real money → mark `rozo_verified: true`.
+
+3. **gemini**: keep `verifiedMode: false` (broken `*` wildcard path). `upstreamPath` override
+   is a separate follow-up.
+
+4. **Catalog response**: surface `rozo_verified` + `rozo_verified_at` on every entry. Do NOT
+   reuse the docs-oriented `status`/`status_note` fields. Drop the v2 `payment_status` /
+   `payment_enabled` design — two fields only, per founder.
+
+### What we will NOT do
+
+- Will NOT weaken router-side route validation or header decoding for a stale/unknown client.
+- Will NOT delete snapshot routes.
+- Will NOT touch nansen/moltycash behavior (merchant-side, correct as-is).
+- Will NOT mass-mark routes `rozo_verified: true` without real-money proof.
+- Will NOT keep the blanket "Route not enabled for payment" gate. Only `verifiedMode: false`
+  stays non-payable.
+
+---
+
+## ⬇️ ORIGINAL v1 hard-gate design (SUPERSEDED — kept for history)
 
 ### Decision: flip the catalog to opt-IN honesty (the core change)
 
@@ -139,7 +238,7 @@ without deleting anything — untested routes are visible and promotable.
    `status_note` fields alone unless this change intentionally includes a full API contract
    migration.
 
-### What we will NOT do
+### What we will NOT do (v1)
 
 - Will NOT weaken router-side route validation or header decoding to make a stale/unknown
   client "work". Unknown route → 400 is correct.

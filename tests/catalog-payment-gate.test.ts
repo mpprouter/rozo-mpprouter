@@ -201,15 +201,19 @@ function withRoute<T>(
 describe('catalog honesty (opt-IN payment advertising)', () => {
   const env = { X402_ENABLED: 'false' }
 
-  it('an untested (verifiedMode undefined) route is listed but not payable', () => {
+  it('an untested (verifiedMode undefined) route is payable but marked available/unverified (Option A)', () => {
     withRoute({ id: '__gate_untested__', publicPath: '/v1/services/gatetest/untested' }, () => {
       const item = listPublicCatalog(env).find(i => i.id === '__gate_untested__')!
       expect(item).toBeDefined()
-      expect(item.methods.stellar).toBeUndefined()
-      expect(item.payment_status).toBe('untested')
-      expect(item.payment_enabled).toBe(false)
+      // Option A: untested routes ARE payable (advertise stellar) but flagged
+      // available + unverified so the client decides its own risk.
+      expect(item.methods.stellar).toEqual({ intents: ['charge'] })
+      expect(item.payment_status).toBe('available')
+      expect(item.payment_enabled).toBe(true)
       expect(item.payment_status_note).toBeTypeOf('string')
-      expect(item.payment_hints).toBeUndefined()
+      // Per-mode trust fields present and null (never verified in either mode).
+      expect(item.charge_rozo_verified).toBeNull()
+      expect(item.session_rozo_verified).toBeNull()
     })
   })
 
@@ -235,19 +239,24 @@ describe('catalog honesty (opt-IN payment advertising)', () => {
     })
   })
 
-  it('GLOBAL invariant: no verifiedMode-undefined route advertises a stellar block', () => {
+  it('GLOBAL invariant (Option A): only verifiedMode:false routes are non-payable', () => {
     const items = listPublicCatalog(env)
     for (const route of PUBLIC_SERVICE_ROUTES) {
-      if (route.verifiedMode === undefined) {
-        const item = items.find(i => i.id === route.id)
-        // The catalog dedupes by id in practice; if present it must not be payable.
-        if (item) {
-          expect(item.methods.stellar, `route ${route.id} should not advertise stellar`).toBeUndefined()
-          expect(item.payment_status).toBe('untested')
-        }
+      const item = items.find(i => i.id === route.id)
+      if (!item) continue
+      if (route.verifiedMode === false) {
+        // Confirmed-broken: not payable, no stellar block.
+        expect(item.methods.stellar, `broken route ${route.id} must not advertise stellar`).toBeUndefined()
+        expect(item.payment_status).toBe('unavailable')
+        expect(item.payment_enabled).toBe(false)
+      } else {
+        // verified OR untested: payable, advertises stellar.
+        expect(item.methods.stellar, `route ${route.id} should advertise stellar`).toEqual({ intents: ['charge'] })
+        expect(item.payment_enabled).toBe(true)
+        expect(['verified', 'available']).toContain(item.payment_status)
       }
     }
-    // And the verified set is exactly the routes carrying a charge/session verifiedMode.
+    // The verified set is exactly the routes carrying a charge/session verifiedMode.
     const verifiedCount = items.filter(i => i.payment_status === 'verified').length
     const overlayVerified = PUBLIC_SERVICE_ROUTES.filter(
       r => r.verifiedMode === 'charge' || r.verifiedMode === 'session',
@@ -262,8 +271,11 @@ describe('proxy verifiedMode execution gate', () => {
     vi.restoreAllMocks()
   })
 
-  it('refuses an untested (verifiedMode undefined) route with 403 BEFORE any secret/KV/merchant access', async () => {
+  it('Option A: an untested (verifiedMode undefined) route is NOT gated — it proceeds into the payment flow', async () => {
     const env = makeTrapEnv()
+    // Spy on the trap accessors so we can PROVE the request reached the
+    // payment flow (which reads secrets/KV) rather than passing vacuously on
+    // some earlier throw. makeTrapEnv throws from these on access.
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     await withRoute(
       { id: '__gate_proxy_untested__', publicPath: '/v1/services/gatetest/proxy-untested' },
@@ -273,16 +285,28 @@ describe('proxy verifiedMode execution gate', () => {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ q: 'x' }),
         })
-        // makeTrapEnv throws on any secret/KV read, so reaching this line
-        // at all proves the gate short-circuited before any payment work.
-        const res = await handleProxy(req, env, makeCtx())
-        expect(res.status).toBe(403)
-        // No merchant was contacted and no Tempo payment was attempted.
-        expect(fetchSpy).not.toHaveBeenCalled()
-        const body = await res.json() as { error?: string }
-        // Generic refusal — must not leak the merchant host / channel / internals.
-        expect(JSON.stringify(body)).not.toContain('merchant.invalid')
-        expect(body.error).toBe('Route not enabled for payment')
+        // Under Option A an untested route is payable, so the proxy must NOT
+        // short-circuit with the 403 gate. It must proceed past the gate and
+        // attempt payment work, which means it tries to reach the merchant
+        // (fetch) and/or trips makeTrapEnv's secret/KV trap.
+        let gateRefused = false
+        let reachedPaymentFlow = false
+        try {
+          const res = await handleProxy(req, env, makeCtx())
+          // Got a response (no throw): it must NOT be the 403 gate.
+          if (res.status === 403) {
+            const body = (await res.json()) as { error?: string }
+            gateRefused = body.error === 'Route not enabled for payment'
+          }
+          // A merchant probe means we got past the gate into payment work.
+          reachedPaymentFlow = fetchSpy.mock.calls.length > 0
+        } catch {
+          // Trap tripped (secret/KV access) — that only happens AFTER the gate,
+          // inside the payment flow. Proves the route was not gated.
+          reachedPaymentFlow = true
+        }
+        expect(gateRefused, 'untested route must NOT hit the 403 payment gate').toBe(false)
+        expect(reachedPaymentFlow, 'untested route must reach the payment flow past the gate').toBe(true)
       },
     )
   })

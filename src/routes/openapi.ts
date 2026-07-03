@@ -209,18 +209,35 @@ const spec = {
           status_note: { type: 'string' },
           payment_status: {
             type: 'string',
-            enum: ['verified', 'untested', 'unavailable'],
+            enum: ['verified', 'available', 'unavailable'],
             description:
-              'Payment availability tier (orthogonal to status): "verified" = operator-tested and chargeable; ' +
-              '"untested" = listed but not yet verified, not chargeable; "unavailable" = known-broken, not chargeable.',
+              'Payment availability tier (orthogonal to status): "verified" = operator real-money tested and chargeable; ' +
+              '"available" = chargeable but NOT verified by Rozo (check charge_rozo_verified / session_rozo_verified before relying on it); ' +
+              '"unavailable" = known-broken (real-money tested and failed), not chargeable.',
           },
           payment_enabled: {
             type: 'boolean',
-            description: 'True iff the route is chargeable (payment_status === "verified"). Mirrors presence of methods.stellar.',
+            description: 'True iff the route is chargeable (payment_status is "verified" or "available"; i.e. not "unavailable").',
           },
           payment_status_note: {
             type: 'string',
-            description: 'Explanation for untested/unavailable routes. Omitted when verified.',
+            description: 'Explanation for "available"/"unavailable" routes. Omitted when verified.',
+          },
+          charge_rozo_verified: {
+            type: ['boolean', 'null'],
+            description: 'Has Rozo real-money verified this route in charge mode? null = N/A for this mode or never tested in it.',
+          },
+          charge_rozo_verified_at: {
+            type: ['string', 'null'],
+            description: 'ISO timestamp of charge-mode verification, or null.',
+          },
+          session_rozo_verified: {
+            type: ['boolean', 'null'],
+            description: 'Has Rozo real-money verified this route in session mode? null = N/A for this mode or never tested in it.',
+          },
+          session_rozo_verified_at: {
+            type: ['string', 'null'],
+            description: 'ISO timestamp of session-mode verification, or null.',
           },
           docs: {
             type: 'object',
