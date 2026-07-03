@@ -1,13 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { listPublicCatalog, PUBLIC_SERVICE_ROUTES } from '../src/services/merchants'
 import { handleProxy } from '../src/routes/proxy'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
-function loadDevVars(): Record<string, string> {
+function loadDevVars(): Record<string, string> | null {
   const path = resolve(__dirname, '..', '.dev.vars')
+  if (!existsSync(path)) return null
   const raw = readFileSync(path, 'utf8')
   const out: Record<string, string> = {}
   for (const line of raw.split('\n')) {
@@ -49,6 +50,7 @@ function makeEnv(): Env {
   } as unknown as KVNamespace
 
   const vars = loadDevVars()
+  if (!vars) throw new Error('.dev.vars missing — suite is skipped in CI')
   return {
     MPP_STORE,
     // P1-3: in-process DO mock so doAtomicParams() works in tests without CF runtime.
@@ -88,7 +90,7 @@ function decodeRequestFromWwwAuthenticate(www: string): any {
   return JSON.parse(Buffer.from(`${b64}${pad}`, 'base64').toString('utf8'))
 }
 
-describe('catalog payment_hints metadata', () => {
+describe.skipIf(!loadDevVars())('catalog payment_hints metadata', () => {
   it('keeps existing catalog fields and adds optional payment_hints on a verified route', () => {
     const env = makeEnv()
     const items = listPublicCatalog(env)

@@ -19,18 +19,14 @@ import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
  * Load secrets from .dev.vars (Wrangler's local secrets file, gitignored).
  * We never hardcode key material in test files.
  */
-function loadDevVars(): Record<string, string> {
+function loadDevVars(): Record<string, string> | null {
   const path = resolve(__dirname, '..', '.dev.vars')
   let raw: string
   try {
     raw = readFileSync(path, 'utf8')
   } catch {
-    throw new Error(
-      `Could not read .dev.vars at ${path}. ` +
-        `Copy .dev.vars.example (or ask the operator) and populate: ` +
-        `STELLAR_ROUTER_PUBLIC, STELLAR_GAS_SECRET, STELLAR_GAS_PUBLIC, ` +
-        `TEMPO_ROUTER_PRIVATE_KEY, TEMPO_ROUTER_ADDRESS, MPP_SECRET_KEY.`,
-    )
+    // Fresh clone / CI: no local secrets — suites self-skip via skipIf below.
+    return null
   }
   const out: Record<string, string> = {}
   for (const line of raw.split('\n')) {
@@ -105,6 +101,7 @@ function makeEnv(): Env {
   } as unknown as KVNamespace
 
   const vars = loadDevVars()
+  if (!vars) throw new Error('.dev.vars missing — suite is skipped in CI')
 
   return {
     MPP_STORE,
@@ -218,7 +215,7 @@ function makeTempoChallengeResponse(
   })
 }
 
-describe('handleProxy payment verification', () => {
+describe.skipIf(!loadDevVars())('handleProxy payment verification', () => {
   beforeEach(() => {
     payMerchantSpy.mockClear()
   })
