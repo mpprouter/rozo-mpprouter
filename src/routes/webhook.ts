@@ -1,5 +1,6 @@
 import type { Env } from '../index'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
+import { sendDingTalkAlert } from '../utils/dingtalk'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -378,6 +379,20 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
     if (eventType === 'payment_payout_completed') {
       rec.status = 'failed_insufficient_balance'
       rec.failureReason = `funder balance ${balance} (avail ${available}) < invoice ${invoiceAtomic}`
+      // Ops alert: the caller HAS paid (payout landed) but we can't settle
+      // the Coinbase link. Awaited — handleRozoWebhook has no ctx.waitUntil,
+      // and sendDingTalkAlert never throws.
+      if (env.DINGTALK_ACCESS_TOKEN) {
+        await sendDingTalkAlert(
+          env.DINGTALK_ACCESS_TOKEN,
+          `[MPP Router] 🚨 Invoice fulfillment BLOCKED: insufficient funder balance\n` +
+            `Invoice: ${plId} (${(Number(invoiceAtomic) / 1e6).toFixed(2)} USDC)\n` +
+            `Funder ${FUNDER_WALLET.slice(0, 6)}…${FUNDER_WALLET.slice(-4)}: ` +
+            `balance ${balance !== null ? (Number(balance) / 1e6).toFixed(2) : '?'} USDC, ` +
+            `available ${available !== null ? (Number(available) / 1e6).toFixed(2) : '?'} USDC\n` +
+            `Caller already paid — top up the funder wallet, then replay the webhook.`,
+        )
+      }
     }
     await saveRecord(env, plId, rec)
     return json(200, {
@@ -426,6 +441,17 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
       at: new Date().toISOString(),
       detail: { status: payResult.status, body: payResult.body },
     })
+    // Ops alert: caller paid but the Coinbase settlement call failed —
+    // terminal state, needs a human (fix cause, then replay webhook).
+    if (env.DINGTALK_ACCESS_TOKEN) {
+      await sendDingTalkAlert(
+        env.DINGTALK_ACCESS_TOKEN,
+        `[MPP Router] 🚨 Invoice fulfillment FAILED: agentapi pay-invoice returned ${payResult.status}\n` +
+          `Invoice: ${plId}\n` +
+          `Detail: ${JSON.stringify(payResult.body).slice(0, 300)}\n` +
+          `Caller already paid — investigate, then replay the webhook.`,
+      )
+    }
   }
   await saveRecord(env, plId, rec)
 

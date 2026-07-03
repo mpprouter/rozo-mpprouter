@@ -29,13 +29,14 @@ import { Credential } from 'mppx'
  * Load secrets from .dev.vars — same pattern as tests/proxy.test.ts.
  * Never hardcode key material.
  */
-function loadDevVars(): Record<string, string> {
+function loadDevVars(): Record<string, string> | null {
   const path = resolve(__dirname, '..', '.dev.vars')
   let raw: string
   try {
     raw = readFileSync(path, 'utf8')
   } catch {
-    throw new Error(`Could not read .dev.vars at ${path}.`)
+    // Fresh clone / CI: no local secrets — suites self-skip via skipIf below.
+    return null
   }
   const out: Record<string, string> = {}
   for (const line of raw.split('\n')) {
@@ -166,6 +167,7 @@ function makeEnv(): Env {
   } as unknown as KVNamespace
 
   const vars = loadDevVars()
+  if (!vars) throw new Error('.dev.vars missing — suite is skipped in CI')
 
   return {
     MPP_STORE,
@@ -258,7 +260,7 @@ function makeTempoSessionChallenge(amount: string = '2500'): Response {
  * dispatch misrouted charge-mode merchants).
  */
 
-describe('handleProxy session dispatch (structural)', () => {
+describe.skipIf(!loadDevVars())('handleProxy session dispatch (structural)', () => {
   beforeEach(() => {
     payMerchantSpy.mockClear()
     payMerchantSessionSpy.mockClear()

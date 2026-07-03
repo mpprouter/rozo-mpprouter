@@ -71,18 +71,24 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'parallel_search',
     publicPath: '/v1/services/parallel/search',
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
   },
   // Exa AI Search
   'exa::/search': {
     id: 'exa_search',
     publicPath: '/v1/services/exa/search',
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
   },
   // Firecrawl Scrape
   'firecrawl::/v1/scrape': {
     id: 'firecrawl_scrape',
     publicPath: '/v1/services/firecrawl/scrape',
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
   },
   // OpenRouter Chat — flipped to tempo.session 2026-04-11 after
   // open-tempo-channel.ts opened the $1 channel
@@ -95,6 +101,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/openrouter/chat',
     upstreamPaymentMethod: 'tempo.session',
     verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-04-11T00:00:00Z',
   },
   // Anthropic Messages — broken upstream
   'anthropic::/v1/messages': {
@@ -113,6 +121,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/openai/chat',
     upstreamPaymentMethod: 'tempo.session',
     verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-04-11T00:00:00Z',
   },
   // Google Gemini — uses {model} placeholder, defaults to gemini-2.0-flash
   // The upstream path uses Google's `:generateContent` literal
@@ -170,6 +180,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/alchemy/rpc',
     upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
     placeholderDefaults: { network: 'eth-mainnet' },
   },
   // Tempo L2 RPC
@@ -178,6 +190,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/tempo/rpc',
     upstreamPaymentMethod: 'tempo.session',
     verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-04-11T00:00:00Z',
   },
   // DeepSeek Chat — OpenAI-compatible chat completions, tempo.charge.
   // Stable publicPath so agents don't hit the auto-slugged
@@ -189,6 +203,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/deepseek/chat',
     upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-06-22T00:00:00Z',
   },
   // Groq Chat — OpenAI-compatible, very fast inference, tempo.charge.
   // Price dynamic ($0.005–$0.10 by model/tokens).
@@ -199,6 +215,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/groq/chat',
     upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-06-22T00:00:00Z',
   },
   // CoinGecko Simple Price — flat $0.06/request, tempo.charge. Cheapest
   // representative data endpoint; the other 15 coingecko routes keep
@@ -210,6 +228,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/coingecko/simple-price',
     upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-06-22T00:00:00Z',
   },
   // QuickNode JSON-RPC — $0.001/request, tempo.charge. Upstream path is
   // `/{network}`; QuickNode uses `<chain>-mainnet` naming, so default to
@@ -234,6 +254,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'storage_upload',
     publicPath: '/v1/services/storage/upload',
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
     placeholderDefaults: { key: 'upload' },
   },
 }
@@ -264,36 +286,26 @@ export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] =
 /**
  * Build the list of Stellar intents this route accepts.
  *
- * Opt-IN honesty (2026-06-22): a route only advertises a payable
- * `charge` intent once the operator has verified it end-to-end with
- * real money (`verifiedMode === 'charge' | 'session'`). Previously this
- * was opt-OUT — every route advertised `charge` unless explicitly
- * marked `verifiedMode: false` — which meant the catalog promised
- * hundreds of unverified routes as payable, most of which 404 or 502
- * (the Argens "most providers broken" report). Now:
+ * Option A (2026-06-23): every route is payable EXCEPT ones we've
+ * real-money tested and confirmed broken (`verifiedMode === false`).
+ * Unverified routes (`verifiedMode === undefined`) are payable again —
+ * the charge/x402 flows only settle the customer after the downstream
+ * merchant responds, and the catalog now carries per-mode
+ * `*_rozo_verified` flags so a paying agent can see exactly what we've
+ * vetted vs what is best-effort. This replaces the 2026-06-22 opt-IN
+ * model, which gated the ~485 unverified routes and broke services
+ * customers actually use (the Argens report).
  *
- * - `verifiedMode === 'charge' | 'session'`: operator-verified →
- *   advertise `charge`. (Both upstream modes are paid by the agent via
- *   single-shot Stellar charge; the router handles the upstream session
- *   dance internally.)
- * - `verifiedMode === false`: known-broken → no intents, so agents
- *   won't send money into a black hole.
- * - `verifiedMode === undefined`: untested → no intents. The route is
- *   still LISTED in the catalog (so it can be discovered and promoted)
- *   but carries no `methods.stellar` block and `payment_status:
- *   "untested"`, so no agent sends money into an unverified route.
+ * - `verifiedMode === false`: known-broken → no intents (no stellar
+ *   block), and the proxy gate refuses it. Don't send money to a black hole.
+ * - everything else (verified OR untested): advertise `charge`.
  *
- * This is paired with a server-side gate in `src/routes/proxy.ts` that
- * refuses to charge for any route whose `verifiedMode` isn't
- * 'charge'/'session' — hiding a route from the catalog alone does not
- * stop a direct POST to an ugly/stale path, so the proxy gate is the
- * actual security control. Keep the two in sync.
+ * Kept in sync with the proxy gate in `src/routes/proxy.ts`, which
+ * refuses ONLY `verifiedMode === false` routes.
  */
 function stellarIntentsFor(route: PublicServiceRoute): Array<'charge'> {
-  if (route.verifiedMode === 'charge' || route.verifiedMode === 'session') {
-    return ['charge']
-  }
-  return []
+  if (route.verifiedMode === false) return []
+  return ['charge']
 }
 
 /**
@@ -370,25 +382,30 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
     // by verifiedMode, kept in lockstep with stellarIntentsFor (which
     // only advertises `charge` for the verified tier) and the proxy
     // execution gate.
+    // Option A (2026-06-23): payable unless confirmed-broken. 'verified'
+    // = operator real-money tested; 'available' = payable but unverified
+    // (client decides risk via *_rozo_verified); 'unavailable' = broken,
+    // proxy gate refuses. Kept in sync with stellarIntentsFor + proxy gate.
     const paymentTier: Pick<
       PublicCatalogEntry,
       'payment_status' | 'payment_enabled' | 'payment_status_note'
     > =
-      route.verifiedMode === 'charge' || route.verifiedMode === 'session'
-        ? { payment_status: 'verified', payment_enabled: true }
-        : route.verifiedMode === false
-          ? {
-              payment_status: 'unavailable',
-              payment_enabled: false,
-              payment_status_note:
-                route.verifiedNote ??
-                'Route is known-broken (merchant error or bad upstream path) and is not chargeable.',
-            }
+      route.verifiedMode === false
+        ? {
+            payment_status: 'unavailable',
+            payment_enabled: false,
+            payment_status_note:
+              route.verifiedNote ??
+              'Route is known-broken (merchant error or bad upstream path) and is not chargeable.',
+          }
+        : route.verifiedMode === 'charge' || route.verifiedMode === 'session'
+          ? { payment_status: 'verified', payment_enabled: true }
           : {
-              payment_status: 'untested',
-              payment_enabled: false,
+              payment_status: 'available',
+              payment_enabled: true,
               payment_status_note:
-                'Route exists upstream but has not been verified end-to-end by the operator; not chargeable yet.',
+                'Route is payable but has not been verified end-to-end by Rozo. ' +
+                'Check charge_rozo_verified / session_rozo_verified before relying on it.',
             }
     const entry: PublicCatalogEntry = {
       id: route.id,
@@ -410,6 +427,13 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
         status_note: 'llms_txt not available — use with caution; agents may not know how to construct request bodies.',
       }),
       ...paymentTier,
+      // Per-mode verification flags. `?? null` so the catalog ALWAYS carries
+      // the 4 keys (clients don't have to handle missing keys); null = N/A
+      // for this mode or never tested in it.
+      charge_rozo_verified: route.chargeVerified ?? null,
+      charge_rozo_verified_at: route.chargeVerifiedAt ?? null,
+      session_rozo_verified: route.sessionVerified ?? null,
+      session_rozo_verified_at: route.sessionVerifiedAt ?? null,
       docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
       methods: {
         // Only include `stellar` when the route has usable intents —

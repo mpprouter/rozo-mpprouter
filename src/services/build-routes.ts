@@ -335,6 +335,19 @@ export function buildRoutesFromMppSnapshot(
           // session dispatch.
           route.upstreamPaymentMethod = overlayEntry.upstreamPaymentMethod
         }
+        // Per-mode real-money verification flags + timestamps (operator-only).
+        if (overlayEntry.chargeVerified !== undefined) {
+          route.chargeVerified = overlayEntry.chargeVerified
+        }
+        if (overlayEntry.chargeVerifiedAt !== undefined) {
+          route.chargeVerifiedAt = overlayEntry.chargeVerifiedAt
+        }
+        if (overlayEntry.sessionVerified !== undefined) {
+          route.sessionVerified = overlayEntry.sessionVerified
+        }
+        if (overlayEntry.sessionVerifiedAt !== undefined) {
+          route.sessionVerifiedAt = overlayEntry.sessionVerifiedAt
+        }
       }
       routes.push(route)
     }

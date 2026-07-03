@@ -1,0 +1,3078 @@
+Reading additional input from stdin...
+OpenAI Codex v0.136.0
+--------
+workdir: /Users/happyfish/workspace/rozov2/rozo-mpprouter
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: high
+reasoning summaries: none
+session id: 019ef801-2c4f-7b83-9502-678b304c12fb
+--------
+user
+You are a skeptical staff engineer reviewing a PROCESS PROPOSAL (not code). FILESYSTEM BOUNDARY: only read files under the current working directory (/Users/happyfish/workspace/rozov2/rozo-mpprouter). Do NOT read ~/.claude/, agents/, or anything outside this repo.
+
+Read docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md (the proposal). For context also read: docs/SOP-provider-e2e-test.md (the existing reactive SOP it extends), docs/rootcause-invalid-base64-json-header-2026-06-24.md (the incident that triggered it), scripts/e2e/providers.mjs and scripts/e2e/charge-e2e.mjs (the existing test tooling it builds on), and src/services/merchants.ts (how OPERATOR_OVERLAY and the *_rozo_verified flags work today).
+
+This proposal aims to stop the class of bug where a previously-working provider breaks silently (merchant changes its 402 challenge, or we upgrade a dependency) and a customer reports it before we notice.
+
+Review the PROPOSAL critically. Answer the 6 explicit questions at the end of the proposal document. Additionally judge:
+- Is the four-stage lifecycle (onboard/verify/monitor/triage) over-engineered for a solo-founder + agents shop, or appropriately minimal? Where would you cut?
+- Does it actually close the gaps G1-G4 it claims? Any gap it misses?
+- Stage C question 3 is the crux: the sanitizer now TOLERATES a merchant adding a solana offer, so should the daily monitor even alert on that? Reconcile "monitor for drift" vs "we deliberately tolerate this specific drift now."
+- Concrete cheapest-thing-that-works recommendation: if we only did ONE of the four build items, which one prevents the most customer-visible incidents?
+
+Output: answers to the 6 questions, then a prioritized recommendation (what to build, what to cut), then a one-line verdict on whether the proposal is sound enough to implement. Tag any concrete risks [P0]/[P1]/[P2].
+2026-06-24T05:01:33.343756Z ERROR codex_core_skills::loader: failed to stat skills path /Users/happyfish/.codex/.tmp/plugins/plugins/vercel/skills/workflow/SKILL.md: No such file or directory (os error 2)
+codex
+I’ll review this as a process/design critique rather than a code review. I’m going to stay inside the repo boundary and first read the proposal plus the specific context files you named.
+exec
+/bin/zsh -lc "sed -n '1,260p' docs/SOP-provider-e2e-test.md" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+exec
+/bin/zsh -lc "sed -n '1,260p' docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+# SOP — MPP Router Provider 端到端付费测试
+
+> 用途:当客户报某个 provider "verification-failed / 付了钱没返回 / 5xx" 时,**用我们自己的测试钱包走生产 Router 真打一笔**,在几分钟内判定责任在 **我们 / merchant / 客户**。
+> 风险等级:**HIGH(动真钱)** — 每笔 ~0.001 USDC + Stellar 手续费。改 Router 代码后也用这套做 smoke test。
+
+---
+
+## 0. 一句话原理
+
+Router 的链路是:`客户付 Stellar USDC → Router pool → Router 用 Tempo 付下游 merchant → 返回结果`。
+光看代码/注释会误判,**必须真付一笔才能测到"付款之后的下游结算"**。零成本探测只能验证报价层,验不了下游。
+
+---
+
+## 1. 前置(一次性)
+
+- **测试钱包**:`/Users/happyfish/workspace/rozo/rozocontracts/rozoskilltest/.env` 里的 `STELLAR_ADDRESS` / `STELLAR_PRIVATE_KEY`(公钥 `GAN3YS...4UYY`)。需 Stellar 主网有 USDC 余额(查:`horizon.stellar.org/accounts/<G地址>`)。
+- **客户端**:`stellar-agent-wallet` skill 的 `pay-per-call`(插件缓存 `~/.claude/plugins/cache/mpprouter/stellar-agent-wallet/<ver>/`)。它自动处理 402→签名→重试,默认走 MPP charge dialect。
+- **Router base**:`https://apiserver.mpprouter.dev`(公开)。
+
+### 🔒 密钥纪律(必须遵守)
+- **绝不**把私钥打印到对话/日志。
+- `pay-per-call` 的 `--secret-file` 期望**纯 S-key 单行文件**;直接传 `.env` 会报 "does not contain a valid Stellar secret key"。
+- 正确做法:提取到 600 权限临时文件,**用完立即 `rm`**:
+  ```bash
+  TMP=$(mktemp /tmp/.stkey.XXXXXX); chmod 600 "$TMP"
+  python3 -c "
+  for l in open('/Users/happyfish/workspace/rozo/rozocontracts/rozoskilltest/.env'):
+      if l.startswith('STELLAR_PRIVATE_KEY='):
+          open('$TMP','w').write(l.split('=',1)[1].strip().strip('\"').strip(\"'\")); break
+  "
+  # ... 跑测试 ...
+  rm -f "$TMP"   # 测完务必删
+  ```
+
+---
+
+## 2. Step 1 — 零成本探测(先做,不花钱)
+
+确认 Router 健康 + 看每个 provider 的 402 challenge(报价/intent/收款地址)。**这步能验证报价层,但验不了下游。**
+
+```bash
+BASE="https://apiserver.mpprouter.dev"
+curl -s "$BASE/health" | head           # 确认 router_pool 地址
+# 无付款 POST,看 402 challenge 头(intent=charge/session? 报价多少?)
+curl -s -X POST "$BASE/v1/services/<svc>/<path>" \
+  -H "Content-Type: application/json" -d '<最轻body>' \
+  -D - -o /dev/null -w "[HTTP %{http_code}]\n" | grep -iE "www-authenticate|payment-required"
+```
+- 返回 **402 + `www-authenticate: Payment ... intent="..."`** = 报价层正常,继续 Step 2。
+- 返回 **5xx / 无 challenge** = Router 入站层就坏了,先查 Router 本身。
+
+### 各 provider 最轻 body(抄这个)
+| provider | publicPath | 最轻 body |
+|---|---|---|
+| alchemy | `/v1/services/alchemy/rpc` | `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}` |
+| anthropic | `/v1/services/anthropic/messages` | `{"model":"claude-3-5-haiku-20241022","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}` |
+| openai | `/v1/services/openai/chat` | `{"model":"gpt-4o-mini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}` |
+| gemini | `/v1/services/gemini/generate` | `{"contents":[{"parts":[{"text":"hi"}]}]}` |
+| exa | `/v1/services/exa/search` | `{"query":"test"}` |
+| firecrawl | `/v1/services/firecrawl/scrape` | `{"url":"https://example.com"}` |
+
+(provider 全表见 `src/services/merchants.ts` 的 `OPERATOR_OVERLAY`。)
+
+---
+
+## 3. Step 2 — 付费实测(真打一笔,判定责任)
+
+```bash
+cd ~/.claude/plugins/cache/mpprouter/stellar-agent-wallet/*/   # skill 目录
+npx tsx skills/pay-per-call/run.ts \
+  "https://apiserver.mpprouter.dev/v1/services/<svc>/<path>" \
+  --body '<最轻body>' --method POST \
+  --secret-file "$TMP" --network pubnet --max-auto 0.10
+```
+
+### 怎么读结果(责任判定表)
+
+| 实测返回 | 含义 | 责任 |
+|---|---|---|
+| **200 + 正常 body** | 全链路通 | ✅ 健康,无问题 |
+| **502 "Merchant payment failed", detail = merchant 5xx**(如 `Internal error`) | 我们付款成功,merchant 自己 500 | **merchant 侧** |
+| **502, detail = `verification-failed: descriptor required for TIP-1034 ...`** | 我们的 voucher 缺 TIP-1034 descriptor(mppx 旧) | **我们的**(升级 mppx + 补 descriptor) |
+| **503 "Router session channel not installed"** | 该 session merchant 没开 Tempo channel | **我们的**(运营,开 channel) |
+| **503 "Tempo pool balance insufficient"** | pool 钱不够 | **我们的**(运营,充值 pool) |
+| **402 一直循环 / 签名后仍 402** | challenge 绑定不上(memo/凭证格式) | **我们的**(凭证逻辑/版本漂移) |
+| **付款后 timeout/504** | 下游慢 or 我们多往返撞 CF 限额 | 需多跑几次区分:偶发=merchant 慢;每次必现=我们 |
+
+> 关键:**merchant 返回 5xx → Router 映射成 502**(`proxy.ts:597`);**503 只来自我们这边**(channel 未开 / pool 不足,`proxy.ts:553,986`)。看到 503 别甩给 merchant。
+
+---
+
+## 4. Step 3 — 记录 + 同步
+
+1. 结果写进 `analytics_log`(在 ainative):
+   ```bash
+   cd /Users/happyfish/workspace/ainative
+   python3 scripts/analytics_log.py add --title "..." --summary "..." \
+     --report docs/xxx.md --tags mpprouter,e2e-test
+   ```
+2. 若判定是**我们的 bug**:开 Trello 卡 / 项目 todo,标 high-risk,修复走 **codex review + 本 SOP 复测**。
+3. **务必 `rm -f "$TMP"`** 删临时密钥。
+
+---
+
+## 5. 已知结论(2026-06-21 首次实测)
+
+- **anthropic / openai**:`verification-failed: descriptor required for TIP-1034 session action` → **我们的**。`mppx@0.4.12` 太老,voucher 缺 TIP-1034 descriptor(`tempo-client.ts:229-233` 只传 action/channelId/cumulative)。`package.json` mppx pin 成 `"latest"` 是根因隐患。
+- **alchemy**:merchant 500 `Internal error` → merchant 侧。
+- **修复方向**(待排期,high-risk):升级 mppx 到支持 TIP-1034 → voucher 补 descriptor → 重开 session channel → 本 SOP 全量复测。
+
+---
+
+## 6. 安全清单(每次跑前后核对)
+
+- [ ] 临时密钥文件 600 权限,内容从不打印
+- [ ] 测完 `rm -f` 临时密钥
+- [ ] 地址在对话里 mask(前6+后4)
+- [ ] 这是 HIGH risk(动钱),改 Router 生产前先跟老板确认
+- [ ] 测试用最小金额 / 最轻 body,别跑大 token 请求
+
+ succeeded in 0ms:
+# PROPOSAL — Provider Lifecycle SOP + Test System (for codex review)
+
+> Status: **PROPOSAL — not implemented.** This document is for codex review of the
+> *approach* before any code/SOP is written. It extends the existing reactive
+> `docs/SOP-provider-e2e-test.md` into a full lifecycle: onboard → verify →
+> monitor → triage.
+>
+> Owner: Rozo. Date: 2026-06-24. Trigger: the stableemail `502 "Invalid base64
+> JSON header"` incident (see `docs/rootcause-invalid-base64-json-header-2026-06-24.md`).
+
+---
+
+## 1. Why this proposal exists — the gap the incident exposed
+
+The current SOP (`SOP-provider-e2e-test.md`) is **reactive**: it tells us how to
+diagnose a provider AFTER a customer reports it broken. The stableemail incident
+showed a class of failure that gets to the customer first, every time:
+
+> A provider that was working can break **silently** when (a) we upgrade a shared
+> dependency (mppx 0.4→0.7 made the x402 schema strict) and/or (b) the **merchant
+> unilaterally changes its 402 challenge** (stableemail added a `solana:` offer).
+> Neither change is visible in our repo, our tests, or our catalog. The first
+> signal we got was a customer (Argens) reporting a 502.
+
+The five mistakes made while fixing it (all caught by codex, see the RCA) share
+one root pattern: **a locally-safe assumption breaks when it composes with an
+external/other change.** A lifecycle that only reacts cannot catch these. We need
+gates and monitors.
+
+### Concrete gaps in today's SOP
+
+| Gap | Today | Consequence |
+|---|---|---|
+| **G1. No onboarding gate** | A route can be marked `verified` / advertised payable by hand-editing OPERATOR_OVERLAY, with no enforced real-money proof. | A route can claim "verified" without ever settling once. |
+| **G2. No continuous regression** | We only test when a customer complains. | Merchant- or dependency-induced breakage reaches customers before us. |
+| **G3. Triage table is incomplete** | It covers TIP-1034/channel/pool errors, but NOT challenge-parse failures (`Invalid base64 JSON header`), dependency version drift, or "merchant changed its challenge shape". | We mis-blamed the client at first; the table would have pointed straight at the merchant challenge. |
+| **G4. No "verified-but-now-failing" reconciliation** | `*_rozo_verified` flags are set once and never revisited. | A flag says "verified 2026-04-11" while the route is dead today. |
+
+---
+
+## 2. Proposed lifecycle (the four stages)
+
+```
+ONBOARD ──▶ VERIFY ──▶ MONITOR ──▶ (on failure) TRIAGE ──▶ back to VERIFY
+  add route   real-$    weekly smoke   responsibility    fix + codex + reverify
+  to overlay  proof     of all verified  table (extended)
+```
+
+### Stage A — ONBOARD (adding a new provider)
+
+A checklist, NOT new code. When a route is added to OPERATOR_OVERLAY:
+1. Record the merchant's upstream URL, intent (`charge`/`session`), price, and the
+   minimal request body in `scripts/e2e/providers.mjs` (the single source of truth
+   for testable routes) — including an `okCheck` that validates a real upstream body.
+2. The route starts as `payment_status: available` (payable, **not** `verified`).
+   It MUST NOT be hand-marked `*_rozo_verified: true` at this stage.
+3. Capture the merchant's 402 challenge shape once (zero-cost probe) and note
+   which networks it advertises in `accepts[]` — so a later change is detectable.
+
+**Open question for codex:** should onboarding be blocked unless `providers.mjs` has
+an entry? i.e. make `providers.mjs` the gate, so an un-testable route cannot be
+advertised. (Leaning yes.)
+
+### Stage B — VERIFY (the gate to mark `verified`)
+
+A route may only get `charge_rozo_verified: true` / `session_rozo_verified: true`
+(+ timestamp) after a **real-money** pass through production:
+- `node scripts/e2e/charge-e2e.mjs <id>` returns `PASS` (HTTP 200 + okCheck).
+- The verification timestamp is written by the **same tooling that runs the test**,
+  not by hand — so a `verified` flag always corresponds to an actual settlement.
+
+**Proposal:** add a `--write-verified` mode to `charge-e2e.mjs` that, on PASS,
+emits the overlay snippet (`{chargeVerified:true, chargeVerifiedAt:"<ISO>"}`) for
+the operator to paste — OR (stronger) writes a machine-managed
+`verified-routes.json` that the catalog reads, so humans never hand-set the flag.
+
+**Open question for codex:** machine-managed `verified-routes.json` vs hand-edited
+overlay with tool-generated snippets. Trade-off: automation correctness vs. an
+extra moving part on the payment-advertising path. (Leaning: tool-generated
+snippet first — smaller blast radius — then automate if it proves reliable.)
+
+### Stage C — MONITOR (catch silent regressions before customers)
+
+A scheduled job that re-runs the e2e suite against ALL routes currently flagged
+`verified`, on a cadence (proposal: weekly; charge routes are cheap — whole suite
+< $1). Two parts:
+
+1. **Zero-cost layer (frequent, e.g. daily):** probe every `verified` route's 402
+   and assert the challenge still parses with mppx's parser AND that
+   `accepts[].network` set hasn't gained an unrecognized network. This would have
+   caught the stableemail Solana-offer change **before** anyone paid. Cheap enough
+   to run daily.
+2. **Real-money layer (weekly):** `charge-e2e.mjs` full run; any route that flips
+   from PASS→FAIL raises an alert (DingTalk, the channel the router already uses)
+   and is auto-demoted from `verified` → `available` with a note.
+
+**Open question for codex:** is auto-demotion on a single failed run too
+aggressive (flaky merchant → false demote)? Proposal: demote only after N
+consecutive failures, alert on the first.
+
+### Stage D — TRIAGE (extend the responsibility table)
+
+Add the missing failure modes to the SOP's table:
+
+| Symptom | Layer | Likely cause | Blame |
+|---|---|---|---|
+| `502 ... "Invalid base64 JSON header"` | challenge parse (mppx) | merchant added an offer with a network mppx can't parse (e.g. `solana:`), OR mppx schema got stricter on upgrade | **us** (parser fragility) — mitigated by the sanitizer; if it still appears, a NEW unparseable shape |
+| `502 ... validation failed / expected array` | merchant body schema | our request body shape is wrong for this merchant | **us** (wrong body in providers.mjs) |
+| previously-verified route now 502/parse-fails | merchant changed challenge, or dep upgrade | external change to a working route | **us to detect, often merchant to fix** |
+| catalog says `verified` but route dead | stale flag (G4) | flag never reconciled | **us** (process) |
+
+---
+
+## 3. What gets built (if the approach is approved)
+
+Minimal, in priority order — NONE of this is implemented yet:
+
+1. **Extend the triage table** in `SOP-provider-e2e-test.md` with the rows above
+   (docs only, zero risk).
+2. **`scripts/e2e/monitor-verified.mjs`** — zero-cost daily layer: for every
+   `verified` route, probe 402 and assert (a) mppx can parse the challenge, (b) the
+   advertised `accepts[].network` set is a subset of a known-good allowlist. Emits a
+   report; alerts on drift. (Read-only, no money, safe to run anywhere.)
+3. **Wire the weekly real-money run** into the existing `charge-e2e.mjs` + a
+   schedule, with first-failure alert / N-consecutive demote.
+4. **(Optional, debated) machine-managed verified flag** per Stage B.
+
+The sanitizer shipped today (`sanitize402Response`) is the *point fix*; this
+proposal is the *process fix* so the next merchant/dep change is caught by us, not
+by a customer.
+
+---
+
+## 4. Explicit questions for codex
+
+1. Is the four-stage lifecycle the right decomposition, or is there a simpler
+   framing that still closes G1–G4?
+2. Stage B: tool-generated overlay snippet vs machine-managed `verified-routes.json`
+   — which is safer for a payment-advertising path?
+3. Stage C: daily zero-cost network-drift probe — is "assert `accepts[].network` ⊆
+   allowlist" the right invariant, or does it create false alarms when a merchant
+   adds a *legitimate* new network we simply don't pay (which is exactly the
+   stableemail case the sanitizer now tolerates)? If the sanitizer already tolerates
+   it, should the monitor alert (informational) rather than fail?
+4. Stage C auto-demotion: right call, or should `verified` only ever be changed by
+   a human after triage?
+5. Anything in this proposal that could itself create a payment-safety risk (e.g.
+   a monitor that accidentally runs against real customer funds, or a verified-flag
+   automation that could mark a broken route verified)?
+6. What's MISSING — a failure mode this lifecycle still wouldn't catch?
+
+exec
+/bin/zsh -lc 'pwd && rg --files docs scripts/e2e src/services | sort' in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+/Users/happyfish/workspace/rozov2/rozo-mpprouter
+docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md
+docs/SOP-provider-e2e-test.md
+docs/catalog-drift-fix-plan-2026-06-22.md
+docs/codex-fix-review-2026-06-24.txt
+docs/codex-fix-review-r2-2026-06-24.txt
+docs/codex-fix-review-r3-2026-06-24.txt
+docs/codex-review-catalog-v2-2026-06-23.md
+docs/codex-review-round2.txt
+docs/codex-review-round3.txt
+docs/codex-review-round4.txt
+docs/codex-review-round5.txt
+docs/codex-rootcause-review-2026-06-24.txt
+docs/codex-sop-proposal-review-2026-06-24.txt
+docs/e2e-provider-suite.md
+docs/e2e-results-2026-06-22.md
+docs/rootcause-invalid-base64-json-header-2026-06-24.md
+docs/tip-1034-fix-design.md
+docs/tip-1034-fix-notes.md
+docs/verified-services.md
+scripts/e2e/charge-e2e.mjs
+scripts/e2e/probe-402.mjs
+scripts/e2e/providers.mjs
+scripts/e2e/repro-stableemail.mjs
+src/services/build-routes.ts
+src/services/merchants-types.ts
+src/services/merchants.ts
+src/services/mpp-catalog-snapshot.json
+
+codex
+I’ve got the proposal and reactive SOP. Next I’m reading the incident writeup and the concrete test/catalog code so the critique is anchored in how this repo actually behaves.
+exec
+/bin/zsh -lc "sed -n '1,280p' scripts/e2e/providers.mjs" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+exec
+/bin/zsh -lc "sed -n '1,360p' src/services/merchants.ts" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+exec
+/bin/zsh -lc "sed -n '1,320p' docs/rootcause-invalid-base64-json-header-2026-06-24.md" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+/**
+ * Single source of truth for the MPP Router provider E2E suite.
+ *
+ * Each entry is one *target* provider the operator cares about, split
+ * into two families per the goal:
+ *   - "ai"    — AI inference: openai, anthropic, openrouter, gemini, deepseek, groq
+ *   - "data"  — blockchain / market data: alchemy, dune, coingecko, quicknode
+ *
+ * `publicPath` is the stable router path an agent calls. `body` is the
+ * lightest payload that still produces a real upstream call (so a true
+ * 200 proves the *whole* chain, not just the quote layer). `mode` is
+ * the upstream payment method the router uses today (charge | session).
+ *
+ * Keep the `body` minimal — small token counts, cheapest model — so
+ * real-money tests cost fractions of a cent. The probe step (402) never
+ * spends; only the charge step does.
+ */
+
+export const ROUTER_BASE = 'https://apiserver.mpprouter.dev'
+
+export const PROVIDERS = [
+  // ---- AI inference ----
+  {
+    id: 'openai',
+    family: 'ai',
+    publicPath: '/v1/services/openai/chat',
+    method: 'POST',
+    mode: 'session',
+    body: { model: 'gpt-4o-mini', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message ?? j?.choices?.[0]?.text),
+  },
+  {
+    id: 'anthropic',
+    family: 'ai',
+    publicPath: '/v1/services/anthropic/messages',
+    method: 'POST',
+    mode: 'session',
+    body: { model: 'claude-3-5-haiku-20241022', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.content?.[0]?.text ?? j?.choices),
+  },
+  {
+    id: 'openrouter',
+    family: 'ai',
+    publicPath: '/v1/services/openrouter/chat',
+    method: 'POST',
+    mode: 'session',
+    body: { model: 'openai/gpt-4o-mini', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
+  },
+  {
+    id: 'gemini',
+    family: 'ai',
+    publicPath: '/v1/services/gemini/generate',
+    method: 'POST',
+    mode: 'session',
+    body: { contents: [{ parts: [{ text: 'hi' }] }] },
+    okCheck: (j) => Boolean(j?.candidates?.[0]?.content),
+  },
+  {
+    id: 'deepseek',
+    family: 'ai',
+    publicPath: '/v1/services/deepseek/chat',
+    method: 'POST',
+    mode: 'charge',
+    body: { model: 'deepseek-chat', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
+  },
+  {
+    id: 'groq',
+    family: 'ai',
+    publicPath: '/v1/services/groq/chat',
+    method: 'POST',
+    mode: 'charge',
+    body: { model: 'llama-3.1-8b-instant', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
+  },
+
+  // ---- Blockchain / data ----
+  {
+    id: 'alchemy',
+    family: 'data',
+    publicPath: '/v1/services/alchemy/rpc',
+    method: 'POST',
+    mode: 'charge',
+    body: { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] },
+    okCheck: (j) => typeof j?.result === 'string' && j.result.startsWith('0x'),
+  },
+  {
+    id: 'dune',
+    family: 'data',
+    publicPath: '/v1/services/dune/execute',
+    method: 'POST',
+    mode: 'session',
+    // query_id 1215383 is Dune's "block number" sample; cheapest real exec
+    body: { query_id: 1215383 },
+    okCheck: (j) => Boolean(j?.execution_id ?? j?.state),
+  },
+  {
+    id: 'coingecko',
+    family: 'data',
+    publicPath: '/v1/services/coingecko/simple-price',
+    method: 'POST',
+    mode: 'charge',
+    body: { ids: 'bitcoin', vs_currencies: 'usd' },
+    okCheck: (j) => Boolean(j?.bitcoin?.usd),
+  },
+  {
+    id: 'quicknode',
+    family: 'data',
+    // overlay defaults network=ethereum-mainnet; pass ?network=base-mainnet etc
+    publicPath: '/v1/services/quicknode/rpc',
+    method: 'POST',
+    mode: 'charge',
+    body: { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] },
+    okCheck: (j) => typeof j?.result === 'string' && j.result.startsWith('0x'),
+  },
+]
+
+ succeeded in 0ms:
+# Root cause: `502 "Invalid base64 JSON header"` on stableemail/send (and any merchant that added a Solana x402 offer)
+
+Date: 2026-06-24
+Reporter: Argens (Fucci), customer
+Severity: HIGH (payment path; silently breaks previously-working `charge` merchants)
+Status: root-caused, reproduced at zero cost, fix proposed (pending codex review)
+
+## TL;DR
+
+`mppx@0.7.0`'s x402 challenge parser rejects the **entire** 402 response if **any**
+`accepts[]` offer carries a `network` it does not recognize. Several upstream
+merchants (stableemail, exa, …) recently added a **Solana** x402 offer
+(`network: "solana:5eykt4Us…"`) alongside their EVM/Tempo offers. mppx's
+`PaymentRequiredSchema` only accepts `eip155:\d+`, so decoding throws
+`InvalidJsonHeaderError("Invalid base64 JSON header.")`. That throw kills the
+whole challenge-collection step — including the perfectly valid `www-authenticate`
+(tempo) challenge that the router actually pays with. The router catches the throw
+and returns `502 {"error":"Merchant payment failed","detail":"Invalid base64 JSON header."}`.
+
+**No money moves** — the failure is during challenge decode, strictly before any
+signing or broadcast. Argens's read ("thrown server-side during MPP→merchant
+settlement, not client-side") is **correct**: it is thrown inside our router's
+`payMerchant()` → mppx client, on the router→merchant leg.
+
+## Evidence (all reproduced, zero cost)
+
+1. The error string lives only in `mppx/dist/internal/HeaderCodec.js:28`
+   (`throw new InvalidJsonHeaderError()` → message `"Invalid base64 JSON header."`).
+   `HeaderCodec.decode()` throws it on ANY of: bad base64, bad JSON, or
+   **failing `schema.parse`** (zod). It is NOT only a base64 problem.
+
+2. The upstream `payment-required` header base64-decodes to valid JSON fine
+   (manual `Buffer.from(h,'base64')` → `JSON.parse` succeeds). So the failure is
+   the zod `schema.parse`, not base64.
+
+3. Running the real router charge client (`mppx/client` `tempo.charge`,
+   identical to `src/mpp/tempo-client.ts payMerchant`) against the live
+   `https://stableemail.dev/api/send` throws:
+
+   ```
+   InvalidJsonHeaderError: Invalid base64 JSON header.
+     at Module.decode (mppx/dist/internal/HeaderCodec.js:19)
+     at x402Challenges (mppx/dist/client/Transport.js:82)        <-- decodePaymentRequired(header)
+     at paymentRequiredChallenges (mppx/dist/client/Transport.js:75)
+     at getChallenges (mppx/dist/client/Transport.js:48)
+     at wrappedFetch (mppx/dist/client/internal/Fetch.js:54)
+   ```
+
+4. Feeding the live header through mppx's own `PaymentRequiredSchema.safeParse`
+   pinpoints the exact field:
+
+   ```
+   issues: [{ path: ['accepts', 1, 'network'],
+              code: 'invalid_format',
+              message: 'Invalid EVM CAIP-2 network' }]
+   ```
+
+5. Dumping `accepts[]` shows what `accepts[1]` is — a Solana offer:
+
+   | merchant | accepts[0] | accepts[1] | www-authenticate |
+   |---|---|---|---|
+   | stableemail | `exact eip155:8453` (USDC/Base) | `exact solana:5eykt4Us…` | **present** (`method=tempo`) |
+   | exa | `exact eip155:8453` | `exact solana:5eykt4Us…` | **absent** |
+
+## Why it broke "suddenly" (was working before)
+
+- Pre-`0f432b1`/`6d97455` the router ran `mppx@0.4.12`. The merchants had not
+  yet added the Solana offer. So the x402 header decoded fine.
+- Two things changed around the same window: (a) we bumped mppx 0.4.12→0.7.0,
+  (b) merchants began advertising a Solana x402 offer. The 0.7.0 x402 schema is
+  strict (`eip155:\d+` only) AND the decode failure is non-isolating (one bad
+  offer fails the whole list), so the Solana offer now poisons the whole 402.
+- This is the classic "two safe-looking changes compose into a break" trap.
+
+## Why exa still settles but stableemail doesn't — the real distinction
+
+Both upstream x402 headers now contain the poisoning Solana offer, so the
+**x402 collection branch throws for both**. The difference is the
+`www-authenticate` header:
+
+- `paymentRequiredChallenges` (Transport.js:70) array-spreads BOTH branches:
+  `Challenge.fromResponseList` (www-authenticate / tempo) **and** `x402Challenges`
+  (payment-required). Because they're spread into one array literal, the
+  `x402Challenges` throw aborts the whole expression **even when the
+  www-authenticate branch would have yielded a usable tempo challenge.**
+- So the presence/absence of `www-authenticate` does not save stableemail here —
+  the x402 throw happens regardless. (Exa's production success is via a
+  different leg: x402-over-Stellar paid directly by the agent's `@x402/stellar`
+  client, which never invokes mppx's EVM x402 decoder. stableemail/send is paid
+  by the router via mppx `tempo.charge`, which does.)
+
+The crisp, defensible statement: **mppx 0.7.0's `x402Challenges` is not
+fault-isolating — a single unrecognized-network offer throws and discards every
+other (valid) challenge in the same 402.**
+
+## Critical-eye check on the reporter (treat as potential adversary)
+
+- Argens's claim is independently verified by our own zero-cost repro against the
+  live upstream — not taken on trust. ✅
+- His "no funds moved (receipt null)" is consistent with HIS path: he pays via
+  x402 v2 (`@x402/stellar`), which settles the customer AFTER the merchant returns
+  2xx. For that branch, this error throws before merchant 2xx, so he is not
+  charged. ✅
+
+### ⚠️ P0 CORRECTION (found by codex review 2026-06-24): NOT universally "no money moves"
+
+An earlier draft claimed "there is NO scenario where the customer is charged and
+the merchant isn't." **That is FALSE for the legacy inbound `stellar/charge`
+path.** It is true ONLY for (a) the outbound router→merchant Tempo leg and (b) the
+inbound `stellar.x402` branch (settles after merchant 2xx).
+
+- Legacy `stellar/charge` "verifies AND settles" — `@stellar/mpp` broadcasts the
+  customer's on-chain payment during *verify* (`sendRawTransactionSync`,
+  `tempo/server/Charge.js:338`), which the proxy runs at `proxy.ts:1428`,
+  BEFORE `payMerchantAndGetBody()` at `proxy.ts:1547`.
+- So a customer who pays via the **legacy stellar.charge** flavor CAN be charged
+  while the merchant is never paid, for exactly this `InvalidJsonHeaderError`
+  (the merchant leg 502s after the customer is already settled).
+- This is the same accepted-risk settlement ordering documented at
+  `proxy.ts:748`. The Solana-offer bug makes that latent risk *fire* for any
+  charge merchant that added a Solana x402 offer.
+- Argens himself is NOT exposed (he's on x402 v2), but other legacy clients are.
+  The fix below removes the trigger entirely; the underlying settlement-order
+  risk for legacy stellar.charge remains a separate, founder-accepted item.
+- His wallet `GDCO2AKY…6LB6` and tx `11069520…a8bb89` (exa) are public on-chain
+  facts; nothing sensitive disclosed. No action needed.
+- He did NOT send us a malformed header to trick our parser — the malformed- for-
+  mppx header comes from the *merchant*, not the client. The client cannot
+  exploit this to make us pay the wrong party.
+
+## Fix options
+
+### Option 1 (preferred, smallest, robust) — sanitize the upstream 402 before mppx sees it
+
+In the router→merchant leg (`src/mpp/tempo-client.ts`), wrap `client.fetch` with a
+fetch that, on a 402 response, rewrites the `payment-required` header to **drop
+offers whose `network` mppx can't parse** (anything not `eip155:\d+`), keeping the
+EVM/Tempo offer the router actually pays. If, after filtering, no x402 offer
+remains, drop the `payment-required` header entirely so mppx falls back to the
+`www-authenticate` (tempo) challenge.
+
+- Pro: surgical, version-proof (works regardless of which networks mppx adds
+  later), keeps us paying the same EVM offer we always did. No settlement-order
+  change. No catalog change.
+- Con: we parse/rewrite a header in the proxy (well-contained, base64-JSON only).
+
+### Option 2 — upgrade/patch mppx so x402Challenges is fault-isolating
+
+File upstream: `x402Challenges` should `try/catch` per-offer (or per-header) and
+skip unparseable offers instead of throwing the whole list. Right fix long-term,
+but not in our control and slower.
+
+### Option 3 — pin/patch the merchant side
+
+Not ours to fix; and it'll recur with the next merchant that adds Solana.
+
+**Recommendation: ship Option 1 now, also file Option 2 upstream.** Option 1 is a
+~30-line, well-isolated change on a path we already own, fully covered by the
+existing zero-cost repro + a real-money charge verification.
+
+## Verification plan
+
+1. Zero-cost: `scripts/e2e/repro-stableemail.mjs` must stop throwing
+   `InvalidJsonHeaderError` for stableemail after the fix (it should reach the
+   broadcast/funds step and fail there with a zero-balance key — proving decode
+   succeeded).
+2. Real-money: `node scripts/e2e/charge-e2e.mjs` including a stableemail target
+   → expect PASS (HTTP 200, real email sent) with on-chain settlement.
+3. Regression: exa/firecrawl/parallel (existing charge PASS set) still PASS.
+
+ succeeded in 0ms:
+/**
+ * Public service catalog for the MPP Router.
+ *
+ * History: this file used to contain a hand-typed list of 12
+ * routes (PUBLIC_SERVICE_ROUTES). It drifted relative to the
+ * upstream mpp.dev catalog, which now has 88 services and 832
+ * endpoints. As of 2026-04-12 the route table is generated from
+ * a frozen snapshot (`mpp-catalog-snapshot.json`) at module load
+ * time via `buildRoutesFromMppSnapshot`. The 12 historical
+ * route IDs and their `verifiedMode` operator-test results are
+ * preserved via `OPERATOR_OVERLAY` so existing client URL
+ * bookmarks (`/v1/services/parallel/search`) keep working
+ * unchanged.
+ *
+ * To refresh the snapshot:
+ *   npx tsx scripts/admin/refresh-mpp-snapshot.ts
+ *   git add src/services/mpp-catalog-snapshot.json
+ *   git commit -m "Refresh mpp.dev catalog snapshot YYYY-MM-DD"
+ *
+ * To add an operator-only override (verifiedMode, placeholder
+ * defaults, session-channel pre-provisioning), edit
+ * `OPERATOR_OVERLAY` below — keyed by `${serviceId}::${upstreamPath}`
+ * where the upstream path uses `{name}` placeholder syntax.
+ *
+ * The router used to be 12 routes for ~6 months. The instinct to
+ * read this file linearly to find a route is no longer practical
+ * with 800+ entries — use the `getRouteByPublicPath` helper or
+ * grep for `id:` if you really need to inspect a single entry.
+ */
+
+import mppSnapshot from './mpp-catalog-snapshot.json'
+import { buildRoutesFromMppSnapshot } from './build-routes'
+import type {
+  PublicServiceRoute,
+  PublicServiceRouteOverlay,
+  PublicCatalogEntry,
+} from './merchants-types'
+
+// Re-export types from `merchants-types.ts` so existing imports
+// like `import type { PublicServiceRoute } from './services/merchants'`
+// continue to work.
+export type {
+  PublicServiceRoute,
+  PublicServiceRouteOverlay,
+  PublicCatalogEntry,
+} from './merchants-types'
+
+// ---------------------------------------------------------------------
+// Operator overlay
+// ---------------------------------------------------------------------
+
+/**
+ * Per-route operator-only overrides applied during route generation.
+ * Keyed by `${serviceId}::${upstreamPath}` where upstreamPath uses
+ * `{name}` placeholder syntax (the post-rewrite shape).
+ *
+ * Use this for:
+ * - Stable historical IDs / publicPaths so old client bookmarks work
+ * - verifiedMode flags from real end-to-end testing
+ * - Session-channel mode flips (when the operator has opened a KV
+ *   channel via `scripts/admin/open-tempo-channel.ts`)
+ * - placeholderDefaults for path-templated upstreams
+ *
+ * Each entry's session-mode flag MUST match a key in
+ * `scripts/admin/open-tempo-channel.ts MERCHANTS` so
+ * `payMerchantSession` reads the right `tempoChannel:<id>` KV record.
+ */
+export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
+  // Parallel Search — first verified route, hand-tested 2026-04-11
+  'parallel::/api/search': {
+    id: 'parallel_search',
+    publicPath: '/v1/services/parallel/search',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+  },
+  // Exa AI Search
+  'exa::/search': {
+    id: 'exa_search',
+    publicPath: '/v1/services/exa/search',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+  },
+  // Firecrawl Scrape
+  'firecrawl::/v1/scrape': {
+    id: 'firecrawl_scrape',
+    publicPath: '/v1/services/firecrawl/scrape',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+  },
+  // OpenRouter Chat — flipped to tempo.session 2026-04-11 after
+  // open-tempo-channel.ts opened the $1 channel
+  // 0x278bf3c7bb88da8d20de75a2cf0f8aec94c00fd399a1be5ae53911b1d83fac75
+  // and persisted TempoChannelState to KV at
+  // `tempoChannel:openrouter_chat`. payMerchantSession reads that
+  // KV entry on every request.
+  'openrouter::/v1/chat/completions': {
+    id: 'openrouter_chat',
+    publicPath: '/v1/services/openrouter/chat',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+  },
+  // Anthropic Messages — broken upstream
+  'anthropic::/v1/messages': {
+    id: 'anthropic_messages',
+    publicPath: '/v1/services/anthropic/messages',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant returns 500 on direct mppx call (verified bypassing router). ' +
+      'Both /v1/messages and /v1/chat/completions endpoints fail upstream. ' +
+      'Channel is open but unusable until anthropic merchant is fixed.',
+  },
+  // OpenAI Chat — verified session mode
+  'openai::/v1/chat/completions': {
+    id: 'openai_chat',
+    publicPath: '/v1/services/openai/chat',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+  },
+  // Google Gemini — uses {model} placeholder, defaults to gemini-2.0-flash
+  // The upstream path uses Google's `:generateContent` literal
+  // colon convention; the build step rewrites `:version` →
+  // `{version}` if mpp.dev publishes the templated form, but the
+  // operator override here pins both the public id and the model
+  // default for backward compat with old bookmarks.
+  //
+  // verifiedMode false — real-money E2E 2026-06-22: after re-opening the
+  // session channel (descriptor now captured, payment layer OK — the old
+  // `descriptor required for TIP-1034` error is GONE), the merchant
+  // returns 502/status:404. Root cause: upstream path is
+  // `/{version}/models/*` and `resolveUpstreamPath` does not substitute
+  // the literal `*` wildcard, so we forward `/v1beta/models/*` instead of
+  // `/v1beta/models/gemini-2.0-flash:generateContent`. Needs a proper
+  // upstreamPath override (overlay can't override upstreamPath today).
+  // The PAYMENT path (session voucher + descriptor) is verified working.
+  'gemini::/{version}/models/*': {
+    id: 'gemini_generate',
+    publicPath: '/v1/services/gemini/generate',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: false,
+    verifiedNote:
+      'Payment/session layer OK after channel re-open (descriptor captured). ' +
+      'Blocked on upstream model path: `/{version}/models/*` wildcard is not ' +
+      'substituted, so merchant 404s. Needs upstreamPath override support.',
+    placeholderDefaults: { version: 'v1beta', model: 'gemini-2.0-flash' },
+  },
+  // Dune SQL Execute — channel underfunded
+  'dune::/api/v1/sql/execute': {
+    id: 'dune_execute',
+    publicPath: '/v1/services/dune/execute',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: false,
+    verifiedNote:
+      'Channel underfunded — Dune SQL execute charged $4 USDC initial probe ' +
+      'charge but channel deposit was only $1. Cumulative > deposit, so the ' +
+      'next voucher will be rejected. Needs a topup or a higher initial deposit.',
+  },
+  // Modal Sandbox — body shape issue
+  'modal::/sandbox/exec': {
+    id: 'modal_exec',
+    publicPath: '/v1/services/modal/exec',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant returns tempo.charge instead of session despite mpp.dev catalog. ' +
+      'Router charge fallback fires correctly, but the modal forwarder rejects ' +
+      'an empty {} body with 500. Need to find a body shape modal accepts.',
+  },
+  // Alchemy Ethereum RPC — actually charge mode despite catalog
+  // (mpp.dev lists tempo.session, but the merchant accepts charge)
+  'alchemy::/{network}/v2': {
+    id: 'alchemy_rpc',
+    publicPath: '/v1/services/alchemy/rpc',
+    upstreamPaymentMethod: 'tempo.charge',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+    placeholderDefaults: { network: 'eth-mainnet' },
+  },
+  // Tempo L2 RPC
+  'rpc::/': {
+    id: 'tempo_rpc',
+    publicPath: '/v1/services/tempo/rpc',
+    upstreamPaymentMethod: 'tempo.session',
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+  },
+  // DeepSeek Chat — OpenAI-compatible chat completions, tempo.charge.
+  // Stable publicPath so agents don't hit the auto-slugged
+  // `/deepseek/deepseek_chat`. Price is dynamic (~$0.004–$0.025).
+  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+  // LLM completion (model deepseek-v4-flash) through the full chain.
+  'deepseek::/deepseek/chat': {
+    id: 'deepseek_chat',
+    publicPath: '/v1/services/deepseek/chat',
+    upstreamPaymentMethod: 'tempo.charge',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-06-22T00:00:00Z',
+  },
+  // Groq Chat — OpenAI-compatible, very fast inference, tempo.charge.
+  // Price dynamic ($0.005–$0.10 by model/tokens).
+  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+  // llama-3.1-8b-instant completion through the full chain.
+  'groq::/groq/chat': {
+    id: 'groq_chat',
+    publicPath: '/v1/services/groq/chat',
+    upstreamPaymentMethod: 'tempo.charge',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-06-22T00:00:00Z',
+  },
+  // CoinGecko Simple Price — flat $0.06/request, tempo.charge. Cheapest
+  // representative data endpoint; the other 15 coingecko routes keep
+  // their auto-generated paths.
+  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+  // price (bitcoin/usd) through the full chain.
+  'coingecko::/coingecko/simple-price': {
+    id: 'coingecko_simple_price',
+    publicPath: '/v1/services/coingecko/simple-price',
+    upstreamPaymentMethod: 'tempo.charge',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-06-22T00:00:00Z',
+  },
+  // QuickNode JSON-RPC — $0.001/request, tempo.charge. Upstream path is
+  // `/{network}`; QuickNode uses `<chain>-mainnet` naming, so default to
+  // `ethereum-mainnet` (NOT alchemy's `eth-mainnet`, which 404s
+  // `unsupported_network`). Pass ?network=base-mainnet / solana-mainnet
+  // / etc to target another QuickNode-supported network.
+  // verifiedMode false — real-money E2E 2026-06-22: we paid OK but the
+  // QuickNode merchant returned 502/5xx (merchant-side, like alchemy).
+  'quicknode::/{network}': {
+    id: 'quicknode_rpc',
+    publicPath: '/v1/services/quicknode/rpc',
+    upstreamPaymentMethod: 'tempo.charge',
+    placeholderDefaults: { network: 'ethereum-mainnet' },
+    verifiedMode: false,
+    verifiedNote:
+      'We paid OK (charge) but QuickNode merchant returned 502/5xx on ' +
+      'ethereum-mainnet eth_blockNumber. Merchant-side, same pattern as alchemy. ' +
+      'Re-verify when QuickNode upstream is fixed.',
+  },
+  // Object Storage Upload — actually charge mode for multipart-init
+  'storage::/{key}': {
+    id: 'storage_upload',
+    publicPath: '/v1/services/storage/upload',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+    placeholderDefaults: { key: 'upload' },
+  },
+}
+
+// ---------------------------------------------------------------------
+// Route table (generated from snapshot at module load)
+// ---------------------------------------------------------------------
+
+/**
+ * The full route table the router serves. Generated from
+ * `mpp-catalog-snapshot.json` + `OPERATOR_OVERLAY` at module load.
+ * Effectively immutable for the lifetime of the Worker isolate.
+ *
+ * Length drifts with the snapshot (88 services × a handful of paid POST
+ * endpoints each, after filtering out free/non-POST routes). Do NOT
+ * hardcode a count here — inspect `PUBLIC_SERVICE_ROUTES.length` at
+ * runtime. Only a small operator-verified subset (those carrying
+ * `verifiedMode: 'charge' | 'session'`) is actually chargeable; the rest
+ * are listed as `payment_status: "untested"` and carry no stellar block.
+ */
+export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] =
+  buildRoutesFromMppSnapshot(mppSnapshot as any, OPERATOR_OVERLAY)
+
+// ---------------------------------------------------------------------
+// Catalog rendering
+// ---------------------------------------------------------------------
+
+/**
+ * Build the list of Stellar intents this route accepts.
+ *
+ * Option A (2026-06-23): every route is payable EXCEPT ones we've
+ * real-money tested and confirmed broken (`verifiedMode === false`).
+ * Unverified routes (`verifiedMode === undefined`) are payable again —
+ * the charge/x402 flows only settle the customer after the downstream
+ * merchant responds, and the catalog now carries per-mode
+ * `*_rozo_verified` flags so a paying agent can see exactly what we've
+ * vetted vs what is best-effort. This replaces the 2026-06-22 opt-IN
+ * model, which gated the ~485 unverified routes and broke services
+ * customers actually use (the Argens report).
+ *
+ * - `verifiedMode === false`: known-broken → no intents (no stellar
+ *   block), and the proxy gate refuses it. Don't send money to a black hole.
+ * - everything else (verified OR untested): advertise `charge`.
+ *
+ * Kept in sync with the proxy gate in `src/routes/proxy.ts`, which
+ * refuses ONLY `verifiedMode === false` routes.
+ */
+function stellarIntentsFor(route: PublicServiceRoute): Array<'charge'> {
+  if (route.verifiedMode === false) return []
+  return ['charge']
+}
+
+/**
+ * Minimal env shape `listPublicCatalog` needs to decide whether to
+ * attach the `methods.stellar_x402` block. Typed as a subset rather
+ * than importing the full `Env` from `src/index.ts` to avoid a
+ * circular dependency (index.ts imports routes which eventually
+ * import this file).
+ */
+export type CatalogEnvView = {
+  X402_ENABLED?: string
+  STELLAR_NETWORK?: string
+  STELLAR_X402_PAY_TO?: string
+  STELLAR_ROUTER_PUBLIC?: string
+}
+
+/**
+ * USDC asset identifier for the Stellar x402 `asset` field in the
+ * public catalog. @x402/stellar's default parser treats USDC
+ * specially; this is advertised to clients so they know which
+ * Stellar token we accept.
+ */
+const STELLAR_X402_ASSET = 'USDC'
+const STELLAR_USDC_SAC_BY_NETWORK: Record<string, string> = {
+  'stellar:pubnet': 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75',
+  'stellar:testnet': 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+}
+
+const RECOMMENDED_WALLET_PREFLIGHT: Array<
+  'account_exists' | 'classic_usdc_trustline' | 'usdc_balance_gte_amount' | 'xlm_reserve_ok'
+> = [
+  'account_exists',
+  'classic_usdc_trustline',
+  'usdc_balance_gte_amount',
+  'xlm_reserve_ok',
+]
+
+function parseFixedUsdPrice(price: string): string | null {
+  const m = /^\$([0-9]+(?:\.[0-9]+)?)\/request$/.exec(price.trim())
+  if (!m) return null
+  return m[1]
+}
+
+function toStellarUsdc7(amountDecimal: string): string | null {
+  if (!/^\d+(?:\.\d+)?$/.test(amountDecimal)) return null
+  const [whole, fracRaw = ''] = amountDecimal.split('.')
+  if (fracRaw.length > 7) return null
+  return `${whole}.${fracRaw.padEnd(7, '0')}`
+}
+
+function getUsdcSacForNetwork(network?: string): string | undefined {
+  if (!network) return undefined
+
+exec
+/bin/zsh -lc "sed -n '1,360p' scripts/e2e/charge-e2e.mjs" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+/**
+ * Real-money charge E2E for the MPP Router provider suite.
+ *
+ * For each target provider this drives the production charge path:
+ *   client pays Stellar USDC  →  Router pool  →  Router pays merchant
+ *   via Tempo  →  merchant returns result.
+ *
+ * A 200 with a sane body proves the WHOLE chain (the only thing that
+ * does — a 402 probe can't reach downstream settlement). Failures are
+ * classified per the SOP responsibility table (us vs merchant vs
+ * client).
+ *
+ * This SPENDS REAL USDC. Each call is the lightest body for that
+ * provider; per-call cost ranges $0.001 (quicknode) to $0.06
+ * (coingecko). The whole suite is well under $1.
+ *
+ * It shells out to the stellar-agent-wallet `pay-per-call` skill, which
+ * owns the 402 → sign → retry loop. We never touch the private key
+ * directly here beyond extracting it to a 0600 temp file that is
+ * deleted on exit.
+ *
+ * Usage:
+ *   node scripts/e2e/charge-e2e.mjs                  # all providers
+ *   node scripts/e2e/charge-e2e.mjs openai deepseek  # subset
+ *   MAX_AUTO_USD=0.10 node scripts/e2e/charge-e2e.mjs
+ *
+ * Env:
+ *   STELLAR_ENV_FILE  path to .env holding STELLAR_PRIVATE_KEY
+ *                     (default: rozoskilltest/.env)
+ *   PAY_PER_CALL_DIR  path to the pay-per-call skill dir
+ *                     (default: latest mpprouter plugin cache)
+ *   MAX_AUTO_USD      per-call auto-pay ceiling (default 0.10)
+ *   ROUTER_BASE_OVERRIDE  test against a non-prod router
+ */
+
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { globSync } from 'node:fs'
+
+import { ROUTER_BASE, PROVIDERS } from './providers.mjs'
+
+const BASE = process.env.ROUTER_BASE_OVERRIDE || ROUTER_BASE
+const MAX_AUTO_USD = process.env.MAX_AUTO_USD || '0.10'
+const ENV_FILE =
+  process.env.STELLAR_ENV_FILE ||
+  '/Users/happyfish/workspace/rozo/rozocontracts/rozoskilltest/.env'
+
+function resolvePayPerCallDir() {
+  if (process.env.PAY_PER_CALL_DIR) return process.env.PAY_PER_CALL_DIR
+  const home = process.env.HOME
+  const candidates = globSync(
+    `${home}/.claude/plugins/cache/mpprouter/stellar-agent-wallet/*/skills/pay-per-call`,
+  )
+  if (!candidates.length) {
+    throw new Error(
+      'pay-per-call skill not found. Set PAY_PER_CALL_DIR or install the mpprouter plugin.',
+    )
+  }
+  // Highest version last after sort.
+  candidates.sort()
+  return candidates[candidates.length - 1]
+}
+
+/**
+ * Extract the Stellar secret key from the .env into a 0600 temp file.
+ * We NEVER print the key. The file is deleted by the caller's finally.
+ */
+function extractSecretFile() {
+  if (!existsSync(ENV_FILE)) throw new Error(`STELLAR_ENV_FILE not found: ${ENV_FILE}`)
+  const lines = readFileSync(ENV_FILE, 'utf8').split('\n')
+  let secret = null
+  for (const l of lines) {
+    if (l.startsWith('STELLAR_PRIVATE_KEY=')) {
+      secret = l.slice('STELLAR_PRIVATE_KEY='.length).trim().replace(/^["']|["']$/g, '')
+      break
+    }
+  }
+  if (!secret) throw new Error('STELLAR_PRIVATE_KEY not found in env file')
+  if (!secret.startsWith('S')) throw new Error('extracted value is not a Stellar secret key')
+  const dir = mkdtempSync(join(tmpdir(), 'mpp-e2e-'))
+  // Self-clean: if ANY step after the dir exists throws (writeFile, chmod),
+  // delete the dir before re-throwing so a partially-written key file can
+  // never be left on disk outside the caller's try/finally.
+  try {
+    const file = join(dir, 'stkey')
+    writeFileSync(file, secret, { mode: 0o600 })
+    chmodSync(file, 0o600)
+    return { file, dir }
+  } catch (e) {
+    rmSync(dir, { recursive: true, force: true })
+    throw e
+  }
+}
+
+/**
+ * Defense in depth: scrub anything that looks like a Stellar secret key
+ * (S + 55 base32 chars) from any text before it can reach stdout/stderr/
+ * logs. We never print the key ourselves, but the child wallet tool's
+ * error paths are not under our control — redact its output too.
+ */
+function redactSecrets(text) {
+  if (!text) return text
+  return String(text).replace(/S[A-Z2-7]{55}/g, 'S<redacted-stellar-secret>')
+}
+
+/**
+ * Classify a pay-per-call result into the SOP responsibility verdict.
+ * Returns { verdict, blame, detail }.
+ */
+function classify(p, { ok, stdout, stderr, json }) {
+  // The router wraps merchant responses as { success: true, data: <body> }.
+  // Unwrap so per-provider okCheck sees the real upstream body.
+  const unwrap = (j) => (j && j.success === true && j.data ? j.data : j)
+  if (ok && json && p.okCheck(unwrap(json))) {
+    return { verdict: 'PASS', blame: 'none', detail: 'full chain OK, valid upstream body' }
+  }
+  if (ok && json) {
+    return { verdict: 'PASS_WEAK', blame: 'none', detail: 'HTTP 200 but body shape unexpected (manual check)' }
+  }
+  const err = (stderr || '') + (stdout || '')
+  if (/descriptor required for TIP-1034/i.test(err)) {
+    return { verdict: 'FAIL', blame: 'us', detail: 'voucher missing TIP-1034 descriptor (mppx too old)' }
+  }
+  if (/session channel not installed/i.test(err)) {
+    return { verdict: 'FAIL', blame: 'us', detail: 'session channel not opened for this merchant (503)' }
+  }
+  if (/pool balance insufficient/i.test(err)) {
+    return { verdict: 'FAIL', blame: 'us', detail: 'router pool underfunded (503)' }
+  }
+  if (/cumulative.*deposit|channel underfunded|exceeds.*deposit/i.test(err)) {
+    return { verdict: 'FAIL', blame: 'us', detail: 'channel deposit exhausted — needs topup / new channel' }
+  }
+  if (/502|merchant payment failed/i.test(err) && /5\d\d|internal error/i.test(err)) {
+    return { verdict: 'FAIL', blame: 'merchant', detail: 'we paid OK, merchant returned 5xx (502)' }
+  }
+  if (/402/.test(err)) {
+    return { verdict: 'FAIL', blame: 'us', detail: 'challenge could not be satisfied (402 loop)' }
+  }
+  return { verdict: 'FAIL', blame: 'unknown', detail: err.replace(/\s+/g, ' ').slice(0, 200) }
+}
+
+function payOne(p, secretFile, payDir) {
+  const url = `${BASE}${p.publicPath}`
+  const args = [
+    'tsx',
+    join(payDir, 'run.ts'),
+    url,
+    '--method',
+    p.method,
+    '--body',
+    JSON.stringify(p.body),
+    '--secret-file',
+    secretFile,
+    '--network',
+    'pubnet',
+    '--max-auto',
+    MAX_AUTO_USD,
+    '--yes',
+    '--json',
+  ]
+  try {
+    const stdout = execFileSync('npx', args, {
+      cwd: join(payDir, '../..'),
+      encoding: 'utf8',
+      timeout: 90000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let json = null
+    try {
+      json = JSON.parse(stdout.trim().split('\n').filter(Boolean).pop())
+    } catch {}
+    // Redact before anything from the child can be stored/logged.
+    return { ok: true, stdout: redactSecrets(stdout), stderr: '', json }
+  } catch (e) {
+    return {
+      ok: false,
+      stdout: redactSecrets(e.stdout?.toString() || ''),
+      stderr: redactSecrets(e.stderr?.toString() || String(e.message || e)),
+      json: null,
+    }
+  }
+}
+
+async function main() {
+  const only = process.argv.slice(2)
+  const targets = only.length ? PROVIDERS.filter((p) => only.includes(p.id)) : PROVIDERS
+
+  // Health gate.
+  const h = await fetch(`${BASE}/health`).then((r) => r.json()).catch((e) => ({ error: String(e) }))
+  if (h?.status !== 'ok') {
+    console.error('ROUTER UNHEALTHY, aborting real-money run:', JSON.stringify(h))
+    process.exit(2)
+  }
+  console.error(`router OK  base=${BASE}  max-auto=$${MAX_AUTO_USD}/call\n`)
+
+  // Resolve everything that can throw BEFORE extracting the secret, so the
+  // 0600 temp key file is created only inside the try/finally that deletes
+  // it. (If resolvePayPerCallDir threw after extraction, the key would leak.)
+  const payDir = resolvePayPerCallDir()
+  const { file: secretFile, dir: secretDir } = extractSecretFile()
+  const results = []
+  try {
+    for (const p of targets) {
+      process.stderr.write(`→ ${p.id} (${p.family}/${p.mode}) ${p.publicPath} ... `)
+      const raw = payOne(p, secretFile, payDir)
+      const c = classify(p, raw)
+      results.push({ id: p.id, family: p.family, mode: p.mode, path: p.publicPath, ...c })
+      process.stderr.write(`${c.verdict} [${c.blame}] ${c.detail}\n`)
+    }
+  } finally {
+    rmSync(secretDir, { recursive: true, force: true })
+  }
+
+  console.error('\n=== E2E SUMMARY ===')
+  // Only a strict PASS (200 + okCheck passed) is green. PASS_WEAK (200 but
+  // body shape unexpected — unwrap/okCheck failed) is NOT success: it needs
+  // a human look and must not let the suite exit 0.
+  const pass = results.filter((r) => r.verdict === 'PASS')
+  const weak = results.filter((r) => r.verdict === 'PASS_WEAK')
+  const ourFault = results.filter((r) => r.blame === 'us')
+  const merchantFault = results.filter((r) => r.blame === 'merchant')
+  console.error(`PASS: ${pass.length}/${results.length}  (${pass.map((r) => r.id).join(', ') || 'none'})`)
+  if (weak.length) console.error(`PASS_WEAK (200, body unexpected — verify): ${weak.map((r) => r.id).join(', ')}`)
+  if (ourFault.length) console.error(`OUR BUG: ${ourFault.map((r) => `${r.id}(${r.detail})`).join('; ')}`)
+  if (merchantFault.length) console.error(`MERCHANT: ${merchantFault.map((r) => r.id).join(', ')}`)
+
+  // Machine-readable report to stdout.
+  console.log(JSON.stringify({ base: BASE, ts: new Date().toISOString(), results }, null, 2))
+  process.exit(pass.length === results.length ? 0 : 1)
+}
+
+main().catch((e) => {
+  console.error(e)
+  process.exit(1)
+})
+
+codex
+The code confirms a few important constraints: `providers.mjs` is only a hand-curated subset, the overlay already mixes verified, known-broken, and untested/payable routes, and `charge-e2e` currently spends real funds against all listed providers unless narrowed. I’m checking the rest of `merchants.ts` for how the flags are surfaced, then I’ll answer the proposal questions directly.
+exec
+/bin/zsh -lc "sed -n '1,280p' src/services/merchants-types.ts" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+exec
+/bin/zsh -lc "sed -n '1,360p' src/services/build-routes.ts" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+exec
+/bin/zsh -lc "sed -n '360,760p' src/services/merchants.ts" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+  if (!network) return undefined
+  return STELLAR_USDC_SAC_BY_NETWORK[network] ?? STELLAR_USDC_SAC_BY_NETWORK['stellar:pubnet']
+}
+
+export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
+  // Single place to decide stellar.x402 inclusion — don't scatter
+  // the check across every entry.
+  const stellarX402Block =
+    env?.X402_ENABLED === 'true' &&
+    env.STELLAR_NETWORK &&
+    env.STELLAR_X402_PAY_TO
+      ? {
+          scheme: 'exact' as const,
+          network: env.STELLAR_NETWORK,
+          pay_to: env.STELLAR_X402_PAY_TO,
+          asset: STELLAR_X402_ASSET,
+        }
+      : null
+
+  return PUBLIC_SERVICE_ROUTES.map(route => {
+    const stellarIntents = stellarIntentsFor(route)
+    // Payment availability tier — orthogonal to docs `status`. Driven
+    // by verifiedMode, kept in lockstep with stellarIntentsFor (which
+    // only advertises `charge` for the verified tier) and the proxy
+    // execution gate.
+    // Option A (2026-06-23): payable unless confirmed-broken. 'verified'
+    // = operator real-money tested; 'available' = payable but unverified
+    // (client decides risk via *_rozo_verified); 'unavailable' = broken,
+    // proxy gate refuses. Kept in sync with stellarIntentsFor + proxy gate.
+    const paymentTier: Pick<
+      PublicCatalogEntry,
+      'payment_status' | 'payment_enabled' | 'payment_status_note'
+    > =
+      route.verifiedMode === false
+        ? {
+            payment_status: 'unavailable',
+            payment_enabled: false,
+            payment_status_note:
+              route.verifiedNote ??
+              'Route is known-broken (merchant error or bad upstream path) and is not chargeable.',
+          }
+        : route.verifiedMode === 'charge' || route.verifiedMode === 'session'
+          ? { payment_status: 'verified', payment_enabled: true }
+          : {
+              payment_status: 'available',
+              payment_enabled: true,
+              payment_status_note:
+                'Route is payable but has not been verified end-to-end by Rozo. ' +
+                'Check charge_rozo_verified / session_rozo_verified before relying on it.',
+            }
+    const entry: PublicCatalogEntry = {
+      id: route.id,
+      name: route.name,
+      // Backward-compat: keep `category` (singular) populated
+      // with the first category for v1 clients that don't know
+      // about the array.
+      category: route.categories[0] ?? 'misc',
+      categories: route.categories,
+      description: route.description,
+      public_path: route.publicPath,
+      method: route.method,
+      price: route.price,
+      payment_method: route.paymentMethod,
+      network: route.network,
+      asset: route.asset,
+      status: route.docs?.llmsTxt ? 'active' : 'limited',
+      ...(route.docs?.llmsTxt ? {} : {
+        status_note: 'llms_txt not available — use with caution; agents may not know how to construct request bodies.',
+      }),
+      ...paymentTier,
+      // Per-mode verification flags. `?? null` so the catalog ALWAYS carries
+      // the 4 keys (clients don't have to handle missing keys); null = N/A
+      // for this mode or never tested in it.
+      charge_rozo_verified: route.chargeVerified ?? null,
+      charge_rozo_verified_at: route.chargeVerifiedAt ?? null,
+      session_rozo_verified: route.sessionVerified ?? null,
+      session_rozo_verified_at: route.sessionVerifiedAt ?? null,
+      docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
+      methods: {
+        // Only include `stellar` when the route has usable intents —
+        // broken routes (verifiedMode === false) get no stellar block.
+        ...(stellarIntents.length > 0 ? { stellar: { intents: stellarIntents } } : {}),
+        // Only include `stellar_x402` when the feature flag is on AND
+        // the route has stellar intents — don't advertise x402 payment
+        // for a route where stellar is disabled.
+        ...(stellarIntents.length > 0 && stellarX402Block ? { stellar_x402: stellarX402Block } : {}),
+        tempo: {
+          intents: ['charge'] as Array<'charge' | 'session'>,
+          role: 'upstream' as const,
+        },
+      },
+    }
+    if (stellarIntents.length > 0) {
+      const dialect: 'mpp' | 'both' =
+        stellarX402Block ? 'both' : 'mpp'
+      const mppPayTo = env?.STELLAR_ROUTER_PUBLIC
+      const x402PayTo = env?.STELLAR_X402_PAY_TO
+      let payTo: string | undefined
+      if (dialect === 'mpp') {
+        payTo = mppPayTo
+      } else if (mppPayTo && x402PayTo && mppPayTo === x402PayTo) {
+        // Only expose a single pay_to for "both" when they are
+        // actually the same address. Otherwise omit to avoid guessing.
+        payTo = mppPayTo
+      }
+
+      const fixedUsd = parseFixedUsdPrice(route.price)
+      const amountUsdc = fixedUsd ? toStellarUsdc7(fixedUsd) : null
+      const paymentHints: NonNullable<PublicCatalogEntry['payment_hints']> = {
+        network: env?.STELLAR_NETWORK,
+        intent: stellarIntents[0] === 'charge' ? 'charge' : 'channel',
+        dialect,
+        ...(payTo ? { pay_to: payTo } : {}),
+        ...(amountUsdc ? { amount_usdc: amountUsdc } : {}),
+        ...(env?.STELLAR_NETWORK ? { asset_sac: getUsdcSacForNetwork(env.STELLAR_NETWORK) } : {}),
+        requires_classic_usdc_trustline: true,
+        recommended_wallet_preflight: RECOMMENDED_WALLET_PREFLIGHT,
+      }
+      entry.payment_hints = paymentHints
+    }
+    if (route.docs) {
+      entry.docs = {
+        ...(route.docs.homepage ? { homepage: route.docs.homepage } : {}),
+        ...(route.docs.llmsTxt ? { llms_txt: route.docs.llmsTxt } : {}),
+        ...(route.docs.apiReference ? { api_reference: route.docs.apiReference } : {}),
+      }
+    }
+    if (route.verifiedMode !== undefined) {
+      entry.verified_mode = route.verifiedMode
+    }
+    if (route.verifiedNote !== undefined) {
+      entry.verified_note = route.verifiedNote
+    }
+    return entry
+  })
+}
+
+// ---------------------------------------------------------------------
+// Route lookup + path placeholder resolution
+// ---------------------------------------------------------------------
+
+export function getRouteByPublicPath(
+  pathname: string,
+  method: string,
+): PublicServiceRoute | undefined {
+  return PUBLIC_SERVICE_ROUTES.find(
+    route => route.publicPath === pathname && route.method === method.toUpperCase(),
+  )
+}
+
+/**
+ * Return every method registered for `pathname`, regardless of HTTP
+ * method. Used by the proxy to distinguish "path doesn't exist" (→ 400)
+ * from "path exists but wrong method" (→ 405 with allowed_methods),
+ * so agents that default to GET get an actionable hint instead of a
+ * misleading 'Unknown public service route' error.
+ */
+export function getAllowedMethodsForPath(pathname: string): string[] {
+  const methods = new Set<string>()
+  for (const route of PUBLIC_SERVICE_ROUTES) {
+    if (route.publicPath === pathname) methods.add(route.method)
+  }
+  return [...methods]
+}
+
+/**
+ * Whitelist for `{placeholder}` substitution values. Restricts to
+ * model-name-style identifiers so a client cannot inject path
+ * traversal (`../`), query strings (`?`), or anchors (`#`).
+ *
+ * If you need to widen this for a future placeholder type (e.g.
+ * an arbitrary network id with `/` in it), do it per-placeholder
+ * with a route-specific override, NOT by relaxing this regex.
+ */
+const PLACEHOLDER_VALUE_PATTERN = /^[A-Za-z0-9._-]+$/
+
+export class UpstreamPathPlaceholderError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'UpstreamPathPlaceholderError'
+  }
+}
+
+/**
+ * Substitute `{placeholder}` tokens in `route.upstreamPath` from a
+ * URLSearchParams (request URL query). Falls back to per-route
+ * defaults; throws when neither has a value, or when a value fails
+ * validation. Returns the path with substitutions applied AND the
+ * set of consumed param names so the proxy can strip them from the
+ * forwarded query string.
+ */
+export function resolveUpstreamPath(
+  route: Pick<PublicServiceRoute, 'upstreamPath' | 'placeholderDefaults' | 'id'>,
+  searchParams: URLSearchParams,
+): { path: string; consumed: Set<string> } {
+  const consumed = new Set<string>()
+  const defaults = route.placeholderDefaults ?? {}
+  const path = route.upstreamPath.replace(/\{([A-Za-z0-9_]+)\}/g, (_match, name: string) => {
+    const fromQuery = searchParams.get(name)
+    let value: string | undefined
+    if (fromQuery !== null) {
+      value = fromQuery
+      consumed.add(name)
+    } else if (Object.prototype.hasOwnProperty.call(defaults, name)) {
+      value = defaults[name]
+    } else {
+      throw new UpstreamPathPlaceholderError(
+        `Route ${route.id} requires {${name}} placeholder but no value was supplied ` +
+          `(no ?${name}= query param and no default in placeholderDefaults).`,
+      )
+    }
+    if (!PLACEHOLDER_VALUE_PATTERN.test(value)) {
+      throw new UpstreamPathPlaceholderError(
+        `Route ${route.id} {${name}} placeholder value ${JSON.stringify(value)} ` +
+          `must match ${PLACEHOLDER_VALUE_PATTERN}`,
+      )
+    }
+    return value
+  })
+  return { path, consumed }
+}
+
+ succeeded in 0ms:
+/**
+ * Build PUBLIC_SERVICE_ROUTES from a frozen mpp.dev catalog snapshot.
+ *
+ * Why this exists: the router used to maintain `PUBLIC_SERVICE_ROUTES`
+ * by hand — twelve services, twelve route entries, hand-typed prices.
+ * This drifted relative to upstream as mpp.dev grew to 88 services
+ * and 832 endpoints. Operators discovering an mpp.dev service via
+ * the docs would find the router silently didn't proxy it.
+ *
+ * The fix is one-shot bulk import: snapshot mpp.dev's
+ * `/api/services` JSON, commit it as
+ * `mpp-catalog-snapshot.json`, and generate routes from it at
+ * module-load time. Operators can refresh by re-running
+ * `scripts/admin/refresh-mpp-snapshot.ts` and committing the new
+ * snapshot. No hand-edits needed for new merchants.
+ *
+ * The 12 historical hand-coded routes ARE NOT lost: an "operator
+ * overlay" map carries their `verifiedMode` / `verifiedNote` /
+ * `placeholderDefaults` flags. When a generated route matches a
+ * hand-coded one by `(service, normalizedPath)`, the overlay
+ * fields get merged in. The verified-status work the operator
+ * has done is preserved across re-imports.
+ *
+ * Edge cases:
+ * - mpp.dev endpoints use `:placeholder` syntax for path parameters.
+ *   The router's `resolveUpstreamPath` only knows `{placeholder}`.
+ *   We rewrite `:name` → `{name}` at import time.
+ * - Some generated route IDs would collide (e.g. two endpoints
+ *   `POST /v1/foo` and `GET /v1/foo` on the same service). We
+ *   disambiguate by appending the HTTP method when needed.
+ * - Endpoints with `payment === null` (free / preview routes) are
+ *   imported with `price: 'free'` and a `freeRoute: true` marker.
+ * - Services missing tempo charge intent (e.g. session-only
+ *   merchants) get `upstreamPaymentMethod: 'tempo.session'`. Same
+ *   logic as before.
+ * - Categories: mpp.dev uses an array (`["ai", "media"]`); router
+ *   schema is now `categories: string[]`. Single-category routes
+ *   become a 1-element array.
+ */
+
+import type {
+  PublicServiceRoute,
+  PublicServiceRouteOverlay,
+} from './merchants-types'
+
+// Top-level shape of the snapshot file. Loose typing — we duck-type
+// access only the fields we need so a future minor change in
+// mpp.dev's response shape doesn't break the build.
+interface MppSnapshot {
+  version: number
+  services: MppService[]
+}
+
+interface MppService {
+  id: string
+  name: string
+  description?: string
+  serviceUrl: string
+  url?: string
+  categories?: string[]
+  tags?: string[]
+  status?: string
+  docs?: { homepage?: string; llmsTxt?: string; apiReference?: string }
+  methods?: {
+    tempo?: { intents?: string[]; assets?: string[] }
+  }
+  endpoints?: MppEndpoint[]
+}
+
+interface MppEndpoint {
+  method: string
+  path: string
+  description?: string
+  payment?: {
+    intent?: string
+    method?: string
+    currency?: string
+    decimals?: number
+    description?: string
+    amount?: string
+  } | null
+}
+
+/**
+ * Slug a path into an underscore-separated identifier suitable for
+ * use as part of a route ID. Strips leading slashes and common
+ * boilerplate prefixes (`api/`, `v1/`, etc), normalizes
+ * placeholders, and lowercases.
+ *
+ * Examples:
+ *   /api/search                  → search
+ *   /v1/chat/completions         → chat_completions
+ *   /fal-ai/flux/schnell         → fal-ai_flux_schnell
+ *   /v1beta/models/{model}:gen   → models_model_gen
+ *   /                            → root
+ */
+/**
+ * Path segments to strip from the front of a path before slugifying.
+ * These are noise prefixes that don't add information for the route
+ * id and would otherwise produce ugly slugs like
+ * `fal_fal-ai_flux_schnell`. After stripping, that becomes
+ * `fal_flux_schnell` which matches operator intuition.
+ *
+ * Stripping is conservative: only the LEADING segment is dropped,
+ * and only if it matches one of these literals (or matches the
+ * common `v[0-9]+(beta|alpha)?` versioning pattern).
+ */
+const STRIPPABLE_LEADING_SEGMENTS = new Set([
+  'api',
+  'fal-ai',
+  'xai',
+])
+
+function isVersionSegment(seg: string): boolean {
+  return /^v\d+(?:[a-z]+)?$/.test(seg)
+}
+
+function slugifyPath(path: string): string {
+  // Split into segments, strip noise leading segments, then re-join
+  // and normalize.
+  const segments = path
+    .replace(/^\/+/, '')
+    .split('/')
+    .filter(s => s.length > 0)
+  while (
+    segments.length > 1 &&
+    (STRIPPABLE_LEADING_SEGMENTS.has(segments[0]) ||
+      isVersionSegment(segments[0]))
+  ) {
+    segments.shift()
+  }
+  let s = segments
+    .join('_')
+    .replace(/\{([^}]+)\}/g, '$1')
+    .replace(/:([a-z_][a-z0-9_]*)/gi, '$1')
+    .replace(/[^a-z0-9_-]+/gi, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_|_$/g, '')
+    .toLowerCase()
+  if (s === '') s = 'root'
+  return s
+}
+
+/**
+ * Compute the route id for a (service, endpoint) pair. Format:
+ * `<serviceId>_<slugifiedPath>`. The HTTP method is appended only
+ * when two endpoints on the same service would otherwise collide.
+ */
+function makeRouteId(serviceId: string, endpoint: MppEndpoint): string {
+  return `${serviceId}_${slugifyPath(endpoint.path)}`
+}
+
+/**
+ * The router's `resolveUpstreamPath` only understands `{name}`
+ * placeholders. mpp.dev paths use `:name`. Rewrite `:name` → `{name}`
+ * (only when the colon is followed by an identifier, NOT when it's
+ * a literal segment like `/foo:bar`).
+ *
+ * Examples:
+ *   /:network/v2                → /{network}/v2
+ *   /:network/nft/v3/:endpoint  → /{network}/nft/v3/{endpoint}
+ *   /v1beta/models/foo:gen      → /v1beta/models/foo:gen  (literal colon NOT rewritten)
+ *
+ * The distinction: `:name` only matches at the start of a path
+ * segment, never in the middle. We use a regex with `(?:^|/)` to
+ * enforce this.
+ */
+function rewritePathPlaceholders(path: string): string {
+  return path.replace(/(^|\/):([a-z_][a-z0-9_]*)/gi, '$1{$2}')
+}
+
+/**
+ * Derive the upstream host from `serviceUrl`. mpp.dev returns the
+ * full origin (e.g. `https://fal.mpp.tempo.xyz`); the router's
+ * `upstreamHost` field expects host-only (`fal.mpp.tempo.xyz`).
+ */
+function deriveHost(serviceUrl: string): string {
+  try {
+    return new URL(serviceUrl).host
+  } catch {
+    // serviceUrl was already host-only
+    return serviceUrl
+  }
+}
+
+/**
+ * Pretty-format a Tempo USDC base-unit amount string into a
+ * human-readable price. The router's `price` field has historically
+ * been a free-form string; we keep it that way for backward
+ * compatibility, but populate it from the snapshot's actual
+ * payment.amount instead of hand-typed values that drift over time.
+ */
+function formatPrice(payment: MppEndpoint['payment']): string {
+  if (!payment || !payment.amount) return 'free'
+  const decimals = payment.decimals ?? 6
+  const raw = payment.amount
+  try {
+    const big = BigInt(raw)
+    const divisor = 10n ** BigInt(decimals)
+    const dollars = Number(big * 1000n / divisor) / 1000
+    return `$${dollars.toFixed(3)}/request`
+  } catch {
+    return 'unknown'
+  }
+}
+
+/**
+ * Determine which Tempo intent the router should use to forward
+ * agent requests to this upstream. Charge if the service advertises
+ * it (most do), session otherwise. Some services advertise BOTH;
+ * for now we prefer charge because it doesn't require pre-opening
+ * a KV channel via `scripts/admin/open-tempo-channel.ts`.
+ */
+function pickUpstreamPaymentMethod(
+  service: MppService,
+): 'tempo.charge' | 'tempo.session' {
+  const intents = service.methods?.tempo?.intents ?? []
+  if (intents.includes('charge')) return 'tempo.charge'
+  if (intents.includes('session')) return 'tempo.session'
+  // Default. Many services that don't advertise tempo.* intents at
+  // all are still tempo.charge in practice — the router's runtime
+  // dispatch on `parsed.intent` corrects this anyway.
+  return 'tempo.charge'
+}
+
+/**
+ * Build the full route table from a frozen mpp.dev snapshot plus an
+ * operator overlay. Pure function — no I/O, no env access.
+ */
+export function buildRoutesFromMppSnapshot(
+  snapshot: MppSnapshot,
+  overlay: Record<string, PublicServiceRouteOverlay> = {},
+): PublicServiceRoute[] {
+  const routes: PublicServiceRoute[] = []
+  const seenIds = new Set<string>()
+  const seenPublicPaths = new Set<string>()
+
+  for (const service of snapshot.services) {
+    if (service.status && service.status !== 'active') continue
+    const upstreamHost = deriveHost(service.serviceUrl)
+    const upstreamPaymentMethod = pickUpstreamPaymentMethod(service)
+    const categories = service.categories ?? []
+
+    for (const endpoint of service.endpoints ?? []) {
+      const method = (endpoint.method || 'POST').toUpperCase()
+      // The router only proxies POST routes today. Skip GET/PATCH/
+      // DELETE etc — they tend to be free management endpoints
+      // that don't fit the "pay-per-request" model and aren't
+      // wired into proxy.ts's payment flow.
+      if (method !== 'POST') continue
+
+      // Skip free/non-paid endpoints. The router's pay-per-request
+      // dispatch path doesn't have a "no payment needed" branch,
+      // and these endpoints are rarely useful as proxied targets
+      // anyway (they're usually internal service mgmt routes).
+      if (!endpoint.payment) continue
+
+      let id = makeRouteId(service.id, endpoint)
+      // Disambiguate id collisions by appending the HTTP method.
+      // Should be rare since we filter to POST only.
+      if (seenIds.has(id)) {
+        id = `${id}_${method.toLowerCase()}`
+      }
+      if (seenIds.has(id)) {
+        // Still collides — append a counter. Logged as a warning
+        // in test fixtures so we can rename in the snapshot
+        // overlay if needed.
+        let n = 2
+        while (seenIds.has(`${id}_${n}`)) n += 1
+        id = `${id}_${n}`
+      }
+      seenIds.add(id)
+
+      const upstreamPath = rewritePathPlaceholders(endpoint.path)
+      const publicPath = `/v1/services/${service.id}/${slugifyPath(endpoint.path)}`
+      // Public path collisions get resolved the same way as IDs:
+      // never silently overwrite, always rename. With 832 source
+      // endpoints this is theoretically possible.
+      let dedupedPublicPath = publicPath
+      if (seenPublicPaths.has(dedupedPublicPath)) {
+        let n = 2
+        while (seenPublicPaths.has(`${publicPath}_${n}`)) n += 1
+        dedupedPublicPath = `${publicPath}_${n}`
+      }
+      seenPublicPaths.add(dedupedPublicPath)
+
+      const description =
+        endpoint.description ?? service.description ?? `${service.name} ${endpoint.path}`
+      const route: PublicServiceRoute = {
+        id,
+        service: service.id,
+        operation: slugifyPath(endpoint.path),
+        name:
+          endpoint.description && endpoint.description.length < 60
+            ? `${service.name} – ${endpoint.description}`
+            : service.name,
+        categories,
+        description,
+        method,
+        price: formatPrice(endpoint.payment),
+        paymentMethod: 'stellar',
+        upstreamPaymentMethod,
+        network: 'stellar-mainnet',
+        asset: 'USDC',
+        publicPath: dedupedPublicPath,
+        upstreamHost,
+        upstreamPath,
+        ...(service.docs ? { docs: service.docs } : {}),
+      }
+      const overlayKey = `${service.id}::${upstreamPath}`
+      const overlayEntry = overlay[overlayKey]
+      if (overlayEntry) {
+        if (overlayEntry.id) {
+          // Honor the historical ID so existing client URL
+          // bookmarks (`/v1/services/parallel/search`) keep working.
+          // We also re-derive publicPath from the historical id
+          // when the overlay specifies one.
+          route.id = overlayEntry.id
+          if (overlayEntry.publicPath) {
+            route.publicPath = overlayEntry.publicPath
+          }
+        }
+        if (overlayEntry.verifiedMode !== undefined) {
+          route.verifiedMode = overlayEntry.verifiedMode
+        }
+        if (overlayEntry.verifiedNote !== undefined) {
+          route.verifiedNote = overlayEntry.verifiedNote
+        }
+        if (overlayEntry.placeholderDefaults !== undefined) {
+          route.placeholderDefaults = overlayEntry.placeholderDefaults
+        }
+        if (overlayEntry.upstreamPaymentMethod !== undefined) {
+          // Operator override — e.g. the operator opened a session
+          // channel for this merchant and wants the router to use
+          // session dispatch.
+          route.upstreamPaymentMethod = overlayEntry.upstreamPaymentMethod
+        }
+        // Per-mode real-money verification flags + timestamps (operator-only).
+        if (overlayEntry.chargeVerified !== undefined) {
+          route.chargeVerified = overlayEntry.chargeVerified
+        }
+        if (overlayEntry.chargeVerifiedAt !== undefined) {
+          route.chargeVerifiedAt = overlayEntry.chargeVerifiedAt
+        }
+        if (overlayEntry.sessionVerified !== undefined) {
+          route.sessionVerified = overlayEntry.sessionVerified
+        }
+        if (overlayEntry.sessionVerifiedAt !== undefined) {
+          route.sessionVerifiedAt = overlayEntry.sessionVerifiedAt
+        }
+      }
+      routes.push(route)
+    }
+  }
+
+  return routes
+}
+
+ succeeded in 0ms:
+/**
+ * Type definitions for the public service catalog. Lives in its
+ * own file so `build-routes.ts` can import these without pulling
+ * in the catalog body (which would create a circular import via
+ * `merchants.ts`).
+ */
+
+/**
+ * A single proxied merchant route. Most fields come from the
+ * mpp.dev catalog snapshot at build time; the verifiedMode /
+ * verifiedNote / placeholderDefaults fields can be overridden per
+ * route via the operator overlay (see
+ * `merchants.ts → OPERATOR_OVERLAY`).
+ */
+export interface PublicServiceRoute {
+  id: string
+  service: string
+  operation: string
+  name: string
+  /**
+   * One or more category tags. mpp.dev publishes a string array per
+   * service (e.g. `["ai", "media"]`). The router used to flatten
+   * this to a single string; v2 (2026-04-12) keeps the array. The
+   * legacy `category` field on `PublicCatalogEntry` is still
+   * populated with `categories[0]` for backward compatibility with
+   * old clients.
+   */
+  categories: string[]
+  description: string
+  method: string
+  price: string
+  /**
+   * Which wallet type the AGENT uses to pay Router. Always 'stellar'
+   * for the current catalog; this is the value exposed on the public
+   * catalog JSON and is consumed by agent-side SDKs.
+   */
+  paymentMethod: 'stellar'
+  /**
+   * Which Tempo payment intent Router uses to pay the upstream
+   * merchant. Fixed-price merchants use `tempo.charge` (single-shot
+   * 402 settle per request); dynamic merchants use `tempo.session`
+   * (long-lived channel with streaming vouchers, requires the
+   * operator to pre-open the channel via
+   * `scripts/admin/open-tempo-channel.ts`).
+   *
+   * Important: this is a HINT for the dispatch helper. The router's
+   * runtime payMerchantAndGetBody dispatches on the merchant's
+   * actual `parsed.intent` value, so a wrong hint here doesn't
+   * silently break a route — the router auto-corrects. The hint
+   * matters for documentation and for KV channel pre-provisioning.
+   */
+  upstreamPaymentMethod: 'tempo.charge' | 'tempo.session'
+  network: 'stellar-mainnet'
+  asset: 'USDC'
+  publicPath: string
+  upstreamHost: string
+  /**
+   * Path on the upstream merchant. May contain `{placeholder}`
+   * tokens which the router substitutes from URL query params at
+   * request time. mpp.dev paths use `:placeholder` syntax; the
+   * build step rewrites them to `{placeholder}` because that's
+   * what `resolveUpstreamPath` in this file knows how to expand.
+   *
+   * If a placeholder is referenced but missing from both the
+   * query and `placeholderDefaults`, the router emits 400. The
+   * substitution is whitelist-based — only values matching
+   * `[A-Za-z0-9._-]+` are allowed, so a malicious client cannot
+   * inject path traversal or query strings.
+   */
+  upstreamPath: string
+  /**
+   * Default values for `{placeholder}` tokens in upstreamPath.
+   * Looked up by placeholder name when the request URL doesn't
+   * carry the corresponding query param.
+   */
+  placeholderDefaults?: Record<string, string>
+  /** Upstream service docs URLs from mpp.dev catalog */
+  docs?: {
+    homepage?: string
+    llmsTxt?: string
+    apiReference?: string
+  }
+  /**
+   * Verified end-to-end status. Operator-maintained flag set
+   * after a real client call (agent → router → merchant → 200)
+   * succeeded against this route on mainnet. Carried in the
+   * operator overlay (NOT generated from the snapshot — mpp.dev
+   * doesn't know which routes a particular operator has tested).
+   *
+   * Values:
+   *   - `'session'`: route works end-to-end via tempo.session.
+   *     Lower latency (~8s), uses an open KV channel.
+   *   - `'charge'`: route works end-to-end via tempo.charge.
+   *     Higher latency (~25s), per-request settle, no KV channel.
+   *   - `false`: route is registered but a recent client test
+   *     failed for a reason that isn't the router's fault. See
+   *     `verifiedNote`.
+   *   - omitted: untested or status unknown. Treat as best-effort.
+   */
+  verifiedMode?: 'session' | 'charge' | false
+  /**
+   * Operator note explaining a `verifiedMode === false` status.
+   * Tells the agent operator WHY a route is broken so they don't
+   * have to read the source.
+   */
+  verifiedNote?: string
+  /**
+   * Per-mode real-money verification, operator-maintained (carried in the
+   * overlay). Independent of `verifiedMode` (which is a single legacy enum):
+   * a route's downstream merchant may accept charge, session, or both, and
+   * we may have verified one mode but not the other.
+   *
+   *   - `true`  — we ran a real-money test in this mode and it worked.
+   *   - `false` — we tested this mode and it failed.
+   *   - `null` / omitted — this mode is N/A for the route, or we have never
+   *     tested it in this mode. (Distinct from `false`.)
+   *
+   * `*VerifiedAt` is the ISO timestamp of that verification (null/omitted
+   * when not verified). Rendered to the catalog as `charge_rozo_verified` /
+   * `charge_rozo_verified_at` / `session_rozo_verified` /
+   * `session_rozo_verified_at`.
+   */
+  chargeVerified?: boolean | null
+  chargeVerifiedAt?: string | null
+  sessionVerified?: boolean | null
+  sessionVerifiedAt?: string | null
+}
+
+/**
+ * Operator-controlled overrides applied to generated routes during
+ * build. Keyed by `${serviceId}::${upstreamPath}` (the upstream
+ * path AFTER `:name` → `{name}` rewriting, so it matches what the
+ * generator emits). Allows operators to:
+ *
+ * - Override the auto-generated route id with a stable historical
+ *   id (e.g. `parallel_search`) so existing client URL bookmarks
+ *   keep working after the bulk import.
+ * - Override the auto-generated publicPath the same way.
+ * - Set verifiedMode / verifiedNote based on real testing — this
+ *   info is operator-only, mpp.dev doesn't know it.
+ * - Provide placeholderDefaults for routes with `{placeholder}`
+ *   tokens (mpp.dev doesn't ship defaults).
+ * - Override upstreamPaymentMethod when the operator has opened a
+ *   session channel for a route the snapshot lists as charge.
+ */
+export interface PublicServiceRouteOverlay {
+  id?: string
+  publicPath?: string
+  verifiedMode?: 'session' | 'charge' | false
+  verifiedNote?: string
+  placeholderDefaults?: Record<string, string>
+  upstreamPaymentMethod?: 'tempo.charge' | 'tempo.session'
+  /** Per-mode real-money verification flags + timestamps. See
+   * PublicServiceRoute.chargeVerified for semantics. */
+  chargeVerified?: boolean | null
+  chargeVerifiedAt?: string | null
+  sessionVerified?: boolean | null
+  sessionVerifiedAt?: string | null
+}
+
+/**
+ * Public-catalog entry shape. The top-level fields match what
+ * V1 agents have depended on since `/v1/services/catalog` first
+ * shipped. The `methods` sub-object is a V2 addition that lets
+ * channel-aware clients discover which Stellar intent(s) a route
+ * accepts without probing the endpoint first.
+ */
+export interface PublicCatalogEntry {
+  id: string
+  name: string
+  /**
+   * Legacy single-string category, populated as `categories[0]`
+   * for backward compatibility with v1 clients that don't know
+   * about the multi-category array.
+   */
+  category: string
+  /**
+   * v2 multi-category. Mirrors mpp.dev's array shape.
+   */
+  categories: string[]
+  description: string
+  public_path: string
+  method: string
+  price: string
+  /**
+   * Legacy flat field. V1 agents read this to know they should
+   * build a Stellar MPP client. V2 keeps it populated for
+   * backward compatibility — do not remove.
+   */
+  payment_method: 'stellar'
+  network: 'stellar-mainnet'
+  asset: 'USDC'
+  status: 'active' | 'limited'
+  status_note?: string
+  /**
+   * Payment availability tier — orthogonal to `status` (which is about
+   * docs availability, i.e. `llms_txt` present). Driven by the
+   * operator's `verifiedMode` flag, NOT by mpp.dev. Updated 2026-06-23
+   * (Option A): unverified routes are PAYABLE again; only confirmed-broken
+   * routes are blocked.
+   *
+   *   - `'verified'`    — operator verified the full agent → router →
+   *                       merchant chain with real money. Chargeable.
+   *   - `'available'`   — route exists upstream and is chargeable, but we
+   *                       have NOT verified it end-to-end. Payable; the
+   *                       client decides its own risk via the
+   *                       `*_rozo_verified` fields.
+   *   - `'unavailable'` — known-broken (we real-money tested it and it
+   *                       failed: merchant 5xx / bad path). NOT chargeable;
+   *                       the proxy gate refuses it.
+   */
+  payment_status: 'verified' | 'available' | 'unavailable'
+  /**
+   * Convenience boolean: true iff the proxy will accept a charge for this
+   * route (i.e. `payment_status !== 'unavailable'`). Both `verified` and
+   * `available` routes are payable. Agents can gate on this without
+   * string-matching `payment_status`.
+   */
+  payment_enabled: boolean
+  /**
+   * Human-readable explanation for `available` / `unavailable` routes so
+   * a client (or operator) gets an actionable signal. Omitted for
+   * `verified` routes.
+   */
+  payment_status_note?: string
+  /**
+   * Per-mode operator verification, surfaced so a paying agent can see
+   * exactly what WE have vetted vs what is best-effort. See
+   * PublicServiceRoute.chargeVerified for the true/false/null semantics
+   * (null = N/A for this mode or never tested in it).
+   */
+  charge_rozo_verified: boolean | null
+  charge_rozo_verified_at: string | null
+  session_rozo_verified: boolean | null
+  session_rozo_verified_at: string | null
+  docs_url: string
+  /**
+   * V2 multi-intent discovery. Lists the Stellar MPP intents the
+   * router is willing to accept for this route, plus the upstream
+   * tempo intents for informational purposes.
+   *
+   * The optional `stellar_x402` block is the x402-over-Stellar
+   * recipient + asset, present only when `X402_ENABLED=true`.
+   */
+  methods: {
+    stellar?: {
+      intents: Array<'charge'>
+    }
+    stellar_x402?: {
+      scheme: 'exact'
+      network: string
+      pay_to: string
+      asset: string
+    }
+    tempo?: {
+      intents: Array<'charge' | 'session'>
+      role: 'upstream'
+    }
+  }
+  /**
+   * Optional wallet UX metadata. Hints only — never authoritative
+   * over the live 402 challenge. Wallets must still validate live
+   * challenge fields before signing.
+   */
+  payment_hints?: {
+    network?: string
+    intent?: 'charge' | 'channel'
+    dialect?: 'mpp' | 'x402' | 'both'
+    pay_to?: string
+    amount_usdc?: string | null
+    asset_sac?: string
+    requires_classic_usdc_trustline?: boolean
+    recommended_wallet_preflight?: Array<
+      'account_exists' | 'classic_usdc_trustline' | 'usdc_balance_gte_amount' | 'xlm_reserve_ok'
+    >
+  }
+  /** Upstream API documentation links. Clients should read these
+   * (especially llms_txt) to learn the request body format — the
+   * router forwards bodies as-is without transformation. */
+  docs?: {
+
+exec
+/bin/zsh -lc 'rg -n "verifiedMode|chargeVerified|sessionVerified|payment_status|stellar_x402|OPERATOR_OVERLAY" src scripts docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md docs/SOP-provider-e2e-test.md' in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+src/services/build-routes.ts:18: * overlay" map carries their `verifiedMode` / `verifiedNote` /
+src/services/build-routes.ts:323:        if (overlayEntry.verifiedMode !== undefined) {
+src/services/build-routes.ts:324:          route.verifiedMode = overlayEntry.verifiedMode
+src/services/build-routes.ts:339:        if (overlayEntry.chargeVerified !== undefined) {
+src/services/build-routes.ts:340:          route.chargeVerified = overlayEntry.chargeVerified
+src/services/build-routes.ts:342:        if (overlayEntry.chargeVerifiedAt !== undefined) {
+src/services/build-routes.ts:343:          route.chargeVerifiedAt = overlayEntry.chargeVerifiedAt
+src/services/build-routes.ts:345:        if (overlayEntry.sessionVerified !== undefined) {
+src/services/build-routes.ts:346:          route.sessionVerified = overlayEntry.sessionVerified
+src/services/build-routes.ts:348:        if (overlayEntry.sessionVerifiedAt !== undefined) {
+src/services/build-routes.ts:349:          route.sessionVerifiedAt = overlayEntry.sessionVerifiedAt
+docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md:34:| **G1. No onboarding gate** | A route can be marked `verified` / advertised payable by hand-editing OPERATOR_OVERLAY, with no enforced real-money proof. | A route can claim "verified" without ever settling once. |
+docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md:51:A checklist, NOT new code. When a route is added to OPERATOR_OVERLAY:
+docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md:55:2. The route starts as `payment_status: available` (payable, **not** `verified`).
+docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md:73:emits the overlay snippet (`{chargeVerified:true, chargeVerifiedAt:"<ISO>"}`) for
+src/services/merchants-types.ts:10: * mpp.dev catalog snapshot at build time; the verifiedMode /
+src/services/merchants-types.ts:13: * `merchants.ts → OPERATOR_OVERLAY`).
+src/services/merchants-types.ts:100:  verifiedMode?: 'session' | 'charge' | false
+src/services/merchants-types.ts:102:   * Operator note explaining a `verifiedMode === false` status.
+src/services/merchants-types.ts:109:   * overlay). Independent of `verifiedMode` (which is a single legacy enum):
+src/services/merchants-types.ts:123:  chargeVerified?: boolean | null
+src/services/merchants-types.ts:124:  chargeVerifiedAt?: string | null
+src/services/merchants-types.ts:125:  sessionVerified?: boolean | null
+src/services/merchants-types.ts:126:  sessionVerifiedAt?: string | null
+src/services/merchants-types.ts:139: * - Set verifiedMode / verifiedNote based on real testing — this
+src/services/merchants-types.ts:149:  verifiedMode?: 'session' | 'charge' | false
+src/services/merchants-types.ts:154:   * PublicServiceRoute.chargeVerified for semantics. */
+src/services/merchants-types.ts:155:  chargeVerified?: boolean | null
+src/services/merchants-types.ts:156:  chargeVerifiedAt?: string | null
+src/services/merchants-types.ts:157:  sessionVerified?: boolean | null
+src/services/merchants-types.ts:158:  sessionVerifiedAt?: string | null
+src/services/merchants-types.ts:198:   * operator's `verifiedMode` flag, NOT by mpp.dev. Updated 2026-06-23
+src/services/merchants-types.ts:212:  payment_status: 'verified' | 'available' | 'unavailable'
+src/services/merchants-types.ts:215:   * route (i.e. `payment_status !== 'unavailable'`). Both `verified` and
+src/services/merchants-types.ts:217:   * string-matching `payment_status`.
+src/services/merchants-types.ts:225:  payment_status_note?: string
+src/services/merchants-types.ts:229:   * PublicServiceRoute.chargeVerified for the true/false/null semantics
+src/services/merchants-types.ts:242:   * The optional `stellar_x402` block is the x402-over-Stellar
+src/services/merchants-types.ts:249:    stellar_x402?: {
+src/services/merchants.ts:10: * route IDs and their `verifiedMode` operator-test results are
+src/services/merchants.ts:11: * preserved via `OPERATOR_OVERLAY` so existing client URL
+src/services/merchants.ts:20: * To add an operator-only override (verifiedMode, placeholder
+src/services/merchants.ts:22: * `OPERATOR_OVERLAY` below — keyed by `${serviceId}::${upstreamPath}`
+src/services/merchants.ts:59: * - verifiedMode flags from real end-to-end testing
+src/services/merchants.ts:68:export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
+src/services/merchants.ts:73:    verifiedMode: 'charge',
+src/services/merchants.ts:74:    chargeVerified: true,
+src/services/merchants.ts:75:    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+src/services/merchants.ts:81:    verifiedMode: 'charge',
+src/services/merchants.ts:82:    chargeVerified: true,
+src/services/merchants.ts:83:    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+src/services/merchants.ts:89:    verifiedMode: 'charge',
+src/services/merchants.ts:90:    chargeVerified: true,
+src/services/merchants.ts:91:    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+src/services/merchants.ts:103:    verifiedMode: 'session',
+src/services/merchants.ts:104:    sessionVerified: true,
+src/services/merchants.ts:105:    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+src/services/merchants.ts:112:    verifiedMode: false,
+src/services/merchants.ts:123:    verifiedMode: 'session',
+src/services/merchants.ts:124:    sessionVerified: true,
+src/services/merchants.ts:125:    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+src/services/merchants.ts:134:  // verifiedMode false — real-money E2E 2026-06-22: after re-opening the
+src/services/merchants.ts:147:    verifiedMode: false,
+src/services/merchants.ts:159:    verifiedMode: false,
+src/services/merchants.ts:170:    verifiedMode: false,
+src/services/merchants.ts:182:    verifiedMode: 'charge',
+src/services/merchants.ts:183:    chargeVerified: true,
+src/services/merchants.ts:184:    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+src/services/merchants.ts:192:    verifiedMode: 'session',
+src/services/merchants.ts:193:    sessionVerified: true,
+src/services/merchants.ts:194:    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+src/services/merchants.ts:199:  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+src/services/merchants.ts:205:    verifiedMode: 'charge',
+src/services/merchants.ts:206:    chargeVerified: true,
+src/services/merchants.ts:207:    chargeVerifiedAt: '2026-06-22T00:00:00Z',
+src/services/merchants.ts:211:  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+src/services/merchants.ts:217:    verifiedMode: 'charge',
+src/services/merchants.ts:218:    chargeVerified: true,
+src/services/merchants.ts:219:    chargeVerifiedAt: '2026-06-22T00:00:00Z',
+src/services/merchants.ts:224:  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
+src/services/merchants.ts:230:    verifiedMode: 'charge',
+src/services/merchants.ts:231:    chargeVerified: true,
+src/services/merchants.ts:232:    chargeVerifiedAt: '2026-06-22T00:00:00Z',
+src/services/merchants.ts:239:  // verifiedMode false — real-money E2E 2026-06-22: we paid OK but the
+src/services/merchants.ts:246:    verifiedMode: false,
+src/services/merchants.ts:256:    verifiedMode: 'charge',
+src/services/merchants.ts:257:    chargeVerified: true,
+src/services/merchants.ts:258:    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+src/services/merchants.ts:269: * `mpp-catalog-snapshot.json` + `OPERATOR_OVERLAY` at module load.
+src/services/merchants.ts:276: * `verifiedMode: 'charge' | 'session'`) is actually chargeable; the rest
+src/services/merchants.ts:277: * are listed as `payment_status: "untested"` and carry no stellar block.
+src/services/merchants.ts:280:  buildRoutesFromMppSnapshot(mppSnapshot as any, OPERATOR_OVERLAY)
+src/services/merchants.ts:290: * real-money tested and confirmed broken (`verifiedMode === false`).
+src/services/merchants.ts:291: * Unverified routes (`verifiedMode === undefined`) are payable again —
+src/services/merchants.ts:299: * - `verifiedMode === false`: known-broken → no intents (no stellar
+src/services/merchants.ts:304: * refuses ONLY `verifiedMode === false` routes.
+src/services/merchants.ts:307:  if (route.verifiedMode === false) return []
+src/services/merchants.ts:313: * attach the `methods.stellar_x402` block. Typed as a subset rather
+src/services/merchants.ts:382:    // by verifiedMode, kept in lockstep with stellarIntentsFor (which
+src/services/merchants.ts:391:      'payment_status' | 'payment_enabled' | 'payment_status_note'
+src/services/merchants.ts:393:      route.verifiedMode === false
+src/services/merchants.ts:395:            payment_status: 'unavailable',
+src/services/merchants.ts:397:            payment_status_note:
+src/services/merchants.ts:401:        : route.verifiedMode === 'charge' || route.verifiedMode === 'session'
+src/services/merchants.ts:402:          ? { payment_status: 'verified', payment_enabled: true }
+src/services/merchants.ts:404:              payment_status: 'available',
+src/services/merchants.ts:406:              payment_status_note:
+src/services/merchants.ts:433:      charge_rozo_verified: route.chargeVerified ?? null,
+src/services/merchants.ts:434:      charge_rozo_verified_at: route.chargeVerifiedAt ?? null,
+src/services/merchants.ts:435:      session_rozo_verified: route.sessionVerified ?? null,
+src/services/merchants.ts:436:      session_rozo_verified_at: route.sessionVerifiedAt ?? null,
+src/services/merchants.ts:440:        // broken routes (verifiedMode === false) get no stellar block.
+src/services/merchants.ts:442:        // Only include `stellar_x402` when the feature flag is on AND
+src/services/merchants.ts:445:        ...(stellarIntents.length > 0 && stellarX402Block ? { stellar_x402: stellarX402Block } : {}),
+src/services/merchants.ts:487:    if (route.verifiedMode !== undefined) {
+src/services/merchants.ts:488:      entry.verified_mode = route.verifiedMode
+docs/SOP-provider-e2e-test.md:63:(provider 全表见 `src/services/merchants.ts` 的 `OPERATOR_OVERLAY`。)
+src/mpp/stellar-x402-server.ts:45: *     under `stellar_x402:nonce:<from>:<nonce>`. TTL is capped at
+src/mpp/stellar-x402-server.ts:282:  return `stellar_x402:payload:${payloadHash}`
+src/routes/services.ts:7: * `methods.stellar_x402` block (scheme=exact, network=stellar:pubnet,
+src/routes/services.ts:40:    verified: services.filter(s => s.payment_status === 'verified').length,
+src/routes/services.ts:41:    available_unverified: services.filter(s => s.payment_status === 'available').length,
+src/routes/services.ts:42:    unavailable: services.filter(s => s.payment_status === 'unavailable').length,
+src/routes/health.ts:31:  results.stellar_x402 = {
+src/routes/openapi.ts:210:          payment_status: {
+src/routes/openapi.ts:220:            description: 'True iff the route is chargeable (payment_status is "verified" or "available"; i.e. not "unavailable").',
+src/routes/openapi.ts:222:          payment_status_note: {
+src/routes/proxy.ts:743:  // real-money tested and confirmed BROKEN (verifiedMode === false).
+src/routes/proxy.ts:745:  // (verifiedMode === undefined) — so the ~485 unverified-but-working
+src/routes/proxy.ts:767:  if (route.verifiedMode === false) {
+
+codex
+One notable inconsistency already: a comment in `merchants.ts` still says only verified routes are chargeable, but the live logic makes all non-broken routes payable and uses `verified` as an advisory tier. That matters for the proposal’s G1 framing: “verified” is not the same as “advertised payable” today.
+exec
+/bin/zsh -lc 'rg -n "sanitize402Response|payment-required|Invalid base64|x402Challenges|network" src scripts test docs/rootcause-invalid-base64-json-header-2026-06-24.md' in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:1:# Root cause: `502 "Invalid base64 JSON header"` on stableemail/send (and any merchant that added a Solana x402 offer)
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:11:`accepts[]` offer carries a `network` it does not recognize. Several upstream
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:13:(`network: "solana:5eykt4Us…"`) alongside their EVM/Tempo offers. mppx's
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:15:`InvalidJsonHeaderError("Invalid base64 JSON header.")`. That throw kills the
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:18:and returns `502 {"error":"Merchant payment failed","detail":"Invalid base64 JSON header."}`.
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:28:   (`throw new InvalidJsonHeaderError()` → message `"Invalid base64 JSON header."`).
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:32:2. The upstream `payment-required` header base64-decodes to valid JSON fine
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:41:   InvalidJsonHeaderError: Invalid base64 JSON header.
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:43:     at x402Challenges (mppx/dist/client/Transport.js:82)        <-- decodePaymentRequired(header)
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:53:   issues: [{ path: ['accepts', 1, 'network'],
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:55:              message: 'Invalid EVM CAIP-2 network' }]
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:82:  `Challenge.fromResponseList` (www-authenticate / tempo) **and** `x402Challenges`
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:83:  (payment-required). Because they're spread into one array literal, the
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:84:  `x402Challenges` throw aborts the whole expression **even when the
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:92:The crisp, defensible statement: **mppx 0.7.0's `x402Challenges` is not
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:93:fault-isolating — a single unrecognized-network offer throws and discards every
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:136:fetch that, on a 402 response, rewrites the `payment-required` header to **drop
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:137:offers whose `network` mppx can't parse** (anything not `eip155:\d+`), keeping the
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:139:remains, drop the `payment-required` header entirely so mppx falls back to the
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:142:- Pro: surgical, version-proof (works regardless of which networks mppx adds
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:147:### Option 2 — upgrade/patch mppx so x402Challenges is fault-isolating
+docs/rootcause-invalid-base64-json-header-2026-06-24.md:149:File upstream: `x402Challenges` should `try/catch` per-offer (or per-header) and
+src/services/build-routes.ts:160: *   /:network/v2                → /{network}/v2
+src/services/build-routes.ts:161: *   /:network/nft/v3/:endpoint  → /{network}/nft/v3/{endpoint}
+src/services/build-routes.ts:303:        network: 'stellar-mainnet',
+src/services/merchants-types.ts:53:  network: 'stellar-mainnet'
+src/services/merchants-types.ts:191:  network: 'stellar-mainnet'
+src/services/merchants-types.ts:251:      network: string
+src/services/merchants-types.ts:266:    network?: string
+test/test-client.ts:40:      // network and rpcUrl will be inferred from the 402 challenge
+src/services/merchants.ts:178:  'alchemy::/{network}/v2': {
+src/services/merchants.ts:185:    placeholderDefaults: { network: 'eth-mainnet' },
+src/services/merchants.ts:235:  // `/{network}`; QuickNode uses `<chain>-mainnet` naming, so default to
+src/services/merchants.ts:237:  // `unsupported_network`). Pass ?network=base-mainnet / solana-mainnet
+src/services/merchants.ts:238:  // / etc to target another QuickNode-supported network.
+src/services/merchants.ts:241:  'quicknode::/{network}': {
+src/services/merchants.ts:245:    placeholderDefaults: { network: 'ethereum-mainnet' },
+src/services/merchants.ts:359:function getUsdcSacForNetwork(network?: string): string | undefined {
+src/services/merchants.ts:360:  if (!network) return undefined
+src/services/merchants.ts:361:  return STELLAR_USDC_SAC_BY_NETWORK[network] ?? STELLAR_USDC_SAC_BY_NETWORK['stellar:pubnet']
+src/services/merchants.ts:373:          network: env.STELLAR_NETWORK,
+src/services/merchants.ts:423:      network: route.network,
+src/services/merchants.ts:469:        network: env?.STELLAR_NETWORK,
+src/services/merchants.ts:531: * an arbitrary network id with `/` in it), do it per-placeholder
+scripts/e2e/repro-stableemail.mjs:3: * "Invalid base64 JSON header" 502 Argens reported.
+scripts/e2e/repro-stableemail.mjs:50:    const pr = response.headers.get('payment-required')
+scripts/e2e/repro-stableemail.mjs:59:          (a) => typeof a?.network === 'string' && EVM_CAIP2.test(a.network),
+scripts/e2e/repro-stableemail.mjs:63:          h.set('payment-required', Buffer.from(JSON.stringify({ ...obj, accepts: filtered })).toString('base64'))
+scripts/e2e/repro-stableemail.mjs:71:      h.delete('payment-required')
+scripts/e2e/repro-stableemail.mjs:101:    if (/Invalid base64 JSON header/i.test(err?.message || '')) {
+scripts/e2e/repro-stableemail.mjs:102:      console.log('  >>> MATCH: this is the "Invalid base64 JSON header" error <<<')
+scripts/e2e/repro-stableemail.mjs:123://    proves the "Invalid base64 JSON header" is gone. Any throw here must
+scripts/e2e/providers.mjs:110:    // overlay defaults network=ethereum-mainnet; pass ?network=base-mainnet etc
+scripts/admin/register-stellar-channel.ts:45: *   --network    (optional) 'stellar:pubnet' or 'stellar:testnet'.
+scripts/admin/register-stellar-channel.ts:71:  network: string
+scripts/admin/register-stellar-channel.ts:98:        '  [--network stellar:pubnet|stellar:testnet]',
+scripts/admin/register-stellar-channel.ts:133:    network: values.network ?? 'stellar:pubnet',
+scripts/admin/register-stellar-channel.ts:171:  console.log(`  network:           ${args.network}`)
+scripts/admin/register-stellar-channel.ts:181:    network: args.network,
+scripts/e2e/charge-e2e.mjs:156:    '--network',
+src/services/mpp-catalog-snapshot.json:1471:      "description": "Comprehensive onchain data API for tokens and prediction markets. Real-time prices, charts, trades, and wallet analytics across 80+ networks via GraphQL.",
+src/services/mpp-catalog-snapshot.json:3608:          "path": "/:network/v2",
+src/services/mpp-catalog-snapshot.json:3618:          "docs": "https://www.alchemy.com/llms.txt?topic=POST%20%2F%3Anetwork%2Fv2"
+src/services/mpp-catalog-snapshot.json:3622:          "path": "/:network/nft/v3/:endpoint",
+src/services/mpp-catalog-snapshot.json:3632:          "docs": "https://www.alchemy.com/llms.txt?topic=GET%20%2F%3Anetwork%2Fnft%2Fv3%2F%3Aendpoint"
+src/services/mpp-catalog-snapshot.json:3636:          "path": "/:network/nft/v3/:endpoint",
+src/services/mpp-catalog-snapshot.json:3646:          "docs": "https://www.alchemy.com/llms.txt?topic=POST%20%2F%3Anetwork%2Fnft%2Fv3%2F%3Aendpoint"
+src/services/mpp-catalog-snapshot.json:3655:      "description": "EVM JSON-RPC access to Conduit Nodes across 60+ networks including Tempo, Plume, and Polygon Katana.",
+src/services/mpp-catalog-snapshot.json:3690:          "path": "/:network/",
+src/services/mpp-catalog-snapshot.json:3763:      "description": "Quicknode Core Node API for 80+ blockchains and 140+ networks.",
+src/services/mpp-catalog-snapshot.json:3800:          "path": "/:network",
+src/services/mpp-catalog-snapshot.json:3814:          "path": "/session/:network",
+src/mpp/kv-atomic-store.ts:124: * makes an outbound network request. We use a stable fake origin so
+scripts/admin/inspect-channels.ts:383:        network: string
+scripts/admin/deploy-stellar-channel-for-agent.ts:29: *   - `stellar network ls` shows `mainnet`
+scripts/admin/deploy-stellar-channel-for-agent.ts:101: * Verify with: `stellar contract id asset --asset native --network mainnet`
+scripts/admin/deploy-stellar-channel-for-agent.ts:295:        '--network',
+scripts/admin/deploy-stellar-channel-for-agent.ts:309:  // (`stellar contract id asset --asset native --network mainnet`)
+scripts/admin/deploy-stellar-channel-for-agent.ts:320:      '--network',
+scripts/admin/deploy-stellar-channel-for-agent.ts:356:    network: 'stellar:pubnet',
+scripts/admin/multi-agent-bootstrap.ts:75:// Base fee well above the network minimum to avoid the "insufficient
+scripts/admin/multi-agent-bootstrap.ts:223:    networkPassphrase: NETWORK_PASSPHRASE,
+scripts/admin/multi-agent-bootstrap.ts:245:    networkPassphrase: NETWORK_PASSPHRASE,
+scripts/admin/multi-agent-bootstrap.ts:258:    networkPassphrase: NETWORK_PASSPHRASE,
+scripts/admin/multi-agent-bootstrap.ts:271:    networkPassphrase: NETWORK_PASSPHRASE,
+src/mpp/stellar-channel-dispatch.ts:81: * URI of the form `did:pkh:stellar:<network>:G...`, produced by
+src/mpp/stellar-channel-dispatch.ts:112:    // Expected format: did:pkh:stellar:<network>:G...
+src/mpp/stellar-channel-dispatch.ts:113:    // Accept any network id; the KV index is keyed only by G address.
+src/mpp/stellar-channel-dispatch.ts:152:    network: env.STELLAR_NETWORK as any,
+src/mpp/stellar-channel-dispatch.ts:157:    // sponsor network fees either — the savings per voucher are
+src/routes/x402-supported.ts:38:        network: env.STELLAR_NETWORK,
+scripts/admin/topup-stellar-channel.ts:241:    network: string
+scripts/admin/topup-stellar-channel.ts:286:      '--network',
+src/mpp/stellar-server.ts:15: * with the same `recipient`/`network` boilerplate as a "free" upgrade,
+src/mpp/stellar-server.ts:33: * Stellar USDC SAC contract addresses, keyed by network id.
+src/mpp/stellar-server.ts:41:  const network = env.STELLAR_NETWORK || 'stellar:pubnet'
+src/mpp/stellar-server.ts:42:  return USDC_SAC[network] || USDC_SAC['stellar:pubnet']
+src/mpp/stellar-server.ts:61:    network: env.STELLAR_NETWORK as any,
+src/mpp/stellar-channel-store.ts:67:  /** Stellar network id. V2 initial rollout is `'stellar:pubnet'`. */
+src/mpp/stellar-channel-store.ts:68:  network: string
+src/routes/services.ts:7: * `methods.stellar_x402` block (scheme=exact, network=stellar:pubnet,
+src/routes/services.ts:21:  const supportedPaymentMethods: Array<{ scheme: string; network: string }> = [
+src/routes/services.ts:22:    { scheme: 'stellar.mpp', network: env.STELLAR_NETWORK },
+src/routes/services.ts:27:      network: env.STELLAR_NETWORK,
+src/mpp/stellar-x402-server.test.ts:97:  network = 'stellar:pubnet',
+src/mpp/stellar-x402-server.test.ts:104:      network,
+src/mpp/stellar-x402-server.test.ts:144:      network: 'stellar:pubnet',
+src/mpp/stellar-x402-server.test.ts:174:  it('returns false for a credential on the wrong network', () => {
+src/mpp/stellar-x402-server.ts:7: * spec) over the Stellar network can hit the exact same public URLs
+src/mpp/stellar-x402-server.ts:27: *      agent signed (scheme, network, asset, payTo, amount). The
+src/mpp/stellar-x402-server.ts:100: * Cached key includes the rpc URL and network so a mid-isolate
+src/mpp/stellar-x402-server.ts:105:  | { facilitator: x402Facilitator; rpcUrl: string; network: string }
+src/mpp/stellar-x402-server.ts:112:    cachedFacilitator.network === env.STELLAR_NETWORK
+src/mpp/stellar-x402-server.ts:117:  const network = env.STELLAR_NETWORK as Network
+src/mpp/stellar-x402-server.ts:120:  // sets the network passphrase used when signTransaction is called
+src/mpp/stellar-x402-server.ts:122:  // network.
+src/mpp/stellar-x402-server.ts:125:    network,
+src/mpp/stellar-x402-server.ts:137:  facilitator.register(network, scheme)
+src/mpp/stellar-x402-server.ts:142:    network: env.STELLAR_NETWORK,
+src/mpp/stellar-x402-server.ts:195: *   - `payload.accepted.network` must equal env.STELLAR_NETWORK
+src/mpp/stellar-x402-server.ts:208:  if (payload.accepted.network !== env.STELLAR_NETWORK) return false
+src/mpp/stellar-x402-server.ts:337: * field (scheme, network, asset, payTo, amount — matching the same
+src/mpp/stellar-x402-server.ts:344: * `asset` resolves to the network-specific USDC Soroban Asset
+src/mpp/stellar-x402-server.ts:353:  const network = env.STELLAR_NETWORK as Network
+src/mpp/stellar-x402-server.ts:354:  const asset = getUsdcAddress(network)
+src/mpp/stellar-x402-server.ts:357:    network,
+src/mpp/stellar-x402-server.ts:424:  const network = env.STELLAR_NETWORK as Network
+src/mpp/stellar-x402-server.ts:433:        network,
+src/mpp/stellar-x402-server.ts:435:        asset: getUsdcAddress(network),
+src/mpp/stellar-x402-server.ts:518: * network, and a replayed payload's auth nonce has already been
+src/mpp/stellar-x402-server.ts:554:  // integer string at the network's token decimals (7 for USDC).
+src/mpp/stellar-x402-server.ts:598: * against the live network through the @x402/stellar
+scripts/admin/open-tempo-channel.ts:97:   * A payment-required endpoint on the merchant. Any endpoint
+scripts/admin/open-tempo-channel.ts:188:    // NOT at alchemy.mpp.tempo.xyz. Path is /:network/v2 — eth-mainnet
+scripts/admin/open-tempo-channel.ts:189:    // is the network we use for the probe.
+src/routes/admin-seed-store.ts:33: *  stub.fetch() internally and never makes an outbound network request. */
+src/routes/admin-seed-store.ts:113:        error: `DO /seed network error for key ${entry.key}: ${err?.message ?? 'unknown'}`,
+src/routes/health.ts:17:    network: env.STELLAR_NETWORK,
+src/routes/health.ts:33:    network: env.STELLAR_NETWORK,
+src/routes/openapi.ts:142:        description: 'Returns x402 SupportedResponse with accepted schemes and networks.',
+src/routes/openapi.ts:175:                network: { type: 'string' },
+src/utils/tempo-balance.ts:10: * or null if the query fails (network error, unsupported method).
+src/utils/cors.ts:17: *     - payment-required     (x402 402 challenge)
+src/utils/cors.ts:33:  'payment-required',
+src/mpp/tempo-client.ts:83: * Max size of an upstream `payment-required` header we will attempt to
+src/mpp/tempo-client.ts:91:/** mppx 0.7.0's x402 schema only accepts EVM CAIP-2 networks. */
+src/mpp/tempo-client.ts:98: * mppx 0.7.0's `x402Challenges` decodes the WHOLE `payment-required`
+src/mpp/tempo-client.ts:100: * carries an unrecognized network (e.g. a merchant that added a
+src/mpp/tempo-client.ts:102: * ("Invalid base64 JSON header.") and — because mppx spreads the
+src/mpp/tempo-client.ts:109: * drops any `payment-required` offer mppx can't parse, then validates
+src/mpp/tempo-client.ts:113: *                             → strip payment-required entirely, let
+src/mpp/tempo-client.ts:134:    return sanitize402Response(response)
+src/mpp/tempo-client.ts:156: *  - not a 402, or no `payment-required` header → unchanged
+src/mpp/tempo-client.ts:160: *  - if rewrite still fails: strip `payment-required` so mppx falls back
+src/mpp/tempo-client.ts:166:export function sanitize402Response(
+src/mpp/tempo-client.ts:174:  const prHeader = response.headers.get('payment-required')
+src/mpp/tempo-client.ts:190:      `[tempo] oversized payment-required header (${prHeader.length}B) from merchant; ` +
+src/mpp/tempo-client.ts:200:  // Try to drop offers mppx can't handle (non-EVM networks).
+src/mpp/tempo-client.ts:208:        (a: any) => typeof a?.network === 'string' && EVM_CAIP2.test(a.network),
+src/mpp/tempo-client.ts:237:      `[tempo] payment-required unparseable by mppx after filter; ` +
+src/mpp/tempo-client.ts:243:    `[tempo] payment-required unparseable by mppx and no www-authenticate fallback; ` +
+src/mpp/tempo-client.ts:249:/** Return a clone of `response` with the payment-required header replaced. */
+src/mpp/tempo-client.ts:252:  headers.set('payment-required', header)
+src/mpp/tempo-client.ts:260:/** Return a clone of `response` with the payment-required header removed. */
+src/mpp/tempo-client.ts:263:  headers.delete('payment-required')
+src/mpp/tempo-client.ts:353:    // "Invalid base64 JSON header".
+src/routes/proxy.ts:210: * Verify with: `stellar contract id asset --asset native --network mainnet`
+src/routes/proxy.ts:1033:  // whose payTo matches STELLAR_X402_PAY_TO and whose network is
+src/routes/proxy.ts:1053:  //      Soroban simulate against the live network. RPC call. Only
+
+exec
+/bin/zsh -lc "sed -n '1,260p' scripts/e2e/probe-402.mjs" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+exec
+/bin/zsh -lc "sed -n '700,820p' src/routes/proxy.ts" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+    'Content-Type': payResult.contentType,
+    'X-Job-Poll-Url': pollUrl,
+    'X-Job-Id': jobId,
+  }
+
+  return new Response(payResult.body, { status: 202, headers })
+}
+
+export async function handleProxy(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const url = new URL(request.url)
+
+  const route = resolveRoute(url, request.method)
+  if (!route) {
+    const allowedMethods = getAllowedMethodsForPath(url.pathname)
+    if (allowedMethods.length > 0) {
+      return new Response(JSON.stringify({
+        error: 'Method not allowed for this service route',
+        path: url.pathname,
+        method: request.method,
+        allowed_methods: allowedMethods,
+        hint: `Retry with ${allowedMethods.join(' or ')}. The catalog 'method' field is authoritative — see GET /v1/services/catalog.`,
+      }), {
+        status: 405,
+        headers: {
+          'Content-Type': 'application/json',
+          'Allow': allowedMethods.join(', '),
+        },
+      })
+    }
+    return new Response(JSON.stringify({
+      error: 'Unknown public service route',
+      hint: 'Use GET /v1/services/catalog for the list of supported public routes',
+    }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
+  // SECURITY GATE (Option A, 2026-06-23): block ONLY routes we have
+  // real-money tested and confirmed BROKEN (verifiedMode === false).
+  // Everything else is payable — including routes we haven't verified yet
+  // (verifiedMode === undefined) — so the ~485 unverified-but-working
+  // routes customers rely on aren't blocked.
+  //
+  // Settlement-ordering caveat (do NOT misread this): the two pay paths
+  // differ. The x402 branch is verify → pay merchant → settle customer
+  // ONLY on merchant 2xx (proxy.ts ~1128/1158/1179), so a broken x402
+  // route can't charge the customer. The legacy mppx `stellar/charge`
+  // branch is the OPPOSITE: `stellar/charge` verifies-and-settles the
+  // customer BEFORE `payMerchantAndGetBody` runs, so a broken charge
+  // route CAN charge the customer and then 502. We accept that risk for
+  // unverified routes and manage it with honest catalog flags
+  // (charge_rozo_verified/session_rozo_verified) rather than gating every
+  // unverified route — the client sees what we've vetted and decides. See
+  // docs/codex-review-catalog-v2-2026-06-23.md.
+  //
+  // We still gate here (not just in the catalog) because catalog hiding
+  // doesn't stop an attacker — or a stale snapshot — from POSTing a
+  // known-broken path directly. Blocking confirmed-broken routes avoids
+  // customers repeatedly paying into dead merchants.
+  //
+  // The refusal is intentionally generic — no merchant host, channel id,
+  // or internal reason — so it doesn't help an attacker probe the fleet.
+  if (route.verifiedMode === false) {
+    return new Response(JSON.stringify({
+      error: 'Route not enabled for payment',
+      hint: 'See GET /v1/services/catalog for the set of routes that accept payment.',
+    }), {
+      status: 403,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
+  const merchantHost = route.upstreamHost
+  // Resolve `:placeholder` tokens in route.upstreamPath from the
+  // URL query (e.g. ?model=gemini-2.0-flash for the gemini route).
+  // Falls back to per-route defaults. Strips consumed params from
+  // the forwarded query so the merchant doesn't see them.
+  let upstreamPath: string
+  let consumedQueryParams: Set<string>
+  try {
+    const resolved = resolveUpstreamPath(route, url.searchParams)
+    upstreamPath = resolved.path
+    consumedQueryParams = resolved.consumed
+  } catch (err: any) {
+    if (err instanceof UpstreamPathPlaceholderError) {
+      return new Response(JSON.stringify({
+        error: 'Bad upstream path placeholder',
+        detail: err.message,
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }
+    throw err
+  }
+  // Build the forwarded query string. Strip both:
+  //   - placeholder feeders consumed by resolveUpstreamPath
+  //   - router-internal params (?payment=channel&agent=G...) — see §6-D2
+  const forwardedSearch = (() => {
+    const params = new URLSearchParams(url.search)
+    for (const name of consumedQueryParams) params.delete(name)
+    params.delete('payment')
+    params.delete('agent')
+    const s = params.toString()
+    return s.length > 0 ? `?${s}` : ''
+  })()
+  const merchantUrl = buildMerchantUrl(merchantHost, upstreamPath, forwardedSearch)
+
+  // Idempotency check — return cached result on repeat POSTs with same id.
+  const requestId = request.headers.get('x-request-id')
+  if (requestId) {
+    const cached = await env.MPP_STORE.get(`idempotency:${requestId}`)
+    if (cached) {
+      return new Response(cached, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'X-Idempotent': 'true' },
+
+ succeeded in 0ms:
+/**
+ * Zero-cost 402 probe for the MPP Router provider suite.
+ *
+ * For every target provider: POST the lightest body WITHOUT paying and
+ * read the 402 challenge. This verifies the quote layer end to end
+ * (route exists → router issues a payment challenge → intent/amount/
+ * pay_to look sane) WITHOUT spending a cent. It does NOT verify the
+ * downstream settlement — only a real charge (pay-per-call) does that.
+ *
+ * Usage:
+ *   node scripts/e2e/probe-402.mjs            # probe all providers
+ *   node scripts/e2e/probe-402.mjs openai     # probe a subset
+ *
+ * Exit code 0 if every provider returned a usable 402 challenge (or a
+ * clear non-payment error we can explain); non-zero if any route is
+ * missing or the router itself is unhealthy.
+ */
+
+import { ROUTER_BASE, PROVIDERS } from './providers.mjs'
+
+const only = process.argv.slice(2)
+const targets = only.length ? PROVIDERS.filter((p) => only.includes(p.id)) : PROVIDERS
+
+function classify(status, headers, bodyText) {
+  const wwwAuth = headers.get('www-authenticate') || ''
+  if (status === 402) {
+    // Extract intent + amount from the challenge if present. In the MPP
+    // dialect amount/pay_to live inside the base64 credential, not the
+    // header, so we don't require them. But a usable challenge MUST carry
+    // a recognized intent — without it the quote layer is degraded.
+    const intent = /intent="?([a-z]+)"?/i.exec(wwwAuth)?.[1]?.toLowerCase()
+    const amount = /amount="?([0-9.]+)"?/i.exec(wwwAuth)?.[1]
+    if (intent !== 'charge' && intent !== 'session') {
+      return {
+        verdict: 'QUOTE_DEGRADED',
+        detail: `402 but intent missing/unknown (got ${intent ?? 'none'}); www-authenticate=${wwwAuth.slice(0, 80) || 'empty'}`,
+      }
+    }
+    return { verdict: 'QUOTE_OK', detail: `intent=${intent} amount=${amount ?? 'in-credential'}` }
+  }
+  if (status === 400 && /unknown public service route/i.test(bodyText)) {
+    return { verdict: 'NO_ROUTE', detail: 'route not registered (needs overlay or wrong path)' }
+  }
+  if (status === 405) {
+    return { verdict: 'WRONG_METHOD', detail: bodyText.slice(0, 120) }
+  }
+  if (status >= 500) {
+    return { verdict: 'ROUTER_5XX', detail: `inbound layer broken: ${bodyText.slice(0, 120)}` }
+  }
+  return { verdict: `HTTP_${status}`, detail: bodyText.slice(0, 160) }
+}
+
+async function probeOne(p, path) {
+  const url = `${ROUTER_BASE}${path}`
+  try {
+    const res = await fetch(url, {
+      method: p.method,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(p.body),
+      signal: AbortSignal.timeout(20000),
+    })
+    const text = await res.text()
+    const c = classify(res.status, res.headers, text)
+    return { status: res.status, ...c }
+  } catch (e) {
+    return { status: 0, verdict: 'NETWORK_ERR', detail: String(e?.message || e) }
+  }
+}
+
+async function main() {
+  // Health first.
+  const h = await fetch(`${ROUTER_BASE}/health`, { signal: AbortSignal.timeout(15000) })
+    .then((r) => r.json())
+    .catch((e) => ({ error: String(e) }))
+  if (h?.status !== 'ok') {
+    console.error('ROUTER UNHEALTHY:', JSON.stringify(h))
+    process.exit(2)
+  }
+  console.log(`router OK  pool=${h.stellar?.router_pool?.slice(0, 6)}...${h.stellar?.router_pool?.slice(-4)}\n`)
+
+  let allOk = true
+  const rows = []
+  for (const p of targets) {
+    // Probe the canonical (clean) path the suite wants.
+    const r = await probeOne(p, p.publicPath)
+    let row = { id: p.id, family: p.family, mode: p.mode, path: p.publicPath, ...r }
+    rows.push(row)
+    if (r.verdict !== 'QUOTE_OK') allOk = false
+    const tag = r.verdict === 'QUOTE_OK' ? '✅' : '❌'
+    console.log(`${tag} ${p.id.padEnd(11)} [${p.family}/${p.mode}] ${p.publicPath}`)
+    console.log(`     HTTP ${r.status}  ${r.verdict}  ${r.detail}`)
+  }
+
+  console.log('\n--- summary ---')
+  const ok = rows.filter((r) => r.verdict === 'QUOTE_OK').map((r) => r.id)
+  const bad = rows.filter((r) => r.verdict !== 'QUOTE_OK').map((r) => `${r.id}(${r.verdict})`)
+  console.log(`quote-layer OK (${ok.length}/${rows.length}): ${ok.join(', ') || 'none'}`)
+  if (bad.length) console.log(`needs attention: ${bad.join(', ')}`)
+  process.exit(allOk ? 0 : 1)
+}
+
+main()
+
+codex
+I found the shipped sanitizer in `src/mpp/tempo-client.ts`: it intentionally filters non-EVM `payment-required` offers and falls back to `www-authenticate` when needed. So Stage C should distinguish “new network observed” from “router can no longer parse/pay”; those are different severities.
+exec
+/bin/zsh -lc "sed -n '320,390p' src/mpp/tempo-client.ts" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+exec
+/bin/zsh -lc "sed -n '70,275p' src/mpp/tempo-client.ts" in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+ * operator knows to run `scripts/open-channel.ts`.
+ */
+export class ChannelNotInstalledError extends Error {
+  constructor(public readonly merchantId: string) {
+    super(
+      `No Tempo channel installed for merchant "${merchantId}". ` +
+        `Run scripts/open-channel.ts to open one.`,
+    )
+    this.name = 'ChannelNotInstalledError'
+  }
+}
+
+/**
+ * Max size of an upstream `payment-required` header we will attempt to
+ * parse/rewrite. A merchant fully controls this header; cap it before we
+ * base64/JSON-decode so a hostile or buggy merchant cannot make us do
+ * unbounded work. 16 KiB is ~10x the largest legitimate header we've
+ * seen (multi-offer x402 with extensions runs ~3.5 KiB).
+ */
+const MAX_PAYMENT_REQUIRED_HEADER_BYTES = 16 * 1024
+
+/** mppx 0.7.0's x402 schema only accepts EVM CAIP-2 networks. */
+const EVM_CAIP2 = /^eip155:\d+$/
+
+/**
+ * Defensive fetch wrapper for the router→merchant leg.
+ *
+ * Root cause (docs/rootcause-invalid-base64-json-header-2026-06-24.md):
+ * mppx 0.7.0's `x402Challenges` decodes the WHOLE `payment-required`
+ * header against a strict EVM-only schema. If ANY `accepts[]` offer
+ * carries an unrecognized network (e.g. a merchant that added a
+ * `solana:...` offer), the decode throws `InvalidJsonHeaderError`
+ * ("Invalid base64 JSON header.") and — because mppx spreads the
+ * www-authenticate and x402 challenge lists into one array literal —
+ * the throw discards the perfectly usable `www-authenticate` (Tempo)
+ * challenge too. The router then 502s with "Merchant payment failed".
+ *
+ * This wrapper sits UNDER the mppx client (passed as `config.fetch`),
+ * so it sees the raw upstream 402 before mppx parses it. On a 402 it
+ * drops any `payment-required` offer mppx can't parse, then validates
+ * the rewrite using mppx's OWN parser as the oracle:
+ *   - rewrite parses cleanly  → forward the rewritten response
+ *   - rewrite still fails AND a www-authenticate header is present
+ *                             → strip payment-required entirely, let
+ *                               mppx fall back to the Tempo challenge
+ *   - rewrite still fails AND no www-authenticate → forward UNCHANGED
+ *                               so mppx surfaces its own real error
+ *                               (we never silently swallow).
+ *
+ * The router client registers only tempo.charge / tempo.session /
+ * legacySession — there is no `evm/charge` method — so retained eip155
+ * x402 offers are never payable by us anyway; dropping the non-EVM ones
+ * cannot change which party/amount we pay. Falling back to
+ * www-authenticate pays the same Tempo challenge the proxy already
+ * quoted the customer. See codex review 2026-06-24, findings #4/#5/#7/#8.
+ *
+ * Scope guards (codex #8): only touches outbound 402 responses; caps
+ * header size before parsing; never rewrites inbound client credentials
+ * (this fetch only runs for merchant requests we originate); logs counts
+ * and reasons only, never header contents.
+ */
+function sanitizeMerchant402Fetch(baseFetch: typeof globalThis.fetch): typeof globalThis.fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const response = await baseFetch(input as any, init as any)
+    return sanitize402Response(response)
+  }) as typeof globalThis.fetch
+}
+
+/** True iff mppx's own x402/www-authenticate parser accepts this response. */
+function mppxCanParse(resp: Response): boolean {
+  try {
+    const t = Transport.http()
+    // Use the same parser mppx will use. getChallenges is the list form
+    // (what Fetch.from prefers); fall back to getChallenge.
+    if (t.getChallenges) t.getChallenges(resp)
+    else t.getChallenge(resp)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Pure core of the merchant-402 sanitizer (exported for unit tests).
+ *
+ * Given an upstream response, returns a response mppx's client can parse:
+ *  - not a 402, or no `payment-required` header → unchanged
+ *  - already parseable → unchanged (fast path)
+ *  - drop non-EVM (`!eip155:\d+`) offers and re-validate with mppx's own
+ *    parser; forward the rewrite only if it now parses
+ *  - if rewrite still fails: strip `payment-required` so mppx falls back
+ *    to the `www-authenticate` (Tempo) challenge when present, else
+ *    forward UNCHANGED so mppx raises its own real error (never swallow)
+ *
+ * See the wrapper's doc comment + docs/rootcause-...-2026-06-24.md.
+ */
+export function sanitize402Response(
+  response: Response,
+  // Injectable only so tests can assert the oversized guard short-circuits
+  // BEFORE any parse (codex #1). Production always uses mppx's real parser.
+  canParse: (r: Response) => boolean = mppxCanParse,
+): Response {
+  if (response.status !== 402) return response
+
+  const prHeader = response.headers.get('payment-required')
+  if (!prHeader) return response // nothing to sanitize (pure www-authenticate)
+
+  const hasWwwAuth = response.headers.has('www-authenticate')
+
+  // Bound the work BEFORE we hand anything to a parser (codex review #1/R2):
+  // an oversized header is merchant-controlled and suspicious, so we must
+  // not feed it into mppx's base64/JSON/schema parser at all. We ALWAYS
+  // strip it — never return it to mppx — because this wrapper sits under
+  // Mppx.create and mppx would otherwise re-parse the oversized header.
+  //  - with www-authenticate present → mppx falls back to the Tempo challenge
+  //  - without www-authenticate → the 402 now carries no challenge, so mppx
+  //    raises a clean "no challenge" error instead of parsing 17 KiB of
+  //    attacker-controlled bytes. Either way no parser touches the header.
+  if (prHeader.length > MAX_PAYMENT_REQUIRED_HEADER_BYTES) {
+    console.warn(
+      `[tempo] oversized payment-required header (${prHeader.length}B) from merchant; ` +
+        `stripping (will not be parsed)` +
+        (hasWwwAuth ? '; falling back to www-authenticate' : '; no www-authenticate fallback'),
+    )
+    return withoutPaymentRequired(response)
+  }
+
+  // Fast path: if mppx can already parse it, do nothing.
+  if (canParse(response)) return response
+
+  // Try to drop offers mppx can't handle (non-EVM networks).
+  let kept = 0
+  let dropped = 0
+  let rewritten: Response | null = null
+  try {
+    const obj = JSON.parse(Buffer.from(prHeader, 'base64').toString('utf8'))
+    if (obj && Array.isArray(obj.accepts)) {
+      const filtered = obj.accepts.filter(
+        (a: any) => typeof a?.network === 'string' && EVM_CAIP2.test(a.network),
+      )
+      dropped = obj.accepts.length - filtered.length
+      kept = filtered.length
+      if (kept > 0 && dropped > 0) {
+        const newObj = { ...obj, accepts: filtered }
+        const newHeader = Buffer.from(JSON.stringify(newObj)).toString('base64')
+        rewritten = cloneWithPaymentRequired(response, newHeader)
+      }
+    }
+  } catch {
+    // base64/JSON garbage — fall through to the strip/forward decision.
+  }
+
+  // Use mppx's OWN parser as the oracle (codex #7): only forward the
+  // rewrite if mppx now accepts it. This also catches the case where a
+  // *retained* eip155 offer is itself malformed.
+  if (rewritten && canParse(rewritten)) {
+    console.log(
+      `[tempo] sanitized merchant 402: dropped ${dropped} unparseable offer(s), kept ${kept}`,
+    )
+    return rewritten
+  }
+
+  // Rewrite didn't help. Prefer the Tempo (www-authenticate) challenge
+  // if the merchant offered one; otherwise forward unchanged so mppx
+  // raises its own real error instead of us swallowing it.
+  if (hasWwwAuth) {
+    console.warn(
+      `[tempo] payment-required unparseable by mppx after filter; ` +
+        `stripping it, falling back to www-authenticate (Tempo)`,
+    )
+    return withoutPaymentRequired(response)
+  }
+  console.warn(
+    `[tempo] payment-required unparseable by mppx and no www-authenticate fallback; ` +
+      `forwarding unchanged so mppx surfaces the underlying error`,
+  )
+  return response
+}
+
+/** Return a clone of `response` with the payment-required header replaced. */
+function cloneWithPaymentRequired(response: Response, header: string): Response {
+  const headers = new Headers(response.headers)
+  headers.set('payment-required', header)
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+/** Return a clone of `response` with the payment-required header removed. */
+function withoutPaymentRequired(response: Response): Response {
+  const headers = new Headers(response.headers)
+  headers.delete('payment-required')
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+/**
+ * Build an mppx client that can handle both tempo.charge and
+ * tempo.session challenges.
+ *
+ * In manual session mode we pass an `onChannelUpdate` callback
+
+ succeeded in 0ms:
+  // 3. `legacySession(...)` (legacy contract-backed session, was `session`
+  //    in 0.4.12, now re-exported as `sessionLegacy` in 0.7.0) — handles
+  //    merchants that advertise `sessionProtocol: 'v1'` or omit it. Provides
+  //    backward compatibility for any merchant still on the old protocol.
+  //    Its manual-mode context does NOT require `descriptor`.
+  //
+  // mppx dispatches on `canHandleChallenge` to pick the right method:
+  //   v2 challenge → tempo.session (TIP-1034)
+  //   v1 / absent  → legacySession
+  //
+  // No `deposit` parameter on either session method — that parameter is
+  // what flips them into auto mode. Leaving it unset keeps us in manual
+  // mode where our `onChallenge` hook controls every voucher.
+  const mppx = Mppx.create({
+    methods: [
+      tempo.charge({ account }),
+      tempo.session({
+        account,
+        onChannelUpdate: opts.onChannelUpdate,
+      }),
+      legacySession({
+        account,
+        onChannelUpdate: opts.onChannelUpdate as any,
+      }),
+    ],
+    polyfill: false,
+    onChallenge: opts.onChallenge,
+    // Wrap the underlying fetch so we sanitize the upstream merchant's
+    // 402 BEFORE mppx parses it. This covers BOTH the charge
+    // (`payMerchant`) and session (`payMerchantSession`) legs because
+    // both go through this single factory (codex review #5). Without
+    // this, a merchant that adds a non-EVM (e.g. solana) x402 offer
+    // poisons mppx's whole challenge list and the router 502s with
+    // "Invalid base64 JSON header".
+    fetch: sanitizeMerchant402Fetch(globalThis.fetch),
+  } as any)
+
+  return mppx
+}
+
+/**
+ * Pay a Tempo merchant for a single fixed-price request. The
+ * mppx client handles the full 402 dance automatically via the
+ * registered `tempo.charge` method.
+ *
+ * Unchanged from the pre-session Router — callers that speak
+ * tempo.charge (Firecrawl, Exa, Parallel) must NOT switch to
+ * `payMerchantSession`.
+ */
+export async function payMerchant(
+  env: Env,
+  merchantUrl: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const client = createTempoClientInternal(env)
+  return client.fetch(merchantUrl, init)
+}
+
+/**
+ * Add two base-unit cumulative amounts using BigInt so we don't
+ * lose precision on amounts above 2^53. Both inputs and output
+ * are non-negative integer strings.
+ */
+function addRaw(a: string, bRaw: string): string {
+  return (BigInt(a) + BigInt(bRaw)).toString()
+}
+
+/**
+ * Pay a Tempo merchant through an existing payment channel.
+ *
+ * Prerequisites:
+
+exec
+/bin/zsh -lc 'rg -n "sanitize402Response|Solana|solana|Invalid base64|payment-required" src/mpp test src | head -200' in /Users/happyfish/workspace/rozov2/rozo-mpprouter
+ succeeded in 0ms:
+src/services/merchants.ts:237:  // `unsupported_network`). Pass ?network=base-mainnet / solana-mainnet
+src/mpp/tempo-client.ts:83: * Max size of an upstream `payment-required` header we will attempt to
+src/mpp/tempo-client.ts:98: * mppx 0.7.0's `x402Challenges` decodes the WHOLE `payment-required`
+src/mpp/tempo-client.ts:101: * `solana:...` offer), the decode throws `InvalidJsonHeaderError`
+src/mpp/tempo-client.ts:102: * ("Invalid base64 JSON header.") and — because mppx spreads the
+src/mpp/tempo-client.ts:109: * drops any `payment-required` offer mppx can't parse, then validates
+src/mpp/tempo-client.ts:113: *                             → strip payment-required entirely, let
+src/mpp/tempo-client.ts:134:    return sanitize402Response(response)
+src/mpp/tempo-client.ts:156: *  - not a 402, or no `payment-required` header → unchanged
+src/mpp/tempo-client.ts:160: *  - if rewrite still fails: strip `payment-required` so mppx falls back
+src/mpp/tempo-client.ts:166:export function sanitize402Response(
+src/mpp/tempo-client.ts:174:  const prHeader = response.headers.get('payment-required')
+src/mpp/tempo-client.ts:190:      `[tempo] oversized payment-required header (${prHeader.length}B) from merchant; ` +
+src/mpp/tempo-client.ts:237:      `[tempo] payment-required unparseable by mppx after filter; ` +
+src/mpp/tempo-client.ts:243:    `[tempo] payment-required unparseable by mppx and no www-authenticate fallback; ` +
+src/mpp/tempo-client.ts:249:/** Return a clone of `response` with the payment-required header replaced. */
+src/mpp/tempo-client.ts:252:  headers.set('payment-required', header)
+src/mpp/tempo-client.ts:260:/** Return a clone of `response` with the payment-required header removed. */
+src/mpp/tempo-client.ts:263:  headers.delete('payment-required')
+src/mpp/tempo-client.ts:351:    // this, a merchant that adds a non-EVM (e.g. solana) x402 offer
+src/mpp/tempo-client.ts:353:    // "Invalid base64 JSON header".
+src/services/mpp-catalog-snapshot.json:704:        "solana",
+src/services/mpp-catalog-snapshot.json:2501:      "description": "USDC payment infrastructure for AI agents and humans. Send tips, hire people for tasks, and create/earn from gigs — all settled on-chain via x402 (Base, Solana, World Chain) and MPP (Tempo, Stellar, Monad).",
+src/services/mpp-catalog-snapshot.json:2666:          "description": "Smart money DCA orders on Solana",
+src/services/mpp-catalog-snapshot.json:2672:            "description": "Smart money DCA orders on Solana",
+src/services/mpp-catalog-snapshot.json:3058:          "description": "Jupiter DCA orders for a token on Solana",
+src/services/mpp-catalog-snapshot.json:3064:            "description": "Jupiter DCA orders for a token on Solana",
+src/services/mpp-catalog-snapshot.json:3773:        "solana",
+src/mpp/tempo-client.ts:83: * Max size of an upstream `payment-required` header we will attempt to
+src/mpp/tempo-client.ts:98: * mppx 0.7.0's `x402Challenges` decodes the WHOLE `payment-required`
+src/mpp/tempo-client.ts:101: * `solana:...` offer), the decode throws `InvalidJsonHeaderError`
+src/mpp/tempo-client.ts:102: * ("Invalid base64 JSON header.") and — because mppx spreads the
+src/mpp/tempo-client.ts:109: * drops any `payment-required` offer mppx can't parse, then validates
+src/mpp/tempo-client.ts:113: *                             → strip payment-required entirely, let
+src/mpp/tempo-client.ts:134:    return sanitize402Response(response)
+src/mpp/tempo-client.ts:156: *  - not a 402, or no `payment-required` header → unchanged
+src/mpp/tempo-client.ts:160: *  - if rewrite still fails: strip `payment-required` so mppx falls back
+src/mpp/tempo-client.ts:166:export function sanitize402Response(
+src/mpp/tempo-client.ts:174:  const prHeader = response.headers.get('payment-required')
+src/mpp/tempo-client.ts:190:      `[tempo] oversized payment-required header (${prHeader.length}B) from merchant; ` +
+src/mpp/tempo-client.ts:237:      `[tempo] payment-required unparseable by mppx after filter; ` +
+src/mpp/tempo-client.ts:243:    `[tempo] payment-required unparseable by mppx and no www-authenticate fallback; ` +
+src/mpp/tempo-client.ts:249:/** Return a clone of `response` with the payment-required header replaced. */
+src/mpp/tempo-client.ts:252:  headers.set('payment-required', header)
+src/mpp/tempo-client.ts:260:/** Return a clone of `response` with the payment-required header removed. */
+src/mpp/tempo-client.ts:263:  headers.delete('payment-required')
+src/mpp/tempo-client.ts:351:    // this, a merchant that adds a non-EVM (e.g. solana) x402 offer
+src/mpp/tempo-client.ts:353:    // "Invalid base64 JSON header".
+src/routes/proxy.ts:831:  // EVM x402, SIWX, Solana MPP, …) the merchant decides how to handle
+src/utils/cors.ts:17: *     - payment-required     (x402 402 challenge)
+src/utils/cors.ts:33:  'payment-required',
+src/routes/create-invoice.ts:36:  '900':  ['USDC'],           // Solana
+
+codex
+**Answers To The 6 Questions**
+
+1. The lifecycle is directionally right, but too ceremonial. Collapse it to: `verify before marking verified`, `monitor verified routes`, `triage failures`. “Onboard” should be a checklist inside verification, not a separate stage. Do not block all payable/available routes on `providers.mjs`; block only `verified` claims on a real e2e entry plus real-money pass.
+
+2. Use tool-generated overlay snippets first. A runtime `verified-routes.json` adds another catalog merge path and can create payment-advertising bugs. Safer version: `charge-e2e.mjs --write-verified` prints a snippet/report that a human reviews in PR. Also require it to update `verifiedMode` and `chargeVerified/sessionVerified` consistently.
+
+3. [P1] The proposed “unknown network gained = fail” invariant is wrong now that the sanitizer deliberately tolerates Solana. Alert severity should be:
+   - Fail/page: the merchant challenge cannot be sanitized into a payable/parseable path, or the Tempo challenge we rely on disappeared.
+   - Warning/digest: raw `accepts[].network` changed but sanitizer still works.
+   - Info: merchant added a network we do not pay and it is safely ignored.
+
+   More important: if the daily probe only hits the Router public route without paying, it sees the Router’s customer-facing 402, not the upstream merchant’s 402. That would not have caught stableemail. The monitor must either probe upstream merchants directly or add a Router “merchant quote dry-run” path that fetches the upstream 402 without customer settlement.
+
+4. Do not auto-demote from `verified` on one failed run. First failure should alert and mark “suspect” in the report. Demotion should require either N consecutive failures or human triage. For legacy `stellar/charge`, faster demotion is justified because a broken route can charge before merchant settlement, but still avoid unattended source-of-truth edits unless the demotion mechanism is extremely small and audited.
+
+5. [P0] Biggest payment-safety risk: a monitor accidentally running real-money checks broadly against unbounded routes or non-minimal bodies. It needs an allowlisted provider list, per-call `MAX_AUTO_USD`, total run cap, and no customer credentials.  
+   [P1] Verified-flag automation could mark a route verified from a weak 200 unless `okCheck` is strict and `PASS_WEAK` is non-success, which current `charge-e2e.mjs` already does.  
+   [P1] Auto-demotion can cause availability churn if merchants are flaky; alert first, demote after repeat/human confirmation.
+
+6. Missing failure modes:
+   - [P1] Upstream merchant 402 drift will not be caught by current `probe-402.mjs`; it only validates Router quote layer.
+   - [P1] Amount/payee drift: merchant changes price, recipient, intent, or removes `www-authenticate`; network-set checking alone misses this.
+   - [P1] Session-specific failures: open channel underfunded/exhausted, descriptor drift, KV channel state corruption.
+   - [P2] Dependency drift should be tested in CI/pre-deploy too, not only daily production monitoring.
+
+**Prioritized Recommendation**
+
+1. Build the zero-cost upstream merchant challenge monitor first, not merely a Router 402 probe. This is the cheapest single item that would have caught the stableemail class before customers. Invariant: “the challenge path we actually use remains parseable/payable after sanitizer,” not “network set unchanged.”
+
+2. Extend the SOP triage table. Low effort, high operator value, but it does not prevent incidents by itself.
+
+3. Add `charge-e2e.mjs --write-verified` as a reviewed snippet/report generator. Keep `OPERATOR_OVERLAY` as source of truth for now.
+
+4. Add weekly real-money checks only for the small verified allowlist, with per-call and total spend caps. Alert on first failure; demote after repeat or human triage.
+
+Cut for now: machine-managed `verified-routes.json`, auto-demotion on first failure, and mandatory onboarding gates for every payable `available` route.
+
+**Verdict**
+
+Sound enough to implement after one correction: Stage C must monitor upstream merchant 402 drift through the sanitizer, and Solana-style tolerated drift must be warning/info, not failure.
+tokens used
+94,686
+**Answers To The 6 Questions**
+
+1. The lifecycle is directionally right, but too ceremonial. Collapse it to: `verify before marking verified`, `monitor verified routes`, `triage failures`. “Onboard” should be a checklist inside verification, not a separate stage. Do not block all payable/available routes on `providers.mjs`; block only `verified` claims on a real e2e entry plus real-money pass.
+
+2. Use tool-generated overlay snippets first. A runtime `verified-routes.json` adds another catalog merge path and can create payment-advertising bugs. Safer version: `charge-e2e.mjs --write-verified` prints a snippet/report that a human reviews in PR. Also require it to update `verifiedMode` and `chargeVerified/sessionVerified` consistently.
+
+3. [P1] The proposed “unknown network gained = fail” invariant is wrong now that the sanitizer deliberately tolerates Solana. Alert severity should be:
+   - Fail/page: the merchant challenge cannot be sanitized into a payable/parseable path, or the Tempo challenge we rely on disappeared.
+   - Warning/digest: raw `accepts[].network` changed but sanitizer still works.
+   - Info: merchant added a network we do not pay and it is safely ignored.
+
+   More important: if the daily probe only hits the Router public route without paying, it sees the Router’s customer-facing 402, not the upstream merchant’s 402. That would not have caught stableemail. The monitor must either probe upstream merchants directly or add a Router “merchant quote dry-run” path that fetches the upstream 402 without customer settlement.
+
+4. Do not auto-demote from `verified` on one failed run. First failure should alert and mark “suspect” in the report. Demotion should require either N consecutive failures or human triage. For legacy `stellar/charge`, faster demotion is justified because a broken route can charge before merchant settlement, but still avoid unattended source-of-truth edits unless the demotion mechanism is extremely small and audited.
+
+5. [P0] Biggest payment-safety risk: a monitor accidentally running real-money checks broadly against unbounded routes or non-minimal bodies. It needs an allowlisted provider list, per-call `MAX_AUTO_USD`, total run cap, and no customer credentials.  
+   [P1] Verified-flag automation could mark a route verified from a weak 200 unless `okCheck` is strict and `PASS_WEAK` is non-success, which current `charge-e2e.mjs` already does.  
+   [P1] Auto-demotion can cause availability churn if merchants are flaky; alert first, demote after repeat/human confirmation.
+
+6. Missing failure modes:
+   - [P1] Upstream merchant 402 drift will not be caught by current `probe-402.mjs`; it only validates Router quote layer.
+   - [P1] Amount/payee drift: merchant changes price, recipient, intent, or removes `www-authenticate`; network-set checking alone misses this.
+   - [P1] Session-specific failures: open channel underfunded/exhausted, descriptor drift, KV channel state corruption.
+   - [P2] Dependency drift should be tested in CI/pre-deploy too, not only daily production monitoring.
+
+**Prioritized Recommendation**
+
+1. Build the zero-cost upstream merchant challenge monitor first, not merely a Router 402 probe. This is the cheapest single item that would have caught the stableemail class before customers. Invariant: “the challenge path we actually use remains parseable/payable after sanitizer,” not “network set unchanged.”
+
+2. Extend the SOP triage table. Low effort, high operator value, but it does not prevent incidents by itself.
+
+3. Add `charge-e2e.mjs --write-verified` as a reviewed snippet/report generator. Keep `OPERATOR_OVERLAY` as source of truth for now.
+
+4. Add weekly real-money checks only for the small verified allowlist, with per-call and total spend caps. Alert on first failure; demote after repeat or human triage.
+
+Cut for now: machine-managed `verified-routes.json`, auto-demotion on first failure, and mandatory onboarding gates for every payable `available` route.
+
+**Verdict**
+
+Sound enough to implement after one correction: Stage C must monitor upstream merchant 402 drift through the sanitizer, and Solana-style tolerated drift must be warning/info, not failure.

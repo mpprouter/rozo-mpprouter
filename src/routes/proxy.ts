@@ -739,24 +739,32 @@ export async function handleProxy(
     })
   }
 
-  // SECURITY GATE (2026-06-22): only operator-verified routes are
-  // chargeable. The catalog opt-IN flip (stellarIntentsFor) stops HONEST
-  // clients reading /v1/services/catalog from paying an unverified route,
-  // but it does NOT stop an attacker — or anyone holding a stale snapshot
-  // — from POSTing directly to an ugly/untested path. Without this gate
-  // such a request would proceed straight to charge + a downstream Tempo
-  // payment into a route we've never verified (a real money-loss / abuse
-  // surface). So we refuse here, after route resolution but BEFORE any
-  // payment work, for any route whose verifiedMode isn't 'charge'/'session'.
+  // SECURITY GATE (Option A, 2026-06-23): block ONLY routes we have
+  // real-money tested and confirmed BROKEN (verifiedMode === false).
+  // Everything else is payable — including routes we haven't verified yet
+  // (verifiedMode === undefined) — so the ~485 unverified-but-working
+  // routes customers rely on aren't blocked.
+  //
+  // Settlement-ordering caveat (do NOT misread this): the two pay paths
+  // differ. The x402 branch is verify → pay merchant → settle customer
+  // ONLY on merchant 2xx (proxy.ts ~1128/1158/1179), so a broken x402
+  // route can't charge the customer. The legacy mppx `stellar/charge`
+  // branch is the OPPOSITE: `stellar/charge` verifies-and-settles the
+  // customer BEFORE `payMerchantAndGetBody` runs, so a broken charge
+  // route CAN charge the customer and then 502. We accept that risk for
+  // unverified routes and manage it with honest catalog flags
+  // (charge_rozo_verified/session_rozo_verified) rather than gating every
+  // unverified route — the client sees what we've vetted and decides. See
+  // docs/codex-review-catalog-v2-2026-06-23.md.
+  //
+  // We still gate here (not just in the catalog) because catalog hiding
+  // doesn't stop an attacker — or a stale snapshot — from POSTing a
+  // known-broken path directly. Blocking confirmed-broken routes avoids
+  // customers repeatedly paying into dead merchants.
   //
   // The refusal is intentionally generic — no merchant host, channel id,
   // or internal reason — so it doesn't help an attacker probe the fleet.
-  if (route.verifiedMode !== 'charge' && route.verifiedMode !== 'session') {
-    // Keep the body deliberately bland — no merchant host, channel id,
-    // or verification-state reason — so it doesn't help an attacker
-    // distinguish "untested" from "known-broken" or map the fleet. The
-    // catalog (GET /v1/services/catalog, payment_status field) is the
-    // single place that explains which routes are chargeable.
+  if (route.verifiedMode === false) {
     return new Response(JSON.stringify({
       error: 'Route not enabled for payment',
       hint: 'See GET /v1/services/catalog for the set of routes that accept payment.',
