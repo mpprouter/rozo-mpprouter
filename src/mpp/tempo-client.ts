@@ -24,7 +24,7 @@
  * request, and the charge path should not pay that overhead.
  */
 
-import { Mppx, tempo, sessionLegacy as legacySession } from 'mppx/client'
+import { Mppx, tempo, sessionLegacy as legacySession, Transport } from 'mppx/client'
 import { privateKeyToAccount } from 'viem/accounts'
 import type { Env } from '../index'
 import {
@@ -77,6 +77,195 @@ export class ChannelNotInstalledError extends Error {
     )
     this.name = 'ChannelNotInstalledError'
   }
+}
+
+/**
+ * Max size of an upstream `payment-required` header we will attempt to
+ * parse/rewrite. A merchant fully controls this header; cap it before we
+ * base64/JSON-decode so a hostile or buggy merchant cannot make us do
+ * unbounded work. 16 KiB is ~10x the largest legitimate header we've
+ * seen (multi-offer x402 with extensions runs ~3.5 KiB).
+ */
+const MAX_PAYMENT_REQUIRED_HEADER_BYTES = 16 * 1024
+
+/** mppx 0.7.0's x402 schema only accepts EVM CAIP-2 networks. */
+const EVM_CAIP2 = /^eip155:\d+$/
+
+/**
+ * Defensive fetch wrapper for the router→merchant leg.
+ *
+ * Root cause (docs/rootcause-invalid-base64-json-header-2026-06-24.md):
+ * mppx 0.7.0's `x402Challenges` decodes the WHOLE `payment-required`
+ * header against a strict EVM-only schema. If ANY `accepts[]` offer
+ * carries an unrecognized network (e.g. a merchant that added a
+ * `solana:...` offer), the decode throws `InvalidJsonHeaderError`
+ * ("Invalid base64 JSON header.") and — because mppx spreads the
+ * www-authenticate and x402 challenge lists into one array literal —
+ * the throw discards the perfectly usable `www-authenticate` (Tempo)
+ * challenge too. The router then 502s with "Merchant payment failed".
+ *
+ * This wrapper sits UNDER the mppx client (passed as `config.fetch`),
+ * so it sees the raw upstream 402 before mppx parses it. On a 402 it
+ * drops any `payment-required` offer mppx can't parse, then validates
+ * the rewrite using mppx's OWN parser as the oracle:
+ *   - rewrite parses cleanly  → forward the rewritten response
+ *   - rewrite still fails AND a www-authenticate header is present
+ *                             → strip payment-required entirely, let
+ *                               mppx fall back to the Tempo challenge
+ *   - rewrite still fails AND no www-authenticate → forward UNCHANGED
+ *                               so mppx surfaces its own real error
+ *                               (we never silently swallow).
+ *
+ * The router client registers only tempo.charge / tempo.session /
+ * legacySession — there is no `evm/charge` method — so retained eip155
+ * x402 offers are never payable by us anyway; dropping the non-EVM ones
+ * cannot change which party/amount we pay. Falling back to
+ * www-authenticate pays the same Tempo challenge the proxy already
+ * quoted the customer. See codex review 2026-06-24, findings #4/#5/#7/#8.
+ *
+ * Scope guards (codex #8): only touches outbound 402 responses; caps
+ * header size before parsing; never rewrites inbound client credentials
+ * (this fetch only runs for merchant requests we originate); logs counts
+ * and reasons only, never header contents.
+ */
+function sanitizeMerchant402Fetch(baseFetch: typeof globalThis.fetch): typeof globalThis.fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const response = await baseFetch(input as any, init as any)
+    return sanitize402Response(response)
+  }) as typeof globalThis.fetch
+}
+
+/** True iff mppx's own x402/www-authenticate parser accepts this response. */
+function mppxCanParse(resp: Response): boolean {
+  try {
+    const t = Transport.http()
+    // Use the same parser mppx will use. getChallenges is the list form
+    // (what Fetch.from prefers); fall back to getChallenge.
+    if (t.getChallenges) t.getChallenges(resp)
+    else t.getChallenge(resp)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Pure core of the merchant-402 sanitizer (exported for unit tests).
+ *
+ * Given an upstream response, returns a response mppx's client can parse:
+ *  - not a 402, or no `payment-required` header → unchanged
+ *  - already parseable → unchanged (fast path)
+ *  - drop non-EVM (`!eip155:\d+`) offers and re-validate with mppx's own
+ *    parser; forward the rewrite only if it now parses
+ *  - if rewrite still fails: strip `payment-required` so mppx falls back
+ *    to the `www-authenticate` (Tempo) challenge when present, else
+ *    forward UNCHANGED so mppx raises its own real error (never swallow)
+ *
+ * See the wrapper's doc comment + docs/rootcause-...-2026-06-24.md.
+ */
+export function sanitize402Response(
+  response: Response,
+  // Injectable only so tests can assert the oversized guard short-circuits
+  // BEFORE any parse (codex #1). Production always uses mppx's real parser.
+  canParse: (r: Response) => boolean = mppxCanParse,
+): Response {
+  if (response.status !== 402) return response
+
+  const prHeader = response.headers.get('payment-required')
+  if (!prHeader) return response // nothing to sanitize (pure www-authenticate)
+
+  const hasWwwAuth = response.headers.has('www-authenticate')
+
+  // Bound the work BEFORE we hand anything to a parser (codex review #1/R2):
+  // an oversized header is merchant-controlled and suspicious, so we must
+  // not feed it into mppx's base64/JSON/schema parser at all. We ALWAYS
+  // strip it — never return it to mppx — because this wrapper sits under
+  // Mppx.create and mppx would otherwise re-parse the oversized header.
+  //  - with www-authenticate present → mppx falls back to the Tempo challenge
+  //  - without www-authenticate → the 402 now carries no challenge, so mppx
+  //    raises a clean "no challenge" error instead of parsing 17 KiB of
+  //    attacker-controlled bytes. Either way no parser touches the header.
+  if (prHeader.length > MAX_PAYMENT_REQUIRED_HEADER_BYTES) {
+    console.warn(
+      `[tempo] oversized payment-required header (${prHeader.length}B) from merchant; ` +
+        `stripping (will not be parsed)` +
+        (hasWwwAuth ? '; falling back to www-authenticate' : '; no www-authenticate fallback'),
+    )
+    return withoutPaymentRequired(response)
+  }
+
+  // Fast path: if mppx can already parse it, do nothing.
+  if (canParse(response)) return response
+
+  // Try to drop offers mppx can't handle (non-EVM networks).
+  let kept = 0
+  let dropped = 0
+  let rewritten: Response | null = null
+  try {
+    const obj = JSON.parse(Buffer.from(prHeader, 'base64').toString('utf8'))
+    if (obj && Array.isArray(obj.accepts)) {
+      const filtered = obj.accepts.filter(
+        (a: any) => typeof a?.network === 'string' && EVM_CAIP2.test(a.network),
+      )
+      dropped = obj.accepts.length - filtered.length
+      kept = filtered.length
+      if (kept > 0 && dropped > 0) {
+        const newObj = { ...obj, accepts: filtered }
+        const newHeader = Buffer.from(JSON.stringify(newObj)).toString('base64')
+        rewritten = cloneWithPaymentRequired(response, newHeader)
+      }
+    }
+  } catch {
+    // base64/JSON garbage — fall through to the strip/forward decision.
+  }
+
+  // Use mppx's OWN parser as the oracle (codex #7): only forward the
+  // rewrite if mppx now accepts it. This also catches the case where a
+  // *retained* eip155 offer is itself malformed.
+  if (rewritten && canParse(rewritten)) {
+    console.log(
+      `[tempo] sanitized merchant 402: dropped ${dropped} unparseable offer(s), kept ${kept}`,
+    )
+    return rewritten
+  }
+
+  // Rewrite didn't help. Prefer the Tempo (www-authenticate) challenge
+  // if the merchant offered one; otherwise forward unchanged so mppx
+  // raises its own real error instead of us swallowing it.
+  if (hasWwwAuth) {
+    console.warn(
+      `[tempo] payment-required unparseable by mppx after filter; ` +
+        `stripping it, falling back to www-authenticate (Tempo)`,
+    )
+    return withoutPaymentRequired(response)
+  }
+  console.warn(
+    `[tempo] payment-required unparseable by mppx and no www-authenticate fallback; ` +
+      `forwarding unchanged so mppx surfaces the underlying error`,
+  )
+  return response
+}
+
+/** Return a clone of `response` with the payment-required header replaced. */
+function cloneWithPaymentRequired(response: Response, header: string): Response {
+  const headers = new Headers(response.headers)
+  headers.set('payment-required', header)
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
+}
+
+/** Return a clone of `response` with the payment-required header removed. */
+function withoutPaymentRequired(response: Response): Response {
+  const headers = new Headers(response.headers)
+  headers.delete('payment-required')
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  })
 }
 
 /**
@@ -155,6 +344,14 @@ function createTempoClientInternal(
     ],
     polyfill: false,
     onChallenge: opts.onChallenge,
+    // Wrap the underlying fetch so we sanitize the upstream merchant's
+    // 402 BEFORE mppx parses it. This covers BOTH the charge
+    // (`payMerchant`) and session (`payMerchantSession`) legs because
+    // both go through this single factory (codex review #5). Without
+    // this, a merchant that adds a non-EVM (e.g. solana) x402 offer
+    // poisons mppx's whole challenge list and the router 502s with
+    // "Invalid base64 JSON header".
+    fetch: sanitizeMerchant402Fetch(globalThis.fetch),
   } as any)
 
   return mppx

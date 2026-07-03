@@ -384,6 +384,12 @@ async function main() {
     account,
     client,
     decimals: 6,
+    // bootstrap:false → do NOT resume an existing channel from the merchant's
+    // server-side session snapshot. The old test channels have their on-chain
+    // deposit exhausted (cumulative at deposit cap), so resuming them leaves no
+    // voucher headroom. Forcing a FRESH channel opens a new on-chain deposit we
+    // fully control, sidestepping the exhausted legacy channels.
+    bootstrap: false,
     maxDeposit: maxDepositUsdc,
     sessionStore: {
       get() {
