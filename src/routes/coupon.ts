@@ -144,6 +144,12 @@ function rateLimited(): Response {
 
 const DO_ORIGIN = 'https://atomic-store.internal'
 const MAX_CAS_RETRIES = 5
+// Hot shared counters (rl:global, rl:ip, funder-reserve) see genuine burst
+// contention: every conflict means another request committed, so the system
+// makes progress and a retry bound is only a safety net — but 5 is too tight
+// for a public endpoint burst. Coupon-record keys keep the tight bound (a
+// single code sees at most a handful of concurrent requests).
+const MAX_COUNTER_CAS_RETRIES = 25
 
 type CasChange<R> =
   | { op: 'set'; value: string; result: R }
@@ -172,10 +178,11 @@ async function casUpdate<R>(
   env: Env,
   key: string,
   fn: (current: string | null) => CasChange<R>,
+  maxRetries: number = MAX_CAS_RETRIES,
 ): Promise<R> {
   const stub = couponStub(env)
   let { value, version } = await doPost<ReadResponse>(stub, '/read', { key })
-  for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     const change = fn(value)
     if (change.op === 'noop') return change.result
     const result = await doPost<CommitResponse>(stub, '/commit', {
@@ -188,7 +195,7 @@ async function casUpdate<R>(
     value = result.value
     version = result.version
   }
-  throw new Error(`coupon DO casUpdate(${key}): exhausted ${MAX_CAS_RETRIES} retries`)
+  throw new Error(`coupon DO casUpdate(${key}): exhausted ${maxRetries} retries`)
 }
 
 async function casRead(env: Env, key: string): Promise<string | null> {
@@ -237,14 +244,19 @@ async function bumpCounter(
   windowMs: number,
 ): Promise<boolean> {
   const now = Date.now()
-  return casUpdate<boolean>(env, key, (raw) => {
-    const c = parseCounter(raw)
-    const inWindow = now - c.windowStart < windowMs
-    const n = inWindow ? c.n : 0
-    const windowStart = inWindow ? c.windowStart : now
-    if (n >= limit) return { op: 'noop', result: false }
-    return { op: 'set', value: JSON.stringify({ n: n + 1, windowStart }), result: true }
-  })
+  return casUpdate<boolean>(
+    env,
+    key,
+    (raw) => {
+      const c = parseCounter(raw)
+      const inWindow = now - c.windowStart < windowMs
+      const n = inWindow ? c.n : 0
+      const windowStart = inWindow ? c.windowStart : now
+      if (n >= limit) return { op: 'noop', result: false }
+      return { op: 'set', value: JSON.stringify({ n: n + 1, windowStart }), result: true }
+    },
+    MAX_COUNTER_CAS_RETRIES,
+  )
 }
 
 // ── Atomic funder reservation (coupon-side) ─────────────────────────────────
@@ -293,33 +305,43 @@ async function tryReserveFunds(
   webhookReserved: bigint,
 ): Promise<boolean> {
   const now = Date.now()
-  return casUpdate<boolean>(env, RESERVE_KEY, (raw) => {
-    const st = parseReserve(raw)
-    for (const [k, v] of Object.entries(st.entries)) {
-      if (now - v.at > RESERVE_LEASE_MS) delete st.entries[k]
-    }
-    let couponReserved = 0n
-    for (const v of Object.values(st.entries)) {
-      try {
-        couponReserved += BigInt(v.amt)
-      } catch {
-        /* corrupt entry — ignore */
+  return casUpdate<boolean>(
+    env,
+    RESERVE_KEY,
+    (raw) => {
+      const st = parseReserve(raw)
+      for (const [k, v] of Object.entries(st.entries)) {
+        if (now - v.at > RESERVE_LEASE_MS) delete st.entries[k]
       }
-    }
-    const available = balance - webhookReserved - couponReserved
-    if (available < invoiceAtomic) return { op: 'noop', result: false }
-    st.entries[attemptId] = { amt: invoiceAtomic.toString(), at: now }
-    return { op: 'set', value: JSON.stringify(st), result: true }
-  })
+      let couponReserved = 0n
+      for (const v of Object.values(st.entries)) {
+        try {
+          couponReserved += BigInt(v.amt)
+        } catch {
+          /* corrupt entry — ignore */
+        }
+      }
+      const available = balance - webhookReserved - couponReserved
+      if (available < invoiceAtomic) return { op: 'noop', result: false }
+      st.entries[attemptId] = { amt: invoiceAtomic.toString(), at: now }
+      return { op: 'set', value: JSON.stringify(st), result: true }
+    },
+    MAX_COUNTER_CAS_RETRIES,
+  )
 }
 
 async function releaseFunds(env: Env, attemptId: string): Promise<void> {
-  await casUpdate<null>(env, RESERVE_KEY, (raw) => {
-    const st = parseReserve(raw)
-    if (!(attemptId in st.entries)) return { op: 'noop', result: null }
-    delete st.entries[attemptId]
-    return { op: 'set', value: JSON.stringify(st), result: null }
-  })
+  await casUpdate<null>(
+    env,
+    RESERVE_KEY,
+    (raw) => {
+      const st = parseReserve(raw)
+      if (!(attemptId in st.entries)) return { op: 'noop', result: null }
+      delete st.entries[attemptId]
+      return { op: 'set', value: JSON.stringify(st), result: null }
+    },
+    MAX_COUNTER_CAS_RETRIES,
+  )
 }
 
 /** Per-code failure lockout: count a failed attempt; report locked state. */
@@ -335,17 +357,22 @@ async function codeFailCheck(env: Env, code: string): Promise<{ locked: boolean 
 
 async function codeFailBump(env: Env, code: string): Promise<void> {
   const now = Date.now()
-  await casUpdate<null>(env, `rl:code:${code}`, (raw) => {
-    const c = parseCounter(raw)
-    const inWindow = now - c.windowStart < CODE_LOCK_MS
-    const n = (inWindow ? c.n : 0) + 1
-    const next: CounterState = {
-      n,
-      windowStart: inWindow ? c.windowStart || now : now,
-      ...(n >= CODE_FAIL_LIMIT ? { lockedUntil: now + CODE_LOCK_MS } : {}),
-    }
-    return { op: 'set', value: JSON.stringify(next), result: null }
-  })
+  await casUpdate<null>(
+    env,
+    `rl:code:${code}`,
+    (raw) => {
+      const c = parseCounter(raw)
+      const inWindow = now - c.windowStart < CODE_LOCK_MS
+      const n = (inWindow ? c.n : 0) + 1
+      const next: CounterState = {
+        n,
+        windowStart: inWindow ? c.windowStart || now : now,
+        ...(n >= CODE_FAIL_LIMIT ? { lockedUntil: now + CODE_LOCK_MS } : {}),
+      }
+      return { op: 'set', value: JSON.stringify(next), result: null }
+    },
+    MAX_COUNTER_CAS_RETRIES,
+  )
 }
 
 /**
@@ -356,24 +383,37 @@ async function publicGate(request: Request, env: Env): Promise<Response | null> 
   const ip = request.headers.get('cf-connecting-ip') ?? 'unknown'
   const hour = Math.floor(Date.now() / 3_600_000)
 
-  // Per-IP FIRST: a request rejected by its own IP quota must not consume
-  // global budget, otherwise a single abusive IP could trip the circuit
-  // breaker and 429 every legitimate user for the rest of the window.
-  const ipOk = await bumpCounter(env, `rl:ip:${ip}`, IP_LIMIT_PER_HOUR, 3_600_000)
-  if (!ipOk) return rateLimited()
+  // Fail closed: if the counters themselves error out (retry exhaustion
+  // under extreme contention, DO hiccup), a public money endpoint must
+  // reject rather than 500 — and certainly must not proceed unmetered.
+  try {
+    // Per-IP FIRST: a request rejected by its own IP quota must not consume
+    // global budget, otherwise a single abusive IP could trip the circuit
+    // breaker and 429 every legitimate user for the rest of the window.
+    const ipOk = await bumpCounter(env, `rl:ip:${ip}`, IP_LIMIT_PER_HOUR, 3_600_000)
+    if (!ipOk) return rateLimited()
+  } catch (err) {
+    console.warn(`[coupon] per-IP counter error (fail closed): ${err instanceof Error ? err.message : String(err)}`)
+    return rateLimited()
+  }
 
-  const globalOk = await bumpCounter(env, `rl:global:${hour}`, GLOBAL_LIMIT_PER_HOUR, 3_600_000)
-  if (!globalOk) {
-    // Circuit breaker tripped — with per-IP checked first, reaching this
-    // requires many distinct IPs (distributed brute-force). Alerting once
-    // per window would need extra state; an extra alert is harmless, so
-    // just fire best-effort on every tripped request.
-    if (env.DINGTALK_ACCESS_TOKEN) {
-      await sendDingTalkAlert(
-        env.DINGTALK_ACCESS_TOKEN,
-        `[MPP Router] 🚨 Coupon redeem global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} attempts this hour. Redemption paused for the window.`,
-      )
+  try {
+    const globalOk = await bumpCounter(env, `rl:global:${hour}`, GLOBAL_LIMIT_PER_HOUR, 3_600_000)
+    if (!globalOk) {
+      // Circuit breaker tripped — with per-IP checked first, reaching this
+      // requires many distinct IPs (distributed brute-force). Alerting once
+      // per window would need extra state; an extra alert is harmless, so
+      // just fire best-effort on every tripped request.
+      if (env.DINGTALK_ACCESS_TOKEN) {
+        await sendDingTalkAlert(
+          env.DINGTALK_ACCESS_TOKEN,
+          `[MPP Router] 🚨 Coupon redeem global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} attempts this hour. Redemption paused for the window.`,
+        )
+      }
+      return rateLimited()
     }
+  } catch (err) {
+    console.warn(`[coupon] global counter error (fail closed): ${err instanceof Error ? err.message : String(err)}`)
     return rateLimited()
   }
 
