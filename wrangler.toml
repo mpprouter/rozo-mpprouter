@@ -99,6 +99,13 @@ X402_ENABLED = "true"
 #   - src/mpp/stellar-x402-server.ts:436  (buildX402PaymentRequiredHeader)
 STELLAR_X402_PAY_TO = "GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB"
 
+# Coupon admin endpoints (issue/resolve/get) kill switch. Public
+# redeem/status are always on. Deliberately separate from
+# ADMIN_ENDPOINT_ENABLED (which gates /admin/pay-invoice and stays
+# unset/off in production). Flip to "false" + redeploy to stop coupon
+# issuance instantly without touching secrets. See src/routes/coupon.ts.
+COUPON_ENDPOINT_ENABLED = "true"
+
 # Secrets (set via: wrangler secret put <NAME>)
 #
 # STELLAR_ROUTER_PUBLIC          — G... Router pool address (receives agent USDC via mppx)

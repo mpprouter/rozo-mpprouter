@@ -5,8 +5,9 @@ import { sendDingTalkAlert } from '../utils/dingtalk'
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
 // Rozo merchant `wallet_rozopay` and used as `destination.receiverAddress`
-// in create-invoice.ts.
-const FUNDER_WALLET = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
+// in create-invoice.ts. Exported for the coupon redemption path, which
+// gates on the same funder balance.
+export const FUNDER_WALLET = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
 
 const AGENTAPI_PAY_INVOICE_URL = 'https://agentapi.rozo.ai/pay-invoice'
 
@@ -148,7 +149,9 @@ function parseUsdcAtomic(decimal: string): bigint | null {
 // Computes the sum of pending (paying / payin_seen-not-yet-paid) invoice
 // amounts. Used to compute the "reserved" balance so concurrent invoices
 // don't all see the same funder balance and decide they can each pay.
-async function reservedAtomic(env: Env): Promise<bigint> {
+// Shared with the coupon redemption path (routes/coupon.ts) so webhook
+// fulfillments and coupon redemptions reserve against the same pool.
+export async function reservedAtomic(env: Env): Promise<bigint> {
   // Listing KV is expensive; instead we keep a running counter at a
   // single key. Bumped on 'paying' transition, decremented on 'paid' /
   // 'failed_*'. Updates are best-effort — a single read+write race
@@ -163,7 +166,7 @@ async function reservedAtomic(env: Env): Promise<bigint> {
   }
 }
 
-async function bumpReserved(env: Env, deltaAtomic: bigint): Promise<void> {
+export async function bumpReserved(env: Env, deltaAtomic: bigint): Promise<void> {
   const cur = await reservedAtomic(env)
   const next = cur + deltaAtomic
   await env.MPP_STORE.put(
@@ -265,7 +268,9 @@ export async function sendInvoiceFailureAlert(
   }
 }
 
-async function callAgentApiPayInvoice(
+// Shared with the coupon redemption path (routes/coupon.ts) — both flows
+// settle Coinbase links through the same agentapi pay-invoice call.
+export async function callAgentApiPayInvoice(
   env: Env,
   plId: string,
 ): Promise<{ ok: boolean; status: number; body: any }> {

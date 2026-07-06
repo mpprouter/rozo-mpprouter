@@ -28,6 +28,13 @@ import { handleAiPlugin } from './routes/ai-plugin'
 import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-admin'
 import { handleAdminSeedStore } from './routes/admin-seed-store'
 import { handleCreateInvoice } from './routes/create-invoice'
+import {
+  handleIssueCoupon,
+  handleRedeemCoupon,
+  handleCouponStatus,
+  handleResolveCoupon,
+  handleAdminGetCoupon,
+} from './routes/coupon'
 // P1-3: export DO class so wrangler can bind it via [[durable_objects.bindings]]
 export { AtomicStoreDO } from './mpp/atomic-store-do'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
@@ -107,6 +114,18 @@ export interface Env {
   PAYINVOICE_ADMIN_SECRET: string
   ADMIN_ENDPOINT_ENABLED?: string
 
+  // Coupon issuance secret (routes/coupon.ts). Deliberately separate from
+  // PAYINVOICE_ADMIN_SECRET: leaking the coupon-issuance key must not grant
+  // direct pay-invoice access, and vice versa.
+  // Set via: wrangler secret put ADMIN_TOKEN
+  ADMIN_TOKEN: string
+  // Kill switch for the coupon admin endpoints (issue/resolve/get). Separate
+  // from ADMIN_ENDPOINT_ENABLED (which gates /admin/pay-invoice and stays OFF
+  // in production) so enabling coupon issuance does not change the
+  // pay-invoice posture. "true" in wrangler.toml [vars]; flip + redeploy to
+  // stop issuance instantly without touching secrets.
+  COUPON_ENDPOINT_ENABLED?: string
+
   // Rozo Intents API key for creating discounted payment intents from
   // Coinbase Payment Links via POST /v1/services/rozo-agent-api/create-invoice.
   // Set via: wrangler secret put ROZO_INTENTS_API_KEY
@@ -184,6 +203,33 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Gated by x-admin-secret (same as /admin/pay-invoice).
       if (url.pathname === '/admin/seed-atomic-store') {
         return handleAdminSeedStore(request, env)
+      }
+
+      // Coupon redemption layer (routes/coupon.ts). Public redeem/status
+      // are brute-force-hardened (uniform errors + DO-backed rate limits);
+      // admin issue/resolve/get sit behind their own COUPON_ENDPOINT_ENABLED
+      // gate (NOT ADMIN_ENDPOINT_ENABLED, which stays off in production)
+      // plus the ADMIN_TOKEN secret.
+      if (url.pathname === '/coupon/redeem') {
+        return handleRedeemCoupon(request, env)
+      }
+      if (url.pathname === '/coupon/status') {
+        return handleCouponStatus(request, env)
+      }
+      if (
+        url.pathname === '/admin/coupon/issue' ||
+        url.pathname === '/admin/coupon/resolve' ||
+        url.pathname === '/admin/coupon/get'
+      ) {
+        if (env.COUPON_ENDPOINT_ENABLED !== 'true') {
+          return new Response(JSON.stringify({ error: 'Not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.pathname === '/admin/coupon/issue') return handleIssueCoupon(request, env)
+        if (url.pathname === '/admin/coupon/resolve') return handleResolveCoupon(request, env)
+        return handleAdminGetCoupon(request, env)
       }
 
       // Public quote-invoice endpoint — mirrors pay-invoice input contract but
