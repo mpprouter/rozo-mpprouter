@@ -240,8 +240,10 @@ describe('POST /coupon/redeem', () => {
     expect(body.status).toBe('redeemed')
     expect(calls.pay).toBe(1)
 
-    // Reserved counter must be back to zero after completion.
-    expect(await (env.MPP_STORE as any).get('funder-reserved-atomic')).toBe('0')
+    // The atomic funder reservation must be released after completion.
+    const doInst = (env.ATOMIC_STORE as any).instances.get('coupon')
+    const reserveRaw = doInst.store.get('funder-reserve')?.value
+    expect(JSON.parse(reserveRaw).entries).toEqual({})
   })
 
   it('is idempotent for the same (code, plId) after success', async () => {
@@ -345,6 +347,26 @@ describe('POST /coupon/redeem', () => {
     upstream.quoteStatus = 200
     const retry = await handleRedeemCoupon(redeemReq(code), env)
     expect(((await retry.json()) as any).status).toBe('redeemed')
+  })
+
+  it('two coupons racing a pool that covers only one: exactly one pays', async () => {
+    // Balance $25; two $20 coupons. The atomic check-and-reserve must let
+    // exactly one through — the non-atomic read-check-bump this replaces
+    // would have let BOTH pass the balance gate.
+    const { env, calls, fetchMock } = makeEnv({
+      balanceHex: '0x' + (25_000_000n).toString(16),
+    })
+    globalThis.fetch = fetchMock
+    const codeA = await issueCoupon(env)
+    const codeB = await issueCoupon(env)
+
+    const [rA, rB] = await Promise.all([
+      handleRedeemCoupon(redeemReq(codeA, undefined, '1.1.1.1'), env),
+      handleRedeemCoupon(redeemReq(codeB, undefined, '2.2.2.2'), env),
+    ])
+    const statuses = [rA.status, rB.status].sort()
+    expect(statuses).toEqual([200, 503])
+    expect(calls.pay).toBe(1)
   })
 
   it('insufficient funder balance → 503, coupon rolls back to issued', async () => {

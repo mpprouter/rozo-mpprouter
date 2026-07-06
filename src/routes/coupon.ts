@@ -52,7 +52,7 @@ import type { Env } from '../index'
 import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
 import { extractPaymentLinkId } from './pay-invoice-admin'
 import { parseUsdc, formatUsdc } from './create-invoice'
-import { callAgentApiPayInvoice, reservedAtomic, bumpReserved, FUNDER_WALLET } from './webhook'
+import { callAgentApiPayInvoice, reservedAtomic, FUNDER_WALLET } from './webhook'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 
@@ -244,6 +244,81 @@ async function bumpCounter(
     const windowStart = inWindow ? c.windowStart : now
     if (n >= limit) return { op: 'noop', result: false }
     return { op: 'set', value: JSON.stringify({ n: n + 1, windowStart }), result: true }
+  })
+}
+
+// ── Atomic funder reservation (coupon-side) ─────────────────────────────────
+//
+// The webhook path's KV-based reserved counter is read-then-write and openly
+// documents its race as acceptable for rare webhook concurrency. The public
+// redeem endpoint cannot accept that: two valid coupons redeemed concurrently
+// must not BOTH pass a balance check the pool can only cover once. So the
+// coupon side does check-and-reserve in a single CAS on the coupon DO:
+// the decision (balance - webhookReserved - couponReserved >= invoice) and
+// the reservation insert commit atomically. Entries carry a lease so a
+// worker death cannot leak a reservation forever (pay-invoice is a
+// synchronous few-second call; anything older than the lease is dead).
+//
+// The webhook path keeps its own KV counter and doesn't see in-flight coupon
+// reservations for the few seconds they exist — acceptable because agentapi
+// pay-invoice re-checks the funder balance itself as the final gate.
+
+const RESERVE_KEY = 'funder-reserve'
+const RESERVE_LEASE_MS = 10 * 60 * 1000
+
+interface ReserveState {
+  entries: Record<string, { amt: string; at: number }>
+}
+
+function parseReserve(raw: string | null): ReserveState {
+  if (!raw) return { entries: {} }
+  try {
+    const st = JSON.parse(raw) as ReserveState
+    return st && typeof st.entries === 'object' && st.entries ? st : { entries: {} }
+  } catch {
+    return { entries: {} }
+  }
+}
+
+/**
+ * Atomically: prune expired leases, compute available balance, and (only if
+ * sufficient) insert this attempt's reservation. Returns false when the pool
+ * cannot cover the invoice.
+ */
+async function tryReserveFunds(
+  env: Env,
+  attemptId: string,
+  invoiceAtomic: bigint,
+  balance: bigint,
+  webhookReserved: bigint,
+): Promise<boolean> {
+  const now = Date.now()
+  return casUpdate<boolean>(env, RESERVE_KEY, (raw) => {
+    const st = parseReserve(raw)
+    for (const [k, v] of Object.entries(st.entries)) {
+      if (now - v.at > RESERVE_LEASE_MS) delete st.entries[k]
+    }
+    let couponReserved = 0n
+    for (const v of Object.values(st.entries)) {
+      try {
+        couponReserved += BigInt(v.amt)
+      } catch {
+        /* corrupt entry — ignore */
+      }
+    }
+    const available = balance - webhookReserved - couponReserved
+    if (available < invoiceAtomic) return { op: 'noop', result: false }
+    st.entries[attemptId] = { amt: invoiceAtomic.toString(), at: now }
+    return { op: 'set', value: JSON.stringify(st), result: true }
+  })
+}
+
+async function releaseFunds(env: Env, attemptId: string): Promise<void> {
+  await casUpdate<null>(env, RESERVE_KEY, (raw) => {
+    const st = parseReserve(raw)
+    if (!(attemptId in st.entries)) return { op: 'noop', result: null }
+    delete st.entries[attemptId]
+    return { op: 'set', value: JSON.stringify(st), result: null }
   })
 }
 
@@ -736,21 +811,25 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     })
   }
 
-  // Step 3 — funder balance gate (same philosophy as the webhook path:
-  // if balance is unreadable, attempt anyway — agentapi gates internally).
+  // Step 3 — funder balance gate. The decision and the reservation commit in
+  // ONE CAS (tryReserveFunds) so concurrent redemptions of different coupons
+  // cannot both pass a check the pool only covers once. If balance is
+  // unreadable, attempt anyway without a reservation — same philosophy as the
+  // webhook path; agentapi re-checks the funder balance as the final gate.
   const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
   const balance = balanceResult.balance
+  let reservedFunds = false
   if (balance !== null) {
-    const reserved = await reservedAtomic(env)
-    const available = balance - reserved
-    if (available < invoiceAtomic) {
+    const webhookReserved = await reservedAtomic(env)
+    reservedFunds = await tryReserveFunds(env, attemptId, invoiceAtomic, balance, webhookReserved)
+    if (!reservedFunds) {
       await rollbackToIssued(
-        `insufficient funder balance: avail ${available} < invoice ${invoiceAtomic}`,
+        `insufficient funder balance: balance ${balance}, webhookReserved ${webhookReserved} < invoice ${invoiceAtomic}`,
       )
       if (env.DINGTALK_ACCESS_TOKEN) {
         await sendDingTalkAlert(
           env.DINGTALK_ACCESS_TOKEN,
-          `[MPP Router] 🚨 Coupon redeem BLOCKED: insufficient funder balance (avail ${formatUsdc(available < 0n ? 0n : available)} < invoice ${formatUsdc(invoiceAtomic)} USDC). Coupon ${code} rolled back to issued. Top up the funder wallet.`,
+          `[MPP Router] 🚨 Coupon redeem BLOCKED: insufficient funder balance (${formatUsdc(balance)} USDC on hand) for invoice ${formatUsdc(invoiceAtomic)} USDC. Coupon ${code} rolled back to issued. Top up the funder wallet.`,
         )
       }
       return json(503, {
@@ -777,20 +856,20 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     return { op: 'set', value: JSON.stringify(r), result: true }
   })
   if (!enteredPaying) {
+    if (reservedFunds) await releaseFunds(env, attemptId)
     return json(409, {
       error: 'STATE_CHANGED',
       message: 'The coupon state changed while processing (it may have been voided or claimed elsewhere). Check /coupon/status.',
     })
   }
 
-  await bumpReserved(env, invoiceAtomic)
   let payResult: { ok: boolean; status: number; body: any }
   try {
     payResult = await callAgentApiPayInvoice(env, plId)
   } catch (err: any) {
     payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }
   }
-  await bumpReserved(env, -invoiceAtomic)
+  if (reservedFunds) await releaseFunds(env, attemptId)
 
   // Finalization guard: only finalize OUR paying claim. If an admin touched
   // the record mid-payment (resolve), do not overwrite their decision — the
