@@ -119,6 +119,12 @@ export interface Env {
   // direct pay-invoice access, and vice versa.
   // Set via: wrangler secret put ADMIN_TOKEN
   ADMIN_TOKEN: string
+  // Kill switch for the coupon admin endpoints (issue/resolve/get). Separate
+  // from ADMIN_ENDPOINT_ENABLED (which gates /admin/pay-invoice and stays OFF
+  // in production) so enabling coupon issuance does not change the
+  // pay-invoice posture. "true" in wrangler.toml [vars]; flip + redeploy to
+  // stop issuance instantly without touching secrets.
+  COUPON_ENDPOINT_ENABLED?: string
 
   // Rozo Intents API key for creating discounted payment intents from
   // Coinbase Payment Links via POST /v1/services/rozo-agent-api/create-invoice.
@@ -201,8 +207,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
       // Coupon redemption layer (routes/coupon.ts). Public redeem/status
       // are brute-force-hardened (uniform errors + DO-backed rate limits);
-      // admin issue/resolve/get sit behind the ADMIN_ENDPOINT_ENABLED gate
-      // like /admin/pay-invoice, plus their own ADMIN_TOKEN secret.
+      // admin issue/resolve/get sit behind their own COUPON_ENDPOINT_ENABLED
+      // gate (NOT ADMIN_ENDPOINT_ENABLED, which stays off in production)
+      // plus the ADMIN_TOKEN secret.
       if (url.pathname === '/coupon/redeem') {
         return handleRedeemCoupon(request, env)
       }
@@ -214,7 +221,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         url.pathname === '/admin/coupon/resolve' ||
         url.pathname === '/admin/coupon/get'
       ) {
-        if (env.ADMIN_ENDPOINT_ENABLED !== 'true') {
+        if (env.COUPON_ENDPOINT_ENABLED !== 'true') {
           return new Response(JSON.stringify({ error: 'Not found' }), {
             status: 404,
             headers: { 'Content-Type': 'application/json' },
