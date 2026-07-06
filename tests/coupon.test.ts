@@ -72,6 +72,8 @@ interface UpstreamConfig {
   payStatus: number
   payBody: any
   balanceHex: string
+  /** Test hook: runs (once) when the quote call is made, before it returns. */
+  onQuote?: () => Promise<void>
 }
 
 function makeEnv(cfg: Partial<UpstreamConfig> = {}) {
@@ -89,6 +91,11 @@ function makeEnv(cfg: Partial<UpstreamConfig> = {}) {
     const url = String(input)
     if (url.includes('quote-invoice')) {
       calls.quote++
+      if (upstream.onQuote) {
+        const hook = upstream.onQuote
+        upstream.onQuote = undefined
+        await hook()
+      }
       return new Response(JSON.stringify(upstream.quoteBody), {
         status: upstream.quoteStatus,
         headers: { 'Content-Type': 'application/json' },
@@ -353,6 +360,27 @@ describe('POST /coupon/redeem', () => {
 
     const st = await handleCouponStatus(statusReq(code), env)
     expect(((await st.json()) as any).status).toBe('issued')
+  })
+
+  it('admin void racing a redeem (during quote) blocks the payment', async () => {
+    const { env, upstream, calls, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env)
+
+    // While the redeem request is quoting the invoice, an operator voids the
+    // coupon. The request must lose the paying transition and never pay.
+    upstream.onQuote = async () => {
+      const r = await handleResolveCoupon(resolveReq({ code, action: 'void' }), env)
+      expect(r.status).toBe(200)
+    }
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp.status).toBe(409)
+    expect(((await resp.json()) as any).error).toBe('STATE_CHANGED')
+    expect(calls.pay).toBe(0)
+
+    // And the coupon stays void.
+    const resp2 = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp2.status).toBe(400)
   })
 
   it('pay-invoice failure parks in manual_review (reported as processing), never auto-retries payment', async () => {

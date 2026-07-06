@@ -97,6 +97,13 @@ export interface CouponRecord {
   paymentProof: string | null
   /** Set on claim. */
   redeemingAt: string | null
+  /**
+   * Unique id of the in-flight claim (crypto.randomUUID). Every transition
+   * after the claim (rollback, paying, redeemed, manual_review) must verify
+   * it still owns the claim — a stale re-claim or an admin resolve replaces
+   * attemptId, which fences the previous request off the money path.
+   */
+  attemptId: string | null
   plId: string | null
   redeemedAt: string | null
   coinbaseResult: unknown | null
@@ -274,11 +281,18 @@ async function publicGate(request: Request, env: Env): Promise<Response | null> 
   const ip = request.headers.get('cf-connecting-ip') ?? 'unknown'
   const hour = Math.floor(Date.now() / 3_600_000)
 
+  // Per-IP FIRST: a request rejected by its own IP quota must not consume
+  // global budget, otherwise a single abusive IP could trip the circuit
+  // breaker and 429 every legitimate user for the rest of the window.
+  const ipOk = await bumpCounter(env, `rl:ip:${ip}`, IP_LIMIT_PER_HOUR, 3_600_000)
+  if (!ipOk) return rateLimited()
+
   const globalOk = await bumpCounter(env, `rl:global:${hour}`, GLOBAL_LIMIT_PER_HOUR, 3_600_000)
   if (!globalOk) {
-    // Circuit breaker tripped — likely a distributed brute-force. Alert once
-    // per window (piggyback on the counter value crossing the limit exactly
-    // is racy; an extra alert is harmless, so just fire best-effort).
+    // Circuit breaker tripped — with per-IP checked first, reaching this
+    // requires many distinct IPs (distributed brute-force). Alerting once
+    // per window would need extra state; an extra alert is harmless, so
+    // just fire best-effort on every tripped request.
     if (env.DINGTALK_ACCESS_TOKEN) {
       await sendDingTalkAlert(
         env.DINGTALK_ACCESS_TOKEN,
@@ -287,9 +301,6 @@ async function publicGate(request: Request, env: Env): Promise<Response | null> 
     }
     return rateLimited()
   }
-
-  const ipOk = await bumpCounter(env, `rl:ip:${ip}`, IP_LIMIT_PER_HOUR, 3_600_000)
-  if (!ipOk) return rateLimited()
 
   return null
 }
@@ -376,6 +387,7 @@ export async function handleIssueCoupon(request: Request, env: Env): Promise<Res
     expiresAt: new Date(now + expiresInMinutes * 60_000).toISOString(),
     paymentProof,
     redeemingAt: null,
+    attemptId: null,
     plId: null,
     redeemedAt: null,
     coinbaseResult: null,
@@ -439,6 +451,8 @@ export async function handleResolveCoupon(request: Request, env: Env): Promise<R
       const at = new Date().toISOString()
       if (action === 'void') {
         rec.status = 'void'
+        // Fence out any in-flight redeem request holding the old claim.
+        rec.attemptId = null
       } else if (action === 'release') {
         if (!['manual_review', 'redeeming', 'paying'].includes(rec.status)) {
           return {
@@ -448,6 +462,7 @@ export async function handleResolveCoupon(request: Request, env: Env): Promise<R
         }
         rec.status = 'issued'
         rec.redeemingAt = null
+        rec.attemptId = null
         rec.plId = null
       } else {
         // mark_redeemed
@@ -459,6 +474,7 @@ export async function handleResolveCoupon(request: Request, env: Env): Promise<R
         }
         rec.status = 'redeemed'
         rec.redeemedAt = at
+        rec.attemptId = null
       }
       rec.events.push({ kind: `admin_${action}`, at, detail: reason ? { reason } : undefined })
       return { op: 'set', value: JSON.stringify(rec), result: { ok: true, record: rec } }
@@ -556,6 +572,11 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   if (locked) return invalidCoupon()
 
   const nowIso = () => new Date().toISOString()
+  // Fences every post-claim transition: only the request holding this id may
+  // roll back, advance to paying, or finalize. A stale re-claim or an admin
+  // resolve overwrites attemptId, cutting the previous request off before it
+  // can move money.
+  const attemptId = crypto.randomUUID()
 
   // Step 1 — CAS claim: issued → redeeming. Everything that can fail before
   // this point returns the uniform error; after a successful claim the caller
@@ -575,6 +596,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       if (Date.parse(rec.expiresAt) < now) return { op: 'noop', result: { kind: 'rejected' } }
       rec.status = 'redeeming'
       rec.redeemingAt = nowIso()
+      rec.attemptId = attemptId
       rec.plId = plId
       rec.events.push({ kind: 'claim', at: rec.redeemingAt, detail: { plId } })
       return { op: 'set', value: JSON.stringify(rec), result: { kind: 'claimed', rec } }
@@ -585,8 +607,10 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       const stale = now - claimedAt > REDEEMING_STALE_MS
       if (stale) {
         // Abandoned claim (worker died before `paying`) — safe to re-claim:
-        // no pay-invoice call was made under the previous claim.
+        // no pay-invoice call was made under the previous claim. Taking over
+        // attemptId fences the previous request out of all later transitions.
         rec.redeemingAt = nowIso()
+        rec.attemptId = attemptId
         rec.plId = plId
         rec.events.push({ kind: 'reclaim', at: rec.redeemingAt, detail: { plId } })
         return { op: 'set', value: JSON.stringify(rec), result: { kind: 'claimed', rec } }
@@ -637,13 +661,18 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   const rec = claim.rec
   const faceAtomic = BigInt(rec.amountAtomic)
 
-  // Helper: roll the claim back to `issued`. ONLY legal before `paying`.
+  // Helper: roll OUR claim back to `issued`. ONLY legal before `paying`, and
+  // only if this request still owns the claim (attemptId match) — otherwise a
+  // slow request could roll back a newer claim that took over after staleness.
   const rollbackToIssued = async (reason: string) => {
     await casUpdate<null>(env, couponKey(code), (raw) => {
       const r = parseRecord(raw)
-      if (!r || r.status !== 'redeeming') return { op: 'noop', result: null }
+      if (!r || r.status !== 'redeeming' || r.attemptId !== attemptId) {
+        return { op: 'noop', result: null }
+      }
       r.status = 'issued'
       r.redeemingAt = null
+      r.attemptId = null
       r.plId = null
       r.events.push({ kind: 'rollback', at: nowIso(), detail: { reason } })
       return { op: 'set', value: JSON.stringify(r), result: null }
@@ -734,13 +763,25 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // Step 4 — point of no return: redeeming → paying. From here on, failure
   // NEVER rolls back to issued (the pay call may have succeeded upstream even
   // when we see an error). Ambiguity parks in manual_review + ops alert.
-  await casUpdate<null>(env, couponKey(code), (raw) => {
+  //
+  // The transition must be WON, not assumed: if an admin voided/released the
+  // coupon (or a stale re-claim took over) while we were quoting / checking
+  // balance, our claim is gone and we must NOT move money.
+  const enteredPaying = await casUpdate<boolean>(env, couponKey(code), (raw) => {
     const r = parseRecord(raw)
-    if (!r || r.status !== 'redeeming') return { op: 'noop', result: null }
+    if (!r || r.status !== 'redeeming' || r.attemptId !== attemptId) {
+      return { op: 'noop', result: false }
+    }
     r.status = 'paying'
     r.events.push({ kind: 'paying', at: nowIso() })
-    return { op: 'set', value: JSON.stringify(r), result: null }
+    return { op: 'set', value: JSON.stringify(r), result: true }
   })
+  if (!enteredPaying) {
+    return json(409, {
+      error: 'STATE_CHANGED',
+      message: 'The coupon state changed while processing (it may have been voided or claimed elsewhere). Check /coupon/status.',
+    })
+  }
 
   await bumpReserved(env, invoiceAtomic)
   let payResult: { ok: boolean; status: number; body: any }
@@ -751,16 +792,32 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   }
   await bumpReserved(env, -invoiceAtomic)
 
-  if (payResult.ok) {
-    const finalRec = await casUpdate<CouponRecord | null>(env, couponKey(code), (raw) => {
+  // Finalization guard: only finalize OUR paying claim. If an admin touched
+  // the record mid-payment (resolve), do not overwrite their decision — the
+  // payment still happened, so alert for a manual reconcile instead.
+  const finalize = (mutate: (r: CouponRecord) => void) =>
+    casUpdate<CouponRecord | null>(env, couponKey(code), (raw) => {
       const r = parseRecord(raw)
-      if (!r) return { op: 'noop', result: null }
+      if (!r || r.status !== 'paying' || r.attemptId !== attemptId) {
+        return { op: 'noop', result: null }
+      }
+      mutate(r)
+      return { op: 'set', value: JSON.stringify(r), result: r }
+    })
+
+  if (payResult.ok) {
+    const finalRec = await finalize((r) => {
       r.status = 'redeemed'
       r.redeemedAt = nowIso()
       r.coinbaseResult = payResult.body
-      r.events.push({ kind: 'pay_invoice_succeeded', at: r.redeemedAt, detail: { status: payResult.status } })
-      return { op: 'set', value: JSON.stringify(r), result: r }
+      r.events.push({ kind: 'pay_invoice_succeeded', at: r.redeemedAt!, detail: { status: payResult.status } })
     })
+    if (!finalRec && env.DINGTALK_ACCESS_TOKEN) {
+      await sendDingTalkAlert(
+        env.DINGTALK_ACCESS_TOKEN,
+        `[MPP Router] ⚠️ Coupon ${code} paid successfully but its record was modified mid-payment (admin resolve?). Reconcile manually: invoice ${plId} IS settled.`,
+      )
+    }
     return json(200, {
       ok: true,
       status: 'redeemed',
@@ -772,9 +829,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   }
 
   // Failure after the pay attempt — ambiguous by definition. Park it.
-  await casUpdate<null>(env, couponKey(code), (raw) => {
-    const r = parseRecord(raw)
-    if (!r) return { op: 'noop', result: null }
+  const parked = await finalize((r) => {
     r.status = 'manual_review'
     r.failureReason = `agentapi pay-invoice ${payResult.status}`
     r.events.push({
@@ -782,8 +837,13 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       at: nowIso(),
       detail: { status: payResult.status, body: payResult.body },
     })
-    return { op: 'set', value: JSON.stringify(r), result: null }
   })
+  if (!parked && env.DINGTALK_ACCESS_TOKEN) {
+    await sendDingTalkAlert(
+      env.DINGTALK_ACCESS_TOKEN,
+      `[MPP Router] ⚠️ Coupon ${code}: pay-invoice failed (${payResult.status}) AND the record was modified mid-payment. Reconcile ${plId} manually.`,
+    )
+  }
   if (env.DINGTALK_ACCESS_TOKEN) {
     await sendDingTalkAlert(
       env.DINGTALK_ACCESS_TOKEN,
