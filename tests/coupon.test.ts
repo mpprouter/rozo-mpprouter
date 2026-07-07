@@ -212,7 +212,7 @@ describe('POST /admin/coupon/issue', () => {
     }
   })
 
-  it('issues an 8-digit code with ~60min default expiry', async () => {
+  it('issues an 8-digit code with ~12h default expiry', async () => {
     const { env, fetchMock } = makeEnv()
     globalThis.fetch = fetchMock
     const resp = await handleIssueCoupon(issueReq({ amountUsd: '20' }), env)
@@ -221,8 +221,8 @@ describe('POST /admin/coupon/issue', () => {
     expect(body.code).toMatch(/^\d{8}$/)
     expect(body.amountUsd).toBe('20')
     const ttlMs = Date.parse(body.expiresAt) - Date.now()
-    expect(ttlMs).toBeGreaterThan(55 * 60_000)
-    expect(ttlMs).toBeLessThan(65 * 60_000)
+    expect(ttlMs).toBeGreaterThan(11.9 * 3_600_000)
+    expect(ttlMs).toBeLessThan(12.1 * 3_600_000)
   })
 })
 
@@ -305,7 +305,7 @@ describe('POST /coupon/redeem', () => {
     globalThis.fetch = fetchMock
     const code = await issueCoupon(env)
 
-    vi.advanceTimersByTime(61 * 60_000) // past the 60-minute default expiry
+    vi.advanceTimersByTime(12 * 3_600_000 + 60_000) // past the 12h default expiry
     const resp = await handleRedeemCoupon(redeemReq(code), env)
     expect(resp.status).toBe(400)
     const body: any = await resp.json()

@@ -58,7 +58,11 @@ import { sendDingTalkAlert } from '../utils/dingtalk'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
-const DEFAULT_EXPIRES_MINUTES = 60
+// 12h (founder 2026-07-07): long enough that a Goofish buyer can redeem at
+// their leisure, while the global circuit breaker (not the TTL) caps total
+// brute-force attempts — at 500/h global, a 12h window allows at most 6000
+// guesses network-wide (~0.06% hit chance with 10 live coupons in 10^8 space).
+const DEFAULT_EXPIRES_MINUTES = 12 * 60
 // Fat-finger guard on issuance. Goofish orders are typically $5–$50.
 const MAX_FACE_VALUE_ATOMIC = 200_000_000n // $200
 // A `redeeming` claim older than this is considered abandoned (worker died
