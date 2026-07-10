@@ -534,7 +534,10 @@ export async function handleIssueCoupon(request: Request, env: Env): Promise<Res
         // auto-submit; see that file's comments). Hardcoded prod domain,
         // deliberately not an env var — this is a public-facing marketing
         // domain, not an infra endpoint that changes per environment.
-        claimUrl: `https://open.rozo.ai/claim?code=${code}`,
+        // UTM params attribute claim-page visits/conversions to the
+        // coupon channel (Goofish resellers) in analytics; the claim
+        // page ignores unknown query params, so this is display-safe.
+        claimUrl: `https://open.rozo.ai/claim?code=${code}&utm_source=goofish&utm_medium=coupon`,
       })
     }
   }

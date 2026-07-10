@@ -222,7 +222,10 @@ describe('POST /admin/coupon/issue', () => {
     expect(body.amountUsd).toBe('20')
     // 2026-07-07: claimUrl lets operators hand out a clickable prefill link
     // instead of a bare code (open.rozo.ai/claim reads ?code= into the pin field).
-    expect(body.claimUrl).toBe(`https://open.rozo.ai/claim?code=${body.code}`)
+    // UTM params attribute claim-page traffic to the coupon channel.
+    expect(body.claimUrl).toBe(
+      `https://open.rozo.ai/claim?code=${body.code}&utm_source=goofish&utm_medium=coupon`,
+    )
     const ttlMs = Date.parse(body.expiresAt) - Date.now()
     expect(ttlMs).toBeGreaterThan(11.9 * 3_600_000)
     expect(ttlMs).toBeLessThan(12.1 * 3_600_000)
