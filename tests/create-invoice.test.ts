@@ -228,44 +228,229 @@ describe('resolveSource', () => {
   })
 })
 
-// ── P0-1: Stripe rejection must NEVER echo the URL or /pay/<blob> ────────────
-// The 501 returned for a Stripe crypto URL must not include normalized_input,
-// the raw URL, or the replayable session blob. Regression test for the
-// codex-flagged session-hash leak.
-describe('handleCreateInvoice — Stripe URL rejection (P0-1)', () => {
-  const STRIPE_URL =
-    'https://crypto.stripe.com/pay/CDMSuperSecretReplayableBlob_ABC123xyz'
+// ── Stripe create-invoice must NEVER echo the URL or /pay/<blob> ─────────────
+// create-invoice now resolves the Stripe session and (on success) creates a
+// Rozo intent. Whatever the outcome (success, unpayable, expired, upstream
+// error), the response must never contain the URL, the /pay/ path, or the
+// replayable session blob. Regression test for the codex-flagged session-hash
+// leak.
+describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
+  const BLOB = 'CDMSuperSecretReplayableBlob_ABC123xyz'
+  const STRIPE_URL = `https://crypto.stripe.com/pay/${BLOB}`
 
   function makeEnv() {
     return {
       PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
       ROZO_INTENTS_API_KEY: 'test-key',
+      MPP_STORE: makeKvStub(),
+      ATOMIC_STORE: makeDoStub(),
+      // AES-256 key (base64 of 32 bytes) so seedStripeRecord can encrypt the
+      // capability instead of failing closed.
+      INVOICE_CAPABILITY_ENCRYPTION_KEY: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
     } as unknown as import('../src/index').Env
   }
 
-  async function callWith(url: string) {
+  // Minimal in-memory KV stub.
+  function makeKvStub() {
+    const store = new Map<string, string>()
+    return {
+      get: async (k: string) => store.get(k) ?? null,
+      put: async (k: string, v: string) => void store.set(k, v),
+    }
+  }
+
+  // Minimal AtomicStoreDO stub (/read + /commit CAS) for seedStripeRecord.
+  function makeDoStub() {
+    const store = new Map<string, string>()
+    const versions = new Map<string, number>()
+    const stub = {
+      async fetch(req: Request) {
+        const url = new URL(req.url)
+        const b: any = await req.json()
+        if (url.pathname === '/read') {
+          return Response.json({ value: store.get(b.key) ?? null, version: versions.get(b.key) ?? 0 })
+        }
+        const cur = versions.get(b.key) ?? 0
+        if (cur !== b.expectedVersion) {
+          return Response.json({ ok: false, value: store.get(b.key) ?? null, version: cur })
+        }
+        if (b.op === 'set') store.set(b.key, b.value)
+        else store.delete(b.key)
+        versions.set(b.key, b.expectedVersion + 1)
+        return Response.json({ ok: true })
+      },
+    }
+    return { idFromName: (n: string) => ({ name: n }), get: () => stub }
+  }
+
+  async function callWith(url: string, env = makeEnv()) {
     const { handleCreateInvoice } = await import('../src/routes/create-invoice')
     const req = new Request('https://mpp.test/create-invoice', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ url }),
     })
-    const res = await handleCreateInvoice(req, makeEnv())
+    const res = await handleCreateInvoice(req, env)
     const body = await res.text()
     return { status: res.status, body }
   }
 
-  it('returns 501 for a Stripe URL without leaking the URL or blob', async () => {
-    const { status, body } = await callWith(STRIPE_URL)
-    expect(status).toBe(501)
-    // The full URL, the /pay/ path, and the opaque blob must all be absent.
+  function assertNoLeak(body: string) {
     expect(body).not.toContain('crypto.stripe.com')
-    expect(body).not.toContain('CDMSuperSecretReplayableBlob_ABC123xyz')
+    expect(body).not.toContain(BLOB)
     expect(body).not.toContain('/pay/')
     expect(body).not.toContain('normalized_input')
-    // It should still be a helpful, provider-tagged response.
-    const json = JSON.parse(body)
-    expect(json.provider).toBe('stripe_crypto')
-    expect(json.code).toBe('QUOTE_FETCH_FAILED')
+  }
+
+  it('never leaks the URL/blob when Stripe resolution fails (fake blob)', async () => {
+    // A fake blob makes resume_payin_session 404 -> StripeResolveError; the
+    // response must still be blob-free and provider-tagged.
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response('not found', { status: 404 })) as typeof fetch
+    try {
+      const { status, body } = await callWith(STRIPE_URL)
+      // 410 expired (Stripe 404 maps to expired) — the exact code isn't the
+      // point; the no-leak invariant is.
+      expect([410, 502]).toContain(status)
+      assertNoLeak(body)
+      const json = JSON.parse(body)
+      expect(json.provider).toBe('stripe_crypto')
+      expect(json.ok).toBe(false)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('never leaks the URL/blob on the success path (mocked Stripe + Rozo)', async () => {
+    const env = makeEnv()
+    const originalFetch = globalThis.fetch
+    // Mock: resume_payin_session -> query payin_session -> Rozo order lookup
+    // (404 miss) -> Rozo create intent.
+    globalThis.fetch = (async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('/resume_payin_session')) {
+        return new Response(
+          JSON.stringify({
+            sessionId: 'cpis_test123',
+            clientSecret: 'cs_secret_should_never_leak',
+            publishableKey: 'pk_live_should_never_leak',
+            mode: 'pay',
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payin_session')) {
+        return new Response(
+          JSON.stringify({
+            id: 'cpis_test123',
+            state: 'checkout',
+            business_name: 'Test Merchant',
+            merchant: 'acct_test',
+            payment_details: { amount: 1000, currency: 'usd' },
+            supported_currencies: [
+              {
+                id: 'usdc.base',
+                chain_id: 8453,
+                currency_network: 'base',
+                mainnet: true,
+                asset_code: 'usdc',
+                currency_minor_units: 6,
+                contract_address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+                payment_options: ['wallet_connect'],
+              },
+            ],
+            valid_before: '2999-01-01T00:00:00.000Z',
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payments/order/')) {
+        return new Response('not found', { status: 404 }) // idempotency miss
+      }
+      if (u.includes('/payment-api')) {
+        return new Response(
+          JSON.stringify({ id: 'rozo-pay-1', paymentLink: 'https://pay.rozo.ai/x', expiresAt: '2999-01-01T00:00:00.000Z' }),
+          { status: 200 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const { status, body } = await callWith(STRIPE_URL, env)
+      expect(status).toBe(200)
+      assertNoLeak(body)
+      // client_secret / publishable key must never leak either.
+      expect(body).not.toContain('cs_secret_should_never_leak')
+      expect(body).not.toContain('pk_live_should_never_leak')
+      const json = JSON.parse(body)
+      expect(json.provider).toBe('stripe_crypto')
+      expect(json.invoiceKey).toBe('cpis_test123')
+      expect(json.merchantAccount).toBe('acct_test')
+      // discount applied: invoice $10 -> caller pays $9.52 (10*100/105).
+      expect(json.callerPays).toBe('9.523809')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('fails closed (503, no payable link) when the capability key is unset (P1-1)', async () => {
+    const env = makeEnv()
+    // Remove the capability key: seedStripeRecord must refuse rather than store
+    // the replayable URL in plaintext, and create-invoice must NOT hand back a
+    // payable Rozo link for an order it can never settle.
+    ;(env as any).INVOICE_CAPABILITY_ENCRYPTION_KEY = undefined
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('/resume_payin_session')) {
+        return new Response(
+          JSON.stringify({ sessionId: 'cpis_test123', clientSecret: 'cs_x', publishableKey: 'pk_x', mode: 'pay' }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payin_session')) {
+        return new Response(
+          JSON.stringify({
+            id: 'cpis_test123',
+            state: 'checkout',
+            business_name: 'Test Merchant',
+            merchant: 'acct_test',
+            payment_details: { amount: 1000, currency: 'usd' },
+            supported_currencies: [
+              {
+                id: 'usdc.base',
+                chain_id: 8453,
+                currency_network: 'base',
+                mainnet: true,
+                asset_code: 'usdc',
+                currency_minor_units: 6,
+                contract_address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+                payment_options: ['wallet_connect'],
+              },
+            ],
+            valid_before: '2999-01-01T00:00:00.000Z',
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payments/order/')) return new Response('not found', { status: 404 })
+      if (u.includes('/payment-api')) {
+        return new Response(
+          JSON.stringify({ id: 'rozo-pay-1', paymentLink: 'https://pay.rozo.ai/x', expiresAt: '2999-01-01T00:00:00.000Z' }),
+          { status: 200 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const { status, body } = await callWith(STRIPE_URL, env)
+      expect(status).toBe(503)
+      // No payable link handed back.
+      expect(body).not.toContain('pay.rozo.ai')
+      assertNoLeak(body)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 })

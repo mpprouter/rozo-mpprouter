@@ -1,6 +1,13 @@
 import type { Env } from '../index'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { sendDingTalkAlert } from '../utils/dingtalk'
+import {
+  isStripeOrderId,
+  handleStripeWebhookEvent,
+  invoiceKeyFromOrderId,
+  loadStripeRecordForStatus,
+  pickStripeRouterStateSafe,
+} from './stripe-fulfillment'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -370,6 +377,26 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
     expirationTtl: 60 * 60 * 24 * 7,
   })
 
+  // 5b. Provider routing. Stripe Crypto invoices use a provider-qualified
+  // orderId (stripe_crypto_cpis_*) + a separate KV namespace + a per-invoice
+  // reservation guard. Coinbase (pl_*) falls through to the unchanged logic
+  // below. This keeps the two providers fully isolated (design §9 Layer 1/2).
+  if (isStripeOrderId(plId)) {
+    const summary = await handleStripeWebhookEvent(
+      env,
+      {
+        eventId,
+        eventType,
+        orderId: plId,
+        rozoPaymentId,
+        invoiceAmountStr:
+          evt.data?.destination?.amount ?? evt.data?.source?.amount ?? null,
+      },
+      new Date(now),
+    )
+    return json(200, summary)
+  }
+
   // 6. Load or create fulfillment record.
   let rec = await loadRecord(env, plId)
   if (!rec) rec = emptyRecord(plId)
@@ -669,6 +696,36 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
   let rozoId =
     url.searchParams.get('rozo_payment_id') ?? url.searchParams.get('id') ?? null
 
+  // Stripe Crypto branch (design §11). Accepts invoice_key=cpis_*, or a
+  // payment_id/pl that is a cpis_ session id or a stripe_crypto_ orderId.
+  const invoiceKeyParam = url.searchParams.get('invoice_key')
+  const stripeKeyCandidate =
+    invoiceKeyParam ??
+    (plId && (plId.startsWith('cpis_') || isStripeOrderId(plId)) ? plId : null)
+  if (stripeKeyCandidate) {
+    const invoiceKey = isStripeOrderId(stripeKeyCandidate)
+      ? invoiceKeyFromOrderId(stripeKeyCandidate)
+      : stripeKeyCandidate
+    const stripeRec = await loadStripeRecordForStatus(env, invoiceKey)
+    let rozoPayment: any = null
+    const rid = rozoId ?? stripeRec?.rozoPaymentId ?? null
+    if (rid) rozoPayment = await fetchRozoPaymentById(env, rid)
+    if (!stripeRec && !rozoPayment) {
+      return json(404, {
+        ok: false,
+        error: 'no Stripe fulfillment record or Rozo payment found',
+        provider: 'stripe_crypto',
+      })
+    }
+    return json(200, {
+      ok: true,
+      provider: 'stripe_crypto',
+      invoiceKey,
+      routerState: pickStripeRouterStateSafe(stripeRec),
+      rozoPayment: pickRozoCallerSafe(rozoPayment),
+    })
+  }
+
   // Accept payment_id with a uuid value (some callers will paste the
   // Rozo payment id into payment_id without knowing the convention).
   if (plId && !isPlId(plId) && /^[0-9a-f-]{36}$/i.test(plId)) {
@@ -678,7 +735,7 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
 
   if (!plId && !rozoId) {
     return json(400, {
-      error: 'provide payment_id=pl_* (Coinbase) or rozo_payment_id=<uuid> (Rozo)',
+      error: 'provide payment_id=pl_* (Coinbase), invoice_key=cpis_* (Stripe), or rozo_payment_id=<uuid>',
     })
   }
 
