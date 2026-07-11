@@ -227,3 +227,45 @@ describe('resolveSource', () => {
     expect(r.error?.code).toBe('INVALID_SOURCE')
   })
 })
+
+// ── P0-1: Stripe rejection must NEVER echo the URL or /pay/<blob> ────────────
+// The 501 returned for a Stripe crypto URL must not include normalized_input,
+// the raw URL, or the replayable session blob. Regression test for the
+// codex-flagged session-hash leak.
+describe('handleCreateInvoice — Stripe URL rejection (P0-1)', () => {
+  const STRIPE_URL =
+    'https://crypto.stripe.com/pay/CDMSuperSecretReplayableBlob_ABC123xyz'
+
+  function makeEnv() {
+    return {
+      PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
+      ROZO_INTENTS_API_KEY: 'test-key',
+    } as unknown as import('../src/index').Env
+  }
+
+  async function callWith(url: string) {
+    const { handleCreateInvoice } = await import('../src/routes/create-invoice')
+    const req = new Request('https://mpp.test/create-invoice', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url }),
+    })
+    const res = await handleCreateInvoice(req, makeEnv())
+    const body = await res.text()
+    return { status: res.status, body }
+  }
+
+  it('returns 501 for a Stripe URL without leaking the URL or blob', async () => {
+    const { status, body } = await callWith(STRIPE_URL)
+    expect(status).toBe(501)
+    // The full URL, the /pay/ path, and the opaque blob must all be absent.
+    expect(body).not.toContain('crypto.stripe.com')
+    expect(body).not.toContain('CDMSuperSecretReplayableBlob_ABC123xyz')
+    expect(body).not.toContain('/pay/')
+    expect(body).not.toContain('normalized_input')
+    // It should still be a helpful, provider-tagged response.
+    const json = JSON.parse(body)
+    expect(json.provider).toBe('stripe_crypto')
+    expect(json.code).toBe('QUOTE_FETCH_FAILED')
+  })
+})

@@ -240,7 +240,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid JSON body' })
   }
 
-  const { normalized, error, link_id_detected } = normalizePayInvoiceBody(parsed)
+  const { normalized, error, link_id_detected, provider_detected } =
+    normalizePayInvoiceBody(parsed)
   if (!normalized || error) {
     return errorResponse(400, {
       code: error?.code ?? 'INVALID_INPUT',
@@ -249,6 +250,24 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       normalized_input: error?.normalized_input,
       link_id_detected: link_id_detected ?? null,
       route_capabilities: error?.route_capabilities,
+    })
+  }
+
+  // Stripe crypto create-invoice (quote + intent) is Phase B: the Stripe quote
+  // adapter lives in the agentapi/pay-invoice edge function, and fulfillment
+  // is money movement gated on founder approval. Until that ships, direct
+  // Stripe callers to the read-only detail endpoint rather than half-creating
+  // an intent that can never be fulfilled. Coinbase is unaffected.
+  if (provider_detected === 'stripe_crypto') {
+    // SECURITY: never echo the Stripe URL or /pay/<blob> session hash back —
+    // the blob is replayable to resume a live session. Return only a
+    // provider tag + a static message, no normalized_input, no url.
+    return json(501, {
+      error:
+        'Stripe crypto create-invoice is not yet enabled. Use ' +
+        '/v1/services/rozo-agent-api/invoice-details for read-only Stripe invoice detail.',
+      code: 'QUOTE_FETCH_FAILED',
+      provider: 'stripe_crypto',
     })
   }
 

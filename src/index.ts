@@ -38,6 +38,7 @@ import {
 // P1-3: export DO class so wrangler can bind it via [[durable_objects.bindings]]
 export { AtomicStoreDO } from './mpp/atomic-store-do'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
+import { handleInvoiceDetails } from './routes/invoice-details'
 import { handlePreflight, withCors } from './utils/cors'
 
 export interface Env {
@@ -257,6 +258,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // caller-safe state (router KV + Rozo reconciliation).
       if (url.pathname === '/v1/services/rozo-agent-api/invoice-status') {
         return handleInvoiceStatus(request, env)
+      }
+
+      // Public read-only invoice detail — resolves a Coinbase or Stripe
+      // invoice URL to normalized, non-secret merchant/amount/state data.
+      // Moves no money; rate-limited per-IP and per-session.
+      if (url.pathname === '/v1/services/rozo-agent-api/invoice-details') {
+        return handleInvoiceDetails(request, env)
       }
 
       // Async job polling — must match before the catch-all proxy route.
