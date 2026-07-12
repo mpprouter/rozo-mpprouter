@@ -313,8 +313,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return handleProxy(request, env, ctx)
       }
 
+      // Unknown path — return a real 404 (not a soft-404 with status 200) so
+      // search engines do not treat stray URLs like /sitemap.xml as valid
+      // pages. Body stays machine/human-readable and lists the real entry
+      // points for discovery.
       return new Response(
         'MPP Router - Stellar + x402 Payment Proxy\n\n' +
+        'Not found: ' + url.pathname + '\n\n' +
         'Endpoints:\n' +
         '  GET /health                          - Pool status\n' +
         '  GET /services                        - Public service catalog\n' +
@@ -328,7 +333,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         '  GET  /v1/services/<svc>/jobs/<id>/challenge - Get ownership nonce\n' +
         '  GET  /v1/services/<svc>/jobs/<id>   - Poll async job (signed)\n\n' +
         'Docs: https://mpprouter.dev\n',
-        { status: 200, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+        { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       )
     } catch (error: any) {
       console.error('[error]', error.message, error.stack)

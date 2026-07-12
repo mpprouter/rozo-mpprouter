@@ -55,6 +55,11 @@ export function handlePreflight(request: Request): Response {
 export function withCors(request: Request, response: Response): Response {
   const headers = new Headers(response.headers)
   for (const [k, v] of Object.entries(corsHeaders(request))) headers.set(k, v)
+  // Keep this API domain out of search indexes. apiserver.mpprouter.dev is a
+  // machine-facing gateway, not a page for humans to find via Google. This
+  // header only affects search-engine crawlers; it does not change anything
+  // for agent / API consumers (which never read X-Robots-Tag).
+  headers.set('x-robots-tag', 'noindex, nofollow')
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
