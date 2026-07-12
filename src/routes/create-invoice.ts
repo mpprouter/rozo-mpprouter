@@ -4,6 +4,12 @@ import {
   type PayInvoiceErrorCode,
   type PayInvoiceError,
 } from './pay-invoice-admin'
+import {
+  resolveStripeInvoice,
+  StripeResolveError,
+  type NormalizedInvoice,
+} from './invoice-provider'
+import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
@@ -240,7 +246,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid JSON body' })
   }
 
-  const { normalized, error, link_id_detected } = normalizePayInvoiceBody(parsed)
+  const { normalized, error, link_id_detected, provider_detected } =
+    normalizePayInvoiceBody(parsed)
   if (!normalized || error) {
     return errorResponse(400, {
       code: error?.code ?? 'INVALID_INPUT',
@@ -250,6 +257,22 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       link_id_detected: link_id_detected ?? null,
       route_capabilities: error?.route_capabilities,
     })
+  }
+
+  // Stripe crypto create-invoice: resolve the session, create/reuse a Rozo
+  // intent, and seed the locked fulfillment record. Fulfillment itself is
+  // money movement done by the (disabled-by-default) Supabase pay-invoice
+  // Stripe branch, driven later by the webhook. Coinbase is unaffected.
+  if (provider_detected === 'stripe_crypto') {
+    const stripeUrl = (normalized as { url?: string }).url
+    if (!stripeUrl) {
+      // Should be unreachable: provider_detected requires a URL. Never echo it.
+      return errorResponse(400, {
+        code: 'INVALID_INPUT',
+        message: 'Stripe invoice requires a url.',
+      })
+    }
+    return handleStripeCreateInvoice(stripeUrl, env)
   }
 
   // Source override (optional). If caller provided `source`, validate against
@@ -511,5 +534,214 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     },
     ...(source.warnings.length ? { warnings: source.warnings } : {}),
     raw: intentsJson,
+  })
+}
+
+// ── Stripe Crypto create-invoice ────────────────────────────────────────────
+//
+// Resolves the Stripe session (read-only, via invoice-provider), applies the
+// same discount formula as Coinbase, creates/reuses a Rozo intent under a
+// provider-qualified orderId, and seeds the locked fulfillment record so the
+// webhook can settle later WITHOUT trusting the Rozo webhook payload to carry
+// metadata. Moves no money here.
+//
+// SECURITY: the Stripe URL carries a replayable /pay/<blob> session hash. It is
+// stored ONLY in the seeded KV record (never in Rozo metadata, never in any
+// response, never logged). The Rozo metadata carries only the non-secret locked
+// fields (design §6).
+export async function handleStripeCreateInvoice(stripeUrl: string, env: Env): Promise<Response> {
+  // 1. Resolve the session (read-only).
+  let invoice: NormalizedInvoice
+  try {
+    invoice = await resolveStripeInvoice(stripeUrl)
+  } catch (err) {
+    if (err instanceof StripeResolveError) {
+      const status =
+        err.kind === 'invalid_url'
+          ? 400
+          : err.kind === 'expired'
+            ? 410
+            : err.kind === 'unsupported'
+              ? 422
+              : 502
+      // err.message is authored to be address/secret-free by construction.
+      return json(status, { ok: false, provider: 'stripe_crypto', error: err.message, reason: err.kind })
+    }
+    return json(502, { ok: false, provider: 'stripe_crypto', error: 'Failed to resolve Stripe invoice' })
+  }
+
+  // 2. Refuse to create an unfulfillable order (design §12: 422 no wallet_connect).
+  if (!invoice.payable) {
+    return json(422, {
+      ok: false,
+      provider: 'stripe_crypto',
+      invoiceKey: invoice.invoiceKey,
+      error: 'Stripe invoice is not payable under Phase 1 constraints.',
+      reason: invoice.payableReason,
+    })
+  }
+
+  // 3. Discount (unchanged formula; founder decision: Stripe keeps it).
+  let invoiceAtomic: bigint
+  try {
+    invoiceAtomic = BigInt(invoice.stablecoinAmountAtomic)
+  } catch {
+    return json(502, { ok: false, provider: 'stripe_crypto', error: 'Unparseable invoice amount.' })
+  }
+  if (invoiceAtomic <= 0n) {
+    return json(422, { ok: false, provider: 'stripe_crypto', error: 'Invoice amount must be positive.' })
+  }
+  const callerPaysAtomic = computeCallerPaysAtomic(invoiceAtomic)
+  const discountAtomic = invoiceAtomic - callerPaysAtomic
+  const callerPays = formatUsdc(callerPaysAtomic)
+  const originalStr = formatUsdc(invoiceAtomic)
+  const discountStr = formatUsdc(discountAtomic)
+  const title = buildTitle(invoice.merchantTitle, invoiceAtomic, callerPaysAtomic)
+
+  // 4. Provider-qualified orderId (design §6): stripe_crypto_<cpis_*>.
+  const orderId = stripeOrderId(invoice.invoiceKey)
+
+  // 5. Idempotency: reuse an existing, still-valid Rozo intent for this order.
+  let existing: any = null
+  try {
+    const lookup = await fetch(
+      `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(ROZO_APP_ID)}/${encodeURIComponent(orderId)}`,
+      { method: 'GET', headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
+    )
+    if (lookup.ok) {
+      const found: any = await lookup.json().catch(() => null)
+      const expiresAt: string | null = found?.expiresAt ?? null
+      if (found && expiresAt && Date.parse(expiresAt) > Date.now()) existing = found
+    }
+  } catch {
+    // Non-fatal — fall through to create.
+  }
+
+  // 6. Locked metadata (design §6). NO url / session hash / secrets.
+  const lockedMetadata = {
+    source: 'mpprouter-create-invoice',
+    invoiceProvider: 'stripe_crypto',
+    invoiceKey: invoice.invoiceKey,
+    invoiceLockFingerprint: invoice.lockFingerprint,
+    merchantAccount: invoice.merchantAccount,
+    invoiceAmountAtomic: invoice.stablecoinAmountAtomic,
+    invoiceCurrency: invoice.fiatCurrency,
+    settlementChainId: SETTLEMENT_CHAIN_ID,
+    settlementToken: 'USDC',
+  }
+
+  let rozoPaymentId: string | null
+  let paymentLink: string | null
+  let expiresAt: string | null
+  let reused: boolean
+
+  if (existing) {
+    rozoPaymentId = existing?.id ?? null
+    paymentLink = existing?.paymentLink ?? existing?.url ?? existing?.payment_link ?? null
+    expiresAt = existing?.expiresAt ?? null
+    reused = true
+  } else {
+    // 7. Create the Rozo intent. Caller pays the discounted amount on Base USDC;
+    // settlement receiver is the funder wallet (same as Coinbase).
+    const intentsBody = {
+      appId: ROZO_APP_ID,
+      orderId,
+      type: 'exactIn',
+      display: { title, currency: 'USD' },
+      source: {
+        chainId: BASE_CHAIN_ID,
+        tokenSymbol: 'USDC',
+        amount: callerPays,
+        tokenAddress: BASE_USDC_ADDRESS,
+      },
+      destination: {
+        chainId: SETTLEMENT_CHAIN_ID,
+        receiverAddress: SETTLEMENT_RECEIVER,
+        tokenSymbol: 'USDC',
+        tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
+      },
+      metadata: lockedMetadata,
+    }
+    let intentsResp: Response
+    try {
+      intentsResp = await fetch(ROZO_INTENTS_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'X-API-Key': env.ROZO_INTENTS_API_KEY },
+        body: JSON.stringify(intentsBody),
+      })
+    } catch (err: any) {
+      return json(502, {
+        ok: false,
+        provider: 'stripe_crypto',
+        error: `Rozo intents API unreachable: ${err?.message ?? 'unknown error'}`,
+      })
+    }
+    const intentsText = await intentsResp.text()
+    if (!intentsResp.ok) {
+      return json(502, {
+        ok: false,
+        provider: 'stripe_crypto',
+        error: `Rozo intents API returned ${intentsResp.status}.`,
+        hint: intentsText.substring(0, 300),
+      })
+    }
+    let intentsJson: any
+    try {
+      intentsJson = JSON.parse(intentsText)
+    } catch {
+      return json(502, { ok: false, provider: 'stripe_crypto', error: 'Rozo intents API returned non-JSON.' })
+    }
+    rozoPaymentId = intentsJson?.id ?? intentsJson?.paymentId ?? intentsJson?.data?.id ?? null
+    paymentLink =
+      intentsJson?.paymentLink ?? intentsJson?.url ?? intentsJson?.payment_link ?? intentsJson?.data?.url ?? null
+    expiresAt = intentsJson?.expiresAt ?? null
+    reused = false
+  }
+
+  // 8. Seed the locked fulfillment record so the webhook has the binding fields
+  // + the (sensitive) Stripe URL without depending on the Rozo webhook payload.
+  //
+  // This record is the ONLY authoritative source of the lock binding. If we
+  // can't persist it, the webhook could never settle this order (it would fall
+  // into manual_review), so we must NOT hand the caller a payable link for an
+  // order we're guaranteed not to fulfill automatically. Fail the request
+  // instead. (P1-1)
+  try {
+    await seedStripeRecord(env, {
+      invoiceKey: invoice.invoiceKey,
+      merchantAccount: invoice.merchantAccount,
+      invoiceAmountAtomic: invoice.stablecoinAmountAtomic,
+      invoiceCurrency: invoice.fiatCurrency,
+      lockFingerprint: invoice.lockFingerprint,
+      stripeUrl,
+      rozoPaymentId,
+    })
+  } catch {
+    return json(503, {
+      ok: false,
+      provider: 'stripe_crypto',
+      error:
+        'Could not persist the fulfillment lock record; not returning a payable ' +
+        'link for an order that cannot be settled. Please retry.',
+      code: 'SEED_FAILED',
+    })
+  }
+
+  // 9. Response. provider-neutral v2 fields; NEVER echo the Stripe URL.
+  return json(200, {
+    ok: true,
+    reused,
+    provider: 'stripe_crypto',
+    invoiceKey: invoice.invoiceKey,
+    merchant: invoice.merchantTitle,
+    merchantAccount: invoice.merchantAccount,
+    original: originalStr,
+    callerPays,
+    discount: discountStr,
+    title,
+    paymentLink,
+    rozoPaymentId,
+    expiresAt,
+    invoice,
   })
 }

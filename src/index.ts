@@ -38,6 +38,7 @@ import {
 // P1-3: export DO class so wrangler can bind it via [[durable_objects.bindings]]
 export { AtomicStoreDO } from './mpp/atomic-store-do'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
+import { handleInvoiceDetails } from './routes/invoice-details'
 import { handlePreflight, withCors } from './utils/cors'
 
 export interface Env {
@@ -146,6 +147,34 @@ export interface Env {
   // DingTalk webhook token for operational alerts (low balance, etc.)
   // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
   DINGTALK_ACCESS_TOKEN?: string
+
+  // Stripe Crypto fulfillment: URL of the pay-invoice edge function that owns
+  // the (fail-closed, disabled-by-default) Stripe Permit signing branch.
+  // Defaults to the same agentapi/pay-invoice endpoint the Coinbase path uses;
+  // override to the direct Supabase function URL at deploy time without a code
+  // change. Set via: wrangler secret put STRIPE_PAY_INVOICE_URL
+  STRIPE_PAY_INVOICE_URL?: string
+
+  // Invoice capability encryption (design §6). AES-256-GCM key (base64 of 32
+  // bytes) used to encrypt the replayable Stripe pay URL at rest in the
+  // fulfillment record. REQUIRED for Stripe fulfillment: seeding fails closed
+  // (refuses to store a plaintext fallback) when this is unset.
+  // Set via: wrangler secret put INVOICE_CAPABILITY_ENCRYPTION_KEY
+  INVOICE_CAPABILITY_ENCRYPTION_KEY?: string
+  // Optional key rotation: a previous key kept available for DECRYPT only, so
+  // records sealed before a rotation stay readable. New records always use the
+  // current key. Set both the material and its id together.
+  INVOICE_CAPABILITY_ENCRYPTION_KEY_PREVIOUS?: string
+  INVOICE_CAPABILITY_KEY_ID_PREVIOUS?: string
+  // Key id stamped into new capability blobs (default "v1"). Bump on rotation.
+  INVOICE_CAPABILITY_KEY_ID?: string
+
+  // Caller-side daily-spend cap for Stripe fulfillment, in whole USD (e.g.
+  // "200"). The webhook reserves against this ledger BEFORE calling pay-invoice
+  // (defence in depth — pay-invoice enforces its own fail-closed cap too).
+  // Defaults to $200 when unset. Set via: wrangler secret put
+  // STRIPE_FULFILLMENT_DAILY_CAP_USD
+  STRIPE_FULFILLMENT_DAILY_CAP_USD?: string
 }
 
 export default {
@@ -257,6 +286,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // caller-safe state (router KV + Rozo reconciliation).
       if (url.pathname === '/v1/services/rozo-agent-api/invoice-status') {
         return handleInvoiceStatus(request, env)
+      }
+
+      // Public read-only invoice detail — resolves a Coinbase or Stripe
+      // invoice URL to normalized, non-secret merchant/amount/state data.
+      // Moves no money; rate-limited per-IP and per-session.
+      if (url.pathname === '/v1/services/rozo-agent-api/invoice-details') {
+        return handleInvoiceDetails(request, env)
       }
 
       // Async job polling — must match before the catch-all proxy route.

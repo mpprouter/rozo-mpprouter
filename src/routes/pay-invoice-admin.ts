@@ -31,6 +31,37 @@ export type PayInvoiceNormalized =
 const URL_ALIASES = ['url', 'payment_link', 'link', 'invoice_url'] as const
 const ID_ALIASES = ['payment_id', 'id', 'invoice_id', 'paymentLinkId'] as const
 
+// ── Provider detection ──────────────────────────────────────────────────────
+
+export type InvoiceProvider = 'coinbase' | 'stripe_crypto'
+
+// Strict host allowlists. Only these exact hosts are recognized as invoice
+// providers — any other host (including look-alikes such as
+// crypto.stripe.com.evil.com) resolves to `null` so a caller can never coax
+// the router into resolving an attacker-controlled URL.
+const COINBASE_HOSTS = new Set(['payments.coinbase.com', 'commerce.coinbase.com'])
+const STRIPE_HOSTS = new Set(['crypto.stripe.com'])
+
+/**
+ * Classify an invoice URL by provider using a strict host allowlist.
+ * Returns 'coinbase' for Coinbase payment-link hosts, 'stripe_crypto' for
+ * Stripe crypto checkout, or null when the URL is malformed or the host is
+ * not on either allowlist.
+ */
+export function detectProvider(raw: string): InvoiceProvider | null {
+  let u: URL
+  try {
+    u = new URL(raw)
+  } catch {
+    return null
+  }
+  if (u.protocol !== 'https:') return null
+  const host = u.hostname.toLowerCase()
+  if (STRIPE_HOSTS.has(host)) return 'stripe_crypto'
+  if (COINBASE_HOSTS.has(host)) return 'coinbase'
+  return null
+}
+
 // ── pl_ extraction ────────────────────────────────────────────────────────────
 
 /**
@@ -47,6 +78,30 @@ export function extractPaymentLinkId(raw: string): string | null {
   }
 }
 
+// ── Stripe pay-blob extraction ──────────────────────────────────────────────
+
+/**
+ * Extract the opaque `/pay/<blob>` segment from a Stripe crypto checkout URL.
+ * The blob is the customer-facing session hash used to resume the Payin
+ * Session. Returns null when the host is not the Stripe checkout host or no
+ * `/pay/<blob>` segment is present.
+ *
+ * The blob is NOT a secret on its own — it is the same value embedded in the
+ * customer checkout URL — but it must never be logged or echoed back in
+ * responses (it can be replayed to extend a live session). Callers use this
+ * only to hand the URL to the read-only resolver.
+ */
+export function extractStripeSessionBlob(raw: string): string | null {
+  if (detectProvider(raw) !== 'stripe_crypto') return null
+  try {
+    const u = new URL(raw)
+    const m = u.pathname.match(/\/pay\/([A-Za-z0-9_-]+)/)
+    return m ? m[1] : null
+  } catch {
+    return null
+  }
+}
+
 // ── normalizePayInvoiceBody ───────────────────────────────────────────────────
 
 export interface NormalizedPayInvoiceResult {
@@ -55,6 +110,12 @@ export interface NormalizedPayInvoiceResult {
   raw_url: string
   raw_id: string
   link_id_detected: string | null
+  /**
+   * Provider classified from the URL (strict host allowlist), or null when no
+   * URL was given / the host is unknown. Additive: Coinbase callers that pass
+   * a pl_ id (no URL) get `null` here and are unaffected.
+   */
+  provider_detected: InvoiceProvider | null
   error?: PayInvoiceError
 }
 
@@ -64,6 +125,7 @@ export function normalizePayInvoiceBody(input: unknown): NormalizedPayInvoiceRes
     raw_url: '',
     raw_id: '',
     link_id_detected: null,
+    provider_detected: null,
   }
 
   if (!input || typeof input !== 'object') {
@@ -105,8 +167,13 @@ export function normalizePayInvoiceBody(input: unknown): NormalizedPayInvoiceRes
 
   // If url provided but no explicit id, try to derive payment_id from pl_ in URL
   let linkIdDetected: string | null = null
+  let providerDetected: InvoiceProvider | null = null
   if (rawUrl) {
     linkIdDetected = extractPaymentLinkId(rawUrl)
+    // Classify the provider from the URL host (strict allowlist). Purely
+    // additive — used by the Stripe path and for error context; the Coinbase
+    // normalization result (url/payment_id) is unchanged.
+    providerDetected = detectProvider(rawUrl)
     // If we can derive a payment_id from the url and no explicit id given, prefer url form
     // but record detection for error reporting
   }
@@ -139,6 +206,7 @@ export function normalizePayInvoiceBody(input: unknown): NormalizedPayInvoiceRes
       raw_url: rawUrl,
       raw_id: rawId,
       link_id_detected: linkIdDetected,
+      provider_detected: providerDetected,
     }
   }
 
@@ -148,15 +216,17 @@ export function normalizePayInvoiceBody(input: unknown): NormalizedPayInvoiceRes
       raw_url: rawUrl,
       raw_id: '',
       link_id_detected: linkIdDetected,
+      provider_detected: providerDetected,
     }
   }
 
-  // hasId only
+  // hasId only (no URL → no provider classification possible)
   return {
     normalized: { payment_id: rawId },
     raw_url: '',
     raw_id: rawId,
     link_id_detected: null,
+    provider_detected: null,
   }
 }
 
