@@ -220,11 +220,12 @@ describe('POST /admin/coupon/issue', () => {
     const body: any = await resp.json()
     expect(body.code).toMatch(/^\d{8}$/)
     expect(body.amountUsd).toBe('20')
-    // 2026-07-07: claimUrl lets operators hand out a clickable prefill link
-    // instead of a bare code (open.rozo.ai/claim reads ?code= into the pin field).
-    // UTM params attribute claim-page traffic to the coupon channel.
+    // 2026-07-07: claimUrl lets operators hand out a clickable link instead of
+    // a bare code (open.rozo.ai/claim resolves ?code= and shows face value).
+    // 2026-07-12: dropped utm_source/utm_medium — Goofish is the only channel,
+    // so the tags add no signal and just lengthen the link (founder request).
     expect(body.claimUrl).toBe(
-      `https://open.rozo.ai/claim?code=${body.code}&utm_source=goofish&utm_medium=coupon`,
+      `https://open.rozo.ai/claim?code=${body.code}`,
     )
     const ttlMs = Date.parse(body.expiresAt) - Date.now()
     expect(ttlMs).toBeGreaterThan(11.9 * 3_600_000)

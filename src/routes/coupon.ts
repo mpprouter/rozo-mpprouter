@@ -529,15 +529,15 @@ export async function handleIssueCoupon(request: Request, env: Env): Promise<Res
         amountUsd: record.amountUsd,
         expiresAt: record.expiresAt,
         // 2026-07-07 founder request: hand operators a clickable link instead
-        // of a bare 8-digit code, so the redeem page can prefill ?code=
-        // (claim.html reads it into #cl-code — prefill only, never
-        // auto-submit; see that file's comments). Hardcoded prod domain,
-        // deliberately not an env var — this is a public-facing marketing
-        // domain, not an infra endpoint that changes per environment.
-        // UTM params attribute claim-page visits/conversions to the
-        // coupon channel (Goofish resellers) in analytics; the claim
-        // page ignores unknown query params, so this is display-safe.
-        claimUrl: `https://open.rozo.ai/claim?code=${code}&utm_source=goofish&utm_medium=coupon`,
+        // of a bare 8-digit code, so the redeem page can look the coupon up by
+        // ?code= and show its face value + one-tap redeem (see claim.html).
+        // Hardcoded prod domain, deliberately not an env var — this is a
+        // public-facing marketing domain, not an infra endpoint.
+        // 2026-07-12 founder request: drop the utm_source/utm_medium params.
+        // Goofish is the only channel handing these out, so the attribution
+        // tags add no signal and just make the link longer / harder to copy
+        // out of the Feishu message. Keep the URL as short as possible.
+        claimUrl: `https://open.rozo.ai/claim?code=${code}`,
       })
     }
   }
