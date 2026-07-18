@@ -13,11 +13,12 @@
 //   - the "enter provider_paying" transition (at most one settlement in flight
 //     per Stripe session — the double-sign guard),
 //   - the create-time record seed (must never roll a live record back),
-//   - the daily-spend ledger reserve/release (atomic, no lost update).
+//   - the daily-spend ledger reserve/release (atomic, no lost update),
+//   - the shared funder reservation used by Coinbase, Stripe, and coupons.
 //
-// We use a DEDICATED DO singleton named `stripe-fulfillment`, separate from the
-// mppx `mppx` singleton, so Stripe fulfillment contention never serializes
-// against mppx charge/channel traffic and vice-versa.
+// We use a DEDICATED financial-controls singleton named `stripe-fulfillment`,
+// separate from the mppx `mppx` singleton, so invoice fulfillment contention
+// never serializes against mppx charge/channel traffic and vice-versa.
 //
 // The DO is the single source of truth for these keys. We deliberately do NOT
 // also write them to KV: a KV+DO split would reintroduce the eventual-

@@ -19,6 +19,7 @@ import {
   sendInvoiceFailureAlert,
 } from '../src/routes/webhook'
 import type { Env } from '../src/index'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -78,6 +79,7 @@ function makeEnv(overrides: Record<string, unknown> = {}) {
   const kv = makeKvMock()
   const env = {
     MPP_STORE: kv,
+    ATOMIC_STORE: makeAtomicStoreMock(),
     ROZO_WEBHOOK_SECRET: WEBHOOK_SECRET,
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     BASE_RPC_URL: 'https://rpc.test/primary',

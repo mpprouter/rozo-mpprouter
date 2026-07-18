@@ -8,6 +8,10 @@ import {
   loadStripeRecordForStatus,
   pickStripeRouterStateSafe,
 } from './stripe-fulfillment'
+import {
+  releaseFunderReservation,
+  tryReserveFunder,
+} from './funder-reservation'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -151,35 +155,6 @@ function parseUsdcAtomic(decimal: string): bigint | null {
   const whole = BigInt(m[1])
   const fracRaw = (m[2] ?? '').padEnd(6, '0').slice(0, 6)
   return whole * 1_000_000n + BigInt(fracRaw)
-}
-
-// Computes the sum of pending (paying / payin_seen-not-yet-paid) invoice
-// amounts. Used to compute the "reserved" balance so concurrent invoices
-// don't all see the same funder balance and decide they can each pay.
-// Shared with the coupon redemption path (routes/coupon.ts) so webhook
-// fulfillments and coupon redemptions reserve against the same pool.
-export async function reservedAtomic(env: Env): Promise<bigint> {
-  // Listing KV is expensive; instead we keep a running counter at a
-  // single key. Bumped on 'paying' transition, decremented on 'paid' /
-  // 'failed_*'. Updates are best-effort — a single read+write race
-  // could understate by one invoice, which is acceptable for this
-  // application (rare concurrent webhooks, small dollar amounts).
-  const raw = await env.MPP_STORE.get('funder-reserved-atomic')
-  if (!raw) return 0n
-  try {
-    return BigInt(raw)
-  } catch {
-    return 0n
-  }
-}
-
-export async function bumpReserved(env: Env, deltaAtomic: bigint): Promise<void> {
-  const cur = await reservedAtomic(env)
-  const next = cur + deltaAtomic
-  await env.MPP_STORE.put(
-    'funder-reserved-atomic',
-    (next < 0n ? 0n : next).toString(),
-  )
 }
 
 // ── Invoice failure ops alerts (DingTalk) ────────────────────────────────
@@ -366,19 +341,22 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
     })
   }
 
-  // 5. Dedup by event_id. If we've seen this exact event before, return
-  // 200 and bail. Rozo doesn't retry but our own infra (worker invocation,
-  // proxies) could double-deliver.
+  // 5. Dedup by event_id. The processed marker is written only AFTER the
+  // provider orchestration returns successfully. Writing it here would turn a
+  // transient AtomicStoreDO failure into a permanently swallowed retry.
   const seen = await env.MPP_STORE.get(eventKvKey(eventId))
   if (seen) {
     return json(200, { ok: true, dedup: true, eventId })
   }
-  await env.MPP_STORE.put(eventKvKey(eventId), '1', {
-    expirationTtl: 60 * 60 * 24 * 7,
-  })
+  const finishProcessed = async (response: Response): Promise<Response> => {
+    await env.MPP_STORE.put(eventKvKey(eventId), '1', {
+      expirationTtl: 60 * 60 * 24 * 7,
+    })
+    return response
+  }
 
   // 5b. Provider routing. Stripe Crypto invoices use a provider-qualified
-  // orderId (stripe_crypto_cpis_*) + a separate KV namespace + a per-invoice
+  // orderId (stripe_crypto_cpis_*) + a separate DO namespace + a per-invoice
   // reservation guard. Coinbase (pl_*) falls through to the unchanged logic
   // below. This keeps the two providers fully isolated (design §9 Layer 1/2).
   if (isStripeOrderId(plId)) {
@@ -394,7 +372,7 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
       },
       new Date(now),
     )
-    return json(200, summary)
+    return finishProcessed(json(200, summary))
   }
 
   // 6. Load or create fulfillment record.
@@ -416,7 +394,7 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
   // If already paid or terminally failed, just persist the event and 200.
   if (rec.status === 'paid' || rec.status === 'failed_pay_invoice') {
     await saveRecord(env, plId, rec)
-    return json(200, { ok: true, alreadyTerminal: rec.status, plId })
+    return finishProcessed(json(200, { ok: true, alreadyTerminal: rec.status, plId }))
   }
 
   // 7. Decide whether to attempt pay-invoice for this event.
@@ -429,13 +407,13 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
     eventType === 'payment_payout_completed'
   if (!shouldAttempt) {
     await saveRecord(env, plId, rec)
-    return json(200, { ok: true, ignored_type: eventType, plId })
+    return finishProcessed(json(200, { ok: true, ignored_type: eventType, plId }))
   }
 
   // Already in-flight? Don't double-fire.
   if (rec.status === 'paying') {
     await saveRecord(env, plId, rec)
-    return json(200, { ok: true, already_paying: true, plId })
+    return finishProcessed(json(200, { ok: true, already_paying: true, plId }))
   }
 
   // 8. Balance check (with reserved subtraction).
@@ -463,47 +441,70 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
       detail: { invoice: invoiceAmountStr },
     })
     await saveRecord(env, plId, rec)
-    return json(200, { ok: true, deferred: 'invoice_unmeasurable', plId })
+    return finishProcessed(json(200, { ok: true, deferred: 'invoice_unmeasurable', plId }))
   }
 
-  // If balance read failed (all RPCs down), don't sit forever — agentapi
-  // pay-invoice will check funder balance itself and reject if low, so
-  // we can safely attempt and let it be the gate.
+  // Balance and reservation are one safety gate. If every balance RPC is down,
+  // we cannot prove the shared pool can cover this invoice, so fail closed and
+  // leave the event unprocessed for retry.
   if (balance === null) {
     rec.events.push({
-      kind: 'balance_check_skipped_attempt_anyway',
+      kind: 'balance_unavailable',
       at: new Date().toISOString(),
       detail: { rpcsTried: balanceResult.rpcsTried },
     })
-    console.log(
-      `[webhook] balance unmeasurable but attempting pay-invoice anyway for ${plId} (eventType=${eventType})`,
-    )
-    // Fall through to pay-invoice attempt below (skipping reservation
-    // arithmetic since we don't know balance).
+    await saveRecord(env, plId, rec)
+    return json(503, {
+      ok: false,
+      retryable: true,
+      deferred: 'balance_unavailable',
+      plId,
+    })
   }
 
-  // If balance is null we skip reservation arithmetic and just attempt.
-  const reserved = balance !== null ? await reservedAtomic(env) : 0n
-  const available = balance !== null ? balance - reserved : null
+  // The availability decision and reservation insert happen in ONE DO CAS.
+  // A plain atomic increment after this check would still race: two requests
+  // could both pass against the same old balance before either incremented.
+  const reservationId = `coinbase:${plId}`
+  const reservation = await tryReserveFunder(env, {
+    reservationId,
+    amountAtomic: invoiceAtomic,
+    balanceAtomic: balance,
+  })
+  const reserved = reservation.reservedAtomic
+  const availableBefore = balance - (reserved - (reservation.kind === 'acquired' ? invoiceAtomic : 0n))
   rec.events.push({
     kind: 'balance_check',
     at: new Date().toISOString(),
     detail: {
-      balance: balance?.toString() ?? null,
+      balance: balance.toString(),
       reserved: reserved.toString(),
-      available: available?.toString() ?? null,
+      available: availableBefore.toString(),
       invoice: invoiceAtomic.toString(),
-      sufficient: available === null ? 'unknown_attempt_anyway' : available >= invoiceAtomic,
+      sufficient: reservation.kind === 'acquired',
     },
   })
 
-  if (available !== null && available < invoiceAtomic) {
+  if (reservation.kind === 'already_reserved') {
+    // Another invocation already owns this invoice's shared-pool slot. Do not
+    // make a second pay call and do not mark the event processed while the
+    // owner may still be running.
+    await saveRecord(env, plId, rec)
+    return json(503, {
+      ok: false,
+      retryable: true,
+      deferred: 'reservation_in_flight',
+      plId,
+    })
+  }
+
+  if (reservation.kind === 'insufficient') {
     // Insufficient. For payin_completed this is normal — wait for the
     // destination tx (payout_completed) to credit the funder.
     // For payout_completed this is a real funding problem — flag it.
     if (eventType === 'payment_payout_completed') {
       rec.status = 'failed_insufficient_balance'
-      rec.failureReason = `funder balance ${balance} (avail ${available}) < invoice ${invoiceAtomic}`
+      rec.failureReason = `funder balance ${balance} (avail ${reservation.availableAtomic}) < invoice ${invoiceAtomic}`
       // Ops alert: the caller HAS paid (payout landed) but we can't settle
       // the Coinbase link. Awaited — handleRozoWebhook has no ctx.waitUntil,
       // and sendInvoiceFailureAlert never throws.
@@ -512,20 +513,20 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
         plId,
         invoiceAtomic,
         funderBalanceAtomic: balance,
-        availableAtomic: available,
+        availableAtomic: reservation.availableAtomic,
         failureReason: rec.failureReason,
       })
     }
     await saveRecord(env, plId, rec)
-    return json(200, {
+    return finishProcessed(json(200, {
       ok: true,
       deferred: 'insufficient_balance',
       eventType,
       plId,
-      balance: balance?.toString() ?? null,
-      available: available?.toString() ?? null,
+      balance: balance.toString(),
+      available: reservation.availableAtomic.toString(),
       invoice: invoiceAtomic.toString(),
-    })
+    }))
   }
 
   // 9. Reserve, transition to paying, persist BEFORE calling pay-invoice.
@@ -533,8 +534,18 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
   // we record 'paid', a later retry (manual or via /invoice-status reconciler)
   // will see status=paying and can poll Rozo + Coinbase to recover.
   rec.status = 'paying'
-  await bumpReserved(env, invoiceAtomic)
-  await saveRecord(env, plId, rec)
+  try {
+    await saveRecord(env, plId, rec)
+  } catch (err) {
+    // No provider call happened. Return the reservation if possible; a failed
+    // release only causes conservative deferral pending reconciliation.
+    try {
+      await releaseFunderReservation(env, reservationId)
+    } catch {
+      // Fail-safe leak: never proceed to money movement after persistence fails.
+    }
+    throw err
+  }
 
   // 10. Trigger pay-invoice. Best-effort; never throw out of the handler.
   let payResult: { ok: boolean; status: number; body: any }
@@ -545,7 +556,17 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
   }
 
   // 11. Finalize.
-  await bumpReserved(env, -invoiceAtomic)
+  try {
+    await releaseFunderReservation(env, reservationId)
+  } catch (err) {
+    // A leaked reservation can only defer later work. Do not lose the provider
+    // outcome by throwing here; reconciliation can release the stale entry.
+    console.warn(
+      `[webhook] funder reservation release failed for ${plId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+  }
   if (payResult.ok) {
     rec.status = 'paid'
     rec.paidAt = new Date().toISOString()
@@ -577,14 +598,14 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
   }
   await saveRecord(env, plId, rec)
 
-  return json(200, {
+  return finishProcessed(json(200, {
     ok: true,
     plId,
     status: rec.status,
     paid: rec.status === 'paid',
     coinbaseResult: payResult.ok ? payResult.body : null,
     error: payResult.ok ? null : payResult.body,
-  })
+  }))
 }
 
 // Public read-only status endpoint.

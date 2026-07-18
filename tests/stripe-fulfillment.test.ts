@@ -20,6 +20,7 @@ import {
   CapabilityCryptoError,
 } from '../src/routes/invoice-capability-crypto'
 import type { Env } from '../src/index'
+import { readFunderReservedAtomic } from '../src/routes/funder-reservation'
 
 // ── In-memory AtomicStoreDO mock ────────────────────────────────────────────
 // Implements the DO's /read + /commit versioned-CAS contract so the code under
@@ -347,16 +348,25 @@ describe('handleStripeWebhookEvent', () => {
   })
 
   it('records provider_disabled (not a failure) when pay-invoice is fail-closed', async () => {
-    const kv = makeKv()
-    const env = makeEnv({ kv })
+    const env = makeEnv()
     await seed(env)
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response(JSON.stringify({ code: 'stripe_fulfillment_disabled', error: 'disabled' }), { status: 403 }),
-    )
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('pay-invoice') || u.includes('agentapi')) {
+        return new Response(
+          JSON.stringify({ code: 'stripe_fulfillment_disabled', error: 'disabled' }),
+          { status: 403 },
+        )
+      }
+      return new Response(
+        JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16) }),
+        { status: 200 },
+      )
+    })
     const now = new Date(Date.UTC(2026, 6, 12))
     const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev1' }), now)
     expect(summary.status).toBe('provider_disabled')
-    expect(await kv.get('funder-reserved-atomic')).toBe('0')
+    expect(await readFunderReservedAtomic(env)).toBe(0n)
     // no money moved → daily ledger back to 0 (reservation released).
     expect(await readDailySpentAtomic(env, now)).toBe(0n)
   })

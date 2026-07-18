@@ -8,6 +8,7 @@ import {
   handleAdminGetCoupon,
 } from '../src/routes/coupon'
 import type { Env } from '../src/index'
+import { readFunderReservedAtomic } from '../src/routes/funder-reservation'
 
 // ── Fakes ────────────────────────────────────────────────────────────────────
 
@@ -247,9 +248,7 @@ describe('POST /coupon/redeem', () => {
     expect(calls.pay).toBe(1)
 
     // The atomic funder reservation must be released after completion.
-    const doInst = (env.ATOMIC_STORE as any).instances.get('coupon')
-    const reserveRaw = doInst.store.get('funder-reserve')?.value
-    expect(JSON.parse(reserveRaw).entries).toEqual({})
+    expect(await readFunderReservedAtomic(env)).toBe(0n)
   })
 
   it('is idempotent for the same (code, plId) after success', async () => {
