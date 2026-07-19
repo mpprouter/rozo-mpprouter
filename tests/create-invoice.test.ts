@@ -247,6 +247,9 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
       // AES-256 key (base64 of 32 bytes) so seedStripeRecord can encrypt the
       // capability instead of failing closed.
       INVOICE_CAPABILITY_ENCRYPTION_KEY: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
+      // Enable the payable-link path so these tests exercise real resolution;
+      // finding 1 otherwise short-circuits to 503 fulfillment_disabled.
+      STRIPE_FULFILLMENT_ENABLED: '1',
     } as unknown as import('../src/index').Env
   }
 
@@ -449,6 +452,160 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
       // No payable link handed back.
       expect(body).not.toContain('pay.rozo.ai')
       assertNoLeak(body)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  // Finding 1: when STRIPE_FULFILLMENT_ENABLED is unset, refuse UP FRONT — do
+  // not resolve the session or create a payable Rozo intent that could not be
+  // settled downstream.
+  it('fails closed (503, no session resolution) when fulfillment is disabled (finding 1)', async () => {
+    const env = makeEnv()
+    ;(env as any).STRIPE_FULFILLMENT_ENABLED = undefined
+    let stripeContacted = false
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('stripe.com')) stripeContacted = true
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const { status, body } = await callWith(STRIPE_URL, env)
+      expect(status).toBe(503)
+      const json = JSON.parse(body)
+      expect(json.reason).toBe('fulfillment_disabled')
+      expect(json.ok).toBe(false)
+      // Never even resolved the session — no upstream Stripe contact.
+      expect(stripeContacted).toBe(false)
+      assertNoLeak(body)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  // Finding 11: when BOTH a Stripe URL and a payment_id alias are present, the
+  // normalizer keeps { payment_id } canonical but provider_detected is Stripe.
+  // The handler must fall back to the raw URL, not 400 on a missing url.
+  it('handles a Stripe URL supplied alongside a payment_id alias (finding 11)', async () => {
+    const env = makeEnv()
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('/resume_payin_session')) {
+        return new Response(
+          JSON.stringify({ sessionId: 'cpis_alias1', clientSecret: 'cs_x', publishableKey: 'pk_x', mode: 'pay' }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payin_session')) {
+        return new Response(
+          JSON.stringify({
+            id: 'cpis_alias1',
+            state: 'checkout',
+            business_name: 'Alias Merchant',
+            merchant: 'acct_alias',
+            payment_details: { amount: 1000, currency: 'usd' },
+            supported_currencies: [
+              {
+                id: 'usdc.base',
+                chain_id: 8453,
+                currency_network: 'base',
+                mainnet: true,
+                asset_code: 'usdc',
+                contract_address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+                payment_options: ['wallet_connect'],
+              },
+            ],
+            valid_before: '2999-01-01T00:00:00.000Z',
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payments/order/')) return new Response('not found', { status: 404 })
+      if (u.includes('/payment-api')) {
+        return new Response(
+          JSON.stringify({ id: 'rozo-alias-1', paymentLink: 'https://pay.rozo.ai/x', expiresAt: '2999-01-01T00:00:00.000Z' }),
+          { status: 200 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const { handleCreateInvoice } = await import('../src/routes/create-invoice')
+      // Body carries BOTH the Stripe url and a payment_id alias.
+      const req = new Request('https://mpp.test/create-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: STRIPE_URL, payment_id: 'cpis_alias1' }),
+      })
+      const res = await handleCreateInvoice(req, env)
+      const body = await res.text()
+      expect(res.status).toBe(200)
+      const json = JSON.parse(body)
+      expect(json.ok).toBe(true)
+      expect(json.provider).toBe('stripe_crypto')
+      expect(json.invoiceKey).toBe('cpis_alias1')
+      assertNoLeak(body)
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  // Finding 7: the advertised expiry must never outlive the Stripe session's
+  // valid_before, even when the Rozo intent reports a later expiry.
+  it('caps the advertised expiresAt at the Stripe valid_before (finding 7)', async () => {
+    const env = makeEnv()
+    const VALID_BEFORE = '2030-01-01T00:00:00.000Z'
+    const ROZO_LATER = '2031-06-01T00:00:00.000Z' // Rozo intent expires LATER
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('/resume_payin_session')) {
+        return new Response(
+          JSON.stringify({ sessionId: 'cpis_cap1', clientSecret: 'cs_x', publishableKey: 'pk_x', mode: 'pay' }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payin_session')) {
+        return new Response(
+          JSON.stringify({
+            id: 'cpis_cap1',
+            state: 'checkout',
+            business_name: 'Cap Merchant',
+            merchant: 'acct_cap',
+            payment_details: { amount: 1000, currency: 'usd' },
+            supported_currencies: [
+              {
+                id: 'usdc.base',
+                chain_id: 8453,
+                currency_network: 'base',
+                mainnet: true,
+                asset_code: 'usdc',
+                contract_address: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913',
+                payment_options: ['wallet_connect'],
+              },
+            ],
+            valid_before: VALID_BEFORE,
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payments/order/')) return new Response('not found', { status: 404 })
+      if (u.includes('/payment-api')) {
+        return new Response(
+          JSON.stringify({ id: 'rozo-cap-1', paymentLink: 'https://pay.rozo.ai/x', expiresAt: ROZO_LATER }),
+          { status: 200 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const { status, body } = await callWith(STRIPE_URL, env)
+      expect(status).toBe(200)
+      const json = JSON.parse(body)
+      // Reported expiry clamped down to valid_before, not the later Rozo value.
+      expect(json.expiresAt).toBe(VALID_BEFORE)
     } finally {
       globalThis.fetch = originalFetch
     }

@@ -246,7 +246,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid JSON body' })
   }
 
-  const { normalized, error, link_id_detected, provider_detected } =
+  const { normalized, error, link_id_detected, provider_detected, raw_url } =
     normalizePayInvoiceBody(parsed)
   if (!normalized || error) {
     return errorResponse(400, {
@@ -264,7 +264,12 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // money movement done by the (disabled-by-default) Supabase pay-invoice
   // Stripe branch, driven later by the webhook. Coinbase is unaffected.
   if (provider_detected === 'stripe_crypto') {
-    const stripeUrl = (normalized as { url?: string }).url
+    // provider_detected is URL-derived. When BOTH a URL and a payment_id alias
+    // are supplied, the normalizer keeps { payment_id } as canonical, so
+    // normalized.url is undefined — reading it would 400 a legitimate Stripe
+    // request. Fall back to the original raw_url the provider was detected from
+    // (finding 11). We never echo the URL either way.
+    const stripeUrl = (normalized as { url?: string }).url ?? (raw_url || null)
     if (!stripeUrl) {
       // Should be unreachable: provider_detected requires a URL. Never echo it.
       return errorResponse(400, {
@@ -550,6 +555,25 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
 // response, never logged). The Rozo metadata carries only the non-secret locked
 // fields (design §6).
 export async function handleStripeCreateInvoice(stripeUrl: string, env: Env): Promise<Response> {
+  // 0. Fail closed when downstream fulfillment is disabled (finding 1). The
+  // Supabase pay-invoice Stripe branch is disabled-by-default; a payable Rozo
+  // link created while it is disabled would collect the caller's USDC into the
+  // funder wallet and then hit 403 provider_disabled at settlement time — money
+  // in, Stripe invoice never settled. Refuse UP FRONT rather than discover it
+  // only after the caller has paid. Gated by the SAME enablement signal the
+  // fulfillment path reads, so the two can never diverge (create-payable while
+  // settle-disabled).
+  if (env.STRIPE_FULFILLMENT_ENABLED !== '1' && env.STRIPE_FULFILLMENT_ENABLED !== 'true') {
+    return json(503, {
+      ok: false,
+      provider: 'stripe_crypto',
+      error:
+        'Stripe Crypto fulfillment is not enabled on this router; refusing to ' +
+        'create a payable link that cannot be settled.',
+      reason: 'fulfillment_disabled',
+    })
+  }
+
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
   try {
@@ -696,6 +720,22 @@ export async function handleStripeCreateInvoice(stripeUrl: string, env: Env): Pr
       intentsJson?.paymentLink ?? intentsJson?.url ?? intentsJson?.payment_link ?? intentsJson?.data?.url ?? null
     expiresAt = intentsJson?.expiresAt ?? null
     reused = false
+  }
+
+  // 7b. Cap the advertised validity at the Stripe session's own valid_before
+  // (finding 7). The Rozo intent may expire later than the Stripe session; a
+  // caller paying after valid_before but before the Rozo expiry would strand
+  // funds (payin lands, provider settlement fails on the expired session). We
+  // cannot shrink the upstream Rozo intent, but we must not ADVERTISE an expiry
+  // that outlives the session — clamp the reported value to valid_before.
+  if (invoice.validBefore) {
+    const vb = Date.parse(invoice.validBefore)
+    if (Number.isFinite(vb)) {
+      const cur = expiresAt ? Date.parse(expiresAt) : NaN
+      if (!Number.isFinite(cur) || cur > vb) {
+        expiresAt = invoice.validBefore
+      }
+    }
   }
 
   // 8. Seed the locked fulfillment record so the webhook has the binding fields

@@ -310,7 +310,22 @@ export function maskAddress(addr: string | null | undefined): string | null {
  * Throws StripeResolveError('unsupported') only for a non-USD currency, where
  * we cannot even compute a safe stablecoin amount.
  */
-export async function normalizeStripeSession(session: StripePayinSession): Promise<NormalizedInvoice> {
+export async function normalizeStripeSession(
+  session: StripePayinSession,
+  now: Date = new Date(),
+): Promise<NormalizedInvoice> {
+  // The session body is unvalidated JSON at runtime. A missing/empty/blank id
+  // would otherwise flow into `stripe_crypto_undefined` as the orderId + DO key
+  // (finding 12), letting unrelated anomalous sessions collide on one intent /
+  // lock record and reuse the wrong binding. Validate it like `amount`: require
+  // a well-formed cpis_* identifier, else surface an anomalous-response 502 via
+  // StripeResolveError('upstream').
+  if (typeof session.id !== 'string' || !/^cpis_[A-Za-z0-9]+$/.test(session.id)) {
+    throw new StripeResolveError(
+      'upstream',
+      'session id missing or not a valid cpis_* identifier',
+    )
+  }
   const invoiceKey = session.id
   const merchantTitle = session.business_name ?? 'Unknown merchant'
   const merchantAccount = typeof session.merchant === 'string' ? session.merchant : null
@@ -388,11 +403,36 @@ export async function normalizeStripeSession(session: StripePayinSession): Promi
   const state = safeStripeState(session.state)
   const statePayable = state === 'initialized' || state === 'checkout'
 
+  // valid_before deadline gating (finding 7). A deadline that has already
+  // passed — or that we cannot even parse — means the Stripe session will
+  // reject settlement AFTER the caller has already paid the Rozo intent. This
+  // must fail closed even when Stripe still reports an entry-payable state
+  // (stale-state / boundary race). We compare against the injected `now`.
+  const validBeforeStr =
+    typeof session.valid_before === 'string' ? session.valid_before : null
+  const validBeforeMs = validBeforeStr !== null ? Date.parse(validBeforeStr) : null
+  const validBeforeUnparseable =
+    validBeforeStr !== null && (validBeforeMs === null || !Number.isFinite(validBeforeMs))
+  const validBeforeExpired =
+    validBeforeMs !== null && Number.isFinite(validBeforeMs) && validBeforeMs <= now.getTime()
+
   let payable = true
   let payableReason: string | null = null
   if (!statePayable) {
     payable = false
     payableReason = `session state "${state}" is not entry-payable`
+  } else if (!merchantAccount) {
+    // A valid merchant account is a REQUIRED upstream field: it is half the
+    // fulfillment lock binding. Without it every paid order would land in
+    // manual_review (finding 6). Refuse to advertise the invoice as payable.
+    payable = false
+    payableReason = 'session is missing a merchant account (required for settlement)'
+  } else if (validBeforeUnparseable) {
+    payable = false
+    payableReason = 'session valid_before deadline is unparseable'
+  } else if (validBeforeExpired) {
+    payable = false
+    payableReason = 'session valid_before deadline has already expired'
   } else if (!usdcBase) {
     payable = false
     payableReason = 'merchant does not offer usdc.base settlement'

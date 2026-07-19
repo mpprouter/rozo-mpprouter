@@ -175,6 +175,16 @@ export interface Env {
   // Defaults to $200 when unset. Set via: wrangler secret put
   // STRIPE_FULFILLMENT_DAILY_CAP_USD
   STRIPE_FULFILLMENT_DAILY_CAP_USD?: string
+
+  // Master opt-in for creating PAYABLE Stripe Crypto intents (finding 1). The
+  // downstream Supabase pay-invoice Stripe branch is fail-closed / disabled by
+  // default, so a payable link created while it is disabled would collect the
+  // caller's USDC and then hit 403 provider_disabled at settlement time.
+  // create-invoice therefore refuses to hand out payable Stripe links unless
+  // this is explicitly "1" (or "true"). Fail-closed: unset / anything else =
+  // disabled. Set via wrangler.toml vars or: wrangler secret put
+  // STRIPE_FULFILLMENT_ENABLED
+  STRIPE_FULFILLMENT_ENABLED?: string
 }
 
 export default {

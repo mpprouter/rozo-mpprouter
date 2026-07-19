@@ -43,7 +43,9 @@ function fixtureSession(overrides: Partial<StripePayinSession> = {}): StripePayi
         payment_options: ['wallet_connect', 'direct_deposit'],
       },
     ],
-    valid_before: '2026-07-11T01:28:10.000Z',
+    // Far-future deadline so the shared fixture stays entry-payable regardless
+    // of the wall clock. Individual expiry tests override this explicitly.
+    valid_before: '2999-01-01T00:00:00.000Z',
     ...overrides,
   }
 }
@@ -149,7 +151,7 @@ describe('normalizeStripeSession', () => {
     expect(inv.state).toBe('checkout')
     expect(inv.payable).toBe(true)
     expect(inv.payableReason).toBeNull()
-    expect(inv.validBefore).toBe('2026-07-11T01:28:10.000Z')
+    expect(inv.validBefore).toBe('2999-01-01T00:00:00.000Z')
     expect(inv.settlement.chainId).toBe('8453')
     expect(inv.settlement.tokenSymbol).toBe('USDC')
     expect(inv.lockFingerprint).toMatch(/^sha256:[0-9a-f]{64}$/)
@@ -278,6 +280,86 @@ describe('normalizeStripeSession', () => {
         }),
       )
       expect(inv.payable).toBe(false)
+    })
+  })
+
+  // Finding 6: a missing merchant account means no fulfillment lock binding —
+  // every paid order would land in manual_review, so it must be a REQUIRED
+  // upstream field checked before the invoice is advertised as payable.
+  describe('merchant account required (finding 6)', () => {
+    it('marks payable=false when the merchant account is missing', async () => {
+      const inv = await normalizeStripeSession(fixtureSession({ merchant: undefined }))
+      expect(inv.merchantAccount).toBeNull()
+      expect(inv.payable).toBe(false)
+      expect(inv.payableReason).toContain('merchant account')
+    })
+    it('marks payable=false when the merchant field is not a string', async () => {
+      const inv = await normalizeStripeSession(
+        fixtureSession({ merchant: 12345 as unknown as string }),
+      )
+      expect(inv.merchantAccount).toBeNull()
+      expect(inv.payable).toBe(false)
+    })
+  })
+
+  // Finding 7: the session deadline must be in the future AND parseable, even
+  // when Stripe still reports an entry-payable state (stale-state boundary).
+  describe('valid_before deadline gating (finding 7)', () => {
+    const now = new Date('2026-07-19T00:00:00.000Z')
+    it('marks payable=false for an already-expired deadline (state still checkout)', async () => {
+      const inv = await normalizeStripeSession(
+        fixtureSession({ state: 'checkout', valid_before: '2026-07-11T01:28:10.000Z' }),
+        now,
+      )
+      expect(inv.payable).toBe(false)
+      expect(inv.payableReason).toContain('expired')
+    })
+    it('marks payable=false at the exact boundary (valid_before === now)', async () => {
+      const inv = await normalizeStripeSession(
+        fixtureSession({ valid_before: now.toISOString() }),
+        now,
+      )
+      expect(inv.payable).toBe(false)
+      expect(inv.payableReason).toContain('expired')
+    })
+    it('marks payable=false for an unparseable deadline', async () => {
+      const inv = await normalizeStripeSession(
+        fixtureSession({ valid_before: 'not-a-date' }),
+        now,
+      )
+      expect(inv.payable).toBe(false)
+      expect(inv.payableReason).toContain('unparseable')
+    })
+    it('stays payable for a future deadline', async () => {
+      const inv = await normalizeStripeSession(
+        fixtureSession({ valid_before: '2999-01-01T00:00:00.000Z' }),
+        now,
+      )
+      expect(inv.payable).toBe(true)
+    })
+  })
+
+  // Finding 12: a missing / blank / malformed session id must not flow into
+  // `stripe_crypto_undefined` — reject anomalous responses as an upstream 502.
+  describe('session id validation (finding 12)', () => {
+    it('throws when the session id is missing', async () => {
+      await expect(
+        normalizeStripeSession(fixtureSession({ id: undefined as unknown as string })),
+      ).rejects.toBeInstanceOf(StripeResolveError)
+    })
+    it('throws when the session id is empty', async () => {
+      await expect(
+        normalizeStripeSession(fixtureSession({ id: '' })),
+      ).rejects.toBeInstanceOf(StripeResolveError)
+    })
+    it('throws when the session id is not a cpis_* identifier', async () => {
+      await expect(
+        normalizeStripeSession(fixtureSession({ id: 'pi_wrongprefix' })),
+      ).rejects.toBeInstanceOf(StripeResolveError)
+    })
+    it('accepts a well-formed cpis_* id', async () => {
+      const inv = await normalizeStripeSession(fixtureSession({ id: 'cpis_valid123' }))
+      expect(inv.invoiceKey).toBe('cpis_valid123')
     })
   })
 
