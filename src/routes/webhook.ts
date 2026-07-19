@@ -372,6 +372,14 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
       },
       new Date(now),
     )
+    // Retryable deferrals (insufficient balance / daily cap reached / provider
+    // disabled / rate-limited on the FINAL payout event) must NOT be marked
+    // processed: Rozo will not necessarily send another event, and a replay of
+    // THIS event_id is the only automatic path to settlement once the
+    // condition clears. Return a retryable response instead. (P1)
+    if (summary.retryable === true) {
+      return json(503, { ...summary, ok: false, retryable: true })
+    }
     return finishProcessed(json(200, summary))
   }
 
@@ -488,8 +496,11 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
   if (reservation.kind === 'already_reserved') {
     // Another invocation already owns this invoice's shared-pool slot. Do not
     // make a second pay call and do not mark the event processed while the
-    // owner may still be running.
-    await saveRecord(env, plId, rec)
+    // owner may still be running. Also do NOT persist `rec` here: it is a
+    // pre-race snapshot loaded before the owner transitioned to paying/paid,
+    // and an unconditional KV write landing after the owner's final write
+    // would roll a terminal state back. Losing this event's audit entry is
+    // acceptable — the 503 below means it will be replayed anyway. (P1)
     return json(503, {
       ok: false,
       retryable: true,

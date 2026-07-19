@@ -324,6 +324,69 @@ describe('callStripePayInvoice', () => {
     expect(r.disabled).toBe(true)
     expect(r.ok).toBe(false)
   })
+
+  // Finding 4: a 2xx with an empty / HTML / truncated body proves nothing —
+  // pay-invoice MAY have signed. It must be AMBIGUOUS, never a confirmed
+  // success (which would mark provider_submitted and fence off retries).
+  it('treats an unparseable 2xx body as ambiguous, not success (finding 4)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('<html>gateway</html>', { status: 200 }),
+    )
+    const r = await callStripePayInvoice(makeEnv(), {
+      stripeUrl: 'https://crypto.stripe.com/pay/X',
+      expectedMerchantAccount: 'acct_x',
+      expectedAmountAtomic: '1',
+      spentTodayAtomic: '0',
+    })
+    expect(r.ok).toBe(false)
+    expect(r.ambiguous).toBe(true)
+    expect(r.disabled).toBe(false)
+  })
+
+  it('treats a 2xx JSON body without an affirmative field as ambiguous (finding 4)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ note: 'accepted for processing' }), { status: 200 }),
+    )
+    const r = await callStripePayInvoice(makeEnv(), {
+      stripeUrl: 'https://crypto.stripe.com/pay/X',
+      expectedMerchantAccount: 'acct_x',
+      expectedAmountAtomic: '1',
+      spentTodayAtomic: '0',
+    })
+    expect(r.ok).toBe(false)
+    expect(r.ambiguous).toBe(true)
+  })
+
+  it('confirms success only with an explicit affirmative field (finding 4)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ success: true }), { status: 200 }),
+    )
+    const r = await callStripePayInvoice(makeEnv(), {
+      stripeUrl: 'https://crypto.stripe.com/pay/X',
+      expectedMerchantAccount: 'acct_x',
+      expectedAmountAtomic: '1',
+      spentTodayAtomic: '0',
+    })
+    expect(r.ok).toBe(true)
+    expect(r.ambiguous).toBe(false)
+  })
+
+  // Finding 5: a parseable 429 is a DEFINITE-but-temporary rejection where
+  // pay-invoice did NOT sign. It is NOT ambiguous — it is retryable.
+  it('classifies a parseable 429 as non-ambiguous, non-ok (retryable) (finding 5)', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ error: 'rate limited' }), { status: 429 }),
+    )
+    const r = await callStripePayInvoice(makeEnv(), {
+      stripeUrl: 'https://crypto.stripe.com/pay/X',
+      expectedMerchantAccount: 'acct_x',
+      expectedAmountAtomic: '1',
+      spentTodayAtomic: '0',
+    })
+    expect(r.ok).toBe(false)
+    expect(r.ambiguous).toBe(false)
+    expect(r.status).toBe(429)
+  })
 })
 
 describe('handleStripeWebhookEvent', () => {
@@ -469,6 +532,126 @@ describe('handleStripeWebhookEvent', () => {
     expect(fetchSpy).not.toHaveBeenCalled()
     const rec = await loadRec(env, 'cpis_mr')
     expect(rec.status).toBe('manual_review')
+  })
+
+  // Finding 5: a 429 from pay-invoice must release the claim back to a
+  // retryable state (payout_seen), NOT park it in terminal failed_provider,
+  // and must return the daily-spend reservation (no money moved).
+  it('a 429 from pay-invoice is retryable, not terminal failed_provider (finding 5)', async () => {
+    const env = makeEnv()
+    await seed(env)
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('pay-invoice') || u.includes('agentapi')) {
+        return new Response(JSON.stringify({ error: 'rate limited' }), { status: 429 })
+      }
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16).padStart(64, '0') }), { status: 200 })
+    })
+    const now = new Date(Date.UTC(2026, 6, 12))
+    const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev429' }), now)
+    expect(summary.deferred).toBe('provider_rate_limited')
+    // Payout event → retryable so the webhook layer will not mark it processed.
+    expect(summary.retryable).toBe(true)
+    // Daily reservation released (money did not move) and claim is NOT terminal.
+    expect(await readDailySpentAtomic(env, now)).toBe(0n)
+    expect(await readFunderReservedAtomic(env)).toBe(0n)
+    const rec = await loadRec(env, 'cpis_wh')
+    expect(rec.status).toBe('payout_seen') // retryable, not failed_provider
+  })
+
+  // Finding 10: a payin-completed event that finds insufficient balance must
+  // release the claim to payin_seen — NOT payout_seen — so the audit trail
+  // never falsely asserts the destination tx already landed.
+  it('payin insufficient-balance releases the claim to payin_seen, not payout_seen (finding 10)', async () => {
+    const env = makeEnv()
+    await seed(env)
+    // Balance RPC returns 0 → reservation insufficient for the $10 invoice.
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('pay-invoice') || u.includes('agentapi')) {
+        throw new Error('pay-invoice should never be called on insufficient balance')
+      }
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x0' }), { status: 200 })
+    })
+    const now = new Date(Date.UTC(2026, 6, 12))
+    const summary = await handleStripeWebhookEvent(
+      env,
+      evt({ eventId: 'evpayin', eventType: 'payment_payin_completed' }),
+      now,
+    )
+    expect(summary.deferred).toBe('insufficient_balance')
+    // NOT retryable (payin will be followed by a payout event).
+    expect(summary.retryable).toBeUndefined()
+    const rec = await loadRec(env, 'cpis_wh')
+    expect(rec.status).toBe('payin_seen')
+  })
+
+  // Finding 3: an unexpected throw AFTER the funder reservation is acquired but
+  // BEFORE the pay-invoice request is sent must release the funder reservation,
+  // the daily reservation, and the provider_paying claim — otherwise the order
+  // and the shared pool are stuck forever with no call ever made.
+  it('pre-call throw releases funder + daily reservation and steps the claim down (finding 3)', async () => {
+    let payInvoiceCalled = false
+    // Throw INSIDE the pre-call guard (after the claim + funder reservation +
+    // daily reserve, before any request is sent) by making exactly the SECOND
+    // read of the fulfillment record — the pre-call load — fail with a DO 503.
+    // The claim read (#1) and every later read (the cleanup releaseClaim and
+    // this test's own assertions) must keep working.
+    const goodNs = makeDoNamespace()
+    const goodEnv = makeEnv({ ns: goodNs })
+    await seedStripeRecord(goodEnv, {
+      invoiceKey: 'cpis_precall',
+      merchantAccount: 'acct_pc',
+      invoiceAmountAtomic: '10000000',
+      invoiceCurrency: 'usd',
+      lockFingerprint: 'sha256:pc',
+      stripeUrl: 'https://crypto.stripe.com/pay/PC',
+      rozoPaymentId: 'rp-pc',
+    })
+    // Reads of the record key done during seeding are already over; from here
+    // read #1 is the claim CAS, read #2 is the pre-call load.
+    let recReads = 0
+    const wrappedStub = {
+      async fetch(req: Request): Promise<Response> {
+        const clone = req.clone()
+        const body: any = await clone.json().catch(() => ({}))
+        const isRecordRead =
+          new URL(req.url).pathname === '/read' &&
+          body.key === stripeKvKey('cpis_precall')
+        if (isRecordRead) {
+          recReads++
+          if (recReads === 2) return new Response('boom', { status: 503 })
+        }
+        return goodNs.get(null).fetch(req)
+      },
+    }
+    goodEnv.ATOMIC_STORE = {
+      idFromName: (_n: string) => ({ name: _n }),
+      get: () => wrappedStub,
+    } as any
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('pay-invoice') || u.includes('agentapi')) {
+        payInvoiceCalled = true
+        return new Response(JSON.stringify({ success: true }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16).padStart(64, '0') }), { status: 200 })
+    })
+    const now = new Date(Date.UTC(2026, 6, 12))
+    await expect(
+      handleStripeWebhookEvent(goodEnv, {
+        eventId: 'evpc', eventType: 'payment_payout_completed',
+        orderId: 'stripe_crypto_cpis_precall', rozoPaymentId: 'rp-pc', invoiceAmountStr: '10.00',
+      }, now),
+    ).rejects.toThrow()
+    // No pay-invoice call was made.
+    expect(payInvoiceCalled).toBe(false)
+    // Funder + daily reservations released (shared pool not stuck).
+    expect(await readFunderReservedAtomic(goodEnv)).toBe(0n)
+    expect(await readDailySpentAtomic(goodEnv, now)).toBe(0n)
+    // Claim stepped down from provider_paying to the retryable payout_seen.
+    const rec = await loadRec(goodEnv, 'cpis_precall')
+    expect(rec.status).toBe('payout_seen')
   })
 
   it('advances to provider_submitted + bumps daily ledger on accept; stores WHITELISTED result (P1-2)', async () => {

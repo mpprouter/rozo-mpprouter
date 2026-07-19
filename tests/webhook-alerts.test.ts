@@ -20,6 +20,7 @@ import {
 } from '../src/routes/webhook'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
+import { tryReserveFunder } from '../src/routes/funder-reservation'
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -424,5 +425,50 @@ describe('handleRozoWebhook failure alerts (state machine integration)', () => {
     const rec = JSON.parse(kv._store.get('invoice-fulfillment:pl_testInvoiceAlert1')!)
     expect(rec.status).toBe('failed_insufficient_balance')
     expect(dingtalkCalls).toHaveLength(0)
+  })
+
+  // Finding 9: when a concurrent invocation already owns the shared funder-pool
+  // slot for this pl_id (already_reserved), the loser must return 503 retryable
+  // and must NOT persist its pre-race record snapshot — an unconditional KV
+  // write landing after the winner's write would roll the record back and
+  // leave no processed marker means it replays safely.
+  it('already_reserved on a non-terminal record → 503 retryable, record not overwritten (finding 9)', async () => {
+    stubFetch({ balanceAtomic: 10_000_000n })
+    const { env, kv } = makeEnv()
+
+    // Pre-hold the shared-pool slot (as a concurrent winner would).
+    await tryReserveFunder(env, {
+      reservationId: 'coinbase:pl_testInvoiceAlert1',
+      amountAtomic: 1_000_000n,
+      balanceAtomic: 10_000_000n,
+    })
+
+    // A non-terminal `payin_seen` record (passes the "already paying?" gate so
+    // execution reaches the reservation gate). The winner-marker event proves
+    // the loser must NOT clobber it back to a stale snapshot.
+    const winnerRecord = {
+      status: 'payin_seen', pl_id: 'pl_testInvoiceAlert1',
+      rozoPaymentId: '11111111-2222-3333-4444-555555555555',
+      invoiceAmountAtomic: '1000000', funderBalanceAtomic: '10000000',
+      paidAt: null, coinbaseResult: null, failureReason: null,
+      webhookEventIds: ['evt-winner'],
+      events: [{ kind: 'winner-marker', at: new Date().toISOString() }],
+    }
+    await kv.put('invoice-fulfillment:pl_testInvoiceAlert1', JSON.stringify(winnerRecord))
+
+    const res = await handleRozoWebhook(await signedWebhookRequest(payoutEvent()), env)
+    expect(res.status).toBe(503)
+    const body = (await res.json()) as any
+    expect(body.retryable).toBe(true)
+    expect(body.deferred).toBe('reservation_in_flight')
+    // The winner's record is untouched — the loser wrote nothing (no stale
+    // snapshot overwrite that could roll a later terminal state back).
+    const rec = JSON.parse(kv._store.get('invoice-fulfillment:pl_testInvoiceAlert1')!)
+    expect(rec.status).toBe('payin_seen')
+    expect(rec.events.some((e: any) => e.kind === 'winner-marker')).toBe(true)
+    expect(rec.events.some((e: any) => e.kind === 'payment_payout_completed')).toBe(false)
+    // No processed marker exists for the loser's event (it must be replayable).
+    const markerKeys = [...kv._store.keys()].filter((k) => k.startsWith('webhook-event:'))
+    expect(markerKeys).toEqual([])
   })
 })

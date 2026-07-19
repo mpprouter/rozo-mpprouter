@@ -350,9 +350,12 @@ export interface StripePayInvoiceResult {
   status: number
   disabled: boolean // pay-invoice returned "fulfillment disabled" (403 fail-closed)
   // AMBIGUOUS: we never got a definite business answer — transport threw,
-  // status 0, a 5xx, or an unparseable body. pay-invoice MAY have signed, so
-  // the caller must NOT auto-retry (design §9). Distinct from a definite
-  // rejection (a parseable 4xx business refusal), which is safe to retry.
+  // status 0, a 5xx, or an unparseable body (INCLUDING an unparseable 2xx).
+  // pay-invoice MAY have signed, so the caller must NOT auto-retry (design §9).
+  // A DEFINITE-but-TEMPORARY rejection where pay-invoice provably did NOT sign
+  // (a parseable 429) is classified by `status` at the webhook layer, not here:
+  // it is released back to a retryable state instead of terminal failed_provider
+  // (finding 5).
   ambiguous: boolean
   body: unknown
 }
@@ -415,11 +418,21 @@ export async function callStripePayInvoice(
     (parsed?.code === 'stripe_fulfillment_disabled' ||
       (typeof parsed?.error === 'string' &&
         /disabled|fail-closed/i.test(parsed.error)))
-  // Ambiguous outcomes: a 5xx (pay-invoice may have signed then failed to
-  // respond) or an unparseable body (can't confirm the result). A parseable
-  // 4xx is a DEFINITE business refusal (safe to retry) and is NOT ambiguous.
-  const ambiguous = !resp.ok && !disabled && (resp.status >= 500 || !parseOk)
-  return { ok: resp.ok, status: resp.status, disabled, ambiguous, body: parsed }
+  // Success + ambiguity classification (P1):
+  //  - A 2xx counts as SUCCESS only when the body parses AND carries an
+  //    explicit affirmative field. A 200/204 with an empty/HTML/truncated body
+  //    (e.g. a proxy default page) proves nothing — pay-invoice MAY have
+  //    signed, so it is AMBIGUOUS, never "submitted".
+  //  - A non-2xx is ambiguous on 5xx or an unparseable body (as before). A
+  //    parseable 4xx is a DEFINITE business refusal and is NOT ambiguous.
+  const confirmedOk =
+    resp.ok &&
+    parseOk &&
+    (parsed?.success === true || parsed?.ok === true || parsed?.settled === true)
+  const ambiguous =
+    !disabled &&
+    ((resp.ok && !confirmedOk) || (!resp.ok && (resp.status >= 500 || !parseOk)))
+  return { ok: confirmedOk, status: resp.status, disabled, ambiguous, body: parsed }
 }
 
 // ── Webhook Stripe branch ───────────────────────────────────────────────────
@@ -569,13 +582,24 @@ export async function handleStripeWebhookEvent(
   // ── We hold the claim. From here we own the single in-flight slot. ──────────
   const invoiceAtomic = BigInt(claim.invoiceAtomic)
 
+  // The state a held claim is released back to when NO request was sent:
+  // payout events return to payout_seen; anything else must NOT claim the
+  // destination tx already landed — return to payin_seen. (P2)
+  const isPayoutEvent = input.eventType === 'payment_payout_completed'
+  const releaseTo: StripeRouterStatus = isPayoutEvent ? 'payout_seen' : 'payin_seen'
+  // Deferrals on the FINAL payout event are retryable: the webhook layer must
+  // NOT write the processed marker for them, because a replay of the SAME
+  // event_id is the only automatic path to settlement once the condition
+  // (balance / daily cap / provider enable / rate limit) clears. (P1)
+  const retryable = isPayoutEvent
+
   // Balance check against the SHARED funder pool (design §7: Coinbase, Stripe,
   // and coupons compete for the same available balance). The availability
   // decision and reservation insert happen in one DO CAS.
   const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
   const balance = balanceResult.balance
   if (balance === null) {
-    await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', null, {
+    await releaseClaim(env, invoiceKey, orderId, nowIso, releaseTo, null, {
       kind: 'balance_unavailable',
       detail: { rpcsTried: balanceResult.rpcsTried },
     })
@@ -593,14 +617,14 @@ export async function handleStripeWebhookEvent(
       balanceAtomic: balance,
     })
   } catch (err) {
-    await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', balance, {
+    await releaseClaim(env, invoiceKey, orderId, nowIso, releaseTo, balance, {
       kind: 'funder_reservation_unavailable',
     })
     throw err
   }
 
   if (funderReservation.kind === 'already_reserved') {
-    await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', balance, {
+    await releaseClaim(env, invoiceKey, orderId, nowIso, releaseTo, balance, {
       kind: 'funder_reservation_in_flight',
     })
     throw new Error('Stripe fulfillment funder reservation is already in flight')
@@ -609,11 +633,10 @@ export async function handleStripeWebhookEvent(
   if (funderReservation.kind === 'insufficient') {
     // Insufficient: for payin this is normal (await payout); for payout it's a
     // real funding gap. Release the claim so a later event can retry.
-    const releaseTo: StripeRouterStatus =
-      input.eventType === 'payment_payout_completed'
-        ? 'failed_insufficient_balance'
-        : 'payout_seen'
-    await releaseClaim(env, invoiceKey, orderId, nowIso, releaseTo, balance, {
+    const insufficientTo: StripeRouterStatus = isPayoutEvent
+      ? 'failed_insufficient_balance'
+      : releaseTo
+    await releaseClaim(env, invoiceKey, orderId, nowIso, insufficientTo, balance, {
       kind: 'balance_check',
       detail: {
         balance: balance.toString(),
@@ -628,65 +651,122 @@ export async function handleStripeWebhookEvent(
       deferred: 'insufficient_balance',
       provider: 'stripe_crypto',
       eventType: input.eventType,
+      ...(retryable ? { retryable: true } : {}),
     }
   }
 
-  // Atomically RESERVE the daily-spend headroom BEFORE signing (design §9). If
-  // the reservation would exceed the daily cap, release everything and defer —
-  // never sign past the cap. On success `spentBefore` is the pre-reservation
-  // spend to hand pay-invoice as spent_today_atomic.
-  const spentBefore = await reserveDailySpend(env, now, invoiceAtomic)
-  if (spentBefore === null) {
-    await releaseFunderReservation(env, funderReservationId)
-    await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', balance, {
-      kind: 'daily_cap_reached',
-      detail: { invoice: invoiceAtomic.toString() },
-    })
-    return { ok: true, deferred: 'daily_cap_reached', provider: 'stripe_crypto' }
-  }
-
-  // Load the claimed record to read the locked binding + url for the call.
-  const claimed = await loadStripeRecord(env, invoiceKey)
-  if (
-    !claimed ||
-    !claimed.stripeUrlEncrypted ||
-    !claimed.merchantAccount ||
-    !claimed.invoiceAmountAtomic
-  ) {
-    // Should be impossible (we just claimed with these set) — treat as ambiguous
-    // rather than risk anything. Release accounting; do NOT auto-retry.
-    await releaseFunderReservation(env, funderReservationId)
-    await releaseDailySpend(env, now, invoiceAtomic)
-    await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
-      failureReason: 'claimed record vanished before call',
-      event: { kind: 'stripe_confirm_error' },
-    })
-    return { ok: true, provider: 'stripe_crypto', status: 'manual_review' }
-  }
-
-  // Decrypt the capability in memory, only to hand it to pay-invoice. On any
-  // decrypt failure (wrong/rotated-away key, tampered blob) we STOP — design
-  // §12: never reconstruct the capability from elsewhere. No money moved yet,
-  // so release the daily reservation and route to manual_review.
-  let stripeUrl: string
+  // ── Pre-call guard (P1) ─────────────────────────────────────────────────────
+  // From here until the pay-invoice request is actually handed to fetch,
+  // nothing has been sent. Any UNEXPECTED throw in this segment (DO 503, CAS
+  // retries exhausted) must release the funder reservation, any daily-spend
+  // reservation, and the provider_paying claim — otherwise the order and the
+  // shared pool stay stuck forever with no call ever made. Rethrow so the
+  // webhook event stays unprocessed (retryable). The flags track exactly what
+  // is still held so the explicit branches below never double-release.
+  let spentBefore = 0n
+  let funderHeld = true
+  let dailyReserved = false
+  let stripeUrl = ''
+  let expectedMerchantAccount = ''
+  let expectedAmountAtomic = ''
   try {
-    stripeUrl = await decryptCapability(claimed.stripeUrlEncrypted, env)
-  } catch {
-    await releaseFunderReservation(env, funderReservationId)
-    await releaseDailySpend(env, now, invoiceAtomic)
-    await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
-      failureReason: 'capability decrypt failed',
-      event: { kind: 'stripe_capability_decrypt_failed' },
-    })
-    return { ok: true, provider: 'stripe_crypto', status: 'manual_review' }
+    // Atomically RESERVE the daily-spend headroom BEFORE signing (design §9).
+    // If the reservation would exceed the daily cap, release everything and
+    // defer — never sign past the cap. On success `spentBefore` is the
+    // pre-reservation spend to hand pay-invoice as spent_today_atomic.
+    const reservedSpend = await reserveDailySpend(env, now, invoiceAtomic)
+    if (reservedSpend === null) {
+      funderHeld = false
+      await releaseFunderReservation(env, funderReservationId)
+      await releaseClaim(env, invoiceKey, orderId, nowIso, releaseTo, balance, {
+        kind: 'daily_cap_reached',
+        detail: { invoice: invoiceAtomic.toString() },
+      })
+      return {
+        ok: true,
+        deferred: 'daily_cap_reached',
+        provider: 'stripe_crypto',
+        ...(retryable ? { retryable: true } : {}),
+      }
+    }
+    spentBefore = reservedSpend
+    dailyReserved = true
+
+    // Load the claimed record to read the locked binding + url for the call.
+    const claimed = await loadStripeRecord(env, invoiceKey)
+    if (
+      !claimed ||
+      !claimed.stripeUrlEncrypted ||
+      !claimed.merchantAccount ||
+      !claimed.invoiceAmountAtomic
+    ) {
+      // Should be impossible (we just claimed with these set) — release
+      // accounting and park for a human; do NOT auto-retry.
+      funderHeld = false
+      await releaseFunderReservation(env, funderReservationId)
+      dailyReserved = false
+      await releaseDailySpend(env, now, invoiceAtomic)
+      await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
+        failureReason: 'claimed record vanished before call',
+        event: { kind: 'stripe_confirm_error' },
+      })
+      return { ok: true, provider: 'stripe_crypto', status: 'manual_review' }
+    }
+    expectedMerchantAccount = claimed.merchantAccount
+    expectedAmountAtomic = claimed.invoiceAmountAtomic
+
+    // Decrypt the capability in memory, only to hand it to pay-invoice. On any
+    // decrypt failure (wrong/rotated-away key, tampered blob) we STOP — design
+    // §12: never reconstruct the capability from elsewhere. No money moved yet,
+    // so release the daily reservation and route to manual_review.
+    try {
+      stripeUrl = await decryptCapability(claimed.stripeUrlEncrypted, env)
+    } catch {
+      funderHeld = false
+      await releaseFunderReservation(env, funderReservationId)
+      dailyReserved = false
+      await releaseDailySpend(env, now, invoiceAtomic)
+      await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
+        failureReason: 'capability decrypt failed',
+        event: { kind: 'stripe_capability_decrypt_failed' },
+      })
+      return { ok: true, provider: 'stripe_crypto', status: 'manual_review' }
+    }
+  } catch (err) {
+    // No request was sent — cleanup is provably safe. Best-effort each step;
+    // a failed release only defers later work (fail-safe direction).
+    if (funderHeld) {
+      try {
+        await releaseFunderReservation(env, funderReservationId)
+      } catch {
+        // Leaked reservation defers later fulfillments; reconciliation frees it.
+      }
+    }
+    if (dailyReserved) {
+      try {
+        await releaseDailySpend(env, now, invoiceAtomic)
+      } catch {
+        // Over-counted ledger only under-spends today — conservative.
+      }
+    }
+    try {
+      await releaseClaim(env, invoiceKey, orderId, nowIso, releaseTo, balance, {
+        kind: 'stripe_precall_error',
+        detail: { error: err instanceof Error ? err.message.slice(0, 200) : 'unknown' },
+      })
+    } catch {
+      // Claim stays provider_paying only if even the CAS is down; the next
+      // successful releaseClaim/reconciliation unblocks it.
+    }
+    throw err
   }
 
   let payResult: StripePayInvoiceResult
   try {
     payResult = await callStripePayInvoice(env, {
       stripeUrl,
-      expectedMerchantAccount: claimed.merchantAccount,
-      expectedAmountAtomic: claimed.invoiceAmountAtomic,
+      expectedMerchantAccount,
+      expectedAmountAtomic,
       spentTodayAtomic: spentBefore.toString(),
     })
   } catch {
@@ -738,6 +818,9 @@ export async function handleStripeWebhookEvent(
       provider: 'stripe_crypto',
       status: 'provider_disabled',
       note: 'stripe fulfillment disabled (fail-closed) — orchestration wired, no money moved',
+      // Retryable (P1): once the provider is enabled, a replay of the SAME
+      // payout event is the only automatic path to settling this paid order.
+      ...(retryable ? { retryable: true } : {}),
     }
   }
 
@@ -753,10 +836,29 @@ export async function handleStripeWebhookEvent(
     return { ok: true, provider: 'stripe_crypto', status: 'provider_submitted' }
   }
 
-  // Definite provider REJECTION (a real HTTP status with a non-ok, non-403
-  // body — pay-invoice explicitly refused, e.g. 400/409/422). Money did not
-  // move → release the daily reservation. This IS retryable (a later corrected
-  // event can retry), so return to payout_seen rather than a stuck state.
+  // TEMPORARY definite rejection (429 rate limit): pay-invoice explicitly
+  // refused WITHOUT signing, and the condition clears on its own. Do not park
+  // the order in terminal failed_provider (human-gated) — release accounting
+  // and the claim so a retry can settle it once the limit lifts. (P1)
+  if (payResult.status === 429) {
+    await releaseDailySpend(env, now, invoiceAtomic)
+    await releaseClaim(env, invoiceKey, orderId, nowIso, releaseTo, balance, {
+      kind: 'stripe_provider_rate_limited',
+      detail: { status: payResult.status },
+    })
+    return {
+      ok: true,
+      provider: 'stripe_crypto',
+      deferred: 'provider_rate_limited',
+      ...(retryable ? { retryable: true } : {}),
+    }
+  }
+
+  // Definite provider REJECTION (a parseable non-ok, non-403, non-429 status —
+  // pay-invoice explicitly refused, e.g. 400/409/422). Money did not move →
+  // release the daily reservation. failed_provider is human-gated terminal
+  // (the claim CAS refuses to re-enter settlement from it): a definite refusal
+  // needs a human to fix the cause and replay, never a blind auto-retry.
   await releaseDailySpend(env, now, invoiceAtomic)
   await finalizeClaim(env, invoiceKey, orderId, nowIso, 'failed_provider', {
     failureReason: `pay-invoice ${payResult.status}`,
