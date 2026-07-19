@@ -630,7 +630,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // this point returns the uniform error; after a successful claim the caller
   // has proven possession of a live coupon and gets specific errors.
   type ClaimResult =
-    | { kind: 'claimed'; rec: CouponRecord }
+    | { kind: 'claimed'; rec: CouponRecord; stalePreviousAttemptId?: string | null }
     | { kind: 'processing' }
     | { kind: 'already_redeemed'; rec: CouponRecord }
     | { kind: 'rejected' }
@@ -657,11 +657,18 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
         // Abandoned claim (worker died before `paying`) — safe to re-claim:
         // no pay-invoice call was made under the previous claim. Taking over
         // attemptId fences the previous request out of all later transitions.
+        // Remember the fenced-off attemptId so its funder reservation can be
+        // released after the CAS commits (see below). (P1)
+        const stalePreviousAttemptId = rec.attemptId
         rec.redeemingAt = nowIso()
         rec.attemptId = attemptId
         rec.plId = plId
         rec.events.push({ kind: 'reclaim', at: rec.redeemingAt, detail: { plId } })
-        return { op: 'set', value: JSON.stringify(rec), result: { kind: 'claimed', rec } }
+        return {
+          op: 'set',
+          value: JSON.stringify(rec),
+          result: { kind: 'claimed', rec, stalePreviousAttemptId },
+        }
       }
       if (rec.plId === plId) return { op: 'noop', result: { kind: 'processing' } }
       return { op: 'noop', result: { kind: 'rejected' } }
@@ -704,6 +711,28 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       amountUsd: claim.rec.amountUsd,
       redeemedAt: claim.rec.redeemedAt,
     })
+  }
+
+  // Stale reclaim housekeeping (P1): the previous attempt died somewhere
+  // between acquiring its `coupon:<attemptId>` funder reservation and entering
+  // `paying`. That reservation has NO expiry, so without this release it would
+  // block the shared pool forever — when the balance just covers the invoice,
+  // every new attempt would see insufficient funds. Safe because the old
+  // attempt is fenced off the money path by the attemptId change, and if it
+  // inserts its reservation after this release it releases it itself on the
+  // fence check (enteredPaying === false path).
+  if (claim.kind === 'claimed' && claim.stalePreviousAttemptId) {
+    try {
+      await releaseFunderReservation(env, `coupon:${claim.stalePreviousAttemptId}`)
+    } catch (err) {
+      // Non-fatal: redemption can proceed; a still-stuck entry defers work
+      // conservatively and is released by the next reclaim/reconciliation.
+      console.warn(
+        `[coupon] stale funder reservation release failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      )
+    }
   }
 
   const rec = claim.rec

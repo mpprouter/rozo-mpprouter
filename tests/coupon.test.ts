@@ -8,7 +8,10 @@ import {
   handleAdminGetCoupon,
 } from '../src/routes/coupon'
 import type { Env } from '../src/index'
-import { readFunderReservedAtomic } from '../src/routes/funder-reservation'
+import {
+  readFunderReservedAtomic,
+  tryReserveFunder,
+} from '../src/routes/funder-reservation'
 
 // ── Fakes ────────────────────────────────────────────────────────────────────
 
@@ -531,5 +534,57 @@ describe('admin resolve + get', () => {
     const body: any = await resp.json()
     expect(body.coupon.status).toBe('issued')
     expect(body.coupon.events[0].kind).toBe('issued')
+  })
+})
+
+// ── Stale reclaim reservation release (finding 8) ────────────────────────────
+
+describe('stale reclaim releases the previous funder reservation (finding 8)', () => {
+  // Reach into the FakeAtomicNamespace to mutate the stored coupon record the
+  // way a died-mid-flight worker would have left it. Coupon records live in the
+  // 'coupon' DO instance (couponStub); funder reservations live in the
+  // 'stripe-fulfillment' instance (stripe-atomic).
+  function doStoreOf(env: Env): Map<string, { value: string; version: number }> {
+    const ns = (env as any).ATOMIC_STORE
+    return ns.get(ns.idFromName('coupon')).store
+  }
+
+  it('releases the dangling coupon:<oldAttempt> reservation so redemption succeeds on an exact balance', async () => {
+    // Funder balance EXACTLY covers the $20 coupon — any leaked reservation
+    // makes the pool look insufficient forever (the finding-8 deadlock).
+    const { env, fetchMock, calls } = makeEnv({
+      balanceHex: '0x' + (20_000_000n).toString(16),
+    })
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env)
+
+    // Simulate the previous worker: claimed the coupon, acquired its funder
+    // reservation, then died before entering `paying`, >10 minutes ago.
+    await tryReserveFunder(env, {
+      reservationId: 'coupon:dead-attempt',
+      amountAtomic: 20_000_000n,
+      balanceAtomic: 20_000_000n,
+    })
+    expect(await readFunderReservedAtomic(env)).toBe(20_000_000n)
+    const store = doStoreOf(env)
+    const key = `coupon:${code}`
+    const cur = store.get(key)!
+    const rec = JSON.parse(cur.value)
+    rec.status = 'redeeming'
+    rec.attemptId = 'dead-attempt'
+    rec.plId = 'pl_test123'
+    rec.redeemingAt = new Date(Date.now() - 11 * 60 * 1000).toISOString() // stale
+    store.set(key, { value: JSON.stringify(rec), version: cur.version + 1 })
+
+    // A fresh redemption reclaims the stale claim, releases the dangling
+    // reservation, and settles. Before the fix it deadlocked: the dead
+    // attempt's reservation made available = 0 < invoice, forever.
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp.status).toBe(200)
+    const body: any = await resp.json()
+    expect(body.status).toBe('redeemed')
+    expect(calls.pay).toBe(1)
+    // No reservation left behind — dead attempt's AND our own both released.
+    expect(await readFunderReservedAtomic(env)).toBe(0n)
   })
 })
