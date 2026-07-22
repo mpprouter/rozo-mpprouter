@@ -50,6 +50,19 @@ class_name = "AtomicStoreDO"
 tag = "v1"
 new_classes = ["AtomicStoreDO"]
 
+# MPPRouter-specific D1 for the coupon security audit log (design 20260722).
+# Historical, redacted (keyed-HMAC only) record of every /coupon/redeem outcome.
+# This is NOT the Rozo Intents Supabase. Provision before deploy:
+#   wrangler d1 create mpprouter-coupon-security
+#   (paste the returned database_id below)
+#   wrangler d1 migrations apply mpprouter-coupon-security --remote
+# The migrations directory holds migrations/0001_coupon_security_events.sql.
+[[d1_databases]]
+binding = "COUPON_SECURITY_DB"
+database_name = "mpprouter-coupon-security"
+database_id = "4bcb90b4-57c6-4a7d-848e-30e043cbc8ca"
+migrations_dir = "migrations"
+
 # Public keys (not secrets, safe to commit)
 [vars]
 STELLAR_NETWORK = "stellar:pubnet"

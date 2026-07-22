@@ -3,19 +3,73 @@ import {
   generateCouponCode,
   handleIssueCoupon,
   handleRedeemCoupon,
-  handleCouponStatus,
   handleResolveCoupon,
   handleAdminGetCoupon,
+  handleReopenCircuit,
 } from '../src/routes/coupon'
 import type { Env } from '../src/index'
+import { CIRCUIT_THRESHOLD, WARN_THRESHOLD } from '../src/routes/coupon-security'
+
+/** In-memory stand-in for a Cloudflare D1Database (prepare/bind/run + all). */
+class FakeD1 {
+  rows: any[] = []
+  prepare(sql: string) {
+    const self = this
+    return {
+      _sql: sql,
+      _args: [] as any[],
+      bind(...args: any[]) {
+        this._args = args
+        return this
+      },
+      async run() {
+        if (/^\s*INSERT/i.test(sql)) {
+          const [
+            request_id, created_at, result, failure_reason,
+            code_hash, payment_id_hash, pair_hash, ip_prefix_hash, turnstile_passed,
+          ] = this._args
+          // INSERT OR IGNORE: skip on duplicate request_id.
+          if (self.rows.some((r) => r.request_id === request_id)) return { success: true }
+          self.rows.push({
+            request_id, created_at, result, failure_reason,
+            code_hash, payment_id_hash, pair_hash, ip_prefix_hash, turnstile_passed,
+          })
+        } else if (/^\s*DELETE/i.test(sql)) {
+          const cutoff = this._args[0]
+          self.rows = self.rows.filter((r) => r.created_at >= cutoff)
+        }
+        return { success: true }
+      },
+      async all() {
+        return { results: self.rows }
+      },
+      async first() {
+        return self.rows[0] ?? null
+      },
+    }
+  }
+}
 
 // ── Fakes ────────────────────────────────────────────────────────────────────
 
 /** In-memory stand-in for AtomicStoreDO speaking the /read + /commit protocol. */
 class FakeAtomicDO {
   store = new Map<string, { value: string; version: number }>()
+  // Real Durable Objects run at most ONE fetch handler at a time; all other
+  // concurrent requests queue behind it. The fake must model that, otherwise
+  // two concurrent CAS clients can interleave a /read between another's
+  // /read and /commit and both "win" — a bypass that cannot happen in prod.
+  // Serialize every fetch through a promise chain (single-threaded mutex).
+  private tail: Promise<unknown> = Promise.resolve()
 
-  async fetch(req: Request): Promise<Response> {
+  fetch(req: Request): Promise<Response> {
+    const run = this.tail.then(() => this._fetch(req))
+    // Keep the chain alive even if a handler rejects.
+    this.tail = run.catch(() => {})
+    return run
+  }
+
+  private async _fetch(req: Request): Promise<Response> {
     const url = new URL(req.url)
     const body: any = await req.json()
     const cur = this.store.get(body.key) ?? { value: null as string | null, version: 0 }
@@ -74,6 +128,13 @@ interface UpstreamConfig {
   balanceHex: string
   /** Test hook: runs (once) when the quote call is made, before it returns. */
   onQuote?: () => Promise<void>
+  /**
+   * Test hook: when set, every pay-invoice call awaits this promise before
+   * returning. Used to hold concurrent redemptions inside their `paying`
+   * window simultaneously, so an overlapping funder reservation is genuinely
+   * exercised (real pay-invoice takes seconds; the mock is instant otherwise).
+   */
+  payGate?: Promise<void>
 }
 
 function makeEnv(cfg: Partial<UpstreamConfig> = {}) {
@@ -103,6 +164,7 @@ function makeEnv(cfg: Partial<UpstreamConfig> = {}) {
     }
     if (url.includes('pay-invoice')) {
       calls.pay++
+      if (upstream.payGate) await upstream.payGate
       return new Response(JSON.stringify(upstream.payBody), {
         status: upstream.payStatus,
         headers: { 'Content-Type': 'application/json' },
@@ -117,6 +179,7 @@ function makeEnv(cfg: Partial<UpstreamConfig> = {}) {
       headers: { 'Content-Type': 'application/json' },
     })
   })
+  const d1 = new FakeD1()
   const env = {
     ATOMIC_STORE: new FakeAtomicNamespace() as any,
     MPP_STORE: new FakeKV() as any,
@@ -124,8 +187,22 @@ function makeEnv(cfg: Partial<UpstreamConfig> = {}) {
     PAYINVOICE_ADMIN_SECRET: 'test-pay-secret',
     ADMIN_ENDPOINT_ENABLED: 'true',
     BASE_RPC_URL: 'https://fake-rpc.test',
+    COUPON_HASH_SECRET: 'test-hmac-secret',
+    COUPON_SECURITY_DB: d1 as any,
+    // Turnstile intentionally unset → skipped (staged-rollout posture). The
+    // dedicated turnstile describe block sets TURNSTILE_SECRET explicitly.
   } as unknown as Env
-  return { env, upstream, calls, fetchMock }
+  return { env, upstream, calls, fetchMock, d1 }
+}
+
+/** Read the coupon record straight from the fake coupon DO (replaces the
+ *  removed public /coupon/status probe for state assertions). */
+async function couponState(env: Env, code: string): Promise<string | null> {
+  const ns = (env as any).ATOMIC_STORE
+  const store = ns.get(ns.idFromName('coupon')).store as Map<string, { value: string }>
+  const cur = store.get(`coupon:${code}`)
+  if (!cur || !cur.value) return null
+  return JSON.parse(cur.value).status
 }
 
 function issueReq(body: any, secret = 'test-coupon-admin') {
@@ -141,13 +218,6 @@ function redeemReq(code: string, url = 'https://payments.coinbase.com/payment-li
     method: 'POST',
     headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip },
     body: JSON.stringify({ code, url }),
-  })
-}
-
-function statusReq(code: string, ip = '1.2.3.4') {
-  return new Request(`https://router.test/coupon/status?code=${code}`, {
-    method: 'GET',
-    headers: { 'cf-connecting-ip': ip },
   })
 }
 
@@ -360,17 +430,29 @@ describe('POST /coupon/redeem', () => {
     // Balance $25; two $20 coupons. The atomic check-and-reserve must let
     // exactly one through — the non-atomic read-check-bump this replaces
     // would have let BOTH pass the balance gate.
-    const { env, calls, fetchMock } = makeEnv({
+    const { env, upstream, calls, fetchMock } = makeEnv({
       balanceHex: '0x' + (25_000_000n).toString(16),
     })
     globalThis.fetch = fetchMock
     const codeA = await issueCoupon(env)
     const codeB = await issueCoupon(env)
 
-    const [rA, rB] = await Promise.all([
+    // Hold the winner inside its `paying` window (reservation still held) until
+    // both requests have raced the funder gate, so the reservation genuinely
+    // overlaps — otherwise the mock's instant pay-invoice would let the winner
+    // reserve→pay→release before the loser even reserves (sequential, not a race).
+    let releasePay: () => void = () => {}
+    upstream.payGate = new Promise<void>((r) => { releasePay = r })
+
+    const race = Promise.all([
       handleRedeemCoupon(redeemReq(codeA, undefined, '1.1.1.1'), env),
       handleRedeemCoupon(redeemReq(codeB, undefined, '2.2.2.2'), env),
     ])
+    // Give the loser time to hit (and fail) the funder gate while the winner
+    // is parked in pay-invoice, then let the winner finish.
+    await new Promise((r) => setTimeout(r, 20))
+    releasePay()
+    const [rA, rB] = await race
     const statuses = [rA.status, rB.status].sort()
     expect(statuses).toEqual([200, 503])
     expect(calls.pay).toBe(1)
@@ -387,8 +469,7 @@ describe('POST /coupon/redeem', () => {
     expect(resp.status).toBe(503)
     expect(calls.pay).toBe(0)
 
-    const st = await handleCouponStatus(statusReq(code), env)
-    expect(((await st.json()) as any).status).toBe('issued')
+    expect(await couponState(env, code)).toBe('issued')
   })
 
   it('admin void racing a redeem (during quote) blocks the payment', async () => {
@@ -474,28 +555,9 @@ describe('public rate limiting', () => {
     for (let i = 0; i < 5; i++) {
       await handleRedeemCoupon(redeemReq('12345678', undefined, `10.0.0.${i}`), env)
     }
-    // Now issue can't be probed: even the status endpoint sees it as invalid.
-    const st = await handleCouponStatus(statusReq('12345678', '10.0.1.1'), env)
-    expect(st.status).toBe(400)
-  })
-})
-
-// ── Status endpoint ──────────────────────────────────────────────────────────
-
-describe('GET /coupon/status', () => {
-  it('shows issued state for a valid code, uniform error for unknown', async () => {
-    const { env, fetchMock } = makeEnv()
-    globalThis.fetch = fetchMock
-    const code = await issueCoupon(env)
-
-    const ok = await handleCouponStatus(statusReq(code), env)
-    const okBody: any = await ok.json()
-    expect(okBody.status).toBe('issued')
-    expect(okBody.amountUsd).toBe('20')
-
-    const missing = await handleCouponStatus(statusReq('00000001'), env)
-    expect(missing.status).toBe(400)
-    expect(((await missing.json()) as any).error).toBe('INVALID_COUPON')
+    // A subsequent redeem for the locked/frozen code returns the uniform 400.
+    const resp = await handleRedeemCoupon(redeemReq('12345678', undefined, '10.0.1.1'), env)
+    expect(resp.status).toBe(400)
   })
 })
 
@@ -533,5 +595,214 @@ describe('admin resolve + get', () => {
     const body: any = await resp.json()
     expect(body.coupon.status).toBe('issued')
     expect(body.coupon.events[0].kind).toBe('issued')
+  })
+})
+
+// ── Abuse protection: audit, redaction, Turnstile, circuit, freezes ──────────
+// (design: ainative/todos/20260722-mpprouter-coupon-claim-security.md)
+
+function redeemReqT(code: string, url: string | undefined, ip: string, turnstileToken?: string) {
+  return new Request('https://router.test/coupon/redeem', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cf-connecting-ip': ip },
+    body: JSON.stringify({
+      code,
+      url: url ?? 'https://payments.coinbase.com/payment-links/pl_test123',
+      ...(turnstileToken !== undefined ? { turnstileToken } : {}),
+    }),
+  })
+}
+
+describe('redeem audit trail (D1)', () => {
+  it('writes exactly one redacted event for EVERY outcome, never plaintext', async () => {
+    const { env, d1, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env, '20')
+
+    // success
+    await handleRedeemCoupon(redeemReqT(code, undefined, '1.2.3.4'), env)
+    // unknown code (failure)
+    await handleRedeemCoupon(redeemReqT('00000000', undefined, '1.2.3.5'), env)
+    // malformed (no code)
+    await handleRedeemCoupon(
+      new Request('https://router.test/coupon/redeem', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'cf-connecting-ip': '1.2.3.6' },
+        body: JSON.stringify({ url: 'pl_test123' }),
+      }),
+      env,
+    )
+
+    expect(d1.rows.length).toBe(3)
+    const results = d1.rows.map((r: any) => r.result).sort()
+    expect(results).toEqual(['failure', 'failure', 'success'])
+
+    // No stored row may contain a plaintext code / full payment id / full IP.
+    const blob = JSON.stringify(d1.rows)
+    expect(blob).not.toContain(code)
+    expect(blob).not.toContain('00000000')
+    expect(blob).not.toContain('pl_test123')
+    expect(blob).not.toContain('1.2.3.4')
+    // Digests are 64-hex; ip_prefix_hash always present.
+    for (const row of d1.rows) {
+      expect(row.ip_prefix_hash).toMatch(/^[0-9a-f]{64}$/)
+      expect([0, 1]).toContain(row.turnstile_passed)
+    }
+  })
+
+  it('fails closed (500) with no plaintext when the HMAC key is unset', async () => {
+    const { env, d1, fetchMock } = makeEnv()
+    ;(env as any).COUPON_HASH_SECRET = undefined
+    globalThis.fetch = fetchMock
+    const resp = await handleRedeemCoupon(redeemReqT('12345678', undefined, '1.2.3.4'), env)
+    expect(resp.status).toBe(500)
+    expect(d1.rows.length).toBe(0) // never audit a plaintext-derivable row
+  })
+})
+
+describe('redeem Turnstile enforcement', () => {
+  function withTurnstile(env: Env, siteverify: any) {
+    ;(env as any).TURNSTILE_SECRET = 'sk_test'
+    const inner = globalThis.fetch as any
+    globalThis.fetch = vi.fn(async (input: any, init?: any) => {
+      if (String(input).includes('turnstile/v0/siteverify')) {
+        return new Response(JSON.stringify(siteverify), { status: 200 })
+      }
+      return inner(input, init)
+    }) as any
+  }
+
+  it('rejects a redeem with a forged Turnstile token before any payment', async () => {
+    const { env, calls, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env)
+    withTurnstile(env, { success: false, 'error-codes': ['invalid-input-response'] })
+
+    const resp = await handleRedeemCoupon(redeemReqT(code, undefined, '1.2.3.4', 'forged'), env)
+    expect(resp.status).toBe(400)
+    expect(((await resp.json()) as any).error).toBe('INVALID_COUPON')
+    expect(calls.pay).toBe(0) // never reached payment
+  })
+
+  it('records turnstile_passed=1 on a valid token and completes redemption', async () => {
+    const { env, d1, calls, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env)
+    withTurnstile(env, { success: true, action: 'coupon_redeem' })
+
+    const resp = await handleRedeemCoupon(redeemReqT(code, undefined, '1.2.3.4', 'good'), env)
+    expect(((await resp.json()) as any).status).toBe('redeemed')
+    expect(calls.pay).toBe(1)
+    expect(d1.rows.at(-1).turnstile_passed).toBe(1)
+  })
+})
+
+describe('redeem global circuit breaker', () => {
+  it('blocks redemption before any payment once the circuit is open, and audits the rejection', async () => {
+    const { env, d1, calls, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    // Drive >CIRCUIT_THRESHOLD malformed POSTs from many IPs to open the circuit.
+    for (let i = 0; i <= CIRCUIT_THRESHOLD + 1; i++) {
+      await handleRedeemCoupon(
+        new Request('https://router.test/coupon/redeem', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'cf-connecting-ip': `77.0.${Math.floor(i / 250)}.${i % 250}` },
+          body: JSON.stringify({ code: '00000000', url: 'pl_nope' }),
+        }),
+        env,
+      )
+    }
+    // A brand-new valid coupon now cannot pay — circuit is open.
+    const code = await issueCoupon(env)
+    const before = calls.pay
+    const resp = await handleRedeemCoupon(redeemReqT(code, undefined, '9.9.9.9'), env)
+    expect(resp.status).toBe(503)
+    expect(((await resp.json()) as any).error).toBe('TEMPORARILY_UNAVAILABLE')
+    expect(calls.pay).toBe(before) // no payment while open
+    // The rejected-while-open request is audited.
+    expect(d1.rows.some((r: any) => r.failure_reason === 'circuit_open')).toBe(true)
+  })
+
+  it('authenticated admin reopen restores redemption; unauthenticated fails', async () => {
+    const { env, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    for (let i = 0; i <= CIRCUIT_THRESHOLD + 1; i++) {
+      await handleRedeemCoupon(
+        new Request('https://router.test/coupon/redeem', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'cf-connecting-ip': `66.0.${Math.floor(i / 250)}.${i % 250}` },
+          body: JSON.stringify({ code: '00000000', url: 'pl_nope' }),
+        }),
+        env,
+      )
+    }
+    // Unauthenticated reopen is rejected.
+    const bad = await handleReopenCircuit(
+      new Request('https://router.test/admin/coupon/circuit/reopen', { method: 'POST', headers: { 'x-admin-secret': 'wrong' } }),
+      env,
+    )
+    expect(bad.status).toBe(401)
+
+    // Authenticated reopen clears it.
+    const ok = await handleReopenCircuit(
+      new Request('https://router.test/admin/coupon/circuit/reopen', { method: 'POST', headers: { 'x-admin-secret': 'test-coupon-admin' } }),
+      env,
+    )
+    expect(ok.status).toBe(200)
+    expect(((await ok.json()) as any).wasOpen).toBe(true)
+
+    // Redemption works again.
+    const code = await issueCoupon(env)
+    const resp = await handleRedeemCoupon(redeemReqT(code, undefined, '9.9.9.9'), env)
+    expect(((await resp.json()) as any).status).toBe('redeemed')
+  })
+})
+
+describe('pair freeze cannot permanently DoS a valid coupon', () => {
+  it('5 failed pair attempts freeze temporarily but the coupon survives (not voided)', async () => {
+    const { env, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env, '20')
+    // Attacker submits the SAME (code, wrong-amount link) 5 times → pair fails.
+    // Use a link whose quote amount mismatches so each attempt is a real failure
+    // that rolls the coupon back to issued (never permanently void).
+    ;(env as any).__mismatch = true
+    const attackLink = 'https://payments.coinbase.com/payment-links/pl_attack'
+    // Point the quote mock at a mismatching amount for the attack link only.
+    const inner = globalThis.fetch as any
+    globalThis.fetch = vi.fn(async (input: any, init?: any) => {
+      if (String(input).includes('quote-invoice')) {
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        if (body.payment_id === 'pl_attack') {
+          return new Response(JSON.stringify({ invoice: { amount: '999' } }), { status: 200 })
+        }
+      }
+      return inner(input, init)
+    }) as any
+
+    for (let i = 0; i < 5; i++) {
+      await handleRedeemCoupon(redeemReqT(code, attackLink, `55.0.0.${i}`), env)
+    }
+    // The pair (code + pl_attack) is now frozen → uniform 400.
+    const frozen = await handleRedeemCoupon(redeemReqT(code, attackLink, '55.0.0.9'), env)
+    expect(frozen.status).toBe(400)
+
+    // The KEY security property: the identifier freeze is TEMPORARY and does
+    // NOT permanently void the victim's coupon. The record is still `issued`
+    // (rolled back after every mismatch), never `void`. Only a success, expiry,
+    // or an authenticated admin action may permanently void it — an attacker
+    // spamming failures cannot.
+    globalThis.fetch = fetchMock
+    expect(await couponState(env, code)).toBe('issued')
+
+    // And once the temporary freeze lifts (simulated here by clearing the DO
+    // freeze counters the way expiry would), the coupon redeems normally with a
+    // correct link — the victim is not locked out.
+    const ns = (env as any).ATOMIC_STORE
+    const store = ns.get(ns.idFromName('coupon')).store as Map<string, unknown>
+    for (const k of [...store.keys()]) if (String(k).startsWith('frz:')) store.delete(k)
+
+    const good = await handleRedeemCoupon(redeemReqT(code, undefined, '55.0.9.9'), env)
+    expect(((await good.json()) as any).status).toBe('redeemed')
   })
 })

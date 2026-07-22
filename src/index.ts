@@ -31,9 +31,9 @@ import { handleCreateInvoice } from './routes/create-invoice'
 import {
   handleIssueCoupon,
   handleRedeemCoupon,
-  handleCouponStatus,
   handleResolveCoupon,
   handleAdminGetCoupon,
+  handleReopenCircuit,
 } from './routes/coupon'
 // P1-3: export DO class so wrangler can bind it via [[durable_objects.bindings]]
 export { AtomicStoreDO } from './mpp/atomic-store-do'
@@ -175,6 +175,30 @@ export interface Env {
   // Defaults to $200 when unset. Set via: wrangler secret put
   // STRIPE_FULFILLMENT_DAILY_CAP_USD
   STRIPE_FULFILLMENT_DAILY_CAP_USD?: string
+
+  // ── Coupon abuse protection (design: ainative 20260722-mpprouter-coupon-
+  //    claim-security.md) ──
+  //
+  // MPPRouter-specific D1 database holding the historical, redacted security
+  // audit of every /coupon/redeem outcome. Bound via [[d1_databases]] in
+  // wrangler.toml. NOT the Rozo Intents Supabase. Optional so a staged rollout
+  // can deploy the code before provisioning the DB (audit becomes a no-op).
+  COUPON_SECURITY_DB?: D1Database
+
+  // HMAC-SHA-256 key for the coupon audit digests (code_hash / payment_id_hash
+  // / pair_hash / ip_prefix_hash). The 8-digit code space is enumerable, so a
+  // plain hash would be reversible offline — this keyed digest is not. REQUIRED
+  // for /coupon/redeem (fails closed when unset). Rotating it severs
+  // correlation to older audit rows. Set via: wrangler secret put COUPON_HASH_SECRET
+  COUPON_HASH_SECRET?: string
+
+  // Cloudflare Turnstile secret key for server-side siteverify on /coupon/redeem.
+  // When unset, Turnstile is skipped (staged rollout before the widget is wired
+  // on the frontend). Set via: wrangler secret put TURNSTILE_SECRET
+  TURNSTILE_SECRET?: string
+  // Optional expected hostname to pin verified tokens to (e.g. "open.rozo.ai").
+  // Set via: wrangler secret put TURNSTILE_HOSTNAME
+  TURNSTILE_HOSTNAME?: string
 }
 
 export default {
@@ -242,13 +266,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       if (url.pathname === '/coupon/redeem') {
         return handleRedeemCoupon(request, env)
       }
-      if (url.pathname === '/coupon/status') {
-        return handleCouponStatus(request, env)
-      }
+      // NOTE: the public GET /coupon/status endpoint was REMOVED (design
+      // 20260722): a status-by-code probe is a brute-force oracle for the
+      // 8-digit space (it leaked amount/existence/expiry/used). The redeem POST
+      // now returns terminal status inline, and operators use /admin/coupon/get.
       if (
         url.pathname === '/admin/coupon/issue' ||
         url.pathname === '/admin/coupon/resolve' ||
-        url.pathname === '/admin/coupon/get'
+        url.pathname === '/admin/coupon/get' ||
+        url.pathname === '/admin/coupon/circuit/reopen'
       ) {
         if (env.COUPON_ENDPOINT_ENABLED !== 'true') {
           return new Response(JSON.stringify({ error: 'Not found' }), {
@@ -258,6 +284,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         }
         if (url.pathname === '/admin/coupon/issue') return handleIssueCoupon(request, env)
         if (url.pathname === '/admin/coupon/resolve') return handleResolveCoupon(request, env)
+        if (url.pathname === '/admin/coupon/circuit/reopen') return handleReopenCircuit(request, env)
         return handleAdminGetCoupon(request, env)
       }
 
