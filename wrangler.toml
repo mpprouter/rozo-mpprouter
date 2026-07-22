@@ -60,7 +60,7 @@ new_classes = ["AtomicStoreDO"]
 [[d1_databases]]
 binding = "COUPON_SECURITY_DB"
 database_name = "mpprouter-coupon-security"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "4bcb90b4-57c6-4a7d-848e-30e043cbc8ca"
 migrations_dir = "migrations"
 
 # Public keys (not secrets, safe to commit)
