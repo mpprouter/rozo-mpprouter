@@ -10,6 +10,7 @@ import {
   type NormalizedInvoice,
 } from './invoice-provider'
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
+import { checkCreateInvoiceGate } from './create-invoice-gate'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
@@ -173,6 +174,8 @@ export type CreateInvoiceErrorCode =
   | 'SERVER_MISCONFIGURED'
   | 'INVALID_SOURCE'
   | 'UNSUPPORTED_SOURCE'
+  | 'RATE_LIMITED'
+  | 'SERVICE_UNAVAILABLE'
 
 export interface CreateInvoiceError extends Omit<PayInvoiceError, 'code'> {
   code: CreateInvoiceErrorCode
@@ -264,6 +267,23 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     return errorResponse(500, {
       code: 'SERVER_MISCONFIGURED',
       message: 'ROZO_INTENTS_API_KEY is not configured',
+    })
+  }
+
+  // Anti-abuse gate: per-IP hourly rate limit + global hourly creation circuit
+  // breaker (fail-open on DO error). Same-payment reuse is handled below via the
+  // idempotency lookup; this caps raw creation volume from a spray/botnet.
+  const gate = await checkCreateInvoiceGate(request, env)
+  if (!gate.ok) {
+    if (gate.reason === 'global_circuit_open') {
+      return errorResponse(503, {
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'Invoice creation is temporarily paused. Please try again shortly.',
+      })
+    }
+    return errorResponse(429, {
+      code: 'RATE_LIMITED',
+      message: 'Too many invoice creation requests. Please try again later.',
     })
   }
 
