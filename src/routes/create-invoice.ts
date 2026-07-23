@@ -41,9 +41,10 @@ type SourceToken = 'USDC' | 'USDT'
 
 const SUPPORTED_SOURCE: Record<string, SourceToken[]> = {
   '1':    ['USDC', 'USDT'],   // Ethereum
+  '56':   ['USDC', 'USDT'],   // BNB Smart Chain (BSC) — downstream sol/evm monitors live
   '137':  ['USDC', 'USDT'],   // Polygon
   '8453': ['USDC'],           // Base
-  '900':  ['USDC'],           // Solana
+  '900':  ['USDC', 'USDT'],   // Solana — USDT payin supported (sol-pool-monitor)
   '1500': ['USDC'],           // Stellar
 }
 
@@ -56,8 +57,21 @@ const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
     USDC: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
     USDT: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
   },
+  // BNB Smart Chain (BSC). Addresses match downstream rozo-intents
+  // rozo-address-service.ts / alchemy-client.ts. NOTE: BSC USDT/USDC are 18-decimals
+  // (not 6) — decimal scaling is handled downstream (monitors/deposit-service), not
+  // here; mpprouter only carries the (chainId, tokenSymbol, address) triple.
+  '56':   {
+    USDC: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d',
+    USDT: '0x55d398326f99059fF775485246999027B3197955',
+  },
   '8453': { USDC: BASE_USDC_ADDRESS },
-  '900':  { USDC: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v' },
+  // Solana USDT mint. USDT payin is supported (sol-pool-monitor); Solana USDT *payout*
+  // is not (rejected downstream) — irrelevant here since settlement is Base USDC.
+  '900':  {
+    USDC: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    USDT: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
+  },
   '1500': { USDC: 'USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN' },
 }
 
