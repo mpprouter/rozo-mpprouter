@@ -10,12 +10,16 @@ import {
   type NormalizedInvoice,
 } from './invoice-provider'
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
+import { checkCreateInvoiceGate } from './create-invoice-gate'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
 const QUOTE_INVOICE_URL = 'https://agentapi.rozo.ai/quote-invoice'
 
 const ROZO_APP_ID = 'wallet_rozopay'
+// OpenRouter / Coinbase line runs under its own merchant appId (no discount,
+// exactOut for Lightning). Stripe line keeps ROZO_APP_ID unchanged.
+const OPENROUTER_APP_ID = 'merchant_openrouter'
 
 const BASE_CHAIN_ID = '8453'
 const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
@@ -59,7 +63,9 @@ const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
 
 export interface ResolvedSource {
   chainId: string
-  tokenSymbol: SourceToken
+  tokenSymbol: SourceToken | 'BTC'
+  // Empty string for chains without an ERC-20-style token address (e.g.
+  // Lightning BTC, where the payment rail carries no contract address).
   tokenAddress: string
   warnings: string[]
 }
@@ -99,7 +105,23 @@ export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?:
   }
 
   const chainId = String(src.chainId)
-  const tokenSymbol = src.tokenSymbol.toUpperCase() as SourceToken
+  const tokenSymbol = src.tokenSymbol.toUpperCase() as SourceToken | 'BTC'
+
+  // Lightning (BTC) source: no chain contract address, settled via exactOut so
+  // the caller pays the BTC equivalent while the merchant receives full USDC on
+  // Base. Not part of the numeric-chainId USDC/USDT whitelist below.
+  if (chainId === 'lightning') {
+    if (tokenSymbol !== 'BTC') {
+      return {
+        error: {
+          code: 'UNSUPPORTED_SOURCE',
+          message: `tokenSymbol ${tokenSymbol} is not supported on chainId lightning — only BTC.`,
+          supported: SUPPORTED_SOURCE,
+        },
+      }
+    }
+    return { resolved: { chainId: 'lightning', tokenSymbol: 'BTC', tokenAddress: '', warnings } }
+  }
 
   const allowedTokens = SUPPORTED_SOURCE[chainId]
   if (!allowedTokens) {
@@ -111,7 +133,7 @@ export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?:
       },
     }
   }
-  if (!allowedTokens.includes(tokenSymbol)) {
+  if (!allowedTokens.includes(tokenSymbol as SourceToken)) {
     return {
       error: {
         code: 'UNSUPPORTED_SOURCE',
@@ -130,7 +152,7 @@ export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?:
     )
   }
 
-  const tokenAddress = TOKEN_ADDRS[chainId]?.[tokenSymbol]
+  const tokenAddress = TOKEN_ADDRS[chainId]?.[tokenSymbol as SourceToken]
   if (!tokenAddress) {
     // Should be unreachable given the whitelist above, but keep the safety net.
     return {
@@ -152,6 +174,8 @@ export type CreateInvoiceErrorCode =
   | 'SERVER_MISCONFIGURED'
   | 'INVALID_SOURCE'
   | 'UNSUPPORTED_SOURCE'
+  | 'RATE_LIMITED'
+  | 'SERVICE_UNAVAILABLE'
 
 export interface CreateInvoiceError extends Omit<PayInvoiceError, 'code'> {
   code: CreateInvoiceErrorCode
@@ -221,6 +245,13 @@ export function buildTitle(
   )
 }
 
+// OpenRouter / Coinbase line has no discount — the caller pays the full invoice
+// amount, so the title is a plain "Pay <merchant> $<amount>" with no
+// "originally.../Discount" clause.
+export function buildFullAmountTitle(merchant: string, invoiceAtomic: bigint): string {
+  return `Pay ${merchant} ${formatTitleAmount(invoiceAtomic)}`
+}
+
 export async function handleCreateInvoice(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') {
     return json(405, { error: 'Method not allowed' })
@@ -236,6 +267,23 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     return errorResponse(500, {
       code: 'SERVER_MISCONFIGURED',
       message: 'ROZO_INTENTS_API_KEY is not configured',
+    })
+  }
+
+  // Anti-abuse gate: per-IP hourly rate limit + global hourly creation circuit
+  // breaker (fail-open on DO error). Same-payment reuse is handled below via the
+  // idempotency lookup; this caps raw creation volume from a spray/botnet.
+  const gate = await checkCreateInvoiceGate(request, env)
+  if (!gate.ok) {
+    if (gate.reason === 'global_circuit_open') {
+      return errorResponse(503, {
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'Invoice creation is temporarily paused. Please try again shortly.',
+      })
+    }
+    return errorResponse(429, {
+      code: 'RATE_LIMITED',
+      message: 'Too many invoice creation requests. Please try again later.',
     })
   }
 
@@ -369,13 +417,13 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       link_id_detected,
     })
   }
-  const callerPaysAtomic = computeCallerPaysAtomic(invoiceAtomic)
-  const discountAtomic = invoiceAtomic - callerPaysAtomic
-
-  const callerPays = formatUsdc(callerPaysAtomic)
+  // OpenRouter / Coinbase line: no discount (founder decision). Caller pays the
+  // full invoice amount; discount fields are kept in the response for shape
+  // stability but are always the full amount / "0".
+  const callerPays = formatUsdc(invoiceAtomic)
   const originalStr = formatUsdc(invoiceAtomic)
-  const discountStr = formatUsdc(discountAtomic)
-  const title = buildTitle(merchantName, invoiceAtomic, callerPaysAtomic)
+  const discountStr = '0'
+  const title = buildFullAmountTitle(merchantName, invoiceAtomic)
 
   // Step 3a: idempotency — if an intent already exists for this Coinbase
   // link, reuse it instead of creating a new one. The Rozo payment-api
@@ -388,7 +436,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     let lookup: Response | null = null
     try {
       lookup = await fetch(
-        `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(ROZO_APP_ID)}/${encodeURIComponent(orderId)}`,
+        `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(OPENROUTER_APP_ID)}/${encodeURIComponent(orderId)}`,
         {
           method: 'GET',
           headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY },
@@ -436,30 +484,64 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   }
 
   // Step 3b: no usable existing intent → create one.
-  const intentsBody = {
-    appId: ROZO_APP_ID,
-    orderId: orderId ?? `mpprouter-${Date.now()}`,
-    type: 'exactIn',
-    display: {
-      title,
-      currency: 'USD',
-    },
-    source: {
-      chainId: source.chainId,
-      tokenSymbol: source.tokenSymbol,
-      amount: callerPays,
-      tokenAddress: source.tokenAddress,
-    },
-    destination: {
-      chainId: SETTLEMENT_CHAIN_ID,
-      receiverAddress: SETTLEMENT_RECEIVER,
-      tokenSymbol: 'USDC',
-      tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
-    },
-    metadata: {
-      source: 'mpprouter-create-invoice',
-      coinbasePaymentLinkId: linkId,
-    },
+  //
+  // Lightning (BTC) source → exactOut: the caller pays the BTC equivalent, and
+  // the destination.amount pins the full USDC the merchant must receive. Rozo
+  // has no fixed source.amount to quote against here (BTC price floats), so we
+  // omit source.amount / source.tokenAddress and let Rozo quote the input.
+  //
+  // Non-Lightning (existing EVM USDC/USDT) source → exactIn: the caller pays the
+  // full invoice amount on source, destination carries no amount.
+  const isLightning = source.chainId === 'lightning'
+  const intentsBody = isLightning
+    ? {
+        appId: OPENROUTER_APP_ID,
+        orderId: orderId ?? `mpprouter-${Date.now()}`,
+        type: 'exactOut',
+        display: {
+          title,
+          currency: 'USD',
+        },
+        source: {
+          chainId: 'lightning',
+          tokenSymbol: 'BTC',
+        },
+        destination: {
+          chainId: SETTLEMENT_CHAIN_ID,
+          receiverAddress: SETTLEMENT_RECEIVER,
+          tokenSymbol: 'USDC',
+          tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
+          amount: callerPays,
+        },
+        metadata: {
+          source: 'mpprouter-create-invoice',
+          coinbasePaymentLinkId: linkId,
+        },
+      }
+    : {
+        appId: OPENROUTER_APP_ID,
+        orderId: orderId ?? `mpprouter-${Date.now()}`,
+        type: 'exactIn',
+        display: {
+          title,
+          currency: 'USD',
+        },
+        source: {
+          chainId: source.chainId,
+          tokenSymbol: source.tokenSymbol,
+          amount: callerPays,
+          tokenAddress: source.tokenAddress,
+        },
+        destination: {
+          chainId: SETTLEMENT_CHAIN_ID,
+          receiverAddress: SETTLEMENT_RECEIVER,
+          tokenSymbol: 'USDC',
+          tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
+        },
+        metadata: {
+          source: 'mpprouter-create-invoice',
+          coinbasePaymentLinkId: linkId,
+        },
   }
 
   let intentsResp: Response

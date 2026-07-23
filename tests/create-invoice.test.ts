@@ -5,6 +5,7 @@ import {
   formatUsdc,
   formatTitleAmount,
   buildTitle,
+  buildFullAmountTitle,
   resolveSource,
 } from '../src/routes/create-invoice'
 
@@ -123,6 +124,22 @@ describe('buildTitle', () => {
   })
 })
 
+describe('buildFullAmountTitle (OpenRouter line — no discount)', () => {
+  it('renders the full invoice amount with no discount clause', () => {
+    expect(buildFullAmountTitle('OpenRouter, Inc.', parseUsdc('105'))).toBe(
+      'Pay OpenRouter, Inc. $105',
+    )
+  })
+  it('renders non-integer amounts to 2 decimals', () => {
+    expect(buildFullAmountTitle('Acme', parseUsdc('9.52'))).toBe('Pay Acme $9.52')
+  })
+  it('has no "originally" / "Discount" text', () => {
+    const t = buildFullAmountTitle('OpenRouter, Inc.', parseUsdc('210'))
+    expect(t).not.toMatch(/originally/i)
+    expect(t).not.toMatch(/discount/i)
+  })
+})
+
 describe('resolveSource', () => {
   it('defaults to Base USDC when no source given', () => {
     const r = resolveSource(undefined)
@@ -225,6 +242,121 @@ describe('resolveSource', () => {
   it('rejects non-object source', () => {
     const r = resolveSource('stellar')
     expect(r.error?.code).toBe('INVALID_SOURCE')
+  })
+
+  it('resolves Lightning BTC (empty tokenAddress, no chain contract)', () => {
+    const r = resolveSource({ chainId: 'lightning', tokenSymbol: 'BTC' })
+    expect(r.error).toBeUndefined()
+    expect(r.resolved).toEqual({
+      chainId: 'lightning',
+      tokenSymbol: 'BTC',
+      tokenAddress: '',
+      warnings: [],
+    })
+  })
+
+  it('uppercases lightning tokenSymbol (btc → BTC)', () => {
+    const r = resolveSource({ chainId: 'lightning', tokenSymbol: 'btc' })
+    expect(r.resolved?.tokenSymbol).toBe('BTC')
+  })
+
+  it('rejects non-BTC token on lightning', () => {
+    const r = resolveSource({ chainId: 'lightning', tokenSymbol: 'USDC' })
+    expect(r.resolved).toBeUndefined()
+    expect(r.error?.code).toBe('UNSUPPORTED_SOURCE')
+    expect(r.error?.message).toMatch(/BTC/)
+  })
+})
+
+// ── OpenRouter / Coinbase line: appId, no-discount, exactIn/exactOut split ───
+// These drive handleCreateInvoice through the (non-Stripe) Coinbase path with a
+// mocked quote-invoice upstream and a mocked Rozo intents API, then assert the
+// intent-create body Rozo receives.
+describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
+  function makeEnv() {
+    return {
+      PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
+      ROZO_INTENTS_API_KEY: 'test-key',
+    } as unknown as import('../src/index').Env
+  }
+
+  // Runs the handler with a body, capturing the JSON body POSTed to the Rozo
+  // intents create endpoint. Quote upstream returns a fixed $105 OpenRouter
+  // invoice; the order-lookup returns 404 (idempotency miss).
+  async function run(body: Record<string, unknown>) {
+    const { handleCreateInvoice } = await import('../src/routes/create-invoice')
+    let createBody: any = null
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('/quote-invoice')) {
+        return new Response(
+          JSON.stringify({
+            invoice: { amount: '105' },
+            merchant: 'OpenRouter, Inc.',
+            linkId: 'pl_test123',
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payments/order/')) {
+        return new Response('not found', { status: 404 }) // idempotency miss
+      }
+      // The create call is a POST to the payment-api root.
+      if (u.includes('/payment-api')) {
+        createBody = init?.body ? JSON.parse(init.body) : null
+        return new Response(
+          JSON.stringify({ id: 'rozo-1', paymentLink: 'https://pay.rozo.ai/x', expiresAt: '2999-01-01T00:00:00.000Z' }),
+          { status: 200 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const req = new Request('https://mpp.test/create-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const res = await handleCreateInvoice(req, makeEnv())
+      const json = JSON.parse(await res.text())
+      return { status: res.status, json, createBody }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  it('EVM default source → exactIn, appId=merchant_openrouter, full amount (no discount)', async () => {
+    const { status, json, createBody } = await run({ payment_id: 'pl_test123' })
+    expect(status).toBe(200)
+    expect(createBody.appId).toBe('merchant_openrouter')
+    expect(createBody.type).toBe('exactIn')
+    // Full amount — NOT the discounted 100.
+    expect(createBody.source.amount).toBe('105')
+    expect(createBody.source.chainId).toBe('8453')
+    expect(createBody.destination.amount).toBeUndefined()
+    // Response reflects no discount.
+    expect(json.callerPays).toBe('105')
+    expect(json.discount).toBe('0')
+    expect(json.title).toBe('Pay OpenRouter, Inc. $105')
+  })
+
+  it('Lightning source → exactOut, destination.amount full, source BTC no amount, appId=merchant_openrouter', async () => {
+    const { status, createBody } = await run({
+      payment_id: 'pl_test123',
+      source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+    })
+    expect(status).toBe(200)
+    expect(createBody.appId).toBe('merchant_openrouter')
+    expect(createBody.type).toBe('exactOut')
+    expect(createBody.source).toEqual({ chainId: 'lightning', tokenSymbol: 'BTC' })
+    expect(createBody.source.amount).toBeUndefined()
+    expect(createBody.source.tokenAddress).toBeUndefined()
+    // destination pins the full USDC the merchant receives.
+    expect(createBody.destination.amount).toBe('105')
+    expect(createBody.destination.chainId).toBe('8453')
+    expect(createBody.destination.receiverAddress).toBe('0x2352Fa2970dBadD12d21808DB0F56CDEC8141739')
+    expect(createBody.destination.tokenSymbol).toBe('USDC')
   })
 })
 
