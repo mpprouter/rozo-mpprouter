@@ -6,6 +6,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   normalizePayInvoiceBody,
+  extractCoinbaseCheckoutId,
   extractPaymentLinkId,
 } from '../src/routes/pay-invoice-admin'
 
@@ -36,6 +37,30 @@ describe('extractPaymentLinkId', () => {
 
   it('returns null for an empty string', () => {
     expect(extractPaymentLinkId('')).toBeNull()
+  })
+})
+
+describe('extractCoinbaseCheckoutId', () => {
+  it('extracts a Coinbase payment session v3 id', () => {
+    expect(
+      extractCoinbaseCheckoutId(
+        'https://payments.coinbase.com/payment-sessions/paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22',
+      ),
+    ).toBe('paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22')
+  })
+
+  it('keeps extracting legacy payment link ids', () => {
+    expect(
+      extractCoinbaseCheckoutId('https://payments.coinbase.com/payment-links/pl_abc123'),
+    ).toBe('pl_abc123')
+  })
+
+  it('rejects a Coinbase-shaped path on an untrusted host', () => {
+    expect(
+      extractCoinbaseCheckoutId(
+        'https://example.com/payment-sessions/paymentSession_abc123',
+      ),
+    ).toBeNull()
   })
 })
 
@@ -129,6 +154,17 @@ describe('normalizePayInvoiceBody — pl_ detection from URL', () => {
     })
     expect(r.normalized).toEqual({ url: 'https://payments.coinbase.com/payment-links/pl_XYZ' })
     expect(r.link_id_detected).toBe('pl_XYZ')
+  })
+
+  it('accepts a Coinbase payment session v3 URL unchanged and detects its id', () => {
+    const url =
+      'https://payments.coinbase.com/payment-sessions/paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22'
+    const r = normalizePayInvoiceBody({ url })
+    expect(r.normalized).toEqual({ url })
+    expect(r.provider_detected).toBe('coinbase')
+    expect(r.link_id_detected).toBe(
+      'paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22',
+    )
   })
 })
 
