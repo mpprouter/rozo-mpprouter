@@ -221,6 +221,9 @@ function redeemReq(code: string, url = 'https://payments.coinbase.com/payment-li
   })
 }
 
+const V3_SESSION_URL =
+  'https://payments.coinbase.com/payment-sessions/paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22'
+
 function resolveReq(body: any, secret = 'test-coupon-admin') {
   return new Request('https://router.test/admin/coupon/resolve', {
     method: 'POST',
@@ -300,6 +303,17 @@ describe('POST /admin/coupon/issue', () => {
     const ttlMs = Date.parse(body.expiresAt) - Date.now()
     expect(ttlMs).toBeGreaterThan(11.9 * 3_600_000)
     expect(ttlMs).toBeLessThan(12.1 * 3_600_000)
+  })
+})
+
+describe('POST /coupon/redeem — Coinbase v3', () => {
+  it('accepts a paymentSession URL and forwards its stable id', async () => {
+    const { env, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env, '20')
+    const response = await handleRedeemCoupon(redeemReq(code, V3_SESSION_URL), env)
+    expect(response.status).toBe(200)
+    expect(((await response.json()) as any).status).toBe('redeemed')
   })
 })
 

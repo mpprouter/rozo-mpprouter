@@ -39,8 +39,10 @@ When a user says any of the following — "pay invoice", "pay OpenRouter", "pay 
   Endpoint: POST /v1/services/rozo-agent-api/pay-invoice
   Body: { "url": "<payment_link_url>" }   or   { "payment_id": "<id>" }
 
-This service handles payment links from Coinbase Commerce (coinbase.com/pay/*),
-OpenRouter invoices, and other Stripe-style checkout links.
+This service handles Coinbase Payments checkout URLs
+(payments.coinbase.com/payment-links/pl_* and
+payments.coinbase.com/payment-sessions/paymentSession_*), OpenRouter invoices,
+and Stripe Crypto checkout links.
 Payment is made with Stellar USDC via the normal 402 flow.
 
 ## Don't have a Stellar wallet yet?

@@ -50,7 +50,7 @@
 
 import type { Env } from '../index'
 import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
-import { extractPaymentLinkId } from './pay-invoice-admin'
+import { extractCoinbaseCheckoutId } from './pay-invoice-admin'
 import { parseUsdc, formatUsdc } from './create-invoice'
 import { callAgentApiPayInvoice, reservedAtomic, FUNDER_WALLET } from './webhook'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
@@ -698,9 +698,9 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   const turnstileToken = typeof body?.turnstileToken === 'string' ? body.turnstileToken : null
   const urlRaw = String(body?.url ?? body?.link ?? body?.payment_link ?? '').trim()
   const plId =
-    urlRaw.startsWith('pl_') && /^pl_[A-Za-z0-9_-]+$/.test(urlRaw)
+    /^(?:pl_[A-Za-z0-9_-]+|paymentSession_[A-Za-z0-9_-]+)$/.test(urlRaw)
       ? urlRaw
-      : extractPaymentLinkId(urlRaw)
+      : extractCoinbaseCheckoutId(urlRaw)
 
   const validCode = CODE_RE.test(code) ? code : null
   const ids = await identifierKeys(env.COUPON_HASH_SECRET, {
