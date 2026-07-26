@@ -2,7 +2,7 @@
 //
 // POST /v1/services/rozo-agent-api/invoice-details  { "url": "<invoice url>" }
 //
-// Resolves a Coinbase or Stripe invoice URL to normalized, NON-SECRET detail:
+// Resolves a Coinbase or Stripe checkout URL to normalized, NON-SECRET detail:
 // merchant, amount, currency, state, expiry, supported payment options, and
 // masked transaction details — the same data a customer already sees on the
 // checkout page.
@@ -118,6 +118,7 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
       supported_url_families: [
         'https://crypto.stripe.com/pay/<blob>',
         'https://payments.coinbase.com/payment-links/pl_<id>',
+        'https://payments.coinbase.com/payment-sessions/paymentSession_<id>',
       ],
     })
   }
@@ -130,6 +131,7 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
       supported_url_families: [
         'https://crypto.stripe.com/pay/<blob>',
         'https://payments.coinbase.com/payment-links/pl_<id>',
+        'https://payments.coinbase.com/payment-sessions/paymentSession_<id>',
       ],
     })
   }

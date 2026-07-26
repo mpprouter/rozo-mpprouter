@@ -44,7 +44,7 @@ const STRIPE_HOSTS = new Set(['crypto.stripe.com'])
 
 /**
  * Classify an invoice URL by provider using a strict host allowlist.
- * Returns 'coinbase' for Coinbase payment-link hosts, 'stripe_crypto' for
+ * Returns 'coinbase' for Coinbase checkout hosts, 'stripe_crypto' for
  * Stripe crypto checkout, or null when the URL is malformed or the host is
  * not on either allowlist.
  */
@@ -62,7 +62,7 @@ export function detectProvider(raw: string): InvoiceProvider | null {
   return null
 }
 
-// ── pl_ extraction ────────────────────────────────────────────────────────────
+// ── Coinbase checkout ID extraction ──────────────────────────────────────────
 
 /**
  * If the input is a Coinbase payment link URL containing /payment-links/pl_...,
@@ -73,6 +73,28 @@ export function extractPaymentLinkId(raw: string): string | null {
     const u = new URL(raw)
     const match = u.pathname.match(/\/payment-links\/(pl_[A-Za-z0-9_-]+)/)
     return match ? match[1] : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Extract the stable ID from either Coinbase checkout URL family.
+ *
+ * Kept separate from extractPaymentLinkId so existing callers that require a
+ * legacy pl_* ID (coupon redemption and fulfillment KV keys) do not silently
+ * start accepting paymentSession_* IDs before those flows support v3.
+ */
+export function extractCoinbaseCheckoutId(raw: string): string | null {
+  if (detectProvider(raw) !== 'coinbase') return null
+  try {
+    const u = new URL(raw)
+    const legacy = u.pathname.match(/\/payment-links\/(pl_[A-Za-z0-9_-]+)/)
+    if (legacy) return legacy[1]
+    const session = u.pathname.match(
+      /\/payment-sessions\/(paymentSession_[A-Za-z0-9_-]+)/,
+    )
+    return session ? session[1] : null
   } catch {
     return null
   }
@@ -137,7 +159,7 @@ export function normalizePayInvoiceBody(input: unknown): NormalizedPayInvoiceRes
         hint: 'Send Content-Type: application/json with a JSON object body.',
         route_capabilities: [
           'POST body: { "url": "<payment_link_url>" }',
-          'POST body: { "payment_id": "<pl_...>" }',
+          'POST body: { "payment_id": "<pl_... or paymentSession_...>" }',
           'Aliases accepted for url: payment_link, link, invoice_url',
           'Aliases accepted for payment_id: id, invoice_id, paymentLinkId',
         ],
@@ -165,11 +187,11 @@ export function normalizePayInvoiceBody(input: unknown): NormalizedPayInvoiceRes
     }
   }
 
-  // If url provided but no explicit id, try to derive payment_id from pl_ in URL
+  // If a URL is provided, expose its stable checkout ID for diagnostics.
   let linkIdDetected: string | null = null
   let providerDetected: InvoiceProvider | null = null
   if (rawUrl) {
-    linkIdDetected = extractPaymentLinkId(rawUrl)
+    linkIdDetected = extractCoinbaseCheckoutId(rawUrl)
     // Classify the provider from the URL host (strict allowlist). Purely
     // additive — used by the Stripe path and for error context; the Coinbase
     // normalization result (url/payment_id) is unchanged.
@@ -187,13 +209,15 @@ export function normalizePayInvoiceBody(input: unknown): NormalizedPayInvoiceRes
       error: {
         code: 'INVALID_INPUT',
         message: 'Body must contain at least one of: url or payment_id (with accepted aliases).',
-        hint: 'Provide { "url": "<payment_link_url>" } or { "payment_id": "<pl_...>" }.',
+        hint:
+          'Provide { "url": "<checkout_url>" } or ' +
+          '{ "payment_id": "<pl_... or paymentSession_...>" }.',
         normalized_input: {},
         link_id_detected: null,
         route_capabilities: [
           'url aliases: url, payment_link, link, invoice_url',
           'id aliases: payment_id, id, invoice_id, paymentLinkId',
-          'If url contains /payment-links/pl_..., payment_id is auto-derived',
+          'Coinbase URL families: /payment-links/pl_... and /payment-sessions/paymentSession_...',
         ],
       },
     }

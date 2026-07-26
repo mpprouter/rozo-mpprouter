@@ -50,7 +50,7 @@ function safeStripeState(state: unknown): string {
 
 export interface NormalizedInvoice {
   provider: InvoiceProvider
-  invoiceKey: string // coinbase: pl_*; stripe: cpis_*
+  invoiceKey: string // coinbase: pl_* or paymentSession_*; stripe: cpis_*
   merchantTitle: string
   merchantAccount: string | null // Stripe acct_*; null for providers without it
   fiatAmountMinor: string // integer string, e.g. "1819"

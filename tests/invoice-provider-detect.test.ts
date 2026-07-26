@@ -21,6 +21,14 @@ describe('detectProvider — strict host allowlist', () => {
     expect(detectProvider('https://payments.coinbase.com/payment-links/pl_abc')).toBe('coinbase')
   })
 
+  it('detects Coinbase payment-sessions v3 host', () => {
+    expect(
+      detectProvider(
+        'https://payments.coinbase.com/payment-sessions/paymentSession_abc-123',
+      ),
+    ).toBe('coinbase')
+  })
+
   it('detects Coinbase commerce host', () => {
     expect(detectProvider('https://commerce.coinbase.com/payment-links/pl_abc')).toBe('coinbase')
   })

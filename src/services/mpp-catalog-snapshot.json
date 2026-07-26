@@ -6,7 +6,7 @@
       "name": "Rozo Agent API",
       "serviceUrl": "https://agentapi.rozo.ai",
       "url": "https://agentapi.rozo.ai",
-      "description": "Agentic payment for online checkout. Pay Coinbase Payment Links (Coinbase Payments) and similar checkout invoices, including Stripe-style pay links, with your agents.",
+      "description": "Agentic payment for online checkout. Pay Coinbase Payments checkout sessions and similar checkout invoices, including Stripe-style pay links, with your agents.",
       "categories": [
         "AI",
         "crypto",
@@ -30,7 +30,7 @@
         {
           "method": "POST",
           "path": "/pay-invoice",
-          "description": "Pay a Coinbase Payment Link (Coinbase Payments / Stripe-style invoice link)",
+          "description": "Pay a Coinbase Payments checkout URL (payment-links or payment-sessions) or Stripe-style invoice link",
           "payment": {
             "intent": "charge",
             "method": "tempo",
