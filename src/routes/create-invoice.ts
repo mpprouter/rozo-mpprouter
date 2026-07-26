@@ -11,6 +11,7 @@ import {
 } from './invoice-provider'
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
+import { verifyQuoteReceipt } from './quote-receipt'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
@@ -353,57 +354,77 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   }
   const source = sourceResult.resolved
 
-  // Step 1: fetch the quote (price + merchant name) by calling our own
-  // upstream quote-invoice with the router's admin secret.
-  let quoteResp: Response
-  try {
-    quoteResp = await fetch(QUOTE_INVOICE_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
-      },
-      body: JSON.stringify(normalized),
-    })
-  } catch (err: any) {
-    return errorResponse(502, {
-      code: 'QUOTE_FETCH_FAILED',
-      message: `Quote upstream unreachable: ${err?.message ?? 'unknown error'}`,
-      normalized_input: normalized,
-      link_id_detected,
-    })
-  }
+  let quote: any
+  const receiptRaw = (parsed as Record<string, unknown> | null)?.quoteReceipt
+  const normalizedPaymentId =
+    'payment_id' in normalized ? normalized.payment_id : link_id_detected
+  const receipt =
+    typeof receiptRaw === 'string' && normalizedPaymentId
+      ? await verifyQuoteReceipt(
+          receiptRaw,
+          normalizedPaymentId,
+          env.PAYINVOICE_ADMIN_SECRET,
+        )
+      : null
 
-  if (!quoteResp.ok) {
-    const detail = await quoteResp.text()
-    if (quoteResp.status === 409 || quoteResp.status === 410) {
-      return errorResponse(quoteResp.status, {
-        code: 'LINK_USED_OR_EXPIRED',
-        message: 'Payment link has already been used or has expired.',
-        hint: 'Request a new payment link from the merchant.',
+  if (receipt) {
+    quote = {
+      invoice: { amount: receipt.amount },
+      merchant: receipt.merchant,
+      linkId: receipt.paymentId,
+    }
+  } else {
+    // Backward compatibility and safe fallback: callers without a receipt, or
+    // with an expired/tampered receipt, get a fresh server-side quote.
+    let quoteResp: Response
+    try {
+      quoteResp = await fetch(QUOTE_INVOICE_URL, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
+        },
+        body: JSON.stringify(normalized),
+      })
+    } catch (err: any) {
+      return errorResponse(502, {
+        code: 'QUOTE_FETCH_FAILED',
+        message: `Quote upstream unreachable: ${err?.message ?? 'unknown error'}`,
         normalized_input: normalized,
         link_id_detected,
       })
     }
-    return errorResponse(502, {
-      code: 'QUOTE_FETCH_FAILED',
-      message: 'Quote upstream returned an error.',
-      hint: detail.substring(0, 300),
-      normalized_input: normalized,
-      link_id_detected,
-    })
-  }
 
-  let quote: any
-  try {
-    quote = await quoteResp.json()
-  } catch {
-    return errorResponse(502, {
-      code: 'QUOTE_FETCH_FAILED',
-      message: 'Quote upstream returned non-JSON body.',
-      normalized_input: normalized,
-      link_id_detected,
-    })
+    if (!quoteResp.ok) {
+      const detail = await quoteResp.text()
+      if (quoteResp.status === 409 || quoteResp.status === 410) {
+        return errorResponse(quoteResp.status, {
+          code: 'LINK_USED_OR_EXPIRED',
+          message: 'Payment link has already been used or has expired.',
+          hint: 'Request a new payment link from the merchant.',
+          normalized_input: normalized,
+          link_id_detected,
+        })
+      }
+      return errorResponse(502, {
+        code: 'QUOTE_FETCH_FAILED',
+        message: 'Quote upstream returned an error.',
+        hint: detail.substring(0, 300),
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+
+    try {
+      quote = await quoteResp.json()
+    } catch {
+      return errorResponse(502, {
+        code: 'QUOTE_FETCH_FAILED',
+        message: 'Quote upstream returned non-JSON body.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
   }
 
   const invoiceAmount: string | undefined = quote?.invoice?.amount
