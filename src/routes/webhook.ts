@@ -596,10 +596,9 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
 //                              source.txHash). Source of truth for the
 //                              caller → 0x2352... leg.
 //
-//   ?payment_id=pl_*         → asks Coinbase Payment Link API "did the
-//                              underlying invoice get settled?" (status,
-//                              usageCount). Source of truth for the
-//                              MPP Router → Coinbase leg.
+//   ?payment_id=<Coinbase id> → asks Coinbase "did the underlying invoice get
+//                               settled?" Supports legacy pl_* links and v3
+//                               paymentSession_* sessions.
 //
 // Either way we also return our own router KV state so the caller can
 // tell which step the end-to-end flow is on.
@@ -611,15 +610,26 @@ function isPlId(s: string): boolean {
   return /^pl_[0-9a-zA-Z]+$/.test(s)
 }
 
-async function fetchCoinbasePaymentLink(plId: string): Promise<any | null> {
+function isPaymentSessionId(s: string): boolean {
+  return /^paymentSession_[A-Za-z0-9_-]+$/.test(s)
+}
+
+function isCoinbasePaymentId(s: string): boolean {
+  return isPlId(s) || isPaymentSessionId(s)
+}
+
+async function fetchCoinbasePayment(paymentId: string): Promise<any | null> {
   try {
+    const resource = isPaymentSessionId(paymentId)
+      ? 'payment-sessions'
+      : 'payment-links'
     const r = await fetch(
-      `${COINBASE_PAYMENTS_BASE}/next-api/payment-links/${encodeURIComponent(plId)}`,
+      `${COINBASE_PAYMENTS_BASE}/next-api/${resource}/${encodeURIComponent(paymentId)}`,
       {
         headers: {
           Accept: 'application/json',
           Origin: COINBASE_PAYMENTS_BASE,
-          Referer: `${COINBASE_PAYMENTS_BASE}/`,
+          Referer: `${COINBASE_PAYMENTS_BASE}/${resource}/${encodeURIComponent(paymentId)}`,
         },
       },
     )
@@ -673,7 +683,27 @@ function pickRozoCallerSafe(rp: any) {
 
 function pickCoinbaseCallerSafe(cp: any) {
   if (!cp) return null
+  if (typeof cp.paymentSessionId === 'string') {
+    return {
+      protocolVersion: 'v3',
+      id: cp.paymentSessionId,
+      status: cp.status,
+      fiat: {
+        amount: cp.amount,
+        currency: cp.asset,
+      },
+      maxAmount: cp.amount,
+      usageCount: null,
+      maxUsage: null,
+      preApprovalExpiry: cp.expiresAt,
+      merchant: cp.customerDisplay?.merchantName
+        ? { name: cp.customerDisplay.merchantName }
+        : null,
+      settled: cp.status === 'PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED',
+    }
+  }
   return {
+    protocolVersion: 'v1',
     id: cp.id,
     status: cp.status,
     fiat: cp.fiat,
@@ -728,14 +758,14 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
 
   // Accept payment_id with a uuid value (some callers will paste the
   // Rozo payment id into payment_id without knowing the convention).
-  if (plId && !isPlId(plId) && /^[0-9a-f-]{36}$/i.test(plId)) {
+  if (plId && !isCoinbasePaymentId(plId) && /^[0-9a-f-]{36}$/i.test(plId)) {
     rozoId = plId
     plId = null
   }
 
   if (!plId && !rozoId) {
     return json(400, {
-      error: 'provide payment_id=pl_* (Coinbase), invoice_key=cpis_* (Stripe), or rozo_payment_id=<uuid>',
+      error: 'provide payment_id=<pl_* or paymentSession_*> (Coinbase), invoice_key=cpis_* (Stripe), or rozo_payment_id=<uuid>',
     })
   }
 
@@ -746,16 +776,16 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
   let rozo: any = null
 
   if (plId) {
-    coinbase = await fetchCoinbasePaymentLink(plId)
+    coinbase = await fetchCoinbasePayment(plId)
   }
   if (rozoId) {
     rozo = await fetchRozoPaymentById(env, rozoId)
-    // If Rozo lookup returned an orderId that looks like a pl_, surface
+    // If Rozo lookup returned a Coinbase orderId, surface
     // the corresponding Coinbase state too (caller may want both).
     const inferredPl = rozo?.orderId
-    if (typeof inferredPl === 'string' && isPlId(inferredPl) && !coinbase) {
+    if (typeof inferredPl === 'string' && isCoinbasePaymentId(inferredPl) && !coinbase) {
       plId = inferredPl
-      coinbase = await fetchCoinbasePaymentLink(plId)
+      coinbase = await fetchCoinbasePayment(plId)
     }
   }
 
