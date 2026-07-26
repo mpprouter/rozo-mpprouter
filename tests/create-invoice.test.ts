@@ -8,6 +8,85 @@ import {
   buildFullAmountTitle,
   resolveSource,
 } from '../src/routes/create-invoice'
+import {
+  createQuoteReceipt,
+  verifyQuoteReceipt,
+} from '../src/routes/quote-receipt'
+
+describe('quote receipt', () => {
+  it('round-trips a signed quote and binds it to the payment id', async () => {
+    const receipt = await createQuoteReceipt(
+      'pl_test123',
+      '105',
+      'OpenRouter, Inc.',
+      'test-secret',
+      1_000,
+    )
+    await expect(
+      verifyQuoteReceipt(receipt, 'pl_test123', 'test-secret', 1_001),
+    ).resolves.toMatchObject({
+      paymentId: 'pl_test123',
+      amount: '105',
+      merchant: 'OpenRouter, Inc.',
+    })
+    await expect(
+      verifyQuoteReceipt(receipt, 'pl_other', 'test-secret', 1_001),
+    ).resolves.toBeNull()
+  })
+
+  it('rejects tampered and expired receipts', async () => {
+    const receipt = await createQuoteReceipt(
+      'pl_test123',
+      '105',
+      'OpenRouter, Inc.',
+      'test-secret',
+      1_000,
+    )
+    await expect(
+      verifyQuoteReceipt(`${receipt}x`, 'pl_test123', 'test-secret', 1_001),
+    ).resolves.toBeNull()
+    await expect(
+      verifyQuoteReceipt(receipt, 'pl_test123', 'test-secret', 1_301),
+    ).resolves.toBeNull()
+  })
+
+  it('is issued by quote-invoice and can be verified against its link id', async () => {
+    const { handleQuoteInvoice } = await import('../src/routes/pay-invoice-admin')
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response(
+        JSON.stringify({
+          ok: true,
+          linkId: 'paymentSession_test123',
+          merchant: 'OpenRouter, Inc.',
+          invoice: { amount: '1.05' },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )) as typeof fetch
+    try {
+      const response = await handleQuoteInvoice(
+        new Request('https://mpp.test/quote-invoice', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ payment_id: 'paymentSession_test123' }),
+        }),
+        { PAYINVOICE_ADMIN_SECRET: 'test-secret' } as import('../src/index').Env,
+      )
+      const body = await response.json() as any
+      expect(response.status).toBe(200)
+      expect(body.quoteReceipt).toEqual(expect.any(String))
+      await expect(
+        verifyQuoteReceipt(
+          body.quoteReceipt,
+          'paymentSession_test123',
+          'test-secret',
+        ),
+      ).resolves.toMatchObject({ amount: '1.05', merchant: 'OpenRouter, Inc.' })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})
 
 describe('parseUsdc', () => {
   it('parses integer dollars', () => {
@@ -286,10 +365,12 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
   async function run(body: Record<string, unknown>) {
     const { handleCreateInvoice } = await import('../src/routes/create-invoice')
     let createBody: any = null
+    let quoteFetches = 0
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async (input: any, init?: any) => {
       const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
       if (u.includes('/quote-invoice')) {
+        quoteFetches += 1
         return new Response(
           JSON.stringify({
             invoice: { amount: '105' },
@@ -320,7 +401,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
       })
       const res = await handleCreateInvoice(req, makeEnv())
       const json = JSON.parse(await res.text())
-      return { status: res.status, json, createBody }
+      return { status: res.status, json, createBody, quoteFetches }
     } finally {
       globalThis.fetch = originalFetch
     }
@@ -357,6 +438,38 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(createBody.destination.chainId).toBe('8453')
     expect(createBody.destination.receiverAddress).toBe('0x2352Fa2970dBadD12d21808DB0F56CDEC8141739')
     expect(createBody.destination.tokenSymbol).toBe('USDC')
+  })
+
+  it('uses a valid signed quote receipt without fetching the quote upstream again', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '77',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+    )
+    const { status, createBody, quoteFetches } = await run({
+      payment_id: 'pl_test123',
+      quoteReceipt,
+    })
+    expect(status).toBe(200)
+    expect(quoteFetches).toBe(0)
+    expect(createBody.source.amount).toBe('77')
+  })
+
+  it('falls back to a fresh upstream quote when the receipt is tampered', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '77',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+    )
+    const { status, createBody, quoteFetches } = await run({
+      payment_id: 'pl_test123',
+      quoteReceipt: `${quoteReceipt}x`,
+    })
+    expect(status).toBe(200)
+    expect(quoteFetches).toBe(1)
+    expect(createBody.source.amount).toBe('105')
   })
 })
 

@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { createQuoteReceipt } from './quote-receipt'
 
 // ── Error code constants ─────────────────────────────────────────────────────
 
@@ -410,10 +411,24 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     })
   }
 
-  const contentType = upstream.headers.get('content-type') || 'application/json'
-  const body = await upstream.text()
-  return new Response(body, {
-    status: upstream.status,
-    headers: { 'Content-Type': contentType },
-  })
+  const quote: any = await upstream.json().catch(() => null)
+  const paymentId = quote?.linkId ?? link_id_detected
+  const amount = quote?.invoice?.amount
+  const merchant = quote?.merchant
+  if (!quote || !paymentId || typeof amount !== 'string' || typeof merchant !== 'string') {
+    return errorResponse(502, {
+      code: 'QUOTE_UNAVAILABLE',
+      message: 'Quote upstream returned an invalid response.',
+      normalized_input: normalized,
+      link_id_detected,
+    })
+  }
+
+  const quoteReceipt = await createQuoteReceipt(
+    paymentId,
+    amount,
+    merchant,
+    env.PAYINVOICE_ADMIN_SECRET,
+  )
+  return json(200, { ...quote, quoteReceipt })
 }
