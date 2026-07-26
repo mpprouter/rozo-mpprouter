@@ -46,7 +46,7 @@ describe('quote receipt', () => {
       verifyQuoteReceipt(`${receipt}x`, 'pl_test123', 'test-secret', 1_001),
     ).resolves.toBeNull()
     await expect(
-      verifyQuoteReceipt(receipt, 'pl_test123', 'test-secret', 1_301),
+      verifyQuoteReceipt(receipt, 'pl_test123', 'test-secret', 1_061),
     ).resolves.toBeNull()
   })
 

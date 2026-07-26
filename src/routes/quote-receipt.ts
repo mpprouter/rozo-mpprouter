@@ -1,4 +1,4 @@
-const RECEIPT_TTL_SECONDS = 5 * 60
+const RECEIPT_TTL_SECONDS = 60
 const encoder = new TextEncoder()
 
 export interface QuoteReceiptPayload {
