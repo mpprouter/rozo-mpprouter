@@ -66,13 +66,53 @@ export type {
  * `payMerchantSession` reads the right `tempoChannel:<id>` KV record.
  */
 export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
+  // -------------------------------------------------------------------
+  // Service-wide blocks (`serviceId::*`) — 2026-07-29 NANOUSD migration.
+  // These merchants (*.mpp.tempo.xyz) now charge in NANOUSD
+  // (0x20c0…ec7a, ~$45 total supply, no DEX route from USDC.e), which
+  // the router cannot settle. Blocking at the SERVICE level disables
+  // every auto-generated payable endpoint (e.g. openai `/responses`,
+  // `/embeddings`), not just the historical public paths — otherwise
+  // customers could still pay a sibling route and get a 502.
+  // Endpoint-specific entries below still win field-by-field.
+  // -------------------------------------------------------------------
+  'openai::*': {
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant migrated its charge currency to NANOUSD (unobtainable). ' +
+      'All endpoints disabled until resolved with Tempo. 2026-07-29.',
+  },
+  'anthropic::*': {
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant migrated its charge currency to NANOUSD (unobtainable). ' +
+      'All endpoints disabled until resolved with Tempo. 2026-07-29.',
+  },
+  'openrouter::*': {
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant migrated its charge currency to NANOUSD (unobtainable). ' +
+      'All endpoints disabled until resolved with Tempo. 2026-07-29.',
+  },
+  'gemini::*': {
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant migrated its charge currency to NANOUSD (unobtainable). ' +
+      'All endpoints disabled until resolved with Tempo. 2026-07-29.',
+  },
+  'rpc::*': {
+    verifiedMode: false,
+    verifiedNote:
+      'Merchant migrated its charge currency to NANOUSD (unobtainable). ' +
+      'All endpoints disabled until resolved with Tempo. 2026-07-29.',
+  },
   // Parallel Search — first verified route, hand-tested 2026-04-11
   'parallel::/api/search': {
     id: 'parallel_search',
     publicPath: '/v1/services/parallel/search',
     verifiedMode: 'charge',
     chargeVerified: true,
-    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
   },
   // Exa AI Search
   'exa::/search': {
@@ -80,7 +120,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/exa/search',
     verifiedMode: 'charge',
     chargeVerified: true,
-    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
   },
   // Firecrawl Scrape
   'firecrawl::/v1/scrape': {
@@ -88,7 +128,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/firecrawl/scrape',
     verifiedMode: 'charge',
     chargeVerified: true,
-    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
   },
   // OpenRouter Chat — flipped to tempo.session 2026-04-11 after
   // open-tempo-channel.ts opened the $1 channel
@@ -100,34 +140,52 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'openrouter_chat',
     publicPath: '/v1/services/openrouter/chat',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+    // 2026-07-29 real-money E2E: customer payment settles, then the
+    // merchant rejects settlement — the *.mpp.tempo.xyz family now
+    // charges in NANOUSD (0x20c0…ec7a), a token with ~$45 total supply
+    // and no DEX route from USDC.e. Disabled to stop agents paying
+    // then getting a 502.
+    verifiedMode: false,
+    sessionVerified: false,
+    sessionVerifiedAt: '2026-07-29T00:00:00Z',
+    verifiedNote:
+      'Upstream migrated its charge currency to NANOUSD (unobtainable — ' +
+      '$45 total supply, no DEX route). Session vouchers no longer honored; ' +
+      'real-money E2E 2026-07-29 failed post-payment. Disabled until the ' +
+      'mpp.tempo.xyz merchant currency issue is resolved with Tempo.',
   },
-  // Anthropic Messages — upstream recovered, now charge-mode
+  // Anthropic Messages — blocked on upstream NANOUSD currency
   'anthropic::/v1/messages': {
     id: 'anthropic_messages',
     publicPath: '/v1/services/anthropic/messages',
-    // 2026-07-29 re-probe: the merchant that 500'd on 2026-04-11 now
-    // returns a clean 402 with `intent="charge"` (Tempo charge, not
-    // session). verifiedMode deliberately left unset: the route is
-    // payable-but-unverified (`payment_status: "available"`) until a
-    // real-money E2E succeeds post-deploy — only then flip to
-    // verifiedMode: 'charge' + chargeVerified.
+    // 2026-07-29: the merchant that 500'd on 2026-04-11 now returns a
+    // clean 402, but its charge currency is NANOUSD (0x20c0…ec7a) — a
+    // token with ~$45 total supply and no DEX route from USDC.e, so
+    // the router cannot settle it. Real-money E2E failed post-payment.
     upstreamPaymentMethod: 'tempo.charge',
+    verifiedMode: false,
     verifiedNote:
-      'Upstream recovered 2026-07-29 — merchant 402 challenge is ' +
-      'intent="charge" (was 500 on 2026-04-11). Payable again via charge ' +
-      'dispatch; pending fresh real-money E2E before re-marking verified.',
+      'Upstream alive again (402 intent="charge") but charges in NANOUSD, ' +
+      'which the router cannot acquire (no DEX route, ~$45 total supply). ' +
+      'Disabled until the mpp.tempo.xyz merchant currency issue is ' +
+      'resolved with Tempo.',
   },
-  // OpenAI Chat — verified session mode
+  // OpenAI Chat — blocked on upstream NANOUSD currency
   'openai::/v1/chat/completions': {
     id: 'openai_chat',
     publicPath: '/v1/services/openai/chat',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+    // 2026-07-29 real-money E2E (fresh $2 channel): customer payment
+    // settles, merchant then rejects — same NANOUSD migration as the
+    // rest of the *.mpp.tempo.xyz family. Disabled to protect agents.
+    verifiedMode: false,
+    sessionVerified: false,
+    sessionVerifiedAt: '2026-07-29T00:00:00Z',
+    verifiedNote:
+      'Upstream migrated its charge currency to NANOUSD (unobtainable). ' +
+      'Real-money E2E 2026-07-29 failed post-payment even on a freshly ' +
+      'opened $2 channel. Disabled until the mpp.tempo.xyz merchant ' +
+      'currency issue is resolved with Tempo.',
   },
   // Google Gemini — uses {model} placeholder, defaults to gemini-2.0-flash
   // The upstream path uses Google's `:generateContent` literal
@@ -150,20 +208,47 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     publicPath: '/v1/services/gemini/generate',
     upstreamPaymentMethod: 'tempo.session',
     // 2026-07-29: upstreamPath override replaces the snapshot's literal
-    // `*` wildcard with a fully-templated path, unblocking the 404
-    // documented in the 2026-06-22 E2E (payment/session layer was
-    // already verified working then). verifiedMode deliberately left
-    // unset: payable-but-unverified (`payment_status: "available"`)
-    // until a fresh real-money E2E succeeds post-deploy — only then
-    // flip to verifiedMode: 'session' + sessionVerified.
+    // `*` wildcard with a fully-templated path, fixing the 404
+    // documented in the 2026-06-22 E2E. However the real-money E2E
+    // still fails post-payment: the merchant now charges in NANOUSD
+    // (same *.mpp.tempo.xyz migration). Path fix kept so the route
+    // works the moment the currency issue is resolved.
     upstreamPath: '/{version}/models/{model}:generateContent',
+    verifiedMode: false,
     verifiedNote:
-      'Session/payment layer verified 2026-06-22 (descriptor captured). ' +
-      'Upstream 404 fixed 2026-07-29 via upstreamPath override — the ' +
-      'snapshot wildcard `/{version}/models/*` is now templated as ' +
-      '`/{version}/models/{model}:generateContent`. Pending fresh ' +
-      'real-money E2E before re-marking verified.',
+      'Upstream path 404 fixed 2026-07-29 via upstreamPath override, but ' +
+      'the merchant migrated its charge currency to NANOUSD (unobtainable). ' +
+      'Real-money E2E 2026-07-29 failed post-payment. Disabled until the ' +
+      'mpp.tempo.xyz merchant currency issue is resolved with Tempo.',
     placeholderDefaults: { version: 'v1beta', model: 'gemini-2.0-flash' },
+  },
+  // Grok (xAI) Chat — verified 2026-07-29 real-money E2E via Stellar
+  // charge (paywithlocus family; live grok-3-mini completion).
+  'grok::/grok/chat': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
+  },
+  // Mistral Chat — verified 2026-07-29 real-money E2E via Stellar
+  // charge (live mistral-small-latest completion).
+  'mistral::/mistral/chat': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
+  },
+  // Perplexity Sonar Chat — verified 2026-07-29 real-money E2E via
+  // Stellar charge (live sonar completion with usage metering).
+  'perplexity::/perplexity/chat': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
+  },
+  // Deepgram List Models — verified 2026-07-29 real-money E2E via
+  // Stellar charge ($0.004/request, valid model list returned).
+  'deepgram::/deepgram/list-models': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
   },
   // Dune SQL Execute — channel underfunded
   'dune::/api/v1/sql/execute': {
@@ -198,14 +283,22 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     chargeVerifiedAt: '2026-04-11T00:00:00Z',
     placeholderDefaults: { network: 'eth-mainnet' },
   },
-  // Tempo L2 RPC
+  // Tempo L2 RPC — blocked on upstream NANOUSD currency
   'rpc::/': {
     id: 'tempo_rpc',
     publicPath: '/v1/services/tempo/rpc',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+    // 2026-07-29 real-money E2E: merchant charge now demands NANOUSD
+    // (TIP20 InsufficientBalance revert, token 0x20c0…ec7a). Same
+    // migration as the rest of the *.mpp.tempo.xyz family.
+    verifiedMode: false,
+    sessionVerified: false,
+    sessionVerifiedAt: '2026-07-29T00:00:00Z',
+    verifiedNote:
+      'Upstream migrated its charge currency to NANOUSD (unobtainable). ' +
+      'Real-money E2E 2026-07-29 reverted with TIP20 InsufficientBalance. ' +
+      'Disabled until the mpp.tempo.xyz merchant currency issue is ' +
+      'resolved with Tempo.',
   },
   // DeepSeek Chat — OpenAI-compatible chat completions, tempo.charge.
   // Stable publicPath so agents don't hit the auto-slugged
@@ -218,7 +311,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
     chargeVerified: true,
-    chargeVerifiedAt: '2026-06-22T00:00:00Z',
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
   },
   // Groq Chat — OpenAI-compatible, very fast inference, tempo.charge.
   // Price dynamic ($0.005–$0.10 by model/tokens).
@@ -243,7 +336,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
     chargeVerified: true,
-    chargeVerifiedAt: '2026-06-22T00:00:00Z',
+    chargeVerifiedAt: '2026-07-29T00:00:00Z',
   },
   // QuickNode JSON-RPC — $0.001/request, tempo.charge. Upstream path is
   // `/{network}`; QuickNode uses `<chain>-mainnet` naming, so default to

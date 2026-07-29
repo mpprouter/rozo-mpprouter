@@ -307,8 +307,18 @@ export function buildRoutesFromMppSnapshot(
         upstreamPath,
         ...(service.docs ? { docs: service.docs } : {}),
       }
+      // Service-wide overlay (`serviceId::*`) applies to every endpoint
+      // of the service; an endpoint-specific entry wins field-by-field
+      // by being spread second. Used to block ALL payable endpoints of
+      // a merchant at once (e.g. the NANOUSD-migrated family) so no
+      // auto-generated sibling route keeps charging customers.
+      const serviceWide = overlay[`${service.id}::*`]
       const overlayKey = `${service.id}::${upstreamPath}`
-      const overlayEntry = overlay[overlayKey]
+      const endpointEntry = overlay[overlayKey]
+      const overlayEntry =
+        serviceWide || endpointEntry
+          ? { ...serviceWide, ...endpointEntry }
+          : undefined
       if (overlayEntry) {
         if (overlayEntry.id) {
           // Honor the historical ID so existing client URL

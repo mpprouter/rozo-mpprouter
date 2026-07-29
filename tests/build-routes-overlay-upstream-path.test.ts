@@ -60,16 +60,34 @@ describe('production overlay (real snapshot)', () => {
     expect(gemini).toBeDefined()
     const { path } = resolveUpstreamPath(gemini!, new URLSearchParams())
     expect(path).toBe('/v1beta/models/gemini-2.0-flash:generateContent')
-    // payable-but-unverified until a fresh real-money E2E passes
-    expect(gemini!.verifiedMode).toBeUndefined()
-    expect(gemini!.sessionVerified).toBeUndefined()
+    // disabled until the upstream NANOUSD currency issue is resolved
+    expect(gemini!.verifiedMode).toBe(false)
   })
 
-  it('anthropic_messages is payable again on the charge path, not yet verified', () => {
-    const anthropic = PUBLIC_SERVICE_ROUTES.find((r) => r.id === 'anthropic_messages')
-    expect(anthropic).toBeDefined()
-    expect(anthropic!.upstreamPaymentMethod).toBe('tempo.charge')
-    expect(anthropic!.verifiedMode).toBeUndefined()
-    expect(anthropic!.chargeVerified).toBeUndefined()
+  it('NANOUSD-blocked mpp.tempo.xyz routes are disabled', () => {
+    for (const id of ['anthropic_messages', 'openai_chat', 'openrouter_chat', 'tempo_rpc']) {
+      const route = PUBLIC_SERVICE_ROUTES.find((r) => r.id === id)
+      expect(route, id).toBeDefined()
+      expect(route!.verifiedMode, id).toBe(false)
+    }
+  })
+
+  it('services verified by 2026-07-29 real-money E2E are charge-verified', () => {
+    const expected = [
+      'grok_grok_chat',
+      'mistral_mistral_chat',
+      'perplexity_perplexity_chat',
+      'deepgram_deepgram_list-models',
+      'deepseek_chat',
+      'coingecko_simple_price',
+      'exa_search',
+      'firecrawl_scrape',
+      'parallel_search',
+    ]
+    for (const id of expected) {
+      const route = PUBLIC_SERVICE_ROUTES.find((r) => r.id === id)
+      expect(route, id).toBeDefined()
+      expect(route!.chargeVerified, id).toBe(true)
+    }
   })
 })

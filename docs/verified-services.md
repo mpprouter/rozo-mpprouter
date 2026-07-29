@@ -160,3 +160,45 @@ Full logs: `rozoskilltest/smoke-test-charge-log.md`, `rozoskilltest/smoke-test-x
 | 2026-04-12 | muggledev | Created doc. Fixed `stellarIntentsFor` to respect upstream mode. Added `upstreamPaymentMethod: 'tempo.charge'` override for alchemy_rpc |
 | 2026-04-11 | muggledev | Initial `verifiedMode` overlay for 12 services (5 charge, 4 session, 3 broken) |
 | 2026-04-10 | muggledev | First service catalog shipped with `parallel_search` as test service |
+
+---
+
+## 2026-07-29 re-verification (SCF #44 Tranche 1)
+
+Full real-money re-test of the verified set + candidate expansion.
+
+### Root cause found: NANOUSD migration broke the *.mpp.tempo.xyz family
+
+The merchants at `*.mpp.tempo.xyz` (openai, anthropic, gemini, openrouter,
+tempo rpc) migrated their charge currency from USDC.e
+(`0x20c0…8b50`) to **NANOUSD** (`0x20c0…ec7a`) — a TIP20 token with
+~$45 total supply and **no DEX route** from USDC.e (PairDoesNotExist on
+the stablecoin DEX, direct and via pathUSD). The router pool holds 0
+NANOUSD, so every payment reverts with `TIP20 InsufficientBalance`
+AFTER the customer already paid Stellar-side. Session vouchers are no
+longer honored either (502 on a freshly opened $2 openai channel).
+**All five routes disabled (`verifiedMode: false`) until resolved with
+the Tempo team.** exa/firecrawl/storage (same domain family) still
+charge in USDC.e and keep working.
+
+### Newly verified (real-money E2E via Stellar charge, 2026-07-29)
+
+| Service ID | Public Path | Result |
+|---|---|---|
+| `grok_grok_chat` | `/v1/services/grok/grok_chat` | live grok-3-mini completion |
+| `mistral_mistral_chat` | `/v1/services/mistral/mistral_chat` | live mistral-small-latest completion |
+| `perplexity_perplexity_chat` | `/v1/services/perplexity/perplexity_chat` | live sonar completion |
+| `deepgram_deepgram_list-models` | `/v1/services/deepgram/deepgram_list-models` | valid model list ($0.004) |
+
+### Re-verified same day
+
+deepseek, coingecko, exa, firecrawl, parallel — full-chain PASS.
+groq passed once, intermittent client-side failures on rapid retries.
+alchemy: merchant `-32002 Internal error` (upstream-side, retry later).
+
+### Gemini path fix (kept while disabled)
+
+`OPERATOR_OVERLAY` now supports an `upstreamPath` override; gemini's
+snapshot wildcard `/{version}/models/*` is templated as
+`/{version}/models/{model}:generateContent`. The route 404 is fixed —
+it stays disabled only because of the NANOUSD currency issue above.

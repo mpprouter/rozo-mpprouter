@@ -20,6 +20,94 @@ export const ROUTER_BASE = 'https://apiserver.mpprouter.dev'
 
 export const PROVIDERS = [
   // ---- AI inference ----
+  // verified 2026-07-29 real-money E2E (paywithlocus charge family):
+  {
+    id: 'grok',
+    family: 'ai',
+    publicPath: '/v1/services/grok/grok_chat',
+    method: 'POST',
+    mode: 'charge',
+    body: { model: 'grok-3-mini', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
+  },
+  {
+    id: 'mistral',
+    family: 'ai',
+    publicPath: '/v1/services/mistral/mistral_chat',
+    method: 'POST',
+    mode: 'charge',
+    body: { model: 'mistral-small-latest', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
+  },
+  {
+    id: 'perplexity',
+    family: 'ai',
+    publicPath: '/v1/services/perplexity/perplexity_chat',
+    method: 'POST',
+    mode: 'charge',
+    body: { model: 'sonar', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
+  },
+  {
+    id: 'deepgram',
+    family: 'ai',
+    publicPath: '/v1/services/deepgram/deepgram_list-models',
+    method: 'POST',
+    mode: 'charge',
+    body: {},
+    okCheck: (j) => Boolean(j?.stt ?? j?.tts ?? j?.models),
+  },
+  {
+    id: 'deepseek',
+    family: 'ai',
+    publicPath: '/v1/services/deepseek/chat',
+    method: 'POST',
+    mode: 'charge',
+    body: { model: 'deepseek-chat', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
+  },
+  {
+    id: 'groq',
+    family: 'ai',
+    publicPath: '/v1/services/groq/chat',
+    method: 'POST',
+    mode: 'charge',
+    body: { model: 'llama-3.1-8b-instant', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
+  },
+
+  // ---- Blockchain / data ----
+  {
+    id: 'alchemy',
+    family: 'data',
+    publicPath: '/v1/services/alchemy/rpc',
+    method: 'POST',
+    mode: 'charge',
+    body: { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] },
+    okCheck: (j) => typeof j?.result === 'string' && j.result.startsWith('0x'),
+  },
+  {
+    id: 'coingecko',
+    family: 'data',
+    publicPath: '/v1/services/coingecko/simple-price',
+    method: 'POST',
+    mode: 'charge',
+    body: { ids: 'bitcoin', vs_currencies: 'usd' },
+    okCheck: (j) => Boolean(j?.bitcoin?.usd),
+  },
+]
+
+/**
+ * Providers currently DISABLED in OPERATOR_OVERLAY (router returns 403
+ * before payment). Kept out of the default suite so no-arg runs of
+ * probe-402/charge-e2e stay green; test explicitly to re-verify after
+ * the upstream issue is fixed:
+ *   - openai/anthropic/openrouter/gemini: NANOUSD currency migration
+ *     (2026-07-29, *.mpp.tempo.xyz family)
+ *   - dune: session channel underfunded
+ *   - quicknode: merchant-side 5xx (2026-06-22)
+ */
+export const DISABLED_PROVIDERS = [
   {
     id: 'openai',
     family: 'ai',
@@ -57,35 +145,6 @@ export const PROVIDERS = [
     okCheck: (j) => Boolean(j?.candidates?.[0]?.content),
   },
   {
-    id: 'deepseek',
-    family: 'ai',
-    publicPath: '/v1/services/deepseek/chat',
-    method: 'POST',
-    mode: 'charge',
-    body: { model: 'deepseek-chat', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
-    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
-  },
-  {
-    id: 'groq',
-    family: 'ai',
-    publicPath: '/v1/services/groq/chat',
-    method: 'POST',
-    mode: 'charge',
-    body: { model: 'llama-3.1-8b-instant', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
-    okCheck: (j) => Boolean(j?.choices?.[0]?.message),
-  },
-
-  // ---- Blockchain / data ----
-  {
-    id: 'alchemy',
-    family: 'data',
-    publicPath: '/v1/services/alchemy/rpc',
-    method: 'POST',
-    mode: 'charge',
-    body: { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] },
-    okCheck: (j) => typeof j?.result === 'string' && j.result.startsWith('0x'),
-  },
-  {
     id: 'dune',
     family: 'data',
     publicPath: '/v1/services/dune/execute',
@@ -94,15 +153,6 @@ export const PROVIDERS = [
     // query_id 1215383 is Dune's "block number" sample; cheapest real exec
     body: { query_id: 1215383 },
     okCheck: (j) => Boolean(j?.execution_id ?? j?.state),
-  },
-  {
-    id: 'coingecko',
-    family: 'data',
-    publicPath: '/v1/services/coingecko/simple-price',
-    method: 'POST',
-    mode: 'charge',
-    body: { ids: 'bitcoin', vs_currencies: 'usd' },
-    okCheck: (j) => Boolean(j?.bitcoin?.usd),
   },
   {
     id: 'quicknode',

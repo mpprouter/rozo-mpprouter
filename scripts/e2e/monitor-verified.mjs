@@ -68,9 +68,16 @@ const VERIFIED = [
   { id: 'coingecko', body: { ids: 'bitcoin', vs_currencies: 'usd' } },
   { id: 'deepseek', body: { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
   { id: 'groq', body: { model: 'llama-3.1-8b-instant', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
-  // session-mode merchants (still zero-cost to probe — we only read the 402):
-  { id: 'openai', body: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
-  { id: 'openrouter', body: { model: 'openai/gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
+  // verified 2026-07-29 (real-money E2E, paywithlocus charge family):
+  { id: 'grok', body: { model: 'grok-3-mini', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
+  { id: 'mistral', body: { model: 'mistral-small-latest', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
+  { id: 'perplexity', body: { model: 'sonar', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
+  // explicit endpointPath: the verified route is list-models, but the
+  // snapshot's first paid POST endpoint is /deepgram/transcribe.
+  { id: 'deepgram', endpointPath: '/deepgram/list-models', body: {} },
+  // openai/openrouter removed 2026-07-29: the *.mpp.tempo.xyz family
+  // migrated to NANOUSD charges (unpayable) and the routes are disabled
+  // in OPERATOR_OVERLAY. Re-add when the Tempo currency issue resolves.
 ]
 
 function loadServices() {
@@ -85,13 +92,17 @@ function loadServices() {
  * homepage). Path is the first paid POST endpoint in the snapshot.
  * Returns { url, path, intent } or null.
  */
-function upstreamFor(services, id, pathVars) {
+function upstreamFor(services, id, pathVars, endpointPath) {
   const svc = services.find((s) => s.id === id)
   if (!svc) return null
   const base = (svc.serviceUrl || svc.url || '').replace(/\/$/, '')
   if (!base) return null
   const eps = svc.endpoints || []
-  const ep = eps.find((e) => e.payment && e.method === 'POST') || eps.find((e) => e.payment) || eps[0]
+  const ep =
+    (endpointPath && eps.find((e) => e.path === endpointPath)) ||
+    eps.find((e) => e.payment && e.method === 'POST') ||
+    eps.find((e) => e.payment) ||
+    eps[0]
   if (!ep || !ep.path) return null
   // Substitute `:var` placeholders in the path (e.g. alchemy's :network).
   let path = ep.path
@@ -148,7 +159,7 @@ async function probe(url, body, attempts = 3) {
 }
 
 async function checkOne(services, route) {
-  const up = upstreamFor(services, route.id, route.pathVars)
+  const up = upstreamFor(services, route.id, route.pathVars, route.endpointPath)
   if (!up) return { id: route.id, status: 'FAIL', reason: 'no upstream URL/path in snapshot' }
   const url = up.url
 
