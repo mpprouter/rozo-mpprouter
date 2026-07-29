@@ -320,6 +320,14 @@ export function buildRoutesFromMppSnapshot(
             route.publicPath = overlayEntry.publicPath
           }
         }
+        if (overlayEntry.upstreamPath !== undefined) {
+          // Operator-supplied templated path replaces a snapshot path
+          // the router cannot resolve (e.g. a literal `*` wildcard).
+          // Applied after the overlay key was matched on the
+          // snapshot-derived path, so keys stay stable across
+          // snapshot refreshes.
+          route.upstreamPath = overlayEntry.upstreamPath
+        }
         if (overlayEntry.verifiedMode !== undefined) {
           route.verifiedMode = overlayEntry.verifiedMode
         }

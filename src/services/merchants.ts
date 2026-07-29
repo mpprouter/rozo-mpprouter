@@ -104,16 +104,21 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     sessionVerified: true,
     sessionVerifiedAt: '2026-04-11T00:00:00Z',
   },
-  // Anthropic Messages — broken upstream
+  // Anthropic Messages — upstream recovered, now charge-mode
   'anthropic::/v1/messages': {
     id: 'anthropic_messages',
     publicPath: '/v1/services/anthropic/messages',
-    upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: false,
+    // 2026-07-29 re-probe: the merchant that 500'd on 2026-04-11 now
+    // returns a clean 402 with `intent="charge"` (Tempo charge, not
+    // session). verifiedMode deliberately left unset: the route is
+    // payable-but-unverified (`payment_status: "available"`) until a
+    // real-money E2E succeeds post-deploy — only then flip to
+    // verifiedMode: 'charge' + chargeVerified.
+    upstreamPaymentMethod: 'tempo.charge',
     verifiedNote:
-      'Merchant returns 500 on direct mppx call (verified bypassing router). ' +
-      'Both /v1/messages and /v1/chat/completions endpoints fail upstream. ' +
-      'Channel is open but unusable until anthropic merchant is fixed.',
+      'Upstream recovered 2026-07-29 — merchant 402 challenge is ' +
+      'intent="charge" (was 500 on 2026-04-11). Payable again via charge ' +
+      'dispatch; pending fresh real-money E2E before re-marking verified.',
   },
   // OpenAI Chat — verified session mode
   'openai::/v1/chat/completions': {
@@ -144,11 +149,20 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'gemini_generate',
     publicPath: '/v1/services/gemini/generate',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: false,
+    // 2026-07-29: upstreamPath override replaces the snapshot's literal
+    // `*` wildcard with a fully-templated path, unblocking the 404
+    // documented in the 2026-06-22 E2E (payment/session layer was
+    // already verified working then). verifiedMode deliberately left
+    // unset: payable-but-unverified (`payment_status: "available"`)
+    // until a fresh real-money E2E succeeds post-deploy — only then
+    // flip to verifiedMode: 'session' + sessionVerified.
+    upstreamPath: '/{version}/models/{model}:generateContent',
     verifiedNote:
-      'Payment/session layer OK after channel re-open (descriptor captured). ' +
-      'Blocked on upstream model path: `/{version}/models/*` wildcard is not ' +
-      'substituted, so merchant 404s. Needs upstreamPath override support.',
+      'Session/payment layer verified 2026-06-22 (descriptor captured). ' +
+      'Upstream 404 fixed 2026-07-29 via upstreamPath override — the ' +
+      'snapshot wildcard `/{version}/models/*` is now templated as ' +
+      '`/{version}/models/{model}:generateContent`. Pending fresh ' +
+      'real-money E2E before re-marking verified.',
     placeholderDefaults: { version: 'v1beta', model: 'gemini-2.0-flash' },
   },
   // Dune SQL Execute — channel underfunded
