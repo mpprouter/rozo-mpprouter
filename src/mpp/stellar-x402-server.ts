@@ -131,6 +131,25 @@ function getFacilitator(env: Env): x402Facilitator {
     // fees on behalf of the agent. This matches our gas-sponsor
     // wallet model where the router's STELLAR_GAS_SECRET account
     // holds XLM specifically for this purpose.
+    //
+    // maxTransactionFeeStroops MUST be set. The library default is
+    // 50_000, and verify() checks the client fee two-sidedly:
+    //
+    //   fee >= simResponse.minResourceFee   (else fee_below_minimum)
+    //   fee <= maxTransactionFeeStroops     (else fee_exceeds_maximum)
+    //
+    // A real mainnet SAC transfer simulates at ~141_535 stroops, which
+    // is already above the default ceiling — so the acceptable window
+    // was EMPTY and no client could ever settle via x402 on mainnet.
+    // Measured 2026-07-31 against a live challenge; every attempt
+    // returned invalid_exact_stellar_payload_fee_exceeds_maximum.
+    //
+    // 500_000 stroops (0.05 XLM) leaves ~3.5x headroom over today's
+    // resource fee for congestion and future ledger cost changes,
+    // while still bounding what the sponsor can be made to pay per
+    // call. Fees come from the router's gas-sponsor wallet, so this
+    // is a real spend ceiling, not a formality.
+    maxTransactionFeeStroops: 500_000,
   })
 
   const facilitator = new x402Facilitator()
