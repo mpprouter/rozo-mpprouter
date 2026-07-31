@@ -192,6 +192,30 @@ function deriveHost(serviceUrl: string): string {
 }
 
 /**
+ * Should we append a billing unit to a merchant's `amountHint`?
+ *
+ * Only when the hint is a bare amount or range — "$0.05-$4",
+ * "~$0.001–$0.02" — where "/request" adds the missing information.
+ *
+ * Anything else passes through untouched: already-qualified rates
+ * ("$0.12/hr", "$0.01/result", "~$0.005 per 1,000 characters") and
+ * prose ("Varies by TLD", "Model-dependent"). Appending unconditionally
+ * produced "$0.12/hr/request" and "Varies by TLD/request" — six live
+ * routes read that way, which is its own kind of lie about what a call
+ * costs.
+ *
+ * Implemented as "strip the amounts and see what is left": if only
+ * separators remain, the hint was pure amounts. Both the ASCII hyphen
+ * and the en-dash appear in live hints.
+ */
+function hintNeedsUnit(hint: string): boolean {
+  const remainder = hint
+    .replace(/\$\s*[\d.,]+/g, '')
+    .replace(/[-–—~\s]/g, '')
+  return remainder === ''
+}
+
+/**
  * Pretty-format a Tempo USDC base-unit amount string into a
  * human-readable price. The router's `price` field has historically
  * been a free-form string; we keep it that way for backward
@@ -206,7 +230,9 @@ function formatPrice(payment: MppEndpoint['payment']): string {
   // billed $4 on a `SELECT 1`. Say "dynamic" and pass the merchant's
   // own range through when it has one.
   if (payment.dynamic || !payment.amount) {
-    if (payment.amountHint) return `${payment.amountHint}/request (dynamic)`
+    if (payment.amountHint) {
+      return `${payment.amountHint}${hintNeedsUnit(payment.amountHint) ? '/request' : ''} (dynamic)`
+    }
     if (!payment.amount) return 'dynamic'
   }
   const decimals = payment.decimals ?? 6
