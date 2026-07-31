@@ -92,7 +92,17 @@ works against any x402 v2 server, no router-specific code needed.
 Each entry in the catalog has:
 - id, name, description, categories
 - public_path — the URL path to call
-- price — human-readable (e.g. "$0.003/request")
+- method — "POST" or "GET". Authoritative: call the route with this
+  verb. The same public_path may exist under both verbs (submit vs
+  fetch-results); a wrong verb returns 405 with allowed_methods.
+- path_params — present only when the upstream path is templated
+  (e.g. /execution/{execution_id}/results). Supply each name as a
+  QUERY PARAM on the router URL — not a path segment, not in the
+  body: GET /v1/services/dune/execution_execution_id_results?execution_id=01H…
+  The router substitutes it upstream and strips it from the
+  forwarded query. Missing or malformed → 400 naming the parameter.
+- price — human-readable (e.g. "$0.003/request"), or a range ending
+  in "(dynamic)" when the merchant quotes at call time
 - status — "active" (has llms_txt docs) or "limited" (use with caution)
 - docs.llms_txt — URL to the upstream service's llms.txt (when available)
 - methods.stellar.intents — always ["charge"]

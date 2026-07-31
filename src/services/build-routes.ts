@@ -258,6 +258,32 @@ function pickUpstreamPaymentMethod(
 }
 
 /**
+ * HTTP methods the proxy will build routes for. See the comment at
+ * the filter site for why PUT/DELETE are excluded.
+ */
+const PROXYABLE_METHODS = new Set(['POST', 'GET'])
+
+/**
+ * Stable-sort endpoints so POST is processed before any other
+ * method. This is load-bearing for backward compatibility, not
+ * cosmetics: route ids and public paths are de-duplicated in
+ * iteration order, so if a GET on the same path were seen first it
+ * would claim the bare id (`storage_key`) and demote the existing,
+ * already-published POST route to `storage_key_post`. Agents have
+ * that id bookmarked. POST first ⇒ every pre-existing id and public
+ * path is byte-identical to what shipped before GET support.
+ */
+function orderEndpointsPostFirst(endpoints: MppEndpoint[]): MppEndpoint[] {
+  const post: MppEndpoint[] = []
+  const rest: MppEndpoint[] = []
+  for (const e of endpoints) {
+    if ((e.method || 'POST').toUpperCase() === 'POST') post.push(e)
+    else rest.push(e)
+  }
+  return [...post, ...rest]
+}
+
+/**
  * Build the full route table from a frozen mpp.dev snapshot plus an
  * operator overlay. Pure function — no I/O, no env access.
  */
@@ -276,13 +302,23 @@ export function buildRoutesFromMppSnapshot(
     const upstreamPaymentMethod = pickUpstreamPaymentMethod(service)
     const categories = service.categories ?? []
 
-    for (const endpoint of service.endpoints ?? []) {
+    for (const endpoint of orderEndpointsPostFirst(service.endpoints ?? [])) {
       const method = (endpoint.method || 'POST').toUpperCase()
-      // The router only proxies POST routes today. Skip GET/PATCH/
-      // DELETE etc — they tend to be free management endpoints
-      // that don't fit the "pay-per-request" model and aren't
-      // wired into proxy.ts's payment flow.
-      if (method !== 'POST') continue
+      // Only proxyable methods. GET was added 2026-07-31; the old
+      // filter was `method !== 'POST'`, whose stated reason ("they
+      // tend to be free management endpoints") the snapshot
+      // disproves: 174 GET endpoints carry a `payment` block, and
+      // they are systematically the *result-retrieval* half of
+      // async APIs (Dune `GET /execution/:id/results`, Allium
+      // `GET /query-runs/:id/results`). Dropping them meant an
+      // agent could pay for a query it had no way to read.
+      //
+      // PUT/DELETE stay out deliberately. The only two in the
+      // snapshot are `storage /:key`, i.e. mutations, and the
+      // proxy's idempotency-replay and passthrough semantics have
+      // not been reviewed for non-idempotent verbs. Narrowing, not
+      // deleting, the guard.
+      if (!PROXYABLE_METHODS.has(method)) continue
 
       // Skip free/non-paid endpoints. The router's pay-per-request
       // dispatch path doesn't have a "no payment needed" branch,
@@ -311,13 +347,21 @@ export function buildRoutesFromMppSnapshot(
       // Public path collisions get resolved the same way as IDs:
       // never silently overwrite, always rename. With 832 source
       // endpoints this is theoretically possible.
+      //
+      // Keyed by METHOD + path, not path alone. `GET /x` and
+      // `POST /x` are not a collision — they are the case
+      // `getRouteByPublicPath(path, method)` and the proxy's 405 +
+      // `allowed_methods` response exist to serve. Renaming one to
+      // `…_2` would break that contract and hand agents a URL that
+      // does not match the catalog. Only a genuine same-method
+      // clash gets renamed.
       let dedupedPublicPath = publicPath
-      if (seenPublicPaths.has(dedupedPublicPath)) {
+      if (seenPublicPaths.has(`${method} ${dedupedPublicPath}`)) {
         let n = 2
-        while (seenPublicPaths.has(`${publicPath}_${n}`)) n += 1
+        while (seenPublicPaths.has(`${method} ${publicPath}_${n}`)) n += 1
         dedupedPublicPath = `${publicPath}_${n}`
       }
-      seenPublicPaths.add(dedupedPublicPath)
+      seenPublicPaths.add(`${method} ${dedupedPublicPath}`)
 
       const description =
         endpoint.description ?? service.description ?? `${service.name} ${endpoint.path}`
@@ -341,6 +385,25 @@ export function buildRoutesFromMppSnapshot(
         upstreamHost,
         upstreamPath,
         ...(service.docs ? { docs: service.docs } : {}),
+        // Newly-routable non-POST routes are built but NOT payable.
+        //
+        // The router's default is "payable unless proven broken"
+        // (`verifiedMode === undefined` ⇒ payable, see the security
+        // gate in proxy.ts). Inheriting that default here would add
+        // ~176 never-probed routes to the payable set in one commit —
+        // which is precisely how 45 dead Nansen routes came to be
+        // advertised as available. So these start `false` and an
+        // operator flips them per-route in OPERATOR_OVERLAY after a
+        // real-money probe, using the method-qualified key
+        // `service::GET::/path`.
+        ...(method === 'POST'
+          ? {}
+          : {
+              verifiedMode: false as const,
+              verifiedNote:
+                `${method} route is wired end-to-end but has not been real-money ` +
+                'verified by Rozo yet. Enable per-route in OPERATOR_OVERLAY after a probe.',
+            }),
       }
       // Service-level overlay first, so a whole-provider outage can be
       // handled with one entry instead of one per route. A per-route
@@ -355,8 +418,16 @@ export function buildRoutesFromMppSnapshot(
         }
       }
 
-      const overlayKey = `${service.id}::${upstreamPath}`
-      const overlayEntry = overlay[overlayKey]
+      // Overlay lookup. The historical key is `service::path`, which
+      // predates non-POST routes and therefore cannot distinguish
+      // `GET /{key}` from `POST /{key}`. A method-qualified key wins
+      // when present; the bare key is honoured only for POST, so
+      // every existing OPERATOR_OVERLAY entry keeps applying to
+      // exactly the route it was written for and never leaks onto a
+      // newly-added GET sibling.
+      const overlayEntry =
+        overlay[`${service.id}::${method}::${upstreamPath}`] ??
+        (method === 'POST' ? overlay[`${service.id}::${upstreamPath}`] : undefined)
       if (overlayEntry) {
         if (overlayEntry.id) {
           // Honor the historical ID so existing client URL
