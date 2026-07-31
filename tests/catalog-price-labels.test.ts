@@ -63,6 +63,40 @@ describe('catalog price labels', () => {
     expect(priceOf({ ...base, amount: '1000000' })).toBe('$1.000/request')
   })
 
+  it('appends /request only to bare amounts and ranges', () => {
+    // Real snapshot hints. Dune, dripstack: bare range → needs a unit.
+    expect(priceOf({ ...base, dynamic: true, amountHint: '$0.05-$4' }))
+      .toBe('$0.05-$4/request (dynamic)')
+    // En-dash and a leading tilde are both live in the snapshot.
+    expect(priceOf({ ...base, dynamic: true, amountHint: '~$0.001–$0.02' }))
+      .toBe('~$0.001–$0.02/request (dynamic)')
+    expect(priceOf({ ...base, dynamic: true, amountHint: '$1–$100' }))
+      .toBe('$1–$100/request (dynamic)')
+  })
+
+  it('never double-labels a hint that already states its unit', () => {
+    // These six read "$0.12/hr/request" and "$0.01/result/request" in
+    // production until 2026-07-31 — a different lie about what a call
+    // costs than the "free" one this file's other tests guard.
+    expect(priceOf({ ...base, dynamic: true, amountHint: '$0.12/hr' }))
+      .toBe('$0.12/hr (dynamic)')
+    expect(priceOf({ ...base, dynamic: true, amountHint: '$0.01/result' }))
+      .toBe('$0.01/result (dynamic)')
+    expect(priceOf({ ...base, dynamic: true, amountHint: '$0.008/org' }))
+      .toBe('$0.008/org (dynamic)')
+    expect(
+      priceOf({ ...base, dynamic: true, amountHint: '~$0.005 per 1,000 characters' }),
+    ).toBe('~$0.005 per 1,000 characters (dynamic)')
+  })
+
+  it('leaves prose hints alone', () => {
+    // "Varies by TLD/request" is not English.
+    expect(priceOf({ ...base, dynamic: true, amountHint: 'Varies by TLD' }))
+      .toBe('Varies by TLD (dynamic)')
+    expect(priceOf({ ...base, dynamic: true, amountHint: 'Model-dependent' }))
+      .toBe('Model-dependent (dynamic)')
+  })
+
   it('still calls a genuinely zero-priced endpoint free', () => {
     expect(priceOf({ ...base, amount: '0' })).toBe('free')
     expect(priceOf(null)).toBeUndefined() // no payment → route is skipped
