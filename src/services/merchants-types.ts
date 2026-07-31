@@ -181,6 +181,20 @@ export interface PublicCatalogEntry {
   description: string
   public_path: string
   method: string
+  /**
+   * Names of the `{placeholder}` tokens in this route's upstream
+   * path that the caller MUST supply, as query params on the router
+   * URL (`?execution_id=01H…`) — not as path segments and not in the
+   * body. Placeholders that have an operator-configured default are
+   * omitted, since the caller does not have to supply them.
+   *
+   * Omitted entirely when the route has no required placeholders, so
+   * v1 clients see no change. Added 2026-07-31 alongside GET route
+   * support: the result-retrieval half of async APIs
+   * (`/execution/{execution_id}/results`) is templated by nature, and
+   * an agent cannot construct the call without knowing the names.
+   */
+  path_params?: string[]
   price: string
   /**
    * Legacy flat field. V1 agents read this to know they should

@@ -183,8 +183,26 @@ not a missing feature. The comment at `build-routes.ts:246-249` assumes non-POST
 `dynamic: true` and `amountHint: "$0.05-$10"`.
 
 **Fix**: allow GET routes with a `payment` block through `buildRoutesFromMppSnapshot`
-and teach `src/routes/proxy.ts` to forward GET with path-parameter substitution. That is
-a real proxy change with its own review, so it is filed here, not attempted in this PR.
+and teach `src/routes/proxy.ts` to forward GET with path-parameter substitution.
+
+**Status: fixed** (founder-approved follow-up, same day). 174 GET routes now build —
+496 POST + 174 GET = 670 — and the proxy forwards them. Details:
+
+- `build-routes.ts` filter narrowed from `method !== 'POST'` to a `PROXYABLE_METHODS`
+  allowlist of `{POST, GET}`. PUT/DELETE stay out: the only two are `storage /:key`
+  mutations and the proxy's idempotency-replay semantics are not reviewed for
+  non-idempotent verbs.
+- **Path params are query params.** `GET /v1/services/dune/execution_execution_id_results?execution_id=01H…`
+  — the existing `resolveUpstreamPath` machinery, not a second scheme. The catalog now
+  carries `path_params: ["execution_id"]` per route so an agent can construct the call,
+  and the 400 names the missing parameter and the retry shape.
+- **Payability is unchanged: still 446.** Every new GET route is built with
+  `verifiedMode: false`. Adding 174 never-probed routes to the payable set is exactly how
+  the Nansen situation happened. An operator flips them one at a time after a paid probe,
+  via the new method-qualified overlay key `service::GET::/path`.
+
+Bug 6 (agentmail placeholders) is partly addressed by the same work: the 400 message now
+states the query-param contract, and those routes' `path_params` are in the catalog.
 
 ### Bug 6 — path-placeholder routes are unusable · P2
 

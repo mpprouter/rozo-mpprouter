@@ -459,6 +459,9 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
       description: route.description,
       public_path: route.publicPath,
       method: route.method,
+      ...(requiredPathParams(route).length > 0
+        ? { path_params: requiredPathParams(route) }
+        : {}),
       price: route.price,
       payment_method: route.paymentMethod,
       network: route.network,
@@ -539,6 +542,25 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
 // Route lookup + path placeholder resolution
 // ---------------------------------------------------------------------
 
+/**
+ * Placeholder names in `route.upstreamPath` that the caller must
+ * supply as query params, i.e. those without an operator default.
+ * Deliberately shares its regex with `resolveUpstreamPath` below —
+ * if the catalog and the resolver ever disagree about what is
+ * required, agents get 400s they cannot act on.
+ */
+export function requiredPathParams(
+  route: Pick<PublicServiceRoute, 'upstreamPath' | 'placeholderDefaults'>,
+): string[] {
+  const defaults = route.placeholderDefaults ?? {}
+  const names = new Set<string>()
+  for (const m of route.upstreamPath.matchAll(/\{([A-Za-z0-9_]+)\}/g)) {
+    const name = m[1]
+    if (!Object.prototype.hasOwnProperty.call(defaults, name)) names.add(name)
+  }
+  return [...names]
+}
+
 export function getRouteByPublicPath(
   pathname: string,
   method: string,
@@ -605,8 +627,11 @@ export function resolveUpstreamPath(
       value = defaults[name]
     } else {
       throw new UpstreamPathPlaceholderError(
-        `Route ${route.id} requires {${name}} placeholder but no value was supplied ` +
-          `(no ?${name}= query param and no default in placeholderDefaults).`,
+        `Route ${route.id} requires {${name}} placeholder but no value was supplied. ` +
+          `Path parameters are supplied as QUERY PARAMS on the router URL, not as path ` +
+          `segments and not in the body: retry with ?${name}=<value>. The router ` +
+          `substitutes it into the upstream path and strips it from the forwarded query. ` +
+          `The full list for a route is the 'path_params' field in GET /v1/services/catalog.`,
       )
     }
     if (!PLACEHOLDER_VALUE_PATTERN.test(value)) {

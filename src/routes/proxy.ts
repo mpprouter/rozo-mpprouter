@@ -671,10 +671,13 @@ async function handleAsyncJob(
   }
 
   // Resolve the upstream host from the route table.
-  const routeInfo = getRouteByPublicPath(requestUrl.pathname, 'POST')
-  const actualHost = routeInfo
-    ? routeInfo.upstreamHost
-    : `${route.id.split('_')[0]}.dev`
+  // Use the already-resolved route rather than re-looking it up by
+  // pathname. The old lookup hardcoded method 'POST' — correct while
+  // the route table held nothing else, but since GET routes exist
+  // (2026-07-31) it would miss and fall back to the `<service>.dev`
+  // host guess, binding the job record to the wrong upstream. The
+  // caller resolved this exact route already, so just read it.
+  const actualHost = route.upstreamHost || `${route.id.split('_')[0]}.dev`
 
   const record: JobAuthRecord = {
     stellarAddress,
