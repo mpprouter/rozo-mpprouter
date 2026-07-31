@@ -65,6 +65,43 @@ export type {
  * `scripts/admin/open-tempo-channel.ts MERCHANTS` so
  * `payMerchantSession` reads the right `tempoChannel:<id>` KV record.
  */
+/**
+ * Service-level overlay — applied to EVERY route of a service before
+ * the per-route `OPERATOR_OVERLAY` below (which still wins on any
+ * field it sets).
+ *
+ * This exists for whole-provider outages. Marking 45 routes broken one
+ * key at a time is error-prone and invites a half-disabled provider,
+ * which is worse than either state: the catalog keeps advertising the
+ * routes someone forgot, and agents keep paying into them.
+ *
+ * Only `verifiedMode` / `verifiedNote` are honoured here on purpose.
+ * Identity fields (id, publicPath, placeholderDefaults) are per-route
+ * by nature and must stay in OPERATOR_OVERLAY.
+ */
+export const SERVICE_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
+  // Nansen — 2026-07-31: every route is broken upstream.
+  //
+  // Probed 10/10 routes unpaid, all returned
+  // `502 Merchant returned 402 without WWW-Authenticate header`
+  // (see proxy.ts). The merchant answers 402 but omits the challenge
+  // header, so an agent cannot construct a payment at all — the route
+  // is unusable, not merely unverified.
+  //
+  // 45 of these were advertised as payable, ~9% of the payable
+  // catalog. Advertising a route we know cannot settle spends the
+  // caller's time and trust, so they are marked unpayable until the
+  // upstream emits a valid challenge. Re-probe before re-enabling.
+  nansen: {
+    verifiedMode: false,
+    verifiedNote:
+      'Upstream returns 402 without a WWW-Authenticate challenge header on ' +
+      'every probed route (10/10 on 2026-07-31), so no payment can be ' +
+      'constructed. Disabled provider-wide until the merchant emits a valid ' +
+      'challenge; re-probe before re-enabling.',
+  },
+}
+
 export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // Parallel Search — first verified route, hand-tested 2026-04-11
   'parallel::/api/search': {
@@ -277,7 +314,11 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
  * are listed as `payment_status: "untested"` and carry no stellar block.
  */
 export const PUBLIC_SERVICE_ROUTES: PublicServiceRoute[] =
-  buildRoutesFromMppSnapshot(mppSnapshot as any, OPERATOR_OVERLAY)
+  buildRoutesFromMppSnapshot(
+    mppSnapshot as any,
+    OPERATOR_OVERLAY,
+    SERVICE_OVERLAY,
+  )
 
 // ---------------------------------------------------------------------
 // Catalog rendering

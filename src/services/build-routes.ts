@@ -264,6 +264,7 @@ function pickUpstreamPaymentMethod(
 export function buildRoutesFromMppSnapshot(
   snapshot: MppSnapshot,
   overlay: Record<string, PublicServiceRouteOverlay> = {},
+  serviceOverlay: Record<string, PublicServiceRouteOverlay> = {},
 ): PublicServiceRoute[] {
   const routes: PublicServiceRoute[] = []
   const seenIds = new Set<string>()
@@ -341,6 +342,19 @@ export function buildRoutesFromMppSnapshot(
         upstreamPath,
         ...(service.docs ? { docs: service.docs } : {}),
       }
+      // Service-level overlay first, so a whole-provider outage can be
+      // handled with one entry instead of one per route. A per-route
+      // entry below still wins on any field it sets.
+      const serviceEntry = serviceOverlay[service.id]
+      if (serviceEntry) {
+        if (serviceEntry.verifiedMode !== undefined) {
+          route.verifiedMode = serviceEntry.verifiedMode
+        }
+        if (serviceEntry.verifiedNote !== undefined) {
+          route.verifiedNote = serviceEntry.verifiedNote
+        }
+      }
+
       const overlayKey = `${service.id}::${upstreamPath}`
       const overlayEntry = overlay[overlayKey]
       if (overlayEntry) {
