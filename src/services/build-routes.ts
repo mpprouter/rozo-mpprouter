@@ -78,6 +78,14 @@ interface MppEndpoint {
     decimals?: number
     description?: string
     amount?: string
+    /**
+     * Merchant prices this endpoint per request at call time; the
+     * snapshot carries no fixed `amount`. Present on 80 POST
+     * endpoints today (Dune, Tavily, Grok, DeepSeek, …).
+     */
+    dynamic?: boolean
+    /** Human range the merchant advertises, e.g. `"$0.05-$4"`. */
+    amountHint?: string
   } | null
 }
 
@@ -191,17 +199,43 @@ function deriveHost(serviceUrl: string): string {
  * payment.amount instead of hand-typed values that drift over time.
  */
 function formatPrice(payment: MppEndpoint['payment']): string {
-  if (!payment || !payment.amount) return 'free'
+  if (!payment) return 'free'
+  // Merchant quotes at call time. Historically this returned 'free',
+  // which is a lie an agent acts on: Tavily search advertised "free"
+  // while its live 402 asks $0.09, and Dune's "free" SQL execute
+  // billed $4 on a `SELECT 1`. Say "dynamic" and pass the merchant's
+  // own range through when it has one.
+  if (payment.dynamic || !payment.amount) {
+    if (payment.amountHint) return `${payment.amountHint}/request (dynamic)`
+    if (!payment.amount) return 'dynamic'
+  }
   const decimals = payment.decimals ?? 6
   const raw = payment.amount
   try {
     const big = BigInt(raw)
-    const divisor = 10n ** BigInt(decimals)
-    const dollars = Number(big * 1000n / divisor) / 1000
-    return `$${dollars.toFixed(3)}/request`
+    if (big === 0n) return 'free'
+    // Exact decimal rendering. The previous `big * 1000n / divisor`
+    // floored to 3dp, so $0.00375 (mapbox geocode) advertised as
+    // "$0.003" and every sub-$0.001 route ($0.0001 alchemy/storage)
+    // advertised as "$0.000" — indistinguishable from free.
+    return `$${baseUnitsToPriceString(big, decimals)}/request`
   } catch {
     return 'unknown'
   }
+}
+
+/**
+ * Render an integer base-unit amount as an exact decimal string with
+ * no precision loss and no trailing-zero noise. Always at least 3
+ * fractional digits so existing `$0.003/request` labels are stable.
+ */
+function baseUnitsToPriceString(amount: bigint, decimals: number): string {
+  const divisor = 10n ** BigInt(decimals)
+  const whole = amount / divisor
+  const frac = (amount % divisor).toString().padStart(decimals, '0')
+  const trimmed = frac.replace(/0+$/, '')
+  const padded = trimmed.padEnd(3, '0')
+  return `${whole}.${padded}`
 }
 
 /**
