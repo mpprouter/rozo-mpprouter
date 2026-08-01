@@ -4,6 +4,17 @@ compatibility_date = "2026-04-09"
 compatibility_flags = ["nodejs_compat"]
 account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
 
+# Workers Logs retention. Without this block Cloudflare keeps NO request logs,
+# so a production payment incident can only be debugged by catching it live with
+# `wrangler tail` — useless after the fact. Established 2026-08-01 after a real
+# Lightning order (paymentSession_bd1ba4d7…) could not be traced through the
+# router at all: create-invoice is a stateless proxy that persists nothing.
+# head_sampling_rate = 1 keeps every request; this Worker's volume is low enough
+# that sampling would only create blind spots.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 # Force @stellar/stellar-sdk and @stellar/stellar-base to their CJS
 # entry points, NOT the minified browser bundles.
 #
