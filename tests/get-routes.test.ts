@@ -104,9 +104,17 @@ describe('GET routes — build', () => {
   })
 
   it('does not change how many routes are payable', () => {
-    // Same number as before GET support: every newly-built route is
-    // gated off. This is the anti-Nansen invariant.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(446)
+    // Every newly-built GET route is gated off — the anti-Nansen
+    // invariant, asserted by the second expectation below.
+    //
+    // The POST baseline was 446 when GET support landed. It is 442 as of
+    // 2026-08-01, when real-money verification delisted four routes that
+    // take payment and then fail: openai_chat and openrouter_chat
+    // (merchant's upstream region-restricted / credential invalid,
+    // tempoxyz/mpp#852), alchemy_rpc and tempo_rpc (both confirmed
+    // pay-then-fail on chain). Moving this number DOWN is the mechanism
+    // working; moving it up without a paid verification is not.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(442)
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(0)
   })
 

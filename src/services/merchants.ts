@@ -133,13 +133,26 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // and persisted TempoChannelState to KV at
   // `tempoChannel:openrouter_chat`. payMerchantSession reads that
   // KV entry on every request.
+  // 2026-08-01: disabled. Real-money re-verification settles the payment
+  // and then fails upstream. Reproduced by calling the merchant DIRECTLY
+  // with mppx tempo.charge (router entirely out of the loop), from two
+  // different client networks, with byte-identical output — so the fault
+  // is in the merchant → OpenRouter leg, not ours:
+  //   401 {"error":{"message":"User not found.","code":401}}
+  // An invalid key against openrouter.ai returns the same body, and
+  // OpenRouter documents 401 as key missing/invalid/revoked. Filed as
+  // tempoxyz/mpp#852. NOT the NANOUSD regression (tempoxyz/mpp#840),
+  // which the Tempo team fixed on 2026-07-30.
   'openrouter::/v1/chat/completions': {
     id: 'openrouter_chat',
     publicPath: '/v1/services/openrouter/chat',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+    verifiedMode: false,
+    verifiedNote:
+      "Merchant's upstream OpenRouter authentication is missing, invalid or " +
+      'revoked: 401 "User not found." after the payment settles. Reproduced ' +
+      'bypassing the router (2026-08-01). Filed upstream as tempoxyz/mpp#852; ' +
+      're-verify with a real paid call before re-enabling.',
   },
   // Anthropic Messages — broken upstream
   'anthropic::/v1/messages': {
@@ -150,16 +163,28 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedNote:
       'Merchant returns 500 on direct mppx call (verified bypassing router). ' +
       'Both /v1/messages and /v1/chat/completions endpoints fail upstream. ' +
-      'Channel is open but unusable until anthropic merchant is fixed.',
+      'Channel is open but unusable until anthropic merchant is fixed. ' +
+      'Re-confirmed 2026-08-01 and filed upstream as tempoxyz/mpp#852.',
   },
-  // OpenAI Chat — verified session mode
+  // 2026-08-01: disabled. Same shape as openrouter above — the payment
+  // settles, then the merchant's own call to OpenAI is refused:
+  //   403 {"error":{"code":"unsupported_country_region_territory", ...}}
+  // Reproduced calling the merchant DIRECTLY with mppx tempo.charge from
+  // two different client networks, byte-identical, so it is the
+  // merchant → OpenAI leg. We cannot tell from outside whether the
+  // restriction is on the gateway's egress, its OpenAI organization, or
+  // the key — all three sit upstream of us. Filed as tempoxyz/mpp#852.
+  // NOT the NANOUSD regression (#840), fixed 2026-07-30.
   'openai::/v1/chat/completions': {
     id: 'openai_chat',
     publicPath: '/v1/services/openai/chat',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+    verifiedMode: false,
+    verifiedNote:
+      "Merchant's upstream OpenAI egress/account is region-restricted: 403 " +
+      'unsupported_country_region_territory after the payment settles. ' +
+      'Reproduced bypassing the router (2026-08-01). Filed upstream as ' +
+      'tempoxyz/mpp#852; re-verify with a real paid call before re-enabling.',
   },
   // Google Gemini — uses {model} placeholder, defaults to gemini-2.0-flash
   // The upstream path uses Google's `:generateContent` literal
@@ -212,23 +237,78 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   },
   // Alchemy Ethereum RPC — actually charge mode despite catalog
   // (mpp.dev lists tempo.session, but the merchant accepts charge)
+  // 2026-08-01: disabled. This is a PAY-THEN-FAIL, the failure mode this
+  // catalog exists to prevent, so it is recorded plainly: the agent's
+  // Stellar payment settled (0.0010000 USDC, tx
+  // 05406b45ea6a3638...), then the merchant rejected the router's
+  // Tempo-side payment because its own upstream refused it —
+  //   402 verification-failed / "Status: 403
+  //   URL: https://tempo-mainnet.g.alchemy.com/v2/..."
+  // — and the agent got a 502 with no result. Detected by the
+  // real-money verification round and delisted the same day.
   'alchemy::/{network}/v2': {
     id: 'alchemy_rpc',
     publicPath: '/v1/services/alchemy/rpc',
     upstreamPaymentMethod: 'tempo.charge',
-    verifiedMode: 'charge',
-    chargeVerified: true,
-    chargeVerifiedAt: '2026-04-11T00:00:00Z',
+    verifiedMode: false,
+    verifiedNote:
+      'Pay-then-fail on 2026-08-01: the Stellar payment settled, then the ' +
+      "merchant's upstream (tempo-mainnet.g.alchemy.com) returned 403 and the " +
+      'call failed with no result. Delisted until the merchant is fixed; ' +
+      're-verify with a real paid call before re-enabling.',
     placeholderDefaults: { network: 'eth-mainnet' },
   },
-  // Tempo L2 RPC
+  // ---------------------------------------------------------------
+  // paywithlocus AI family — charge-verified 2026-08-01 with real
+  // Stellar-USDC paid calls. Each entry cites the settling transaction
+  // so the flag is auditable rather than asserted; verify any of them at
+  // https://stellar.expert/explorer/public/tx/<hash>
+  // ---------------------------------------------------------------
+  // Grok (xAI) chat — paid 0.0010000 USDC, live grok-3-mini completion.
+  // tx bd4ff356ce96b095be1654209ef84cce7a53a62b0b606421b4b4c5b9d1121b96
+  'grok::/grok/chat': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-01T16:10:11Z',
+  },
+  // Mistral chat — paid 0.0080000 USDC, live completion.
+  // tx acd8d604c6af05ee47e91e88fcd59ba421fd3be3a2fad72fcadd698ea6868973
+  'mistral::/mistral/chat': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-01T16:10:27Z',
+  },
+  // Perplexity chat — paid 0.0092200 USDC, live sonar completion.
+  // tx e17f10439d37aafd9594d6f1ef8173a7bdd9657632138bd83c39dad23c93359d
+  // First attempt that round returned a transient upstream 502 with no
+  // payment taken; the retry settled. Flagged charge-verified on the
+  // successful paid call, not the probe.
+  'perplexity::/perplexity/chat': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-01T16:26:16Z',
+  },
+  // Deepgram list-models — paid 0.0040000 USDC, model list returned.
+  // tx 035adb0f16b269d59503b4eadbafc8cfb5a4c3deab187af914f1aeb44ec057d5
+  'deepgram::/deepgram/list-models': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-01T16:11:11Z',
+  },
+  // Tempo L2 RPC — 2026-08-01: disabled, also a pay-then-fail.
+  // The paid request returns 202 with an async job id, and every poll of
+  // the job URL then answers 401 indefinitely (79 consecutive attempts
+  // observed before we aborted). The agent paid 0.0010000 USDC
+  // (tx 83c1ec857138b4f8...) and can never retrieve a result.
   'rpc::/': {
     id: 'tempo_rpc',
     publicPath: '/v1/services/tempo/rpc',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-04-11T00:00:00Z',
+    verifiedMode: false,
+    verifiedNote:
+      'Pay-then-fail on 2026-08-01: payment settles and the merchant returns ' +
+      'an async job id, but polling that job returns 401 forever, so the paid ' +
+      'result is unobtainable. Delisted until the merchant is fixed.',
   },
   // DeepSeek Chat — OpenAI-compatible chat completions, tempo.charge.
   // Stable publicPath so agents don't hit the auto-slugged
