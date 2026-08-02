@@ -191,9 +191,11 @@ export type CreateInvoiceErrorCode =
   | 'UNSUPPORTED_SOURCE'
   | 'RATE_LIMITED'
   | 'SERVICE_UNAVAILABLE'
+  | 'PAYMENT_ALREADY_PAID'
 
 export interface CreateInvoiceError extends Omit<PayInvoiceError, 'code'> {
   code: CreateInvoiceErrorCode
+  payment_status?: string
 }
 
 function json(status: number, payload: unknown): Response {
@@ -398,12 +400,33 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     if (!quoteResp.ok) {
       const detail = await quoteResp.text()
       if (quoteResp.status === 409 || quoteResp.status === 410) {
+        // Upstream 409 detail carries the real Coinbase state, e.g.
+        // "payment session is not payable: PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED"
+        // or "payment link already fully used (1/1)". A captured session or a
+        // fully-used single-use link means the invoice was PAID — surface that
+        // distinctly so the FE can show a success state instead of "expired".
+        const paymentStatus =
+          detail.match(/PAYMENT_SESSION_STATUS_[A-Z_]+/)?.[0] ?? null
+        const alreadyPaid =
+          paymentStatus === 'PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED' ||
+          /already fully used/i.test(detail)
+        if (alreadyPaid) {
+          return errorResponse(409, {
+            code: 'PAYMENT_ALREADY_PAID',
+            message: 'This payment link has already been paid.',
+            hint: 'No further action needed — the payment completed successfully.',
+            normalized_input: normalized,
+            link_id_detected,
+            ...(paymentStatus ? { payment_status: paymentStatus } : {}),
+          })
+        }
         return errorResponse(quoteResp.status, {
           code: 'LINK_USED_OR_EXPIRED',
           message: 'Payment link has already been used or has expired.',
           hint: 'Request a new payment link from the merchant.',
           normalized_input: normalized,
           link_id_detected,
+          ...(paymentStatus ? { payment_status: paymentStatus } : {}),
         })
       }
       return errorResponse(502, {
