@@ -699,3 +699,75 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
     }
   })
 })
+
+// ── Already-paid vs expired disambiguation on quote-upstream 409/410 ─────────
+describe('handleCreateInvoice — already-paid vs expired', () => {
+  function makeEnv() {
+    return {
+      PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
+      ROZO_INTENTS_API_KEY: 'test-key',
+    } as unknown as import('../src/index').Env
+  }
+
+  async function runWithQuoteError(status: number, detail: string) {
+    const { handleCreateInvoice } = await import('../src/routes/create-invoice')
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('/quote-invoice')) return new Response(detail, { status })
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const req = new Request('https://mpp.test/create-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          url: 'https://payments.coinbase.com/payment-sessions/paymentSession_e8d9fb75-eab1-4621-ae94-379b7f2836f6',
+        }),
+      })
+      const res = await handleCreateInvoice(req, makeEnv())
+      return { status: res.status, json: JSON.parse(await res.text()) }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  it('CAPTURE_SUCCEEDED session → PAYMENT_ALREADY_PAID with payment_status', async () => {
+    const { status, json } = await runWithQuoteError(
+      409,
+      JSON.stringify({ error: 'payment session is not payable: PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED' }),
+    )
+    expect(status).toBe(409)
+    expect(json.code).toBe('PAYMENT_ALREADY_PAID')
+    expect(json.message).toMatch(/already been paid/i)
+    expect(json.payment_status).toBe('PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED')
+  })
+
+  it('fully-used v1 link → PAYMENT_ALREADY_PAID', async () => {
+    const { status, json } = await runWithQuoteError(
+      409,
+      JSON.stringify({ error: 'payment link already fully used (1/1)' }),
+    )
+    expect(status).toBe(409)
+    expect(json.code).toBe('PAYMENT_ALREADY_PAID')
+  })
+
+  it('expired session (410) → LINK_USED_OR_EXPIRED unchanged', async () => {
+    const { status, json } = await runWithQuoteError(
+      410,
+      JSON.stringify({ error: 'payment session expired' }),
+    )
+    expect(status).toBe(410)
+    expect(json.code).toBe('LINK_USED_OR_EXPIRED')
+  })
+
+  it('other non-payable status (409) → LINK_USED_OR_EXPIRED with payment_status passthrough', async () => {
+    const { status, json } = await runWithQuoteError(
+      409,
+      JSON.stringify({ error: 'payment session is not payable: PAYMENT_SESSION_STATUS_EXPIRED' }),
+    )
+    expect(status).toBe(409)
+    expect(json.code).toBe('LINK_USED_OR_EXPIRED')
+    expect(json.payment_status).toBe('PAYMENT_SESSION_STATUS_EXPIRED')
+  })
+})
