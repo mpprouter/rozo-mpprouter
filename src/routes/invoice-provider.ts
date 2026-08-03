@@ -546,12 +546,16 @@ export type CoinbasePayment = CoinbasePaymentLink | CoinbasePaymentSession
  */
 const COINBASE_V3_PAYABLE_STATES = new Set(['PAYMENT_SESSION_STATUS_CREATED'])
 
-// NOTE on v1 `status`: Coinbase does not publish the Payment Link status enum,
-// and the production signer (`supabase/functions/pay-invoice/coinbase.ts`) does
-// not gate on it either — it gates on usageCount/maxUsage and preApprovalExpiry,
-// which is what we mirror below. `status` is therefore surfaced as informational
-// `state` only. An allowlist here would need the real enum; guessing at it would
-// mark every live link unpayable. Tracked as an open question.
+// NOTE on v1 `status`: Coinbase does not publish the legacy Payment Link status
+// enum, and the production signer (`supabase/functions/pay-invoice/coinbase.ts`)
+// does not gate on it either — it gates on usageCount/maxUsage and
+// preApprovalExpiry, which is what we mirror below. `status` is therefore
+// surfaced as informational `state` only.
+//
+// CLOSED, do not reopen (owner decision, 2026-08-03): Coinbase moved merchants
+// to v3 payment sessions and legacy `pl_*` links are no longer issued, so
+// reverse-engineering that enum has no payoff. The v1 path is kept because it
+// still fails closed on usage and expiry — it is not worth deleting either.
 
 /**
  * Sanitize a provider-controlled status for caller-visible output.
