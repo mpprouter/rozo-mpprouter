@@ -561,6 +561,23 @@ const COINBASE_V3_PAYABLE_STATES = new Set(['PAYMENT_SESSION_STATUS_CREATED'])
  * anything else becomes "unknown". This keeps arbitrary upstream content from
  * being reflected into our response while still surfacing real states.
  */
+/**
+ * True when a v3 session's payment target network is Base mainnet.
+ *
+ * VERIFIED against a live session (2026-08-03): Coinbase sends the enum name
+ * `PAYMENT_TARGET_NETWORK_BASE`, NOT the bare string "base". The bare form is
+ * accepted too because the repo's older fixture uses it and Coinbase has
+ * changed this representation before. Anything else fails closed.
+ *
+ * Matching is exact against this set — deliberately not a substring/prefix
+ * test, so a future `..._BASE_SEPOLIA` (testnet) can never satisfy it.
+ */
+const COINBASE_BASE_NETWORKS = new Set(['payment_target_network_base', 'base'])
+
+function isCoinbaseBaseNetwork(network: string): boolean {
+  return COINBASE_BASE_NETWORKS.has(network.toLowerCase())
+}
+
 function safeCoinbaseState(state: unknown): string {
   return typeof state === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(state) ? state : 'unknown'
 }
@@ -637,7 +654,12 @@ export async function normalizeCoinbasePayment(
     (v3 ? payment.customerDisplay?.merchantName : payment.merchant?.name) ?? 'Unknown merchant'
 
   // ── Amounts ──
-  // v3: `amount` is denominated in `asset` (USD) and settles 1:1 in USDC.
+  // v3: `amount` is denominated in `asset`. VERIFIED against a live session
+  //     (2026-08-03): `asset` is the SETTLEMENT asset in lowercase — "usdc",
+  //     not a fiat code. USD is accepted too because webhook.ts already maps
+  //     this field into a `fiat.currency` slot and older payloads use it.
+  //     USDC is treated as 1:1 with USD, which is what the whole Phase-1
+  //     pipeline already assumes.
   // v1: `fiat.amount` is what the customer is billed; `maxAmount` is the
   //     authoritative on-chain USDC charge. Use each for its own field rather
   //     than deriving one from the other.
@@ -646,13 +668,16 @@ export async function normalizeCoinbasePayment(
   if (typeof fiatRaw !== 'string' || typeof currencyRaw !== 'string') {
     throw new CoinbaseResolveError('upstream', 'Coinbase payment is missing its amount/currency')
   }
-  const fiatCurrency = currencyRaw.toLowerCase()
-  if (fiatCurrency !== 'usd') {
+  const declaredAsset = currencyRaw.toLowerCase()
+  const V3_ACCEPTED_ASSETS = new Set(['usdc', 'usd'])
+  if (v3 ? !V3_ACCEPTED_ASSETS.has(declaredAsset) : declaredAsset !== 'usd') {
     throw new CoinbaseResolveError(
       'unsupported',
-      `unsupported fiat currency "${fiatCurrency}": Phase 1 only supports USD`,
+      `unsupported currency "${declaredAsset}": Phase 1 only supports USD/USDC`,
     )
   }
+  // Normalized output always reports the fiat side as USD (USDC is 1:1).
+  const fiatCurrency = 'usd'
   const fiatAmountMinor = decimalToAtomic(fiatRaw, 2, 'fiat amount')
 
   let stablecoinAtomic: bigint
@@ -697,7 +722,7 @@ export async function normalizeCoinbasePayment(
     // not be silently reported as canonical Base USDC.
     const wallet = payment.target?.paymentTargetWallet
     const network = typeof wallet?.network === 'string' ? wallet.network : ''
-    if (network.toLowerCase() !== 'base') {
+    if (!isCoinbaseBaseNetwork(network)) {
       settlementMismatch =
         network === ''
           ? 'session does not declare a payment target network'

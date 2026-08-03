@@ -45,19 +45,31 @@ function fixtureLink(overrides: Partial<CoinbasePaymentLink> = {}): CoinbasePaym
   }
 }
 
-/** A live, payable v3 payment session for $1.05. */
+/**
+ * A live, payable v3 payment session for $1.05.
+ *
+ * This is the VERBATIM shape of a real production response, captured
+ * 2026-08-03 from a live OpenRouter session. Two fields differ from what the
+ * older repo fixture assumed, and both would have broken every real session:
+ *   - `asset` is "usdc" (settlement asset, lowercase) — NOT "USD"
+ *   - the target network is the enum name "PAYMENT_TARGET_NETWORK_BASE" — NOT "base"
+ * Do not "tidy" these values to match intuition; they are what Coinbase sends.
+ */
 function fixtureSession(
   overrides: Partial<CoinbasePaymentSession> = {},
 ): CoinbasePaymentSession {
   return {
-    paymentSessionId: 'paymentSession_03155b8e-a9c1-4d6f-88f2-7752f6904266',
+    paymentSessionId: 'paymentSession_656a435c-ee45-4c3e-936c-b80929a4e7f2',
     status: 'PAYMENT_SESSION_STATUS_CREATED',
     amount: '1.05',
-    asset: 'USD',
+    asset: 'usdc',
     expiresAt: FUTURE_ISO,
     customerDisplay: { merchantName: 'OpenRouter, Inc' },
     target: {
-      paymentTargetWallet: { address: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739', network: 'base' },
+      paymentTargetWallet: {
+        address: '0x4C3f2E391498e2590bd327a7A1CAA68Dd42c4647',
+        network: 'PAYMENT_TARGET_NETWORK_BASE',
+      },
     },
     ...overrides,
   }
@@ -181,11 +193,60 @@ describe('Coinbase v1 payment link normalization', () => {
 })
 
 describe('Coinbase v3 payment session normalization', () => {
+  // Regression guard for a real near-miss: the first cut of this normalizer
+  // assumed asset="USD" and network="base" from a stale repo fixture. Against
+  // production (asset="usdc", network="PAYMENT_TARGET_NETWORK_BASE") it would
+  // have thrown 422 on the currency check and, had it not, reported
+  // payable=false on the network check. Every live v3 session would have
+  // failed. This asserts the untouched production payload verbatim.
+  it('normalizes a VERBATIM live production payload as payable', async () => {
+    const live = JSON.parse(`{
+      "paymentSessionId": "paymentSession_656a435c-ee45-4c3e-936c-b80929a4e7f2",
+      "amount": "1.05",
+      "asset": "usdc",
+      "status": "PAYMENT_SESSION_STATUS_CREATED",
+      "target": {
+        "paymentTargetWallet": {
+          "address": "0x4C3f2E391498e2590bd327a7A1CAA68Dd42c4647",
+          "network": "PAYMENT_TARGET_NETWORK_BASE"
+        }
+      },
+      "url": "https://payments.coinbase.com/payment-sessions/paymentSession_656a435c-ee45-4c3e-936c-b80929a4e7f2",
+      "redirect": { "successUrl": "https://openrouter.ai/settings/credits" },
+      "createdAt": "2026-08-03T05:06:10.900629Z",
+      "updatedAt": "2026-08-03T05:06:10.924498Z",
+      "customerDisplay": { "merchantName": "OpenRouter, Inc" },
+      "expiresAt": "2026-08-04T05:06:10.897678Z"
+    }`)
+
+    const inv = await normalizeCoinbasePayment(live, Date.parse('2026-08-03T06:00:00Z'))
+    expect(inv.payable).toBe(true)
+    expect(inv.payableReason).toBeNull()
+    expect(inv.merchantTitle).toBe('OpenRouter, Inc')
+    expect(inv.fiatCurrency).toBe('usd')
+    expect(inv.stablecoinAmountAtomic).toBe('1050000')
+  })
+
+  it('still fails closed on a Base TESTNET-looking target network', async () => {
+    // The Base check is an exact match, not a prefix/substring test, so a
+    // future PAYMENT_TARGET_NETWORK_BASE_SEPOLIA can never satisfy it.
+    const inv = await normalizeCoinbasePayment(
+      fixtureSession({
+        target: {
+          paymentTargetWallet: { address: '0xabc', network: 'PAYMENT_TARGET_NETWORK_BASE_SEPOLIA' },
+        },
+      }),
+      NOW,
+    )
+    expect(inv.payable).toBe(false)
+    expect(inv.payableReason).toContain('Base mainnet')
+  })
+
   it('normalizes a live session to the provider-neutral shape', async () => {
     const inv = await normalizeCoinbasePayment(fixtureSession(), NOW)
 
     expect(inv.provider).toBe('coinbase')
-    expect(inv.invoiceKey).toBe('paymentSession_03155b8e-a9c1-4d6f-88f2-7752f6904266')
+    expect(inv.invoiceKey).toBe('paymentSession_656a435c-ee45-4c3e-936c-b80929a4e7f2')
     expect(inv.merchantTitle).toBe('OpenRouter, Inc')
     expect(inv.fiatAmountMinor).toBe('105')
     expect(inv.stablecoinAmountAtomic).toBe('1050000')
