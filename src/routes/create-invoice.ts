@@ -324,24 +324,14 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     })
   }
 
-  // Stripe crypto create-invoice: resolve the session, create/reuse a Rozo
-  // intent, and seed the locked fulfillment record. Fulfillment itself is
-  // money movement done by the (disabled-by-default) Supabase pay-invoice
-  // Stripe branch, driven later by the webhook. Coinbase is unaffected.
-  if (provider_detected === 'stripe_crypto') {
-    const stripeUrl = (normalized as { url?: string }).url
-    if (!stripeUrl) {
-      // Should be unreachable: provider_detected requires a URL. Never echo it.
-      return errorResponse(400, {
-        code: 'INVALID_INPUT',
-        message: 'Stripe invoice requires a url.',
-      })
-    }
-    return handleStripeCreateInvoice(stripeUrl, env)
-  }
-
   // Source override (optional). If caller provided `source`, validate against
   // the whitelist; otherwise default to Base USDC.
+  //
+  // This runs BEFORE the provider branch on purpose. It used to sit after the
+  // Stripe early-return, so a Stripe caller's `source` was silently dropped and
+  // the intent was forced to Base USDC — worse than rejecting it, because the
+  // caller was charged on a chain they did not ask for with no error. Both
+  // providers now share one source-resolution path and one error contract.
   const sourceRaw = (parsed as Record<string, unknown> | null)?.source
   const sourceResult = resolveSource(sourceRaw)
   if (sourceResult.error) {
@@ -355,6 +345,22 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     } as CreateInvoiceError & { supported_sources?: Record<string, SourceToken[]> })
   }
   const source = sourceResult.resolved
+
+  // Stripe crypto create-invoice: resolve the session, create/reuse a Rozo
+  // intent, and seed the locked fulfillment record. Fulfillment itself is
+  // money movement done by the (disabled-by-default) Supabase pay-invoice
+  // Stripe branch, driven later by the webhook. Coinbase is unaffected.
+  if (provider_detected === 'stripe_crypto') {
+    const stripeUrl = (normalized as { url?: string }).url
+    if (!stripeUrl) {
+      // Should be unreachable: provider_detected requires a URL. Never echo it.
+      return errorResponse(400, {
+        code: 'INVALID_INPUT',
+        message: 'Stripe invoice requires a url.',
+      })
+    }
+    return handleStripeCreateInvoice(stripeUrl, env, source)
+  }
 
   let quote: any
   const receiptRaw = (parsed as Record<string, unknown> | null)?.quoteReceipt
@@ -689,7 +695,20 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
 // stored ONLY in the seeded KV record (never in Rozo metadata, never in any
 // response, never logged). The Rozo metadata carries only the non-secret locked
 // fields (design §6).
-export async function handleStripeCreateInvoice(stripeUrl: string, env: Env): Promise<Response> {
+/**
+ * Stripe crypto create-invoice.
+ *
+ * `source` is the caller's chosen pay-with chain/token, already validated by
+ * `resolveSource()` — the SAME resolution the Coinbase branch uses. It controls
+ * only the leg the caller funds. It does NOT change:
+ *   - `destination` — always Base USDC to SETTLEMENT_RECEIVER (the funder wallet)
+ *   - the downstream payment to Stripe itself — always Base USDC
+ */
+export async function handleStripeCreateInvoice(
+  stripeUrl: string,
+  env: Env,
+  source: ResolvedSource,
+): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
   try {
@@ -781,27 +800,54 @@ export async function handleStripeCreateInvoice(stripeUrl: string, env: Env): Pr
     expiresAt = existing?.expiresAt ?? null
     reused = true
   } else {
-    // 7. Create the Rozo intent. Caller pays the discounted amount on Base USDC;
-    // settlement receiver is the funder wallet (same as Coinbase).
-    const intentsBody = {
-      appId: ROZO_APP_ID,
-      orderId,
-      type: 'exactIn',
-      display: { title, currency: 'USD' },
-      source: {
-        chainId: BASE_CHAIN_ID,
-        tokenSymbol: 'USDC',
-        amount: callerPays,
-        tokenAddress: BASE_USDC_ADDRESS,
-      },
-      destination: {
-        chainId: SETTLEMENT_CHAIN_ID,
-        receiverAddress: SETTLEMENT_RECEIVER,
-        tokenSymbol: 'USDC',
-        tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
-      },
-      metadata: lockedMetadata,
-    }
+    // 7. Create the Rozo intent. The caller pays the discounted amount on the
+    // source they chose; the settlement receiver is always the funder wallet on
+    // Base USDC (same as Coinbase).
+    //
+    // Lightning (BTC) source → exactOut: the caller pays the BTC equivalent and
+    // destination.amount pins the USDC we must receive. BTC price floats, so we
+    // omit source.amount / source.tokenAddress and let Rozo quote the input.
+    // Every other source → exactIn: the caller pays `callerPays` on that chain.
+    // This mirrors the Coinbase branch exactly.
+    const isLightning = source.chainId === 'lightning'
+    const intentsBody = isLightning
+      ? {
+          appId: ROZO_APP_ID,
+          orderId,
+          type: 'exactOut',
+          display: { title, currency: 'USD' },
+          source: {
+            chainId: 'lightning',
+            tokenSymbol: 'BTC',
+          },
+          destination: {
+            chainId: SETTLEMENT_CHAIN_ID,
+            receiverAddress: SETTLEMENT_RECEIVER,
+            tokenSymbol: 'USDC',
+            tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
+            amount: callerPays,
+          },
+          metadata: lockedMetadata,
+        }
+      : {
+          appId: ROZO_APP_ID,
+          orderId,
+          type: 'exactIn',
+          display: { title, currency: 'USD' },
+          source: {
+            chainId: source.chainId,
+            tokenSymbol: source.tokenSymbol,
+            amount: callerPays,
+            tokenAddress: source.tokenAddress,
+          },
+          destination: {
+            chainId: SETTLEMENT_CHAIN_ID,
+            receiverAddress: SETTLEMENT_RECEIVER,
+            tokenSymbol: 'USDC',
+            tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
+          },
+          metadata: lockedMetadata,
+        }
     let intentsResp: Response
     try {
       intentsResp = await fetch(ROZO_INTENTS_URL, {
@@ -868,10 +914,34 @@ export async function handleStripeCreateInvoice(stripeUrl: string, env: Env): Pr
   }
 
   // 9. Response. provider-neutral v2 fields; NEVER echo the Stripe URL.
+  //
+  // On reuse, echo the source the EXISTING intent was created with (from Rozo),
+  // not the one this caller asked for — a previous caller may have used a
+  // different chain for the same invoice. When the two disagree, say so
+  // explicitly rather than letting the caller assume their request took effect.
+  const existingSourceChain = existing?.source?.chainId ?? existing?.source_chain_id ?? null
+  const existingSourceToken = existing?.source?.tokenSymbol ?? existing?.source_token_symbol ?? null
+  const warnings = [...source.warnings]
+  if (
+    reused &&
+    existingSourceChain !== null &&
+    (String(existingSourceChain) !== source.chainId || existingSourceToken !== source.tokenSymbol)
+  ) {
+    warnings.push(
+      `Reused an existing intent for this invoice that pays from ${existingSourceChain} ` +
+        `${existingSourceToken}; the requested source ${source.chainId} ${source.tokenSymbol} ` +
+        `was not applied.`,
+    )
+  }
+
   return json(200, {
     ok: true,
     reused,
     provider: 'stripe_crypto',
+    source: reused
+      ? { chainId: existingSourceChain, tokenSymbol: existingSourceToken }
+      : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
+    ...(warnings.length ? { warnings } : {}),
     invoiceKey: invoice.invoiceKey,
     merchant: invoice.merchantTitle,
     merchantAccount: invoice.merchantAccount,
