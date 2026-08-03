@@ -546,6 +546,13 @@ export type CoinbasePayment = CoinbasePaymentLink | CoinbasePaymentSession
  */
 const COINBASE_V3_PAYABLE_STATES = new Set(['PAYMENT_SESSION_STATUS_CREATED'])
 
+// NOTE on v1 `status`: Coinbase does not publish the Payment Link status enum,
+// and the production signer (`supabase/functions/pay-invoice/coinbase.ts`) does
+// not gate on it either — it gates on usageCount/maxUsage and preApprovalExpiry,
+// which is what we mirror below. `status` is therefore surfaced as informational
+// `state` only. An allowlist here would need the real enum; guessing at it would
+// mark every live link unpayable. Tracked as an open question.
+
 /**
  * Sanitize a provider-controlled status for caller-visible output.
  *
@@ -659,10 +666,15 @@ export async function normalizeCoinbasePayment(
   }
 
   // ── Expiry ──
+  // FAIL CLOSED: a missing or unparseable expiry means we cannot verify the
+  // invoice is still live, so it is reported not-payable rather than assumed
+  // fresh. "Cannot verify" must never read as "verified OK".
   const expiryRaw = v3 ? payment.expiresAt : payment.preApprovalExpiry
   const validBefore = toIsoTimestamp(expiryRaw)
   const expiresAtMs = expiryMs(expiryRaw)
-  const expired = expiresAtMs !== null && expiresAtMs <= nowMs
+  const expired = expiresAtMs === null || expiresAtMs <= nowMs
+  const expiryReason =
+    expiresAtMs === null ? 'invoice expiry could not be verified' : 'invoice has expired'
 
   const state = safeCoinbaseState(v3 ? payment.status : payment.status)
 
@@ -680,10 +692,20 @@ export async function normalizeCoinbasePayment(
   let settlementMismatch: string | null = null
   const supportedPaymentOptions: NormalizedInvoice['supportedPaymentOptions'] = []
   if (v3) {
+    // FAIL CLOSED: only claim Base settlement when the session actually names
+    // Base as its payment target network. An absent or different network must
+    // not be silently reported as canonical Base USDC.
     const wallet = payment.target?.paymentTargetWallet
+    const network = typeof wallet?.network === 'string' ? wallet.network : ''
+    if (network.toLowerCase() !== 'base') {
+      settlementMismatch =
+        network === ''
+          ? 'session does not declare a payment target network'
+          : 'session does not settle on Base mainnet'
+    }
     supportedPaymentOptions.push({
       id: 'usdc.base',
-      network: typeof wallet?.network === 'string' ? wallet.network : 'base',
+      network: network || 'unknown',
       chainId: Number(BASE_CHAIN_ID),
       tokenSymbol: 'USDC',
       tokenAddress: BASE_USDC_ADDRESS,
@@ -716,16 +738,21 @@ export async function normalizeCoinbasePayment(
       payableReason = `session state "${state}" is not entry-payable`
     }
   } else {
-    const usageCount = typeof payment.usageCount === 'number' ? payment.usageCount : 0
-    const maxUsage = typeof payment.maxUsage === 'number' ? payment.maxUsage : 1
-    if (usageCount >= maxUsage) {
+    // FAIL CLOSED: usage is the only signal that a v1 link has already been
+    // paid. If the upstream did not give us both counters we cannot rule that
+    // out, so the link is reported not-payable rather than defaulting to 0.
+    const { usageCount, maxUsage } = payment
+    if (typeof usageCount !== 'number' || typeof maxUsage !== 'number') {
+      payable = false
+      payableReason = 'payment link usage could not be verified'
+    } else if (usageCount >= maxUsage) {
       payable = false
       payableReason = `payment link already fully used (${usageCount}/${maxUsage})`
     }
   }
   if (payable && expired) {
     payable = false
-    payableReason = 'invoice has expired'
+    payableReason = expiryReason
   }
   if (payable && settlementMismatch) {
     payable = false

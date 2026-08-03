@@ -156,12 +156,27 @@ describe('Coinbase v1 payment link normalization', () => {
     expect(wrongChain.payableReason).toContain('Base mainnet')
   })
 
-  it('defaults maxUsage to 1 when absent so a used link is not reported payable', async () => {
-    const inv = await normalizeCoinbasePayment(
-      fixtureLink({ maxUsage: undefined, usageCount: 1 }),
-      NOW,
-    )
-    expect(inv.payable).toBe(false)
+  // Fail-closed: "cannot verify" must never be reported as "verified OK".
+  describe('fails closed on unverifiable fields', () => {
+    it('is not payable when the usage counters are missing', async () => {
+      for (const missing of [{ maxUsage: undefined }, { usageCount: undefined }]) {
+        const inv = await normalizeCoinbasePayment(fixtureLink(missing), NOW)
+        expect(inv.payable).toBe(false)
+        expect(inv.payableReason).toContain('usage could not be verified')
+      }
+    })
+
+    it('is not payable when the expiry is missing or unparseable', async () => {
+      for (const bad of [undefined, '', 'not-a-date']) {
+        const inv = await normalizeCoinbasePayment(
+          fixtureLink({ preApprovalExpiry: bad as string | undefined }),
+          NOW,
+        )
+        expect(inv.payable).toBe(false)
+        expect(inv.payableReason).toContain('expiry could not be verified')
+        expect(inv.validBefore).toBeNull()
+      }
+    })
   })
 })
 
@@ -198,6 +213,27 @@ describe('Coinbase v3 payment session normalization', () => {
     const inv = await normalizeCoinbasePayment(fixtureSession({ expiresAt: PAST_ISO }), NOW)
     expect(inv.payable).toBe(false)
     expect(inv.payableReason).toBe('invoice has expired')
+  })
+
+  // Fail-closed: never advertise canonical Base USDC settlement off an
+  // unverified target network.
+  it('is not payable when the payment target is not Base', async () => {
+    const other = await normalizeCoinbasePayment(
+      fixtureSession({ target: { paymentTargetWallet: { address: '0xabc', network: 'ethereum' } } }),
+      NOW,
+    )
+    expect(other.payable).toBe(false)
+    expect(other.payableReason).toContain('Base mainnet')
+
+    const absent = await normalizeCoinbasePayment(fixtureSession({ target: undefined }), NOW)
+    expect(absent.payable).toBe(false)
+    expect(absent.payableReason).toContain('does not declare a payment target network')
+  })
+
+  it('is not payable when expiresAt is missing', async () => {
+    const inv = await normalizeCoinbasePayment(fixtureSession({ expiresAt: undefined }), NOW)
+    expect(inv.payable).toBe(false)
+    expect(inv.payableReason).toContain('expiry could not be verified')
   })
 })
 
