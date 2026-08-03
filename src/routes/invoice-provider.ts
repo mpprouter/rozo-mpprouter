@@ -14,7 +14,11 @@
 //   URL/hash, unmasked wallet addresses, private keys, or signatures.
 
 import type { InvoiceProvider } from './pay-invoice-admin'
-import { extractStripeSessionBlob } from './pay-invoice-admin'
+import {
+  extractCoinbaseCheckoutId,
+  extractStripeSessionBlob,
+  isCoinbasePaymentSessionId,
+} from './pay-invoice-admin'
 
 // Base mainnet canonical USDC. Phase 1 settles only on Base USDC (6 decimals).
 const BASE_CHAIN_ID = '8453'
@@ -470,4 +474,405 @@ export async function resolveStripeInvoice(payUrl: string): Promise<NormalizedIn
   const resumed = await resumeStripeSession(payUrl)
   const session = await queryStripeSession(resumed)
   return normalizeStripeSession(session)
+}
+
+// ── Coinbase (read-only) ────────────────────────────────────────────────────
+//
+// Strictly READ-ONLY, exactly like the Stripe half above: resolve a Coinbase
+// checkout URL to the same provider-neutral NormalizedInvoice so callers stop
+// needing two code paths. Nothing here signs, locks, reserves, or moves funds.
+//
+// IMPORTANT (design doc §10-3): this does NOT replace `quote-invoice`. That
+// endpoint issues the HMAC-signed quote receipt which is the amount trust chain
+// for Coinbase settlement. This endpoint is display-only and issues no receipt.
+
+const COINBASE_PAYMENTS_BASE = 'https://payments.coinbase.com'
+
+export type CoinbaseResolveErrorKind = StripeResolveErrorKind
+
+export class CoinbaseResolveError extends Error {
+  constructor(
+    public kind: CoinbaseResolveErrorKind,
+    message: string,
+  ) {
+    super(message)
+    this.name = 'CoinbaseResolveError'
+  }
+}
+
+/**
+ * Coinbase v1 Payment Link, as returned by `next-api/payment-links/pl_*`.
+ * Field names mirror the production payment client
+ * (`supabase/functions/quote-invoice/coinbase.ts`) — do not rename them here.
+ */
+export interface CoinbasePaymentLink {
+  id: string
+  status?: string
+  maxAmount: string // USDC decimal string, e.g. "18.19"
+  token?: string // ERC-20 address of the settlement token
+  networkId?: number
+  preApprovalExpiry?: string // unix SECONDS as a string
+  maxUsage?: number
+  usageCount?: number
+  merchant?: { name?: string }
+  fiat?: { amount?: string; currency?: string }
+  [k: string]: unknown
+}
+
+/** Coinbase v3 Payment Session, from `next-api/payment-sessions/paymentSession_*`. */
+export interface CoinbasePaymentSession {
+  paymentSessionId: string
+  status?: string
+  amount: string // decimal string in `asset`
+  asset?: string
+  expiresAt?: string // ISO-8601
+  customerDisplay?: { merchantName?: string }
+  target?: {
+    paymentTargetWallet?: { address?: string; network?: string }
+    [k: string]: unknown
+  }
+  [k: string]: unknown
+}
+
+export type CoinbasePayment = CoinbasePaymentLink | CoinbasePaymentSession
+
+/**
+ * The only Coinbase v3 session state that is entry-payable.
+ *
+ * This is an ALLOWLIST on purpose. The Stripe skill previously used a denylist
+ * (exclude succeeded/failed) and mis-reported in-flight sessions such as
+ * `fulfillment_complete` as payable; the same mistake must not be repeated
+ * here. Anything not on this list is reported payable=false with a reason.
+ */
+const COINBASE_V3_PAYABLE_STATES = new Set(['PAYMENT_SESSION_STATUS_CREATED'])
+
+// NOTE on v1 `status`: Coinbase does not publish the legacy Payment Link status
+// enum, and the production signer (`supabase/functions/pay-invoice/coinbase.ts`)
+// does not gate on it either — it gates on usageCount/maxUsage and
+// preApprovalExpiry, which is what we mirror below. `status` is therefore
+// surfaced as informational `state` only.
+//
+// CLOSED, do not reopen (owner decision, 2026-08-03): Coinbase moved merchants
+// to v3 payment sessions and legacy `pl_*` links are no longer issued, so
+// reverse-engineering that enum has no payoff. The v1 path is kept because it
+// still fails closed on usage and expiry — it is not worth deleting either.
+
+/**
+ * Sanitize a provider-controlled status for caller-visible output.
+ *
+ * Unlike Stripe we do not have the full Coinbase status enum, so instead of a
+ * fixed allowlist we constrain the SHAPE: a short bare identifier is echoed,
+ * anything else becomes "unknown". This keeps arbitrary upstream content from
+ * being reflected into our response while still surfacing real states.
+ */
+/**
+ * True when a v3 session's payment target network is Base mainnet.
+ *
+ * VERIFIED against a live session (2026-08-03): Coinbase sends the enum name
+ * `PAYMENT_TARGET_NETWORK_BASE`, NOT the bare string "base". The bare form is
+ * accepted too because the repo's older fixture uses it and Coinbase has
+ * changed this representation before. Anything else fails closed.
+ *
+ * Matching is exact against this set — deliberately not a substring/prefix
+ * test, so a future `..._BASE_SEPOLIA` (testnet) can never satisfy it.
+ */
+const COINBASE_BASE_NETWORKS = new Set(['payment_target_network_base', 'base'])
+
+function isCoinbaseBaseNetwork(network: string): boolean {
+  return COINBASE_BASE_NETWORKS.has(network.toLowerCase())
+}
+
+function safeCoinbaseState(state: unknown): string {
+  return typeof state === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(state) ? state : 'unknown'
+}
+
+/**
+ * Parse an exact decimal string into atomic units, without floating point.
+ *
+ * Rejects anything that is not a plain non-negative decimal, and rejects more
+ * fractional digits than the token has — we must never silently round a
+ * customer-visible amount into a different amount + lock fingerprint.
+ */
+export function decimalToAtomic(value: string, decimals: number, label: string): bigint {
+  if (typeof value !== 'string' || !/^\d+(\.\d+)?$/.test(value.trim())) {
+    throw new CoinbaseResolveError('upstream', `${label} is not a plain decimal amount`)
+  }
+  const [whole, frac = ''] = value.trim().split('.')
+  if (frac.length > decimals) {
+    throw new CoinbaseResolveError(
+      'upstream',
+      `${label} has more than ${decimals} decimal places`,
+    )
+  }
+  return BigInt(whole + frac.padEnd(decimals, '0'))
+}
+
+/** Normalize a unix-seconds string or an ISO timestamp to ISO-8601, else null. */
+function toIsoTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string' || value.trim() === '') return null
+  const raw = value.trim()
+  const ms = /^\d+$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw)
+  if (!Number.isFinite(ms)) return null
+  return new Date(ms).toISOString()
+}
+
+/** Milliseconds-since-epoch for an expiry value, or null when unparseable. */
+function expiryMs(value: unknown): number | null {
+  const iso = toIsoTimestamp(value)
+  return iso === null ? null : Date.parse(iso)
+}
+
+function isPaymentSession(p: CoinbasePayment): p is CoinbasePaymentSession {
+  return typeof (p as CoinbasePaymentSession).paymentSessionId === 'string'
+}
+
+/**
+ * Normalize a Coinbase v1 Payment Link or v3 Payment Session into the
+ * provider-neutral invoice model. Pure (no I/O), so it is unit-testable with
+ * fixtures.
+ *
+ * Payability mirrors the checks the production payment client actually
+ * enforces, plus a Base-USDC settlement check:
+ *   v1 — not fully used (`usageCount < maxUsage`), not past `preApprovalExpiry`,
+ *        and the link settles in canonical Base USDC.
+ *   v3 — status is on the payable allowlist and the session is not past
+ *        `expiresAt`.
+ *
+ * Throws CoinbaseResolveError('unsupported') for a non-USD fiat currency, where
+ * we cannot compute a trustworthy amount at all — same hard stop as Stripe.
+ *
+ * `nowMs` is injectable so expiry behavior is deterministic under test.
+ */
+export async function normalizeCoinbasePayment(
+  payment: CoinbasePayment,
+  nowMs: number = Date.now(),
+): Promise<NormalizedInvoice> {
+  const v3 = isPaymentSession(payment)
+
+  const invoiceKey = v3 ? payment.paymentSessionId : payment.id
+  if (typeof invoiceKey !== 'string' || invoiceKey === '') {
+    throw new CoinbaseResolveError('upstream', 'Coinbase payment is missing its id')
+  }
+
+  const merchantTitle =
+    (v3 ? payment.customerDisplay?.merchantName : payment.merchant?.name) ?? 'Unknown merchant'
+
+  // ── Amounts ──
+  // v3: `amount` is denominated in `asset`. VERIFIED against a live session
+  //     (2026-08-03): `asset` is the SETTLEMENT asset in lowercase — "usdc",
+  //     not a fiat code. USD is accepted too because webhook.ts already maps
+  //     this field into a `fiat.currency` slot and older payloads use it.
+  //     USDC is treated as 1:1 with USD, which is what the whole Phase-1
+  //     pipeline already assumes.
+  // v1: `fiat.amount` is what the customer is billed; `maxAmount` is the
+  //     authoritative on-chain USDC charge. Use each for its own field rather
+  //     than deriving one from the other.
+  const fiatRaw = v3 ? payment.amount : payment.fiat?.amount
+  const currencyRaw = v3 ? payment.asset : payment.fiat?.currency
+  if (typeof fiatRaw !== 'string' || typeof currencyRaw !== 'string') {
+    throw new CoinbaseResolveError('upstream', 'Coinbase payment is missing its amount/currency')
+  }
+  const declaredAsset = currencyRaw.toLowerCase()
+  const V3_ACCEPTED_ASSETS = new Set(['usdc', 'usd'])
+  if (v3 ? !V3_ACCEPTED_ASSETS.has(declaredAsset) : declaredAsset !== 'usd') {
+    throw new CoinbaseResolveError(
+      'unsupported',
+      `unsupported currency "${declaredAsset}": Phase 1 only supports USD/USDC`,
+    )
+  }
+  // Normalized output always reports the fiat side as USD (USDC is 1:1).
+  const fiatCurrency = 'usd'
+  const fiatAmountMinor = decimalToAtomic(fiatRaw, 2, 'fiat amount')
+
+  let stablecoinAtomic: bigint
+  if (v3) {
+    stablecoinAtomic = fiatMinorToUsdcAtomic(fiatAmountMinor, fiatCurrency)
+  } else {
+    if (typeof payment.maxAmount !== 'string') {
+      throw new CoinbaseResolveError('upstream', 'payment link is missing maxAmount')
+    }
+    stablecoinAtomic = decimalToAtomic(payment.maxAmount, 6, 'maxAmount')
+  }
+
+  // ── Expiry ──
+  // FAIL CLOSED: a missing or unparseable expiry means we cannot verify the
+  // invoice is still live, so it is reported not-payable rather than assumed
+  // fresh. "Cannot verify" must never read as "verified OK".
+  const expiryRaw = v3 ? payment.expiresAt : payment.preApprovalExpiry
+  const validBefore = toIsoTimestamp(expiryRaw)
+  const expiresAtMs = expiryMs(expiryRaw)
+  const expired = expiresAtMs === null || expiresAtMs <= nowMs
+  const expiryReason =
+    expiresAtMs === null ? 'invoice expiry could not be verified' : 'invoice has expired'
+
+  const state = safeCoinbaseState(v3 ? payment.status : payment.status)
+
+  // ── Settlement / supported options ──
+  // v1 settles by ERC-3009 transfer authorization (a signature, no direct
+  // transfer) -> closest neutral label is `wallet_connect`.
+  // v3 settles by sending funds to `target.paymentTargetWallet` -> direct deposit.
+  const settlementPaymentOption: NormalizedInvoice['settlement']['paymentOption'] = v3
+    ? 'direct_deposit'
+    : 'wallet_connect'
+
+  // v1 links carry their own token/chain. Verify they are canonical Base USDC
+  // before reporting Base USDC settlement + payable=true, exactly as the Stripe
+  // half strictly validates its `usdc.base` offer.
+  let settlementMismatch: string | null = null
+  const supportedPaymentOptions: NormalizedInvoice['supportedPaymentOptions'] = []
+  if (v3) {
+    // FAIL CLOSED: only claim Base settlement when the session actually names
+    // Base as its payment target network. An absent or different network must
+    // not be silently reported as canonical Base USDC.
+    const wallet = payment.target?.paymentTargetWallet
+    const network = typeof wallet?.network === 'string' ? wallet.network : ''
+    if (!isCoinbaseBaseNetwork(network)) {
+      settlementMismatch =
+        network === ''
+          ? 'session does not declare a payment target network'
+          : 'session does not settle on Base mainnet'
+    }
+    supportedPaymentOptions.push({
+      id: 'usdc.base',
+      network: network || 'unknown',
+      chainId: Number(BASE_CHAIN_ID),
+      tokenSymbol: 'USDC',
+      tokenAddress: BASE_USDC_ADDRESS,
+      paymentOptions: ['direct_deposit'],
+    })
+  } else {
+    const token = typeof payment.token === 'string' ? payment.token : ''
+    const chainId = typeof payment.networkId === 'number' ? payment.networkId : 0
+    if (chainId !== Number(BASE_CHAIN_ID)) {
+      settlementMismatch = 'payment link does not settle on Base mainnet'
+    } else if (token.toLowerCase() !== BASE_USDC_ADDRESS.toLowerCase()) {
+      settlementMismatch = 'payment link does not settle in canonical Base USDC'
+    }
+    supportedPaymentOptions.push({
+      id: 'usdc.base',
+      network: 'base',
+      chainId,
+      tokenSymbol: 'USDC',
+      tokenAddress: token,
+      paymentOptions: ['wallet_connect'],
+    })
+  }
+
+  // ── Payability ──
+  let payable = true
+  let payableReason: string | null = null
+  if (v3) {
+    if (!COINBASE_V3_PAYABLE_STATES.has(state)) {
+      payable = false
+      payableReason = `session state "${state}" is not entry-payable`
+    }
+  } else {
+    // FAIL CLOSED: usage is the only signal that a v1 link has already been
+    // paid. If the upstream did not give us both counters we cannot rule that
+    // out, so the link is reported not-payable rather than defaulting to 0.
+    const { usageCount, maxUsage } = payment
+    if (typeof usageCount !== 'number' || typeof maxUsage !== 'number') {
+      payable = false
+      payableReason = 'payment link usage could not be verified'
+    } else if (usageCount >= maxUsage) {
+      payable = false
+      payableReason = `payment link already fully used (${usageCount}/${maxUsage})`
+    }
+  }
+  if (payable && expired) {
+    payable = false
+    payableReason = expiryReason
+  }
+  if (payable && settlementMismatch) {
+    payable = false
+    payableReason = settlementMismatch
+  }
+
+  const lockFingerprint = await computeLockFingerprint({
+    provider: 'coinbase',
+    invoiceKey,
+    merchantAccount: null,
+    fiatAmountMinor: fiatAmountMinor.toString(),
+    fiatCurrency,
+    stablecoinAmountAtomic: stablecoinAtomic.toString(),
+    settlementChainId: BASE_CHAIN_ID,
+    settlementTokenAddress: BASE_USDC_ADDRESS,
+  })
+
+  return {
+    provider: 'coinbase',
+    invoiceKey,
+    merchantTitle,
+    // Coinbase has no Stripe-style connected-account id.
+    merchantAccount: null,
+    fiatAmountMinor: fiatAmountMinor.toString(),
+    fiatCurrency,
+    stablecoinAmountAtomic: stablecoinAtomic.toString(),
+    stablecoinAmount: formatUsdcAtomic(stablecoinAtomic),
+    state,
+    payable,
+    payableReason,
+    validBefore,
+    settlement: {
+      chainId: '8453',
+      network: 'base',
+      tokenSymbol: 'USDC',
+      tokenAddress: BASE_USDC_ADDRESS,
+      paymentOption: settlementPaymentOption,
+    },
+    supportedPaymentOptions,
+    // The read-only `next-api` payloads carry no settled-transaction detail.
+    transaction: null,
+    lockFingerprint,
+  }
+}
+
+/**
+ * Fetch a Coinbase checkout payload from the public `next-api` used by the
+ * checkout page itself. No credentials are involved — the Origin/Referer pair
+ * is what the browser sends. Mirrors `fetchCoinbasePayment` in webhook.ts.
+ */
+async function fetchCoinbasePayment(paymentId: string): Promise<CoinbasePayment> {
+  const resource = isCoinbasePaymentSessionId(paymentId) ? 'payment-sessions' : 'payment-links'
+  const path = `${resource}/${encodeURIComponent(paymentId)}`
+  let res: Response
+  try {
+    res = await fetch(`${COINBASE_PAYMENTS_BASE}/next-api/${path}`, {
+      headers: {
+        Accept: 'application/json',
+        Origin: COINBASE_PAYMENTS_BASE,
+        Referer: `${COINBASE_PAYMENTS_BASE}/${path}`,
+      },
+    })
+  } catch {
+    throw new CoinbaseResolveError('upstream', 'Coinbase checkout API is unreachable')
+  }
+  if (!res.ok) {
+    // Do NOT echo the upstream body — surface a short, content-free status.
+    throw new CoinbaseResolveError(
+      res.status === 404 || res.status === 410 ? 'expired' : 'upstream',
+      `Coinbase checkout lookup failed (${res.status})`,
+    )
+  }
+  try {
+    return (await res.json()) as CoinbasePayment
+  } catch {
+    throw new CoinbaseResolveError('upstream', 'Coinbase checkout lookup returned non-JSON')
+  }
+}
+
+/**
+ * End-to-end read-only resolution of a Coinbase checkout URL (v1 payment link
+ * or v3 payment session) into a NormalizedInvoice. Performs live network I/O.
+ * Throws CoinbaseResolveError on any failure.
+ */
+export async function resolveCoinbaseInvoice(url: string): Promise<NormalizedInvoice> {
+  const id = extractCoinbaseCheckoutId(url)
+  if (!id) {
+    throw new CoinbaseResolveError(
+      'invalid_url',
+      'URL is not a payments.coinbase.com /payment-links/pl_* or /payment-sessions/paymentSession_* link',
+    )
+  }
+  return normalizeCoinbasePayment(await fetchCoinbasePayment(id))
 }

@@ -101,6 +101,24 @@ export function extractCoinbaseCheckoutId(raw: string): string | null {
   }
 }
 
+/**
+ * True when the ID is a Coinbase v3 Payment Session ID (`paymentSession_*`)
+ * rather than a legacy v1 Payment Link ID (`pl_*`).
+ *
+ * Callers use this to pick the upstream `next-api` resource path and the
+ * matching response schema. Kept here alongside the URL extractors so the
+ * Coinbase ID grammar lives in exactly one place.
+ *
+ * NOTE: `webhook.ts` still carries its own private `isPlId` / `isPaymentSessionId`
+ * pair whose `pl_` pattern is STRICTER (alphanumeric only, no `_`/`-`). That
+ * copy sits on the fund-movement path, so consolidating it is deliberately out
+ * of scope for this read-only change — widening which IDs the payout webhook
+ * accepts is a behavior change that belongs in its own reviewed PR.
+ */
+export function isCoinbasePaymentSessionId(id: string): boolean {
+  return /^paymentSession_[A-Za-z0-9_-]+$/.test(id)
+}
+
 // ── Stripe pay-blob extraction ──────────────────────────────────────────────
 
 /**
