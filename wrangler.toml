@@ -130,6 +130,13 @@ STELLAR_X402_PAY_TO = "GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB"
 # issuance instantly without touching secrets. See src/routes/coupon.ts.
 COUPON_ENDPOINT_ENABLED = "true"
 
+# Partner platform kill switch. Covers the pages AND the API together: a
+# half-open surface looks usable and then fails at the point where money moves.
+# Flip to "false" and redeploy to pull the feature without a code rollback.
+PARTNER_ENDPOINT_ENABLED = "true"
+# Shown on the partner explainer page ("需要充值？联系我们"). Not a secret.
+PARTNER_CONTACT = "Telegram @rozoai"
+
 # Secrets (set via: wrangler secret put <NAME>)
 #
 # STELLAR_ROUTER_PUBLIC          — G... Router pool address (receives agent USDC via mppx)

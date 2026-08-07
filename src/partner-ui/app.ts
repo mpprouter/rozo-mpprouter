@@ -89,7 +89,7 @@ function body(contact: string): string {
     <div style="margin:16px 0 6px;">
       <label class="label" for="expires-input">有效期（小时，留空 = 12）</label>
       <input class="input" id="expires-input" type="text" inputmode="numeric"
-             autocomplete="off" placeholder="12（最长 168 = 7 天）" />
+             autocomplete="off" placeholder="336（默认 14 天，可设更短）" />
     </div>
 
     <div id="issue-hint" class="note note--err" style="display:none;" role="alert"></div>
@@ -340,7 +340,7 @@ ${analyticsScript(opts)}
     if (pending.mode === 'credits') payload.credits = Number(pending.creditsLabel);
     else payload.amountUsd = atomicToUsd(pending.faceAtomic);
     var hours = parseInt($('expires-input').value.trim(), 10);
-    if (hours > 0) payload.expiresMinutes = Math.min(hours, 168) * 60;
+    if (hours > 0) payload.expiresInMinutes = Math.min(hours, 336) * 60;
 
     var req = MOCK
       ? Promise.resolve({

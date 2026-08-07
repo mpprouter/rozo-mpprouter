@@ -60,8 +60,20 @@ const MAX_FACE_VALUE_ATOMIC = 1_050_000_000n
 /** Minimum issuance: 1 credit (§3.2). */
 const MIN_CREDITS_ATOMIC = 1_000_000n
 
-const DEFAULT_EXPIRES_MINUTES = 12 * 60
-const MAX_EXPIRES_MINUTES = 60 * 24 * 7 // 7 days, same cap as admin issuance
+/**
+ * 14 days (founder 2026-08-07). Partners resell to end customers who may sit
+ * on a code for a week or more, and a code that dies before the buyer gets to
+ * it turns into a support ticket for us.
+ *
+ * This is only defensible now that codes are 10 digits. Expiry is what caps
+ * how many coupons are live at once, and the brute-force hit rate scales
+ * linearly with that: at ~140 live coupons a 14-day window is ~0.24% against
+ * 10^10, but would have been ~24% against the old 10^8 space. Do NOT raise
+ * this further without redoing that arithmetic — see ainative
+ * todos/20260807-coupon-reseller-platform.md §9.2.
+ */
+const DEFAULT_EXPIRES_MINUTES = 60 * 24 * 14
+const MAX_EXPIRES_MINUTES = 60 * 24 * 14 // same as the default; shorter is allowed
 
 const MAX_LEDGER_ROWS = 50
 
@@ -160,6 +172,22 @@ export function resolveAmount(body: any): AmountResolution | { error: string } {
   return { amountAtomic, credits: null }
 }
 
+/**
+ * A face value must land on a whole cent.
+ *
+ * The coupon only redeems if the customer's OpenRouter payment link is for
+ * EXACTLY this amount, and no payment UI lets anyone enter $1.05525. A
+ * sub-cent face is therefore a coupon that was paid for and can never be
+ * spent. The money is recoverable by voiding it, so this is not a loss — it
+ * is a support ticket, which is worse per hour of our time.
+ *
+ * Reachable from both entry points: `credits: 1.005` survives the ×21/20
+ * conversion, and the direct amountUsd path accepts 6dp because parseUsdc does.
+ */
+function wholeCents(amountAtomic: bigint): boolean {
+  return amountAtomic % 10_000n === 0n
+}
+
 // ── GET /partner/me ──────────────────────────────────────────────────────────
 
 /** Balance + recent ledger for the SESSION's partner. No id is accepted from
@@ -234,11 +262,25 @@ export async function handlePartnerIssueCoupon(request: Request, env: Env): Prom
     })
   }
 
+  // Accept BOTH spellings. The dashboard shipped `expiresMinutes` while this
+  // handler read `expiresInMinutes`, so every custom expiry was silently
+  // dropped to the 12h default with no error — the worst kind of bug, because
+  // the UI looked like it worked. The UI now sends the canonical name; this
+  // keeps the alias so an older cached page does not regress.
+  const expiresRaw = body?.expiresInMinutes ?? body?.expiresMinutes
   const expiresInMinutes =
-    typeof body?.expiresInMinutes === 'number' && body.expiresInMinutes > 0
-      ? Math.min(Math.floor(body.expiresInMinutes), MAX_EXPIRES_MINUTES)
+    typeof expiresRaw === 'number' && expiresRaw > 0
+      ? Math.min(Math.floor(expiresRaw), MAX_EXPIRES_MINUTES)
       : DEFAULT_EXPIRES_MINUTES
   const note = typeof body?.note === 'string' ? body.note.slice(0, 500) : null
+
+  if (!wholeCents(resolved.amountAtomic)) {
+    return json(400, {
+      error:
+        'face value must be a whole number of cents — the customer cannot create a payment link for a fraction of a cent',
+      amountUsd: formatUsdc(resolved.amountAtomic),
+    })
+  }
 
   try {
     const result = await issuePartnerCoupon(env, {

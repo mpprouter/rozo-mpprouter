@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import worker from '../src/index'
+import { SESSION_COOKIE, signSession } from '../src/routes/partner-auth'
 import { getOrCreatePartnerByEmail, setPartnerPassword, getPartner } from '../src/routes/partner-store'
 import type { Env } from '../src/index'
 
@@ -168,10 +169,43 @@ describe('session and tenancy', () => {
     expect((await postJson('/partner/coupon/issue', { credits: 1, clientKey: 'k' })).status).toBe(401)
   })
 
-  it('rejects a forged cookie', async () => {
-    await seed('e@x.com', '100')
-    const resp = await call('/partner/me', { headers: { Cookie: 'rozo_partner=forged.value' } })
+  it('rejects forged and foreign-signed session cookies', async () => {
+    // The first version of this test used the WRONG cookie name, so it only
+    // exercised the no-cookie path and gave signature verification zero
+    // coverage — a regression accepting any 3-part token would have passed.
+    const id = await seed('e@x.com', '100')
+    const good = await login('e@x.com')
+    const value = good.split('=')[1]
+    const [v, payload, sig] = value.split('.')
+
+    const forged = [
+      `${SESSION_COOKIE}=v1.${payload}.${sig}xx`, // tampered signature
+      `${SESSION_COOKIE}=v1.${btoa(JSON.stringify({ p: id, e: Date.now() + 1e9 }))}.${sig}`, // payload swapped under an old sig
+      `${SESSION_COOKIE}=${v}.${payload}`, // truncated, 2 parts
+      `${SESSION_COOKIE}=not.a.token`,
+    ]
+    for (const c of forged) {
+      expect((await call('/partner/me', { headers: { Cookie: c } })).status, c.slice(0, 40)).toBe(401)
+    }
+
+    // A cookie signed with a DIFFERENT secret must not validate here.
+    const otherEnv = { ...env, PARTNER_SESSION_SECRET: 'a-different-secret' } as Env
+    const foreign = await signSession('a-different-secret', id, Date.now() + 1e9)
+    const resp = await worker.fetch(
+      new Request('https://apiserver.mpprouter.dev/partner/me', {
+        headers: { Cookie: `${SESSION_COOKIE}=${foreign}` },
+      }),
+      env,
+      ctx,
+    )
     expect(resp.status).toBe(401)
+    void otherEnv
+  })
+
+  it('the genuine cookie still works (guards against the test above passing vacuously)', async () => {
+    await seed('e@x.com', '100')
+    const cookie = await login('e@x.com')
+    expect((await call('/partner/me', { headers: { Cookie: cookie } })).status).toBe(200)
   })
 
   it('one partner cannot see or void another partner’s coupon', async () => {
@@ -193,15 +227,27 @@ describe('session and tenancy', () => {
     const codes = (list.coupons ?? list).map((c: any) => c.code)
     expect(codes).not.toContain(issued.code)
 
+    const myBefore: any = await (await call('/partner/me', { headers: { Cookie: myCookie } })).json()
     const stolen = await postJson(
       `/partner/coupon/${issued.code}/void`,
       { confirm: issued.code.slice(-4) },
       { Cookie: myCookie },
     )
-    expect(stolen.status).toBeGreaterThanOrEqual(400)
-    // ...and the real owner's balance is untouched by the attempt.
+    // Exactly 404 — a coupon that is not yours must be indistinguishable from
+    // one that does not exist. `>= 400` would also accept a 500, which could
+    // mean the store got far enough to touch it.
+    expect(stolen.status).toBe(404)
+
+    // The victim keeps their debit...
     const yourMe: any = await (await call('/partner/me', { headers: { Cookie: yourCookie } })).json()
     expect(BigInt(yourMe.balanceAtomic)).toBe(98_950_000n) // 100 - 1.05
+    // ...and, the part the earlier assertion missed, the ATTACKER gained
+    // nothing. A bug refunding a cross-tenant void into the caller's balance
+    // would have passed the victim-side check alone.
+    const myAfter: any = await (await call('/partner/me', { headers: { Cookie: myCookie } })).json()
+    expect(myAfter.balanceAtomic).toBe(myBefore.balanceAtomic)
+    // And the coupon itself is untouched.
+    expect((await call('/partner/coupons', { headers: { Cookie: yourCookie } })).status).toBe(200)
   })
 })
 
@@ -243,6 +289,59 @@ describe('issue', () => {
     expect(b.code).toBe(a.code)
     const me: any = await (await call('/partner/me', { headers: { Cookie: cookie } })).json()
     expect(BigInt(me.balanceAtomic)).toBe(98_950_000n)
+  })
+})
+
+describe('expiry', () => {
+  it('defaults to 14 days', async () => {
+    await seed('e@x.com', '100')
+    const cookie = await login('e@x.com')
+    const b: any = await (
+      await postJson('/partner/coupon/issue', { credits: 1, clientKey: 'k' }, { Cookie: cookie })
+    ).json()
+    const days = (Date.parse(b.expiresAt) - Date.now()) / 86_400_000
+    expect(days).toBeGreaterThan(13.9)
+    expect(days).toBeLessThan(14.1)
+  })
+
+  it('honours a custom expiry — the field name mismatch made this silently impossible', async () => {
+    await seed('e@x.com', '100')
+    const cookie = await login('e@x.com')
+    for (const field of ['expiresInMinutes', 'expiresMinutes']) {
+      const b: any = await (
+        await postJson(
+          '/partner/coupon/issue',
+          { credits: 1, clientKey: `k-${field}`, [field]: 60 },
+          { Cookie: cookie },
+        )
+      ).json()
+      const hours = (Date.parse(b.expiresAt) - Date.now()) / 3_600_000
+      expect(hours, field).toBeLessThan(1.1)
+    }
+  })
+})
+
+describe('whole cents', () => {
+  it('refuses a face value with a sub-cent tail', async () => {
+    // 1.005 credits x 1.05 = $1.05525 — no payment UI can produce that, so the
+    // coupon would be paid for and unspendable.
+    await seed('e@x.com', '100')
+    const cookie = await login('e@x.com')
+    const a = await postJson(
+      '/partner/coupon/issue',
+      { credits: 1.005, clientKey: 'k1' },
+      { Cookie: cookie },
+    )
+    expect(a.status).toBe(400)
+    const b = await postJson(
+      '/partner/coupon/issue',
+      { amountUsd: '10.505', clientKey: 'k2' },
+      { Cookie: cookie },
+    )
+    expect(b.status).toBe(400)
+    // Nothing was charged.
+    const me: any = await (await call('/partner/me', { headers: { Cookie: cookie } })).json()
+    expect(BigInt(me.balanceAtomic)).toBe(100_000_000n)
   })
 })
 

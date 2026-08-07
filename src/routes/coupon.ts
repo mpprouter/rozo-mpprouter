@@ -567,7 +567,7 @@ export async function handleIssueCoupon(request: Request, env: Env): Promise<Res
 
   const expiresInMinutes =
     typeof body?.expiresInMinutes === 'number' && body.expiresInMinutes > 0
-      ? Math.min(body.expiresInMinutes, 60 * 24 * 7) // hard cap: 7 days
+      ? Math.min(body.expiresInMinutes, 60 * 24 * 14) // hard cap: 14 days (2026-08-07)
       : DEFAULT_EXPIRES_MINUTES
   const paymentProof = typeof body?.paymentProof === 'string' ? body.paymentProof : null
 

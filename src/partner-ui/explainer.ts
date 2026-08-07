@@ -74,7 +74,7 @@ function body(contact: string): string {
   <section class="card">
     <h2>有效期和作废规则</h2>
     <ul style="margin:0;padding-left:20px;" class="muted">
-      <li>卡密默认 <strong>12 小时</strong>有效，最长可设到 <strong>7 天</strong>。</li>
+      <li>卡密默认 <strong>14 天</strong>有效，也可以设得更短。</li>
       <li>还没被用掉的卡密，你可以随时<strong>作废</strong>；过期的卡密可以<strong>回收</strong>。两种情况钱都会回到你的余额。</li>
       <li><strong>已经被使用的卡密不可撤销</strong> —— 钱已经付给 OpenRouter 了，没有回头路。</li>
     </ul>
