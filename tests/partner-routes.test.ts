@@ -535,3 +535,30 @@ describe('dashboard copy and controls', () => {
     expect(html.indexOf('cust-copy')).toBeLessThan(html.indexOf('login-form'))
   })
 })
+
+// ── coupon.rozo.ai root ──────────────────────────────────────────────────────
+
+describe('coupon.rozo.ai root', () => {
+  const at = (host: string, path: string) =>
+    worker.fetch(new Request(`https://${host}${path}`), env, ctx)
+
+  it('redirects the bare domain to the partner backend', async () => {
+    const resp = await at('coupon.rozo.ai', '/')
+    expect(resp.status).toBe(302)
+    expect(new URL(resp.headers.get('Location')!).pathname).toBe('/partner')
+  })
+
+  it('leaves apiserver.mpprouter.dev alone', async () => {
+    // The API hostname must keep serving its own index; redirecting it would
+    // point integrators at a page that means nothing to them.
+    const resp = await at('apiserver.mpprouter.dev', '/')
+    expect(resp.status).not.toBe(302)
+  })
+
+  it('does not touch anything below the root on coupon.rozo.ai', async () => {
+    // A blanket redirect here would swallow /partner/auth/login, which the
+    // login form posts to from this very origin.
+    expect((await at('coupon.rozo.ai', '/partner')).status).toBe(200)
+    expect((await at('coupon.rozo.ai', '/health')).status).toBe(200)
+  })
+})
