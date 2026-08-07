@@ -173,6 +173,27 @@ export interface PartnerRecord {
    * wrong code for an interleaved issue A / issue B / retry A.
    */
   applied: Array<{ k: string; e: string; c?: string }>
+  /**
+   * Password credential. OPTIONAL: partners created before auth existed (and
+   * partners created by the admin login-link path, which mints an account
+   * before a password is ever set) must keep deserialising. Absent `auth`
+   * means "no password login for this account yet" — never "any password
+   * works".
+   *
+   * Stores a PBKDF2-HMAC-SHA-256 derivation only. The plaintext is generated
+   * by us, handed to the partner out of band, and never written anywhere.
+   */
+  auth?: PartnerAuth
+}
+
+export interface PartnerAuth {
+  algo: 'PBKDF2-SHA256'
+  /** Hex, 16 random bytes, per account. Defeats cross-account rainbow reuse. */
+  salt: string
+  /** Hex, 32-byte derived key. */
+  hash: string
+  iterations: number
+  setAt: string
 }
 
 /** A tombstone occupies a coupon key so the code can never be created later.
@@ -1138,4 +1159,291 @@ export async function listPartnerCoupons(
     })
   }
   return out
+}
+
+// ── Auth: password credentials, lockout, one-shot login tokens ───────────────
+//
+// These live here rather than in the route module for the same reason the money
+// primitives do: they are the only things allowed to touch durable partner
+// state. Routes call them; routes never CAS.
+//
+// Scope note (founder 2026-08-07): there is no signup, no self-serve password
+// change, and no reset flow. We generate the credential, hand it over out of
+// band, and the fallback for a lost password is an admin-minted login link.
+// That deliberate absence is why this section stays small.
+
+/** PBKDF2 work factor. 100k SHA-256 iterations is the specified floor; raising
+ * it later is safe because `iterations` is stored per record and verification
+ * replays whatever that record says. */
+const PBKDF2_ITERATIONS = 100_000
+const PBKDF2_KEY_BYTES = 32
+const PBKDF2_SALT_BYTES = 16
+
+/** Failed logins allowed per account per window before the account locks. */
+export const AUTH_FAIL_LIMIT = 10
+export const AUTH_FAIL_WINDOW_MS = 60 * 60_000
+export const AUTH_LOCK_MS = 60 * 60_000
+
+/** 15 minutes, single use (§3.10). Long enough to paste into a chat app, short
+ * enough that a leaked link in a message history is worthless. */
+export const LOGIN_TOKEN_TTL_MS = 15 * 60_000
+
+export const authFailKey = (partnerId: string) => `pauthfail:${partnerId}`
+export const loginTokenKey = (tokenHash: string) => `plogin:${tokenHash}`
+
+function toHex(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf)
+  let out = ''
+  for (let i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0')
+  return out
+}
+
+function fromHex(hex: string): Uint8Array {
+  const clean = hex.length % 2 === 0 ? hex : `0${hex}`
+  const out = new Uint8Array(clean.length / 2)
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16)
+  return out
+}
+
+/**
+ * Compare two hex digests without leaking a matching prefix through timing.
+ * `crypto.subtle.timingSafeEqual` exists on the Workers runtime but not
+ * everywhere these tests run, so fall back to a full-width loop that always
+ * touches every byte (no early return).
+ */
+export function constantTimeEqualHex(a: string, b: string): boolean {
+  const ab = fromHex(a)
+  const bb = fromHex(b)
+  if (ab.length !== bb.length) return false
+  const subtle = crypto.subtle as unknown as {
+    timingSafeEqual?: (x: ArrayBufferView, y: ArrayBufferView) => boolean
+  }
+  if (typeof subtle.timingSafeEqual === 'function') return subtle.timingSafeEqual(ab, bb)
+  let diff = 0
+  for (let i = 0; i < ab.length; i++) diff |= ab[i] ^ bb[i]
+  return diff === 0
+}
+
+async function pbkdf2(password: string, saltHex: string, iterations: number): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(password),
+    'PBKDF2',
+    false,
+    ['deriveBits'],
+  )
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: fromHex(saltHex), iterations, hash: 'SHA-256' },
+    key,
+    PBKDF2_KEY_BYTES * 8,
+  )
+  return toHex(bits)
+}
+
+/**
+ * Mint a password for a partner. Unambiguous alphabet (no 0/O/1/l/I) because a
+ * human copies this out of a chat message. 20 chars over a 32-symbol alphabet
+ * is 100 bits — far past anything the lockout would ever have to defend.
+ */
+export function generatePartnerPassword(length = 20): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
+  const buf = new Uint8Array(length)
+  crypto.getRandomValues(buf)
+  let out = ''
+  // 256 % 32 === 0, so a plain modulus here is unbiased.
+  for (let i = 0; i < length; i++) out += alphabet[buf[i] % alphabet.length]
+  return out
+}
+
+/** Derive and store a credential. The plaintext is never persisted or logged. */
+export async function setPartnerPassword(
+  env: Env,
+  partnerId: string,
+  password: string,
+): Promise<void> {
+  const saltBytes = new Uint8Array(PBKDF2_SALT_BYTES)
+  crypto.getRandomValues(saltBytes)
+  const salt = toHex(saltBytes.buffer)
+  const hash = await pbkdf2(password, salt, PBKDF2_ITERATIONS)
+  const auth: PartnerAuth = {
+    algo: 'PBKDF2-SHA256',
+    salt,
+    hash,
+    iterations: PBKDF2_ITERATIONS,
+    setAt: new Date().toISOString(),
+  }
+  await casUpdate<void>(env, partnerKey(partnerId), (raw) => {
+    const p = parsePartner(raw)
+    if (!p) throw new PartnerError('PARTNER_NOT_FOUND', `no partner ${partnerId}`)
+    p.auth = auth
+    return { op: 'set', value: JSON.stringify(p), result: undefined }
+  })
+}
+
+/**
+ * Verify a password against a stored credential.
+ *
+ * Takes the credential rather than a partner id so the caller can run the SAME
+ * derivation for an unknown account (by passing `decoyAuth()`), which is what
+ * keeps "no such user" and "wrong password" indistinguishable.
+ */
+export async function verifyPassword(
+  auth: PartnerAuth | undefined,
+  password: string,
+): Promise<boolean> {
+  if (!auth) return false
+  const derived = await pbkdf2(password, auth.salt, auth.iterations)
+  return constantTimeEqualHex(derived, auth.hash)
+}
+
+/** A throwaway credential so an unknown username burns the same work. Its empty
+ * hash can never match a 32-byte derivation. */
+export function decoyAuth(): PartnerAuth {
+  return {
+    algo: 'PBKDF2-SHA256',
+    salt: '00000000000000000000000000000000',
+    hash: '',
+    iterations: PBKDF2_ITERATIONS,
+    setAt: new Date(0).toISOString(),
+  }
+}
+
+interface AuthFailState {
+  /** Failure timestamps inside the current window. */
+  ts: number[]
+  lockedUntil?: number
+}
+
+/** Read-only lock check. */
+export async function isAuthLocked(env: Env, partnerId: string): Promise<boolean> {
+  const raw = await casRead(env, authFailKey(partnerId))
+  if (!raw) return false
+  try {
+    const s = JSON.parse(raw) as AuthFailState
+    return !!s.lockedUntil && s.lockedUntil > Date.now()
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Record one failed login. Rolling window in a single CAS — two isolates cannot
+ * each read "9" and both believe they are the tenth-and-only. Returns whether
+ * the account is now locked.
+ */
+export async function recordAuthFailure(env: Env, partnerId: string): Promise<boolean> {
+  const now = Date.now()
+  return casUpdate<boolean>(env, authFailKey(partnerId), (raw) => {
+    let s: AuthFailState = { ts: [] }
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw) as AuthFailState
+        if (parsed && Array.isArray(parsed.ts)) s = parsed
+      } catch {
+        /* a corrupt counter must not become a free pass; treat as empty */
+      }
+    }
+    if (s.lockedUntil && s.lockedUntil > now) return { op: 'noop', result: true }
+    const ts = s.ts.filter((t) => t > now - AUTH_FAIL_WINDOW_MS)
+    ts.push(now)
+    const locked = ts.length >= AUTH_FAIL_LIMIT
+    const next: AuthFailState = locked
+      ? { ts: [], lockedUntil: now + AUTH_LOCK_MS }
+      : { ts: ts.slice(-AUTH_FAIL_LIMIT) }
+    return { op: 'set', value: JSON.stringify(next), result: locked }
+  })
+}
+
+/** Clear the counter after a successful login. */
+export async function clearAuthFailures(env: Env, partnerId: string): Promise<void> {
+  await casUpdate<void>(env, authFailKey(partnerId), () => ({
+    op: 'set',
+    value: JSON.stringify({ ts: [] } satisfies AuthFailState),
+    result: undefined,
+  }))
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  return toHex(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input)))
+}
+
+/**
+ * Mint a one-shot login token. Only its SHA-256 is stored, so a dump of the DO
+ * cannot be replayed as a login. The token is 32 random bytes, so the digest
+ * needs neither salt nor work factor.
+ */
+export async function createLoginToken(env: Env, partnerId: string): Promise<string> {
+  const raw = new Uint8Array(32)
+  crypto.getRandomValues(raw)
+  const token = toHex(raw.buffer)
+  const digest = await sha256Hex(token)
+  await casUpdate<void>(env, loginTokenKey(digest), () => ({
+    op: 'set',
+    value: JSON.stringify({ partnerId, exp: Date.now() + LOGIN_TOKEN_TTL_MS, used: false }),
+    result: undefined,
+  }))
+  return token
+}
+
+/**
+ * Consume a login token. Single use is enforced by the CAS itself, so two
+ * concurrent clicks on the same link cannot both authenticate.
+ */
+export async function consumeLoginToken(env: Env, token: string): Promise<string | null> {
+  if (!/^[0-9a-f]{64}$/.test(token)) return null
+  const digest = await sha256Hex(token)
+  return casUpdate<string | null>(env, loginTokenKey(digest), (raw) => {
+    if (!raw) return { op: 'noop', result: null }
+    let rec: { partnerId: string; exp: number; used: boolean }
+    try {
+      rec = JSON.parse(raw)
+    } catch {
+      return { op: 'noop', result: null }
+    }
+    if (rec.used || rec.exp < Date.now()) return { op: 'noop', result: null }
+    return { op: 'set', value: JSON.stringify({ ...rec, used: true }), result: rec.partnerId }
+  })
+}
+
+// ── Coupon lookup + audit (tenant-scoped, no money) ──────────────────────────
+
+/**
+ * Read one of a partner's OWN coupons. Returns null both for "does not exist"
+ * and "belongs to someone else", so it cannot be used to probe whether a code
+ * exists under another account.
+ */
+export async function readPartnerCoupon(
+  env: Env,
+  partnerId: string,
+  code: string,
+): Promise<CouponRecord | null> {
+  const rec = parseRecord(await casRead(env, couponKey(code)))
+  if (!rec || isTombstone(rec)) return null
+  if (rec.partnerId !== partnerId) return null
+  return rec
+}
+
+/**
+ * Append an audit entry to a coupon's event chain without touching its status.
+ *
+ * Needed because a REFUSED void must still be recorded, and the refusal happens
+ * before `voidPartnerCoupon` writes anything. Tenant-scoped and status-neutral:
+ * it can only ever add to `events`.
+ */
+export async function appendCouponAuditEvent(
+  env: Env,
+  partnerId: string,
+  code: string,
+  kind: string,
+  detail: Record<string, unknown>,
+): Promise<void> {
+  await casUpdate<void>(env, couponKey(code), (raw) => {
+    const rec = parseRecord(raw)
+    if (!rec || isTombstone(rec) || rec.partnerId !== partnerId) {
+      return { op: 'noop', result: undefined }
+    }
+    rec.events = Array.isArray(rec.events) ? rec.events : []
+    rec.events.push({ kind, at: new Date().toISOString(), detail })
+    return { op: 'set', value: JSON.stringify(rec), result: undefined }
+  })
 }
