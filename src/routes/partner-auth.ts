@@ -61,7 +61,7 @@ import {
   recordAuthFailure,
   setPartnerPassword,
   verifyPassword,
-} from './partner-store'
+  isValidPartnerIdentifier,} from './partner-store'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -351,7 +351,7 @@ export async function handleAdminPartnerLoginLink(request: Request, env: Env): P
   // Deliberately loose: an operator types this by hand and a strict RFC pattern
   // would reject valid addresses. The address is an account label, not a
   // delivery target — we never send mail.
-  if (!email || !email.includes('@') || /\s/.test(email)) {
+  if (!email || !isValidPartnerIdentifier(email)) {
     return json(400, { error: 'email is required' })
   }
 
