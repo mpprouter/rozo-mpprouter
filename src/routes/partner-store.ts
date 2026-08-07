@@ -83,7 +83,13 @@ import { formatUsdc } from './create-invoice'
  */
 const PENDING_STALE_MS = 60_000
 
-/** Bounded so the partner record cannot grow without limit. */
+/**
+ * Cap on UNSETTLED recovery breadcrumbs. Reaching it REJECTS new operations
+ * rather than evicting old ones: a pendingIssue/pendingRefund is the only
+ * pointer back to money that is mid-flight, so dropping the oldest to make room
+ * strands that money permanently. Refusing to start op 51 is recoverable;
+ * forgetting op 1 is not.
+ */
 const MAX_PENDING_OPS = 50
 const MAX_COUPON_INDEX = 200
 const MAX_LEDGER_INDEX = 500
@@ -106,7 +112,8 @@ export interface LedgerEntry {
   kind: LedgerKind
   /** Signed, atomic USD (6dp). Positive credits, negative debits. */
   deltaAtomic: string
-  balanceAfterAtomic: string
+  /** Null only in the window between the body write and the balance commit. */
+  balanceAfterAtomic: string | null
   /** Coupon code / payment proof / operator note. */
   ref: string | null
   /** Funding source address, recorded on topups only. Kept for a future payout
@@ -159,8 +166,13 @@ export interface PartnerRecord {
   couponIndex: CouponIndexEntry[]
   /** Newest-first ledger entry ids, bounded. Full entries live at their own keys. */
   ledgerIndex: string[]
-  /** Idempotency keys already applied, newest-first, bounded. */
-  appliedKeys: string[]
+  /**
+   * Idempotency keys already applied, newest-first, bounded. Each remembers the
+   * ledger entry it produced and, for issues, the coupon code — so a replay
+   * returns THAT coupon rather than "the newest one", which would hand back the
+   * wrong code for an interleaved issue A / issue B / retry A.
+   */
+  applied: Array<{ k: string; e: string; c?: string }>
 }
 
 /** A tombstone occupies a coupon key so the code can never be created later.
@@ -206,7 +218,7 @@ function parsePartner(raw: string | null): PartnerRecord | null {
     p.pendingRefunds ??= []
     p.couponIndex ??= []
     p.ledgerIndex ??= []
-    p.appliedKeys ??= []
+    p.applied ??= []
     return p
   } catch {
     return null
@@ -231,7 +243,9 @@ export class PartnerError extends Error {
       | 'COUPON_NOT_FOUND'
       | 'COUPON_NOT_REFUNDABLE'
       | 'NOT_YOUR_COUPON'
-      | 'CODE_ALLOCATION_FAILED',
+      | 'CODE_ALLOCATION_FAILED'
+      | 'TOO_MANY_PENDING'
+      | 'ISSUE_IN_FLIGHT',
     message: string,
     public detail?: unknown,
   ) {
@@ -251,6 +265,8 @@ interface LedgerMutation {
   entryId: string
   /** Idempotency key (I4). Replaying the same key is a no-op. */
   idempotencyKey: string
+  /** Recorded alongside the key so a replay can return the same coupon. */
+  couponCode?: string
 }
 
 /**
@@ -267,13 +283,44 @@ async function applyLedger(
 ): Promise<{ partner: PartnerRecord; applied: boolean; entry: LedgerEntry | null }> {
   let entry: LedgerEntry | null = null
 
+  // Write the ledger BODY first, then commit the balance + index.
+  //
+  // Ordering matters and the reverse is what looks natural: index first, body
+  // after. That version can crash in between and leave an indexed entry whose
+  // body never exists, and the retry takes the idempotent no-op path, so the
+  // body is never written — `readLedger` then permanently omits a real balance
+  // mutation and sum(ledger) stops matching the balance.
+  //
+  // Body-first cannot do that. Its failure mode is an orphan body that no index
+  // references, which nothing reads and nothing sums. `balanceAfterAtomic` is
+  // backfilled after the CAS (it is not knowable before) and is a reporting
+  // convenience only — `deltaAtomic` is the number the invariant is built on.
+  const draft: LedgerEntry = {
+    id: m.entryId,
+    partnerId,
+    at: new Date().toISOString(),
+    kind: m.kind,
+    deltaAtomic: m.deltaAtomic.toString(),
+    balanceAfterAtomic: null,
+    ref: m.ref,
+    sourceAddress: m.sourceAddress ?? null,
+    operator: m.operator ?? null,
+  }
+  await casUpdate<boolean>(env, ledgerKey(partnerId, m.entryId), (cur) =>
+    cur !== null
+      ? { op: 'noop', result: false }
+      : { op: 'set', value: JSON.stringify(draft), result: true },
+  )
+
   const partner = await casUpdate<PartnerRecord>(env, partnerKey(partnerId), (raw) => {
     const p = parsePartner(raw)
     if (!p) throw new PartnerError('PARTNER_NOT_FOUND', `no partner ${partnerId}`)
 
-    if (p.appliedKeys.includes(m.idempotencyKey)) {
+    if (p.applied.some((a) => a.k === m.idempotencyKey)) {
       // Already applied — return the record untouched. This is what makes a
-      // retried POST safe (I4).
+      // retried POST safe (I4). Callers MUST check the returned `applied` flag
+      // before doing any follow-on work: acting anyway is how a retry mints a
+      // coupon that nobody paid for.
       entry = null
       return { op: 'noop', result: p }
     }
@@ -289,29 +336,24 @@ async function applyLedger(
     }
 
     p.balanceAtomic = after.toString()
-    entry = {
-      id: m.entryId,
-      partnerId,
-      at: new Date().toISOString(),
-      kind: m.kind,
-      deltaAtomic: m.deltaAtomic.toString(),
-      balanceAfterAtomic: after.toString(),
-      ref: m.ref,
-      sourceAddress: m.sourceAddress ?? null,
-      operator: m.operator ?? null,
-    }
+    entry = { ...draft, balanceAfterAtomic: after.toString() }
     p.ledgerIndex = pushBounded(p.ledgerIndex, m.entryId, MAX_LEDGER_INDEX)
-    p.appliedKeys = pushBounded(p.appliedKeys, m.idempotencyKey, MAX_IDEM_KEYS)
+    p.applied = pushBounded(
+      p.applied,
+      { k: m.idempotencyKey, e: m.entryId, ...(m.couponCode ? { c: m.couponCode } : {}) },
+      MAX_IDEM_KEYS,
+    )
     mutate?.(p)
     return { op: 'set', value: JSON.stringify(p), result: p }
   })
 
   if (entry) {
-    await casUpdate<boolean>(env, ledgerKey(partnerId, m.entryId), (cur) =>
-      cur !== null
-        ? { op: 'noop', result: false }
-        : { op: 'set', value: JSON.stringify(entry), result: true },
-    )
+    const settled = entry
+    await casUpdate<void>(env, ledgerKey(partnerId, m.entryId), () => ({
+      op: 'set',
+      value: JSON.stringify(settled),
+      result: undefined,
+    }))
   }
   return { partner, applied: entry !== null, entry }
 }
@@ -350,7 +392,7 @@ export async function getOrCreatePartnerByEmail(
       pendingRefunds: [],
       couponIndex: [],
       ledgerIndex: [],
-      appliedKeys: [],
+      applied: [],
     }
     return { op: 'set', value: JSON.stringify(fresh), result: fresh }
   })
@@ -411,6 +453,19 @@ export async function topupPartner(
 ): Promise<{ partner: PartnerRecord; applied: boolean }> {
   if (args.amountAtomic <= 0n) throw new PartnerError('INSUFFICIENT_BALANCE', 'amount must be > 0')
   const partner = await getOrCreatePartnerByEmail(env, args.email)
+
+  // Second line of defence for the long tail. `applied` is bounded, so after
+  // enough later mutations the original `topup:<proof>` key falls off the end
+  // and a replay of that proof would credit again. Top-ups are rare and manual,
+  // so scanning the ledger for the same proof is cheap and closes the window
+  // that eviction opens. (The in-record key still handles the concurrent case,
+  // which this scan cannot.)
+  for (const e of await readLedger(env, partner.id, MAX_LEDGER_INDEX)) {
+    if (e.kind === 'topup' && e.ref === args.proof) {
+      return { partner: (await getPartner(env, partner.id))!, applied: false }
+    }
+  }
+
   const res = await applyLedger(env, partner.id, {
     kind: 'topup',
     deltaAtomic: args.amountAtomic,
@@ -464,35 +519,50 @@ export async function issuePartnerCoupon(env: Env, args: IssueArgs): Promise<Iss
     const ledgerEntryId = newLedgerId()
 
     // ── Step 1: debit + record intent, atomically on the partner key.
-    const partner = (
-      await applyLedger(
-        env,
-        args.partnerId,
-        {
-          kind: 'issue_hold',
-          deltaAtomic: -args.amountAtomic,
-          ref: code,
-          entryId: ledgerEntryId,
-          idempotencyKey: `issue:${args.clientKey}`,
-        },
-        (p) => {
-          if (p.status === 'suspended') {
-            throw new PartnerError('PARTNER_SUSPENDED', 'partner is suspended')
-          }
-          p.pendingIssues = pushBounded(
-            p.pendingIssues,
-            {
-              opId,
-              clientKey: args.clientKey,
-              code,
-              amountAtomic: args.amountAtomic.toString(),
-              at: Date.now(),
-            },
-            MAX_PENDING_OPS,
+    const debit = await applyLedger(
+      env,
+      args.partnerId,
+      {
+        kind: 'issue_hold',
+        deltaAtomic: -args.amountAtomic,
+        ref: code,
+        entryId: ledgerEntryId,
+        idempotencyKey: `issue:${args.clientKey}`,
+        couponCode: code,
+      },
+      (p) => {
+        if (p.status === 'suspended') {
+          throw new PartnerError('PARTNER_SUSPENDED', 'partner is suspended')
+        }
+        if (p.pendingIssues.length >= MAX_PENDING_OPS) {
+          throw new PartnerError(
+            'TOO_MANY_PENDING',
+            'too many unsettled operations; retry shortly',
           )
-        },
+        }
+        p.pendingIssues.unshift({
+          opId,
+          clientKey: args.clientKey,
+          code,
+          amountAtomic: args.amountAtomic.toString(),
+          at: Date.now(),
+        })
+      },
+    )
+
+    // The debit did NOT happen — this clientKey was already consumed, almost
+    // certainly by a concurrent request that beat us past the pre-flight check.
+    // Continuing here would create a coupon backed by no debit, i.e. hand out
+    // free credit. Return the winner's coupon instead.
+    if (!debit.applied) {
+      const settled = await findIssuedByClientKey(env, args.partnerId, args.clientKey)
+      if (settled) return settled
+      throw new PartnerError(
+        'ISSUE_IN_FLIGHT',
+        'an identical request is still in flight; retry shortly',
       )
-    ).partner
+    }
+    const partner = debit.partner
 
     const now = Date.now()
     const issuedAt = new Date(now).toISOString()
@@ -558,9 +628,12 @@ async function findIssuedByClientKey(
   clientKey: string,
 ): Promise<IssueResult | null> {
   const p = await getPartner(env, partnerId)
-  if (!p || !p.appliedKeys.includes(`issue:${clientKey}`)) return null
-  const still = p.pendingIssues.find((o) => o.clientKey === clientKey)
-  const code = still?.code ?? p.couponIndex[0]?.code
+  if (!p) return null
+  // Look the code up by the key that produced it. Falling back to "the newest
+  // coupon" would answer issue A / issue B / retry A with B's code.
+  const rec0 = p.applied.find((a) => a.k === `issue:${clientKey}`)
+  if (!rec0) return null
+  const code = rec0.c ?? p.pendingIssues.find((o) => o.clientKey === clientKey)?.code
   if (!code) return null
   const rec = parseRecord(await casRead(env, couponKey(code)))
   if (!rec || isTombstone(rec) || rec.partnerId !== partnerId) return null
@@ -757,17 +830,16 @@ export async function voidPartnerCoupon(
     const p = parsePartner(raw)
     if (!p) throw new PartnerError('PARTNER_NOT_FOUND', 'no such partner')
     if (p.pendingRefunds.some((r) => r.code === args.code)) return { op: 'noop', result: undefined }
-    p.pendingRefunds = pushBounded(
-      p.pendingRefunds,
-      {
-        refundOpId,
-        code: args.code,
-        amountAtomic: current.amountAtomic,
-        kind,
-        at: Date.now(),
-      },
-      MAX_PENDING_OPS,
-    )
+    if (p.pendingRefunds.length >= MAX_PENDING_OPS) {
+      throw new PartnerError('TOO_MANY_PENDING', 'too many unsettled refunds; retry shortly')
+    }
+    p.pendingRefunds.unshift({
+      refundOpId,
+      code: args.code,
+      amountAtomic: current.amountAtomic,
+      kind,
+      at: Date.now(),
+    })
     return { op: 'set', value: JSON.stringify(p), result: undefined }
   })
 

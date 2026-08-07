@@ -176,7 +176,11 @@ describe('issue', () => {
 
   it('refuses when the balance cannot cover it, and creates NO coupon', async () => {
     const id = await seedPartner('p@x.com', '10')
-    const before = ns.get('coupon').store.size
+    // Count coupon keys specifically. applyLedger writes the ledger body before
+    // committing the balance, so a rejected issue can leave an orphan `pledger:`
+    // draft — unindexed, unread, unsummed. What must NOT appear is a coupon.
+    const coupons = () => [...ns.get('coupon').store.keys()].filter((k) => k.startsWith('coupon:'))
+    const before = coupons().length
     await expect(
       issuePartnerCoupon(env, {
         partnerId: id,
@@ -185,7 +189,7 @@ describe('issue', () => {
         clientKey: 'ck-1',
       }),
     ).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' })
-    expect(ns.get('coupon').store.size).toBe(before)
+    expect(coupons().length).toBe(before)
     expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('10').toString())
   })
 
@@ -226,6 +230,104 @@ describe('issue', () => {
     const p = await getPartner(env, id)
     expect(BigInt(p!.balanceAtomic)).toBe(0n)
     expect(await ledgerSum(id)).toBe(0n)
+  })
+})
+
+describe('codex review regressions', () => {
+  it('concurrent same-clientKey issues mint exactly ONE coupon, and it is paid for', async () => {
+    // The loss-bearing bug: both callers pass the pre-flight "key unused" check,
+    // one debits, the other no-ops on the idempotency key — and the old code
+    // then went on to create a second coupon anyway. Free credit.
+    const id = await seedPartner('p@x.com', '100')
+    const settled = await Promise.allSettled(
+      Array.from({ length: 4 }, () =>
+        issuePartnerCoupon(env, {
+          partnerId: id,
+          amountAtomic: USD('10'),
+          expiresInMinutes: 720,
+          clientKey: 'same-key',
+        }),
+      ),
+    )
+    const codes = new Set(
+      settled.flatMap((r) => (r.status === 'fulfilled' ? [r.value.code] : [])),
+    )
+    expect(codes.size).toBeLessThanOrEqual(1)
+
+    const live = [...ns.get('coupon').store.keys()]
+      .filter((k) => k.startsWith('coupon:'))
+      .map((k) => parseRecord(ns.get('coupon').store.get(k)!.value))
+      .filter((r) => r && r.partnerId === id)
+    // Exactly one coupon, and the balance shows exactly one debit.
+    expect(live).toHaveLength(1)
+    expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('90').toString())
+    expect(await ledgerSum(id)).toBe(USD('90'))
+  })
+
+  it('a replayed clientKey returns ITS coupon, not merely the newest one', async () => {
+    const id = await seedPartner('p@x.com', '100')
+    const a = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'A',
+    })
+    const b = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'B',
+    })
+    expect(b.code).not.toBe(a.code)
+    const replayA = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'A',
+    })
+    expect(replayA.code).toBe(a.code)
+    expect(await ledgerSum(id)).toBe(USD('80'))
+  })
+
+  it('refuses a new issue rather than evicting an unsettled recovery breadcrumb', async () => {
+    // Dropping the oldest pendingIssue to make room would strand that money:
+    // reconcile could no longer find it. Refusing op 51 is recoverable.
+    const id = await seedPartner('p@x.com', '1000')
+    await casUpdate<void>(env, partnerKey(id), (raw) => {
+      const p = JSON.parse(raw!)
+      p.pendingIssues = Array.from({ length: 50 }, (_, i) => ({
+        opId: `op_${i}`, clientKey: `k${i}`, code: `${1000000000 + i}`,
+        amountAtomic: USD('1').toString(), at: Date.now(),
+      }))
+      return { op: 'set', value: JSON.stringify(p), result: undefined }
+    })
+    await expect(
+      issuePartnerCoupon(env, {
+        partnerId: id, amountAtomic: USD('1'), expiresInMinutes: 720, clientKey: 'overflow',
+      }),
+    ).rejects.toMatchObject({ code: 'TOO_MANY_PENDING' })
+    expect((await getPartner(env, id))!.pendingIssues).toHaveLength(50)
+  })
+
+  it('every indexed ledger entry has a readable body (body-first write order)', async () => {
+    const id = await seedPartner('p@x.com', '100')
+    const r = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'x',
+    })
+    await voidPartnerCoupon(env, { partnerId: id, code: r.code })
+    const p = await getPartner(env, id)
+    for (const eid of p!.ledgerIndex) {
+      expect(await casRead(env, ledgerKey(id, eid))).not.toBeNull()
+    }
+    expect((await readLedger(env, id)).length).toBe(p!.ledgerIndex.length)
+  })
+
+  it('an evicted topup key still cannot double-credit (ledger scan backstop)', async () => {
+    const { partner } = await topupPartner(env, {
+      email: 'p@x.com', amountAtomic: USD('100'), proof: 'order-1',
+    })
+    // Simulate the key having aged out of the bounded `applied` list.
+    await casUpdate<void>(env, partnerKey(partner.id), (raw) => {
+      const p = JSON.parse(raw!)
+      p.applied = p.applied.filter((a: any) => a.k !== 'topup:order-1')
+      return { op: 'set', value: JSON.stringify(p), result: undefined }
+    })
+    const again = await topupPartner(env, {
+      email: 'p@x.com', amountAtomic: USD('100'), proof: 'order-1',
+    })
+    expect(again.applied).toBe(false)
+    expect(again.partner.balanceAtomic).toBe(USD('100').toString())
   })
 })
 
