@@ -308,6 +308,75 @@ describe('codex review regressions', () => {
     expect(await ledgerSum(id)).toBe(USD('80'))
   })
 
+  it('refuses a negative amount instead of minting balance', async () => {
+    // -amountAtomic flips the debit into a credit: an unguarded negative issue
+    // credits the partner and the money can then buy a real coupon for free.
+    const id = await seedPartner('p@x.com', '100')
+    for (const bad of [-10n * 1000000n, 0n]) {
+      await expect(
+        issuePartnerCoupon(env, {
+          partnerId: id, amountAtomic: bad, expiresInMinutes: 720, clientKey: `neg${bad}`,
+        }),
+      ).rejects.toMatchObject({ code: 'INVALID_AMOUNT' })
+    }
+    expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('100').toString())
+  })
+
+  it('a code collision still retries and ends up issuing a coupon', async () => {
+    // The retry loop is only reachable if the collision releases the caller
+    // key; leaving it consumed short-circuits every later attempt.
+    const id = await seedPartner('p@x.com', '100')
+    const real = generateCouponCode
+    let calls = 0
+    const taken = '9999999999'
+    // Park a foreign coupon on the first code the generator will hand out.
+    await casUpdate<boolean>(env, couponKey(taken), () => ({
+      op: 'set',
+      value: JSON.stringify({
+        code: taken, status: 'issued', amountAtomic: '1', amountUsd: '0.000001',
+        issuedAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 3.6e6).toISOString(),
+        events: [], partnerId: 'ptn_other', issueLedgerId: 'op_other',
+      }),
+      result: true,
+    }))
+    const spy = vi
+      .spyOn(await import('../src/routes/coupon'), 'generateCouponCode')
+      .mockImplementation(() => (++calls === 1 ? taken : real()))
+
+    const res = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'collide',
+    })
+    expect(calls).toBeGreaterThan(1) // it really did retry
+    expect(res.code).not.toBe(taken)
+    // Charged exactly once despite the extra loop.
+    expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('90').toString())
+    expect(await ledgerSum(id)).toBe(USD('90'))
+    spy.mockRestore()
+  })
+
+  it('a concurrent loser cannot poison the replay record with its own code', async () => {
+    // The loser reaches the settle step holding a code it never created. If it
+    // overwrites the durable record, every later replay looks up a code that
+    // does not exist and reports IN_FLIGHT for an issue that actually worked.
+    const id = await seedPartner('p@x.com', '100')
+    await Promise.allSettled(
+      Array.from({ length: 3 }, () =>
+        issuePartnerCoupon(env, {
+          partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'dup',
+        }),
+      ),
+    )
+    // A later replay must resolve to the coupon that really exists.
+    const replay = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'dup',
+    })
+    const rec = parseRecord(await casRead(env, couponKey(replay.code)))
+    expect(rec).not.toBeNull()
+    expect(rec!.partnerId).toBe(id)
+    expect(await ledgerSum(id)).toBe(USD('90'))
+  })
+
   it('refuses a new issue rather than evicting an unsettled recovery breadcrumb', async () => {
     // Dropping the oldest pendingIssue to make room would strand that money:
     // reconcile could no longer find it. Refusing op 51 is recoverable.

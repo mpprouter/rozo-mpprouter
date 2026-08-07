@@ -252,7 +252,8 @@ export class PartnerError extends Error {
       | 'NOT_YOUR_COUPON'
       | 'CODE_ALLOCATION_FAILED'
       | 'TOO_MANY_PENDING'
-      | 'ISSUE_IN_FLIGHT',
+      | 'ISSUE_IN_FLIGHT'
+      | 'INVALID_AMOUNT',
     message: string,
     public detail?: unknown,
   ) {
@@ -299,25 +300,26 @@ async function applyLedger(
   //                       take over: the balance change and the `applied` insert
   //                       are one CAS, so if it had committed within the stale
   //                       window `applied` would still show it.
-  const claim = await casUpdate<{ state: string; e?: string; c?: string; at: number }>(
+  const claim = await casUpdate<{ state: string; at: number; mine: boolean }>(
     env,
     idemKey(partnerId, m.idempotencyKey),
     (cur) => {
       const now = Date.now()
-      const prev = cur ? (JSON.parse(cur) as { state: string; e?: string; c?: string; at: number }) : null
-      if (prev?.state === 'done') return { op: 'noop', result: prev }
-      if (prev?.state === 'pending' && now - prev.at < PENDING_STALE_MS) {
-        return { op: 'noop', result: prev }
+      const prev = cur ? (JSON.parse(cur) as { state: string; at: number }) : null
+      // `done` -> already applied. `pending` and fresh -> a sibling owns it.
+      // Anything else (absent / released / stale pending) is ours to take.
+      if (prev?.state === 'done' || (prev?.state === 'pending' && now - prev.at < PENDING_STALE_MS)) {
+        return { op: 'noop', result: { ...prev, mine: false } }
       }
       const fresh = { state: 'pending', at: now }
-      return { op: 'set', value: JSON.stringify(fresh), result: fresh }
+      return { op: 'set', value: JSON.stringify(fresh), result: { ...fresh, mine: true } }
     },
   )
 
-  if (claim.state === 'done') {
-    return { partner: (await getPartner(env, partnerId))!, applied: false, entry: null }
-  }
-  if (claim.state === 'pending' && Date.now() - claim.at < PENDING_STALE_MS && claim.e !== undefined) {
+  // Whether WE won the claim is the thing that matters, not what state it is
+  // in: a losing caller reading its own `pending` back would otherwise march on
+  // and debit a second time.
+  if (!claim.mine) {
     return { partner: (await getPartner(env, partnerId))!, applied: false, entry: null }
   }
 
@@ -394,18 +396,26 @@ async function applyLedger(
     }))
   }
 
-  // Settle the claim either way. On the in-record no-op path the mutation was
-  // already applied by an earlier attempt, so the key is still `done` from then.
-  await casUpdate<void>(env, idemKey(partnerId, m.idempotencyKey), () => ({
-    op: 'set',
-    value: JSON.stringify({
-      state: 'done',
-      at: Date.now(),
-      e: m.entryId,
-      ...(m.couponCode ? { c: m.couponCode } : {}),
-    }),
-    result: undefined,
-  }))
+  // Settle the claim — but only the request that actually applied the mutation
+  // may write the result. A concurrent loser reaches here with entry === null
+  // and its OWN freshly generated code; letting it overwrite the record would
+  // point every later replay at a code that was never created, and the lookup
+  // would then report ISSUE_IN_FLIGHT forever for an issue that succeeded.
+  await casUpdate<void>(env, idemKey(partnerId, m.idempotencyKey), (cur) => {
+    const prev = cur ? (JSON.parse(cur) as { state: string }) : null
+    if (prev?.state === 'done') return { op: 'noop', result: undefined }
+    if (!entry) return { op: 'noop', result: undefined }
+    return {
+      op: 'set',
+      value: JSON.stringify({
+        state: 'done',
+        at: Date.now(),
+        e: m.entryId,
+        ...(m.couponCode ? { c: m.couponCode } : {}),
+      }),
+      result: undefined,
+    }
+  })
 
   return { partner, applied: entry !== null, entry }
 }
@@ -548,6 +558,13 @@ export interface IssueResult {
  * ordering) makes "coupon without debit" unreachable.
  */
 export async function issuePartnerCoupon(env: Env, args: IssueArgs): Promise<IssueResult> {
+  // A negative amount would flip `-amountAtomic` into a CREDIT, minting balance
+  // out of an issue call. The route layer will validate too, but a primitive on
+  // the money path must not depend on its caller for that.
+  if (args.amountAtomic <= 0n) {
+    throw new PartnerError('INVALID_AMOUNT', 'amount must be > 0')
+  }
+
   // Repair anything left over before touching money, so a stale pending op
   // cannot make a fresh issue look like a duplicate.
   await reconcilePending(env, args.partnerId)
@@ -660,7 +677,11 @@ export async function issuePartnerCoupon(env: Env, args: IssueArgs): Promise<Iss
     }
 
     // Collision. We definitely did not create that coupon, so refunding is safe.
+    // The idempotency key must be RELEASED too: leaving it consumed makes the
+    // next loop iteration no-op on the debit and short-circuit to a lookup of
+    // the foreign code, so the ten advertised retries would never happen.
     await refundPendingIssue(env, args.partnerId, opId, 'code_collision')
+    await releaseIdempotency(env, args.partnerId, `issue:${args.clientKey}`)
   }
 
   throw new PartnerError('CODE_ALLOCATION_FAILED', 'could not allocate a unique coupon code')
@@ -747,6 +768,31 @@ async function refundPendingIssue(
       if (i !== -1) rec.pendingIssues.splice(i, 1)
     },
   )
+}
+
+/**
+ * Undo an idempotency claim for an attempt that provably moved no money, so a
+ * fresh attempt under the same caller key may proceed. `released` is neither
+ * `done` nor `pending`, so the claim logic treats it as absent.
+ */
+async function releaseIdempotency(env: Env, partnerId: string, key: string): Promise<void> {
+  // Unconditional, including from `done`. A collision is only discovered AFTER
+  // the debit has committed and settled the claim, so refusing to clear `done`
+  // would leave the key consumed and the retry loop dead — which is exactly the
+  // bug this function exists to fix. Callers must have refunded first.
+  await casUpdate<void>(env, idemKey(partnerId, key), () => ({
+    op: 'set',
+    value: JSON.stringify({ state: 'released', at: Date.now() }),
+    result: undefined,
+  }))
+  await casUpdate<void>(env, partnerKey(partnerId), (raw) => {
+    const p = parsePartner(raw)
+    if (!p) return { op: 'noop', result: undefined }
+    const i = p.applied.findIndex((a) => a.k === key)
+    if (i === -1) return { op: 'noop', result: undefined }
+    p.applied.splice(i, 1)
+    return { op: 'set', value: JSON.stringify(p), result: undefined }
+  })
 }
 
 // ── Reconcile ────────────────────────────────────────────────────────────────
