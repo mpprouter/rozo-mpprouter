@@ -233,7 +233,33 @@ describe('issue', () => {
   })
 })
 
-describe('codex review regressions', () => {
+/**
+ * Simulate the Worker dying after the debit commits and before the coupon is
+ * created, by making the coupon-key commit throw.
+ */
+async function crashAfterDebit(partnerId: string, clientKey: string) {
+  const doInst = ns.get('coupon')
+  const real = doInst.fetch.bind(doInst)
+  const spy = vi.spyOn(doInst, 'fetch').mockImplementation(async (req: Request) => {
+    const url = new URL(req.url)
+    const body = await req.clone().json<any>()
+    if (url.pathname === '/commit' && String(body.key).startsWith('coupon:')) {
+      throw new Error('simulated worker death before coupon creation')
+    }
+    return real(req)
+  })
+  await expect(
+    issuePartnerCoupon(env, {
+      partnerId,
+      amountAtomic: USD('10'),
+      expiresInMinutes: 720,
+      clientKey,
+    }),
+  ).rejects.toThrow(/simulated worker death/)
+  spy.mockRestore()
+}
+
+describe('review regressions', () => {
   it('concurrent same-clientKey issues mint exactly ONE coupon, and it is paid for', async () => {
     // The loss-bearing bug: both callers pass the pre-flight "key unused" check,
     // one debits, the other no-ops on the idempotency key — and the old code
@@ -306,6 +332,81 @@ describe('codex review regressions', () => {
     })
     expect(replayA.code).toBe(a.code)
     expect(await ledgerSum(id)).toBe(USD('80'))
+  })
+
+  it('two concurrent reconciles do not strand the debit on a tombstone', async () => {
+    // The tombstone carries partnerId + issueLedgerId so it reads as a dead
+    // coupon. A reconcile that LOSES the tombstone CAS then re-reads it and,
+    // without an explicit tombstone check, accepts it as a successful issue:
+    // breadcrumb dropped, sibling finds nothing to refund, money stuck forever.
+    const id = await seedPartner('p@x.com', '100')
+    await crashAfterDebit(id, 'ck-crash')
+    await casUpdate<void>(env, partnerKey(id), (raw) => {
+      const rec = JSON.parse(raw!)
+      rec.pendingIssues[0].at = Date.now() - 120_000
+      return { op: 'set', value: JSON.stringify(rec), result: undefined }
+    })
+
+    // Two reconciles racing over the same stale op.
+    await Promise.all([reconcilePending(env, id), reconcilePending(env, id)])
+
+    const p = await getPartner(env, id)
+    expect(p!.balanceAtomic).toBe(USD('100').toString()) // refunded, not stranded
+    expect(p!.pendingIssues).toHaveLength(0)
+    expect(await ledgerSum(id)).toBe(USD('100'))
+    // And the tombstone never entered the partner's coupon list.
+    expect(p!.couponIndex).toHaveLength(0)
+  })
+
+  it('a clientKey whose coupon died can be reissued, not wedged on IN_FLIGHT', async () => {
+    // `done` never goes stale, so without an explicit release one ordinary
+    // crash would burn that clientKey permanently.
+    const id = await seedPartner('p@x.com', '100')
+    await crashAfterDebit(id, 'ck-wedge')
+    await casUpdate<void>(env, partnerKey(id), (raw) => {
+      const rec = JSON.parse(raw!)
+      rec.pendingIssues[0].at = Date.now() - 120_000
+      return { op: 'set', value: JSON.stringify(rec), result: undefined }
+    })
+    await reconcilePending(env, id)
+    expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('100').toString())
+
+    // Same clientKey again — must actually issue, not throw ISSUE_IN_FLIGHT.
+    const retry = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'ck-wedge',
+    })
+    expect(retry.code).toMatch(/^\d{10}$/)
+    expect(retry.reused).toBe(false)
+    expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('90').toString())
+    expect(await ledgerSum(id)).toBe(USD('90'))
+  })
+
+  it('a refund intent recorded but never transitioned is dropped, not leaked', async () => {
+    // Crash between void step 1 and step 2 leaves the coupon `issued`. That
+    // breadcrumb used to fall through every branch and stay forever; 50 of
+    // them trip TOO_MANY_PENDING and block all future voids.
+    const id = await seedPartner('p@x.com', '100')
+    const r = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'k',
+    })
+    await casUpdate<void>(env, partnerKey(id), (raw) => {
+      const p = JSON.parse(raw!)
+      p.pendingRefunds.push({
+        refundOpId: newOpId(), code: r.code,
+        amountAtomic: USD('10').toString(), kind: 'void_refund', at: Date.now() - 120_000,
+      })
+      return { op: 'set', value: JSON.stringify(p), result: undefined }
+    })
+
+    await reconcilePending(env, id)
+    const p = await getPartner(env, id)
+    expect(p!.pendingRefunds).toHaveLength(0)
+    // No money moved: the coupon is still live and still paid for.
+    expect(p!.balanceAtomic).toBe(USD('90').toString())
+    expect(parseRecord(await casRead(env, couponKey(r.code)))!.status).toBe('issued')
+    // And it can still be voided normally afterwards.
+    await voidPartnerCoupon(env, { partnerId: id, code: r.code })
+    expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('100').toString())
   })
 
   it('refuses a negative amount instead of minting balance', async () => {
@@ -431,31 +532,6 @@ describe('codex review regressions', () => {
 // ── The race that matters ────────────────────────────────────────────────────
 
 describe('crash between debit and coupon creation', () => {
-  /**
-   * Simulates the Worker dying after step 1 (debit + pendingIssue recorded) and
-   * before step 2 (coupon created), by making the coupon-key commit throw.
-   */
-  async function crashAfterDebit(partnerId: string, clientKey: string) {
-    const real = ns.get('coupon').fetch.bind(ns.get('coupon'))
-    const spy = vi.spyOn(ns.get('coupon'), 'fetch').mockImplementation(async (req: Request) => {
-      const url = new URL(req.url)
-      const body = await req.clone().json<any>()
-      if (url.pathname === '/commit' && String(body.key).startsWith('coupon:')) {
-        throw new Error('simulated worker death before coupon creation')
-      }
-      return real(req)
-    })
-    await expect(
-      issuePartnerCoupon(env, {
-        partnerId,
-        amountAtomic: USD('10'),
-        expiresInMinutes: 720,
-        clientKey,
-      }),
-    ).rejects.toThrow(/simulated worker death/)
-    spy.mockRestore()
-  }
-
   it('leaves money debited, then reconcile refunds it', async () => {
     const id = await seedPartner('p@x.com', '100')
     await crashAfterDebit(id, 'ck-crash')

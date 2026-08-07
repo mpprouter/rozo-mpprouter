@@ -710,10 +710,25 @@ async function findIssuedByClientKey(
     }
   }
   code ??= p.applied.find((a) => a.k === `issue:${clientKey}`)?.c
-  code ??= p.pendingIssues.find((o) => o.clientKey === clientKey)?.code
+  const inFlight = p.pendingIssues.find((o) => o.clientKey === clientKey)
+  code ??= inFlight?.code
   if (!code) return null
+
   const rec = parseRecord(await casRead(env, couponKey(code)))
-  if (!rec || isTombstone(rec) || rec.partnerId !== partnerId) return null
+  const usable = rec && !isTombstone(rec) && rec.partnerId === partnerId
+  if (!usable) {
+    // The claim says this key was consumed, but the coupon it points at is
+    // gone (tombstoned by reconcile, or a foreign code from a collision). If
+    // no pendingIssue is still open for this key, reconcile has already
+    // refunded and the operation is finished-and-failed — so the key must be
+    // released, or an ordinary single crash wedges this clientKey on
+    // ISSUE_IN_FLIGHT forever (`done` never goes stale).
+    //
+    // The "no open pendingIssue" condition is what separates this from
+    // "debited, creation still in flight", which must NOT be released.
+    if (!inFlight) await releaseIdempotency(env, partnerId, `issue:${clientKey}`)
+    return null
+  }
   return {
     code: rec.code,
     amountUsd: rec.amountUsd,
@@ -867,9 +882,19 @@ export async function reconcilePending(env: Env, partnerId: string): Promise<voi
     if (claimed) {
       await refundPendingIssue(env, partnerId, op.opId, 'abandoned')
     } else {
-      // The issuer beat us to it. Re-read and settle on the next pass.
+      // Someone beat us to this key. It was either the issuer (coupon is real,
+      // confirm it) or a CONCURRENT RECONCILE that tombstoned it first.
+      //
+      // The tombstone deliberately carries partnerId and issueLedgerId so it
+      // reads as a dead coupon, which means a naive "does it match my op?"
+      // check here accepts it as a successful issue: the breadcrumb gets
+      // dropped, and the sibling reconcile then finds no op to refund and
+      // returns quietly. Balance debited, coupon key holding an unredeemable
+      // tombstone, nothing left to repair it. Exclude tombstones explicitly.
       const fresh = parseRecord(await casRead(env, couponKey(op.code)))
-      if (fresh && fresh.partnerId === partnerId && fresh.issueLedgerId === op.opId) {
+      if (isTombstone(fresh)) {
+        await refundPendingIssue(env, partnerId, op.opId, 'tombstoned_by_peer')
+      } else if (fresh && fresh.partnerId === partnerId && fresh.issueLedgerId === op.opId) {
         await confirmPendingIssue(env, partnerId, op.opId, {
           code: fresh.code,
           amountAtomic: fresh.amountAtomic,
@@ -1010,8 +1035,14 @@ async function settlePendingRefund(
     await settlePendingRefundById(env, partnerId, pr.code, opId)
     return
   }
-  // The transition never happened (or the coupon moved on) — no credit is owed.
-  if (!rec || rec.status !== 'issued') await dropPendingRefund(env, partnerId, pr.code)
+  // No credit is owed. Two cases, both drop the breadcrumb:
+  //   - the coupon moved on (redeemed/paying/...) — never ours to refund
+  //   - the coupon is still `issued`, i.e. we crashed between recording the
+  //     intent and winning the transition, so no money moved at all
+  // The second case used to fall through both branches and leak the
+  // breadcrumb forever; 50 of those trip TOO_MANY_PENDING and block every
+  // future void for that partner.
+  await dropPendingRefund(env, partnerId, pr.code)
 }
 
 /** Credit the refund, keyed on the coupon's own `refundOpId` (never on `status`). */
