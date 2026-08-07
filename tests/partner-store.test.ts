@@ -264,6 +264,34 @@ describe('codex review regressions', () => {
     expect(await ledgerSum(id)).toBe(USD('90'))
   })
 
+  it('idempotency survives eviction of the whole in-record list', async () => {
+    // The bounded `applied` list is a recent-window optimisation; the durable
+    // per-key record is what actually authorises money. Wipe the list entirely
+    // and both a replayed topup and a replayed issue must still be no-ops.
+    const id = await seedPartner('p@x.com', '100')
+    const first = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'K',
+    })
+    await casUpdate<void>(env, partnerKey(id), (raw) => {
+      const p = JSON.parse(raw!)
+      p.applied = [] // simulate every key having aged out
+      p.ledgerIndex = [] // and the ledger scan window having rolled past
+      return { op: 'set', value: JSON.stringify(p), result: undefined }
+    })
+
+    const replay = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'K',
+    })
+    expect(replay.code).toBe(first.code)
+    expect(replay.reused).toBe(true)
+
+    const t = await topupPartner(env, {
+      email: 'p@x.com', amountAtomic: USD('100'), proof: 'seed-p@x.com',
+    })
+    expect(t.applied).toBe(false)
+    expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('90').toString())
+  })
+
   it('a replayed clientKey returns ITS coupon, not merely the newest one', async () => {
     const id = await seedPartner('p@x.com', '100')
     const a = await issuePartnerCoupon(env, {
@@ -313,7 +341,7 @@ describe('codex review regressions', () => {
     expect((await readLedger(env, id)).length).toBe(p!.ledgerIndex.length)
   })
 
-  it('an evicted topup key still cannot double-credit (ledger scan backstop)', async () => {
+  it('an evicted topup key still cannot double-credit (durable idempotency record)', async () => {
     const { partner } = await topupPartner(env, {
       email: 'p@x.com', amountAtomic: USD('100'), proof: 'order-1',
     })

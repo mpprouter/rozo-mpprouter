@@ -186,6 +186,13 @@ export interface CouponTombstone extends CouponRecord {
 // ── Keys ─────────────────────────────────────────────────────────────────────
 
 export const partnerKey = (id: string) => `partner:${id}`
+/**
+ * One durable record per idempotency key. The bounded `applied` list inside the
+ * partner record cannot carry this on its own: it evicts, and an evicted key
+ * means a replayed top-up proof or client key credits/charges a second time.
+ * Bounded state is fine for a recent-window check, not for authorising money.
+ */
+export const idemKey = (partnerId: string, key: string) => `pidem:${partnerId}:${key}`
 export const partnerEmailKey = (email: string) => `partneremail:${normalizeEmail(email)}`
 export const ledgerKey = (partnerId: string, entryId: string) =>
   `pledger:${partnerId}:${entryId}`
@@ -283,6 +290,37 @@ async function applyLedger(
 ): Promise<{ partner: PartnerRecord; applied: boolean; entry: LedgerEntry | null }> {
   let entry: LedgerEntry | null = null
 
+  // ── Idempotency gate (durable, O(1)).
+  //
+  // Claimed BEFORE the money moves and settled after, so the three states are:
+  //   done            -> already applied; replay the recorded result
+  //   pending, fresh   -> a sibling request is mid-flight; do not race it
+  //   pending, stale   -> the previous attempt died before committing. Safe to
+  //                       take over: the balance change and the `applied` insert
+  //                       are one CAS, so if it had committed within the stale
+  //                       window `applied` would still show it.
+  const claim = await casUpdate<{ state: string; e?: string; c?: string; at: number }>(
+    env,
+    idemKey(partnerId, m.idempotencyKey),
+    (cur) => {
+      const now = Date.now()
+      const prev = cur ? (JSON.parse(cur) as { state: string; e?: string; c?: string; at: number }) : null
+      if (prev?.state === 'done') return { op: 'noop', result: prev }
+      if (prev?.state === 'pending' && now - prev.at < PENDING_STALE_MS) {
+        return { op: 'noop', result: prev }
+      }
+      const fresh = { state: 'pending', at: now }
+      return { op: 'set', value: JSON.stringify(fresh), result: fresh }
+    },
+  )
+
+  if (claim.state === 'done') {
+    return { partner: (await getPartner(env, partnerId))!, applied: false, entry: null }
+  }
+  if (claim.state === 'pending' && Date.now() - claim.at < PENDING_STALE_MS && claim.e !== undefined) {
+    return { partner: (await getPartner(env, partnerId))!, applied: false, entry: null }
+  }
+
   // Write the ledger BODY first, then commit the balance + index.
   //
   // Ordering matters and the reverse is what looks natural: index first, body
@@ -355,6 +393,20 @@ async function applyLedger(
       result: undefined,
     }))
   }
+
+  // Settle the claim either way. On the in-record no-op path the mutation was
+  // already applied by an earlier attempt, so the key is still `done` from then.
+  await casUpdate<void>(env, idemKey(partnerId, m.idempotencyKey), () => ({
+    op: 'set',
+    value: JSON.stringify({
+      state: 'done',
+      at: Date.now(),
+      e: m.entryId,
+      ...(m.couponCode ? { c: m.couponCode } : {}),
+    }),
+    result: undefined,
+  }))
+
   return { partner, applied: entry !== null, entry }
 }
 
@@ -454,17 +506,10 @@ export async function topupPartner(
   if (args.amountAtomic <= 0n) throw new PartnerError('INSUFFICIENT_BALANCE', 'amount must be > 0')
   const partner = await getOrCreatePartnerByEmail(env, args.email)
 
-  // Second line of defence for the long tail. `applied` is bounded, so after
-  // enough later mutations the original `topup:<proof>` key falls off the end
-  // and a replay of that proof would credit again. Top-ups are rare and manual,
-  // so scanning the ledger for the same proof is cheap and closes the window
-  // that eviction opens. (The in-record key still handles the concurrent case,
-  // which this scan cannot.)
-  for (const e of await readLedger(env, partner.id, MAX_LEDGER_INDEX)) {
-    if (e.kind === 'topup' && e.ref === args.proof) {
-      return { partner: (await getPartner(env, partner.id))!, applied: false }
-    }
-  }
+  // Idempotency lives in applyLedger's durable claim (see idemKey). An earlier
+  // draft scanned the ledger for the same proof instead; that was no better,
+  // because ledgerIndex is bounded by the same kind of cap it was meant to
+  // outlive.
 
   const res = await applyLedger(env, partner.id, {
     kind: 'topup',
@@ -629,11 +674,22 @@ async function findIssuedByClientKey(
 ): Promise<IssueResult | null> {
   const p = await getPartner(env, partnerId)
   if (!p) return null
-  // Look the code up by the key that produced it. Falling back to "the newest
-  // coupon" would answer issue A / issue B / retry A with B's code.
-  const rec0 = p.applied.find((a) => a.k === `issue:${clientKey}`)
-  if (!rec0) return null
-  const code = rec0.c ?? p.pendingIssues.find((o) => o.clientKey === clientKey)?.code
+  // Durable record first — the in-record list evicts, and a delayed retry after
+  // enough later mutations would otherwise fall through to a second debit.
+  // Falling back to "the newest coupon" would answer issue A / issue B / retry A
+  // with B's code, so the code is looked up by the key that produced it.
+  let code: string | undefined
+  const durable = await casRead(env, idemKey(partnerId, `issue:${clientKey}`))
+  if (durable) {
+    try {
+      const d = JSON.parse(durable) as { state: string; c?: string }
+      if (d.state === 'done') code = d.c
+    } catch {
+      /* fall through to the in-record list */
+    }
+  }
+  code ??= p.applied.find((a) => a.k === `issue:${clientKey}`)?.c
+  code ??= p.pendingIssues.find((o) => o.clientKey === clientKey)?.code
   if (!code) return null
   const rec = parseRecord(await casRead(env, couponKey(code)))
   if (!rec || isTombstone(rec) || rec.partnerId !== partnerId) return null
