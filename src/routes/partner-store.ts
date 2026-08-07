@@ -1260,14 +1260,60 @@ async function pbkdf2(password: string, saltHex: string, iterations: number): Pr
  * human copies this out of a chat message. 20 chars over a 32-symbol alphabet
  * is 100 bits — far past anything the lockout would ever have to defend.
  */
-export function generatePartnerPassword(length = 20): string {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-  const buf = new Uint8Array(length)
+/**
+ * Word list for partner passphrases. Hand-picked to survive being read aloud
+ * over a call or typed on a phone: no homophones, no l/1 or O/0 lookalikes,
+ * nothing that autocorrect rewrites.
+ */
+const PASSPHRASE_WORDS = [
+  'anchor', 'amber', 'basil', 'beacon', 'birch', 'bison', 'bramble', 'bronze',
+  'cactus', 'canyon', 'cedar', 'cobalt', 'copper', 'coral', 'cotton', 'crimson',
+  'dahlia', 'delta', 'denim', 'dolphin', 'ember', 'falcon', 'fennel', 'ferry',
+  'flint', 'fossil', 'garnet', 'ginger', 'granite', 'harbor', 'hazel', 'heron',
+  'indigo', 'ivory', 'jasper', 'juniper', 'kelp', 'lantern', 'lagoon', 'lilac',
+  'linen', 'lumber', 'magnet', 'mahogany', 'maple', 'marble', 'meadow', 'mint',
+  'mustard', 'nectar', 'nutmeg', 'oakwood', 'olive', 'onyx', 'orchid', 'otter',
+  'pebble', 'pepper', 'pewter', 'pigeon', 'pine', 'plum', 'pumpkin', 'quartz',
+  'quiver', 'radish', 'raven', 'ribbon', 'rustic', 'saffron', 'sage', 'salmon',
+  'sandbar', 'sapphire', 'sequoia', 'shadow', 'silver', 'sparrow', 'spruce',
+  'sterling', 'sugar', 'summit', 'sunset', 'tangerine', 'teal', 'thistle',
+  'timber', 'topaz', 'tulip', 'turquoise', 'velvet', 'walnut', 'wheat',
+  'willow', 'winter', 'yarrow', 'zinc',
+]
+
+/** Unbiased pick via rejection sampling — a plain modulus over 97 words would
+ * skew toward the front of the list. */
+function pickWord(): string {
+  const n = PASSPHRASE_WORDS.length
+  const limit = Math.floor(256 / n) * n
+  const buf = new Uint8Array(1)
+  for (;;) {
+    crypto.getRandomValues(buf)
+    if (buf[0] < limit) return PASSPHRASE_WORDS[buf[0] % n]
+  }
+}
+
+/**
+ * `word-word-NN` — memorable enough to read down a phone line, which is how
+ * this actually gets delivered (founder 2026-08-07: "两个单词，让他能说").
+ *
+ * Entropy is ~97^2 x 90 ≈ 850k combinations, which would be far too weak on
+ * its own. It is only acceptable because `POST /partner/auth/login` locks the
+ * account after 10 failures per hour: an attacker gets ~87,600 guesses a year,
+ * so exhausting the space takes ~10 years and the expected hit is ~5. If that
+ * lockout is ever loosened, this generator has to get longer in the same
+ * change — the two numbers are load-bearing together.
+ */
+export function generatePartnerPassword(): string {
+  const buf = new Uint8Array(1)
   crypto.getRandomValues(buf)
-  let out = ''
-  // 256 % 32 === 0, so a plain modulus here is unbiased.
-  for (let i = 0; i < length; i++) out += alphabet[buf[i] % alphabet.length]
-  return out
+  // 0-89 from a byte: reject the tail so the two digits stay uniform.
+  let n = buf[0]
+  while (n >= 180) {
+    crypto.getRandomValues(buf)
+    n = buf[0]
+  }
+  return `${pickWord()}-${pickWord()}-${10 + (n % 90)}`
 }
 
 /** Derive and store a credential. The plaintext is never persisted or logged. */

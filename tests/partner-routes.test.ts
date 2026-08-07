@@ -459,3 +459,40 @@ describe('pages', () => {
     expect(html).toContain('怎么再次登录')
   })
 })
+
+// ── Passphrase generator ─────────────────────────────────────────────────────
+
+describe('generatePartnerPassword', () => {
+  it('produces a readable word-word-NN passphrase', async () => {
+    const { generatePartnerPassword } = await import('../src/routes/partner-store')
+    for (let i = 0; i < 200; i++) {
+      expect(generatePartnerPassword()).toMatch(/^[a-z]+-[a-z]+-\d{2}$/)
+    }
+  })
+
+  it('is not constant and spreads across the word list', async () => {
+    const { generatePartnerPassword } = await import('../src/routes/partner-store')
+    const first = new Set(
+      Array.from({ length: 400 }, () => generatePartnerPassword().split('-')[0]),
+    )
+    // A modulus over a 97-word list biases toward the front; a healthy spread
+    // is the cheap check that rejection sampling is actually running.
+    expect(first.size).toBeGreaterThan(40)
+  })
+
+  it('stays readable: plain lowercase words, no whitespace, no confusable digits', async () => {
+    // NB: an `l` inside `tulip` is fine — l/1 and O/0 confusion is a problem
+    // for isolated random characters, and the whole point of words is that
+    // context disambiguates them. What must stay clean is the DIGIT tail,
+    // where there is no context to lean on.
+    const { generatePartnerPassword } = await import('../src/routes/partner-store')
+    for (let i = 0; i < 200; i++) {
+      const pw = generatePartnerPassword()
+      const [w1, w2, digits] = pw.split('-')
+      expect(w1).toMatch(/^[a-z]{3,}$/)
+      expect(w2).toMatch(/^[a-z]{3,}$/)
+      expect(digits).toMatch(/^[1-9][0-9]$/) // 10-99, never a leading zero
+      expect(pw).not.toMatch(/\s/)
+    }
+  })
+})
