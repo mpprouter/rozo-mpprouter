@@ -41,7 +41,7 @@ function body(contact: string): string {
       <button class="btn" id="issue-open" type="button" disabled>发卡</button>
       <button class="btn btn--ghost" id="refresh" type="button">刷新</button>
     </div>
-    <p class="dim" style="margin:14px 0 0;">需要充值？联系我们：${c}</p>
+    <p class="dim" style="margin:14px 0 0;">需要充值？点右下角的对话按钮找我们。</p>
   </section>
 
   <section class="card">
@@ -61,12 +61,19 @@ function body(contact: string): string {
   </section>
 </main>
 
+<button id="help-fab" type="button" aria-label="联系我们">
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+</button>
+
 <dialog id="issue-dlg" aria-labelledby="issue-title">
   <div id="issue-form-view">
     <h2 id="issue-title">发卡密</h2>
     <span class="label">选择面值（credits）</span>
     <div class="row" id="quick-row" style="margin-bottom:12px;">
+      <button class="chip" type="button" data-credits="1" aria-pressed="false">1</button>
+      <button class="chip" type="button" data-credits="5" aria-pressed="false">5</button>
       <button class="chip" type="button" data-credits="10" aria-pressed="false">10</button>
+      <button class="chip" type="button" data-credits="20" aria-pressed="false">20</button>
       <button class="chip" type="button" data-credits="50" aria-pressed="false">50</button>
       <button class="chip" type="button" data-credits="100" aria-pressed="false">100</button>
     </div>
@@ -86,11 +93,7 @@ function body(contact: string): string {
              autocomplete="off" placeholder="例如 10.50" />
     </details>
 
-    <div style="margin:16px 0 6px;">
-      <label class="label" for="expires-input">有效期（小时，留空 = 12）</label>
-      <input class="input" id="expires-input" type="text" inputmode="numeric"
-             autocomplete="off" placeholder="336（默认 14 天，可设更短）" />
-    </div>
+    <p class="dim" style="margin:16px 0 6px;">卡密有效期 <strong>14 天</strong>。</p>
 
     <div id="issue-hint" class="note note--err" style="display:none;" role="alert"></div>
     <pre class="confirm" id="issue-confirm" style="display:none;"></pre>
@@ -140,6 +143,28 @@ function script(opts: PartnerUiOptions): string {
   return `${MONEY_JS}
 ${analyticsScript(opts)}
 (function () {
+  // Intercom, booted on first click. Same pattern as the explainer and the
+  // blog pages: the widget is a few hundred KB and nobody needs it before
+  // they ask for it.
+  var fab = document.getElementById('help-fab');
+  if (fab) {
+    var icBooted = false;
+    fab.addEventListener('click', function () {
+      var settings = { app_id: 'kpfdpai7', hide_default_launcher: false };
+      function show() { if (typeof window.Intercom === 'function') window.Intercom('show'); }
+      if (icBooted) { show(); return; }
+      icBooted = true;
+      window.intercomSettings = settings;
+      var el = document.createElement('script');
+      el.async = true;
+      el.src = 'https://widget.intercom.io/widget/kpfdpai7';
+      el.onload = function () {
+        if (typeof window.Intercom === 'function') { window.Intercom('boot', settings); show(); }
+      };
+      document.head.appendChild(el);
+    });
+  }
+
   var MOCK = new URLSearchParams(location.search).has('mock');
   var state = { balanceAtomic: '0', coupons: [] };
 
@@ -317,7 +342,6 @@ ${analyticsScript(opts)}
     $('issue-done-view').style.display = 'none';
     $('credits-input').value = '';
     $('amount-input').value = '';
-    $('expires-input').value = '';
     $('amount-mode').open = false;
     var chips = $('quick-row').querySelectorAll('.chip');
     for (var i = 0; i < chips.length; i++) chips[i].setAttribute('aria-pressed', 'false');
@@ -339,8 +363,8 @@ ${analyticsScript(opts)}
     var payload = { clientKey: clientKey };
     if (pending.mode === 'credits') payload.credits = Number(pending.creditsLabel);
     else payload.amountUsd = atomicToUsd(pending.faceAtomic);
-    var hours = parseInt($('expires-input').value.trim(), 10);
-    if (hours > 0) payload.expiresInMinutes = Math.min(hours, 336) * 60;
+    // No expiry field: the server default (14 days) is the only answer, so
+    // there is nothing to send and nothing to keep in sync with it.
 
     var req = MOCK
       ? Promise.resolve({
@@ -374,7 +398,7 @@ ${analyticsScript(opts)}
       if (e && e.message === 'unauthenticated') return;
       var hint = $('issue-hint');
       hint.textContent = (e && e.status === 402)
-        ? '余额不足，发放未执行。需要充值请联系我们。'
+        ? '余额不足，发放未执行。需要充值请点右下角对话按钮。'
         : ('发放失败：' + (e && e.message ? e.message : '未知错误') + '。请刷新后确认这张卡有没有发出去。');
       hint.style.display = 'block';
       btn.textContent = '确认发放';
@@ -474,7 +498,6 @@ ${analyticsScript(opts)}
     updateIssue();
   });
   $('amount-input').addEventListener('input', updateIssue);
-  $('expires-input').addEventListener('input', updateIssue);
   $('amount-mode').addEventListener('toggle', updateIssue);
   (function () {
     var chips = $('quick-row').querySelectorAll('.chip');

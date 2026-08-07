@@ -151,8 +151,9 @@ COUPON_ENDPOINT_ENABLED = "true"
 # half-open surface looks usable and then fails at the point where money moves.
 # Flip to "false" and redeploy to pull the feature without a code rollback.
 PARTNER_ENDPOINT_ENABLED = "true"
-# Shown on the partner explainer page ("需要充值？联系我们"). Not a secret.
-PARTNER_CONTACT = "Telegram @rozoai"
+# NOTE: PARTNER_CONTACT was removed on 2026-08-07. Every "contact us" route on
+# the partner pages is the Intercom launcher now, so a hostname-shaped contact
+# string here would only ever go stale and send someone to a dead channel.
 
 # Secrets (set via: wrangler secret put <NAME>)
 #

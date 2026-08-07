@@ -1109,8 +1109,12 @@ async function settlePendingRefundById(
     (p) => {
       const i = p.pendingRefunds.findIndex((r) => r.code === code)
       if (i !== -1) p.pendingRefunds.splice(i, 1)
-      const c = p.couponIndex.findIndex((x) => x.code === code)
-      if (c !== -1) p.couponIndex.splice(c, 1)
+      // The coupon deliberately STAYS in couponIndex after a refund. Dropping
+      // it made a voided coupon vanish from the partner's list, so the history
+      // silently rewrote itself and "还没有发过卡密" showed up right after a
+      // successful issue-then-void. The list is a ledger, not a to-do list:
+      // voided, expired and redeemed entries all stay visible (founder
+      // 2026-08-07). listPartnerCoupons renders each with its real status.
     },
   )
 

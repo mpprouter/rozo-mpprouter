@@ -8,17 +8,14 @@
  * no signup link — accounts are created by us.
  */
 import {
-  DEFAULT_CONTACT,
   type PartnerUiOptions,
   analyticsScript,
-  escapeHtml,
   htmlPage,
   htmlResponse,
 } from './layout'
 import { MONEY_JS } from './money-js'
 
-function body(contact: string): string {
-  const c = escapeHtml(contact)
+function body(): string {
   return `
 <header class="topbar">
   <div class="wrap">
@@ -91,7 +88,7 @@ function body(contact: string): string {
 
   <footer class="wrap" style="padding:8px 0 48px;">
     <p class="dim" style="margin:0;">
-      有问题找我们：${c}
+      有问题点<strong>右下角的对话按钮</strong>找我们。
     </p>
   </footer>
 </main>
@@ -204,7 +201,7 @@ export function renderPartnerExplainerPage(opts: PartnerUiOptions = {}): Respons
   return htmlResponse(
     htmlPage({
       title: 'ROZO 合伙人后台 · 卡密自助发放',
-      bodyHtml: body(opts.contact ?? DEFAULT_CONTACT),
+      bodyHtml: body(),
       script: script(opts),
     }),
   )
