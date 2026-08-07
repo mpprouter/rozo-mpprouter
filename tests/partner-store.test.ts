@@ -855,6 +855,25 @@ describe('listing', () => {
     expect(list[0].refundable).toBe(true) // expired-but-unused is reclaimable
   })
 
+  it('a voided coupon stays in the list — the history must not rewrite itself', async () => {
+    // The refund used to splice the coupon out of couponIndex, so a partner who
+    // issued one card and voided it was told "还没有发过卡密". The list is a
+    // ledger: voided, expired and redeemed entries all stay visible.
+    const id = await seedPartner('p@x.com', '100')
+    const res = await issuePartnerCoupon(env, {
+      partnerId: id, amountAtomic: USD('10'), expiresInMinutes: 720, clientKey: 'a',
+    })
+    await voidPartnerCoupon(env, { partnerId: id, code: res.code })
+
+    const list = await listPartnerCoupons(env, id)
+    expect(list).toHaveLength(1)
+    expect(list[0].code).toBe(res.code)
+    expect(list[0].status).toBe('void')
+    expect(list[0].refundable).toBe(false)
+    // ...and the money really did come back, so this is not a stale row.
+    expect((await getPartner(env, id))!.balanceAtomic).toBe(USD('100').toString())
+  })
+
   it('an expired coupon can be reclaimed and the money returns', async () => {
     const id = await seedPartner('p@x.com', '100')
     const res = await issuePartnerCoupon(env, {

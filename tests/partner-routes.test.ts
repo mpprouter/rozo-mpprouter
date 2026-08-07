@@ -496,3 +496,42 @@ describe('generatePartnerPassword', () => {
     }
   })
 })
+
+// ── Founder-facing UI contract ───────────────────────────────────────────────
+
+describe('dashboard copy and controls', () => {
+  it('offers 1/5/10/20/50/100 credit quick amounts', async () => {
+    const html = await (await call('/partner/app')).text()
+    for (const n of [1, 5, 10, 20, 50, 100]) {
+      expect(html, `chip ${n}`).toContain(`data-credits="${n}"`)
+    }
+  })
+
+  it('has no expiry input — 14 days is stated, not configurable', async () => {
+    const html = await (await call('/partner/app')).text()
+    expect(html).not.toContain('expires-input')
+    expect(html).toContain('14 天')
+  })
+
+  it('names no contact channel other than the chat widget', async () => {
+    // Every "contact us" route is the Intercom launcher now; a stale Telegram
+    // handle in one corner of one page is how a partner ends up messaging a
+    // channel nobody watches.
+    for (const p of ['/partner', '/partner/app']) {
+      const html = await (await call(p)).text()
+      expect(html, p).not.toMatch(/Telegram|@rozoai/i)
+      expect(html, p).toContain('help-fab')
+    }
+  })
+
+  it('the explainer leads with the customer script and drops the pricing pitch', async () => {
+    const html = await (await call('/partner')).text()
+    expect(html).toContain('cust-copy')
+    expect(html).toContain('open.rozo.ai/claim?code=XXXXXX')
+    expect(html).not.toContain('我们不赚差价')
+    expect(html).not.toContain('没有注册入口')
+    // The customer script must come before the login form: it is what a
+    // partner opens this page to fetch.
+    expect(html.indexOf('cust-copy')).toBeLessThan(html.indexOf('login-form'))
+  })
+})
