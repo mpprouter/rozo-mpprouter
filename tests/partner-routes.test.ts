@@ -1,7 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest'
 import worker from '../src/index'
 import { SESSION_COOKIE, signSession } from '../src/routes/partner-auth'
-import { getOrCreatePartnerByEmail, setPartnerPassword, getPartner } from '../src/routes/partner-store'
+import {
+  getOrCreatePartnerByEmail,
+  setPartnerPassword,
+  getPartner,
+  getPartnerIdByEmail,
+} from '../src/routes/partner-store'
 import type { Env } from '../src/index'
 
 /**
@@ -407,6 +412,33 @@ describe('admin endpoints', () => {
 })
 
 // ── Pages ────────────────────────────────────────────────────────────────────
+
+describe('partner identifier', () => {
+  it('accepts a bare username as well as an email', async () => {
+    // The first partner logs in as `earnest`; requiring an @ would make the
+    // account uncreatable.
+    const r = await postJson(
+      '/admin/partner/topup',
+      { email: 'earnest', amountUsd: '2.10', proof: 'id-test' },
+      { 'x-admin-secret': ADMIN },
+    )
+    expect(r.status).toBe(200)
+    const id = await getPartnerIdByEmail(env, 'earnest')
+    expect(id).toBeTruthy()
+    expect(BigInt((await getPartner(env, id!))!.balanceAtomic)).toBe(2_100_000n)
+  })
+
+  it('still rejects junk that would silently mint a second account', async () => {
+    for (const bad of ['', 'a', 'ear nest', 'earnest;drop', '<script>']) {
+      const r = await postJson(
+        '/admin/partner/topup',
+        { email: bad, amountUsd: '1', proof: `junk-${bad}` },
+        { 'x-admin-secret': ADMIN },
+      )
+      expect(r.status, JSON.stringify(bad)).toBe(400)
+    }
+  })
+})
 
 describe('pages', () => {
   it('the explainer states the fee is OpenRouter’s, not ours', async () => {

@@ -36,7 +36,7 @@ import {
   readLedger,
   reconcilePending,
   topupPartner,
-} from './partner-store'
+  isValidPartnerIdentifier,} from './partner-store'
 import { requirePartnerSession } from './partner-auth'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -334,7 +334,9 @@ export async function handleAdminPartnerTopup(request: Request, env: Env): Promi
   }
 
   const email = typeof body?.email === 'string' ? body.email.trim() : ''
-  if (!email || !email.includes('@')) return json(400, { error: 'email is required' })
+  if (!email || !isValidPartnerIdentifier(email)) {
+    return json(400, { error: 'email is required (a username or an email address)' })
+  }
 
   const proof = typeof body?.proof === 'string' ? body.proof.trim() : ''
   if (!proof) {

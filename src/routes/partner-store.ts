@@ -220,6 +220,21 @@ export const ledgerKey = (partnerId: string, entryId: string) =>
 
 /** Emails are matched case-insensitively and trimmed, so `A@x.com ` and
  * `a@x.com` cannot become two accounts sharing one person's money. */
+/**
+ * A partner identifier is a USERNAME, which may or may not look like an email.
+ * The founder's first partner logs in as `earnest`, so requiring an `@` would
+ * make the account uncreatable.
+ *
+ * Still validated, because the admin endpoints create an account on first use
+ * and a typo would otherwise silently mint a second, empty one that quietly
+ * receives the top-up. Allows letters, digits, and `. _ - + @`; rejects
+ * whitespace and everything else.
+ */
+export function isValidPartnerIdentifier(id: string): boolean {
+  const v = normalizeEmail(id)
+  return v.length >= 3 && v.length <= 254 && /^[a-z0-9._+-]+(@[a-z0-9.-]+)?$/.test(v)
+}
+
 export function normalizeEmail(email: string): string {
   return String(email ?? '').trim().toLowerCase()
 }
