@@ -44,6 +44,7 @@ import {
   handlePartnerMe,
   handlePartnerIssueCoupon,
   handleAdminPartnerTopup,
+  handleAdminPartnerStatus,
 } from './routes/partner-issue'
 import {
   handlePartnerListCoupons,
@@ -354,7 +355,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // link or crediting a balance both create redeemable value.
       if (
         url.pathname === '/admin/partner/login-link' ||
-        url.pathname === '/admin/partner/topup'
+        url.pathname === '/admin/partner/topup' ||
+        url.pathname === '/admin/partner/status'
       ) {
         if (env.COUPON_ENDPOINT_ENABLED !== 'true') {
           return new Response(JSON.stringify({ error: 'Not found' }), {
@@ -364,6 +366,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         }
         if (url.pathname === '/admin/partner/login-link') {
           return handleAdminPartnerLoginLink(request, env)
+        }
+        if (url.pathname === '/admin/partner/status') {
+          return handleAdminPartnerStatus(request, env)
         }
         return handleAdminPartnerTopup(request, env)
       }

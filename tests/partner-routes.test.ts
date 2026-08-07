@@ -562,3 +562,63 @@ describe('coupon.rozo.ai root', () => {
     expect((await at('coupon.rozo.ai', '/health')).status).toBe(200)
   })
 })
+
+// ── Suspension ───────────────────────────────────────────────────────────────
+
+describe('partner status', () => {
+  it('suspends an account: no login, and an existing session stops working', async () => {
+    // Nothing could set this field before, so a partner could not be turned
+    // off at all — a real gap for a system holding balances.
+    await seed('e@x.com', '100')
+    const cookie = await login('e@x.com')
+    expect((await call('/partner/me', { headers: { Cookie: cookie } })).status).toBe(200)
+
+    const r = await postJson(
+      '/admin/partner/status',
+      { email: 'e@x.com', status: 'suspended' },
+      { 'x-admin-secret': ADMIN },
+    )
+    expect(r.status).toBe(200)
+
+    // The live cookie is cut off too, not just new logins.
+    expect((await call('/partner/me', { headers: { Cookie: cookie } })).status).toBe(403)
+    const relogin = await postJson('/partner/auth/login', { username: 'e@x.com', password: PW })
+    expect(relogin.status).not.toBe(200)
+    expect((await postJson(
+      '/partner/coupon/issue',
+      { credits: 1, clientKey: 'k' },
+      { Cookie: cookie },
+    )).status).toBeGreaterThanOrEqual(400)
+  })
+
+  it('keeps the balance and history — the books still have to reconcile', async () => {
+    const id = await seed('e@x.com', '100')
+    await postJson('/admin/partner/status', { email: 'e@x.com', status: 'suspended' }, { 'x-admin-secret': ADMIN })
+    expect(BigInt((await getPartner(env, id))!.balanceAtomic)).toBe(100_000_000n)
+  })
+
+  it('is reversible', async () => {
+    await seed('e@x.com', '100')
+    await postJson('/admin/partner/status', { email: 'e@x.com', status: 'suspended' }, { 'x-admin-secret': ADMIN })
+    await postJson('/admin/partner/status', { email: 'e@x.com', status: 'active' }, { 'x-admin-secret': ADMIN })
+    expect((await postJson('/partner/auth/login', { username: 'e@x.com', password: PW })).status).toBe(200)
+  })
+
+  it('refuses an unknown partner rather than creating one', async () => {
+    // topup and login-link create on first use; flipping the state of something
+    // that does not exist is a typo, not an intent.
+    const r = await postJson(
+      '/admin/partner/status',
+      { email: 'ghost', status: 'suspended' },
+      { 'x-admin-secret': ADMIN },
+    )
+    expect(r.status).toBe(404)
+    expect(await getPartnerIdByEmail(env, 'ghost')).toBeNull()
+  })
+
+  it('needs the admin secret and a valid status', async () => {
+    await seed('e@x.com', '100')
+    expect((await postJson('/admin/partner/status', { email: 'e@x.com', status: 'suspended' })).status).toBe(401)
+    expect((await postJson('/admin/partner/status', { email: 'e@x.com', status: 'banana' }, { 'x-admin-secret': ADMIN })).status).toBe(400)
+  })
+})
