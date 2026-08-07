@@ -279,7 +279,10 @@ describe('POST /admin/coupon/issue', () => {
   it('rejects garbage and out-of-range amounts', async () => {
     const { env, fetchMock } = makeEnv()
     globalThis.fetch = fetchMock
-    for (const amountUsd of ['abc', '-5', '0', '201']) {
+    // '1051' is one cent over MAX_FACE_VALUE_ATOMIC ($1050). This list has to
+    // track that constant: it was '201' while the cap was $200, and raising the
+    // cap without touching it here is what turned this suite red.
+    for (const amountUsd of ['abc', '-5', '0', '1051']) {
       const resp = await handleIssueCoupon(issueReq({ amountUsd }), env)
       expect(resp.status, `amount ${amountUsd}`).toBe(400)
     }

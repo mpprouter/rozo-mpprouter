@@ -76,8 +76,9 @@ import {
 // brute-force attempts — at 500/h global, a 12h window allows at most 6000
 // guesses network-wide (~0.06% hit chance with 10 live coupons in 10^8 space).
 const DEFAULT_EXPIRES_MINUTES = 12 * 60
-// Fat-finger guard on issuance. Goofish orders are typically $5–$50.
-const MAX_FACE_VALUE_ATOMIC = 200_000_000n // $200
+// Fat-finger guard on issuance. Goofish orders are typically $5–$50; raised to
+// $1050 (founder 2026-08-06) so a single 1000-credit coupon (1000 × 1.05) fits.
+const MAX_FACE_VALUE_ATOMIC = 1_050_000_000n // $1050
 // A `redeeming` claim older than this is considered abandoned (worker died
 // before reaching `paying`) and may be re-claimed. `paying` never auto-expires.
 const REDEEMING_STALE_MS = 10 * 60 * 1000
