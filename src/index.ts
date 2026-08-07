@@ -35,6 +35,21 @@ import {
   handleAdminGetCoupon,
   handleReopenCircuit,
 } from './routes/coupon'
+import {
+  handlePartnerLogin,
+  handlePartnerAuthCallback,
+  handleAdminPartnerLoginLink,
+} from './routes/partner-auth'
+import {
+  handlePartnerMe,
+  handlePartnerIssueCoupon,
+  handleAdminPartnerTopup,
+} from './routes/partner-issue'
+import {
+  handlePartnerListCoupons,
+  handlePartnerVoidCoupon,
+} from './routes/partner-coupons'
+import { renderPartnerExplainerPage, renderPartnerAppPage } from './partner-ui'
 // P1-3: export DO class so wrangler can bind it via [[durable_objects.bindings]]
 export { AtomicStoreDO } from './mpp/atomic-store-do'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
@@ -192,6 +207,23 @@ export interface Env {
   // correlation to older audit rows. Set via: wrangler secret put COUPON_HASH_SECRET
   COUPON_HASH_SECRET?: string
 
+  // ── Partner platform (routes/partner-*.ts, partner-ui/) ──────────────────
+  //
+  // HMAC key for the partner session cookie. Auth FAILS CLOSED when unset, so
+  // the partner backend is inert until this secret exists — which is the
+  // behaviour we want if it is ever lost or not yet provisioned.
+  // Set via: wrangler secret put PARTNER_SESSION_SECRET
+  PARTNER_SESSION_SECRET?: string
+
+  // Contact handle shown to partners on the explainer page ("需要充值？联系我们").
+  // Plain config, not a secret; safe in wrangler.toml [vars].
+  PARTNER_CONTACT?: string
+
+  // Kill switch for the whole partner surface, mirroring COUPON_ENDPOINT_ENABLED.
+  // Anything other than "true" makes every /partner* path 404, so the feature
+  // can be pulled without a rollback deploy.
+  PARTNER_ENDPOINT_ENABLED?: string
+
   // Cloudflare Turnstile secret key for server-side siteverify on /coupon/redeem.
   // When unset, Turnstile is skipped (staged rollout before the widget is wired
   // on the frontend). Set via: wrangler secret put TURNSTILE_SECRET
@@ -256,6 +288,72 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Gated by x-admin-secret (same as /admin/pay-invoice).
       if (url.pathname === '/admin/seed-atomic-store') {
         return handleAdminSeedStore(request, env)
+      }
+
+      // ── Partner platform ──────────────────────────────────────────────
+      //
+      // Pages and API are served from THIS worker on purpose: same-origin, so
+      // the session cookie works without a proxy or third-party-cookie games.
+      //
+      // One gate covers pages and API together. A half-open surface (pages up,
+      // API down, or vice versa) is worse than none — it looks usable and
+      // fails at the point where money moves.
+      if (url.pathname === '/partner' || url.pathname.startsWith('/partner/')) {
+        if (env.PARTNER_ENDPOINT_ENABLED !== 'true') {
+          return new Response(JSON.stringify({ error: 'Not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        const uiOpts = { contact: env.PARTNER_CONTACT }
+
+        // Pages
+        if (url.pathname === '/partner' && request.method === 'GET') {
+          return renderPartnerExplainerPage(uiOpts)
+        }
+        if (url.pathname === '/partner/app' && request.method === 'GET') {
+          return renderPartnerAppPage(uiOpts)
+        }
+
+        // Auth
+        if (url.pathname === '/partner/auth/login') return handlePartnerLogin(request, env)
+        if (url.pathname === '/partner/auth/callback') {
+          return handlePartnerAuthCallback(request, env)
+        }
+
+        // Session-scoped API. Every one of these resolves the partner from the
+        // signed cookie; a partnerId is NEVER taken from the client.
+        if (url.pathname === '/partner/me') return handlePartnerMe(request, env)
+        if (url.pathname === '/partner/coupon/issue') {
+          return handlePartnerIssueCoupon(request, env)
+        }
+        if (url.pathname === '/partner/coupons') return handlePartnerListCoupons(request, env)
+        const voidMatch = url.pathname.match(/^\/partner\/coupon\/(\d{8}|\d{10})\/void$/)
+        if (voidMatch) return handlePartnerVoidCoupon(request, env, voidMatch[1])
+
+        return new Response(JSON.stringify({ error: 'Not found' }), {
+          status: 404,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+
+      // Partner admin. Behind the same COUPON_ENDPOINT_ENABLED gate + ADMIN_TOKEN
+      // as coupon issuance, because it is the same authority: minting a login
+      // link or crediting a balance both create redeemable value.
+      if (
+        url.pathname === '/admin/partner/login-link' ||
+        url.pathname === '/admin/partner/topup'
+      ) {
+        if (env.COUPON_ENDPOINT_ENABLED !== 'true') {
+          return new Response(JSON.stringify({ error: 'Not found' }), {
+            status: 404,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (url.pathname === '/admin/partner/login-link') {
+          return handleAdminPartnerLoginLink(request, env)
+        }
+        return handleAdminPartnerTopup(request, env)
       }
 
       // Coupon redemption layer (routes/coupon.ts). Public redeem/status
