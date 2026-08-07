@@ -622,3 +622,25 @@ describe('partner status', () => {
     expect((await postJson('/admin/partner/status', { email: 'e@x.com', status: 'banana' }, { 'x-admin-secret': ADMIN })).status).toBe(400)
   })
 })
+
+// ── Customer message template ────────────────────────────────────────────────
+
+describe('customer message', () => {
+  it('names both the credits and the dollars, and carries no expiry line', async () => {
+    // The buyer picks a package by credits inside OpenRouter, but the link has
+    // to come out at an exact dollar figure. Giving one number without the
+    // other is what produces a link that misses by a few cents.
+    const js = await (await call('/partner/app')).text()
+    expect(js).toContain("credits + '积分（$' + face + '）'")
+    expect(js).toContain("'1. 在 OpenRouter 里生成一条 ' + amountPhrase + ' 的支付链接'")
+    expect(js).not.toContain('有效期至')
+    expect(js).not.toContain('过期后失效')
+  })
+
+  it('falls back to dollars-only when a coupon was issued by amount', async () => {
+    // Those carry no credits figure; "null积分" would be worse than saying
+    // nothing about credits at all.
+    const js = await (await call('/partner/app')).text()
+    expect(js).toContain("'金额正好是 $' + face")
+  })
+})

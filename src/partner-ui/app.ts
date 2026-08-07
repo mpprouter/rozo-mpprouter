@@ -389,7 +389,7 @@ ${analyticsScript(opts)}
         ' · 余额剩 $' + atomicToUsd(state.balanceAtomic);
       $('issue-done-code').textContent = r.code;
       $('issue-done-url').textContent = r.claimUrl;
-      $('issue-done-msg').textContent = buildCustomerMessage(r.code, pending.faceAtomic, r.claimUrl, r.expiresAt);
+      $('issue-done-msg').textContent = buildCustomerMessage(r.code, pending.faceAtomic, r.claimUrl, pending.creditsLabel);
       $('issue-form-view').style.display = 'none';
       $('issue-done-view').style.display = '';
       btn.textContent = '确认发放';
