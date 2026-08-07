@@ -496,6 +496,31 @@ export async function getOrCreatePartnerByEmail(
   })
 }
 
+/**
+ * Enable or disable a partner.
+ *
+ * Suspension was already enforced in four places (login, the session gate, the
+ * login-link mint, and issuance) but nothing could ever SET it — so a partner
+ * could not be turned off at all. That is a real gap for a system that holds
+ * balances: an account is retired, a credential leaks, someone is renamed.
+ *
+ * Balances and history are deliberately left intact. A suspended partner keeps
+ * its ledger so the books still reconcile; it simply cannot log in or spend.
+ */
+export async function setPartnerStatus(
+  env: Env,
+  partnerId: string,
+  status: 'active' | 'suspended',
+): Promise<PartnerRecord | null> {
+  return casUpdate<PartnerRecord | null>(env, partnerKey(partnerId), (raw) => {
+    const p = parsePartner(raw)
+    if (!p) return { op: 'noop', result: null }
+    if (p.status === status) return { op: 'noop', result: p }
+    p.status = status
+    return { op: 'set', value: JSON.stringify(p), result: p }
+  })
+}
+
 export async function getPartner(env: Env, partnerId: string): Promise<PartnerRecord | null> {
   return parsePartner(await casRead(env, partnerKey(partnerId)))
 }

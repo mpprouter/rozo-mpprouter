@@ -562,3 +562,85 @@ describe('coupon.rozo.ai root', () => {
     expect((await at('coupon.rozo.ai', '/health')).status).toBe(200)
   })
 })
+
+// ── Suspension ───────────────────────────────────────────────────────────────
+
+describe('partner status', () => {
+  it('suspends an account: no login, and an existing session stops working', async () => {
+    // Nothing could set this field before, so a partner could not be turned
+    // off at all — a real gap for a system holding balances.
+    await seed('e@x.com', '100')
+    const cookie = await login('e@x.com')
+    expect((await call('/partner/me', { headers: { Cookie: cookie } })).status).toBe(200)
+
+    const r = await postJson(
+      '/admin/partner/status',
+      { email: 'e@x.com', status: 'suspended' },
+      { 'x-admin-secret': ADMIN },
+    )
+    expect(r.status).toBe(200)
+
+    // The live cookie is cut off too, not just new logins.
+    expect((await call('/partner/me', { headers: { Cookie: cookie } })).status).toBe(403)
+    const relogin = await postJson('/partner/auth/login', { username: 'e@x.com', password: PW })
+    expect(relogin.status).not.toBe(200)
+    expect((await postJson(
+      '/partner/coupon/issue',
+      { credits: 1, clientKey: 'k' },
+      { Cookie: cookie },
+    )).status).toBeGreaterThanOrEqual(400)
+  })
+
+  it('keeps the balance and history — the books still have to reconcile', async () => {
+    const id = await seed('e@x.com', '100')
+    await postJson('/admin/partner/status', { email: 'e@x.com', status: 'suspended' }, { 'x-admin-secret': ADMIN })
+    expect(BigInt((await getPartner(env, id))!.balanceAtomic)).toBe(100_000_000n)
+  })
+
+  it('is reversible', async () => {
+    await seed('e@x.com', '100')
+    await postJson('/admin/partner/status', { email: 'e@x.com', status: 'suspended' }, { 'x-admin-secret': ADMIN })
+    await postJson('/admin/partner/status', { email: 'e@x.com', status: 'active' }, { 'x-admin-secret': ADMIN })
+    expect((await postJson('/partner/auth/login', { username: 'e@x.com', password: PW })).status).toBe(200)
+  })
+
+  it('refuses an unknown partner rather than creating one', async () => {
+    // topup and login-link create on first use; flipping the state of something
+    // that does not exist is a typo, not an intent.
+    const r = await postJson(
+      '/admin/partner/status',
+      { email: 'ghost', status: 'suspended' },
+      { 'x-admin-secret': ADMIN },
+    )
+    expect(r.status).toBe(404)
+    expect(await getPartnerIdByEmail(env, 'ghost')).toBeNull()
+  })
+
+  it('needs the admin secret and a valid status', async () => {
+    await seed('e@x.com', '100')
+    expect((await postJson('/admin/partner/status', { email: 'e@x.com', status: 'suspended' })).status).toBe(401)
+    expect((await postJson('/admin/partner/status', { email: 'e@x.com', status: 'banana' }, { 'x-admin-secret': ADMIN })).status).toBe(400)
+  })
+})
+
+// ── Customer message template ────────────────────────────────────────────────
+
+describe('customer message', () => {
+  it('names both the credits and the dollars, and carries no expiry line', async () => {
+    // The buyer picks a package by credits inside OpenRouter, but the link has
+    // to come out at an exact dollar figure. Giving one number without the
+    // other is what produces a link that misses by a few cents.
+    const js = await (await call('/partner/app')).text()
+    expect(js).toContain("credits + '积分（$' + face + '）'")
+    expect(js).toContain("'1. 在 OpenRouter 里生成一条 ' + amountPhrase + ' 的支付链接'")
+    expect(js).not.toContain('有效期至')
+    expect(js).not.toContain('过期后失效')
+  })
+
+  it('falls back to dollars-only when a coupon was issued by amount', async () => {
+    // Those carry no credits figure; "null积分" would be worse than saying
+    // nothing about credits at all.
+    const js = await (await call('/partner/app')).text()
+    expect(js).toContain("'金额正好是 $' + face")
+  })
+})

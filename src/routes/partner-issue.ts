@@ -36,7 +36,9 @@ import {
   readLedger,
   reconcilePending,
   topupPartner,
-  isValidPartnerIdentifier,} from './partner-store'
+  isValidPartnerIdentifier,
+  setPartnerStatus,
+  getPartnerIdByEmail,} from './partner-store'
 import { requirePartnerSession } from './partner-auth'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -381,4 +383,48 @@ export async function handleAdminPartnerTopup(request: Request, env: Env): Promi
     if (err instanceof PartnerError) return partnerErrorResponse(err)
     throw err
   }
+}
+
+// ── POST /admin/partner/status ───────────────────────────────────────────────
+
+/**
+ * Turn a partner on or off. Needed to retire an account without deleting its
+ * ledger — the books have to keep reconciling after the person is gone.
+ */
+export async function handleAdminPartnerStatus(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
+  if (!env.ADMIN_TOKEN) return json(500, { error: 'ADMIN_TOKEN is not configured' })
+  const secret = request.headers.get('x-admin-secret')?.trim()
+  if (!secret || secret !== env.ADMIN_TOKEN) return json(401, { error: 'Unauthorized' })
+
+  let body: any
+  try {
+    body = await request.json()
+  } catch {
+    return json(400, { error: 'Invalid JSON body' })
+  }
+
+  const email = typeof body?.email === 'string' ? body.email.trim() : ''
+  if (!email || !isValidPartnerIdentifier(email)) {
+    return json(400, { error: 'email is required (a username or an email address)' })
+  }
+  const status = body?.status
+  if (status !== 'active' && status !== 'suspended') {
+    return json(400, { error: "status must be 'active' or 'suspended'" })
+  }
+
+  // No account creation here, unlike topup and login-link: switching the state
+  // of something that does not exist is a typo, not an intent.
+  const partnerId = await getPartnerIdByEmail(env, email)
+  if (!partnerId) return json(404, { error: 'no such partner' })
+
+  const partner = await setPartnerStatus(env, partnerId, status)
+  if (!partner) return json(404, { error: 'no such partner' })
+  return json(200, {
+    ok: true,
+    partnerId: partner.id,
+    email: partner.email,
+    status: partner.status,
+    balanceUsd: formatUsdc(BigInt(partner.balanceAtomic)),
+  })
 }

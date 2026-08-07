@@ -109,19 +109,33 @@ function buildIssueConfirmText(creditsLabel, faceAtomic, balanceAtomic) {
   ].join('\\n');
 }
 
-/** Customer-facing message the partner one-taps to copy. */
-function buildCustomerMessage(code, faceAtomic, claimUrl, expiresAt) {
+/**
+ * Customer-facing message the partner one-taps to copy.
+ *
+ * Step 1 names BOTH the credits and the dollars (founder 2026-08-07). The
+ * buyer picks a package by credits inside OpenRouter but the link has to come
+ * out at an exact dollar figure, and giving only one of the two numbers is
+ * what produces a link that misses by a few cents and gets refused.
+ *
+ * No expiry line. It read as pressure on a buyer who is usually paying within
+ * the hour anyway, and 14 days rarely matters to them. The partner still sees
+ * the real expiry in their own list, which is where it is actionable.
+ */
+function buildCustomerMessage(code, faceAtomic, claimUrl, credits) {
   var face = atomicToUsd(faceAtomic);
+  // Coupons issued through the by-amount entry carry no credits figure; naming
+  // only the dollars beats printing "null积分".
+  var amountPhrase = credits
+    ? credits + '积分（$' + face + '）'
+    : '金额正好是 $' + face;
   return [
     '你的 OpenRouter 充值码：' + code,
     '面额：$' + face,
     '',
     '使用步骤：',
-    '1. 在 OpenRouter 里生成一条金额正好是 $' + face + ' 的加密支付链接',
+    '1. 在 OpenRouter 里生成一条 ' + amountPhrase + ' 的支付链接',
     '2. 打开 ' + claimUrl,
-    '3. 贴上支付链接 + 输入充值码，点「立即兑换」',
-    '',
-    '有效期至：' + formatWhen(expiresAt) + '（过期后失效，请尽快使用）'
+    '3. 贴上支付链接 + 输入充值码，点「立即兑换」'
   ].join('\\n');
 }
 
