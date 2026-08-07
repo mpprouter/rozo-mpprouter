@@ -30,10 +30,14 @@ function body(contact: string): string {
 <main class="wrap">
   <section style="padding:34px 0 4px;">
     <h1>发卡密，自己来。</h1>
-    <p class="muted" style="max-width:560px;">
-      这是给你的自助工具：登录后自己发 OpenRouter 充值卡密，卖给你的客户。
-      我们不赚差价、不抽成 —— 你的利润在你卖给客户的那一层。
-    </p>
+  </section>
+
+  <section class="card" id="customer-script">
+    <h2>你的客户怎么用这张卡</h2>
+    <p class="muted" style="margin-top:-4px;">把下面这段直接发给客户，把 <code>XXXXXX</code> 换成你发出的卡密。</p>
+    <pre class="copybox" id="cust-copy">卡号：https://open.rozo.ai/claim?code=XXXXXX
+先打开上面链接。输入代付款支付链接（例如 https://payments.coinbase.com/payment-sessions/paymentSession_xxxxxx ）。默认美国付款方式自动到账，自助自动发货。如果新用户不会操作，请等待人工客服。</pre>
+    <button class="btn btn--ghost" id="cust-copy-btn" type="button">复制这段话</button>
   </section>
 
   <section class="card">
@@ -43,32 +47,6 @@ function body(contact: string): string {
       <li class="step"><span class="step-n">2</span><span>联系我们充值，余额到账后就能发卡。</span></li>
       <li class="step"><span class="step-n">3</span><span>按需发卡密，把兑换链接发给你的客户。</span></li>
     </ol>
-  </section>
-
-  <section class="card">
-    <h2>价格：1 credit = $1.05</h2>
-    <p class="muted" style="margin-bottom:10px;">
-      余额记<strong>美金</strong>。发一张 50 credits 的卡，扣你 50 × 1.05 = <strong>$52.50</strong>。
-    </p>
-    <div class="note note--warn">
-      那 <strong>5%</strong> 是 <strong>OpenRouter 对加密支付收取的手续费，由 OpenRouter 收取，不是 Rozo 收的</strong>。
-      我们原样透传，不加价、不打折。
-    </div>
-    <p class="dim" style="margin:0;">
-      单张卡面额上限 $1050，下限 1 credit（$1.05）。
-    </p>
-  </section>
-
-  <section class="card">
-    <h2>你的客户怎么用这张卡</h2>
-    <ol class="steps">
-      <li class="step"><span class="step-n">1</span><span>你把发卡后拿到的 <code>claimUrl</code> 兑换链接和卡密发给他。</span></li>
-      <li class="step"><span class="step-n">2</span><span>他在 OpenRouter 里生成一条<strong>金额正好等于卡密面额</strong>的加密支付链接。金额对不上会被拒。</span></li>
-      <li class="step"><span class="step-n">3</span><span>他打开兑换页，贴上支付链接 + 输入卡密，我们替他把这张单付掉。</span></li>
-    </ol>
-    <p class="dim" style="margin:12px 0 0;">
-      卡密是<strong>持有即可用</strong>的凭证 —— 谁拿到谁能兑。发出去之后请自己保管好，别群发、别公开贴。
-    </p>
   </section>
 
   <section class="card">
@@ -88,13 +66,12 @@ function body(contact: string): string {
       <li><strong>密码忘了怎么办：</strong>没有自助找回。直接联系我们，我们给你发一条一次性登录链接，点开即登录，然后我们再给你换新密码。</li>
     </ul>
     <div class="note note--ok" style="margin:0;">
-      联系我们（充值 / 忘记密码 / 任何问题）：<strong>${c}</strong>
+      充值 / 忘记密码 / 任何问题 —— 点<strong>右下角的对话按钮</strong>直接找我们。
     </div>
   </section>
 
   <section class="card" id="login-card">
     <h2>登录</h2>
-    <p class="dim" style="margin-top:-2px;">没有注册入口 —— 账号由我们开通。</p>
     <form id="login-form" autocomplete="on" novalidate>
       <div style="margin-bottom:14px;">
         <label class="label" for="username">用户名</label>
@@ -118,6 +95,10 @@ function body(contact: string): string {
     </p>
   </footer>
 </main>
+
+<button id="help-fab" type="button" aria-label="联系我们">
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+</button>
 `
 }
 
@@ -125,6 +106,52 @@ function script(opts: PartnerUiOptions): string {
   return `${MONEY_JS}
 ${analyticsScript(opts)}
 (function () {
+  // Copy the customer-facing script. This is what a partner pastes to a buyer,
+  // so it has to survive verbatim — retyping is how the claim URL ends up wrong.
+  var custBtn = document.getElementById('cust-copy-btn');
+  if (custBtn) {
+    custBtn.addEventListener('click', function () {
+      var text = document.getElementById('cust-copy').textContent;
+      function done() {
+        custBtn.textContent = '已复制';
+        setTimeout(function () { custBtn.textContent = '复制这段话'; }, 1600);
+      }
+      function fallback() {
+        // execCommand path for in-app browsers (WeChat) where the async
+        // clipboard API is missing or blocked outside a secure context.
+        var ta = document.createElement('textarea');
+        ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); done(); } catch (e) { /* select manually */ }
+        document.body.removeChild(ta);
+      }
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, fallback);
+      } else { fallback(); }
+    });
+  }
+
+  // Intercom, booted on the first click rather than on page load: the widget is
+  // a few hundred KB and nobody opening this page needs it before they ask.
+  var fab = document.getElementById('help-fab');
+  if (fab) {
+    var booted = false;
+    fab.addEventListener('click', function () {
+      var settings = { app_id: 'kpfdpai7', hide_default_launcher: false };
+      function show() { if (typeof window.Intercom === 'function') window.Intercom('show'); }
+      if (booted) { show(); return; }
+      booted = true;
+      window.intercomSettings = settings;
+      var el = document.createElement('script');
+      el.async = true;
+      el.src = 'https://widget.intercom.io/widget/kpfdpai7';
+      el.onload = function () {
+        if (typeof window.Intercom === 'function') { window.Intercom('boot', settings); show(); }
+      };
+      document.head.appendChild(el);
+    });
+  }
+
   var form = document.getElementById('login-form');
   var btn = document.getElementById('login-btn');
   var msg = document.getElementById('login-msg');
