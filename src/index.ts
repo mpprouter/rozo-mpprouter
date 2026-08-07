@@ -245,6 +245,18 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const url = new URL(request.url)
 
     try {
+      // coupon.rozo.ai is the partner-facing hostname, not an API endpoint.
+      // Landing on its root should not show the router's index page — the
+      // people who type this domain are partners looking for the backend.
+      //
+      // 302, not 301: a permanent redirect gets cached hard by browsers and
+      // is painful to walk back if this hostname ever fronts something else.
+      // Scoped to the bare root so every /partner* path (and anything else
+      // reached on this hostname) keeps behaving exactly as before.
+      if (url.hostname === 'coupon.rozo.ai' && (url.pathname === '/' || url.pathname === '')) {
+        return Response.redirect(new URL('/partner', url).toString(), 302)
+      }
+
       if (url.pathname === '/health') {
         return handleHealth(env)
       }
