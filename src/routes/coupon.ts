@@ -127,6 +127,20 @@ export interface CouponRecord {
   coinbaseResult: unknown | null
   failureReason: string | null
   events: Array<{ kind: string; at: string; detail?: unknown }>
+  /**
+   * Partner-platform fields (ainative todos/20260807-coupon-reseller-platform.md).
+   * NULL/absent on every coupon issued before 2026-08-07 and on everything the
+   * admin path issues — readers must tolerate that.
+   */
+  partnerId?: string | null
+  /** Op id of the debit that paid for this coupon. Reconcile matches on
+   * partnerId + issueLedgerId together; "the key exists" alone would confirm a
+   * collision with someone else's coupon. */
+  issueLedgerId?: string | null
+  /** Ledger entry that returned the money. Separate from issueLedgerId because
+   * a coupon writes TWO ledger rows over its life (debit on issue, credit on
+   * void/expiry) and one field would clobber the first with the second. */
+  refundLedgerId?: string | null
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────
@@ -192,7 +206,7 @@ async function doPost<T>(stub: DurableObjectStub, path: string, payload: unknown
   return resp.json() as Promise<T>
 }
 
-async function casUpdate<R>(
+export async function casUpdate<R>(
   env: Env,
   key: string,
   fn: (current: string | null) => CasChange<R>,
@@ -216,7 +230,7 @@ async function casUpdate<R>(
   throw new Error(`coupon DO casUpdate(${key}): exhausted ${maxRetries} retries`)
 }
 
-async function casRead(env: Env, key: string): Promise<string | null> {
+export async function casRead(env: Env, key: string): Promise<string | null> {
   const r = await doPost<ReadResponse>(couponStub(env), '/read', { key })
   return r.value
 }
@@ -243,11 +257,11 @@ function serviceUnavailable(): Response {
   })
 }
 
-function couponKey(code: string) {
+export function couponKey(code: string) {
   return `coupon:${code}`
 }
 
-function parseRecord(raw: string | null): CouponRecord | null {
+export function parseRecord(raw: string | null): CouponRecord | null {
   if (!raw) return null
   try {
     return JSON.parse(raw) as CouponRecord
@@ -468,16 +482,41 @@ async function publicGate(request: Request, env: Env): Promise<Response | null> 
  * multiple of 1e8 that fits in 2^32.
  */
 export function generateCouponCode(): string {
-  const LIMIT = 4_200_000_000 // floor(2^32 / 1e8) * 1e8
-  // Statistically this loop runs once (rejection probability ≈ 2.2%).
+  // 2026-08-07 (founder): widened 8 -> 10 digits. Live-coupon count scales the
+  // brute-force hit rate linearly (see ainative
+  // todos/20260807-coupon-reseller-platform.md §9.2), and the partner platform
+  // multiplies how many coupons are live at once. 10^8 -> 10^10 drops the 12h
+  // hit chance at ~100 live coupons from 0.6% to 0.006%.
+  //
+  // A single Uint32 CANNOT back a 10-digit space: 2^32 ≈ 4.29e9 < 1e10, so
+  // `% 1e10` on one uint32 would make more than half the codes unreachable
+  // (you cannot get more entropy out than the source has). Draw 64 bits.
+  //
+  // UX cost of the longer code is ~0: since 2026-07-07 operators hand out a
+  // claimUrl (?code= prefills the field), so nobody types the digits.
   for (;;) {
-    const buf = new Uint32Array(1)
+    const buf = new Uint32Array(2)
     crypto.getRandomValues(buf)
-    if (buf[0] < LIMIT) return (buf[0] % 100_000_000).toString().padStart(8, '0')
+    const n = (BigInt(buf[0]) << 32n) | BigInt(buf[1])
+    // Rejection sampling against the largest multiple of SPACE that fits in
+    // 2^64 — an unbiased draw. Rejection probability ≈ 1.7e-9.
+    if (n < CODE_SAMPLE_LIMIT) return (n % CODE_SPACE).toString().padStart(10, '0')
   }
 }
 
-const CODE_RE = /^\d{8}$/
+const CODE_SPACE = 10_000_000_000n // 10^10
+const CODE_SAMPLE_LIMIT = (2n ** 64n / CODE_SPACE) * CODE_SPACE
+
+// Accepts BOTH lengths during (and after) the migration: 8-digit codes issued
+// before 2026-08-07 stay redeemable until they expire (max 7 days out), while
+// every newly issued code is 10 digits. Shared by redeem, /admin/coupon/get and
+// /admin/coupon/resolve — changing it here covers all three.
+//
+// Both lengths take the SAME lookup path and return the SAME invalidCoupon()
+// body on every pre-claim failure, so the length split adds no oracle. Timing
+// parity is explicitly NOT a goal (founder 2026-08-07: exposure is a few
+// hundred USD; no side-channel hardening).
+export const CODE_RE = /^(?:\d{8}|\d{10})$/
 
 // ── Admin auth ───────────────────────────────────────────────────────────────
 //
@@ -602,7 +641,7 @@ export async function handleResolveCoupon(request: Request, env: Env): Promise<R
   const code = String(body?.code ?? '').trim()
   const action = String(body?.action ?? '').trim()
   const reason = typeof body?.reason === 'string' ? body.reason : null
-  if (!CODE_RE.test(code)) return json(400, { error: 'code must be 8 digits' })
+  if (!CODE_RE.test(code)) return json(400, { error: 'code must be 8 or 10 digits' })
   if (!['void', 'release', 'mark_redeemed'].includes(action)) {
     return json(400, { error: "action must be one of: void, release, mark_redeemed" })
   }
@@ -658,7 +697,7 @@ export async function handleAdminGetCoupon(request: Request, env: Env): Promise<
   if (denied) return denied
 
   const code = new URL(request.url).searchParams.get('code')?.trim() ?? ''
-  if (!CODE_RE.test(code)) return json(400, { error: 'code must be 8 digits' })
+  if (!CODE_RE.test(code)) return json(400, { error: 'code must be 8 or 10 digits' })
   const rec = parseRecord(await casRead(env, couponKey(code)))
   if (!rec) return json(404, { error: 'not found' })
   return json(200, { ok: true, coupon: rec })

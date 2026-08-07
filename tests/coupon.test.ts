@@ -236,7 +236,7 @@ async function issueCoupon(env: Env, amountUsd = '20'): Promise<string> {
   const resp = await handleIssueCoupon(issueReq({ amountUsd }), env)
   expect(resp.status).toBe(200)
   const body: any = await resp.json()
-  expect(body.code).toMatch(/^\d{8}$/)
+  expect(body.code).toMatch(/^\d{10}$/)
   return body.code
 }
 
@@ -254,10 +254,25 @@ afterEach(() => {
 // ── Code generation ──────────────────────────────────────────────────────────
 
 describe('generateCouponCode', () => {
-  it('always returns exactly 8 decimal digits', () => {
-    for (let i = 0; i < 200; i++) {
-      expect(generateCouponCode()).toMatch(/^\d{8}$/)
+  // 2026-08-07: widened 8 -> 10 digits. A single Uint32 (2^32 ≈ 4.29e9) cannot
+  // back a 10^10 space, so the generator draws 64 bits; this asserts the width
+  // actually came out right rather than silently truncating.
+  it('always returns exactly 10 decimal digits', () => {
+    for (let i = 0; i < 500; i++) {
+      expect(generateCouponCode()).toMatch(/^\d{10}$/)
     }
+  })
+
+  it('reaches the top decade — proof the 32-bit source was really widened', () => {
+    // With one Uint32 the value can never exceed 4_294_967_295, so a leading
+    // digit of 5..9 would be unreachable and >half the space would be dead.
+    const leads = new Set(Array.from({ length: 400 }, () => generateCouponCode()[0]))
+    expect([...leads].some((d) => d >= '5')).toBe(true)
+  })
+
+  it('keeps leading zeros (the full 10^10 space is usable)', () => {
+    const codes = Array.from({ length: 2000 }, () => generateCouponCode())
+    expect(codes.every((c) => c.length === 10)).toBe(true)
   })
 
   it('is not constant', () => {
@@ -288,13 +303,13 @@ describe('POST /admin/coupon/issue', () => {
     }
   })
 
-  it('issues an 8-digit code with ~12h default expiry', async () => {
+  it('issues a 10-digit code with ~12h default expiry', async () => {
     const { env, fetchMock } = makeEnv()
     globalThis.fetch = fetchMock
     const resp = await handleIssueCoupon(issueReq({ amountUsd: '20' }), env)
     expect(resp.status).toBe(200)
     const body: any = await resp.json()
-    expect(body.code).toMatch(/^\d{8}$/)
+    expect(body.code).toMatch(/^\d{10}$/)
     expect(body.amountUsd).toBe('20')
     // 2026-07-07: claimUrl lets operators hand out a clickable link instead of
     // a bare code (open.rozo.ai/claim resolves ?code= and shows face value).
