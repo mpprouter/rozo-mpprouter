@@ -4,6 +4,23 @@ compatibility_date = "2026-04-09"
 compatibility_flags = ["nodejs_compat"]
 account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
 
+# Custom domains.
+#
+# apiserver.mpprouter.dev was attached through the dashboard and is NOT
+# optional here: once `routes` exists in this file wrangler manages the set,
+# and leaving the older domain out risks detaching the hostname that currently
+# serves production payments. Both are listed so the config is the whole truth.
+#
+# coupon.rozo.ai (2026-08-07) fronts the partner platform. The rozo.ai zone
+# lives in this same account, which is why a custom_domain entry can create it.
+[[routes]]
+pattern = "apiserver.mpprouter.dev"
+custom_domain = true
+
+[[routes]]
+pattern = "coupon.rozo.ai"
+custom_domain = true
+
 # Workers Logs retention. Without this block Cloudflare keeps NO request logs,
 # so a production payment incident can only be debugged by catching it live with
 # `wrangler tail` — useless after the fact. Established 2026-08-01 after a real

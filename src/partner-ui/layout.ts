@@ -97,6 +97,29 @@ p { margin: 0 0 12px; }
   min-height: 40px; font-weight: 600; font-size: 13.5px;
 }
 .btn--ghost:hover:not(:disabled) { color: #fff; border-color: #52525B; }
+
+/* Copyable script block. Wraps on purpose: the claim URL is long, and a pre
+   that does not wrap makes the whole page scroll sideways on a phone, which
+   is the one thing this layout must never do.
+   (No backticks in here -- the stylesheet lives in a template literal.) */
+.copybox {
+  white-space: pre-wrap; word-break: break-word;
+  background: #0F0F11; border: 1px solid #27272A; border-radius: 8px;
+  padding: 14px; margin: 0 0 12px; font-family: inherit;
+  font-size: 13px; line-height: 1.75; color: #D4D4D8;
+}
+
+/* Chat launcher. Intercom swaps in its own launcher once booted, so this only
+   has to look right until the first click. */
+#help-fab {
+  position: fixed; right: 20px; bottom: 20px;
+  width: 52px; height: 52px; border-radius: 50%; border: none;
+  background: #2F6FED; color: #fff; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 6px 20px rgba(0,0,0,.42); z-index: 2147483000;
+}
+#help-fab:hover { background: #3B7BF5; }
+@media (max-width: 520px) { #help-fab { right: 14px; bottom: 14px; width: 48px; height: 48px; } }
 .btn--danger { background: #DC2626; color: #fff; }
 .steps { display: grid; gap: 12px; margin: 0 0 4px; padding: 0; list-style: none; }
 .step { display: flex; gap: 10px; align-items: flex-start; }
