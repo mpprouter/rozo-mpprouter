@@ -246,6 +246,31 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
     const url = new URL(request.url)
 
     try {
+      // Force HTTPS on the partner hostname, before anything else runs.
+      //
+      // Typing a bare hostname into a browser goes to http:// first, and this
+      // Worker was happily answering: the full login page, password field and
+      // all, in plaintext. Three problems at once — the browser says "not
+      // secure", a submitted password crosses the network in the clear, and the
+      // session cookie is `Secure` so it is never set, meaning the login
+      // silently fails anyway.
+      //
+      // 301 rather than 302: this one really is permanent, and the permanent
+      // form is what browsers remember so the insecure hop stops happening.
+      //
+      // The durable fix is "Always Use HTTPS" at the zone level, which stops
+      // the plaintext request before it reaches a Worker at all. This is the
+      // belt that does not depend on that setting staying on.
+      //
+      // Deliberately NOT applied to apiserver.mpprouter.dev: a 301 turns a POST
+      // into a GET in some clients, and that hostname has existing integrators
+      // whose requests must not be silently mangled.
+      if (url.hostname === 'coupon.rozo.ai' && url.protocol === 'http:') {
+        const secure = new URL(url.toString())
+        secure.protocol = 'https:'
+        return Response.redirect(secure.toString(), 301)
+      }
+
       // coupon.rozo.ai is the partner-facing hostname, not an API endpoint.
       // Landing on its root should not show the router's index page — the
       // people who type this domain are partners looking for the backend.
@@ -312,42 +337,55 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // API down, or vice versa) is worse than none — it looks usable and
       // fails at the point where money moves.
       if (url.pathname === '/partner' || url.pathname.startsWith('/partner/')) {
-        if (env.PARTNER_ENDPOINT_ENABLED !== 'true') {
+        // Build the response first, then stamp HSTS on whatever comes out.
+        // Wrapping each `return` individually would work until someone adds a
+        // branch and forgets — and the forgotten one is a page served without
+        // the header, which is exactly the case that matters.
+        const resp = await (async (): Promise<Response> => {
+          if (env.PARTNER_ENDPOINT_ENABLED !== 'true') {
+            return new Response(JSON.stringify({ error: 'Not found' }), {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            })
+          }
+          const uiOpts = {}
+
+          // Pages
+          if (url.pathname === '/partner' && request.method === 'GET') {
+            return renderPartnerExplainerPage(uiOpts)
+          }
+          if (url.pathname === '/partner/app' && request.method === 'GET') {
+            return renderPartnerAppPage(uiOpts)
+          }
+
+          // Auth
+          if (url.pathname === '/partner/auth/login') return handlePartnerLogin(request, env)
+          if (url.pathname === '/partner/auth/callback') {
+            return handlePartnerAuthCallback(request, env)
+          }
+
+          // Session-scoped API. Every one of these resolves the partner from
+          // the signed cookie; a partnerId is NEVER taken from the client.
+          if (url.pathname === '/partner/me') return handlePartnerMe(request, env)
+          if (url.pathname === '/partner/coupon/issue') {
+            return handlePartnerIssueCoupon(request, env)
+          }
+          if (url.pathname === '/partner/coupons') return handlePartnerListCoupons(request, env)
+          const voidMatch = url.pathname.match(/^\/partner\/coupon\/(\d{8}|\d{10})\/void$/)
+          if (voidMatch) return handlePartnerVoidCoupon(request, env, voidMatch[1])
+
           return new Response(JSON.stringify({ error: 'Not found' }), {
             status: 404,
             headers: { 'Content-Type': 'application/json' },
           })
-        }
-        const uiOpts = { contact: env.PARTNER_CONTACT }
+        })()
 
-        // Pages
-        if (url.pathname === '/partner' && request.method === 'GET') {
-          return renderPartnerExplainerPage(uiOpts)
-        }
-        if (url.pathname === '/partner/app' && request.method === 'GET') {
-          return renderPartnerAppPage(uiOpts)
-        }
-
-        // Auth
-        if (url.pathname === '/partner/auth/login') return handlePartnerLogin(request, env)
-        if (url.pathname === '/partner/auth/callback') {
-          return handlePartnerAuthCallback(request, env)
-        }
-
-        // Session-scoped API. Every one of these resolves the partner from the
-        // signed cookie; a partnerId is NEVER taken from the client.
-        if (url.pathname === '/partner/me') return handlePartnerMe(request, env)
-        if (url.pathname === '/partner/coupon/issue') {
-          return handlePartnerIssueCoupon(request, env)
-        }
-        if (url.pathname === '/partner/coupons') return handlePartnerListCoupons(request, env)
-        const voidMatch = url.pathname.match(/^\/partner\/coupon\/(\d{8}|\d{10})\/void$/)
-        if (voidMatch) return handlePartnerVoidCoupon(request, env, voidMatch[1])
-
-        return new Response(JSON.stringify({ error: 'Not found' }), {
-          status: 404,
-          headers: { 'Content-Type': 'application/json' },
-        })
+        // HSTS so a browser that has been here once never tries plaintext
+        // again. No includeSubDomains: committing every rozo.ai subdomain to
+        // HTTPS-only is not this feature's call to make.
+        const out = new Response(resp.body, resp)
+        out.headers.set('Strict-Transport-Security', 'max-age=31536000')
+        return out
       }
 
       // Partner admin. Behind the same COUPON_ENDPOINT_ENABLED gate + ADMIN_TOKEN

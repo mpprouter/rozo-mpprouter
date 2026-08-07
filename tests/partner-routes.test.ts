@@ -644,3 +644,57 @@ describe('customer message', () => {
     expect(js).toContain("'金额正好是 $' + face")
   })
 })
+
+// ── Transport security ───────────────────────────────────────────────────────
+
+describe('https enforcement', () => {
+  const at = (u: string, init: RequestInit = {}) => worker.fetch(new Request(u, init), env, ctx)
+
+  it('never serves the login page over plaintext http', async () => {
+    // This shipped broken: http://coupon.rozo.ai/partner returned the full
+    // login form, password field and all. The browser calls it "not secure",
+    // a submitted password crosses the wire in the clear, and the Secure
+    // session cookie is never set — so it is insecure AND non-functional.
+    const resp = await at('http://coupon.rozo.ai/partner')
+    expect(resp.status).toBe(301)
+    const loc = new URL(resp.headers.get('Location')!)
+    expect(loc.protocol).toBe('https:')
+    expect(loc.pathname).toBe('/partner')
+  })
+
+  it('upgrades the scheme before doing anything else, including the root redirect', async () => {
+    // The root redirect used to inherit the request scheme, so the bare domain
+    // actively forwarded people TO the plaintext page.
+    const resp = await at('http://coupon.rozo.ai/')
+    expect(resp.status).toBe(301)
+    expect(new URL(resp.headers.get('Location')!).protocol).toBe('https:')
+  })
+
+  it('preserves the path and query when upgrading', async () => {
+    const resp = await at('http://coupon.rozo.ai/partner/auth/callback?token=abc')
+    const loc = new URL(resp.headers.get('Location')!)
+    expect(loc.protocol).toBe('https:')
+    expect(loc.pathname).toBe('/partner/auth/callback')
+    expect(loc.searchParams.get('token')).toBe('abc')
+  })
+
+  it('sends HSTS on every partner response, including errors', async () => {
+    for (const p of ['/partner', '/partner/app', '/partner/me', '/partner/nope']) {
+      const resp = await at(`https://coupon.rozo.ai${p}`)
+      expect(resp.headers.get('Strict-Transport-Security'), p).toBe('max-age=31536000')
+    }
+  })
+
+  it('does not claim includeSubDomains', async () => {
+    // That would commit every rozo.ai subdomain to HTTPS-only.
+    const h = (await at('https://coupon.rozo.ai/partner')).headers.get('Strict-Transport-Security')!
+    expect(h).not.toMatch(/includeSubDomains/i)
+  })
+
+  it('leaves apiserver.mpprouter.dev on http alone', async () => {
+    // A 301 turns a POST into a GET in some clients; that hostname has
+    // integrators whose requests must not be silently mangled.
+    const resp = await at('http://apiserver.mpprouter.dev/health')
+    expect(resp.status).toBe(200)
+  })
+})
