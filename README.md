@@ -24,4 +24,4 @@ curl https://apiserver.mpprouter.dev/health
 curl https://apiserver.mpprouter.dev/v1/services/catalog
 ```
 
-For integration details, see [docs/integration.md](/Users/happyfish/workspace/rozov2/rozo-mpprouter/docs/integration.md).
+For integration details, see [docs/integration.md](docs/integration.md).
