@@ -14,7 +14,7 @@ Router 的链路是:`客户付 Stellar USDC → Router pool → Router 用 Tempo
 
 ## 1. 前置(一次性)
 
-- **测试钱包**:`/Users/happyfish/workspace/rozo/rozocontracts/rozoskilltest/.env` 里的 `STELLAR_ADDRESS` / `STELLAR_PRIVATE_KEY`(公钥 `GAN3YS...4UYY`)。需 Stellar 主网有 USDC 余额(查:`horizon.stellar.org/accounts/<G地址>`)。
+- **测试钱包**:`~/workspace/rozo/rozocontracts/rozoskilltest/.env` 里的 `STELLAR_ADDRESS` / `STELLAR_PRIVATE_KEY`(公钥 `GAN3YS...4UYY`)。需 Stellar 主网有 USDC 余额(查:`horizon.stellar.org/accounts/<G地址>`)。
 - **客户端**:`stellar-agent-wallet` skill 的 `pay-per-call`(插件缓存 `~/.claude/plugins/cache/mpprouter/stellar-agent-wallet/<ver>/`)。它自动处理 402→签名→重试,默认走 MPP charge dialect。
 - **Router base**:`https://apiserver.mpprouter.dev`(公开)。
 
@@ -25,7 +25,7 @@ Router 的链路是:`客户付 Stellar USDC → Router pool → Router 用 Tempo
   ```bash
   TMP=$(mktemp /tmp/.stkey.XXXXXX); chmod 600 "$TMP"
   python3 -c "
-  for l in open('/Users/happyfish/workspace/rozo/rozocontracts/rozoskilltest/.env'):
+  for l in open('~/workspace/rozo/rozocontracts/rozoskilltest/.env'):
       if l.startswith('STELLAR_PRIVATE_KEY='):
           open('$TMP','w').write(l.split('=',1)[1].strip().strip('\"').strip(\"'\")); break
   "
@@ -94,7 +94,7 @@ npx tsx skills/pay-per-call/run.ts \
 
 1. 结果写进 `analytics_log`(在 ainative):
    ```bash
-   cd /Users/happyfish/workspace/ainative
+   cd ~/workspace/ainative
    python3 scripts/analytics_log.py add --title "..." --summary "..." \
      --report docs/xxx.md --tags mpprouter,e2e-test
    ```

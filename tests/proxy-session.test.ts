@@ -327,7 +327,7 @@ describe.skipIf(!loadDevVars())('handleProxy session dispatch (structural)', () 
  * bumpCumulative on 2xx" assertion requires a real HMAC-bound
  * Stellar credential and a working Soroban-simulated RPC path,
  * which the unit test environment does not have. That test is
- * the live SDK run from /Users/happyfish/workspace/stellar/
+ * the live SDK run from ~/workspace/stellar/
  * stellar-mpp-sdk against the deployed Worker — see §11 of
  * internaldocs/session-support-plan.md.
  *

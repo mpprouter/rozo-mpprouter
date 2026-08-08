@@ -16,3 +16,6 @@ CLAUDE.md
 tasks
 bun.lockb
 .gstack/
+
+# Internal working notes (review transcripts, local paths) — never publish
+internal-docs/

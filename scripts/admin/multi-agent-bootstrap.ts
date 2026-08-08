@@ -55,7 +55,7 @@ import {
 // ----------------------------------------------------------------------------
 
 const ENV_DEV_PATH =
-  '/Users/happyfish/workspace/stellar/stellar-mpp-sdk/.env.dev'
+  `${process.env.HOME}/workspace/stellar/stellar-mpp-sdk/.env.dev`
 const HORIZON_URL = 'https://horizon.stellar.org'
 const NETWORK_PASSPHRASE = Networks.PUBLIC
 
