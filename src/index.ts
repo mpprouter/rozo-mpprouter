@@ -38,6 +38,7 @@ import {
 import {
   handlePartnerLogin,
   handlePartnerAuthCallback,
+  handleAdminPartnerApiKey,
   handleAdminPartnerLoginLink,
 } from './routes/partner-auth'
 import {
@@ -394,7 +395,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       if (
         url.pathname === '/admin/partner/login-link' ||
         url.pathname === '/admin/partner/topup' ||
-        url.pathname === '/admin/partner/status'
+        url.pathname === '/admin/partner/status' ||
+        url.pathname === '/admin/partner/api-key'
       ) {
         if (env.COUPON_ENDPOINT_ENABLED !== 'true') {
           return new Response(JSON.stringify({ error: 'Not found' }), {
@@ -407,6 +409,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         }
         if (url.pathname === '/admin/partner/status') {
           return handleAdminPartnerStatus(request, env)
+        }
+        if (url.pathname === '/admin/partner/api-key') {
+          return handleAdminPartnerApiKey(request, env)
         }
         return handleAdminPartnerTopup(request, env)
       }

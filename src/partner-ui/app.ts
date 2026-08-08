@@ -59,6 +59,128 @@ function body(contact: string): string {
       </table>
     </div>
   </section>
+
+  <section class="card">
+    <details id="adv">
+      <summary>
+        <span>高级玩家 · API &amp; Agentic</span>
+        <span class="dim">用脚本或 AI 助手发卡 / 作废</span>
+      </summary>
+
+      <div class="adv-body">
+        <p class="muted" style="margin:0 0 16px;">
+          页面上能做的两件事都有对应接口。需要一把 API Key 才能调用 —
+          <b>点右下角对话按钮找我们要</b>，我们只会给你看一次，请当场存好。
+          Key 泄露等于你的余额被别人花掉，别贴进聊天群或公开仓库。
+        </p>
+
+        <p class="label">鉴权（两个接口都一样）</p>
+        <div class="copybox" id="adv-auth">Authorization: Bearer &lt;你的 API Key&gt;</div>
+        <button class="btn btn--ghost btn--sm" type="button" data-copy="adv-auth">复制</button>
+
+        <p class="label" style="margin-top:26px;">① 发卡</p>
+        <p class="muted" style="margin:0 0 10px;">
+          <code>clientKey</code> 是幂等键，你自己生成、每张卡一个。
+          <b>同一个 clientKey 重复调用只会发出同一张卡</b>（返回里 <code>reused</code> 为 true），
+          所以网络超时时放心重试，不会重复扣钱。<code>credits</code> 和 <code>amountUsd</code> 二选一。
+        </p>
+        <div class="copybox" id="adv-issue">curl -X POST https://coupon.rozo.ai/partner/coupon/issue \\
+  -H "Authorization: Bearer $ROZO_PARTNER_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"clientKey":"my-order-1001","credits":10,"note":"闲鱼订单 1001"}'</div>
+        <button class="btn btn--ghost btn--sm" type="button" data-copy="adv-issue">复制</button>
+        <p class="dim" style="margin:10px 0 0;">
+          返回：<code>code</code>（卡密）、<code>claimUrl</code>（给客户的兑换链接）、
+          <code>amountUsd</code>、<code>expiresAt</code>（默认 14 天）、<code>balanceAfterUsd</code>（发完后的余额）。
+        </p>
+
+        <p class="label" style="margin-top:26px;">② 作废回收</p>
+        <p class="muted" style="margin:0 0 10px;">
+          把未使用的卡作废，面额退回余额。<code>confirm</code> 必须填该卡密的<b>后 4 位</b> —
+          防的是脚本传错变量把好卡废掉。已使用的卡废不掉。
+        </p>
+        <div class="copybox" id="adv-void">curl -X POST https://coupon.rozo.ai/partner/coupon/12345678/void \\
+  -H "Authorization: Bearer $ROZO_PARTNER_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{"confirm":"5678"}'</div>
+        <button class="btn btn--ghost btn--sm" type="button" data-copy="adv-void">复制</button>
+        <p class="dim" style="margin:10px 0 0;">
+          返回：<code>refundedUsd</code>（退回多少）、<code>balanceAfterUsd</code>。
+        </p>
+
+        <p class="label" style="margin-top:26px;">③ 查余额 / 查卡列表</p>
+        <div class="copybox" id="adv-read">curl https://coupon.rozo.ai/partner/me -H "Authorization: Bearer $ROZO_PARTNER_KEY"
+curl https://coupon.rozo.ai/partner/coupons -H "Authorization: Bearer $ROZO_PARTNER_KEY"</div>
+        <button class="btn btn--ghost btn--sm" type="button" data-copy="adv-read">复制</button>
+
+        <p class="label" style="margin-top:26px;">常见错误</p>
+        <ul class="muted" style="margin:0;padding-left:18px;line-height:1.9;">
+          <li><code>401 UNAUTHENTICATED</code> — Key 不对或没带 Authorization 头</li>
+          <li><code>402 INSUFFICIENT_BALANCE</code> — 余额不够，先充值</li>
+          <li><code>409 ISSUE_IN_FLIGHT</code> — 同一个 clientKey 正在处理中，<b>等一下重试，别换 clientKey</b></li>
+          <li><code>409 TOO_MANY_PENDING</code> — 并发太多，降速</li>
+          <li><code>403 PARTNER_SUSPENDED</code> — 账号被停用，联系我们</li>
+        </ul>
+
+        <hr class="adv-hr">
+
+        <p class="label">④ Agentic — 交给 AI 助手来做</p>
+        <p class="muted" style="margin:0 0 12px;">
+          把下面这段整个复制，贴进 Claude / ChatGPT，然后直接用大白话指挥它
+          （例如「发一张 10 credits 的卡，备注闲鱼订单 1001」）。
+          <b>记得把最后一行的 Key 换成你自己的</b>，并且只在你信任的、私密的对话里用。
+        </p>
+        <div class="copybox" id="adv-prompt">你是我的 Rozo 合伙人后台操作助手，负责帮我发放和回收 OpenRouter 充值卡密。
+
+## 接口
+基址 https://coupon.rozo.ai
+所有请求都要带头：Authorization: Bearer &lt;KEY&gt;   以及 Content-Type: application/json
+
+1) 发卡  POST /partner/coupon/issue
+   body: {"clientKey": 字符串, "credits": 数字, "note": 字符串（可选）}
+   - clientKey 是幂等键，必须由你生成且每张卡唯一（建议用订单号，如 "order-1001"）
+   - credits 和 amountUsd 只能二选一，一般用 credits
+   - 返回 code（卡密）、claimUrl（发给客户的兑换链接）、balanceAfterUsd（余额）
+
+2) 作废  POST /partner/coupon/{code}/void
+   body: {"confirm": "该卡密的后 4 位"}
+   - 只能作废未使用的卡，面额会退回余额
+   - 返回 refundedUsd、balanceAfterUsd
+
+3) 查余额  GET /partner/me
+4) 查卡列表 GET /partner/coupons
+
+## 批量发卡
+我可以一次要多张、多种面额，例如「发 2 张 1 credit、5 张 10 credits」。
+
+- 一张卡一个请求，串行发，不要并发。并发会在同一条余额记录上互相抢锁，
+  重试变多、也更难对账。
+- 每张卡的 clientKey 必须唯一。用「批次名-面额-序号」的格式，例如：
+  batch-0808a-c1-1, batch-0808a-c1-2, batch-0808a-c10-1 … batch-0808a-c10-5
+  同一批里绝不能出现两个相同的 clientKey，否则第二张开始会返回第一张的卡密，
+  你会以为发了 5 张，其实只有 1 张。
+- 开始前先算总额（张数 x 面额）并查 /partner/me 余额，不够就停下来告诉我，一张都别发。
+- 发的过程中如果某一张失败：停下，把「已成功几张、各自卡密、失败在第几张」告诉我，
+  不要自动跳过继续发后面的。
+- 全部发完，用表格汇总：序号 | 面额 | 卡密 | 兑换链接，最后一行给出剩余余额。
+
+## 规则（重要，请严格遵守）
+- 发卡和作废都会真实动钱。每次执行前，先用一句话复述你要做什么
+  （发几张、多少 credits、给谁），等我明确说「确认」再发请求。
+- 请求超时或网络出错时：用**完全相同的 clientKey** 重试，不要换。
+  换 clientKey 会真的发出第二张卡、扣第二次钱。
+- 收到 409 ISSUE_IN_FLIGHT：等 2 秒后用同样的 clientKey 重试，最多重试 3 次。
+- 收到 402 INSUFFICIENT_BALANCE：停下来告诉我余额不够，不要尝试改小金额绕过。
+- 收到 401：停下来告诉我 Key 有问题，不要重试。
+- 作废前先确认这张卡确实未使用（可先查 /partner/coupons 看 status）。
+- 每次操作完，告诉我：卡密、兑换链接、以及操作后的余额。
+- 绝对不要把我的 API Key 写进任何输出、代码文件或对话总结里。
+
+我的 KEY 是：&lt;把这里换成你的 API Key&gt;</div>
+        <button class="btn btn--sm" type="button" data-copy="adv-prompt">一键复制 Prompt</button>
+      </div>
+    </details>
+  </section>
 </main>
 
 <button id="help-fab" type="button" aria-label="联系我们">
@@ -512,6 +634,16 @@ ${analyticsScript(opts)}
       });
     }
   })();
+  // Advanced section: every button carries the id of the block it copies, so
+  // adding a snippet is HTML-only and cannot drift out of sync with the JS.
+  var copyBtns = document.querySelectorAll('[data-copy]');
+  for (var ci = 0; ci < copyBtns.length; ci++) {
+    copyBtns[ci].addEventListener('click', function (ev) {
+      var src = $(ev.currentTarget.getAttribute('data-copy'));
+      if (src) copyText(src.textContent, ev.currentTarget);
+    });
+  }
+
   $('copy-url').addEventListener('click', function (ev) { copyText($('issue-done-url').textContent, ev.currentTarget); });
   $('copy-msg').addEventListener('click', function (ev) { copyText($('issue-done-msg').textContent, ev.currentTarget); });
   $('void-cancel').addEventListener('click', function () { voidDlg.close(); });
