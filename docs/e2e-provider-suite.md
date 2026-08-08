@@ -103,7 +103,7 @@ MAX_AUTO_USD=0.10 node scripts/e2e/charge-e2e.mjs    # 调每笔自动付上限
 1. 报告写入 `docs/e2e-results-<YYYY-MM-DD>.md`。
 2. 登记 ainative `analytics_log`：
    ```bash
-   cd /Users/happyfish/workspace/ainative
+   cd ~/workspace/ainative
    python3 scripts/analytics_log.py add --title "MPP Router 10-provider E2E" \
      --summary "一行结论" --report docs/... --tags mpprouter,e2e-test
    ```

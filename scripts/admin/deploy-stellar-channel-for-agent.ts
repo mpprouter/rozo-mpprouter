@@ -25,10 +25,10 @@
  *
  * Prerequisites:
  *   - stellar CLI installed (cargo install --locked stellar-cli)
- *     verified path: /Users/happyfish/.cargo/bin/stellar
+ *     verified path: ~/.cargo/bin/stellar
  *   - `stellar network ls` shows `mainnet`
  *   - WASM_PATH env var OR default path at
- *     /Users/happyfish/workspace/stellar/one-way-channel/target/wasm32v1-none/release/channel.wasm
+ *     ~/workspace/stellar/one-way-channel/target/wasm32v1-none/release/channel.wasm
  *   - .dev.vars contains MAINNET_PAYER_SECRET (via stellar-mpp-sdk/.env.dev or similar)
  *     and STELLAR_ROUTER_PUBLIC
  *   - MAINNET_PAYER account has ≥ 5 XLM for gas + deposit
@@ -91,7 +91,7 @@ function loadEnvFile(path: string): Record<string, string> {
 // ----------------------------------------------------------------------------
 
 const DEFAULT_WASM_PATH =
-  '/Users/happyfish/workspace/stellar/one-way-channel/target/wasm32v1-none/release/channel.wasm'
+  `${process.env.HOME}/workspace/stellar/one-way-channel/target/wasm32v1-none/release/channel.wasm`
 const DEFAULT_DEPOSIT_STROOPS = '1000000' // 0.1 XLM
 const REFUND_WAITING_PERIOD_LEDGERS = '100'
 /**
@@ -222,7 +222,7 @@ async function main() {
   // MAINNET_PAYER_SECRET (the original dogfood account); the
   // --agent-env flag lets the multi-agent flow point at
   // AGENT2_SECRET / AGENT3_SECRET for parallel channels.
-  const envDevPath = '/Users/happyfish/workspace/stellar/stellar-mpp-sdk/.env.dev'
+  const envDevPath = `${process.env.HOME}/workspace/stellar/stellar-mpp-sdk/.env.dev`
   const envVars = loadEnvFile(envDevPath)
   const agentSecret = envVars[args.agentEnvKey]
   if (!agentSecret) {

@@ -213,7 +213,7 @@ async function main() {
 
   // Load agent secret from stellar-mpp-sdk/.env.dev (same convention
   // as deploy-stellar-channel-for-agent.ts).
-  const envDevPath = '/Users/happyfish/workspace/stellar/stellar-mpp-sdk/.env.dev'
+  const envDevPath = `${process.env.HOME}/workspace/stellar/stellar-mpp-sdk/.env.dev`
   const envVars = loadEnvFile(envDevPath)
   const agentSecret = envVars[args.agentEnvKey]
   if (!agentSecret) {

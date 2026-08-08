@@ -45,7 +45,7 @@ const BASE = process.env.ROUTER_BASE_OVERRIDE || ROUTER_BASE
 const MAX_AUTO_USD = process.env.MAX_AUTO_USD || '0.10'
 const ENV_FILE =
   process.env.STELLAR_ENV_FILE ||
-  '/Users/happyfish/workspace/rozo/rozocontracts/rozoskilltest/.env'
+  `${process.env.HOME}/workspace/rozo/rozocontracts/rozoskilltest/.env`
 
 function resolvePayPerCallDir() {
   if (process.env.PAY_PER_CALL_DIR) return process.env.PAY_PER_CALL_DIR

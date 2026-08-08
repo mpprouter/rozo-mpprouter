@@ -106,7 +106,7 @@ function loadEnvFile(path: string): Record<string, string> {
 
 async function main() {
   const envDevPath =
-    '/Users/happyfish/workspace/stellar/stellar-mpp-sdk/.env.dev'
+    `${process.env.HOME}/workspace/stellar/stellar-mpp-sdk/.env.dev`
   const envVars = loadEnvFile(envDevPath)
 
   // Which agent to run the test as. Defaults to the original
