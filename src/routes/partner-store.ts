@@ -184,6 +184,18 @@ export interface PartnerRecord {
    * by us, handed to the partner out of band, and never written anywhere.
    */
   auth?: PartnerAuth
+  /**
+   * API key credential for non-browser callers (scripts, AI agents). OPTIONAL
+   * for the same reason as `auth`: records predating it must keep
+   * deserialising, and absent means "no API access", never "any key works".
+   *
+   * Hex SHA-256 of the key. No salt and no work factor, unlike the password:
+   * the key is 256 bits of our own randomness, so there is nothing to guess
+   * and nothing to rainbow-table, and a PBKDF2 derivation would be paid on
+   * EVERY API request rather than once per login.
+   */
+  apiKeyHash?: string
+  apiKeySetAt?: string
 }
 
 export interface PartnerAuth {
@@ -215,6 +227,13 @@ export const partnerKey = (id: string) => `partner:${id}`
  */
 export const idemKey = (partnerId: string, key: string) => `pidem:${partnerId}:${key}`
 export const partnerEmailKey = (email: string) => `partneremail:${normalizeEmail(email)}`
+/**
+ * Reverse index hash(key) -> partnerId, so a Bearer request resolves its owner
+ * in one read. Without it, authenticating an API key would mean scanning every
+ * partner record, which is both slow and a lookup that gets slower as accounts
+ * are added. Keyed by the HASH, never the key itself.
+ */
+export const partnerApiKeyKey = (keyHashHex: string) => `partnerapikey:${keyHashHex}`
 export const ledgerKey = (partnerId: string, entryId: string) =>
   `pledger:${partnerId}:${entryId}`
 
@@ -1384,6 +1403,79 @@ export async function verifyPassword(
   if (!auth) return false
   const derived = await pbkdf2(password, auth.salt, auth.iterations)
   return constantTimeEqualHex(derived, auth.hash)
+}
+
+// ── API key credential ───────────────────────────────────────────────────────
+//
+// Separate from the password on purpose. The password is short, human-spoken
+// and brute-forceable, so it needs PBKDF2 plus a lockout. The API key is 256
+// bits we generate and a machine stores, so a plain digest is the right tool —
+// and it is the only one cheap enough to run on every request.
+
+/** Prefix so a leaked string is greppable in logs and obviously ours. */
+const API_KEY_PREFIX = 'rzp_live_'
+
+/**
+ * Mint an API key: prefix + 32 random bytes as hex. Returned to the caller
+ * once, for delivery out of band; only the digest is ever persisted.
+ */
+export function generatePartnerApiKey(): string {
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  return `${API_KEY_PREFIX}${toHex(bytes.buffer)}`
+}
+
+/**
+ * Attach a freshly minted API key to a partner and return the plaintext.
+ *
+ * Writes the reverse index BEFORE the record so a crash between the two leaves
+ * an index entry pointing at a partner that does not accept the key (a key
+ * that fails closed) rather than a record claiming a key no lookup can find.
+ * Any previous key is unlinked, so this doubles as rotation.
+ */
+export async function setPartnerApiKey(env: Env, partnerId: string): Promise<string> {
+  const previous = await getPartner(env, partnerId)
+  if (!previous) throw new PartnerError('PARTNER_NOT_FOUND', `no partner ${partnerId}`)
+
+  const key = generatePartnerApiKey()
+  const hash = await sha256Hex(key)
+  await casUpdate<void>(env, partnerApiKeyKey(hash), () => ({ op: 'set', value: partnerId, result: undefined }))
+  await casUpdate<void>(env, partnerKey(partnerId), (raw) => {
+    const p = parsePartner(raw)
+    if (!p) throw new PartnerError('PARTNER_NOT_FOUND', `no partner ${partnerId}`)
+    p.apiKeyHash = hash
+    p.apiKeySetAt = new Date().toISOString()
+    return { op: 'set', value: JSON.stringify(p), result: undefined }
+  })
+  // Retire the old index entry only once the new one is live, so rotation
+  // never leaves a window where neither key works.
+  if (previous.apiKeyHash && previous.apiKeyHash !== hash) {
+    await casUpdate<void>(env, partnerApiKeyKey(previous.apiKeyHash), () => ({
+      op: 'set',
+      value: '',
+      result: undefined,
+    }))
+  }
+  return key
+}
+
+/**
+ * Resolve a presented API key to its partner, or null.
+ *
+ * The index read is the fast path; the record's own `apiKeyHash` is then
+ * compared in constant time. That second check is what makes a stale index
+ * entry (rotation, or a partial write) harmless: the record is the authority
+ * on which key is current, and a mismatch fails closed.
+ */
+export async function resolvePartnerIdByApiKey(env: Env, key: string): Promise<string | null> {
+  if (!key.startsWith(API_KEY_PREFIX)) return null
+  const hash = await sha256Hex(key)
+  const partnerId = await casRead(env, partnerApiKeyKey(hash))
+  if (!partnerId) return null
+  const partner = await getPartner(env, partnerId)
+  if (!partner?.apiKeyHash) return null
+  if (!constantTimeEqualHex(partner.apiKeyHash, hash)) return null
+  return partnerId
 }
 
 /** A throwaway credential so an unknown username burns the same work. Its empty

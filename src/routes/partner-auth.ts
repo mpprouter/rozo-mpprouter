@@ -59,6 +59,8 @@ import {
   isAuthLocked,
   normalizeEmail,
   recordAuthFailure,
+  resolvePartnerIdByApiKey,
+  setPartnerApiKey,
   setPartnerPassword,
   verifyPassword,
   isValidPartnerIdentifier,} from './partner-store'
@@ -195,10 +197,29 @@ export type SessionResult =
   | { ok: true; partnerId: string }
   | { ok: false; response: Response }
 
+/** Extract a `Authorization: Bearer <key>` value, or null. */
+function readBearer(request: Request): string | null {
+  const header = request.headers.get('authorization')?.trim()
+  if (!header) return null
+  const m = header.match(/^Bearer\s+(\S+)$/i)
+  return m ? m[1] : null
+}
+
 /**
- * Gate for every `/partner/*` endpoint. The partner id comes ONLY from the
- * signed cookie — never from the body, query or a header — which is what makes
- * tenant isolation structural rather than a check each route has to remember.
+ * Gate for every `/partner/*` endpoint. The partner id comes ONLY from a signed
+ * cookie or a hashed API key — never from the body, query or a plain header —
+ * which is what makes tenant isolation structural rather than a check each
+ * route has to remember.
+ *
+ * Two credentials, one gate, deliberately: every downstream money route
+ * (issue, void) reads its partner from here, so an API caller gets exactly the
+ * authority of the browser session and not a byte more. A second gate would be
+ * a second place to forget the suspended-account check below.
+ *
+ * The cookie is tried first and the Bearer key is a fallback, so a browser —
+ * which cannot be made to attach an Authorization header cross-site — is never
+ * authenticated by anything an attacking page can control. CSRF therefore
+ * stays a cookie-only concern, unchanged by this path.
  */
 export async function requirePartnerSession(request: Request, env: Env): Promise<SessionResult> {
   const secret = sessionSecret(env)
@@ -209,8 +230,12 @@ export async function requirePartnerSession(request: Request, env: Env): Promise
     }
   }
   const raw = readCookie(request, SESSION_COOKIE)
-  if (!raw) return { ok: false, response: json(401, { error: 'UNAUTHENTICATED' }) }
-  const partnerId = await verifySession(secret, raw)
+  const bearer = raw ? null : readBearer(request)
+  if (!raw && !bearer) return { ok: false, response: json(401, { error: 'UNAUTHENTICATED' }) }
+
+  const partnerId = raw
+    ? await verifySession(secret, raw)
+    : await resolvePartnerIdByApiKey(env, bearer as string)
   if (!partnerId) return { ok: false, response: json(401, { error: 'UNAUTHENTICATED' }) }
 
   // A signed cookie for a deleted or suspended account must not keep working.
@@ -374,5 +399,54 @@ export async function handleAdminPartnerLoginLink(request: Request, env: Env): P
     expiresInMinutes: 15,
     username: partner.email,
     ...(password ? { password } : {}),
+  })
+}
+
+// ── POST /admin/partner/api-key ──────────────────────────────────────────────
+
+/**
+ * Mint (or rotate) a partner's API key and return the plaintext ONCE.
+ *
+ * Admin-only, and deliberately not self-serve from `/partner/app`: a key that
+ * the dashboard can mint is a key that anyone with a stolen session can mint,
+ * and unlike a session an API key does not expire on its own.
+ *
+ * Calling this again invalidates the previous key. The plaintext is returned
+ * here and nowhere else — it is not stored, not logged, and never rendered
+ * into the dashboard HTML.
+ */
+export async function handleAdminPartnerApiKey(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
+  const denied = adminAuthorized(request, env)
+  if (denied) return denied
+
+  let body: any
+  try {
+    body = await request.json()
+  } catch {
+    return json(400, { error: 'Invalid JSON body' })
+  }
+  const email = normalizeEmail(typeof body?.email === 'string' ? body.email : '')
+  if (!email || !isValidPartnerIdentifier(email)) {
+    return json(400, { error: 'email is required' })
+  }
+
+  // Must already exist. Unlike the login-link path this does not create an
+  // account: a typo here would otherwise mint a key for an empty partner and
+  // report success, and the operator would ship that key to a human.
+  const partnerId = await getPartnerIdByEmail(env, email)
+  const partner = partnerId ? await getPartner(env, partnerId) : null
+  if (!partner) return json(404, { error: 'PARTNER_NOT_FOUND' })
+
+  const rotated = Boolean(partner.apiKeyHash)
+  const apiKey = await setPartnerApiKey(env, partner.id)
+
+  return json(200, {
+    ok: true,
+    partnerId: partner.id,
+    email: partner.email,
+    apiKey,
+    rotated,
+    note: 'Shown once. Store it now — any previous key has stopped working.',
   })
 }

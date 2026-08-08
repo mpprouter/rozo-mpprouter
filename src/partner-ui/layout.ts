@@ -109,6 +109,31 @@ p { margin: 0 0 12px; }
   font-size: 13px; line-height: 1.75; color: #D4D4D8;
 }
 
+/* Advanced (API + agentic) disclosure. Collapsed by default: the partner who
+   only clicks buttons must not have to scroll past a wall of curl to reach the
+   coupon table, and the one who wants the API finds it in one click. */
+#adv > summary {
+  cursor: pointer; list-style: none; display: flex; flex-wrap: wrap;
+  align-items: baseline; gap: 10px; font-weight: 600; font-size: 14.5px;
+}
+#adv > summary::-webkit-details-marker { display: none; }
+/* Rotating caret drawn in CSS -- no icon font, and it stays correct if the
+   section is opened by the browser (find-in-page auto-expands details). */
+#adv > summary::before {
+  content: ''; width: 0; height: 0; flex: none;
+  border-left: 5px solid #71717A; border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent; transition: transform 0.15s;
+}
+#adv[open] > summary::before { transform: rotate(90deg); }
+.adv-body { margin-top: 20px; }
+.adv-body code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em; color: #E4E4E7; background: #1C1C20;
+  padding: 1px 5px; border-radius: 4px;
+}
+.adv-hr { border: 0; border-top: 1px solid #27272A; margin: 28px 0 22px; }
+.btn--sm { padding: 6px 12px; font-size: 12.5px; }
+
 /* Chat launcher. Intercom swaps in its own launcher once booted, so this only
    has to look right until the first click. */
 #help-fab {

@@ -698,3 +698,141 @@ describe('https enforcement', () => {
     expect(resp.status).toBe(200)
   })
 })
+
+// ── API key auth ─────────────────────────────────────────────────────────────
+
+/**
+ * The Bearer path is a second way to spend a partner's balance, so these cover
+ * the properties that make it no weaker than the cookie: it authorises exactly
+ * one partner, a wrong key authorises none, rotation revokes, and the
+ * suspended-account check still applies.
+ */
+describe('partner API key', () => {
+  const mintKey = async (email: string) => {
+    const resp = await postJson('/admin/partner/api-key', { email }, { 'x-admin-secret': ADMIN })
+    expect(resp.status).toBe(200)
+    return (await resp.json() as any).apiKey as string
+  }
+  const bearer = (key: string) => ({ Authorization: `Bearer ${key}` })
+
+  it('requires admin auth to mint, and refuses to create the account', async () => {
+    await seed('k@x.com', '100')
+    expect((await postJson('/admin/partner/api-key', { email: 'k@x.com' })).status).toBe(401)
+    // A typo must not silently mint a key for a brand-new empty partner and
+    // report success — the operator would ship that key to a human.
+    const ghost = await postJson(
+      '/admin/partner/api-key',
+      { email: 'ghost@x.com' },
+      { 'x-admin-secret': ADMIN },
+    )
+    expect(ghost.status).toBe(404)
+    expect(await getPartnerIdByEmail(env, 'ghost@x.com')).toBeNull()
+  })
+
+  it('authenticates reads and issues coupons, spending the right partner balance', async () => {
+    await seed('k@x.com', '100')
+    const key = await mintKey('k@x.com')
+
+    const me = await call('/partner/me', { headers: bearer(key) })
+    expect(me.status).toBe(200)
+    expect((await me.json() as any).email).toBe('k@x.com')
+
+    const issued = await postJson(
+      '/partner/coupon/issue',
+      { clientKey: 'api-1', credits: 10 },
+      bearer(key),
+    )
+    expect(issued.status).toBe(200)
+    const body = await issued.json() as any
+    expect(body.code).toMatch(/^\d{8}$|^\d{10}$/)
+    expect(Number(body.balanceAfterUsd)).toBeLessThan(100)
+
+    // Same clientKey must not spend twice, on this path as on the cookie one.
+    const replay = await postJson(
+      '/partner/coupon/issue',
+      { clientKey: 'api-1', credits: 10 },
+      bearer(key),
+    )
+    const replayed = await replay.json() as any
+    expect(replayed.code).toBe(body.code)
+    expect(replayed.reused).toBe(true)
+
+    const voided = await postJson(
+      `/partner/coupon/${body.code}/void`,
+      { confirm: body.code.slice(-4) },
+      bearer(key),
+    )
+    expect(voided.status).toBe(200)
+    expect(Number((await voided.json() as any).balanceAfterUsd)).toBe(100)
+  })
+
+  it('rejects a wrong, absent, malformed or foreign-prefixed key', async () => {
+    await seed('k@x.com', '100')
+    const key = await mintKey('k@x.com')
+    for (const h of [
+      {},
+      { Authorization: 'Bearer rzp_live_deadbeef' },
+      { Authorization: `Bearer ${key}x` },
+      { Authorization: `Basic ${key}` },
+      { Authorization: 'Bearer' },
+    ]) {
+      expect((await call('/partner/me', { headers: h as any })).status, JSON.stringify(h)).toBe(401)
+    }
+  })
+
+  it('never lets one partner reach another, whichever credential is used', async () => {
+    await seed('a@x.com', '100')
+    await seed('b@x.com', '50')
+    const keyA = await mintKey('a@x.com')
+    const issued = await postJson(
+      '/partner/coupon/issue',
+      { clientKey: 'b-1', credits: 1 },
+      { Cookie: await login('b@x.com') },
+    )
+    const codeB = (await issued.json() as any).code
+    // A's key must not be able to void B's coupon.
+    const cross = await postJson(
+      `/partner/coupon/${codeB}/void`,
+      { confirm: codeB.slice(-4) },
+      { Authorization: `Bearer ${keyA}` },
+    )
+    expect(cross.status).toBe(404)
+  })
+
+  it('rotation revokes the previous key', async () => {
+    await seed('k@x.com', '100')
+    const first = await mintKey('k@x.com')
+    const second = await mintKey('k@x.com')
+    expect(second).not.toBe(first)
+    expect((await call('/partner/me', { headers: bearer(first) })).status).toBe(401)
+    expect((await call('/partner/me', { headers: bearer(second) })).status).toBe(200)
+  })
+
+  it('stops working when the account is suspended', async () => {
+    await seed('k@x.com', '100')
+    const key = await mintKey('k@x.com')
+    await postJson(
+      '/admin/partner/status',
+      { email: 'k@x.com', status: 'suspended' },
+      { 'x-admin-secret': ADMIN },
+    )
+    expect((await call('/partner/me', { headers: bearer(key) })).status).toBe(403)
+  })
+
+  it('stores only a digest — the plaintext key is never persisted', async () => {
+    const id = await seed('k@x.com', '100')
+    const key = await mintKey('k@x.com')
+    const partner = await getPartner(env, id)
+    expect(partner!.apiKeyHash).toMatch(/^[0-9a-f]{64}$/)
+    const dump = JSON.stringify([...(env.ATOMIC_STORE as any).instances.values()]
+      .map((i: any) => [...i.store.entries()]))
+    expect(dump).not.toContain(key)
+  })
+
+  it('is dead when the partner surface is switched off', async () => {
+    await seed('k@x.com', '100')
+    const key = await mintKey('k@x.com')
+    env = { ...env, PARTNER_ENDPOINT_ENABLED: 'false' } as Env
+    expect((await call('/partner/me', { headers: bearer(key) })).status).toBe(404)
+  })
+})
