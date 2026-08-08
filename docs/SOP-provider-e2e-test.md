@@ -25,7 +25,7 @@ Router 的链路是:`客户付 Stellar USDC → Router pool → Router 用 Tempo
   ```bash
   TMP=$(mktemp /tmp/.stkey.XXXXXX); chmod 600 "$TMP"
   python3 -c "
-  for l in open('~/workspace/rozo/rozocontracts/rozoskilltest/.env'):
+  for l in open(__import__('os').path.expanduser('~/workspace/rozo/rozocontracts/rozoskilltest/.env')):
       if l.startswith('STELLAR_PRIVATE_KEY='):
           open('$TMP','w').write(l.split('=',1)[1].strip().strip('\"').strip(\"'\")); break
   "
