@@ -209,6 +209,134 @@ function errorResponse(status: number, err: CreateInvoiceError): Response {
   return json(status, { error: err.message, ...err })
 }
 
+// ── Reuse of an existing Rozo intent ────────────────────────────────────────
+// A row is only safe to hand back when it is still awaiting payment. Any other
+// status means money is already in flight or settled, and re-serving the link
+// invites a double payment.
+const REUSABLE_PAYMENT_STATUS = 'payment_unpaid'
+
+/** Status of an intents_payments row, whichever casing the API returned. */
+function readPaymentStatus(row: any): string | null {
+  return row?.status ?? row?.payment_status ?? null
+}
+
+/** Source (chain/token) an intents_payments row currently pays from. */
+function readRowSource(row: any): { chainId: string | null; tokenSymbol: string | null } {
+  const chainId = row?.source?.chainId ?? row?.source_chain_id ?? null
+  const tokenSymbol = row?.source?.tokenSymbol ?? row?.source_token_symbol ?? null
+  return {
+    chainId: chainId === null || chainId === undefined ? null : String(chainId),
+    tokenSymbol:
+      tokenSymbol === null || tokenSymbol === undefined ? null : String(tokenSymbol).toUpperCase(),
+  }
+}
+
+/**
+ * True when the row's source is known AND differs from what this caller asked
+ * for. An unknown row source is not treated as a mismatch (nothing to compare).
+ */
+function sourceDiffers(
+  rowSource: { chainId: string | null; tokenSymbol: string | null },
+  source: ResolvedSource,
+): boolean {
+  if (rowSource.chainId === null) return false
+  return rowSource.chainId !== source.chainId || rowSource.tokenSymbol !== source.tokenSymbol
+}
+
+/**
+ * Ask the Rozo payment-api to re-checkout an unpaid intent against a different
+ * source chain/token, so a caller who wants to pay from another chain is not
+ * silently handed the previous caller's chain.
+ *
+ * The upstream endpoint gates this itself: the row must still be
+ * payment_unpaid, and EURC destinations / Stellar Direct orders are rejected
+ * with `checkoutNotAllowed`. On success it returns the updated payment row.
+ */
+async function rotateExistingSource(
+  env: Env,
+  paymentId: string,
+  source: ResolvedSource,
+): Promise<{ ok: true; row: any } | { ok: false; code: string }> {
+  let resp: Response
+  try {
+    resp = await fetch(
+      `${ROZO_INTENTS_BASE}/payments/${encodeURIComponent(paymentId)}/checkout`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'X-API-Key': env.ROZO_INTENTS_API_KEY,
+        },
+        body: JSON.stringify({
+          source: { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
+        }),
+      },
+    )
+  } catch (err: any) {
+    return { ok: false, code: `network_error (${err?.message ?? 'unknown error'})` }
+  }
+
+  const text = await resp.text()
+  if (!resp.ok) {
+    let code = `HTTP ${resp.status}`
+    try {
+      const parsed: any = JSON.parse(text)
+      const upstream = parsed?.error?.code ?? parsed?.code ?? parsed?.error
+      if (typeof upstream === 'string' && upstream) code = upstream
+    } catch {
+      // Non-JSON error body — the HTTP status is the best code we have.
+    }
+    return { ok: false, code }
+  }
+
+  let row: any
+  try {
+    row = JSON.parse(text)
+  } catch {
+    return { ok: false, code: 'non_json_response' }
+  }
+  if (!row) return { ok: false, code: 'empty_response' }
+  return { ok: true, row }
+}
+
+/**
+ * Re-read a payment's current status straight from the Rozo payment-api.
+ *
+ * Used to close the lookup→rotate race: the row can leave payment_unpaid
+ * between our idempotency lookup and the /checkout call (a payer funds it
+ * mid-flight), in which case rotation fails with `checkoutNotAllowed` and the
+ * pre-fetched row we hold is stale. Returns null when the status cannot be
+ * determined (treated by callers as "unknown, keep the pre-fetched view").
+ */
+async function refetchPaymentStatus(env: Env, paymentId: string): Promise<string | null> {
+  try {
+    const resp = await fetch(
+      `${ROZO_INTENTS_BASE}/payments/${encodeURIComponent(paymentId)}`,
+      { method: 'GET', headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
+    )
+    if (!resp.ok) return null
+    const row: any = await resp.json().catch(() => null)
+    return readPaymentStatus(row)
+  } catch {
+    return null
+  }
+}
+
+/** Human-readable note for a mismatch we could not rotate away. */
+function sourceMismatchWarning(
+  rowSource: { chainId: string | null; tokenSymbol: string | null },
+  source: ResolvedSource,
+  reason: string,
+): string {
+  return (
+    `Requested ${source.tokenSymbol} on chain ${source.chainId}, but the existing ` +
+    `order for this invoice pays ${rowSource.tokenSymbol ?? 'unknown'} on chain ` +
+    `${rowSource.chainId ?? 'unknown'}; switching it failed (${reason}), so the ` +
+    `requested source was not applied. Either pay with the existing source shown ` +
+    `above, or wait for the order to expire and create a new one.`
+  )
+}
+
 // Discount formula: callerPays = max(invoice - 5, invoice × 100/105)
 // Small invoices get ~4.76% off; large invoices cap discount at exactly $5.
 // All math done in atomic USDC (6 decimals) to avoid float drift.
@@ -517,6 +645,85 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       const stillValid =
         existingExpiresAt && Date.parse(existingExpiresAt) > Date.now()
       if (existing && stillValid) {
+        const existingStatus = readPaymentStatus(existing)
+        if (existingStatus !== REUSABLE_PAYMENT_STATUS) {
+          // Unexpired but already funded / settled / in flight. Falling through
+          // to create would only earn a 409 orderIdConflict upstream, so answer
+          // the caller directly instead of letting them pay a second time.
+          return json(409, {
+            ok: false,
+            error: {
+              code: 'ORDER_ALREADY_ACTIVE',
+              message:
+                `An order already exists for this invoice and is no longer awaiting ` +
+                `payment (status: ${existingStatus ?? 'unknown'}). Do not pay again — ` +
+                `poll the payment status instead.`,
+            },
+            linkId,
+            rozoPaymentId: existing?.id ?? null,
+            status: existingStatus,
+            expiresAt: existingExpiresAt,
+          })
+        }
+
+        // Unpaid and unexpired → reusable. If this caller asked for a different
+        // chain/token than the order currently pays from, try to rotate the
+        // order onto the requested source rather than silently echoing the old
+        // one back (which used to make agents abort and lose the sale).
+        let row: any = existing
+        let rowSource = readRowSource(existing)
+        let sourceRotated = false
+        let rotationFailure: string | null = null
+        // Lightning has a BOLT11 invoice lifecycle that re-checkout does not
+        // support, so a mismatch on either side is reported, never rotated.
+        const lightningInvolved =
+          source.chainId === 'lightning' || rowSource.chainId === 'lightning'
+        if (sourceDiffers(rowSource, source) && existing?.id) {
+          if (lightningInvolved) {
+            rotationFailure = 'lightning_not_rotatable'
+          } else {
+            const rotated = await rotateExistingSource(env, String(existing.id), source)
+            if (rotated.ok) {
+              row = rotated.row
+              rowSource = readRowSource(rotated.row)
+              sourceRotated = true
+            } else {
+              rotationFailure = rotated.code
+            }
+          }
+        }
+
+        // Close the lookup→rotate race (codex P1): the row can leave
+        // payment_unpaid while the /checkout call is in flight, in which case
+        // returning the pre-fetched link as payable invites a double payment.
+        // The rotated row carries its own status; after a failure we re-read it.
+        const postRotationStatus = sourceRotated
+          ? readPaymentStatus(row)
+          : rotationFailure
+            ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
+            : REUSABLE_PAYMENT_STATUS
+        if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
+          return json(409, {
+            ok: false,
+            error: {
+              code: 'ORDER_ALREADY_ACTIVE',
+              message:
+                `An order already exists for this invoice and is no longer awaiting ` +
+                `payment (status: ${postRotationStatus}). Do not pay again — ` +
+                `poll the payment status instead.`,
+            },
+            linkId,
+            rozoPaymentId: row?.id ?? existing?.id ?? null,
+            status: postRotationStatus,
+            expiresAt: row?.expiresAt ?? existingExpiresAt,
+          })
+        }
+
+        const warnings = [...source.warnings]
+        if (rotationFailure) {
+          warnings.push(sourceMismatchWarning(rowSource, source, rotationFailure))
+        }
+
         return json(200, {
           ok: true,
           reused: true,
@@ -527,21 +734,19 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           discount: discountStr,
           title,
           paymentLink:
-            existing?.paymentLink ??
-            existing?.url ??
-            existing?.payment_link ??
-            null,
-          rozoPaymentId: existing?.id ?? null,
-          expiresAt: existingExpiresAt,
-          // Echo the source the existing intent was created with (from Rozo),
-          // not the source the current caller asked for — those may differ if
-          // a previous caller used a different chain for the same pl_ id.
+            row?.paymentLink ?? row?.url ?? row?.payment_link ?? null,
+          rozoPaymentId: row?.id ?? existing?.id ?? null,
+          expiresAt: row?.expiresAt ?? existingExpiresAt,
+          // The source the order actually pays from now — rotated to the
+          // requested one when that worked, otherwise the pre-existing one.
           source: {
-            chainId: existing?.source?.chainId ?? existing?.source_chain_id ?? null,
-            tokenSymbol: existing?.source?.tokenSymbol ?? existing?.source_token_symbol ?? null,
+            chainId: rowSource.chainId,
+            tokenSymbol: rowSource.tokenSymbol,
           },
-          ...(source.warnings.length ? { warnings: source.warnings } : {}),
-          raw: existing,
+          ...(sourceRotated ? { sourceRotated: true } : {}),
+          ...(rotationFailure ? { sourceMismatch: true } : {}),
+          ...(warnings.length ? { warnings } : {}),
+          raw: row,
         })
       }
     }
@@ -761,7 +966,10 @@ export async function handleStripeCreateInvoice(
   const orderId = stripeOrderId(invoice.invoiceKey)
 
   // 5. Idempotency: reuse an existing, still-valid Rozo intent for this order.
+  // "Valid" means unexpired AND still awaiting payment — an unexpired row in any
+  // other status is already funded/settled and must never be handed back.
   let existing: any = null
+  let activeConflict: any = null
   try {
     const lookup = await fetch(
       `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(ROZO_APP_ID)}/${encodeURIComponent(orderId)}`,
@@ -769,11 +977,35 @@ export async function handleStripeCreateInvoice(
     )
     if (lookup.ok) {
       const found: any = await lookup.json().catch(() => null)
-      const expiresAt: string | null = found?.expiresAt ?? null
-      if (found && expiresAt && Date.parse(expiresAt) > Date.now()) existing = found
+      const foundExpiresAt: string | null = found?.expiresAt ?? null
+      if (found && foundExpiresAt && Date.parse(foundExpiresAt) > Date.now()) {
+        if (readPaymentStatus(found) === REUSABLE_PAYMENT_STATUS) existing = found
+        else activeConflict = found
+      }
     }
   } catch {
     // Non-fatal — fall through to create.
+  }
+
+  // Creating again under the same orderId would just 409 orderIdConflict
+  // upstream, so tell the caller the order is already active instead.
+  if (activeConflict) {
+    const conflictStatus = readPaymentStatus(activeConflict)
+    return json(409, {
+      ok: false,
+      provider: 'stripe_crypto',
+      error: {
+        code: 'ORDER_ALREADY_ACTIVE',
+        message:
+          `An order already exists for this invoice and is no longer awaiting ` +
+          `payment (status: ${conflictStatus ?? 'unknown'}). Do not pay again — ` +
+          `poll the payment status instead.`,
+      },
+      invoiceKey: invoice.invoiceKey,
+      rozoPaymentId: activeConflict?.id ?? null,
+      status: conflictStatus,
+      expiresAt: activeConflict?.expiresAt ?? null,
+    })
   }
 
   // 6. Locked metadata (design §6). NO url / session hash / secrets.
@@ -794,10 +1026,65 @@ export async function handleStripeCreateInvoice(
   let expiresAt: string | null
   let reused: boolean
 
+  // Source the reused order actually pays from, plus how we got there.
+  let reusedSource: { chainId: string | null; tokenSymbol: string | null } = {
+    chainId: null,
+    tokenSymbol: null,
+  }
+  let sourceRotated = false
+  let rotationFailure: string | null = null
+
   if (existing) {
-    rozoPaymentId = existing?.id ?? null
-    paymentLink = existing?.paymentLink ?? existing?.url ?? existing?.payment_link ?? null
-    expiresAt = existing?.expiresAt ?? null
+    // The order is unpaid, so if this caller wants a different chain/token we
+    // can try to move the order onto it instead of silently billing them on the
+    // previous caller's chain.
+    let row: any = existing
+    reusedSource = readRowSource(existing)
+    const lightningInvolved =
+      source.chainId === 'lightning' || reusedSource.chainId === 'lightning'
+    if (sourceDiffers(reusedSource, source) && existing?.id) {
+      if (lightningInvolved) {
+        // BOLT11 lifecycle — re-checkout does not support it.
+        rotationFailure = 'lightning_not_rotatable'
+      } else {
+        const rotated = await rotateExistingSource(env, String(existing.id), source)
+        if (rotated.ok) {
+          row = rotated.row
+          reusedSource = readRowSource(rotated.row)
+          sourceRotated = true
+        } else {
+          rotationFailure = rotated.code
+        }
+      }
+    }
+    // Close the lookup→rotate race (codex P1): the row can leave
+    // payment_unpaid while the /checkout call is in flight, in which case
+    // returning the pre-fetched link as payable invites a double payment.
+    const postRotationStatus = sourceRotated
+      ? readPaymentStatus(row)
+      : rotationFailure
+        ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
+        : REUSABLE_PAYMENT_STATUS
+    if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
+      return json(409, {
+        ok: false,
+        provider: 'stripe_crypto',
+        error: {
+          code: 'ORDER_ALREADY_ACTIVE',
+          message:
+            `An order already exists for this invoice and is no longer awaiting ` +
+            `payment (status: ${postRotationStatus}). Do not pay again — ` +
+            `poll the payment status instead.`,
+        },
+        invoiceKey: invoice.invoiceKey,
+        rozoPaymentId: row?.id ?? existing?.id ?? null,
+        status: postRotationStatus,
+        expiresAt: row?.expiresAt ?? existing?.expiresAt ?? null,
+      })
+    }
+    rozoPaymentId = row?.id ?? existing?.id ?? null
+    paymentLink = row?.paymentLink ?? row?.url ?? row?.payment_link ?? null
+    expiresAt = row?.expiresAt ?? existing?.expiresAt ?? null
     reused = true
   } else {
     // 7. Create the Rozo intent. The caller pays the discounted amount on the
@@ -915,23 +1202,13 @@ export async function handleStripeCreateInvoice(
 
   // 9. Response. provider-neutral v2 fields; NEVER echo the Stripe URL.
   //
-  // On reuse, echo the source the EXISTING intent was created with (from Rozo),
-  // not the one this caller asked for — a previous caller may have used a
-  // different chain for the same invoice. When the two disagree, say so
-  // explicitly rather than letting the caller assume their request took effect.
-  const existingSourceChain = existing?.source?.chainId ?? existing?.source_chain_id ?? null
-  const existingSourceToken = existing?.source?.tokenSymbol ?? existing?.source_token_symbol ?? null
+  // On reuse, echo the source the order actually pays from — the requested one
+  // when the rotation above succeeded, otherwise the pre-existing one, in which
+  // case we say so explicitly rather than letting the caller assume their
+  // request took effect.
   const warnings = [...source.warnings]
-  if (
-    reused &&
-    existingSourceChain !== null &&
-    (String(existingSourceChain) !== source.chainId || existingSourceToken !== source.tokenSymbol)
-  ) {
-    warnings.push(
-      `Reused an existing intent for this invoice that pays from ${existingSourceChain} ` +
-        `${existingSourceToken}; the requested source ${source.chainId} ${source.tokenSymbol} ` +
-        `was not applied.`,
-    )
+  if (reused && rotationFailure) {
+    warnings.push(sourceMismatchWarning(reusedSource, source, rotationFailure))
   }
 
   return json(200, {
@@ -939,8 +1216,10 @@ export async function handleStripeCreateInvoice(
     reused,
     provider: 'stripe_crypto',
     source: reused
-      ? { chainId: existingSourceChain, tokenSymbol: existingSourceToken }
+      ? { chainId: reusedSource.chainId, tokenSymbol: reusedSource.tokenSymbol }
       : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
+    ...(sourceRotated ? { sourceRotated: true } : {}),
+    ...(rotationFailure ? { sourceMismatch: true } : {}),
     ...(warnings.length ? { warnings } : {}),
     invoiceKey: invoice.invoiceKey,
     merchant: invoice.merchantTitle,

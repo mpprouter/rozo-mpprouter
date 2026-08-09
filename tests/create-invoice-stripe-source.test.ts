@@ -64,10 +64,19 @@ function makeEnv(): Env {
 let createdIntent: any = null
 /** When set, the idempotency lookup returns this instead of 404. */
 let existingIntent: any = null
+/** Body POSTed to /payments/:id/checkout (source rotation), if any. */
+let checkoutBody: any = null
+/** What the rotation endpoint answers; overridden per-test to simulate failure. */
+let checkoutResponse: () => Response = () => new Response('{}', { status: 200 })
+/** When set, the post-rotation status refetch returns this instead of existingIntent. */
+let refetchedIntent: any = null
 
 function installFetchMock() {
   createdIntent = null
   existingIntent = null
+  checkoutBody = null
+  refetchedIntent = null
+  checkoutResponse = () => new Response('{}', { status: 200 })
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u =
       typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -110,6 +119,17 @@ function installFetchMock() {
     if (u.includes('/payments/order/')) {
       return existingIntent
         ? new Response(JSON.stringify(existingIntent), { status: 200 })
+        : new Response('not found', { status: 404 })
+    }
+    if (u.includes('/checkout')) {
+      checkoutBody = JSON.parse(String(init?.body ?? '{}'))
+      return checkoutResponse()
+    }
+    // Status refetch after a failed rotation (GET /payments/:id).
+    if (/\/payments\/[^/]+$/.test(u) && (!init?.method || init.method === 'GET')) {
+      const row = refetchedIntent ?? existingIntent
+      return row
+        ? new Response(JSON.stringify(row), { status: 200 })
         : new Response('not found', { status: 404 })
     }
     if (u.includes('/payment-api')) {
@@ -238,13 +258,25 @@ describe('Stripe create-invoice — what source must NOT change', () => {
 })
 
 describe('Stripe create-invoice — reuse with a conflicting source', () => {
-  it('echoes the existing intent source and warns that the request was not applied', async () => {
+  it('rotates the unpaid order onto the requested source instead of echoing the old one', async () => {
     existingIntent = {
       id: 'rozo-existing-1',
+      status: 'payment_unpaid',
       paymentLink: 'https://pay.rozo.ai/existing',
       expiresAt: '2999-01-01T00:00:00.000Z',
       source: { chainId: '8453', tokenSymbol: 'USDC' },
     }
+    checkoutResponse = () =>
+      new Response(
+        JSON.stringify({
+          id: 'rozo-existing-1',
+          status: 'payment_unpaid',
+          paymentLink: 'https://pay.rozo.ai/existing-rotated',
+          expiresAt: '2999-02-01T00:00:00.000Z',
+          source: { chainId: '900', tokenSymbol: 'USDT' },
+        }),
+        { status: 200 },
+      )
 
     const { status, json } = await createInvoice({
       url: STRIPE_URL,
@@ -253,16 +285,71 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
 
     expect(status).toBe(200)
     expect(json.reused).toBe(true)
-    // No new intent — and the caller is told their source did NOT take effect,
-    // rather than being left to assume it did.
+    expect(json.sourceRotated).toBe(true)
+    // Rotated in place: no new intent, and the caller pays on the chain they asked for.
+    expect(createdIntent).toBeNull()
+    expect(checkoutBody).toEqual({ source: { chainId: '900', tokenSymbol: 'USDT' } })
+    expect(json.source).toEqual({ chainId: '900', tokenSymbol: 'USDT' })
+    expect(json.paymentLink).toBe('https://pay.rozo.ai/existing-rotated')
+    expect(json.warnings ?? []).toEqual([])
+  })
+
+  it('falls back to the existing source with a warning when rotation fails', async () => {
+    existingIntent = {
+      id: 'rozo-existing-1b',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC' },
+    }
+    checkoutResponse = () =>
+      new Response(JSON.stringify({ error: 'checkoutNotAllowed' }), { status: 400 })
+
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: '900', tokenSymbol: 'USDT' },
+    })
+
+    // Never a hard failure — the caller still gets a payable order.
+    expect(status).toBe(200)
+    expect(json.reused).toBe(true)
+    expect(json.sourceMismatch).toBe(true)
     expect(createdIntent).toBeNull()
     expect(json.source).toEqual({ chainId: '8453', tokenSymbol: 'USDC' })
     expect(json.warnings?.join(' ')).toContain('was not applied')
+    expect(json.warnings?.join(' ')).toContain('checkoutNotAllowed')
   })
 
-  it('does not warn when the reused intent matches the requested source', async () => {
+  it('answers 409 when the order left payment_unpaid during a failed rotation (lookup→rotate race)', async () => {
+    existingIntent = {
+      id: 'rozo-existing-1c',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC' },
+    }
+    // A payer funded the order while our /checkout call was in flight: the
+    // rotation is refused, and the refetched row is no longer unpaid.
+    checkoutResponse = () =>
+      new Response(JSON.stringify({ error: 'checkoutNotAllowed' }), { status: 400 })
+    refetchedIntent = { ...existingIntent, status: 'payment_completed' }
+
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: '900', tokenSymbol: 'USDT' },
+    })
+
+    expect(status).toBe(409)
+    expect(json.ok).toBe(false)
+    expect(json.error.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.status).toBe('payment_completed')
+    expect(createdIntent).toBeNull()
+  })
+
+  it('does not warn or rotate when the reused intent matches the requested source', async () => {
     existingIntent = {
       id: 'rozo-existing-2',
+      status: 'payment_unpaid',
       paymentLink: 'https://pay.rozo.ai/existing',
       expiresAt: '2999-01-01T00:00:00.000Z',
       source: { chainId: '900', tokenSymbol: 'USDT' },
@@ -273,6 +360,35 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
       source: { chainId: '900', tokenSymbol: 'USDT' },
     })
     expect(json.reused).toBe(true)
+    expect(checkoutBody).toBeNull()
+    expect(json.sourceRotated).toBeUndefined()
     expect(json.warnings ?? []).not.toContain(expect.stringContaining('was not applied'))
+  })
+})
+
+describe('Stripe create-invoice — an unexpired order that is no longer unpaid', () => {
+  it('returns 409 ORDER_ALREADY_ACTIVE instead of reusing or recreating', async () => {
+    existingIntent = {
+      id: 'rozo-existing-3',
+      status: 'payment_started',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC' },
+    }
+
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: '900', tokenSymbol: 'USDT' },
+    })
+
+    expect(status).toBe(409)
+    expect(json.ok).toBe(false)
+    expect(json.error.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.status).toBe('payment_started')
+    expect(json.rozoPaymentId).toBe('rozo-existing-3')
+    expect(json.expiresAt).toBe('2999-01-01T00:00:00.000Z')
+    // No duplicate order, no rotation attempt.
+    expect(createdIntent).toBeNull()
+    expect(checkoutBody).toBeNull()
   })
 })
