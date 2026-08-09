@@ -148,7 +148,15 @@ class InMemoryStorage {
   }
 
   // Unused stubs required by the type
-  async list(): Promise<Map<string, unknown>> { return new Map() }
+  async list<T>(options?: { prefix?: string; limit?: number }): Promise<Map<string, T>> {
+    const out = new Map<string, T>()
+    for (const [key, value] of this.store) {
+      if (options?.prefix && !key.startsWith(options.prefix)) continue
+      out.set(key, value as T)
+      if (out.size >= (options?.limit ?? Number.POSITIVE_INFINITY)) break
+    }
+    return out
+  }
   async getAlarm(): Promise<null> { return null }
   async setAlarm(): Promise<void> {}
   async deleteAlarm(): Promise<void> {}

@@ -4,6 +4,9 @@ compatibility_date = "2026-04-09"
 compatibility_flags = ["nodejs_compat"]
 account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
 
+[triggers]
+crons = ["*/2 * * * *"]
+
 # Custom domains.
 #
 # apiserver.mpprouter.dev was attached through the dashboard and is NOT
@@ -172,6 +175,8 @@ PARTNER_ENDPOINT_ENABLED = "true"
 #                                  challenges so returning credentials can be
 #                                  verified statelessly. Rotate to invalidate all
 #                                  outstanding challenges.
+# REFUND_EXECUTOR_TOKEN          — dedicated bearer token for the pull-only
+#                                  refund executor admin endpoints.
 #
 # Note: STELLAR_ROUTER_SECRET is NOT stored anywhere in the app.
 # The Router pool private key is managed offline by the operator.

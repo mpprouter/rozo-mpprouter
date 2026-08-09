@@ -13,7 +13,8 @@
  * 5. Return merchant content to the agent with a Payment-Receipt header
  */
 
-import { Credential } from 'mppx'
+import { Credential, Receipt } from 'mppx'
+import { Store } from 'mppx/server'
 import {
   getAllowedMethodsForPath,
   getRouteByPublicPath,
@@ -27,13 +28,18 @@ import {
   payMerchantSession,
 } from '../mpp/tempo-client'
 import { bumpCumulative } from '../mpp/channel-store'
+import { doAtomicParams } from '../mpp/kv-atomic-store'
 import {
   createStellarPayment,
   getRouterStellarAddress,
   getStellarUsdcSac,
 } from '../mpp/stellar-server'
+import { enqueueRefund, payerAccount, type PaymentProof, type RefundReason } from '../refund/refund'
 import {
   resolveStellarChannelMppx,
+  rollbackFailedChannelVoucher,
+  acquireChannelDeliveryLock,
+  releaseChannelDeliveryLock,
   StellarChannelNotRegisteredError,
 } from '../mpp/stellar-channel-dispatch'
 import {
@@ -458,7 +464,7 @@ type MerchantPayResult =
       /** HTTP status from merchant — 200 for sync, 202 for async jobs */
       merchantStatus: number
     }
-  | { kind: 'error'; response: Response }
+  | { kind: 'error'; response: Response; refundReason?: RefundReason }
 
 async function payMerchantAndGetBody(
   env: Env,
@@ -485,6 +491,7 @@ async function payMerchantAndGetBody(
     } catch (err: any) {
       return {
         kind: 'error',
+        refundReason: 'timeout',
         response: new Response(
           JSON.stringify({
             error: 'Merchant admin payment failed',
@@ -500,6 +507,9 @@ async function payMerchantAndGetBody(
     if (!merchantResponse.ok && merchantResponse.status !== 202) {
       return {
         kind: 'error',
+        refundReason: merchantResponse.status === 403
+          ? 'non_fulfillment'
+          : merchantResponse.status >= 500 ? 'upstream_5xx' : undefined,
         response: new Response(
           JSON.stringify({
             error: 'Merchant admin payment failed',
@@ -560,6 +570,7 @@ async function payMerchantAndGetBody(
       console.error(`[proxy] ${err.message}`)
       return {
         kind: 'error',
+        refundReason: 'upstream_5xx',
         response: new Response(
           JSON.stringify({
             error: 'Router session channel not installed',
@@ -576,6 +587,7 @@ async function payMerchantAndGetBody(
     console.error(`[proxy] Tempo payment error: ${err.message}`)
     return {
       kind: 'error',
+      refundReason: 'timeout',
       response: new Response(
         JSON.stringify({
           error: 'Merchant payment failed',
@@ -594,6 +606,9 @@ async function payMerchantAndGetBody(
     console.error(`[proxy] Merchant error body: ${errorBody.substring(0, 200)}`)
     return {
       kind: 'error',
+      refundReason: merchantResponse.status === 403
+        ? 'non_fulfillment'
+        : merchantResponse.status >= 500 ? 'upstream_5xx' : undefined,
       response: new Response(
         JSON.stringify({
           error: 'Merchant payment failed',
@@ -607,6 +622,16 @@ async function payMerchantAndGetBody(
 
   const contentType = merchantResponse.headers.get('content-type') || 'application/json'
   const body = await merchantResponse.text()
+  if (merchantResponse.status !== 202 && body.trim().length === 0) {
+    return {
+      kind: 'error',
+      refundReason: 'empty_response',
+      response: new Response(JSON.stringify({ error: 'Merchant returned an empty response' }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    }
+  }
   return { kind: 'ok', body, contentType, merchantResponse, merchantStatus: merchantResponse.status }
 }
 
@@ -630,6 +655,8 @@ async function handleAsyncJob(
   route: ReturnType<typeof getRouteByPublicPath> & {},
   authHeader: string | null,
   requestUrl: URL,
+  paymentProof?: PaymentProof,
+  channelDelivery?: JobAuthRecord['channelDelivery'],
 ): Promise<Response | null> {
   // Try to extract a job ID from the response body (both 202 and 200 paths).
   let jobId: string | undefined
@@ -652,6 +679,42 @@ async function handleAsyncJob(
   if (!isAsync) return null
 
   if (!jobId) {
+    if (channelDelivery?.action === 'voucher') {
+      const rolledBack = await rollbackFailedChannelVoucher(
+        env, channelDelivery.channelContract, channelDelivery.acceptedAmount,
+        channelDelivery.previousAmount, channelDelivery.challengeId,
+      )
+      if (rolledBack) {
+        await releaseChannelDeliveryLock(env, channelDelivery.channelContract, channelDelivery.lockId)
+      } else {
+        return new Response(JSON.stringify({ error: 'Async voucher requires manual review' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
+        })
+      }
+    }
+    if (paymentProof) {
+      let refund
+      try {
+        refund = await enqueueRefund(env, {
+          proof: paymentProof,
+          reason: 'empty_response',
+          merchant: route.upstreamHost,
+          routeId: route.id,
+        })
+      } catch (error: any) {
+        return new Response(JSON.stringify({
+          error: 'Async delivery and refund persistence failed', detail: error.message,
+        }), { status: 503, headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' } })
+      }
+      if (channelDelivery?.action === 'close') {
+        await releaseChannelDeliveryLock(env, channelDelivery.channelContract, channelDelivery.lockId)
+      }
+      return new Response(JSON.stringify({ error: 'Async merchant returned no job id' }), {
+        status: 502,
+        headers: { 'Content-Type': 'application/json', 'Refund-Id': refund.publicId, 'Refund-Status': 'pending' },
+      })
+    }
     // Merchant returned 202 with no identifiable job id — pass through as-is.
     return new Response(payResult.body, {
       status: 202,
@@ -691,12 +754,54 @@ async function handleAsyncJob(
     upstreamHost: actualHost,
     upstreamJobPath: `/api/jobs/${jobId}`,
     paidAt: new Date().toISOString(),
+    paymentProof,
+    channelDelivery,
   }
 
   // Store with 24h TTL
-  await env.MPP_STORE.put(`jobAuth:${jobId}`, JSON.stringify(record), {
-    expirationTtl: 86400,
-  })
+  try {
+    await env.MPP_STORE.put(`jobAuth:${jobId}`, JSON.stringify(record), {
+      expirationTtl: 86400,
+    })
+  } catch (error: any) {
+    if (channelDelivery?.action === 'voucher') {
+      const rolledBack = await rollbackFailedChannelVoucher(
+        env, channelDelivery.channelContract, channelDelivery.acceptedAmount,
+        channelDelivery.previousAmount, channelDelivery.challengeId,
+      )
+      if (rolledBack) {
+        await releaseChannelDeliveryLock(env, channelDelivery.channelContract, channelDelivery.lockId)
+      }
+      return new Response(JSON.stringify({ error: 'Could not persist async delivery ownership' }), {
+        status: 503,
+        headers: {
+          'Content-Type': 'application/json',
+          'Refund-Status': rolledBack ? 'voucher-not-consumed' : 'manual-review',
+        },
+      })
+    }
+    if (paymentProof) {
+      try {
+        const refund = await enqueueRefund(env, {
+          proof: paymentProof, reason: 'empty_response',
+          merchant: route.upstreamHost, routeId: route.id,
+        })
+        if (channelDelivery) {
+          await releaseChannelDeliveryLock(env, channelDelivery.channelContract, channelDelivery.lockId)
+        }
+        return new Response(JSON.stringify({ error: 'Could not persist async delivery ownership' }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json', 'Refund-Id': refund.publicId, 'Refund-Status': 'pending' },
+        })
+      } catch {
+        // Keep a channel lock held when neither delivery nor refund intent was
+        // durably recorded. An operator must reconcile before unlocking.
+      }
+    }
+    return new Response(JSON.stringify({
+      error: 'Could not persist async delivery ownership', detail: error.message,
+    }), { status: 503, headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' } })
+  }
 
   console.log(`[proxy] Async job ${jobId} stored for agent ${stellarAddress} (route=${route.id})`)
 
@@ -1264,6 +1369,15 @@ export async function handleProxy(
   //     commitmentKey. See src/mpp/stellar-channel-dispatch.ts and
   //     internaldocs/v2-stellar-channel-notes.md §N2.
   let mppx: Awaited<ReturnType<typeof resolveStellarChannelMppx>>['mppx']
+  let settledPayment: PaymentProof | undefined
+  let channelVoucher: {
+    challengeId: string
+    acceptedAmount: string
+    previousAmount: string
+    action: 'voucher' | 'close'
+  } | undefined
+  let channelDeliveryLockId: string | undefined
+  let channelPreviousAmount: string | undefined
   let channelContractForVerify: string | undefined
   let channelCurrencyForVerify: string | undefined
   try {
@@ -1281,7 +1395,17 @@ export async function handleProxy(
         `[proxy] Stellar channel dispatch for ${resolved.channelContract} (agent=${resolved.agentAccount}, currency=${resolved.channelCurrency})`,
       )
     } else {
-      mppx = createStellarPayment(env) as any
+      mppx = createStellarPayment(env, (payment: any) => {
+        settledPayment = {
+          paymentId: payment.challenge.id,
+          paymentTx: payment.receipt.reference,
+          payer: payerAccount(payment.credential.source),
+          recipient: payment.request.recipient,
+          asset: payment.request.currency,
+          amountAtomic: String(payment.request.amount),
+          mode: 'charge',
+        }
+      }) as any
     }
   } catch (err: any) {
     if (err instanceof StellarChannelNotRegisteredError) {
@@ -1426,6 +1550,41 @@ export async function handleProxy(
           `[proxy] XLM channel: converted ${stellarAmount} USDC -> ${channelAmount} XLM at rate ${rate}`,
         )
       }
+      if (authHeader) {
+        channelDeliveryLockId = crypto.randomUUID()
+        const acquired = await acquireChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+        if (!acquired) {
+          return new Response(JSON.stringify({
+            error: 'Another channel delivery is in progress',
+            hint: 'Retry this exact request shortly.',
+          }), { status: 409, headers: { 'Content-Type': 'application/json', 'Retry-After': '2' } })
+        }
+        const channelStore = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+        const previous = await channelStore.get(`stellar:channel:cumulative:${channelContractForVerify}`) as any
+        const previousAmount = previous && typeof previous === 'object' && 'amount' in previous
+          ? String(previous.amount) : '0'
+        channelPreviousAmount = previousAmount
+        ;(mppx as any).onPaymentSuccess((payment: any) => {
+          const action = payment.credential.payload.action === 'close' ? 'close' : 'voucher'
+          channelVoucher = {
+            challengeId: payment.challenge.id,
+            acceptedAmount: String(payment.credential.payload.amount),
+            previousAmount,
+            action,
+          }
+          if (action === 'close') {
+            settledPayment = {
+              paymentId: payment.challenge.id,
+              paymentTx: payment.receipt.reference,
+              payer: payerAccount(payment.credential.source),
+              recipient: getRouterStellarAddress(env),
+              asset: channelCurrencyForVerify!,
+              amountAtomic: String(payment.request.amount),
+              mode: 'channel',
+            }
+          }
+        })
+      }
       verifyResult = await (mppx as any)['stellar/channel']({
         amount: channelAmount,
         channel: channelContractForVerify,
@@ -1456,6 +1615,10 @@ export async function handleProxy(
       })(mppxInput)
     }
   } catch (err: any) {
+    if (channelContractForVerify && channelDeliveryLockId) {
+      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      channelDeliveryLockId = undefined
+    }
     console.error(`[proxy] Stellar verify threw: ${err.message}`)
     return new Response(JSON.stringify({
       error: 'Payment verification failed',
@@ -1467,6 +1630,10 @@ export async function handleProxy(
   }
 
   if (verifyResult.status === 402) {
+    if (channelContractForVerify && channelDeliveryLockId) {
+      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      channelDeliveryLockId = undefined
+    }
     // Either no credential was presented, or it failed verification —
     // including replay attempts. The stellar charge method inside mppx
     // uses the shared KV store (see src/mpp/stellar-server.ts) to
@@ -1526,6 +1693,78 @@ export async function handleProxy(
 
   console.log(`[proxy] Stellar payment verified for route ${route.id}`)
 
+  if (
+    authKind === 'stellar.channel' && !channelVoucher && authHeader &&
+    channelPreviousAmount !== undefined && channelCurrencyForVerify
+  ) {
+    try {
+      const credential = Credential.deserialize(authHeader) as any
+      const receipt = Receipt.fromResponse(verifyResult.withReceipt(new Response(null)))
+      const action = credential.payload.action === 'close' ? 'close' : 'voucher'
+      channelVoucher = {
+        challengeId: credential.challenge.id,
+        acceptedAmount: String(credential.payload.amount),
+        previousAmount: channelPreviousAmount,
+        action,
+      }
+      if (action === 'close') {
+        settledPayment = {
+          paymentId: credential.challenge.id,
+          paymentTx: receipt.reference,
+          payer: payerAccount(credential.source),
+          recipient: getRouterStellarAddress(env),
+          asset: channelCurrencyForVerify,
+          amountAtomic: String(credential.challenge.request.amount),
+          mode: 'channel',
+        }
+      }
+    } catch (error: any) {
+      console.error(`[refund] channel proof recovery failed: ${error.message}`)
+    }
+  }
+
+  if (authKind === 'stellar.channel' && !channelVoucher) {
+    return verifyResult.withReceipt(new Response(JSON.stringify({
+      error: 'Channel payment verified but delivery stopped for refund safety',
+      detail: 'Operator reconciliation required; no upstream call was attempted.',
+    }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
+    }))
+  }
+
+  // Defensive recovery path: observer callbacks are intentionally isolated by
+  // mppx, so reconstruct the same proof from the credential that has just been
+  // cryptographically verified plus the SDK-generated payment receipt.
+  if (authKind !== 'stellar.channel' && !settledPayment && authHeader) {
+    try {
+      const credential = Credential.deserialize(authHeader) as any
+      const receipt = Receipt.fromResponse(verifyResult.withReceipt(new Response(null)))
+      settledPayment = {
+        paymentId: credential.challenge.id,
+        paymentTx: receipt.reference,
+        payer: payerAccount(credential.source),
+        recipient: credential.challenge.request.recipient,
+        asset: credential.challenge.request.currency,
+        amountAtomic: String(credential.challenge.request.amount),
+        mode: 'charge',
+      }
+    } catch (error: any) {
+      console.error(`[refund] payment proof recovery failed: ${error.message}`)
+    }
+  }
+
+  if (authKind !== 'stellar.channel' && !settledPayment) {
+    console.error('[refund] CRITICAL: Stellar charge settled but payment proof capture was unavailable')
+    return verifyResult.withReceipt(new Response(JSON.stringify({
+      error: 'Payment settled but delivery was stopped for refund safety',
+      detail: 'Operator reconciliation required; no upstream charge was attempted.',
+    }), {
+      status: 503,
+      headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
+    }))
+  }
+
   // 4. Pay the merchant from the Tempo pool.
   //
   // Dispatch on the merchant's ACTUAL intent (parsed.intent from
@@ -1553,20 +1792,99 @@ export async function handleProxy(
   // clear message so the operator notices and runs
   // `scripts/admin/open-tempo-channel.ts` before agent traffic
   // builds up.
-  const payResult = await payMerchantAndGetBody(
-    env,
-    ctx,
-    route,
-    parsed,
-    merchantUrl,
-    request,
-    requestBody,
-  )
-  if (payResult.kind === 'error') return payResult.response
+  let payResult: MerchantPayResult
+  try {
+    payResult = await payMerchantAndGetBody(
+      env,
+      ctx,
+      route,
+      parsed,
+      merchantUrl,
+      request,
+      requestBody,
+    )
+  } catch (error: any) {
+    console.error(`[proxy] Merchant delivery threw after payment: ${error.message}`)
+    payResult = {
+      kind: 'error',
+      refundReason: 'timeout',
+      response: new Response(JSON.stringify({
+        error: 'Merchant delivery failed',
+        detail: error.message,
+      }), { status: 502, headers: { 'Content-Type': 'application/json' } }),
+    }
+  }
+  if (payResult.kind === 'error') {
+    if (
+      authKind === 'stellar.channel' && channelContractForVerify &&
+      channelVoucher?.action === 'voucher'
+    ) {
+      let rolledBack = false
+      try {
+        rolledBack = await rollbackFailedChannelVoucher(
+          env,
+          channelContractForVerify,
+          channelVoucher.acceptedAmount,
+          channelVoucher.previousAmount,
+          channelVoucher.challengeId,
+        )
+        if (rolledBack && channelDeliveryLockId) {
+          await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+          channelDeliveryLockId = undefined
+        }
+      } catch (error: any) {
+        console.error(`[refund] channel voucher rollback failed: ${error.message}`)
+      }
+      const response = new Response(payResult.response.body, payResult.response)
+      response.headers.set('Refund-Mode', 'channel-remainder')
+      response.headers.set('Refund-Status', rolledBack ? 'voucher-not-consumed' : 'manual-review')
+      response.headers.set('Refund-Channel', channelContractForVerify)
+      return verifyResult.withReceipt(response)
+    }
+    if (settledPayment && payResult.refundReason) {
+      const refund = await enqueueRefund(env, {
+        proof: settledPayment,
+        reason: payResult.refundReason,
+        merchant: merchantHost,
+        routeId: route.id,
+      })
+      if (channelContractForVerify && channelDeliveryLockId) {
+        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+        channelDeliveryLockId = undefined
+      }
+      const response = new Response(payResult.response.body, payResult.response)
+      response.headers.set('Refund-Id', refund.publicId)
+      response.headers.set('Refund-Status', 'pending')
+      response.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
+      return verifyResult.withReceipt(response)
+    }
+    if (channelContractForVerify && channelDeliveryLockId) {
+      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      channelDeliveryLockId = undefined
+    }
+    return payResult.response
+  }
 
   // Check for async 202 — store job auth and return early with poll URL
-  const asyncResponse = await handleAsyncJob(env, payResult, route, authHeader, url)
+  const asyncResponse = await handleAsyncJob(
+    env, payResult, route, authHeader, url, settledPayment,
+    channelContractForVerify && channelDeliveryLockId && channelVoucher
+      ? {
+          channelContract: channelContractForVerify,
+          lockId: channelDeliveryLockId,
+          challengeId: channelVoucher.challengeId,
+          acceptedAmount: channelVoucher.acceptedAmount,
+          previousAmount: channelVoucher.previousAmount,
+          action: channelVoucher.action,
+        }
+      : undefined,
+  )
   if (asyncResponse) return asyncResponse
+
+  if (channelContractForVerify && channelDeliveryLockId) {
+    await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+    channelDeliveryLockId = undefined
+  }
 
   const { body, contentType } = payResult
 

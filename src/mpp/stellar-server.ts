@@ -48,7 +48,7 @@ export function getStellarUsdcSac(env: Env): string {
  * either a 402 challenge (no/invalid credential) or a 200 receipt holder
  * (credential verified).
  */
-export function createStellarPayment(env: Env) {
+export function createStellarPayment(env: Env, onSuccess?: (context: any) => void) {
   // Store.cloudflare with AtomicParameters produces Store.AtomicStore,
   // which @stellar/mpp 0.7.0 requires for replay protection (update() CAS).
   // The DO-backed doAtomicParams provides TRUE linearizable CAS — see
@@ -67,11 +67,13 @@ export function createStellarPayment(env: Env) {
     },
   })
 
-  return Mppx.create({
+  const mppx = Mppx.create({
     methods: [method],
     realm: 'apiserver.mpprouter.dev',
     secretKey: env.MPP_SECRET_KEY,
   })
+  if (onSuccess) mppx.onPaymentSuccess(onSuccess)
+  return mppx
 }
 
 /**

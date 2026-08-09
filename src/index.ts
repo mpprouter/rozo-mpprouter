@@ -17,7 +17,7 @@
  */
 
 import { handleProxy } from './routes/proxy'
-import { handleJobStatus, handleJobChallenge } from './routes/job-status'
+import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './routes/job-status'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleSearch } from './routes/search'
@@ -57,6 +57,7 @@ export { AtomicStoreDO } from './mpp/atomic-store-do'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
 import { handlePreflight, withCors } from './utils/cors'
+import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -137,6 +138,8 @@ export interface Env {
   // direct pay-invoice access, and vice versa.
   // Set via: wrangler secret put ADMIN_TOKEN
   ADMIN_TOKEN: string
+  // Dedicated least-authority token for the pull-only refund executor.
+  REFUND_EXECUTOR_TOKEN?: string
   // Kill switch for the coupon admin endpoints (issue/resolve/get). Separate
   // from ADMIN_ENDPOINT_ENABLED (which gates /admin/pay-invoice and stays OFF
   // in production) so enabling coupon issuance does not change the
@@ -241,6 +244,9 @@ export default {
     const response = await route(request, env, ctx)
     return withCors(request, response)
   },
+  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(reconcileAsyncRefunds(env))
+  },
 }
 
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -310,6 +316,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
       if (url.pathname === '/x402/supported') {
         return handleX402Supported(env)
+      }
+
+      const refundStatusMatch = url.pathname.match(/^\/v1\/refunds\/([0-9a-f-]{36})$/)
+      if (refundStatusMatch && request.method === 'GET') {
+        return handleRefundStatus(env, refundStatusMatch[1])
+      }
+
+      if (url.pathname.startsWith('/admin/refunds/')) {
+        return handleRefundAdmin(request, env, url)
       }
 
       if (url.pathname === '/admin/pay-invoice') {

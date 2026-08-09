@@ -42,6 +42,9 @@
  *               response: { ok: true }
  *                       | { ok: false; value: string | null; version: number }
  *
+ * POST /scan — body: { prefix: string; limit?: number }
+ *              response: { values: string[] }
+ *
  * If `storedVersion === expectedVersion` the write is applied and `version`
  * is incremented to `expectedVersion + 1`. Otherwise the current (value,
  * version) is returned so the caller can retry without an extra /read.
@@ -92,7 +95,20 @@ export class AtomicStoreDO implements DurableObject {
       return this.handleSeed(body)
     }
 
+    if (url.pathname === '/scan') {
+      return this.handleScan(body)
+    }
+
     return new Response('Not Found', { status: 404 })
+  }
+
+  private async handleScan(body: unknown): Promise<Response> {
+    if (!body || typeof body !== 'object' || typeof (body as any).prefix !== 'string') {
+      return new Response('Bad Request: expected { prefix: string }', { status: 400 })
+    }
+    const prefix = (body as any).prefix as string
+    const listed = await this.storage.list<string>({ prefix: `v:${prefix}` })
+    return Response.json({ values: [...listed.values()] })
   }
 
   // -------------------------------------------------------------------------
