@@ -115,13 +115,18 @@ describe('GET routes — build', () => {
     // pay-then-fail on chain). Moving this number DOWN is the mechanism
     // working; moving it up without a paid verification is not.
     //
-    // 443 as of 2026-08-09: openai_chat is back, and it moved up the only
-    // legitimate way — a real paid call (202, completion returned) run from a
-    // server, which is also how we learned the 2026-08-01 failure was an
-    // artifact of the client environment it was tested from. The other three
-    // were re-tested in the same round and stay delisted, each with a fresh
-    // failure recorded in its verifiedNote.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(443)
+    // 444 as of 2026-08-09, after two rounds of real paid verification run
+    // from a server. Both recoveries moved the number up the only legitimate
+    // way — a paid call that returned an actual result:
+    //   - openai_chat: the 2026-08-01 "region-blocked" verdict was an artifact
+    //     of the client environment that test ran from.
+    //   - anthropic_messages: the 404s were retired 2024 model ids. A current
+    //     id (claude-haiku-4-5) returns a real completion.
+    // Everything else re-tested in those rounds stays delisted with fresh
+    // evidence in its verifiedNote. Note tempo_rpc returned 202 again and was
+    // deliberately NOT re-listed: its documented failure begins with a 202 and
+    // an async job id that never resolves, so a 202 alone is not delivery.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(444)
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(0)
   })
 

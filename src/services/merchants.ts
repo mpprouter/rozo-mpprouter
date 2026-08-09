@@ -183,12 +183,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'anthropic_messages',
     publicPath: '/v1/services/anthropic/messages',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: false,
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-08-09T04:28:00Z',
     verifiedNote:
-      'Merchant returns 500 on direct mppx call (verified bypassing router). ' +
-      'Both /v1/messages and /v1/chat/completions endpoints fail upstream. ' +
-      'Channel is open but unusable until anthropic merchant is fixed. ' +
-      'Re-confirmed 2026-08-01 (filed upstream as tempoxyz/mpp#852) and again 2026-08-09: 404 "model: claude-3-5-haiku-20241022" — merchant lacks the model.',
+      'Verified with a real paid call 2026-08-09 using a current model id ' +
+      '(claude-haiku-4-5): 202 with a real completion in the body. The earlier ' +
+      '404s were retired 2024 model ids, not a broken merchant — callers must ' +
+      'pass a current Claude model.',
   },
   // 2026-08-01: disabled. Same shape as openrouter above — the payment
   // settles, then the merchant's own call to OpenAI is refused:
@@ -347,7 +349,10 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedNote:
       'Pay-then-fail on 2026-08-01: payment settles and the merchant returns ' +
       'an async job id, but polling that job returns 401 forever, so the paid ' +
-      'result is unobtainable. Delisted until the merchant is fixed.',
+      'result is unobtainable. Delisted until the merchant is fixed. ' +
+      'A 2026-08-09 re-test returned 202 again — that is the START of this ' +
+      'failure, not proof of delivery, so it stays delisted until a test ' +
+      'polls the job to completion.',
   },
   // DeepSeek Chat — OpenAI-compatible chat completions, tempo.charge.
   // Stable publicPath so agents don't hit the auto-slugged
