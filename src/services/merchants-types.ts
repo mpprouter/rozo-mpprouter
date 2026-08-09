@@ -146,6 +146,16 @@ export interface PublicServiceRoute {
 export interface PublicServiceRouteOverlay {
   id?: string
   publicPath?: string
+  /**
+   * Override the snapshot-derived upstream path. Needed when the
+   * snapshot publishes a literal wildcard (e.g. gemini's
+   * `/{version}/models/*`) that `resolveUpstreamPath` cannot
+   * substitute — the override supplies a fully-templated path
+   * (`/{version}/models/{model}:generateContent`) whose `{name}`
+   * placeholders resolve from query params / placeholderDefaults.
+   * The overlay KEY still uses the snapshot-derived path.
+   */
+  upstreamPath?: string
   verifiedMode?: 'session' | 'charge' | false
   verifiedNote?: string
   placeholderDefaults?: Record<string, string>

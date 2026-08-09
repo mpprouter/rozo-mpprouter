@@ -199,18 +199,29 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // returns 502/status:404. Root cause: upstream path is
   // `/{version}/models/*` and `resolveUpstreamPath` does not substitute
   // the literal `*` wildcard, so we forward `/v1beta/models/*` instead of
-  // `/v1beta/models/gemini-2.0-flash:generateContent`. Needs a proper
-  // upstreamPath override (overlay can't override upstreamPath today).
+  // `/v1beta/models/gemini-2.0-flash:generateContent`. Fixed via the
+  // `upstreamPath` overlay override below.
   // The PAYMENT path (session voucher + descriptor) is verified working.
   'gemini::/{version}/models/*': {
     id: 'gemini_generate',
     publicPath: '/v1/services/gemini/generate',
     upstreamPaymentMethod: 'tempo.session',
+    // upstreamPath override replaces the snapshot's literal `*` wildcard
+    // with a fully-templated path, unblocking the pay-then-404 documented
+    // in the 2026-06-22 E2E (payment/session layer was already verified
+    // working then). `{version}` and `{model}` resolve from query params
+    // or placeholderDefaults below. verifiedMode stays false — the path
+    // fix is a prerequisite for, not a substitute for, a fresh real-money
+    // E2E. Flip to verifiedMode: 'session' + sessionVerified only after
+    // that E2E passes post-deploy.
+    upstreamPath: '/{version}/models/{model}:generateContent',
     verifiedMode: false,
     verifiedNote:
-      'Payment/session layer OK after channel re-open (descriptor captured). ' +
-      'Blocked on upstream model path: `/{version}/models/*` wildcard is not ' +
-      'substituted, so merchant 404s. Needs upstreamPath override support.',
+      'Session/payment layer verified 2026-06-22 (descriptor captured). ' +
+      'Upstream 404 fixed via upstreamPath override — the snapshot wildcard ' +
+      '`/{version}/models/*` is now templated as ' +
+      '`/{version}/models/{model}:generateContent`. Still verifiedMode:false ' +
+      '(not payable) pending a fresh real-money E2E to re-mark verified.',
     placeholderDefaults: { version: 'v1beta', model: 'gemini-2.0-flash' },
   },
   // Dune SQL Execute — channel underfunded
