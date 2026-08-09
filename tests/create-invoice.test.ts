@@ -771,3 +771,152 @@ describe('handleCreateInvoice — already-paid vs expired', () => {
     expect(json.payment_status).toBe('PAYMENT_SESSION_STATUS_EXPIRED')
   })
 })
+
+// ── Coinbase line: reuse of an existing intent ──────────────────────────────
+// The reuse gate used to be expiry-only, so an unexpired order was handed back
+// regardless of its status and regardless of the source the caller asked for.
+// A caller wanting Solana USDT got a Stellar USDC link with reused:true / 200.
+describe('handleCreateInvoice — Coinbase reuse gate', () => {
+  function makeEnv() {
+    return {
+      PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
+      ROZO_INTENTS_API_KEY: 'test-key',
+    } as unknown as import('../src/index').Env
+  }
+
+  /** Runs the handler with an existing order row and a scripted rotation reply. */
+  async function runReuse(
+    existing: any,
+    body: Record<string, unknown>,
+    checkout: () => Response = () => new Response('{}', { status: 200 }),
+  ) {
+    const { handleCreateInvoice } = await import('../src/routes/create-invoice')
+    let createBody: any = null
+    let checkoutBody: any = null
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('/quote-invoice')) {
+        return new Response(
+          JSON.stringify({
+            invoice: { amount: '105' },
+            merchant: 'OpenRouter, Inc.',
+            linkId: 'pl_test123',
+          }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payments/order/')) {
+        return new Response(JSON.stringify(existing), { status: 200 })
+      }
+      if (u.includes('/checkout')) {
+        checkoutBody = init?.body ? JSON.parse(init.body) : null
+        return checkout()
+      }
+      if (u.includes('/payment-api')) {
+        createBody = init?.body ? JSON.parse(init.body) : null
+        return new Response(
+          JSON.stringify({ id: 'rozo-new', paymentLink: 'https://pay.rozo.ai/x', expiresAt: '2999-01-01T00:00:00.000Z' }),
+          { status: 200 },
+        )
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const req = new Request('https://mpp.test/create-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      const res = await handleCreateInvoice(req, makeEnv())
+      return { status: res.status, json: JSON.parse(await res.text()), createBody, checkoutBody }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  const unpaidStellar = {
+    id: 'rozo-existing',
+    status: 'payment_unpaid',
+    paymentLink: 'https://pay.rozo.ai/existing',
+    expiresAt: '2999-01-01T00:00:00.000Z',
+    source: { chainId: '1500', tokenSymbol: 'USDC' },
+  }
+
+  it('rotates an unpaid order onto the requested source (the lost-sale incident)', async () => {
+    const { status, json, createBody, checkoutBody } = await runReuse(
+      unpaidStellar,
+      { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+      () =>
+        new Response(
+          JSON.stringify({
+            id: 'rozo-existing',
+            status: 'payment_unpaid',
+            paymentLink: 'https://pay.rozo.ai/rotated',
+            expiresAt: '2999-03-01T00:00:00.000Z',
+            source: { chainId: '900', tokenSymbol: 'USDT' },
+          }),
+          { status: 200 },
+        ),
+    )
+    expect(status).toBe(200)
+    expect(json.reused).toBe(true)
+    expect(json.sourceRotated).toBe(true)
+    expect(checkoutBody).toEqual({ source: { chainId: '900', tokenSymbol: 'USDT' } })
+    expect(json.source).toEqual({ chainId: '900', tokenSymbol: 'USDT' })
+    expect(json.paymentLink).toBe('https://pay.rozo.ai/rotated')
+    expect(json.expiresAt).toBe('2999-03-01T00:00:00.000Z')
+    // Reuse means no second order under the same pl_ id.
+    expect(createBody).toBeNull()
+  })
+
+  it('keeps serving the existing order (with a warning) when rotation fails', async () => {
+    const { status, json } = await runReuse(
+      unpaidStellar,
+      { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+      () => new Response(JSON.stringify({ error: 'checkoutNotAllowed' }), { status: 400 }),
+    )
+    expect(status).toBe(200)
+    expect(json.reused).toBe(true)
+    expect(json.sourceMismatch).toBe(true)
+    expect(json.source).toEqual({ chainId: '1500', tokenSymbol: 'USDC' })
+    expect(json.warnings.join(' ')).toContain('checkoutNotAllowed')
+    expect(json.warnings.join(' ')).toContain('was not applied')
+  })
+
+  it('does not rotate when the requested source already matches', async () => {
+    const { json, checkoutBody } = await runReuse(unpaidStellar, {
+      payment_id: 'pl_test123',
+      source: { chainId: '1500', tokenSymbol: 'USDC' },
+    })
+    expect(json.reused).toBe(true)
+    expect(checkoutBody).toBeNull()
+    expect(json.sourceRotated).toBeUndefined()
+    expect(json.sourceMismatch).toBeUndefined()
+    expect(json.warnings).toBeUndefined()
+  })
+
+  it('never rotates a lightning order — warns instead', async () => {
+    const { json, checkoutBody } = await runReuse(
+      { ...unpaidStellar, source: { chainId: 'lightning', tokenSymbol: 'BTC' } },
+      { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+    )
+    expect(checkoutBody).toBeNull()
+    expect(json.sourceMismatch).toBe(true)
+    expect(json.source).toEqual({ chainId: 'lightning', tokenSymbol: 'BTC' })
+  })
+
+  it('409s an unexpired order that is no longer unpaid instead of reusing it', async () => {
+    const { status, json, createBody } = await runReuse(
+      { ...unpaidStellar, status: 'payment_completed' },
+      { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+    )
+    expect(status).toBe(409)
+    expect(json.ok).toBe(false)
+    expect(json.error.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.status).toBe('payment_completed')
+    expect(json.rozoPaymentId).toBe('rozo-existing')
+    expect(json.linkId).toBe('pl_test123')
+    expect(createBody).toBeNull()
+  })
+})
