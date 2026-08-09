@@ -101,7 +101,7 @@ const CHALLENGE_TTL_SECONDS = 120
 const NONCE_BYTES = 32
 
 function classifyAsyncFailure(statusCode: number, body: string): RefundReason | undefined {
-  if (statusCode === 403) return 'non_fulfillment'
+  if (statusCode >= 400 && statusCode < 500) return 'non_fulfillment'
   if (statusCode >= 500) return 'upstream_5xx'
   if (statusCode >= 200 && statusCode < 300 && body.trim().length === 0) return 'empty_response'
   if (statusCode >= 200 && statusCode < 300) {

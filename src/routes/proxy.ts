@@ -507,9 +507,7 @@ async function payMerchantAndGetBody(
     if (!merchantResponse.ok && merchantResponse.status !== 202) {
       return {
         kind: 'error',
-        refundReason: merchantResponse.status === 403
-          ? 'non_fulfillment'
-          : merchantResponse.status >= 500 ? 'upstream_5xx' : undefined,
+        refundReason: merchantResponse.status >= 500 ? 'upstream_5xx' : 'non_fulfillment',
         response: new Response(
           JSON.stringify({
             error: 'Merchant admin payment failed',
@@ -606,9 +604,7 @@ async function payMerchantAndGetBody(
     console.error(`[proxy] Merchant error body: ${errorBody.substring(0, 200)}`)
     return {
       kind: 'error',
-      refundReason: merchantResponse.status === 403
-        ? 'non_fulfillment'
-        : merchantResponse.status >= 500 ? 'upstream_5xx' : undefined,
+      refundReason: merchantResponse.status >= 500 ? 'upstream_5xx' : 'non_fulfillment',
       response: new Response(
         JSON.stringify({
           error: 'Merchant payment failed',
