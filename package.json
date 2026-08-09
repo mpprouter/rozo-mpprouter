@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "deploy:refund-signer": "wrangler deploy --config wrangler.refund-signer.toml",
     "refund-channel": "tsx scripts/refund-stellar-channel.ts",
     "refund-executor": "tsx scripts/admin/refund-executor.ts",
     "test": "vitest"
