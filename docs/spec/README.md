@@ -1,6 +1,10 @@
 # MPP Router — Open AI-Payment Protocol on Stellar (Spec v0.1)
 
-> Tagged as `v0.1.0-tranche1` — the SCF #44 Tranche 1 spec deliverable.
+> Tagged as `v0.2.0-tranche2` — the SCF #44 Tranche 2 spec deliverable.
+> Adds [`receipts-and-refunds.md`](./receipts-and-refunds.md): non-delivery
+> classification, refund amounts and destinations, execution bounds, and the
+> signed receipt format — with a mainnet worked example.
+> (`v0.1.0-tranche1` was the Tranche 1 deliverable: the four documents below.)
 > Status: **draft / v0**. Everything documented here is live in production at
 > `https://apiserver.mpprouter.dev` and was verified with real Stellar-mainnet
 > paid calls. Field names and header shapes are stable within v0.1; breaking
@@ -11,7 +15,7 @@
 An agent with a Stellar wallet — and nothing else: no API key, no account,
 no card — can discover a paid API service, receive a machine-readable quote,
 pay in USDC on Stellar mainnet, and get the result. This directory specifies
-the four contracts that make that work:
+the five contracts that make that work:
 
 | Document | Contract |
 | --- | --- |
@@ -19,6 +23,7 @@ the four contracts that make that work:
 | [`mpp-session.md`](./mpp-session.md) | The MPP payment dialect: `WWW-Authenticate: Payment …` challenges, the `charge` (single-shot) and `channel` (bounded-budget session) intents |
 | [`catalog.md`](./catalog.md) | The machine-readable service catalog: field semantics, price labels, payability, and the verified-flag contract |
 | [`provider-registration.md`](./provider-registration.md) | How a provider/route enters the catalog, the operator overlay, and the real-money verification gate |
+| [`receipts-and-refunds.md`](./receipts-and-refunds.md) | What happens when a paid call does not deliver: non-delivery classification, refund amount and destination, execution bounds, and the signed receipt |
 
 ## Design invariants (normative)
 
@@ -40,6 +45,11 @@ These hold across all four documents:
 5. **Stellar-credential funding boundary.** The router only spends from its
    upstream settlement pool for calls that carry a Stellar credential the
    router itself issued. Any other credential type is forwarded untouched.
+6. **Payment without delivery is refunded.** When a settled call produces no
+   usable upstream response, the payer gets the money back automatically, to
+   the account the payment came from, with a signed receipt referencing both
+   transactions. Bounds and classification live in
+   [`receipts-and-refunds.md`](./receipts-and-refunds.md).
 
 ## Live endpoints
 
