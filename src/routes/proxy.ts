@@ -72,7 +72,7 @@ function buildMerchantUrl(merchantHost: string, upstreamPath: string, search: st
  * Stellar credentials) we keep Authorization so the merchant sees the
  * agent's original auth exactly as sent.
  */
-function forwardHeaders(
+export function forwardHeaders(
   request: Request,
   opts: { keepAuthorization?: boolean } = {},
 ): HeadersInit {
@@ -81,6 +81,12 @@ function forwardHeaders(
     const lower = key.toLowerCase()
     if (lower === 'host') continue
     if (lower === 'authorization' && !opts.keepAuthorization) continue
+    // The agent's Accept-Payment describes what THE AGENT can pay us with
+    // (e.g. stellar/charge). Forwarding it to the merchant makes mppx adopt
+    // it as the ROUTER's own preference, which filters out every Tempo
+    // challenge the merchant offers and leaves zero candidates ("No method
+    // found for challenges"). The router pays merchants on its own terms.
+    if (lower === 'accept-payment') continue
     headers[key] = value
   }
   return headers
