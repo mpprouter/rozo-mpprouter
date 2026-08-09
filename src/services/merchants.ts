@@ -154,7 +154,31 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'bypassing the router (2026-08-01). Filed upstream as tempoxyz/mpp#852; ' +
       're-verify with a real paid call before re-enabling. Re-tested 2026-08-09: still 401 "User not found." — merchant key still bad.',
   },
-  // Anthropic Messages — broken upstream
+  // Anthropic OpenAI-compatible chat completions — verified 2026-08-09.
+  // The merchant only serves CURRENT-generation Claude models; the stale
+  // 2024 ids we were testing with (claude-3-5-haiku-20241022,
+  // claude-3-7-sonnet-latest, claude-3-haiku-20240307) all 404, which is
+  // why this provider looked broken. Verified working with real paid
+  // calls (202, completion returned) on: claude-sonnet-4-5,
+  // claude-haiku-4-5, claude-opus-4-5, claude-opus-4-8, claude-sonnet-5,
+  // claude-opus-5.
+  'anthropic::/v1/chat/completions': {
+    id: 'anthropic_chat_completions',
+    publicPath: '/v1/services/anthropic/chat_completions',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-09T04:19:00Z',
+    verifiedNote:
+      'Verified with real paid calls 2026-08-09 (202, completion returned) ' +
+      'on six current Claude models. Callers must pass a current model id — ' +
+      'retired 2024-era ids return 404 from the merchant.',
+  },
+  // Anthropic Messages — the native /v1/messages endpoint.
+  // 2026-08-09: NOT yet re-tested with a current model id. The sibling
+  // chat_completions route above proves the merchant and its key are
+  // healthy, so the 404 recorded below was very likely the same stale
+  // model id, not a broken merchant. Re-test with claude-haiku-4-5 before
+  // assuming otherwise.
   'anthropic::/v1/messages': {
     id: 'anthropic_messages',
     publicPath: '/v1/services/anthropic/messages',

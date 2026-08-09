@@ -35,7 +35,7 @@ export const PROVIDERS = [
     publicPath: '/v1/services/anthropic/messages',
     method: 'POST',
     mode: 'session',
-    body: { model: 'claude-3-5-haiku-20241022', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    body: { model: 'claude-haiku-4-5', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
     okCheck: (j) => Boolean(j?.content?.[0]?.text ?? j?.choices),
   },
   {
