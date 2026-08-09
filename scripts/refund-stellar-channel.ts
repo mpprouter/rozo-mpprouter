@@ -21,7 +21,9 @@ function usage(): never {
 
 function value(args: string[], flag: string): string | undefined {
   const index = args.indexOf(flag)
-  return index === -1 ? undefined : args[index + 1]
+  if (index === -1) return undefined
+  const next = args[index + 1]
+  return next && !next.startsWith('--') ? next : undefined
 }
 
 function main(): void {
@@ -51,7 +53,7 @@ function main(): void {
     return
   }
 
-  const result = spawnSync('stellar', command, { encoding: 'utf8', stdio: 'inherit' })
+  const result = spawnSync('stellar', command, { stdio: 'inherit' })
   if (result.error) throw result.error
   if (result.status !== 0) process.exit(result.status ?? 1)
 
