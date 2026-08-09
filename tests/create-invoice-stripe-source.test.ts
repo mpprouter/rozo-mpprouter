@@ -68,11 +68,14 @@ let existingIntent: any = null
 let checkoutBody: any = null
 /** What the rotation endpoint answers; overridden per-test to simulate failure. */
 let checkoutResponse: () => Response = () => new Response('{}', { status: 200 })
+/** When set, the post-rotation status refetch returns this instead of existingIntent. */
+let refetchedIntent: any = null
 
 function installFetchMock() {
   createdIntent = null
   existingIntent = null
   checkoutBody = null
+  refetchedIntent = null
   checkoutResponse = () => new Response('{}', { status: 200 })
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u =
@@ -121,6 +124,13 @@ function installFetchMock() {
     if (u.includes('/checkout')) {
       checkoutBody = JSON.parse(String(init?.body ?? '{}'))
       return checkoutResponse()
+    }
+    // Status refetch after a failed rotation (GET /payments/:id).
+    if (/\/payments\/[^/]+$/.test(u) && (!init?.method || init.method === 'GET')) {
+      const row = refetchedIntent ?? existingIntent
+      return row
+        ? new Response(JSON.stringify(row), { status: 200 })
+        : new Response('not found', { status: 404 })
     }
     if (u.includes('/payment-api')) {
       createdIntent = JSON.parse(String(init?.body ?? '{}'))
@@ -308,6 +318,32 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
     expect(json.source).toEqual({ chainId: '8453', tokenSymbol: 'USDC' })
     expect(json.warnings?.join(' ')).toContain('was not applied')
     expect(json.warnings?.join(' ')).toContain('checkoutNotAllowed')
+  })
+
+  it('answers 409 when the order left payment_unpaid during a failed rotation (lookup→rotate race)', async () => {
+    existingIntent = {
+      id: 'rozo-existing-1c',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC' },
+    }
+    // A payer funded the order while our /checkout call was in flight: the
+    // rotation is refused, and the refetched row is no longer unpaid.
+    checkoutResponse = () =>
+      new Response(JSON.stringify({ error: 'checkoutNotAllowed' }), { status: 400 })
+    refetchedIntent = { ...existingIntent, status: 'payment_completed' }
+
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: '900', tokenSymbol: 'USDT' },
+    })
+
+    expect(status).toBe(409)
+    expect(json.ok).toBe(false)
+    expect(json.error.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.status).toBe('payment_completed')
+    expect(createdIntent).toBeNull()
   })
 
   it('does not warn or rotate when the reused intent matches the requested source', async () => {

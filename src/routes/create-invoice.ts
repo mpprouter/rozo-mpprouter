@@ -299,6 +299,29 @@ async function rotateExistingSource(
   return { ok: true, row }
 }
 
+/**
+ * Re-read a payment's current status straight from the Rozo payment-api.
+ *
+ * Used to close the lookup→rotate race: the row can leave payment_unpaid
+ * between our idempotency lookup and the /checkout call (a payer funds it
+ * mid-flight), in which case rotation fails with `checkoutNotAllowed` and the
+ * pre-fetched row we hold is stale. Returns null when the status cannot be
+ * determined (treated by callers as "unknown, keep the pre-fetched view").
+ */
+async function refetchPaymentStatus(env: Env, paymentId: string): Promise<string | null> {
+  try {
+    const resp = await fetch(
+      `${ROZO_INTENTS_BASE}/payments/${encodeURIComponent(paymentId)}`,
+      { method: 'GET', headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
+    )
+    if (!resp.ok) return null
+    const row: any = await resp.json().catch(() => null)
+    return readPaymentStatus(row)
+  } catch {
+    return null
+  }
+}
+
 /** Human-readable note for a mismatch we could not rotate away. */
 function sourceMismatchWarning(
   rowSource: { chainId: string | null; tokenSymbol: string | null },
@@ -670,6 +693,32 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           }
         }
 
+        // Close the lookup→rotate race (codex P1): the row can leave
+        // payment_unpaid while the /checkout call is in flight, in which case
+        // returning the pre-fetched link as payable invites a double payment.
+        // The rotated row carries its own status; after a failure we re-read it.
+        const postRotationStatus = sourceRotated
+          ? readPaymentStatus(row)
+          : rotationFailure
+            ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
+            : REUSABLE_PAYMENT_STATUS
+        if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
+          return json(409, {
+            ok: false,
+            error: {
+              code: 'ORDER_ALREADY_ACTIVE',
+              message:
+                `An order already exists for this invoice and is no longer awaiting ` +
+                `payment (status: ${postRotationStatus}). Do not pay again — ` +
+                `poll the payment status instead.`,
+            },
+            linkId,
+            rozoPaymentId: row?.id ?? existing?.id ?? null,
+            status: postRotationStatus,
+            expiresAt: row?.expiresAt ?? existingExpiresAt,
+          })
+        }
+
         const warnings = [...source.warnings]
         if (rotationFailure) {
           warnings.push(sourceMismatchWarning(rowSource, source, rotationFailure))
@@ -1007,6 +1056,31 @@ export async function handleStripeCreateInvoice(
           rotationFailure = rotated.code
         }
       }
+    }
+    // Close the lookup→rotate race (codex P1): the row can leave
+    // payment_unpaid while the /checkout call is in flight, in which case
+    // returning the pre-fetched link as payable invites a double payment.
+    const postRotationStatus = sourceRotated
+      ? readPaymentStatus(row)
+      : rotationFailure
+        ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
+        : REUSABLE_PAYMENT_STATUS
+    if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
+      return json(409, {
+        ok: false,
+        provider: 'stripe_crypto',
+        error: {
+          code: 'ORDER_ALREADY_ACTIVE',
+          message:
+            `An order already exists for this invoice and is no longer awaiting ` +
+            `payment (status: ${postRotationStatus}). Do not pay again — ` +
+            `poll the payment status instead.`,
+        },
+        invoiceKey: invoice.invoiceKey,
+        rozoPaymentId: row?.id ?? existing?.id ?? null,
+        status: postRotationStatus,
+        expiresAt: row?.expiresAt ?? existing?.expiresAt ?? null,
+      })
     }
     rozoPaymentId = row?.id ?? existing?.id ?? null
     paymentLink = row?.paymentLink ?? row?.url ?? row?.payment_link ?? null
