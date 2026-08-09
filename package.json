@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "refund-channel": "tsx scripts/refund-stellar-channel.ts",
     "test": "vitest"
   },
   "dependencies": {

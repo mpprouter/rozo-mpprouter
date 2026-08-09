@@ -47,7 +47,6 @@ import {
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
-import { decimalToRaw, enqueueManualRefund, type RefundReason } from '../mpp/refund'
 import type { Env } from '../index'
 
 /**
@@ -459,7 +458,7 @@ type MerchantPayResult =
       /** HTTP status from merchant — 200 for sync, 202 for async jobs */
       merchantStatus: number
     }
-  | { kind: 'error'; response: Response; refundReason: RefundReason }
+  | { kind: 'error'; response: Response }
 
 async function payMerchantAndGetBody(
   env: Env,
@@ -486,7 +485,6 @@ async function payMerchantAndGetBody(
     } catch (err: any) {
       return {
         kind: 'error',
-        refundReason: /timeout|timed out|abort/i.test(String(err?.message)) ? 'upstream_timeout' : 'upstream_5xx',
         response: new Response(
           JSON.stringify({
             error: 'Merchant admin payment failed',
@@ -502,7 +500,6 @@ async function payMerchantAndGetBody(
     if (!merchantResponse.ok && merchantResponse.status !== 202) {
       return {
         kind: 'error',
-        refundReason: merchantResponse.status === 403 ? 'upstream_refused' : merchantResponse.status >= 500 ? 'upstream_5xx' : 'malformed_after_charge',
         response: new Response(
           JSON.stringify({
             error: 'Merchant admin payment failed',
@@ -563,7 +560,6 @@ async function payMerchantAndGetBody(
       console.error(`[proxy] ${err.message}`)
       return {
         kind: 'error',
-        refundReason: 'upstream_5xx',
         response: new Response(
           JSON.stringify({
             error: 'Router session channel not installed',
@@ -580,7 +576,6 @@ async function payMerchantAndGetBody(
     console.error(`[proxy] Tempo payment error: ${err.message}`)
     return {
       kind: 'error',
-      refundReason: /timeout|timed out|abort/i.test(String(err?.message)) ? 'upstream_timeout' : 'upstream_5xx',
       response: new Response(
         JSON.stringify({
           error: 'Merchant payment failed',
@@ -599,7 +594,6 @@ async function payMerchantAndGetBody(
     console.error(`[proxy] Merchant error body: ${errorBody.substring(0, 200)}`)
     return {
       kind: 'error',
-      refundReason: merchantResponse.status === 403 ? 'upstream_refused' : merchantResponse.status >= 500 ? 'upstream_5xx' : 'malformed_after_charge',
       response: new Response(
         JSON.stringify({
           error: 'Merchant payment failed',
@@ -1568,50 +1562,7 @@ export async function handleProxy(
     request,
     requestBody,
   )
-  if (payResult.kind === 'error') {
-    // Charge verification has already settled before the merchant call. Record
-    // the resulting debt atomically for the offline operator executor. Channel
-    // failures are intentionally excluded here: the current SDK advances its
-    // cumulative watermark during verify, so a correct two-phase SDK change is
-    // required before we can claim failed vouchers were not consumed.
-    if (authKind === 'stellar.charge' && authHeader) {
-      try {
-        const pending = await enqueueManualRefund(env, {
-          authHeader,
-          merchant: route.id,
-          amountRaw: decimalToRaw(stellarAmount, 7),
-          mode: 'charge',
-          reason: payResult.refundReason,
-        })
-        const headers = new Headers(payResult.response.headers)
-        headers.set('X-Refund-Status', pending.record.status)
-        headers.set('X-Refund-Request-Id', pending.record.paymentId)
-        return new Response(payResult.response.body, {
-          status: payResult.response.status,
-          statusText: payResult.response.statusText,
-          headers,
-        })
-      } catch (err: any) {
-        console.error(`[refund] failed to enqueue manual refund: ${err.message}`)
-        if (env.DINGTALK_ACCESS_TOKEN) {
-          ctx.waitUntil(sendDingTalkAlert(
-            env.DINGTALK_ACCESS_TOKEN,
-            `[MPP Router] 退款债务登记失败\n发生时间: ${new Date().toISOString()}\n` +
-            `问题: ${route.id} 已收款但上游未交付，退款队列写入失败\n` +
-            `影响: 用户退款可能需要人工链上核对\n下一步: CEO/operator 检查 Worker 日志并按 payment credential 对账`,
-          ))
-        }
-        const headers = new Headers(payResult.response.headers)
-        headers.set('X-Refund-Status', 'enqueue_failed')
-        return new Response(payResult.response.body, {
-          status: payResult.response.status,
-          statusText: payResult.response.statusText,
-          headers,
-        })
-      }
-    }
-    return payResult.response
-  }
+  if (payResult.kind === 'error') return payResult.response
 
   // Check for async 202 — store job auth and return early with poll URL
   const asyncResponse = await handleAsyncJob(env, payResult, route, authHeader, url)
