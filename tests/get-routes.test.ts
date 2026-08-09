@@ -107,14 +107,21 @@ describe('GET routes — build', () => {
     // Every newly-built GET route is gated off — the anti-Nansen
     // invariant, asserted by the second expectation below.
     //
-    // The POST baseline was 446 when GET support landed. It is 442 as of
+    // The POST baseline was 446 when GET support landed. It dropped to 442 on
     // 2026-08-01, when real-money verification delisted four routes that
     // take payment and then fail: openai_chat and openrouter_chat
     // (merchant's upstream region-restricted / credential invalid,
     // tempoxyz/mpp#852), alchemy_rpc and tempo_rpc (both confirmed
     // pay-then-fail on chain). Moving this number DOWN is the mechanism
     // working; moving it up without a paid verification is not.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(442)
+    //
+    // 443 as of 2026-08-09: openai_chat is back, and it moved up the only
+    // legitimate way — a real paid call (202, completion returned) run from a
+    // server, which is also how we learned the 2026-08-01 failure was an
+    // artifact of the client environment it was tested from. The other three
+    // were re-tested in the same round and stay delisted, each with a fresh
+    // failure recorded in its verifiedNote.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(443)
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(0)
   })
 
