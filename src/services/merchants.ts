@@ -152,7 +152,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       "Merchant's upstream OpenRouter authentication is missing, invalid or " +
       'revoked: 401 "User not found." after the payment settles. Reproduced ' +
       'bypassing the router (2026-08-01). Filed upstream as tempoxyz/mpp#852; ' +
-      're-verify with a real paid call before re-enabling.',
+      're-verify with a real paid call before re-enabling. Re-tested 2026-08-09: still 401 "User not found." — merchant key still bad.',
   },
   // Anthropic Messages — broken upstream
   'anthropic::/v1/messages': {
@@ -164,7 +164,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'Merchant returns 500 on direct mppx call (verified bypassing router). ' +
       'Both /v1/messages and /v1/chat/completions endpoints fail upstream. ' +
       'Channel is open but unusable until anthropic merchant is fixed. ' +
-      'Re-confirmed 2026-08-01 and filed upstream as tempoxyz/mpp#852.',
+      'Re-confirmed 2026-08-01 (filed upstream as tempoxyz/mpp#852) and again 2026-08-09: 404 "model: claude-3-5-haiku-20241022" — merchant lacks the model.',
   },
   // 2026-08-01: disabled. Same shape as openrouter above — the payment
   // settles, then the merchant's own call to OpenAI is refused:
@@ -179,12 +179,13 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'openai_chat',
     publicPath: '/v1/services/openai/chat',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: false,
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-08-09T03:51:00Z',
     verifiedNote:
-      "Merchant's upstream OpenAI egress/account is region-restricted: 403 " +
-      'unsupported_country_region_territory after the payment settles. ' +
-      'Reproduced bypassing the router (2026-08-01). Filed upstream as ' +
-      'tempoxyz/mpp#852; re-verify with a real paid call before re-enabling.',
+      'Verified with a real paid call on 2026-08-09: 202, chat completion ' +
+      'returned. The earlier post-settlement 403 (2026-08-01, filed as ' +
+      'tempoxyz/mpp#852) no longer reproduces.',
   },
   // Google Gemini — uses {model} placeholder, defaults to gemini-2.0-flash
   // The upstream path uses Google's `:generateContent` literal
@@ -220,8 +221,11 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'Session/payment layer verified 2026-06-22 (descriptor captured). ' +
       'Upstream 404 fixed via upstreamPath override — the snapshot wildcard ' +
       '`/{version}/models/*` is now templated as ' +
-      '`/{version}/models/{model}:generateContent`. Still verifiedMode:false ' +
-      '(not payable) pending a fresh real-money E2E to re-mark verified.',
+      '`/{version}/models/{model}:generateContent`. Re-tested with a real ' +
+      'paid call 2026-08-09: the path fix works (the request now reaches ' +
+      "Google), but the merchant's own Google API key is rejected — 400 " +
+      '"API key not valid". Stays verifiedMode:false until the merchant ' +
+      'fixes its key.',
     placeholderDefaults: { version: 'v1beta', model: 'gemini-2.0-flash' },
   },
   // Dune SQL Execute — channel underfunded
