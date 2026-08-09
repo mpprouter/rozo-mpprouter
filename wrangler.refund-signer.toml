@@ -1,0 +1,28 @@
+name = "mpprouter-refund-signer"
+main = "src/refund-signer.ts"
+compatibility_date = "2026-08-09"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[durable_objects.bindings]]
+name = "SIGNER_COORDINATOR"
+class_name = "RefundSignerCoordinator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RefundSignerCoordinator"]
+
+[vars]
+ROUTER_URL = "https://apiserver.mpprouter.dev"
+STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
+# Strictly less than $100 USDC (7 decimal atomic units) is automatic.
+AUTO_REFUND_MAX_ATOMIC = "1000000000"
+# Refunds strictly greater than $10 are automatic but also alert the operator.
+REFUND_ALERT_THRESHOLD_ATOMIC = "100000000"
+
+# Secrets, set with `wrangler secret put --config wrangler.refund-signer.toml`:
+# ROUTER_SIGNING_SECRET, REFUND_EXECUTOR_TOKEN, DINGTALK_ACCESS_TOKEN

@@ -61,13 +61,20 @@ async function execute(job: any): Promise<void> {
       // envelope has the same hash and cannot create a second refund.
       stellar(['tx', 'send', '--network', network, job.signedXdr])
     } catch {
-      // It may already be accepted; the Worker RPC confirmation below is the
-      // authority, not this command's exit code.
+      // Confirmation below distinguishes an accepted transaction from the
+      // one recoverable pre-broadcast failure: an old malformed Soroban XDR.
     }
-    await api('/admin/refunds/confirm', {
-      method: 'POST', body: JSON.stringify({ refundId: job.refundId, leaseId: job.lease.id }),
-    })
-    console.log(JSON.stringify({ refundId: job.refundId, refundTx: job.refundTx, reconciled: true }))
+    try {
+      await api('/admin/refunds/confirm', {
+        method: 'POST', body: JSON.stringify({ refundId: job.refundId, leaseId: job.lease.id }),
+      })
+      console.log(JSON.stringify({ refundId: job.refundId, refundTx: job.refundTx, reconciled: true }))
+    } catch (error) {
+      await api('/admin/refunds/requeue-malformed', {
+        method: 'POST', body: JSON.stringify({ refundId: job.refundId, leaseId: job.lease.id }),
+      })
+      console.error(`requeued structurally malformed refund ${job.refundId}; run the executor again`)
+    }
     return
   }
 
@@ -78,12 +85,13 @@ async function execute(job: any): Promise<void> {
 
   // Build, sign, and hash before broadcast. If send becomes ambiguous, the
   // same signed XDR/hash can be reconciled; never construct a second payment.
-  const unsignedXdr = stellar([
+  const baseXdr = stellar([
     'contract', 'invoke', '--id', leased.payment.asset, '--source', source,
     '--network', network, '--build-only', '--', 'transfer',
     '--from', operator, '--to', leased.payment.payer, '--amount', leased.refundAmountAtomic,
   ])
-  const signedXdr = stellar(['tx', 'sign', '--network', network, '--sign-with-key', source, unsignedXdr])
+  const simulatedXdr = stellar(['tx', 'simulate', '--source', source, '--network', network, baseXdr])
+  const signedXdr = stellar(['tx', 'sign', '--network', network, '--sign-with-key', source, simulatedXdr])
   const refundTx = stellar(['tx', 'hash', '--network', network, signedXdr])
 
   await api('/admin/refunds/complete', {

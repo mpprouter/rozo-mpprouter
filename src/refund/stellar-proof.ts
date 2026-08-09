@@ -35,6 +35,11 @@ export function validateSignedRefundXdr(record: RefundRecord, signedXdr: string,
   return tx.hash().toString('hex')
 }
 
+export function hasSorobanTransactionData(signedXdr: string, network: string): boolean {
+  const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase(network)) as Transaction
+  return tx.toEnvelope().v1().tx().ext().switch() === 1
+}
+
 export async function verifyConfirmedRefund(
   record: RefundRecord,
   signedXdr: string,

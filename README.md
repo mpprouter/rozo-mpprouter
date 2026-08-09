@@ -46,7 +46,7 @@ executor from an isolated operator account whose Stellar CLI keystore contains
 the Router pool identity:
 
 ```bash
-REFUND_EXECUTOR_TOKEN=... npm run refund-executor -- \
+REFUND_EXECUTOR_TOKEN="$(<"$HOME/.config/mpprouter/refund-executor-token")" npm run refund-executor -- \
   --router https://apiserver.mpprouter.dev \
   --source <router-pool-identity> --network mainnet --watch
 ```
@@ -56,6 +56,17 @@ signed XDR and deterministic hash before broadcast, and reconciles ambiguous
 broadcast outcomes by resubmitting only that exact envelope. Set the optional
 `REFUND_MAX_ATOMIC` operator policy to cap an executor instance; the product
 does not hard-code the sub-$1 limit used by rollout tests.
+
+Production runs the signer as a separate cron-only Cloudflare Worker:
+
+```bash
+npm run deploy:refund-signer
+```
+
+`mpprouter-refund-signer` has no public route and only runs from its cron. It
+holds the Router signing key separately from the request-serving Worker. Jobs
+strictly below $100 are automatic; jobs above $10 additionally send an
+operator alert, while jobs at or above $100 remain pending and alert once.
 
 Public base URL:
 

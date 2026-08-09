@@ -6,12 +6,13 @@ import {
   Keypair,
   Networks,
   StrKey,
+  SorobanDataBuilder,
   TransactionBuilder,
   nativeToScVal,
 } from '@stellar/stellar-sdk'
 import { describe, expect, it } from 'vitest'
 import type { RefundRecord } from '../src/refund/refund'
-import { validateSignedRefundXdr } from '../src/refund/stellar-proof'
+import { hasSorobanTransactionData, validateSignedRefundXdr } from '../src/refund/stellar-proof'
 
 function fixture() {
   const operator = Keypair.random()
@@ -67,5 +68,17 @@ describe('signed refund proof', () => {
     const { record, xdr } = fixture()
     record.refundAmountAtomic = '500001'
     expect(() => validateSignedRefundXdr(record, xdr, 'stellar:pubnet')).toThrow('amount mismatch')
+  })
+
+  it('distinguishes an unsimulated envelope from one carrying Soroban resources', () => {
+    const { xdr } = fixture()
+    expect(hasSorobanTransactionData(xdr, 'stellar:pubnet')).toBe(false)
+
+    const tx = TransactionBuilder.fromXDR(xdr, Networks.PUBLIC) as ReturnType<typeof TransactionBuilder.fromXDR>
+    const rebuilt = TransactionBuilder.cloneFrom(tx, {
+      fee: BASE_FEE,
+      sorobanData: new SorobanDataBuilder().build(),
+    }).build()
+    expect(hasSorobanTransactionData(rebuilt.toXDR(), 'stellar:pubnet')).toBe(true)
   })
 })
