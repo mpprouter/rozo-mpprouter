@@ -9,6 +9,7 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "refund-channel": "tsx scripts/refund-stellar-channel.ts",
+    "refund-executor": "tsx scripts/admin/refund-executor.ts",
     "test": "vitest"
   },
   "dependencies": {

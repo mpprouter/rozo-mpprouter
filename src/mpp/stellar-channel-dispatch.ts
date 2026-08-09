@@ -172,6 +172,75 @@ export function createStellarChannelPayment(
 }
 
 /**
+ * Roll back a voucher only when it is still the latest accepted cumulative.
+ * This is the delivery commit barrier: a failed upstream call must not consume
+ * channel balance. If a later voucher already won, fail closed and leave the
+ * higher watermark untouched.
+ */
+export async function rollbackFailedChannelVoucher(
+  env: Env,
+  channelContract: string,
+  acceptedAmount: string,
+  previousAmount: string,
+  challengeId: string,
+): Promise<boolean> {
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+  const rolledBack: boolean = await (store.update as any)(
+    `stellar:channel:cumulative:${channelContract}`,
+    (current: any) => {
+      if (!current || String(current.amount) !== acceptedAmount || current.settling) {
+        return { op: 'noop', result: false }
+      }
+      if (previousAmount === '0') return { op: 'delete', result: true }
+      return { op: 'set', value: { amount: previousAmount }, result: true }
+    },
+  )
+  if (rolledBack) {
+    await store.delete(`stellar:channel:challenge:${challengeId}`)
+    return true
+  }
+  // Crash recovery: the cumulative may already be restored while the async
+  // terminal record is still "processing". Treat that exact state as an
+  // idempotent success only when the failed challenge has also been removed.
+  const [current, challenge] = await Promise.all([
+    store.get(`stellar:channel:cumulative:${channelContract}`) as Promise<any>,
+    store.get(`stellar:channel:challenge:${challengeId}`),
+  ])
+  return String(current?.amount ?? '0') === previousAmount && challenge === null
+}
+
+export async function acquireChannelDeliveryLock(
+  env: Env,
+  channelContract: string,
+  lockId: string,
+): Promise<boolean> {
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+  return (store.update as any)(`refund:channel-lock:${channelContract}`, (current: any) => {
+    // No automatic takeover: without a fencing token an old request could
+    // wake up and roll back a newer delivered voucher. Crash recovery is an
+    // explicit operator action; fail closed is safer than incorrect money.
+    if (current) return { op: 'noop', result: false }
+    return {
+      op: 'set',
+      value: { id: lockId, acquiredAt: new Date().toISOString() },
+      result: true,
+    }
+  })
+}
+
+export async function releaseChannelDeliveryLock(
+  env: Env,
+  channelContract: string,
+  lockId: string,
+): Promise<void> {
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+  await (store.update as any)(`refund:channel-lock:${channelContract}`, (current: any) => {
+    if (!current || current.id !== lockId) return { op: 'noop', result: false }
+    return { op: 'delete', result: true }
+  })
+}
+
+/**
  * Resolve the Stellar channel for an incoming request by walking
  * the two-step KV lookup:
  *

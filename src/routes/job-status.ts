@@ -40,6 +40,9 @@ import { Keypair } from '@stellar/stellar-base'
 import { Credential } from 'mppx'
 import { fetchWithSiwx } from '../mpp/siwx-signer'
 import type { Env } from '../index'
+import { enqueueRefund, type PaymentProof, type RefundReason } from '../refund/refund'
+import { releaseChannelDeliveryLock, rollbackFailedChannelVoucher } from '../mpp/stellar-channel-dispatch'
+import { doAtomicParams } from '../mpp/kv-atomic-store'
 
 /**
  * Extract the Stellar G address from an already-verified mppx payment
@@ -82,10 +85,135 @@ export interface JobAuthRecord {
   upstreamJobPath: string
   /** ISO-8601 timestamp of the initial payment */
   paidAt: string
+  /** Present for settled stellar.charge jobs so later non-delivery can refund. */
+  paymentProof?: PaymentProof
+  channelDelivery?: {
+    channelContract: string
+    lockId: string
+    challengeId: string
+    acceptedAmount: string
+    previousAmount: string
+    action: 'voucher' | 'close'
+  }
 }
 
 const CHALLENGE_TTL_SECONDS = 120
 const NONCE_BYTES = 32
+
+function classifyAsyncFailure(statusCode: number, body: string): RefundReason | undefined {
+  if (statusCode === 403) return 'non_fulfillment'
+  if (statusCode >= 500) return 'upstream_5xx'
+  if (statusCode >= 200 && statusCode < 300 && body.trim().length === 0) return 'empty_response'
+  if (statusCode >= 200 && statusCode < 300) {
+    try {
+      const status = String(JSON.parse(body).status || '').toLowerCase()
+      if (['failed', 'error', 'refused', 'rejected'].includes(status)) return 'non_fulfillment'
+    } catch {
+      // A non-empty non-JSON success is usable delivery.
+    }
+  }
+  return undefined
+}
+
+export async function finishAsyncDelivery(
+  env: Env,
+  terminalKey: string,
+  record: JobAuthRecord,
+  outcome: 'delivered' | 'failed',
+  reason?: RefundReason,
+): Promise<'done' | 'conflict' | 'manual_review'> {
+  const store = doAtomicParams(env.ATOMIC_STORE)
+  const claimed = await store.update(`refund:async-terminal:${terminalKey}`, (current) => {
+    if (current) {
+      const value = JSON.parse(current) as { outcome: string; state: string }
+      if (value.outcome !== outcome) return { op: 'noop', result: 'conflict' as const }
+      if (value.state === 'done') return { op: 'noop', result: 'done' as const }
+      return { op: 'noop', result: 'retry' as const }
+    }
+    return {
+      op: 'set',
+      value: JSON.stringify({ outcome, state: 'processing', claimedAt: new Date().toISOString() }),
+      result: 'claimed' as const,
+    }
+  })
+  if (claimed === 'conflict') return 'conflict'
+  if (claimed === 'done') return 'done'
+
+  const channel = record.channelDelivery
+  if (outcome === 'failed' && channel?.action === 'voucher') {
+    const rolledBack = await rollbackFailedChannelVoucher(
+      env, channel.channelContract, channel.acceptedAmount,
+      channel.previousAmount, channel.challengeId,
+    )
+    if (!rolledBack) return 'manual_review'
+  } else if (outcome === 'failed' && reason && record.paymentProof) {
+    await enqueueRefund(env, {
+      proof: record.paymentProof,
+      reason,
+      merchant: record.upstreamHost,
+      routeId: record.serviceId,
+    })
+  }
+  if (channel) await releaseChannelDeliveryLock(env, channel.channelContract, channel.lockId)
+  await store.put(`refund:async-terminal:${terminalKey}`, JSON.stringify({
+    outcome, state: 'done', completedAt: new Date().toISOString(),
+  }))
+  return 'done'
+}
+
+/** Cron reconciliation so async refunds do not depend on the buyer polling. */
+export async function reconcileAsyncRefunds(env: Env): Promise<void> {
+  let cursor: string | undefined
+  do {
+    const page = await env.MPP_STORE.list({ prefix: 'jobAuth:', limit: 100, ...(cursor ? { cursor } : {}) })
+    for (const key of page.keys) {
+      if (await env.MPP_STORE.get(`jobRefundChecked:${key.name}`)) continue
+      const raw = await env.MPP_STORE.get(key.name)
+      if (!raw) continue
+      let record: JobAuthRecord
+      try { record = JSON.parse(raw) } catch { continue }
+      if (!record.paymentProof && !record.channelDelivery) continue
+      const jobId = key.name.slice('jobAuth:'.length)
+      const terminalKey = `${record.serviceId}:${jobId}`
+      if (Date.now() - Date.parse(record.paidAt) >= 23 * 60 * 60_000) {
+        const result = await finishAsyncDelivery(env, terminalKey, record, 'failed', 'timeout')
+        if (result === 'done') {
+          await env.MPP_STORE.put(`jobRefundChecked:${key.name}`, 'timeout-refunded', { expirationTtl: 86400 })
+        }
+        continue
+      }
+      try {
+        const upstreamRes = await fetchWithSiwx(
+          `https://${record.upstreamHost}${record.upstreamJobPath}`,
+          env.TEMPO_ROUTER_PRIVATE_KEY,
+        )
+        const body = await upstreamRes.text()
+        const reason = classifyAsyncFailure(upstreamRes.status, body)
+        if (reason) {
+          const result = await finishAsyncDelivery(env, terminalKey, record, 'failed', reason)
+          if (result === 'done') {
+            await env.MPP_STORE.put(`jobRefundChecked:${key.name}`, 'refunded', { expirationTtl: 86400 })
+          }
+        } else if (upstreamRes.ok) {
+          try {
+            const status = String(JSON.parse(body).status || '').toLowerCase()
+            if (['completed', 'complete', 'succeeded', 'success', 'done'].includes(status)) {
+              const result = await finishAsyncDelivery(env, terminalKey, record, 'delivered')
+              if (result === 'done') {
+                await env.MPP_STORE.put(`jobRefundChecked:${key.name}`, 'delivered', { expirationTtl: 86400 })
+              }
+            }
+          } catch {
+            // Non-JSON async bodies remain eligible for a later poll.
+          }
+        }
+      } catch (error: any) {
+        console.error(`[refund-cron] poll failed for ${key.name}: ${error.message}`)
+      }
+    }
+    cursor = page.list_complete ? undefined : page.cursor
+  } while (cursor)
+}
 
 function hex(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
@@ -278,6 +406,57 @@ export async function handleJobStatus(
     const upstreamRes = await fetchWithSiwx(upstreamUrl, env.TEMPO_ROUTER_PRIVATE_KEY)
     const body = await upstreamRes.text()
     const contentType = upstreamRes.headers.get('content-type') || 'application/json'
+
+    const refundReason = classifyAsyncFailure(upstreamRes.status, body)
+
+    if (refundReason && record.paymentProof) {
+      const terminal = await finishAsyncDelivery(
+        env, `${record.serviceId}:${jobId}`, record, 'failed', refundReason,
+      )
+      if (terminal !== 'done') {
+        return new Response(JSON.stringify({ error: 'Async terminal outcome requires manual review' }), {
+          status: 409,
+          headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
+        })
+      }
+      // Idempotent second call retrieves the stable public capability created
+      // by finishAsyncDelivery without creating another refund.
+      const refund = await enqueueRefund(env, {
+        proof: record.paymentProof, reason: refundReason,
+        merchant: record.upstreamHost, routeId: record.serviceId,
+      })
+      const response = new Response(body, {
+        status: upstreamRes.ok ? 502 : upstreamRes.status,
+        headers: { 'Content-Type': contentType },
+      })
+      response.headers.set('Refund-Id', refund.publicId)
+      response.headers.set('Refund-Status', 'pending')
+      response.headers.set('Refund-Status-Url', `${new URL(request.url).origin}/v1/refunds/${refund.publicId}`)
+      return response
+    }
+
+    if (refundReason && record.channelDelivery?.action === 'voucher') {
+      const result = await finishAsyncDelivery(env, `${record.serviceId}:${jobId}`, record, 'failed', refundReason)
+      const response = new Response(body, {
+        status: upstreamRes.ok ? 502 : upstreamRes.status,
+        headers: {
+          'Content-Type': contentType,
+          'Refund-Status': result === 'done' ? 'voucher-not-consumed' : 'manual-review',
+        },
+      })
+      return response
+    }
+
+    if (upstreamRes.ok) {
+      try {
+        const status = String(JSON.parse(body).status || '').toLowerCase()
+        if (['completed', 'complete', 'succeeded', 'success', 'done'].includes(status)) {
+          await finishAsyncDelivery(env, `${record.serviceId}:${jobId}`, record, 'delivered')
+        }
+      } catch {
+        // Keep pending when the upstream did not provide a terminal status.
+      }
+    }
 
     return new Response(body, {
       status: upstreamRes.status,
