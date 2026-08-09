@@ -1,6 +1,7 @@
 import type { Env } from '../index'
-import { completeRefund, leaseRefund, listRefunds, readRefund, readRefundByPublicId } from '../refund/refund'
-import { validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
+import { completeRefund, leaseRefund, listRefunds, readRefund, readRefundByPublicId, requeueMalformedRefund } from '../refund/refund'
+import { hasSorobanTransactionData, validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
+import { rpc } from '@stellar/stellar-sdk'
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } })
@@ -81,6 +82,9 @@ export async function handleRefundAdmin(request: Request, env: Env, url: URL): P
       if (typeof body.signedXdr !== 'string') return json({ error: 'signedXdr required' }, 400)
       const computed = validateSignedRefundXdr(current, body.signedXdr, env.STELLAR_NETWORK)
       if (computed !== body.refundTx) return json({ error: 'refundTx does not match signedXdr' }, 400)
+      if (!hasSorobanTransactionData(body.signedXdr, env.STELLAR_NETWORK)) {
+        return json({ error: 'Refund transaction is missing Soroban resource data' }, 400)
+      }
     }
     const job = await completeRefund(env, body.refundId, body.leaseId, {
       state: body.state,
@@ -103,6 +107,24 @@ export async function handleRefundAdmin(request: Request, env: Env, url: URL): P
     } catch (error: any) {
       return json({ error: error.message }, 409)
     }
+  }
+  if (url.pathname === '/admin/refunds/requeue-malformed' && request.method === 'POST') {
+    const current = await readRefund(env, body.refundId)
+    if (!current || current.state !== 'submitted' || current.lease?.id !== body.leaseId ||
+        !current.signedXdr || !current.refundTx) {
+      return json({ error: 'Submitted refund not found or lease mismatch' }, 409)
+    }
+    const computed = validateSignedRefundXdr(current, current.signedXdr, env.STELLAR_NETWORK)
+    if (computed !== current.refundTx) return json({ error: 'Stored refund proof mismatch' }, 409)
+    if (hasSorobanTransactionData(current.signedXdr, env.STELLAR_NETWORK)) {
+      return json({ error: 'Refusing to replace a structurally valid Soroban transaction' }, 409)
+    }
+    const result = await new rpc.Server(env.STELLAR_RPC_URL).getTransaction(current.refundTx)
+    if (result.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
+      return json({ error: `Refusing to replace transaction in state ${result.status}` }, 409)
+    }
+    const job = await requeueMalformedRefund(env, body.refundId, body.leaseId, current.refundTx)
+    return job ? json({ job }) : json({ error: 'Refund changed during recovery' }, 409)
   }
   return json({ error: 'Not found' }, 404)
 }

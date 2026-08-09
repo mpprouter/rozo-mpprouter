@@ -179,3 +179,24 @@ export async function completeRefund(
   })
   return result
 }
+
+export async function requeueMalformedRefund(
+  env: Env,
+  refundId: string,
+  leaseId: string,
+  expectedTx: string,
+): Promise<RefundRecord | null> {
+  const store = doAtomicParams(env.ATOMIC_STORE)
+  return store.update(`${PREFIX}${refundId}`, (current) => {
+    const record = parseRecord(current)
+    if (!record || record.state !== 'submitted' || record.lease?.id !== leaseId) {
+      return { op: 'noop', result: null }
+    }
+    if (record.refundTx !== expectedTx || !record.signedXdr) {
+      return { op: 'noop', result: null }
+    }
+    const { refundTx: _refundTx, signedXdr: _signedXdr, lease: _lease, ...rest } = record
+    const pending: RefundRecord = { ...rest, state: 'pending' }
+    return { op: 'set', value: JSON.stringify(pending), result: pending }
+  })
+}
