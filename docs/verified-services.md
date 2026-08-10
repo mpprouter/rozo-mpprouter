@@ -152,10 +152,29 @@ Full logs: `rozoskilltest/smoke-test-charge-log.md`, `rozoskilltest/smoke-test-x
 
 ---
 
+## Paid Verification Runs (tx-hash audit trail)
+
+Machine-readable copy: [`verified-runs.json`](./verified-runs.json). Each run is a
+**real Stellar mainnet USDC payment** through the production Router; the tx hash is
+publicly auditable at `https://stellar.expert/explorer/public/tx/<hash>`. Cadence:
+weekly, per-round spend cap $1.
+
+### Run 2026-08-10
+
+| Service | Result | UTC | Amount | Stellar tx |
+|---|---|---|---|---|
+| deepseek_chat | ✅ PASS (real completion) | 2026-08-10T07:55:59Z | $0.004 | `d3a0a8d42fc40415a0c36e6519fd5e121df4c9154405cc8f45399446ac7edf0b` |
+| tavily_tavily_search | ✅ PASS (real search results) — first verification | 2026-08-10T07:56:49Z | $0.090 | `38eaecde40d6430654212bf59b32eb0e1275a6b5f8e3d958be8a56ec71649952` |
+| openai_images_generations | ❌ FAIL — payment settled, upstream OpenAI rejected merchant key region (403 `unsupported_country_region_territory`), Router 502, auto-refund pending | 2026-08-10T07:56:26Z | $0.050 | `62ada49fe848ea313693f83f7e167ed3910a753a18af3e5afb116d0c91b5c934` |
+| gemini_generate | ⛔ NOT RUN — route `payment_status: unavailable` (merchant Google key invalid, re-tested 2026-08-09) | — | — | — |
+
+---
+
 ## Changelog
 
 | Date | Who | Change |
 |---|---|---|
+| 2026-08-10 | agent (founder-approved, $1 cap) | Paid verification run: deepseek+tavily PASS, DALL·E upstream-fail, Gemini blocked. Added `verified-runs.json` tx-hash audit trail |
 | 2026-04-12 | muggledev | Smoke test 6/6 passed (3 mppx charge + 3 x402 exact). Deployed `stellarIntentsFor` fix to production |
 | 2026-04-12 | muggledev | Created doc. Fixed `stellarIntentsFor` to respect upstream mode. Added `upstreamPaymentMethod: 'tempo.charge'` override for alchemy_rpc |
 | 2026-04-11 | muggledev | Initial `verifiedMode` overlay for 12 services (5 charge, 4 session, 3 broken) |
