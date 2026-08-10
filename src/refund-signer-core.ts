@@ -196,7 +196,11 @@ async function buildSignedRefund(
       Address.fromString(job.payment.payer).toScVal(),
       nativeToScVal(amount, { type: 'i128' }),
     ))
-    .setTimeout(60)
+    // Explicit minTime: the network enforces it (no ledger with an earlier
+    // close time can include this tx), giving the dead-envelope recovery a
+    // clock-independent lower bound for its retention check. 60s of grace
+    // absorbs modest clock skew without widening the window materially.
+    .setTimebounds(Math.floor(Date.now() / 1000) - 60, Math.floor(Date.now() / 1000) + 60)
     .build()
   const prepared = await server.prepareTransaction(base)
   if (prepared.source !== signer.publicKey()) throw new Error('prepared refund source mismatch')
@@ -252,9 +256,8 @@ async function confirmSubmitted(
     const ledgerClose = BigInt(Math.floor(Number(ex.latestLedgerCloseTime ?? 0)))
     const oldestClose = BigInt(Math.floor(Number(ex.oldestLedgerCloseTime ?? 0)))
     const minTime = BigInt(tx.timeBounds?.minTime ?? '0')
-    const windowStart = minTime > 0n ? minTime : maxTime - 300n
-    const expired = maxTime > 0n && ledgerClose > 0n && maxTime < ledgerClose &&
-      oldestClose > 0n && oldestClose <= windowStart
+    const expired = maxTime > 0n && minTime > 0n && ledgerClose > 0n && maxTime < ledgerClose &&
+      oldestClose > 0n && oldestClose <= minTime
     if (expired && existing.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
       // The Router's submitted state is immutable by design — a submitted
       // record's refundTx/signedXdr can never be overwritten. The sanctioned

@@ -63,8 +63,11 @@ export async function verifyConfirmedRefund(
  *  - oldestLedgerCloseTime shows the RPC's retained history covers the whole
  *    window in which the envelope could have landed — otherwise NOT_FOUND may
  *    just mean "pruned", and the refund might in fact have succeeded.
- * The inclusion window starts at minTime when set; our signer builds with
- * setTimeout(60), so a 300s pre-maxTime margin safely bounds it otherwise.
+ * The inclusion window's true lower bound is an explicit minTime: the
+ * network itself refuses to include a transaction in any ledger whose close
+ * time precedes minTime, so the bound holds regardless of anyone's clock.
+ * Envelopes signed without a minTime (legacy) can never be proven dead by
+ * this function and are left for manual review.
  */
 export function isProvablyDeadEnvelope(
   signedXdr: string,
@@ -74,9 +77,9 @@ export function isProvablyDeadEnvelope(
 ): boolean {
   const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase(network)) as Transaction
   const maxTime = BigInt(tx.timeBounds?.maxTime ?? '0')
-  if (maxTime <= 0n || latestLedgerCloseTimeSecs <= 0 || oldestLedgerCloseTimeSecs <= 0) return false
-  if (maxTime >= BigInt(latestLedgerCloseTimeSecs)) return false
   const minTime = BigInt(tx.timeBounds?.minTime ?? '0')
-  const windowStart = minTime > 0n ? minTime : maxTime - 300n
-  return BigInt(oldestLedgerCloseTimeSecs) <= windowStart
+  if (maxTime <= 0n || minTime <= 0n) return false
+  if (latestLedgerCloseTimeSecs <= 0 || oldestLedgerCloseTimeSecs <= 0) return false
+  if (maxTime >= BigInt(latestLedgerCloseTimeSecs)) return false
+  return BigInt(oldestLedgerCloseTimeSecs) <= minTime
 }

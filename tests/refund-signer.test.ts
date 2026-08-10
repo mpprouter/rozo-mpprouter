@@ -194,7 +194,7 @@ describe('refund signer policy', () => {
 
     const expiredBase = new TransactionBuilder(new Account(signer.publicKey(), '1'), {
       fee: '100', networkPassphrase: Networks.PUBLIC,
-      timebounds: { minTime: 0, maxTime: Math.floor(Date.now() / 1000) - 120 },
+      timebounds: { minTime: Math.floor(Date.now() / 1000) - 600, maxTime: Math.floor(Date.now() / 1000) - 120 },
     }).addOperation(new Contract(USDC).call(
       'transfer',
       Address.fromString(signer.publicKey()).toScVal(),
