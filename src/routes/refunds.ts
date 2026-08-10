@@ -116,16 +116,19 @@ export async function handleRefundAdmin(request: Request, env: Env, url: URL): P
     }
     const computed = validateSignedRefundXdr(current, current.signedXdr, env.STELLAR_NETWORK)
     if (computed !== current.refundTx) return json({ error: 'Stored refund proof mismatch' }, 409)
-    // A structurally valid envelope may only be replaced once its time bound
-    // has expired — from then on it can never land, so a replacement cannot
-    // double-pay. (Malformed envelopes remain replaceable immediately.)
-    if (hasSorobanTransactionData(current.signedXdr, env.STELLAR_NETWORK) &&
-        !isExpiredEnvelope(current.signedXdr, env.STELLAR_NETWORK)) {
-      return json({ error: 'Refusing to replace a structurally valid, unexpired Soroban transaction' }, 409)
-    }
     const result = await new rpc.Server(env.STELLAR_RPC_URL).getTransaction(current.refundTx)
     if (result.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
       return json({ error: `Refusing to replace transaction in state ${result.status}` }, 409)
+    }
+    // A structurally valid envelope may only be replaced once a CLOSED ledger
+    // is past its time bound — judged from the same RPC response that reported
+    // NOT_FOUND, so "absent" and "can never land" are established atomically.
+    // From then on the envelope is unusable by anyone, so a replacement cannot
+    // double-pay. (Malformed envelopes remain replaceable immediately.)
+    const ledgerCloseTime = Number((result as { latestLedgerCloseTime?: number | string }).latestLedgerCloseTime ?? 0)
+    if (hasSorobanTransactionData(current.signedXdr, env.STELLAR_NETWORK) &&
+        !isExpiredEnvelope(current.signedXdr, env.STELLAR_NETWORK, ledgerCloseTime)) {
+      return json({ error: 'Refusing to replace a Soroban transaction not yet expired by a closed ledger' }, 409)
     }
     const job = await requeueMalformedRefund(env, body.refundId, body.leaseId, current.refundTx)
     return job ? json({ job }) : json({ error: 'Refund changed during recovery' }, 409)

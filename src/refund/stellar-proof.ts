@@ -54,8 +54,15 @@ export async function verifyConfirmedRefund(
   return { txHash, ledger: result.ledger }
 }
 
-export function isExpiredEnvelope(signedXdr: string, network: string): boolean {
+/**
+ * An envelope is definitively expired only when a CLOSED ledger's close time
+ * is past its maxTime — wall-clock comparison is unsafe (a fast local clock
+ * would let a still-includable envelope be replaced, opening a double-refund
+ * window). Pass the latestLedgerCloseTime observed from the same RPC response
+ * that reported the transaction NOT_FOUND.
+ */
+export function isExpiredEnvelope(signedXdr: string, network: string, ledgerCloseTimeSecs: number): boolean {
   const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase(network)) as Transaction
   const maxTime = BigInt(tx.timeBounds?.maxTime ?? '0')
-  return maxTime > 0n && maxTime < BigInt(Math.floor(Date.now() / 1000))
+  return maxTime > 0n && ledgerCloseTimeSecs > 0 && maxTime < BigInt(ledgerCloseTimeSecs)
 }

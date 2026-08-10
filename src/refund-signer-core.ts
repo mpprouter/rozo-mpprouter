@@ -244,7 +244,14 @@ async function confirmSubmitted(
     // every retried refund into manual_review. The expired envelope is
     // unusable by anyone, so signing a replacement cannot double-pay.
     const maxTime = BigInt(tx.timeBounds?.maxTime ?? '0')
-    const expired = maxTime > 0n && maxTime < BigInt(Math.floor(Date.now() / 1000))
+    // Expiry is judged against the close time of a CLOSED ledger, taken from
+    // the same getTransaction response that reported NOT_FOUND — never the
+    // local clock, which could run ahead of the network and replace an
+    // envelope that can still land.
+    const ledgerClose = BigInt(Math.floor(Number(
+      (existing as { latestLedgerCloseTime?: number | string }).latestLedgerCloseTime ?? 0,
+    )))
+    const expired = maxTime > 0n && ledgerClose > 0n && maxTime < ledgerClose
     if (expired && existing.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
       // The Router's submitted state is immutable by design — a submitted
       // record's refundTx/signedXdr can never be overwritten. The sanctioned

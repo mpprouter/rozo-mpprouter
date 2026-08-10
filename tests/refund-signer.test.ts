@@ -241,7 +241,11 @@ describe('refund signer policy', () => {
       },
       getTransaction: async (hash: string) => {
         if (hash === expiredHash) {
-          return { status: rpc.Api.GetTransactionStatus.NOT_FOUND } as rpc.Api.GetMissingTransactionResponse
+          return {
+            status: rpc.Api.GetTransactionStatus.NOT_FOUND,
+            latestLedger: 1000, latestLedgerCloseTime: Math.floor(Date.now() / 1000),
+            oldestLedger: 1, oldestLedgerCloseTime: 1,
+          } as rpc.Api.GetMissingTransactionResponse
         }
         return {
           status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 123,
