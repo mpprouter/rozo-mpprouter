@@ -223,6 +223,11 @@ const spec = {
             type: 'string',
             description: 'Explanation for "available"/"unavailable" routes. Omitted when verified.',
           },
+          recommended: {
+            type: 'boolean',
+            enum: [true],
+            description: 'Present (true) only for operator-curated recommended services. Recommended implies real-money verified.',
+          },
           charge_rozo_verified: {
             type: ['boolean', 'null'],
             description: 'Has Rozo real-money verified this route in charge mode? null = N/A for this mode or never tested in it.',
