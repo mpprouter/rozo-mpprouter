@@ -1,0 +1,192 @@
+{
+ "$schema_note": "Machine-readable audit trail of real paid verification runs against apiserver.mpprouter.dev. Each run is a real Stellar mainnet USDC payment; tx is the Stellar transaction hash (view at https://stellar.expert/explorer/public/tx/<tx>).",
+ "updated": "2026-08-10",
+ "cadence": "weekly",
+ "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1.",
+ "services": [
+  {
+   "id": "anthropic_chat_completions",
+   "name": "Anthropic",
+   "category": "ai",
+   "price": "dynamic",
+   "public_path": "/v1/services/anthropic/chat_completions",
+   "charge_verified_at": "2026-08-09T04:19:00Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "anthropic_messages",
+   "name": "Anthropic",
+   "category": "ai",
+   "price": "dynamic",
+   "public_path": "/v1/services/anthropic/messages",
+   "charge_verified_at": null,
+   "session_verified_at": "2026-08-09T04:28:00Z",
+   "runs": []
+  },
+  {
+   "id": "coingecko_simple_price",
+   "name": "CoinGecko \u2013 Simple Price",
+   "category": "data",
+   "price": "$0.060/request",
+   "public_path": "/v1/services/coingecko/simple-price",
+   "charge_verified_at": "2026-06-22T00:00:00Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "deepgram_deepgram_list-models",
+   "name": "Deepgram \u2013 List Models",
+   "category": "data",
+   "price": "$0.004/request",
+   "public_path": "/v1/services/deepgram/deepgram_list-models",
+   "charge_verified_at": "2026-08-01T16:11:11Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "deepseek_chat",
+   "name": "DeepSeek \u2013 Chat",
+   "category": "ai",
+   "price": "Model + token dependent (~$0.004\u2013$0.025) (dynamic)",
+   "public_path": "/v1/services/deepseek/chat",
+   "charge_verified_at": "2026-06-22T00:00:00Z",
+   "session_verified_at": null,
+   "runs": [
+    {
+     "result": "pass",
+     "utc": "2026-08-10T07:55:59Z",
+     "tx": "d3a0a8d42fc40415a0c36e6519fd5e121df4c9154405cc8f45399446ac7edf0b",
+     "amount_usdc": "0.004"
+    }
+   ]
+  },
+  {
+   "id": "exa_search",
+   "name": "Exa \u2013 Search the web",
+   "category": "search",
+   "price": "$0.005/request",
+   "public_path": "/v1/services/exa/search",
+   "charge_verified_at": "2026-04-11T00:00:00Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "firecrawl_scrape",
+   "name": "Firecrawl \u2013 Scrape a URL",
+   "category": "web",
+   "price": "$0.002/request",
+   "public_path": "/v1/services/firecrawl/scrape",
+   "charge_verified_at": "2026-04-11T00:00:00Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "grok_grok_chat",
+   "name": "Grok \u2013 Chat Completions",
+   "category": "ai",
+   "price": "Model-dependent (~$0.001\u2013$0.02) (dynamic)",
+   "public_path": "/v1/services/grok/grok_chat",
+   "charge_verified_at": "2026-08-01T16:10:11Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "groq_chat",
+   "name": "Groq \u2013 Chat Completion",
+   "category": "ai",
+   "price": "$0.005 \u2013 $0.10 (varies by model and tokens) (dynamic)",
+   "public_path": "/v1/services/groq/chat",
+   "charge_verified_at": "2026-06-22T00:00:00Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "mistral_mistral_chat",
+   "name": "Mistral AI \u2013 Chat Completion",
+   "category": "ai",
+   "price": "$0.005 \u2013 $0.10 (varies by model and tokens) (dynamic)",
+   "public_path": "/v1/services/mistral/mistral_chat",
+   "charge_verified_at": "2026-08-01T16:10:27Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "openai_chat",
+   "name": "OpenAI",
+   "category": "ai",
+   "price": "dynamic",
+   "public_path": "/v1/services/openai/chat",
+   "charge_verified_at": null,
+   "session_verified_at": "2026-08-09T03:51:00Z",
+   "runs": []
+  },
+  {
+   "id": "parallel_search",
+   "name": "Parallel \u2013 Search the web",
+   "category": "search",
+   "price": "$0.010/request",
+   "public_path": "/v1/services/parallel/search",
+   "charge_verified_at": "2026-04-11T00:00:00Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "perplexity_perplexity_chat",
+   "name": "Perplexity \u2013 Sonar Chat",
+   "category": "ai",
+   "price": "Model-dependent (~$0.005\u2013$0.02) (dynamic)",
+   "public_path": "/v1/services/perplexity/perplexity_chat",
+   "charge_verified_at": "2026-08-01T16:26:16Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "storage_upload",
+   "name": "Object Storage \u2013 Initiate/complete multipart upload",
+   "category": "storage",
+   "price": "$0.0001/request",
+   "public_path": "/v1/services/storage/upload",
+   "charge_verified_at": "2026-04-11T00:00:00Z",
+   "session_verified_at": null,
+   "runs": []
+  },
+  {
+   "id": "tavily_tavily_search",
+   "name": "Tavily Search",
+   "category": "search",
+   "price": "$0.09 (basic) / $0.16 (advanced) (dynamic)",
+   "public_path": "/v1/services/tavily/tavily_search",
+   "charge_verified_at": "2026-08-10T07:56:49Z",
+   "session_verified_at": null,
+   "runs": [
+    {
+     "result": "pass",
+     "utc": "2026-08-10T07:56:49Z",
+     "tx": "38eaecde40d6430654212bf59b32eb0e1275a6b5f8e3d958be8a56ec71649952",
+     "amount_usdc": "0.090"
+    }
+   ]
+  }
+ ],
+ "failed_candidates": [
+  {
+   "id": "openai_images_generations",
+   "status": "not_recommended",
+   "runs": [
+    {
+     "result": "fail_upstream",
+     "utc": "2026-08-10T07:56:26Z",
+     "tx": "62ada49fe848ea313693f83f7e167ed3910a753a18af3e5afb116d0c91b5c934",
+     "amount_usdc": "0.050",
+     "note": "Payment settled; upstream OpenAI rejected the merchant key region (403 unsupported_country_region_territory). Router returned 502; automatic refund pending."
+    }
+   ]
+  },
+  {
+   "id": "gemini_generate",
+   "status": "disabled_in_catalog",
+   "note": "Merchant's Google API key invalid (400 API key not valid, re-tested 2026-08-09 with a real paid call). Route set payment_status=unavailable until the merchant fixes its key."
+  }
+ ]
+}
