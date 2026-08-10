@@ -244,7 +244,7 @@ describe('refund signer policy', () => {
           return {
             status: rpc.Api.GetTransactionStatus.NOT_FOUND,
             latestLedger: 1000, latestLedgerCloseTime: Math.floor(Date.now() / 1000),
-            oldestLedger: 1, oldestLedgerCloseTime: 1,
+            oldestLedger: 1, oldestLedgerCloseTime: Math.floor(Date.now() / 1000) - 86_400,
           } as rpc.Api.GetMissingTransactionResponse
         }
         return {

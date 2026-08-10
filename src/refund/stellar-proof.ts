@@ -55,14 +55,28 @@ export async function verifyConfirmedRefund(
 }
 
 /**
- * An envelope is definitively expired only when a CLOSED ledger's close time
- * is past its maxTime — wall-clock comparison is unsafe (a fast local clock
- * would let a still-includable envelope be replaced, opening a double-refund
- * window). Pass the latestLedgerCloseTime observed from the same RPC response
- * that reported the transaction NOT_FOUND.
+ * An envelope is PROVABLY dead only when, in one getTransaction response that
+ * reported it NOT_FOUND:
+ *  - latestLedgerCloseTime (a CLOSED ledger) is past its maxTime — wall-clock
+ *    comparison is unsafe: a fast local clock would let a still-includable
+ *    envelope be replaced, opening a double-refund window; AND
+ *  - oldestLedgerCloseTime shows the RPC's retained history covers the whole
+ *    window in which the envelope could have landed — otherwise NOT_FOUND may
+ *    just mean "pruned", and the refund might in fact have succeeded.
+ * The inclusion window starts at minTime when set; our signer builds with
+ * setTimeout(60), so a 300s pre-maxTime margin safely bounds it otherwise.
  */
-export function isExpiredEnvelope(signedXdr: string, network: string, ledgerCloseTimeSecs: number): boolean {
+export function isProvablyDeadEnvelope(
+  signedXdr: string,
+  network: string,
+  latestLedgerCloseTimeSecs: number,
+  oldestLedgerCloseTimeSecs: number,
+): boolean {
   const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase(network)) as Transaction
   const maxTime = BigInt(tx.timeBounds?.maxTime ?? '0')
-  return maxTime > 0n && ledgerCloseTimeSecs > 0 && maxTime < BigInt(ledgerCloseTimeSecs)
+  if (maxTime <= 0n || latestLedgerCloseTimeSecs <= 0 || oldestLedgerCloseTimeSecs <= 0) return false
+  if (maxTime >= BigInt(latestLedgerCloseTimeSecs)) return false
+  const minTime = BigInt(tx.timeBounds?.minTime ?? '0')
+  const windowStart = minTime > 0n ? minTime : maxTime - 300n
+  return BigInt(oldestLedgerCloseTimeSecs) <= windowStart
 }
