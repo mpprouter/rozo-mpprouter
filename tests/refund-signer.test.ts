@@ -178,6 +178,90 @@ describe('refund signer policy', () => {
     await expect(sendAlert(env(signer.secret()), 'refund alert')).rejects.toThrow('DingTalk alert rejected')
   })
 
+
+  it('re-signs a submitted refund whose time bound expired instead of resubmitting dead XDR', async () => {
+    const signer = Keypair.random()
+    const base = job(signer)
+    const payment = new TransactionBuilder(new Account(base.payment.payer, '1'), {
+      fee: '100', networkPassphrase: Networks.PUBLIC,
+    }).addOperation(new Contract(USDC).call(
+      'transfer',
+      Address.fromString(base.payment.payer).toScVal(),
+      Address.fromString(signer.publicKey()).toScVal(),
+      nativeToScVal(BigInt(base.payment.amountAtomic), { type: 'i128' }),
+    )).setTimeout(30).build()
+    base.payment.paymentTx = payment.hash().toString('hex')
+
+    const expiredBase = new TransactionBuilder(new Account(signer.publicKey(), '1'), {
+      fee: '100', networkPassphrase: Networks.PUBLIC,
+      timebounds: { minTime: 0, maxTime: Math.floor(Date.now() / 1000) - 120 },
+    }).addOperation(new Contract(USDC).call(
+      'transfer',
+      Address.fromString(signer.publicKey()).toScVal(),
+      Address.fromString(base.payment.payer).toScVal(),
+      nativeToScVal(BigInt(base.refundAmountAtomic), { type: 'i128' }),
+    )).build()
+    const expired = TransactionBuilder.cloneFrom(expiredBase, {
+      fee: '100', sorobanData: new SorobanDataBuilder().build(),
+    }).build()
+    expired.sign(signer)
+    const expiredHash = expired.hash().toString('hex')
+
+    const submittedJob = {
+      ...base, state: 'submitted' as const,
+      refundTx: expiredHash, signedXdr: expired.toXDR(),
+      lease: { id: 'lease-77', until: new Date(Date.now() + 60_000).toISOString() },
+    }
+
+    const requests: Array<{ path: string; body?: Record<string, unknown> }> = []
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input)
+      const path = new URL(url).pathname
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined
+      requests.push({ path, body })
+      if (path.endsWith('/admin/refunds/pending')) {
+        return new Response(JSON.stringify({ jobs: [submittedJob] }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ ok: true, errcode: 0 }), { status: 200 })
+    }))
+
+    let sent: Transaction | null = null
+    const server: RefundSignerRpc = {
+      getAccount: async () => new Account(signer.publicKey(), '5'),
+      prepareTransaction: async (tx: Transaction) => TransactionBuilder.cloneFrom(tx, {
+        fee: '100', sorobanData: new SorobanDataBuilder().build(),
+      }).build(),
+      sendTransaction: async (tx) => {
+        sent = tx as Transaction
+        return { status: 'PENDING', hash: (tx as Transaction).hash().toString('hex'), latestLedger: 1, latestLedgerCloseTime: 1 } as rpc.Api.SendTransactionResponse
+      },
+      getTransaction: async (hash: string) => {
+        if (hash === expiredHash) {
+          return { status: rpc.Api.GetTransactionStatus.NOT_FOUND } as rpc.Api.GetMissingTransactionResponse
+        }
+        return {
+          status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 123,
+          envelopeXdr: payment.toXDR(), resultXdr: '', resultMetaXdr: '',
+        } as unknown as rpc.Api.GetSuccessfulTransactionResponse
+      },
+    }
+
+    const { ledger } = ledgerFixture()
+    await runRefundSigner(env(signer.secret()), ledger, server)
+
+    // A fresh envelope was signed and submitted — not the dead one.
+    expect(sent).not.toBeNull()
+    expect(sent!.hash().toString('hex')).not.toBe(expiredHash)
+    // Router was updated with the replacement before submission, then confirmed.
+    const complete = requests.find((r) => r.path.endsWith('/admin/refunds/complete'))?.body
+    expect(complete?.state).toBe('submitted')
+    expect(complete?.refundTx).toBe(sent!.hash().toString('hex'))
+    expect(complete?.leaseId).toBe('lease-77')
+    const confirm = requests.find((r) => r.path.endsWith('/admin/refunds/confirm'))?.body
+    expect(confirm?.leaseId).toBe('lease-77')
+    expect(ledger.markConfirmed).toHaveBeenCalled()
+  })
+
   it('rejects a Router job whose claimed payer differs from the on-chain transfer', async () => {
     const signer = Keypair.random()
     const forged = job(signer)

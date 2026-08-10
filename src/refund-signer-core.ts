@@ -182,15 +182,46 @@ export async function sendAlert(env: Env, content: string): Promise<void> {
   }
 }
 
+async function buildSignedRefund(
+  server: RefundSignerRpc,
+  signer: Keypair,
+  job: RefundJob,
+  amount: bigint,
+): Promise<{ prepared: Transaction; signedXdr: string; refundTx: string }> {
+  const account = await server.getAccount(signer.publicKey())
+  const base = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.PUBLIC })
+    .addOperation(new Contract(job.payment.asset).call(
+      'transfer',
+      Address.fromString(signer.publicKey()).toScVal(),
+      Address.fromString(job.payment.payer).toScVal(),
+      nativeToScVal(amount, { type: 'i128' }),
+    ))
+    .setTimeout(60)
+    .build()
+  const prepared = await server.prepareTransaction(base)
+  if (prepared.source !== signer.publicKey()) throw new Error('prepared refund source mismatch')
+  if (prepared.toEnvelope().v1().tx().ext().switch() !== 1) throw new Error('prepared refund lacks Soroban resources')
+  if (BigInt(prepared.fee) > HARD_MAX_FEE_STROOPS) throw new Error('prepared refund fee exceeds hard limit')
+  validateTransfer(prepared, {
+    from: signer.publicKey(), to: job.payment.payer,
+    asset: job.payment.asset, amount,
+  })
+  prepared.sign(signer)
+  if (prepared.signatures.length !== 1) throw new Error('prepared refund must have exactly one signature')
+  return { prepared, signedXdr: prepared.toXDR(), refundTx: prepared.hash().toString('hex') }
+}
+
 async function confirmSubmitted(
   env: Env,
   server: RefundSignerRpc,
+  signer: Keypair,
   job: RefundJob,
   beforeRouterConfirm: (refundTx: string) => Promise<void>,
-  onRejected: (refundTx: string) => Promise<void>,
+  onRejected: (refundTx: string, detail?: string) => Promise<void>,
 ): Promise<string> {
   if (!job.signedXdr || !job.refundTx || !job.lease?.id) throw new Error('submitted refund is incomplete')
-  const tx = TransactionBuilder.fromXDR(job.signedXdr, Networks.PUBLIC) as Transaction
+  const leaseId = job.lease.id
+  let tx = TransactionBuilder.fromXDR(job.signedXdr, Networks.PUBLIC) as Transaction
   if (tx.hash().toString('hex') !== job.refundTx) throw new Error('submitted refund hash mismatch')
   if (tx.source !== job.payment.recipient || tx.toEnvelope().v1().tx().ext().switch() !== 1) {
     throw new Error('submitted refund envelope is structurally invalid')
@@ -202,18 +233,44 @@ async function confirmSubmitted(
     from: job.payment.recipient, to: job.payment.payer,
     asset: job.payment.asset, amount: BigInt(job.refundAmountAtomic),
   })
-  const send = await server.sendTransaction(tx)
-  if (send.status === 'ERROR') {
-    await parkRejected(env, job, job.refundTx)
-    await onRejected(job.refundTx)
-    throw new Error(`submitted refund rejected and parked: ${job.refundTx}`)
+  let refundTx = job.refundTx
+  // A prior invocation may have landed this tx (or died before submitting it).
+  // If it already succeeded on chain, just confirm; never re-send.
+  const existing = await server.getTransaction(refundTx)
+  if (existing.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+    // The stored envelope was signed with a 60s time bound. If that window
+    // has passed and the tx is not on chain, re-sending the same XDR can
+    // only ever be rejected (txTooLate) — the old failure mode that parked
+    // every retried refund into manual_review. The expired envelope is
+    // unusable by anyone, so signing a replacement cannot double-pay.
+    const maxTime = BigInt(tx.timeBounds?.maxTime ?? '0')
+    const expired = maxTime > 0n && maxTime < BigInt(Math.floor(Date.now() / 1000))
+    if (expired && existing.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
+      const amount = validateJob(job, signer)
+      const fresh = await buildSignedRefund(server, signer, job, amount)
+      await routerApi(env, '/admin/refunds/complete', {
+        method: 'POST',
+        body: JSON.stringify({
+          refundId: job.refundId, leaseId,
+          state: 'submitted', refundTx: fresh.refundTx, signedXdr: fresh.signedXdr,
+        }),
+      })
+      tx = fresh.prepared
+      refundTx = fresh.refundTx
+    }
+    const send = await server.sendTransaction(tx)
+    if (send.status === 'ERROR') {
+      await parkRejected(env, job, refundTx)
+      await onRejected(refundTx, String(send.errorResult ?? send.status))
+      throw new Error(`submitted refund rejected and parked: ${refundTx}`)
+    }
+    await waitForTransaction(server, refundTx)
   }
-  await waitForTransaction(server, job.refundTx)
-  await beforeRouterConfirm(job.refundTx)
+  await beforeRouterConfirm(refundTx)
   await routerApi(env, '/admin/refunds/confirm', {
-    method: 'POST', body: JSON.stringify({ refundId: job.refundId, leaseId: job.lease.id }),
+    method: 'POST', body: JSON.stringify({ refundId: job.refundId, leaseId }),
   })
-  return job.refundTx
+  return refundTx
 }
 
 async function parkRejected(env: Env, job: RefundJob, refundTx: string): Promise<void> {
@@ -230,7 +287,7 @@ async function executePending(
   signer: Keypair,
   job: RefundJob,
   beforeRouterConfirm: (refundTx: string) => Promise<void>,
-  onRejected: (refundTx: string) => Promise<void>,
+  onRejected: (refundTx: string, detail?: string) => Promise<void>,
 ): Promise<string> {
   const leaseId = crypto.randomUUID()
   const leased = await routerApi<{ job: RefundJob }>(env, '/admin/refunds/lease', {
@@ -238,28 +295,7 @@ async function executePending(
   })
   assertLeasedJobMatches(job, leased.job)
   const amount = validateJob(leased.job, signer)
-  const account = await server.getAccount(signer.publicKey())
-  const base = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.PUBLIC })
-    .addOperation(new Contract(leased.job.payment.asset).call(
-      'transfer',
-      Address.fromString(signer.publicKey()).toScVal(),
-      Address.fromString(leased.job.payment.payer).toScVal(),
-      nativeToScVal(amount, { type: 'i128' }),
-    ))
-    .setTimeout(60)
-    .build()
-  const prepared = await server.prepareTransaction(base)
-  if (prepared.source !== signer.publicKey()) throw new Error('prepared refund source mismatch')
-  if (prepared.toEnvelope().v1().tx().ext().switch() !== 1) throw new Error('prepared refund lacks Soroban resources')
-  if (BigInt(prepared.fee) > HARD_MAX_FEE_STROOPS) throw new Error('prepared refund fee exceeds hard limit')
-  validateTransfer(prepared, {
-    from: signer.publicKey(), to: leased.job.payment.payer,
-    asset: leased.job.payment.asset, amount,
-  })
-  prepared.sign(signer)
-  if (prepared.signatures.length !== 1) throw new Error('prepared refund must have exactly one signature')
-  const signedXdr = prepared.toXDR()
-  const refundTx = prepared.hash().toString('hex')
+  const { prepared, signedXdr, refundTx } = await buildSignedRefund(server, signer, leased.job, amount)
 
   await routerApi(env, '/admin/refunds/complete', {
     method: 'POST',
@@ -268,7 +304,7 @@ async function executePending(
   const send = await server.sendTransaction(prepared)
   if (send.status === 'ERROR') {
     await parkRejected(env, leased.job, refundTx)
-    await onRejected(refundTx)
+    await onRejected(refundTx, String(send.errorResult ?? send.status))
     throw new Error(`refund transaction rejected and parked: ${refundTx}`)
   }
   await waitForTransaction(server, refundTx)
@@ -308,15 +344,18 @@ export async function runRefundSigner(
           await ledger.enqueueAlert(`large:${job.refundId}`, `MPP automatic refund completed: $${formatUsdc(amount)}, tx ${refundTx}`)
         }
       }
-      const rejectedAlert = async (refundTx: string): Promise<void> => {
+      const rejectedAlert = async (refundTx: string, detail?: string): Promise<void> => {
         await ledger.enqueueAlert(
           `rejected:${job.refundId}`,
-          `MPP automatic refund requires manual review: $${formatUsdc(amount)}, tx ${refundTx}`,
+          `MPP automatic refund requires manual review: $${formatUsdc(amount)}, merchant ${job.merchant}, ` +
+            `payer ${job.payment.payer.slice(0, 6)}…${job.payment.payer.slice(-4)}, ` +
+            `payment tx ${job.payment.paymentTx}, refund tx ${refundTx}` +
+            (detail ? `, rpc: ${detail}` : ''),
         )
       }
       let refundTx: string
       if (job.state === 'submitted') {
-        refundTx = await confirmSubmitted(env, server, job, beforeRouterConfirm, rejectedAlert)
+        refundTx = await confirmSubmitted(env, server, signer, job, beforeRouterConfirm, rejectedAlert)
       } else if (job.state === 'pending' || job.state === 'leased') {
         refundTx = await executePending(env, server, signer, job, beforeRouterConfirm, rejectedAlert)
       } else {
