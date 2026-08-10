@@ -1,6 +1,6 @@
 import type { Env } from '../index'
 import { completeRefund, leaseRefund, listRefunds, readRefund, readRefundByPublicId, requeueMalformedRefund } from '../refund/refund'
-import { hasSorobanTransactionData, validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
+import { hasSorobanTransactionData, isProvablyDeadEnvelope, validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
 import { rpc } from '@stellar/stellar-sdk'
 
 function json(body: unknown, status = 200): Response {
@@ -116,12 +116,21 @@ export async function handleRefundAdmin(request: Request, env: Env, url: URL): P
     }
     const computed = validateSignedRefundXdr(current, current.signedXdr, env.STELLAR_NETWORK)
     if (computed !== current.refundTx) return json({ error: 'Stored refund proof mismatch' }, 409)
-    if (hasSorobanTransactionData(current.signedXdr, env.STELLAR_NETWORK)) {
-      return json({ error: 'Refusing to replace a structurally valid Soroban transaction' }, 409)
-    }
     const result = await new rpc.Server(env.STELLAR_RPC_URL).getTransaction(current.refundTx)
     if (result.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
       return json({ error: `Refusing to replace transaction in state ${result.status}` }, 409)
+    }
+    // A structurally valid envelope may only be replaced once it is PROVABLY
+    // dead: a closed ledger past its time bound AND retained RPC history
+    // covering its whole inclusion window — all taken from the same response
+    // that reported NOT_FOUND. Anything less (unexpired, or possibly pruned
+    // history) is refused and stays for manual review, because the original
+    // may still land or may already have landed.
+    const r = result as { latestLedgerCloseTime?: number | string; oldestLedgerCloseTime?: number | string }
+    if (hasSorobanTransactionData(current.signedXdr, env.STELLAR_NETWORK) &&
+        !isProvablyDeadEnvelope(current.signedXdr, env.STELLAR_NETWORK,
+          Number(r.latestLedgerCloseTime ?? 0), Number(r.oldestLedgerCloseTime ?? 0))) {
+      return json({ error: 'Refusing to replace: envelope not provably dead (unexpired, or RPC history may be pruned)' }, 409)
     }
     const job = await requeueMalformedRefund(env, body.refundId, body.leaseId, current.refundTx)
     return job ? json({ job }) : json({ error: 'Refund changed during recovery' }, 409)
