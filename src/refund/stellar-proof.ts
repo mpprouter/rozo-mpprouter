@@ -53,3 +53,9 @@ export async function verifyConfirmedRefund(
   }
   return { txHash, ledger: result.ledger }
 }
+
+export function isExpiredEnvelope(signedXdr: string, network: string): boolean {
+  const tx = TransactionBuilder.fromXDR(signedXdr, networkPassphrase(network)) as Transaction
+  const maxTime = BigInt(tx.timeBounds?.maxTime ?? '0')
+  return maxTime > 0n && maxTime < BigInt(Math.floor(Date.now() / 1000))
+}

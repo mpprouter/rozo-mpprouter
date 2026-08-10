@@ -221,7 +221,7 @@ async function confirmSubmitted(
 ): Promise<string> {
   if (!job.signedXdr || !job.refundTx || !job.lease?.id) throw new Error('submitted refund is incomplete')
   const leaseId = job.lease.id
-  let tx = TransactionBuilder.fromXDR(job.signedXdr, Networks.PUBLIC) as Transaction
+  const tx = TransactionBuilder.fromXDR(job.signedXdr, Networks.PUBLIC) as Transaction
   if (tx.hash().toString('hex') !== job.refundTx) throw new Error('submitted refund hash mismatch')
   if (tx.source !== job.payment.recipient || tx.toEnvelope().v1().tx().ext().switch() !== 1) {
     throw new Error('submitted refund envelope is structurally invalid')
@@ -233,7 +233,7 @@ async function confirmSubmitted(
     from: job.payment.recipient, to: job.payment.payer,
     asset: job.payment.asset, amount: BigInt(job.refundAmountAtomic),
   })
-  let refundTx = job.refundTx
+  const refundTx = job.refundTx
   // A prior invocation may have landed this tx (or died before submitting it).
   // If it already succeeded on chain, just confirm; never re-send.
   const existing = await server.getTransaction(refundTx)
@@ -246,17 +246,20 @@ async function confirmSubmitted(
     const maxTime = BigInt(tx.timeBounds?.maxTime ?? '0')
     const expired = maxTime > 0n && maxTime < BigInt(Math.floor(Date.now() / 1000))
     if (expired && existing.status === rpc.Api.GetTransactionStatus.NOT_FOUND) {
-      const amount = validateJob(job, signer)
-      const fresh = await buildSignedRefund(server, signer, job, amount)
-      await routerApi(env, '/admin/refunds/complete', {
-        method: 'POST',
-        body: JSON.stringify({
-          refundId: job.refundId, leaseId,
-          state: 'submitted', refundTx: fresh.refundTx, signedXdr: fresh.signedXdr,
-        }),
+      // The Router's submitted state is immutable by design — a submitted
+      // record's refundTx/signedXdr can never be overwritten. The sanctioned
+      // recovery is requeue: the Router independently re-verifies that the
+      // stored envelope is expired and absent on chain, then strips it and
+      // returns the job to pending, from which the normal pending path signs
+      // a fresh envelope under a fresh lease.
+      await routerApi(env, '/admin/refunds/requeue-malformed', {
+        method: 'POST', body: JSON.stringify({ refundId: job.refundId, leaseId }),
       })
-      tx = fresh.prepared
-      refundTx = fresh.refundTx
+      const requeued: RefundJob = { ...job, state: 'pending' }
+      delete requeued.refundTx
+      delete requeued.signedXdr
+      delete requeued.lease
+      return executePending(env, server, signer, requeued, beforeRouterConfirm, onRejected)
     }
     const send = await server.sendTransaction(tx)
     if (send.status === 'ERROR') {

@@ -222,6 +222,10 @@ describe('refund signer policy', () => {
       if (path.endsWith('/admin/refunds/pending')) {
         return new Response(JSON.stringify({ jobs: [submittedJob] }), { status: 200 })
       }
+      if (path.endsWith('/admin/refunds/lease')) {
+        const cleaned = { ...base, state: 'leased', lease: { id: (body as { leaseId: string }).leaseId, until: new Date(Date.now() + 60_000).toISOString() } }
+        return new Response(JSON.stringify({ job: cleaned }), { status: 200 })
+      }
       return new Response(JSON.stringify({ ok: true, errcode: 0 }), { status: 200 })
     }))
 
@@ -252,13 +256,16 @@ describe('refund signer policy', () => {
     // A fresh envelope was signed and submitted — not the dead one.
     expect(sent).not.toBeNull()
     expect(sent!.hash().toString('hex')).not.toBe(expiredHash)
-    // Router was updated with the replacement before submission, then confirmed.
+    // The dead envelope was requeued through the Router's sanctioned path…
+    const requeue = requests.find((r) => r.path.endsWith('/admin/refunds/requeue-malformed'))?.body
+    expect(requeue?.leaseId).toBe('lease-77')
+    // …then the normal pending path signed fresh under a NEW lease and confirmed.
     const complete = requests.find((r) => r.path.endsWith('/admin/refunds/complete'))?.body
     expect(complete?.state).toBe('submitted')
     expect(complete?.refundTx).toBe(sent!.hash().toString('hex'))
-    expect(complete?.leaseId).toBe('lease-77')
+    expect(complete?.leaseId).not.toBe('lease-77')
     const confirm = requests.find((r) => r.path.endsWith('/admin/refunds/confirm'))?.body
-    expect(confirm?.leaseId).toBe('lease-77')
+    expect(confirm?.leaseId).toBe(complete?.leaseId)
     expect(ledger.markConfirmed).toHaveBeenCalled()
   })
 

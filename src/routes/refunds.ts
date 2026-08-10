@@ -1,6 +1,6 @@
 import type { Env } from '../index'
 import { completeRefund, leaseRefund, listRefunds, readRefund, readRefundByPublicId, requeueMalformedRefund } from '../refund/refund'
-import { hasSorobanTransactionData, validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
+import { hasSorobanTransactionData, isExpiredEnvelope, validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
 import { rpc } from '@stellar/stellar-sdk'
 
 function json(body: unknown, status = 200): Response {
@@ -116,8 +116,12 @@ export async function handleRefundAdmin(request: Request, env: Env, url: URL): P
     }
     const computed = validateSignedRefundXdr(current, current.signedXdr, env.STELLAR_NETWORK)
     if (computed !== current.refundTx) return json({ error: 'Stored refund proof mismatch' }, 409)
-    if (hasSorobanTransactionData(current.signedXdr, env.STELLAR_NETWORK)) {
-      return json({ error: 'Refusing to replace a structurally valid Soroban transaction' }, 409)
+    // A structurally valid envelope may only be replaced once its time bound
+    // has expired — from then on it can never land, so a replacement cannot
+    // double-pay. (Malformed envelopes remain replaceable immediately.)
+    if (hasSorobanTransactionData(current.signedXdr, env.STELLAR_NETWORK) &&
+        !isExpiredEnvelope(current.signedXdr, env.STELLAR_NETWORK)) {
+      return json({ error: 'Refusing to replace a structurally valid, unexpired Soroban transaction' }, 409)
     }
     const result = await new rpc.Server(env.STELLAR_RPC_URL).getTransaction(current.refundTx)
     if (result.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
