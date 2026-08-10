@@ -102,6 +102,22 @@ export const SERVICE_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   },
 }
 
+// Founder-curated recommended services (2026-08-10) surfaced first by
+// discovery UIs. Invariant: only paid-verified services may appear here —
+// audit trail in docs/verified-runs.json.
+const RECOMMENDED_SERVICE_IDS = new Set([
+  'anthropic_chat_completions',
+  'coingecko_simple_price',
+  'deepseek_chat',
+  'exa_search',
+  'firecrawl_scrape',
+  'groq_chat',
+  'mistral_mistral_chat',
+  'parallel_search',
+  'perplexity_perplexity_chat',
+  'tavily_tavily_search',
+])
+
 export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // Parallel Search — first verified route, hand-tested 2026-04-11
   'parallel::/api/search': {
@@ -305,6 +321,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // so the flag is auditable rather than asserted; verify any of them at
   // https://stellar.expert/explorer/public/tx/<hash>
   // ---------------------------------------------------------------
+  // Tavily search — paid 0.0900000 USDC 2026-08-10, live search results
+  // returned end-to-end.
+  // tx 38eaecde40d6430654212bf59b32eb0e1275a6b5f8e3d958be8a56ec71649952
+  'tavily::/tavily/search': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-10T07:56:49Z',
+  },
   // Grok (xAI) chat — paid 0.0010000 USDC, live grok-3-mini completion.
   // tx bd4ff356ce96b095be1654209ef84cce7a53a62b0b606421b4b4c5b9d1121b96
   'grok::/grok/chat': {
@@ -602,6 +626,7 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
       charge_rozo_verified_at: route.chargeVerifiedAt ?? null,
       session_rozo_verified: route.sessionVerified ?? null,
       session_rozo_verified_at: route.sessionVerifiedAt ?? null,
+      ...(RECOMMENDED_SERVICE_IDS.has(route.id) ? { recommended: true as const } : {}),
       docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
       methods: {
         // Only include `stellar` when the route has usable intents —

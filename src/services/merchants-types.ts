@@ -257,6 +257,11 @@ export interface PublicCatalogEntry {
   charge_rozo_verified_at: string | null
   session_rozo_verified: boolean | null
   session_rozo_verified_at: string | null
+  /**
+   * Present (true) only for founder-curated recommended services.
+   * Invariant: recommended implies paid-verified.
+   */
+  recommended?: true
   docs_url: string
   /**
    * V2 multi-intent discovery. Lists the Stellar MPP intents the
