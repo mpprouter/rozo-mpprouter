@@ -53,6 +53,8 @@ import {
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
+import { checkAndBumpDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
+import { newOrderId, recordOrder, type RefundStatus } from '../services/order-ledger'
 import type { Env } from '../index'
 
 /**
@@ -67,6 +69,51 @@ function resolveRoute(url: URL, method: string) {
  */
 function buildMerchantUrl(merchantHost: string, upstreamPath: string, search: string): string {
   return `https://${merchantHost}${upstreamPath}${search}`
+}
+
+/**
+ * Convert a `route.fixedPricing.amountUsd` decimal string (e.g. "0.0005")
+ * into a base-unit integer string at 6 decimals — the same convention
+ * `parsed.request.amount` uses everywhere else in this file (Tempo USDC-6).
+ * Building a fake `parsed` challenge in this shape lets fixed-price routes
+ * flow through the SAME downstream verify/settle code every other route
+ * uses (see the `isRozoPayInvoiceRoute` synthesized-challenge precedent a
+ * few hundred lines below).
+ */
+export function fixedPriceToBaseUnits6(amountUsd: string): string {
+  if (!/^\d+(\.\d+)?$/.test(amountUsd)) {
+    throw new Error(`fixedPriceToBaseUnits6: not a decimal string: ${amountUsd}`)
+  }
+  const [whole, fracRaw = ''] = amountUsd.split('.')
+  if (fracRaw.length > 6) {
+    throw new Error(`fixedPriceToBaseUnits6: more than 6 fractional digits: ${amountUsd}`)
+  }
+  const frac = fracRaw.padEnd(6, '0')
+  const base = BigInt(whole || '0') * 1_000_000n + BigInt(frac || '0')
+  return base.toString()
+}
+
+/**
+ * Router-held upstream credential injection (Mercury MVP). Sets
+ * `route.upstreamAuth.header` from `env[secretBinding]` on top of the
+ * normal forwarded headers. Never logs the credential. No-ops (leaves the
+ * header unset) if the secret isn't configured in this environment — the
+ * upstream call then fails on its own terms (401/403), which is the same
+ * fail-open-on-agent-payment shape every other pay-then-fail merchant in
+ * this file already has, not a new risk class.
+ */
+export function injectUpstreamAuth(
+  headers: HeadersInit,
+  route: { upstreamAuth?: { secretBinding: string; header: string; scheme?: 'bearer' | 'raw' } },
+  env: Env,
+): Headers {
+  const h = new Headers(headers)
+  if (!route.upstreamAuth) return h
+  const token = (env as unknown as Record<string, string | undefined>)[route.upstreamAuth.secretBinding]
+  if (!token) return h
+  const scheme = route.upstreamAuth.scheme ?? 'bearer'
+  h.set(route.upstreamAuth.header, scheme === 'bearer' ? `Bearer ${token}` : token)
+  return h
 }
 
 /**
@@ -463,6 +510,8 @@ type MerchantPayResult =
       merchantResponse: Response
       /** HTTP status from merchant — 200 for sync, 202 for async jobs */
       merchantStatus: number
+      /** Wall-clock ms for the actual upstream call. Order-ledger use only. */
+      latencyMs?: number
     }
   | { kind: 'error'; response: Response; refundReason?: RefundReason }
 
@@ -475,6 +524,52 @@ async function payMerchantAndGetBody(
   request: Request,
   requestBody: string | undefined,
 ): Promise<MerchantPayResult> {
+  // Router-held-credential bridge (Mercury MVP, 2026-08-12): the agent
+  // still pays Router via Stellar/x402 as normal, but instead of paying a
+  // Tempo merchant, Router calls the upstream DIRECTLY with its own held
+  // credential injected. Generalizes the `isRozoPayInvoiceRoute` bridge
+  // below (same shape: skip Tempo, one direct upstream fetch) so future
+  // router-held-credential providers don't need a third hand-wired branch.
+  if (route.upstreamAuth) {
+    const headers = injectUpstreamAuth(forwardHeaders(request), route, env)
+    const startedAt = Date.now()
+    let merchantResponse: Response
+    try {
+      merchantResponse = await fetch(merchantUrl, {
+        method: request.method,
+        headers,
+        body: requestBody,
+      })
+    } catch (err: any) {
+      return {
+        kind: 'error',
+        refundReason: 'timeout',
+        response: new Response(
+          JSON.stringify({ error: 'Upstream call failed', detail: err.message }),
+          { status: 502, headers: { 'Content-Type': 'application/json' } },
+        ),
+      }
+    }
+    const latencyMs = Date.now() - startedAt
+    const contentType = merchantResponse.headers.get('content-type') || 'application/json'
+    const body = await merchantResponse.text()
+    if (!merchantResponse.ok) {
+      return {
+        kind: 'error',
+        refundReason: merchantResponse.status >= 500 ? 'upstream_5xx' : 'non_fulfillment',
+        response: new Response(
+          JSON.stringify({
+            error: 'Upstream request failed',
+            status: merchantResponse.status,
+            detail: body.substring(0, 500),
+          }),
+          { status: 502, headers: { 'Content-Type': 'application/json' } },
+        ),
+      }
+    }
+    return { kind: 'ok', body, contentType, merchantResponse, merchantStatus: merchantResponse.status, latencyMs }
+  }
+
   // Special bridge: user still pays Router via Stellar/x402 API path,
   // but Router settles this merchant via admin-secret upstream call.
   if (isRozoPayInvoiceRoute(route) && env.PAYINVOICE_ADMIN_SECRET) {
@@ -1004,8 +1099,52 @@ export async function handleProxy(
     return passthroughResponse
   }
 
+  // ---- Rate cap (Mercury MVP, before ANY payment step) --------------
+  // Enforced before the agent is ever offered a 402, let alone charged.
+  // Protects a router-held upstream credential (Mercury's scoped JWT)
+  // from being exhausted by router-side traffic — independent of
+  // whatever cap the upstream itself enforces on the token. DO CAS
+  // fixed-window counter, copied from coupon.ts:273-313's bumpCounter
+  // pattern (see src/mpp/rate-limit-do.ts). Over cap → 429, no money
+  // taken, no upstream call made.
+  if (route.rateLimit) {
+    const rlKey = `ratelimit:${route.service}:${utcDateKey()}`
+    const rl = await checkAndBumpDailyLimit(env, rlKey, route.rateLimit.perDay)
+    if (!rl.ok) {
+      const retryAfter = secondsUntilUtcMidnight()
+      return new Response(JSON.stringify({
+        error: 'Daily rate limit exceeded for this service',
+        detail: `${rl.used}/${rl.limit} calls used today (UTC). Resets at next UTC midnight.`,
+      }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) },
+      })
+    }
+  }
+
   // 1. Probe the merchant to learn the live quote. If the merchant
   // serves content for free, pass that through directly.
+  //
+  // Fixed-price routes (Mercury MVP) skip the probe entirely: there is
+  // no merchant-side Tempo 402 to read (the router holds the credential
+  // and sets its own price), and an unpaid probe against Mercury without
+  // our injected token would just 401 — which is not "free", it's
+  // "unauthenticated", and would be misread as a passthrough below.
+  let wwwAuth: string | null = null
+  let parsed: ReturnType<typeof parseTempoChallenge> = null
+  if (route.fixedPricing) {
+    parsed = {
+      id: `mercury-fixed-${Date.now()}`,
+      realm: merchantHost,
+      intent: 'charge',
+      request: {
+        amount: fixedPriceToBaseUnits6(route.fixedPricing.amountUsd),
+        currency: 'usd',
+        decimals: 6,
+        recipient: route.id,
+      },
+    }
+  } else {
   const probeResponse = await fetch(merchantUrl, {
     method: request.method,
     headers: forwardHeaders(request),
@@ -1017,8 +1156,7 @@ export async function handleProxy(
     return probeResponse
   }
 
-  const wwwAuth = probeResponse.headers.get('www-authenticate')
-  let parsed: ReturnType<typeof parseTempoChallenge> = null
+  wwwAuth = probeResponse.headers.get('www-authenticate')
   if (wwwAuth) {
     parsed = parseTempoChallenge(wwwAuth)
   } else if (isRozoPayInvoiceRoute(route)) {
@@ -1082,6 +1220,7 @@ export async function handleProxy(
       headers: { 'Content-Type': 'application/json' },
     })
   }
+  } // end: !route.fixedPricing probe branch
 
   if (!parsed) {
     return new Response(JSON.stringify({
@@ -1098,7 +1237,11 @@ export async function handleProxy(
   // Tempo wallet has enough USDC.e to cover the merchant quote. If
   // not, return 503 so the agent doesn't pay and get nothing back.
   // Also fire a DingTalk alert when the pool is below 5 USDC.
-  const merchantQuoteBaseUnits = (() => {
+  // Fixed-price routes (Mercury MVP) never pay a merchant on Tempo —
+  // `payMerchantAndGetBody`'s upstreamAuth branch calls the upstream
+  // directly — so the Tempo pool balance is irrelevant to whether this
+  // request can be served.
+  const merchantQuoteBaseUnits = route.fixedPricing ? null : (() => {
     try { return BigInt(parsed.request.amount) } catch { return null }
   })()
   if (merchantQuoteBaseUnits !== null) {
@@ -1333,6 +1476,25 @@ export async function handleProxy(
         await env.MPP_STORE.put(`idempotency:${requestId}`, payResult.body, { expirationTtl: 86400 })
       }
     })())
+
+    // Per-call order ledger (router-held-credential routes only — Mercury
+    // MVP, design doc §2.9). Payer isn't decoded from the x402 signed XDR
+    // in v1 (see order-ledger.ts note); settlement_ref is the on-chain
+    // settle tx when it succeeded.
+    if (route.upstreamAuth) {
+      ctx.waitUntil(recordOrder(env, {
+        order_id: newOrderId(),
+        ts: new Date().toISOString(),
+        route_id: route.id,
+        payer: null,
+        amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+        settlement_ref: settle.transaction ?? null,
+        request_path: `${upstreamPath}${forwardedSearch}`,
+        upstream_status: payResult.merchantStatus,
+        latency_ms: payResult.latencyMs ?? 0,
+        refund_status: 'none' as RefundStatus,
+      }))
+    }
 
     const headers: Record<string, string> = {
       'Content-Type': payResult.contentType,
@@ -1893,6 +2055,23 @@ export async function handleProxy(
       await env.MPP_STORE.put(`idempotency:${requestId}`, body, { expirationTtl: 86400 })
     }
   })())
+
+  // Per-call order ledger (router-held-credential routes only — Mercury
+  // MVP, design doc §2.9).
+  if (route.upstreamAuth) {
+    ctx.waitUntil(recordOrder(env, {
+      order_id: newOrderId(),
+      ts: new Date().toISOString(),
+      route_id: route.id,
+      payer: settledPayment?.payer ?? null,
+      amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      settlement_ref: settledPayment?.paymentTx ?? null,
+      request_path: `${upstreamPath}${forwardedSearch}`,
+      upstream_status: payResult.merchantStatus,
+      latency_ms: payResult.latencyMs ?? 0,
+      refund_status: 'none' as RefundStatus,
+    }))
+  }
 
   const merchantContent = new Response(body, {
     status: 200,

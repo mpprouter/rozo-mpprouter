@@ -501,6 +501,18 @@ export function buildRoutesFromMppSnapshot(
         if (overlayEntry.sessionVerifiedAt !== undefined) {
           route.sessionVerifiedAt = overlayEntry.sessionVerifiedAt
         }
+        // Router-held-credential / fixed-price / rate-limit fields
+        // (Mercury MVP, 2026-08-12). Operator-only — never derived from
+        // the mpp.dev snapshot.
+        if (overlayEntry.upstreamAuth !== undefined) {
+          route.upstreamAuth = overlayEntry.upstreamAuth
+        }
+        if (overlayEntry.fixedPricing !== undefined) {
+          route.fixedPricing = overlayEntry.fixedPricing
+        }
+        if (overlayEntry.rateLimit !== undefined) {
+          route.rateLimit = overlayEntry.rateLimit
+        }
       }
       routes.push(route)
     }

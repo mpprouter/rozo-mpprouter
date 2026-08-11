@@ -124,6 +124,48 @@ export interface PublicServiceRoute {
   chargeVerifiedAt?: string | null
   sessionVerified?: boolean | null
   sessionVerifiedAt?: string | null
+  /**
+   * Router-held upstream credential injection (Mercury MVP, 2026-08-12).
+   *
+   * Set ONLY for the small set of first-party-held-credential services
+   * (currently: mercury). When present, `payMerchantAndGetBody` in
+   * `proxy.ts` bypasses the Tempo merchant-payment dispatch entirely and
+   * instead calls the upstream directly with `env[secretBinding]` injected
+   * as the given header (never logged). Precedent: the hand-wired
+   * `rozo-agent-api` admin bridge (`isRozoPayInvoiceRoute`) — this field
+   * generalizes that pattern instead of adding a second hand-wired special
+   * case per new router-held-credential provider.
+   */
+  upstreamAuth?: {
+    /** Name of the `Env` field holding the credential. Never logged. */
+    secretBinding: string
+    /** Header name to set on the upstream request (e.g. `Authorization`). */
+    header: string
+    /** 'bearer' prefixes the value with `Bearer `; 'raw' sends it verbatim. Defaults to 'bearer'. */
+    scheme?: 'bearer' | 'raw'
+  }
+  /**
+   * Fixed-price mode (Mercury MVP). When present, the route has NO
+   * merchant-side Tempo 402 to probe — the router sets its own price and
+   * issues the 402 challenge to the agent itself (both mppx and
+   * stellar.x402 dialects), skipping the unpaid merchant probe and the
+   * Tempo pool balance preflight. Refund path is unchanged: an upstream
+   * 5xx after settlement still triggers the existing auto-refund.
+   */
+  fixedPricing?: {
+    /** Decimal USD string, e.g. "0.0005". */
+    amountUsd: string
+  }
+  /**
+   * Per-service daily rate cap, enforced in the proxy BEFORE payment via
+   * the ATOMIC_STORE Durable Object CAS counter (see
+   * `src/mpp/rate-limit-do.ts`). Protects a router-held upstream credential
+   * from being exhausted by router-side traffic; independent of whatever
+   * cap the upstream itself enforces on the credential.
+   */
+  rateLimit?: {
+    perDay: number
+  }
 }
 
 /**
@@ -166,6 +208,20 @@ export interface PublicServiceRouteOverlay {
   chargeVerifiedAt?: string | null
   sessionVerified?: boolean | null
   sessionVerifiedAt?: string | null
+  /** See `PublicServiceRoute.upstreamAuth`. */
+  upstreamAuth?: {
+    secretBinding: string
+    header: string
+    scheme?: 'bearer' | 'raw'
+  }
+  /** See `PublicServiceRoute.fixedPricing`. */
+  fixedPricing?: {
+    amountUsd: string
+  }
+  /** See `PublicServiceRoute.rateLimit`. */
+  rateLimit?: {
+    perDay: number
+  }
 }
 
 /**

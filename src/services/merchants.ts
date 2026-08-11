@@ -434,6 +434,70 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'ethereum-mainnet eth_blockNumber. Merchant-side, same pattern as alchemy. ' +
       'Re-verify when QuickNode upstream is fixed.',
   },
+  // ---------------------------------------------------------------
+  // Mercury (Stellar indexer, xycloo Labs) — MVP router-held-credential
+  // service (design: ainative todos/20260811-mercury-mpp-router-
+  // integration-design.md). Mercury is NOT an mpp.dev merchant: the
+  // router holds a scoped Mercury JWT (`MERCURYDATA_MAINNET_JWT`,
+  // injected via upstreamAuth) and issues its own fixed-price 402
+  // ($0.0005/call, matching Alchemy's data-API rate) instead of probing
+  // a merchant 402. Capped at 1,000 calls/day (rateLimit) to protect
+  // Federico's token — double wall on top of whatever cap he sets on the
+  // token itself. verifiedMode stays false until the first real paid
+  // call lands (see §2.5 of the design doc); flip to 'charge' + set
+  // chargeVerified/chargeVerifiedAt with the settling tx hash then.
+  // Token issued 2026-08-12, ~3-month validity — renew by ~2026-11-12 or
+  // this SERVICE_OVERLAY-style disable kicks in (kill switch promised to
+  // Federico: same-day delist via a verifiedMode:false flip here).
+  // ---------------------------------------------------------------
+  'mercury::GET::/events/by-contract/{contract_id}': {
+    id: 'mercury_events_by_contract',
+    publicPath: '/v1/services/mercury/events/by-contract',
+    upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
+    fixedPricing: { amountUsd: '0.0005' },
+    rateLimit: { perDay: 1000 },
+    verifiedMode: false,
+    verifiedNote:
+      'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
+      'been real-money verified end-to-end yet — first paid call pending. ' +
+      'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
+  },
+  'mercury::GET::/events/by-ledger': {
+    id: 'mercury_events_by_ledger',
+    publicPath: '/v1/services/mercury/events/by-ledger',
+    upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
+    fixedPricing: { amountUsd: '0.0005' },
+    rateLimit: { perDay: 1000 },
+    verifiedMode: false,
+    verifiedNote:
+      'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
+      'been real-money verified end-to-end yet — first paid call pending. ' +
+      'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
+  },
+  'mercury::GET::/txs/by-contract/{contract_id}': {
+    id: 'mercury_txs_by_contract',
+    publicPath: '/v1/services/mercury/txs/by-contract',
+    upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
+    fixedPricing: { amountUsd: '0.0005' },
+    rateLimit: { perDay: 1000 },
+    verifiedMode: false,
+    verifiedNote:
+      'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
+      'been real-money verified end-to-end yet — first paid call pending. ' +
+      'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
+  },
+  'mercury::GET::/txs/by-hash/{tx_hash}': {
+    id: 'mercury_txs_by_hash',
+    publicPath: '/v1/services/mercury/txs/by-hash',
+    upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
+    fixedPricing: { amountUsd: '0.0005' },
+    rateLimit: { perDay: 1000 },
+    verifiedMode: false,
+    verifiedNote:
+      'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
+      'been real-money verified end-to-end yet — first paid call pending. ' +
+      'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
+  },
   // Object Storage Upload — actually charge mode for multipart-init
   'storage::/{key}': {
     id: 'storage_upload',
