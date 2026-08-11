@@ -179,3 +179,10 @@ weekly, per-round spend cap $1.
 | 2026-04-12 | muggledev | Created doc. Fixed `stellarIntentsFor` to respect upstream mode. Added `upstreamPaymentMethod: 'tempo.charge'` override for alchemy_rpc |
 | 2026-04-11 | muggledev | Initial `verifiedMode` overlay for 12 services (5 charge, 4 session, 3 broken) |
 | 2026-04-10 | muggledev | First service catalog shipped with `parallel_search` as test service |
+
+### Mercury (xycloo Labs) — first Stellar data service — 2026-08-11
+First real-money verify runs (payer masked `GD5R4H...BB4U`, $0.0005/call):
+- `mercury_events_by_contract` — tx `8b3a36f2b359328a37652b7f32e89e19b253487e9b28bc01a257161e1cf6b8c6` — 200, real USDC SAC transfer events
+- `mercury_txs_by_hash` — tx `871099bf7ed2f36605ed568aa927d811d43893afc70863fb8a3fdf4279c07cdb` — 200, full envelope+meta
+- `mercury_txs_by_contract` — tx `c82da0fc01501df246df43e5cbfb85d60bc5d9dd7df31a95addeb59af95f4b98` — 200
+- `mercury_events_by_ledger` — NOT verified: mainnet upstream slow (40s+)/500 on 2026-08-11; kept disabled, filed with provider
