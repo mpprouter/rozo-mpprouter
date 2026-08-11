@@ -463,6 +463,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // test happens. See proxy.ts SECURITY GATE.
   // ---------------------------------------------------------------
   'mercury::GET::/events/by-contract/{contract_id}': {
+    upstreamPath: '/rest/events/by-contract/{contract_id}',
     id: 'mercury_events_by_contract',
     publicPath: '/v1/services/mercury/events/by-contract',
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
@@ -476,6 +477,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
   },
   'mercury::GET::/events/by-ledger': {
+    upstreamPath: '/rest/events/by-ledger',
     id: 'mercury_events_by_ledger',
     publicPath: '/v1/services/mercury/events/by-ledger',
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
@@ -489,6 +491,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
   },
   'mercury::GET::/txs/by-contract/{contract_id}': {
+    upstreamPath: '/rest/txs/by-contract/{contract_id}',
     id: 'mercury_txs_by_contract',
     publicPath: '/v1/services/mercury/txs/by-contract',
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
@@ -502,6 +505,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
   },
   'mercury::GET::/txs/by-hash/{tx_hash}': {
+    upstreamPath: '/rest/txs/by-hash/{tx_hash}',
     id: 'mercury_txs_by_hash',
     publicPath: '/v1/services/mercury/txs/by-hash',
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
