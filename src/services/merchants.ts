@@ -449,6 +449,18 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // Token issued 2026-08-12, ~3-month validity — renew by ~2026-11-12 or
   // this SERVICE_OVERLAY-style disable kicks in (kill switch promised to
   // Federico: same-day delist via a verifiedMode:false flip here).
+  //
+  // Launch gate (P1 fix, codex review 2026-08-12): verifiedMode: false
+  // makes handleProxy's SECURITY GATE 403 the route unconditionally —
+  // but verifiedMode can only ever flip to a real value AFTER a
+  // successful paid call, so without an escape hatch this route could
+  // NEVER be verified. `launchGate: 'MERCURY_LAUNCH_MODE'` lets the
+  // operator flip the `MERCURY_LAUNCH_MODE` Worker var to `'verify'` to
+  // let exactly the operator's own first paid call through (route stays
+  // 403 for everyone else / unset var), do the real-money test, then
+  // unset the var again and flip verifiedMode to 'charge' — the route is
+  // never advertised as verified or opened to the public before that
+  // test happens. See proxy.ts SECURITY GATE.
   // ---------------------------------------------------------------
   'mercury::GET::/events/by-contract/{contract_id}': {
     id: 'mercury_events_by_contract',
@@ -457,6 +469,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     fixedPricing: { amountUsd: '0.0005' },
     rateLimit: { perDay: 1000 },
     verifiedMode: false,
+    launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
       'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
       'been real-money verified end-to-end yet — first paid call pending. ' +
@@ -469,6 +482,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     fixedPricing: { amountUsd: '0.0005' },
     rateLimit: { perDay: 1000 },
     verifiedMode: false,
+    launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
       'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
       'been real-money verified end-to-end yet — first paid call pending. ' +
@@ -481,6 +495,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     fixedPricing: { amountUsd: '0.0005' },
     rateLimit: { perDay: 1000 },
     verifiedMode: false,
+    launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
       'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
       'been real-money verified end-to-end yet — first paid call pending. ' +
@@ -493,6 +508,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     fixedPricing: { amountUsd: '0.0005' },
     rateLimit: { perDay: 1000 },
     verifiedMode: false,
+    launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
       'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
       'been real-money verified end-to-end yet — first paid call pending. ' +

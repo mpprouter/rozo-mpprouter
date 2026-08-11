@@ -513,6 +513,11 @@ export function buildRoutesFromMppSnapshot(
         if (overlayEntry.rateLimit !== undefined) {
           route.rateLimit = overlayEntry.rateLimit
         }
+        // Launch gate (P1 fix, codex review 2026-08-12) — see
+        // `PublicServiceRoute.launchGate`.
+        if (overlayEntry.launchGate !== undefined) {
+          route.launchGate = overlayEntry.launchGate
+        }
       }
       routes.push(route)
     }

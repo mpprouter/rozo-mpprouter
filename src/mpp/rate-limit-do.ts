@@ -68,6 +68,29 @@ export interface DailyLimitResult {
 }
 
 /**
+ * Read-only peek at the fixed-window daily counter — never consumes a
+ * slot. Used for the unpaid/handshake leg (e.g. the initial 402 probe,
+ * before any payment credential has been presented) so unauthenticated
+ * spam can fail fast on an already-exhausted cap WITHOUT burning real
+ * allowance meant for paid calls. Callers on the paid leg must still call
+ * `checkAndBumpDailyLimit` right before the upstream call to actually
+ * consume a slot.
+ */
+export async function peekDailyLimit(
+  env: Env,
+  key: string,
+  perDay: number,
+  now: number = Date.now(),
+): Promise<DailyLimitResult> {
+  const day = utcDateKey(now)
+  const stub = rateLimitStub(env)
+  const { value } = await doPost<ReadResponse>(stub, '/read', { key })
+  const c = parseCounter(value)
+  const used = c.day === day ? c.n : 0
+  return { ok: used < perDay, used, limit: perDay }
+}
+
+/**
  * Atomically check-and-increment a fixed-window daily counter. Returns
  * `{ok:false}` (and does NOT consume a slot) when the caller is already
  * at `perDay`. No payment should be taken when this returns `ok:false`.

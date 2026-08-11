@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { fixedPriceToBaseUnits6, injectUpstreamAuth, forwardHeaders } from '../src/routes/proxy'
+import { fixedPriceToBaseUnits6, injectUpstreamAuth, forwardHeaders, sanitizeUpstreamErrorDetail } from '../src/routes/proxy'
 import type { Env } from '../src/index'
 
 describe('fixedPriceToBaseUnits6', () => {
@@ -69,5 +69,37 @@ describe('injectUpstreamAuth', () => {
     const headers = injectUpstreamAuth(forwardHeaders(request), route, env)
     // Only the router-held credential goes upstream — never the agent's.
     expect(headers.get('Authorization')).toBe('Bearer router-held-secret')
+  })
+})
+
+describe('sanitizeUpstreamErrorDetail', () => {
+  // SECURITY (P1, codex review 2026-08-12): upstreamAuth routes carry a
+  // router-held credential (e.g. the Mercury JWT) on the outbound
+  // request. Reflecting the raw upstream error body back to the caller
+  // risks leaking that credential if the upstream ever echoes request
+  // state in its error output.
+  it('withholds the raw upstream body for upstreamAuth routes, even if it contains a secret', () => {
+    const leakyBody = JSON.stringify({
+      error: 'unauthorized',
+      // Simulates an upstream that echoes the request it received,
+      // including our router-held credential — must never reach the caller.
+      received_authorization: 'Bearer super-secret-mercury-jwt-do-not-leak',
+    })
+    const detail = sanitizeUpstreamErrorDetail(true, leakyBody)
+    expect(detail).not.toContain('super-secret-mercury-jwt-do-not-leak')
+    expect(detail).not.toContain('received_authorization')
+    expect(detail).toBe('Upstream returned an error. Detail withheld for router-held-credential routes.')
+  })
+
+  it('keeps the old verbatim (first-500-chars) passthrough for non-upstreamAuth routes — byte-identical to pre-fix behavior', () => {
+    const body = '{"error":"merchant says no","code":"MERCHANT_DOWN"}'
+    expect(sanitizeUpstreamErrorDetail(false, body)).toBe(body.substring(0, 500))
+  })
+
+  it('non-upstreamAuth truncates at exactly 500 chars like the original inline `body.substring(0, 500)`', () => {
+    const longBody = 'x'.repeat(1000)
+    const detail = sanitizeUpstreamErrorDetail(false, longBody)
+    expect(detail).toHaveLength(500)
+    expect(detail).toBe(longBody.substring(0, 500))
   })
 })

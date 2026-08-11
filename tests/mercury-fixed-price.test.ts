@@ -118,6 +118,7 @@ vi.mock('../src/mpp/tempo-client', () => ({
 }))
 
 import { handleProxy } from '../src/routes/proxy'
+import { checkAndBumpDailyLimit, utcDateKey } from '../src/mpp/rate-limit-do'
 import type { Env } from '../src/index'
 
 const MERCURY_TOKEN = 'test-mercury-jwt-do-not-use'
@@ -202,22 +203,55 @@ describe.skipIf(!loadDevVars())('Mercury fixed-price / upstreamAuth proxy path',
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 
-  it('rejects with 429 and Retry-After once the daily cap is hit, before any payment or fetch', async () => {
+  // P1 fix (codex review 2026-08-12): the unpaid/handshake leg (no
+  // credential presented yet — the agent's very first round-trip, which
+  // only gets the router's own 402 challenge) must NOT consume a
+  // rate-limit slot. Before this fix, checkAndBumpDailyLimit ran
+  // unconditionally here, so a 1,000/day cap became ~500 real calls
+  // (every real call is preceded by one unpaid probe) and unauthenticated
+  // spam could burn the whole daily allowance without a single upstream
+  // call. The gate is now a non-consuming peek; only a verified paid
+  // request consumes (see `mercury-rate-limit-do.test.ts` for
+  // `peekDailyLimit` unit coverage of the primitive itself).
+  it('the unpaid 402 handshake leg never consumes the rate-limit cap, however many times it repeats', async () => {
     const env = makeEnv()
     fetchSpy = vi.spyOn(globalThis, 'fetch')
 
-    // perDay: 2 — first two (unauthenticated) requests still count against
-    // the cap because the cap is enforced before the 402 is even issued.
-    const r1 = await handleProxy(request(), env, makeCtx())
-    const r2 = await handleProxy(request(), env, makeCtx())
+    // perDay is 2 on FIXED_ROUTE, but we fire 5 unauthenticated requests —
+    // if the old bug were still present, request #3 would already 429.
+    const responses = []
+    for (let i = 0; i < 5; i++) {
+      responses.push(await handleProxy(request(), env, makeCtx()))
+    }
+    for (const r of responses) {
+      expect(r.status).toBe(402)
+    }
+    expect(fetchSpy).not.toHaveBeenCalled()
+
+    // Prove the counter itself never moved: the DO's first REAL
+    // (consuming) check still sees a fully fresh cap.
+    const key = `ratelimit:${FIXED_ROUTE.service}:${utcDateKey()}`
+    const firstRealConsume = await checkAndBumpDailyLimit(env, key, FIXED_ROUTE.rateLimit!.perDay)
+    expect(firstRealConsume).toEqual({ ok: true, used: 1, limit: FIXED_ROUTE.rateLimit!.perDay })
+  })
+
+  it('still blocks with 429 + Retry-After when the cap is genuinely exhausted, before any fetch — even on the unpaid leg', async () => {
+    const env = makeEnv()
+
+    // Simulate the cap already having been consumed by real paid calls
+    // (the only leg allowed to consume it) on a prior request.
+    const key = `ratelimit:${FIXED_ROUTE.service}:${utcDateKey()}`
+    await checkAndBumpDailyLimit(env, key, FIXED_ROUTE.rateLimit!.perDay)
+    await checkAndBumpDailyLimit(env, key, FIXED_ROUTE.rateLimit!.perDay)
+
+    fetchSpy = vi.spyOn(globalThis, 'fetch')
     const r3 = await handleProxy(request(), env, makeCtx())
 
-    expect(r1.status).toBe(402)
-    expect(r2.status).toBe(402)
     expect(r3.status).toBe(429)
     expect(r3.headers.get('retry-after')).toBeTruthy()
     const body = await r3.json() as any
     expect(body.error).toMatch(/rate limit/i)
+    // Still no upstream contact and no payment step reached.
     expect(fetchSpy).not.toHaveBeenCalled()
   })
 

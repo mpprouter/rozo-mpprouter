@@ -166,6 +166,21 @@ export interface PublicServiceRoute {
   rateLimit?: {
     perDay: number
   }
+  /**
+   * Launch gate (Mercury MVP, 2026-08-12 P1 fix). A route with
+   * `verifiedMode: false` is normally 403'd by the SECURITY GATE in
+   * `handleProxy` — but that means a brand-new router-held-credential
+   * route can NEVER get its first real paid call verified, because
+   * verifiedMode can only flip to a real value AFTER a successful paid
+   * call. `launchGate` names an `Env` var; when `env[launchGate] ===
+   * 'verify'` the route is allowed through the gate despite
+   * `verifiedMode === false`, so the operator can make the one
+   * first-paid-call test without advertising the route as verified or
+   * opening it to the public ahead of that test. Unset (or any other
+   * value) → still 403, same as today. Not carried to the public
+   * catalog.
+   */
+  launchGate?: string
 }
 
 /**
@@ -222,6 +237,21 @@ export interface PublicServiceRouteOverlay {
   rateLimit?: {
     perDay: number
   }
+  /**
+   * Launch gate (Mercury MVP, 2026-08-12 P1 fix). A route with
+   * `verifiedMode: false` is normally 403'd by the SECURITY GATE in
+   * `handleProxy` — but that means a brand-new router-held-credential
+   * route can NEVER get its first real paid call verified, because
+   * verifiedMode can only flip to a real value AFTER a successful paid
+   * call. `launchGate` names an `Env` var; when `env[launchGate] ===
+   * 'verify'` the route is allowed through the gate despite
+   * `verifiedMode === false`, so the operator can make the one
+   * first-paid-call test without advertising the route as verified or
+   * opening it to the public ahead of that test. Unset (or any other
+   * value) → still 403, same as today. Not carried to the public
+   * catalog.
+   */
+  launchGate?: string
 }
 
 /**

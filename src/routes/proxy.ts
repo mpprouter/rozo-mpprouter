@@ -53,7 +53,7 @@ import {
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
-import { checkAndBumpDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
+import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
 import { newOrderId, recordOrder, type RefundStatus } from '../services/order-ledger'
 import type { Env } from '../index'
 
@@ -102,6 +102,24 @@ export function fixedPriceToBaseUnits6(amountUsd: string): string {
  * fail-open-on-agent-payment shape every other pay-then-fail merchant in
  * this file already has, not a new risk class.
  */
+/**
+ * Build the `detail` field for a non-2xx upstream error response.
+ *
+ * SECURITY (P1, codex review 2026-08-12): `hasUpstreamAuth` routes carry a
+ * router-held credential (e.g. `MERCURYDATA_MAINNET_JWT`) injected into
+ * the OUTBOUND request headers. Reflecting the upstream's raw error body
+ * verbatim back to the caller risks leaking that credential (or other
+ * upstream internals) if the upstream ever echoes request headers/state
+ * in its error output. Routes without `upstreamAuth` never carry a
+ * router-held secret on the request, so they keep the original verbatim
+ * (truncated) passthrough — byte-identical to the pre-fix behavior.
+ */
+export function sanitizeUpstreamErrorDetail(hasUpstreamAuth: boolean, body: string): string {
+  return hasUpstreamAuth
+    ? 'Upstream returned an error. Detail withheld for router-held-credential routes.'
+    : body.substring(0, 500)
+}
+
 export function injectUpstreamAuth(
   headers: HeadersInit,
   route: { upstreamAuth?: { secretBinding: string; header: string; scheme?: 'bearer' | 'raw' } },
@@ -554,6 +572,13 @@ async function payMerchantAndGetBody(
     const contentType = merchantResponse.headers.get('content-type') || 'application/json'
     const body = await merchantResponse.text()
     if (!merchantResponse.ok) {
+      // SECURITY (P1, codex review 2026-08-12): this branch only runs for
+      // upstreamAuth routes — the request carries a router-held credential
+      // (e.g. MERCURYDATA_MAINNET_JWT) in a header. Reflecting the upstream
+      // body verbatim risks leaking that credential (or other upstream
+      // internals) back to the caller if the upstream ever echoes request
+      // headers in an error body. Non-upstreamAuth routes are unaffected —
+      // they never reach this branch.
       return {
         kind: 'error',
         refundReason: merchantResponse.status >= 500 ? 'upstream_5xx' : 'non_fulfillment',
@@ -561,7 +586,7 @@ async function payMerchantAndGetBody(
           JSON.stringify({
             error: 'Upstream request failed',
             status: merchantResponse.status,
-            detail: body.substring(0, 500),
+            detail: sanitizeUpstreamErrorDetail(true, body),
           }),
           { status: 502, headers: { 'Content-Type': 'application/json' } },
         ),
@@ -969,7 +994,18 @@ export async function handleProxy(
   //
   // The refusal is intentionally generic — no merchant host, channel id,
   // or internal reason — so it doesn't help an attacker probe the fleet.
-  if (route.verifiedMode === false) {
+  // Launch gate escape hatch (P1 fix, codex review 2026-08-12): a route
+  // can name a `launchGate` Env var (currently only the 4 Mercury
+  // routes → 'MERCURY_LAUNCH_MODE'). When that var is literally
+  // 'verify', we let the route through despite verifiedMode === false —
+  // this is how a brand-new router-held-credential route gets its FIRST
+  // real paid call (verifiedMode can only ever flip away from false
+  // AFTER that call succeeds, so without this the route could never be
+  // verified). Any other value (including unset) → still 403 below, so
+  // the route stays closed to the public until the operator explicitly
+  // flips the var for their own test call.
+  const launchGateOpen = !!(route.launchGate && env[route.launchGate as keyof Env] === 'verify')
+  if (route.verifiedMode === false && !launchGateOpen) {
     return new Response(JSON.stringify({
       error: 'Route not enabled for payment',
       hint: 'See GET /v1/services/catalog for the set of routes that accept payment.',
@@ -1099,17 +1135,29 @@ export async function handleProxy(
     return passthroughResponse
   }
 
-  // ---- Rate cap (Mercury MVP, before ANY payment step) --------------
+  // ---- Rate cap peek (Mercury MVP, before ANY payment step) ---------
   // Enforced before the agent is ever offered a 402, let alone charged.
   // Protects a router-held upstream credential (Mercury's scoped JWT)
   // from being exhausted by router-side traffic — independent of
   // whatever cap the upstream itself enforces on the token. DO CAS
   // fixed-window counter, copied from coupon.ts:273-313's bumpCounter
-  // pattern (see src/mpp/rate-limit-do.ts). Over cap → 429, no money
-  // taken, no upstream call made.
-  if (route.rateLimit) {
-    const rlKey = `ratelimit:${route.service}:${utcDateKey()}`
-    const rl = await checkAndBumpDailyLimit(env, rlKey, route.rateLimit.perDay)
+  // pattern (see src/mpp/rate-limit-do.ts).
+  //
+  // P1 fix (codex review 2026-08-12): this is a PEEK ONLY — it does not
+  // consume a slot. The unpaid/handshake leg (no credential yet, or the
+  // agent's first 402 round-trip) must not burn allowance meant for real
+  // paid calls, or 1,000/day cap becomes ~500 real calls and
+  // unauthenticated spam can exhaust the whole allowance without ever
+  // reaching upstream. The real consuming check
+  // (`checkAndBumpDailyLimit`) runs later, immediately before the paid
+  // execution path — only for requests that actually carry a verified
+  // payment credential and are about to call upstream — still strictly
+  // before any money is taken, so an over-cap request is never charged.
+  // This peek exists purely to fail fast (no probe/verify work wasted)
+  // when the cap is already exhausted.
+  const rlKey = route.rateLimit ? `ratelimit:${route.service}:${utcDateKey()}` : null
+  if (rlKey && route.rateLimit) {
+    const rl = await peekDailyLimit(env, rlKey, route.rateLimit.perDay)
     if (!rl.ok) {
       const retryAfter = secondsUntilUtcMidnight()
       return new Response(JSON.stringify({
@@ -1120,6 +1168,30 @@ export async function handleProxy(
         headers: { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) },
       })
     }
+  }
+
+  /**
+   * Consume one rate-limit slot. Called ONLY right before a paid
+   * upstream call is actually about to happen (credential verified),
+   * never on the unpaid/handshake leg. Returns a 429 Response to short-
+   * circuit the caller if the cap was hit in the race between the peek
+   * above and now (still before any money is taken).
+   */
+  const routeRateLimit = route.rateLimit
+  async function consumeRateLimitSlotOrReject(): Promise<Response | null> {
+    if (!rlKey || !routeRateLimit) return null
+    const rl = await checkAndBumpDailyLimit(env, rlKey, routeRateLimit.perDay)
+    if (!rl.ok) {
+      const retryAfter = secondsUntilUtcMidnight()
+      return new Response(JSON.stringify({
+        error: 'Daily rate limit exceeded for this service',
+        detail: `${rl.used}/${rl.limit} calls used today (UTC). Resets at next UTC midnight.`,
+      }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': String(retryAfter) },
+      })
+    }
+    return null
   }
 
   // 1. Probe the merchant to learn the live quote. If the merchant
@@ -1415,6 +1487,17 @@ export async function handleProxy(
     console.log(
       `[proxy] stellar.x402 verified for route ${route.id} payloadHash=${verify.payloadHash}`,
     )
+
+    // Consume the rate-limit slot HERE — credential is verified, we are
+    // about to make the real upstream call, and no money has moved yet
+    // (the on-chain settle for stellar.x402 only happens after merchant
+    // 2xx, further below). Release the nonce reservation on reject so
+    // the agent can retry with the same payload.
+    const rateLimitRejectX402 = await consumeRateLimitSlotOrReject()
+    if (rateLimitRejectX402) {
+      ctx.waitUntil(reserve.release())
+      return rateLimitRejectX402
+    }
 
     const payResult = await payMerchantAndGetBody(
       env,
@@ -1950,6 +2033,19 @@ export async function handleProxy(
   // clear message so the operator notices and runs
   // `scripts/admin/open-tempo-channel.ts` before agent traffic
   // builds up.
+  //
+  // Rate-limit slot consumed HERE (credential just verified above, we
+  // are about to make the real upstream call) — never on the
+  // unpaid/handshake leg (the earlier peek only). See consumeRateLimitSlotOrReject.
+  const rateLimitRejectMppx = await consumeRateLimitSlotOrReject()
+  if (rateLimitRejectMppx) {
+    if (channelContractForVerify && channelDeliveryLockId) {
+      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      channelDeliveryLockId = undefined
+    }
+    return verifyResult.withReceipt(rateLimitRejectMppx)
+  }
+
   let payResult: MerchantPayResult
   try {
     payResult = await payMerchantAndGetBody(

@@ -169,6 +169,13 @@ export interface Env {
   // Dev-only counterpart against testnet.mercurydata.app. Not read by any
   // production code path — used only by local smoke scripts.
   MERCURYDATA_TESTNET_JWT?: string
+  // Launch gate for the Mercury MVP routes (P1 fix, codex review
+  // 2026-08-12). verifiedMode: false 403s these routes unconditionally —
+  // set this var to 'verify' to let the operator's own first real paid
+  // call through despite that, without advertising the route as verified.
+  // See `PublicServiceRoute.launchGate` / proxy.ts SECURITY GATE. Unset
+  // (default) → still 403 for everyone. Not a secret; plain var is fine.
+  MERCURY_LAUNCH_MODE?: string
 
   // Optional paid Base RPC (Alchemy / QuickNode / Infura) used as the
   // primary endpoint for funder balance checks. Falls back to public

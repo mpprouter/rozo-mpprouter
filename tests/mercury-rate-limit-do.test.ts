@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { checkAndBumpDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../src/mpp/rate-limit-do'
+import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../src/mpp/rate-limit-do'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import type { Env } from '../src/index'
 
@@ -53,6 +53,38 @@ describe('checkAndBumpDailyLimit', () => {
     await checkAndBumpDailyLimit(env, 'ratelimit:mercury:test-d', 1)
     const other = await checkAndBumpDailyLimit(env, 'ratelimit:other-service:test-d', 1)
     expect(other).toEqual({ ok: true, used: 1, limit: 1 })
+  })
+})
+
+describe('peekDailyLimit', () => {
+  it('never consumes a slot no matter how many times it is called', async () => {
+    const env = makeEnv()
+    const key = 'ratelimit:mercury:peek-a'
+    const p1 = await peekDailyLimit(env, key, 2)
+    const p2 = await peekDailyLimit(env, key, 2)
+    const p3 = await peekDailyLimit(env, key, 2)
+    expect(p1).toEqual({ ok: true, used: 0, limit: 2 })
+    expect(p2).toEqual({ ok: true, used: 0, limit: 2 })
+    expect(p3).toEqual({ ok: true, used: 0, limit: 2 })
+    // The real consuming check still sees a fresh cap — peeking never
+    // advanced the counter.
+    const real = await checkAndBumpDailyLimit(env, key, 2)
+    expect(real).toEqual({ ok: true, used: 1, limit: 2 })
+  })
+
+  it('reflects slots already consumed by checkAndBumpDailyLimit', async () => {
+    const env = makeEnv()
+    const key = 'ratelimit:mercury:peek-b'
+    await checkAndBumpDailyLimit(env, key, 2)
+    await checkAndBumpDailyLimit(env, key, 2)
+    const peek = await peekDailyLimit(env, key, 2)
+    expect(peek).toEqual({ ok: false, used: 2, limit: 2 })
+  })
+
+  it('treats an unwritten key as 0/perDay (ok)', async () => {
+    const env = makeEnv()
+    const peek = await peekDailyLimit(env, 'ratelimit:mercury:peek-c', 5)
+    expect(peek).toEqual({ ok: true, used: 0, limit: 5 })
   })
 })
 

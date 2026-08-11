@@ -54,6 +54,19 @@ describe('Mercury catalog materialization', () => {
     }
   })
 
+  // P1 fix (codex review 2026-08-12): verifiedMode can only ever flip
+  // away from `false` AFTER a successful paid call, so without an escape
+  // hatch these routes could never be verified — the SECURITY GATE would
+  // 403 forever, including the operator's own first test call. Every
+  // mercury route must carry the launch gate so proxy.ts's env-var
+  // bypass has something to check.
+  it('every mercury route carries the MERCURY_LAUNCH_MODE launch gate', () => {
+    for (const id of MERCURY_ROUTE_IDS) {
+      const route = PUBLIC_SERVICE_ROUTES.find(r => r.id === id)!
+      expect(route.launchGate).toBe('MERCURY_LAUNCH_MODE')
+    }
+  })
+
   it('the security gate therefore refuses payment on mercury routes until an operator flips verifiedMode', () => {
     // Catalog honesty check, same invariant as catalog-payment-gate.test.ts:
     // verifiedMode:false ⇒ no methods.stellar block, payment_status
