@@ -177,6 +177,12 @@ PARTNER_ENDPOINT_ENABLED = "true"
 #                                  outstanding challenges.
 # REFUND_EXECUTOR_TOKEN          — dedicated bearer token for the pull-only
 #                                  refund executor admin endpoints.
+# MERCURYDATA_MAINNET_JWT        — Mercury (Stellar indexer, xycloo Labs) scoped
+#                                  read token. Injected as Authorization: Bearer
+#                                  on the mercury::GET routes (route.upstreamAuth,
+#                                  proxy.ts). Never logged. See
+#                                  ainative todos/20260811-mercury-mpp-router-
+#                                  integration-design.md.
 #
 # Note: STELLAR_ROUTER_SECRET is NOT stored anywhere in the app.
 # The Router pool private key is managed offline by the operator.

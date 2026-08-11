@@ -126,14 +126,20 @@ describe('GET routes — build', () => {
     // evidence in its verifiedNote. Note tempo_rpc returned 202 again and was
     // deliberately NOT re-listed: its documented failure begins with a 202 and
     // an async job id that never resolves, so a 202 alone is not delivery.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(444)
-    expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(0)
+    // 447 as of 2026-08-11: +3 mercury GET routes charge-verified with real
+    // paid mainnet calls (tx hashes in docs/verified-services.md); the 4th
+    // (events/by-ledger) stays delisted — upstream 500/slow on the paid attempt.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(447)
+    expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(3)
   })
 
-  it('explains in verifiedNote why each GET route is gated off', () => {
-    for (const r of getRoutes) {
-      expect(r.verifiedMode).toBe(false)
-      expect(r.verifiedNote).toMatch(/not been real-money verified/i)
+  it('explains in verifiedNote why each gated-off GET route is gated', () => {
+    for (const r of getRoutes.filter(r => r.verifiedMode === false)) {
+      expect(r.verifiedNote).toMatch(/not been real-money verified|DISABLED/i)
+    }
+    // verified GET routes must carry the paid-run evidence instead
+    for (const r of getRoutes.filter(r => r.verifiedMode !== false)) {
+      expect(r.verifiedNote).toMatch(/charge-verified/)
     }
   })
 })

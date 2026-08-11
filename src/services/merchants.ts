@@ -434,6 +434,95 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'ethereum-mainnet eth_blockNumber. Merchant-side, same pattern as alchemy. ' +
       'Re-verify when QuickNode upstream is fixed.',
   },
+  // ---------------------------------------------------------------
+  // Mercury (Stellar indexer, xycloo Labs) — MVP router-held-credential
+  // service (design: ainative todos/20260811-mercury-mpp-router-
+  // integration-design.md). Mercury is NOT an mpp.dev merchant: the
+  // router holds a scoped Mercury JWT (`MERCURYDATA_MAINNET_JWT`,
+  // injected via upstreamAuth) and issues its own fixed-price 402
+  // ($0.0005/call, matching Alchemy's data-API rate) instead of probing
+  // a merchant 402. Capped at 1,000 calls/day (rateLimit) to protect
+  // Federico's token — double wall on top of whatever cap he sets on the
+  // token itself. verifiedMode stays false until the first real paid
+  // call lands (see §2.5 of the design doc); flip to 'charge' + set
+  // chargeVerified/chargeVerifiedAt with the settling tx hash then.
+  // Token issued 2026-08-12, ~3-month validity — renew by ~2026-11-12 or
+  // this SERVICE_OVERLAY-style disable kicks in (kill switch promised to
+  // Federico: same-day delist via a verifiedMode:false flip here).
+  //
+  // Launch gate (P1 fix, codex review 2026-08-12): verifiedMode: false
+  // makes handleProxy's SECURITY GATE 403 the route unconditionally —
+  // but verifiedMode can only ever flip to a real value AFTER a
+  // successful paid call, so without an escape hatch this route could
+  // NEVER be verified. `launchGate: 'MERCURY_LAUNCH_MODE'` lets the
+  // operator flip the `MERCURY_LAUNCH_MODE` Worker var to `'verify'` to
+  // let exactly the operator's own first paid call through (route stays
+  // 403 for everyone else / unset var), do the real-money test, then
+  // unset the var again and flip verifiedMode to 'charge' — the route is
+  // never advertised as verified or opened to the public before that
+  // test happens. See proxy.ts SECURITY GATE.
+  // ---------------------------------------------------------------
+  'mercury::GET::/events/by-contract/{contract_id}': {
+    upstreamPath: '/rest/events/by-contract/{contract_id}',
+    id: 'mercury_events_by_contract',
+    publicPath: '/v1/services/mercury/events/by-contract',
+    upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
+    fixedPricing: { amountUsd: '0.0005' },
+    rateLimit: { perDay: 1000 },
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-11T16:48:00Z',
+    launchGate: 'MERCURY_LAUNCH_MODE',
+    verifiedNote:
+      'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
+      'Stellar tx 8b3a36f2b359328a37652b7f32e89e19b253487e9b28bc01a257161e1cf6b8c6 ' +
+      '(see docs/verified-services.md). $0.0005/call, 1,000/day cap, router-held credential.',
+  },
+  'mercury::GET::/events/by-ledger': {
+    upstreamPath: '/rest/events/by-ledger',
+    id: 'mercury_events_by_ledger',
+    publicPath: '/v1/services/mercury/events/by-ledger',
+    upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
+    fixedPricing: { amountUsd: '0.0005' },
+    rateLimit: { perDay: 1000 },
+    verifiedMode: false,
+    launchGate: 'MERCURY_LAUNCH_MODE',
+    verifiedNote:
+      'DISABLED: Mercury mainnet /rest/events/by-ledger observed slow (40s+) and 500 on ' +
+      '2026-08-11 paid verify attempt; filed with provider. Other 3 mercury routes are charge-verified.',
+  },
+  'mercury::GET::/txs/by-contract/{contract_id}': {
+    upstreamPath: '/rest/txs/by-contract/{contract_id}',
+    id: 'mercury_txs_by_contract',
+    publicPath: '/v1/services/mercury/txs/by-contract',
+    upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
+    fixedPricing: { amountUsd: '0.0005' },
+    rateLimit: { perDay: 1000 },
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-11T16:48:00Z',
+    launchGate: 'MERCURY_LAUNCH_MODE',
+    verifiedNote:
+      'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
+      'Stellar tx c82da0fc01501df246df43e5cbfb85d60bc5d9dd7df31a95addeb59af95f4b98 ' +
+      '(see docs/verified-services.md). $0.0005/call, 1,000/day cap, router-held credential.',
+  },
+  'mercury::GET::/txs/by-hash/{tx_hash}': {
+    upstreamPath: '/rest/txs/by-hash/{tx_hash}',
+    id: 'mercury_txs_by_hash',
+    publicPath: '/v1/services/mercury/txs/by-hash',
+    upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
+    fixedPricing: { amountUsd: '0.0005' },
+    rateLimit: { perDay: 1000 },
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-11T16:48:00Z',
+    launchGate: 'MERCURY_LAUNCH_MODE',
+    verifiedNote:
+      'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
+      'Stellar tx 871099bf7ed2f36605ed568aa927d811d43893afc70863fb8a3fdf4279c07cdb ' +
+      '(see docs/verified-services.md). $0.0005/call, 1,000/day cap, router-held credential.',
+  },
   // Object Storage Upload — actually charge mode for multipart-init
   'storage::/{key}': {
     id: 'storage_upload',

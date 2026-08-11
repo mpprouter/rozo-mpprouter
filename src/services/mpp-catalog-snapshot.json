@@ -932,7 +932,7 @@
             "decimals": 6,
             "description": "Fetch results of a completed query",
             "dynamic": true,
-            "amountHint": "$0.01 – $2.00"
+            "amountHint": "$0.01 \u2013 $2.00"
           }
         }
       ]
@@ -1133,7 +1133,7 @@
       "name": "Build With Locus",
       "url": "https://mpp.buildwithlocus.com",
       "serviceUrl": "https://mpp.buildwithlocus.com",
-      "description": "Deploy containerized services, Postgres, Redis, and custom domains on demand — all via REST API. Pay-per-use credit billing.",
+      "description": "Deploy containerized services, Postgres, Redis, and custom domains on demand \u2014 all via REST API. Pay-per-use credit billing.",
       "categories": [
         "compute"
       ],
@@ -1172,13 +1172,13 @@
         {
           "method": "POST",
           "path": "/v1/auth/mpp-sign-up",
-          "description": "Bootstrap workspace — returns JWT and workspace ID (free)",
+          "description": "Bootstrap workspace \u2014 returns JWT and workspace ID (free)",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "Bootstrap workspace — returns JWT and workspace ID (free)",
+            "description": "Bootstrap workspace \u2014 returns JWT and workspace ID (free)",
             "amount": "0",
             "unitType": "request"
           }
@@ -1200,7 +1200,7 @@
             "decimals": 6,
             "description": "Add credits to workspace via MPP payment",
             "dynamic": true,
-            "amountHint": "$1–$100"
+            "amountHint": "$1\u2013$100"
           }
         },
         {
@@ -1557,13 +1557,13 @@
         {
           "method": "POST",
           "path": "/register",
-          "description": "Register a domain — price varies by TLD and domain name",
+          "description": "Register a domain \u2014 price varies by TLD and domain name",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "Register a domain — price varies by TLD and domain name",
+            "description": "Register a domain \u2014 price varies by TLD and domain name",
             "dynamic": true,
             "amountHint": "Varies by TLD"
           }
@@ -2498,7 +2498,7 @@
       "name": "molty.cash",
       "url": "https://api.molty.cash",
       "serviceUrl": "https://api.molty.cash",
-      "description": "USDC payment infrastructure for AI agents and humans. Send tips, hire people for tasks, and create/earn from gigs — all settled on-chain via x402 (Base, Solana, World Chain) and MPP (Tempo, Stellar, Monad).",
+      "description": "USDC payment infrastructure for AI agents and humans. Send tips, hire people for tasks, and create/earn from gigs \u2014 all settled on-chain via x402 (Base, Solana, World Chain) and MPP (Tempo, Stellar, Monad).",
       "icon": "https://molty.cash/logo.svg",
       "categories": [
         "ai",
@@ -2539,15 +2539,15 @@
         {
           "method": "POST",
           "path": "/a2a",
-          "description": "Create pay-per-post gigs — fund tasks for humans to complete on X",
+          "description": "Create pay-per-post gigs \u2014 fund tasks for humans to complete on X",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "Create pay-per-post gigs — fund tasks for humans to complete on X",
+            "description": "Create pay-per-post gigs \u2014 fund tasks for humans to complete on X",
             "dynamic": true,
-            "amountHint": "$0.10 – $50.00"
+            "amountHint": "$0.10 \u2013 $50.00"
           }
         },
         {
@@ -3551,7 +3551,7 @@
             "decimals": 6,
             "description": "Multi-hop web research task - price varies by processor",
             "dynamic": true,
-            "amountHint": "$0.10 – $0.30"
+            "amountHint": "$0.10 \u2013 $0.30"
           }
         }
       ]
@@ -3935,7 +3935,7 @@
       "name": "Pinata IPFS",
       "url": "https://pinata.cloud",
       "serviceUrl": "https://mpp.pinata.cloud",
-      "description": "Paid Pinata IPFS storage — upload and download public files via MPP.",
+      "description": "Paid Pinata IPFS storage \u2014 upload and download public files via MPP.",
       "categories": [
         "storage"
       ],
@@ -3972,13 +3972,13 @@
         {
           "method": "POST",
           "path": "/v1/pin/public",
-          "description": "Upload file to IPFS — dynamic pricing based on file size ($0.10/GB/month, min $0.01)",
+          "description": "Upload file to IPFS \u2014 dynamic pricing based on file size ($0.10/GB/month, min $0.01)",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "Upload file to IPFS — dynamic pricing based on file size ($0.10/GB/month, min $0.01)",
+            "description": "Upload file to IPFS \u2014 dynamic pricing based on file size ($0.10/GB/month, min $0.01)",
             "dynamic": true,
             "amountHint": "$0.01+"
           },
@@ -3987,13 +3987,13 @@
         {
           "method": "GET",
           "path": "/v1/pin/public/:cid",
-          "description": "Download file from IPFS — $0.01 per request",
+          "description": "Download file from IPFS \u2014 $0.01 per request",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "Download file from IPFS — $0.01 per request",
+            "description": "Download file from IPFS \u2014 $0.01 per request",
             "amount": "10000",
             "unitType": "request"
           },
@@ -4006,7 +4006,7 @@
       "name": "StableEmail",
       "url": "https://stableemail.dev",
       "serviceUrl": "https://stableemail.dev",
-      "description": "Pay-per-send email delivery, forwarding inboxes, and custom subdomains — no API keys or accounts.",
+      "description": "Pay-per-send email delivery, forwarding inboxes, and custom subdomains \u2014 no API keys or accounts.",
       "categories": [
         "social"
       ],
@@ -4281,7 +4281,7 @@
       "name": "StableEnrich",
       "url": "https://stableenrich.dev",
       "serviceUrl": "https://stableenrich.dev",
-      "description": "Pay-per-request research APIs — people, companies, web search, scraping, places, social media, and contact enrichment.",
+      "description": "Pay-per-request research APIs \u2014 people, companies, web search, scraping, places, social media, and contact enrichment.",
       "categories": [
         "data",
         "search",
@@ -4677,7 +4677,7 @@
       "name": "StableTravel",
       "url": "https://stabletravel.dev",
       "serviceUrl": "https://stabletravel.dev",
-      "description": "Pay-per-request travel APIs — flights, hotels, activities, transfers, and real-time flight tracking. Powered by Amadeus and FlightAware.",
+      "description": "Pay-per-request travel APIs \u2014 flights, hotels, activities, transfers, and real-time flight tracking. Powered by Amadeus and FlightAware.",
       "categories": [
         "data",
         "web"
@@ -5604,7 +5604,7 @@
       "name": "StablePhone",
       "url": "https://stablephone.dev",
       "serviceUrl": "https://stablephone.dev",
-      "description": "AI phone calls, dedicated phone numbers, and iMessage/FaceTime lookup — pay per request.",
+      "description": "AI phone calls, dedicated phone numbers, and iMessage/FaceTime lookup \u2014 pay per request.",
       "categories": [
         "ai",
         "social"
@@ -6231,7 +6231,7 @@
       "name": "StableStudio",
       "url": "https://stablestudio.dev",
       "serviceUrl": "https://stablestudio.dev",
-      "description": "Pay-per-generation AI image and video creation — Nano Banana, GPT Image, Grok, Flux, Sora, Veo, Seedance, and Wan.",
+      "description": "Pay-per-generation AI image and video creation \u2014 Nano Banana, GPT Image, Grok, Flux, Sora, Veo, Seedance, and Wan.",
       "categories": [
         "ai",
         "media"
@@ -6614,7 +6614,7 @@
       "name": "StableUpload",
       "url": "https://stableupload.dev",
       "serviceUrl": "https://stableupload.dev",
-      "description": "Pay-per-upload file hosting and static site hosting with custom domains — 6 month TTL.",
+      "description": "Pay-per-upload file hosting and static site hosting with custom domains \u2014 6 month TTL.",
       "categories": [
         "storage"
       ],
@@ -6889,7 +6889,7 @@
       "name": "Code Storage",
       "url": "https://code.storage",
       "serviceUrl": "https://codestorage.mpp.tempo.xyz",
-      "description": "Paid Git repository creation — create repos and get authenticated clone URLs.",
+      "description": "Paid Git repository creation \u2014 create repos and get authenticated clone URLs.",
       "categories": [
         "storage"
       ],
@@ -7363,7 +7363,7 @@
       "name": "SpyFu",
       "url": "https://api.spyfu.com",
       "serviceUrl": "https://spyfu.mpp.tempo.xyz",
-      "description": "Competitor keyword research — SEO rankings, PPC ads, ad history, and domain analytics. 18+ years of historical data.",
+      "description": "Competitor keyword research \u2014 SEO rankings, PPC ads, ad history, and domain analytics. 18+ years of historical data.",
       "categories": [
         "data",
         "search"
@@ -7521,7 +7521,7 @@
       "name": "SerpApi",
       "url": "https://serpapi.com",
       "serviceUrl": "https://serpapi.mpp.tempo.xyz",
-      "description": "Google Flights search — real-time prices, schedules, and booking options.",
+      "description": "Google Flights search \u2014 real-time prices, schedules, and booking options.",
       "categories": [
         "search",
         "data"
@@ -7570,7 +7570,7 @@
       "name": "Google Maps",
       "url": "https://maps.googleapis.com",
       "serviceUrl": "https://googlemaps.mpp.tempo.xyz",
-      "description": "Google Maps Platform — geocoding, directions, places, routes, tiles, weather, air quality, and more.",
+      "description": "Google Maps Platform \u2014 geocoding, directions, places, routes, tiles, weather, air quality, and more.",
       "categories": [
         "data"
       ],
@@ -8151,7 +8151,7 @@
       "name": "KicksDB",
       "url": "https://api.kicks.dev",
       "serviceUrl": "https://kicksdb.mpp.tempo.xyz",
-      "description": "Sneaker & streetwear market data — prices, sales history, and availability from StockX, GOAT, and more.",
+      "description": "Sneaker & streetwear market data \u2014 prices, sales history, and availability from StockX, GOAT, and more.",
       "categories": [
         "data"
       ],
@@ -8569,7 +8569,7 @@
       "name": "2Captcha",
       "url": "https://api.2captcha.com",
       "serviceUrl": "https://twocaptcha.mpp.tempo.xyz",
-      "description": "CAPTCHA solving API — reCAPTCHA, Turnstile, hCaptcha, image captchas, and more.",
+      "description": "CAPTCHA solving API \u2014 reCAPTCHA, Turnstile, hCaptcha, image captchas, and more.",
       "categories": [
         "web"
       ],
@@ -8699,7 +8699,7 @@
       "name": "Prospect Butcher",
       "url": "https://agents.prospectbutcher.shop",
       "serviceUrl": "https://agents.prospectbutcher.shop",
-      "description": "Order sandwiches for pickup in Brooklyn — the first food purchase made entirely by an AI agent.",
+      "description": "Order sandwiches for pickup in Brooklyn \u2014 the first food purchase made entirely by an AI agent.",
       "categories": [
         "web"
       ],
@@ -8908,7 +8908,7 @@
       "name": "Alpha Vantage",
       "url": "https://www.alphavantage.co",
       "serviceUrl": "https://alphavantage.mpp.paywithlocus.com",
-      "description": "Financial market data — stock prices, forex, crypto, commodities, economic indicators, technical analysis, and news sentiment.",
+      "description": "Financial market data \u2014 stock prices, forex, crypto, commodities, economic indicators, technical analysis, and news sentiment.",
       "categories": [
         "data"
       ],
@@ -9521,15 +9521,15 @@
         {
           "method": "POST",
           "path": "/agents/:id/run",
-          "description": "Execute an agent — price varies by agent and token usage",
+          "description": "Execute an agent \u2014 price varies by agent and token usage",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "Execute an agent — price varies by agent and token usage",
+            "description": "Execute an agent \u2014 price varies by agent and token usage",
             "dynamic": true,
-            "amountHint": "$0.0006 – $0.075 per 1k tokens"
+            "amountHint": "$0.0006 \u2013 $0.075 per 1k tokens"
           }
         }
       ]
@@ -9597,7 +9597,7 @@
       "name": "Brave Search",
       "url": "https://brave.com/search",
       "serviceUrl": "https://brave.mpp.paywithlocus.com",
-      "description": "Independent web search — web, news, images, videos, AI answers, and LLM context. Privacy-first search from a large independent index.",
+      "description": "Independent web search \u2014 web, news, images, videos, AI answers, and LLM context. Privacy-first search from a large independent index.",
       "categories": [
         "search"
       ],
@@ -9721,7 +9721,7 @@
       "name": "BuiltWith",
       "url": "https://builtwith.com",
       "serviceUrl": "https://builtwith.mpp.paywithlocus.com",
-      "description": "Technology profiling for websites — detect tech stacks, find sites using specific technologies, discover domain relationships, trends, and competitive intelligence across 100M+ websites.",
+      "description": "Technology profiling for websites \u2014 detect tech stacks, find sites using specific technologies, discover domain relationships, trends, and competitive intelligence across 100M+ websites.",
       "categories": [
         "data"
       ],
@@ -10122,7 +10122,7 @@
       "name": "CoinGecko",
       "url": "https://www.coingecko.com",
       "serviceUrl": "https://coingecko.mpp.paywithlocus.com",
-      "description": "Cryptocurrency market data — prices, charts, market cap, exchanges, trending coins, global stats, NFTs, derivatives, and on-chain data.",
+      "description": "Cryptocurrency market data \u2014 prices, charts, market cap, exchanges, trending coins, global stats, NFTs, derivatives, and on-chain data.",
       "categories": [
         "data"
       ],
@@ -10424,7 +10424,7 @@
       "name": "Deepgram",
       "url": "https://deepgram.com",
       "serviceUrl": "https://deepgram.mpp.paywithlocus.com",
-      "description": "Industry-leading speech AI — transcribe audio from URLs with Nova-3, generate natural speech with Aura-2 TTS, and analyze text for sentiment, topics, intents, and summaries.",
+      "description": "Industry-leading speech AI \u2014 transcribe audio from URLs with Nova-3, generate natural speech with Aura-2 TTS, and analyze text for sentiment, topics, intents, and summaries.",
       "categories": [
         "data"
       ],
@@ -10520,7 +10520,7 @@
       "name": "DeepL",
       "url": "https://www.deepl.com",
       "serviceUrl": "https://deepl.mpp.paywithlocus.com",
-      "description": "Professional translation and text improvement — translate text between 30+ languages with industry-leading quality, or improve and rephrase text with DeepL Write.",
+      "description": "Professional translation and text improvement \u2014 translate text between 30+ languages with industry-leading quality, or improve and rephrase text with DeepL Write.",
       "categories": [
         "data"
       ],
@@ -10601,7 +10601,7 @@
       "name": "DeepSeek",
       "url": "https://deepseek.com",
       "serviceUrl": "https://deepseek.mpp.paywithlocus.com",
-      "description": "Frontier AI models — DeepSeek-V3 for fast chat and code, DeepSeek-R1 for deep chain-of-thought reasoning. OpenAI-compatible API format. Among the most capable and cost-efficient models available.",
+      "description": "Frontier AI models \u2014 DeepSeek-V3 for fast chat and code, DeepSeek-R1 for deep chain-of-thought reasoning. OpenAI-compatible API format. Among the most capable and cost-efficient models available.",
       "categories": [
         "ai"
       ],
@@ -10645,7 +10645,7 @@
             "decimals": 6,
             "description": "Chat",
             "dynamic": true,
-            "amountHint": "Model + token dependent (~$0.004–$0.025)"
+            "amountHint": "Model + token dependent (~$0.004\u2013$0.025)"
           }
         },
         {
@@ -10659,7 +10659,7 @@
             "decimals": 6,
             "description": "Fill-In-the-Middle (FIM)",
             "dynamic": true,
-            "amountHint": "Token dependent (~$0.003–$0.005)"
+            "amountHint": "Token dependent (~$0.003\u2013$0.005)"
           }
         },
         {
@@ -10683,7 +10683,7 @@
       "name": "Diffbot",
       "url": "https://www.diffbot.com",
       "serviceUrl": "https://diffbot.mpp.paywithlocus.com",
-      "description": "Web data extraction — articles, products, discussions, images, videos, and auto-detect.",
+      "description": "Web data extraction \u2014 articles, products, discussions, images, videos, and auto-detect.",
       "categories": [
         "web",
         "data"
@@ -10849,7 +10849,7 @@
       "name": "Diffbot KG",
       "url": "https://www.diffbot.com",
       "serviceUrl": "https://diffbot-kg.mpp.paywithlocus.com",
-      "description": "Knowledge Graph — search 10B+ entities and enrich company/person records.",
+      "description": "Knowledge Graph \u2014 search 10B+ entities and enrich company/person records.",
       "categories": [
         "data"
       ],
@@ -10892,7 +10892,7 @@
             "decimals": 6,
             "description": "Search (DQL)",
             "dynamic": true,
-            "amountHint": "$0.03–$1.50 (25 credits/entity)"
+            "amountHint": "$0.03\u2013$1.50 (25 credits/entity)"
           }
         },
         {
@@ -10916,7 +10916,7 @@
       "name": "Diffbot NL",
       "url": "https://www.diffbot.com",
       "serviceUrl": "https://diffbot-nl.mpp.paywithlocus.com",
-      "description": "Natural language processing — NER, sentiment, facts, summarization.",
+      "description": "Natural language processing \u2014 NER, sentiment, facts, summarization.",
       "categories": [
         "ai"
       ],
@@ -10969,7 +10969,7 @@
       "name": "EDGAR (SEC)",
       "url": "https://www.sec.gov/developer",
       "serviceUrl": "https://edgar.mpp.paywithlocus.com",
-      "description": "SEC EDGAR public financial data — company filing history, XBRL financial facts (income statements, balance sheets, cash flows), and full-text search across all public filings. No API key required.",
+      "description": "SEC EDGAR public financial data \u2014 company filing history, XBRL financial facts (income statements, balance sheets, cash flows), and full-text search across all public filings. No API key required.",
       "categories": [
         "data"
       ],
@@ -11050,7 +11050,7 @@
       "name": "EDGAR Full-Text Search",
       "url": "https://efts.sec.gov",
       "serviceUrl": "https://edgar-search.mpp.paywithlocus.com",
-      "description": "Full-text search across all SEC filings — 10-Ks, 10-Qs, 8-Ks, proxy statements, and more. Search by keyword, company name, form type, and date range.",
+      "description": "Full-text search across all SEC filings \u2014 10-Ks, 10-Qs, 8-Ks, proxy statements, and more. Search by keyword, company name, form type, and date range.",
       "categories": [
         "data"
       ],
@@ -11234,7 +11234,7 @@
       "name": "Grok",
       "url": "https://x.ai",
       "serviceUrl": "https://grok.mpp.paywithlocus.com",
-      "description": "xAI models — chat, web/X search, code execution, image generation/editing, and text-to-speech.",
+      "description": "xAI models \u2014 chat, web/X search, code execution, image generation/editing, and text-to-speech.",
       "categories": [
         "ai"
       ],
@@ -11279,7 +11279,7 @@
             "decimals": 6,
             "description": "Chat Completions",
             "dynamic": true,
-            "amountHint": "Model-dependent (~$0.001–$0.02)"
+            "amountHint": "Model-dependent (~$0.001\u2013$0.02)"
           }
         },
         {
@@ -11293,7 +11293,7 @@
             "decimals": 6,
             "description": "Image Generation",
             "dynamic": true,
-            "amountHint": "$0.02–$0.08 per image"
+            "amountHint": "$0.02\u2013$0.08 per image"
           }
         },
         {
@@ -11307,7 +11307,7 @@
             "decimals": 6,
             "description": "Image Editing",
             "dynamic": true,
-            "amountHint": "$0.02–$0.08 per image"
+            "amountHint": "$0.02\u2013$0.08 per image"
           }
         },
         {
@@ -11321,7 +11321,7 @@
             "decimals": 6,
             "description": "Chat with Web Search",
             "dynamic": true,
-            "amountHint": "Dynamic (~$0.01–$0.50)"
+            "amountHint": "Dynamic (~$0.01\u2013$0.50)"
           }
         },
         {
@@ -11335,7 +11335,7 @@
             "decimals": 6,
             "description": "Chat with X Search",
             "dynamic": true,
-            "amountHint": "Dynamic (~$0.01–$0.50)"
+            "amountHint": "Dynamic (~$0.01\u2013$0.50)"
           }
         },
         {
@@ -11349,7 +11349,7 @@
             "decimals": 6,
             "description": "Chat with Code Execution",
             "dynamic": true,
-            "amountHint": "Dynamic (~$0.01–$0.50)"
+            "amountHint": "Dynamic (~$0.01\u2013$0.50)"
           }
         },
         {
@@ -11373,7 +11373,7 @@
       "name": "Groq",
       "url": "https://groq.com",
       "serviceUrl": "https://groq.mpp.paywithlocus.com",
-      "description": "Ultra-fast LLM inference — Llama 3.3, DeepSeek R1, Gemma 2, GPT-OSS, Qwen, Whisper, and PlayAI TTS. OpenAI-compatible API with industry-leading speed.",
+      "description": "Ultra-fast LLM inference \u2014 Llama 3.3, DeepSeek R1, Gemma 2, GPT-OSS, Qwen, Whisper, and PlayAI TTS. OpenAI-compatible API with industry-leading speed.",
       "categories": [
         "ai"
       ],
@@ -11417,7 +11417,7 @@
             "decimals": 6,
             "description": "Chat Completion",
             "dynamic": true,
-            "amountHint": "$0.005 – $0.10 (varies by model and tokens)"
+            "amountHint": "$0.005 \u2013 $0.10 (varies by model and tokens)"
           }
         },
         {
@@ -11749,7 +11749,7 @@
       "name": "IPinfo",
       "url": "https://ipinfo.io",
       "serviceUrl": "https://ipinfo.mpp.paywithlocus.com",
-      "description": "IP intelligence — geolocation, ASN, privacy detection, carrier data, and hosting identification.",
+      "description": "IP intelligence \u2014 geolocation, ASN, privacy detection, carrier data, and hosting identification.",
       "categories": [
         "data"
       ],
@@ -11816,7 +11816,7 @@
       "name": "Judge0",
       "url": "https://judge0.com",
       "serviceUrl": "https://judge0.mpp.paywithlocus.com",
-      "description": "Online code execution — run source code in 60+ programming languages with sandboxed isolation.",
+      "description": "Online code execution \u2014 run source code in 60+ programming languages with sandboxed isolation.",
       "categories": [
         "compute"
       ],
@@ -11924,7 +11924,7 @@
       "name": "Mapbox",
       "url": "https://www.mapbox.com",
       "serviceUrl": "https://mapbox.mpp.paywithlocus.com",
-      "description": "Location and mapping APIs — geocoding, directions, isochrones, matrix routing, map matching, static maps, and spatial queries.",
+      "description": "Location and mapping APIs \u2014 geocoding, directions, isochrones, matrix routing, map matching, static maps, and spatial queries.",
       "categories": [
         "data"
       ],
@@ -12076,7 +12076,7 @@
       "name": "Mathpix",
       "url": "https://mathpix.com",
       "serviceUrl": "https://mathpix.mpp.paywithlocus.com",
-      "description": "OCR for math, science, and documents — extract LaTeX, MathML, and Mathpix Markdown from images and handwriting.",
+      "description": "OCR for math, science, and documents \u2014 extract LaTeX, MathML, and Mathpix Markdown from images and handwriting.",
       "categories": [
         "ai"
       ],
@@ -12144,7 +12144,7 @@
       "name": "Mistral AI",
       "url": "https://mistral.ai",
       "serviceUrl": "https://mistral.mpp.paywithlocus.com",
-      "description": "Premier and open-source LLMs — Mistral Large, Medium, Small, Codestral, Magistral reasoning, Pixtral vision, text embeddings, and content moderation.",
+      "description": "Premier and open-source LLMs \u2014 Mistral Large, Medium, Small, Codestral, Magistral reasoning, Pixtral vision, text embeddings, and content moderation.",
       "categories": [
         "ai"
       ],
@@ -12188,7 +12188,7 @@
             "decimals": 6,
             "description": "Chat Completion",
             "dynamic": true,
-            "amountHint": "$0.005 – $0.10 (varies by model and tokens)"
+            "amountHint": "$0.005 \u2013 $0.10 (varies by model and tokens)"
           }
         },
         {
@@ -12240,7 +12240,7 @@
       "name": "OpenWeather",
       "url": "https://openweathermap.org",
       "serviceUrl": "https://openweather.mpp.paywithlocus.com",
-      "description": "Global weather data — current conditions, 5-day forecasts, hourly forecasts, air quality index with pollutants, geocoding, and One Call 3.0 with full weather suite and government alerts.",
+      "description": "Global weather data \u2014 current conditions, 5-day forecasts, hourly forecasts, air quality index with pollutants, geocoding, and One Call 3.0 with full weather suite and government alerts.",
       "categories": [
         "data"
       ],
@@ -12345,13 +12345,13 @@
         {
           "method": "POST",
           "path": "/openweather/onecall",
-          "description": "One Call — Full Forecast",
+          "description": "One Call \u2014 Full Forecast",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "One Call — Full Forecast",
+            "description": "One Call \u2014 Full Forecast",
             "amount": "10000",
             "unitType": "request"
           }
@@ -12377,7 +12377,7 @@
       "name": "Perplexity",
       "url": "https://perplexity.ai",
       "serviceUrl": "https://perplexity.mpp.paywithlocus.com",
-      "description": "AI-powered search — Sonar chat with real-time web grounding, web search, and embeddings.",
+      "description": "AI-powered search \u2014 Sonar chat with real-time web grounding, web search, and embeddings.",
       "categories": [
         "ai",
         "search"
@@ -12421,7 +12421,7 @@
             "decimals": 6,
             "description": "Sonar Chat",
             "dynamic": true,
-            "amountHint": "Model-dependent (~$0.005–$0.02)"
+            "amountHint": "Model-dependent (~$0.005\u2013$0.02)"
           }
         },
         {
@@ -12525,7 +12525,7 @@
       "name": "RentCast",
       "url": "https://rentcast.io",
       "serviceUrl": "https://rentcast.mpp.paywithlocus.com",
-      "description": "US real estate intelligence — property records, AVM valuations, rent estimates, sale/rental listings, and market statistics.",
+      "description": "US real estate intelligence \u2014 property records, AVM valuations, rent estimates, sale/rental listings, and market statistics.",
       "categories": [
         "data"
       ],
@@ -12704,7 +12704,7 @@
       "name": "Replicate",
       "url": "https://replicate.com",
       "serviceUrl": "https://replicate.mpp.paywithlocus.com",
-      "description": "Run thousands of open-source AI models via API — image generation, language models, speech recognition, video, and more. Pay only for what you use.",
+      "description": "Run thousands of open-source AI models via API \u2014 image generation, language models, speech recognition, video, and more. Pay only for what you use.",
       "categories": [
         "ai",
         "media"
@@ -12748,7 +12748,7 @@
             "decimals": 6,
             "description": "Run Model",
             "dynamic": true,
-            "amountHint": "Model-dependent ($0.005–$0.05)"
+            "amountHint": "Model-dependent ($0.005\u2013$0.05)"
           }
         },
         {
@@ -12800,7 +12800,7 @@
       "name": "ScreenshotOne",
       "url": "https://screenshotone.com",
       "serviceUrl": "https://screenshotone.mpp.paywithlocus.com",
-      "description": "Website screenshot API — capture any URL, HTML, or markdown as PNG, JPEG, WebP, or PDF. Full-page, element selection, dark mode, ad blocking, and more.",
+      "description": "Website screenshot API \u2014 capture any URL, HTML, or markdown as PNG, JPEG, WebP, or PDF. Full-page, element selection, dark mode, ad blocking, and more.",
       "categories": [
         "compute"
       ],
@@ -12852,7 +12852,7 @@
       "name": "Stability AI",
       "url": "https://stability.ai",
       "serviceUrl": "https://stability-ai.mpp.paywithlocus.com",
-      "description": "Generative AI platform for images, 3D models, and audio — text-to-image, editing, upscaling, and more.",
+      "description": "Generative AI platform for images, 3D models, and audio \u2014 text-to-image, editing, upscaling, and more.",
       "categories": [
         "ai",
         "media"
@@ -12924,7 +12924,7 @@
             "decimals": 6,
             "description": "Generate SD3",
             "dynamic": true,
-            "amountHint": "$0.029–$0.075 (model-dependent)"
+            "amountHint": "$0.029\u2013$0.075 (model-dependent)"
           }
         },
         {
@@ -13206,7 +13206,7 @@
       "name": "Suno",
       "url": "https://sunoapi.org",
       "serviceUrl": "https://suno.mpp.paywithlocus.com",
-      "description": "AI music generation — create full songs, generate lyrics, and build custom music tracks with state-of-the-art AI models. Supports custom styles, vocals, and instrumental modes.",
+      "description": "AI music generation \u2014 create full songs, generate lyrics, and build custom music tracks with state-of-the-art AI models. Supports custom styles, vocals, and instrumental modes.",
       "categories": [
         "ai",
         "media"
@@ -13758,7 +13758,7 @@
       "name": "Wolfram|Alpha",
       "url": "https://www.wolframalpha.com",
       "serviceUrl": "https://wolframalpha.mpp.paywithlocus.com",
-      "description": "Computational knowledge engine — math, science, geography, history, nutrition, finance, and more. Get answers as text, spoken audio, LLM-optimized data, or full structured results.",
+      "description": "Computational knowledge engine \u2014 math, science, geography, history, nutrition, finance, and more. Get answers as text, spoken audio, LLM-optimized data, or full structured results.",
       "categories": [
         "data"
       ],
@@ -13966,6 +13966,83 @@
             "description": "Write and send an agent-penned postcard",
             "dynamic": true,
             "amountHint": "$1 digital, $3 physical"
+          }
+        }
+      ]
+    },
+    {
+      "id": "mercury",
+      "name": "Mercury",
+      "serviceUrl": "https://mainnet.mercurydata.app/rest",
+      "url": "https://www.mercurydata.app/",
+      "description": "Stellar indexer by xycloo Labs. Full-history Soroban contract events and transactions with ledger-range and topic filters \u2014 beyond Horizon (no contract events) and Stellar RPC (~7-day window).",
+      "categories": [
+        "blockchain",
+        "stellar",
+        "indexer"
+      ],
+      "status": "active",
+      "docs": {
+        "homepage": "https://docs.mercurydata.app/"
+      },
+      "methods": {
+        "tempo": {
+          "intents": [
+            "charge"
+          ]
+        }
+      },
+      "endpoints": [
+        {
+          "method": "GET",
+          "path": "/events/by-contract/:contract_id",
+          "description": "Contract events, full history (ledger range + topic filters)",
+          "payment": {
+            "intent": "charge",
+            "method": "tempo",
+            "currency": "usd",
+            "decimals": 6,
+            "amount": "500",
+            "description": "Contract events, full history (ledger range + topic filters) - $0.0005 per call"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/events/by-ledger",
+          "description": "Events across a ledger range (from/to)",
+          "payment": {
+            "intent": "charge",
+            "method": "tempo",
+            "currency": "usd",
+            "decimals": 6,
+            "amount": "500",
+            "description": "Events across a ledger range (from/to) - $0.0005 per call"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/txs/by-contract/:contract_id",
+          "description": "Soroban transactions for a contract",
+          "payment": {
+            "intent": "charge",
+            "method": "tempo",
+            "currency": "usd",
+            "decimals": 6,
+            "amount": "500",
+            "description": "Soroban transactions for a contract - $0.0005 per call"
+          }
+        },
+        {
+          "method": "GET",
+          "path": "/txs/by-hash/:tx_hash",
+          "description": "Transaction lookup by hash (beyond RPC retention)",
+          "payment": {
+            "intent": "charge",
+            "method": "tempo",
+            "currency": "usd",
+            "decimals": 6,
+            "amount": "500",
+            "description": "Transaction lookup by hash (beyond RPC retention) - $0.0005 per call"
           }
         }
       ]

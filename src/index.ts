@@ -157,6 +157,26 @@ export interface Env {
   // Set via: wrangler secret put ROZO_WEBHOOK_SECRET
   ROZO_WEBHOOK_SECRET: string
 
+  // Mercury (Stellar indexer, xycloo Labs) — router-held scoped JWT
+  // injected as `Authorization: Bearer <token>` on the 4 mercury::GET
+  // routes via `route.upstreamAuth` (see src/routes/proxy.ts). Never
+  // logged. Mainnet is REQUIRED in production for the mercury routes to
+  // work (payment still succeeds without it — the credential injection
+  // just no-ops and the upstream call 401s, same fail-open-on-agent-
+  // payment risk as any other pay-then-fail merchant). Set via:
+  // wrangler secret put MERCURYDATA_MAINNET_JWT
+  MERCURYDATA_MAINNET_JWT?: string
+  // Dev-only counterpart against testnet.mercurydata.app. Not read by any
+  // production code path — used only by local smoke scripts.
+  MERCURYDATA_TESTNET_JWT?: string
+  // Launch gate for the Mercury MVP routes (P1 fix, codex review
+  // 2026-08-12). verifiedMode: false 403s these routes unconditionally —
+  // set this var to 'verify' to let the operator's own first real paid
+  // call through despite that, without advertising the route as verified.
+  // See `PublicServiceRoute.launchGate` / proxy.ts SECURITY GATE. Unset
+  // (default) → still 403 for everyone. Not a secret; plain var is fine.
+  MERCURY_LAUNCH_MODE?: string
+
   // Optional paid Base RPC (Alchemy / QuickNode / Infura) used as the
   // primary endpoint for funder balance checks. Falls back to public
   // Base RPCs on failure. CF Workers can't reach mainnet.base.org
