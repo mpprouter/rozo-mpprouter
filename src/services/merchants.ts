@@ -469,12 +469,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
     fixedPricing: { amountUsd: '0.0005' },
     rateLimit: { perDay: 1000 },
-    verifiedMode: false,
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-11T16:48:00Z',
     launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
-      'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
-      'been real-money verified end-to-end yet — first paid call pending. ' +
-      'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
+      'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
+      'Stellar tx 8b3a36f2b359328a37652b7f32e89e19b253487e9b28bc01a257161e1cf6b8c6 ' +
+      '(see docs/verified-services.md). $0.0005/call, 1,000/day cap, router-held credential.',
   },
   'mercury::GET::/events/by-ledger': {
     upstreamPath: '/rest/events/by-ledger',
@@ -486,9 +488,8 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: false,
     launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
-      'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
-      'been real-money verified end-to-end yet — first paid call pending. ' +
-      'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
+      'DISABLED: Mercury mainnet /rest/events/by-ledger observed slow (40s+) and 500 on ' +
+      '2026-08-11 paid verify attempt; filed with provider. Other 3 mercury routes are charge-verified.',
   },
   'mercury::GET::/txs/by-contract/{contract_id}': {
     upstreamPath: '/rest/txs/by-contract/{contract_id}',
@@ -497,12 +498,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
     fixedPricing: { amountUsd: '0.0005' },
     rateLimit: { perDay: 1000 },
-    verifiedMode: false,
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-11T16:48:00Z',
     launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
-      'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
-      'been real-money verified end-to-end yet — first paid call pending. ' +
-      'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
+      'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
+      'Stellar tx c82da0fc01501df246df43e5cbfb85d60bc5d9dd7df31a95addeb59af95f4b98 ' +
+      '(see docs/verified-services.md). $0.0005/call, 1,000/day cap, router-held credential.',
   },
   'mercury::GET::/txs/by-hash/{tx_hash}': {
     upstreamPath: '/rest/txs/by-hash/{tx_hash}',
@@ -511,12 +514,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
     fixedPricing: { amountUsd: '0.0005' },
     rateLimit: { perDay: 1000 },
-    verifiedMode: false,
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-11T16:48:00Z',
     launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
-      'Mercury MVP token (~3mo, issued 2026-08-12, renew by ~2026-11-12). Has not ' +
-      'been real-money verified end-to-end yet — first paid call pending. ' +
-      'Router-held credential (upstreamAuth), fixed $0.0005/call, 1,000 calls/day cap.',
+      'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
+      'Stellar tx 871099bf7ed2f36605ed568aa927d811d43893afc70863fb8a3fdf4279c07cdb ' +
+      '(see docs/verified-services.md). $0.0005/call, 1,000/day cap, router-held credential.',
   },
   // Object Storage Upload — actually charge mode for multipart-init
   'storage::/{key}': {

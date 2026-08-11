@@ -47,11 +47,16 @@ describe('Mercury catalog materialization', () => {
     }
   })
 
-  it('ships verifiedMode:false until the first real paid run (per design doc §2.4)', () => {
-    for (const id of MERCURY_ROUTE_IDS) {
+  const VERIFIED_IDS = ['mercury_events_by_contract', 'mercury_txs_by_contract', 'mercury_txs_by_hash']
+
+  it('3 routes are charge-verified (real paid runs 2026-08-11); by-ledger stays gated', () => {
+    for (const id of VERIFIED_IDS) {
       const route = PUBLIC_SERVICE_ROUTES.find(r => r.id === id)!
-      expect(route.verifiedMode).toBe(false)
+      expect(route.verifiedMode).toBe('charge')
+      expect(route.chargeVerified).toBe(true)
+      expect(route.verifiedNote).toMatch(/charge-verified 2026-08-11/)
     }
+    expect(PUBLIC_SERVICE_ROUTES.find(r => r.id === 'mercury_events_by_ledger')!.verifiedMode).toBe(false)
   })
 
   // P1 fix (codex review 2026-08-12): verifiedMode can only ever flip
@@ -67,13 +72,15 @@ describe('Mercury catalog materialization', () => {
     }
   })
 
-  it('the security gate therefore refuses payment on mercury routes until an operator flips verifiedMode', () => {
-    // Catalog honesty check, same invariant as catalog-payment-gate.test.ts:
-    // verifiedMode:false ⇒ no methods.stellar block, payment_status
-    // 'unavailable', payment_enabled false.
+  it('catalog honesty: verified routes payable, by-ledger unavailable', () => {
     const catalog = listPublicCatalog({ STELLAR_NETWORK: 'stellar:pubnet' })
-    for (const id of MERCURY_ROUTE_IDS) {
+    for (const id of VERIFIED_IDS) {
       const entry = catalog.find(e => e.id === id)!
+      expect(entry.payment_status).toBe('verified')
+      expect(entry.payment_enabled).toBe(true)
+    }
+    {
+      const entry = catalog.find(e => e.id === 'mercury_events_by_ledger')!
       expect(entry.payment_status).toBe('unavailable')
       expect(entry.payment_enabled).toBe(false)
       expect(entry.methods.stellar).toBeUndefined()
