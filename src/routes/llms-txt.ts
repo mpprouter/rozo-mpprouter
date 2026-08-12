@@ -161,6 +161,25 @@ Each entry in the catalog has:
   prices — merchants may re-price dynamically.
 - Do not hardcode upstream hostnames. Always call via public_path.
 
+## Add your service (providers)
+
+Want your API listed and payable here? Open an issue on GitHub or
+contact us — onboarding can be as small as handing us a scoped API
+key (we run the 402/payment layer for you) or as full as running your
+own MPP merchant endpoint.
+
+- Router source (open source, auditable):
+  https://github.com/mpprouter/rozo-mpprouter
+- Contact / listing requests:
+  https://github.com/mpprouter/rozo-mpprouter/issues
+
+Every listed route can be **verified**: we make a real paid call
+through the production chain (Stellar tx hash published in
+docs/verified-services.md) and re-check on a regular cadence — the
+blue verified badge and dates on https://www.mpprouter.dev/services
+come from those runs, not from self-reporting. Ask us to verify your
+routes after listing.
+
 ## Errors
 
 - 400 — unknown route
