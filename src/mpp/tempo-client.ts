@@ -460,11 +460,13 @@ export async function payMerchant(
       ? {
           onChallenge: async (challenge, { createCredential }) => {
             if (opts.maxAmountRaw) assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw)
-            // Signal BEFORE createCredential returns: from here on a payment
-            // credential exists for this request, so the money may have moved.
-            opts.onCredentialSigned?.()
             // No context: tempo.charge signs its default single-shot intent.
-            return createCredential()
+            const credential = await createCredential()
+            // Signal ONLY AFTER the credential actually exists. If
+            // createCredential throws, `paid` stays false and the caller
+            // releases — there is no "paid=true but nothing signed" window.
+            opts.onCredentialSigned?.()
+            return credential
           },
         }
       : {},
@@ -553,10 +555,8 @@ export async function payMerchantSession(
       if (opts.maxAmountRaw) {
         assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw)
       }
-      // Signal BEFORE the voucher is built: past this point a paid credential
-      // exists for THIS call. Call-local and signing-correlated, unlike the
-      // KV watermark.
-      opts.onCredentialSigned?.()
+      // Compute the new cumulative FIRST — if addRaw throws (malformed
+      // stored/delta amount) nothing was signed and `paid` must stay false.
       const newCumulativeRaw = addRaw(channel.cumulativeRaw, delta)
       // Manual-mode context: tell mppx "sign a voucher action on
       // channel X at the new cumulative".
@@ -572,12 +572,16 @@ export async function payMerchantSession(
       // entries opened with pre-0.7.0 mppx. The `legacySession` method
       // handles their challenges without requiring `descriptor`.
       // Including it when present is harmless; legacySession ignores it.
-      return createCredential({
+      const credential = await createCredential({
         action: 'voucher',
         channelId: channel.channelId,
         cumulativeAmountRaw: newCumulativeRaw,
         ...(channel.descriptor ? { descriptor: channel.descriptor } : {}),
       } as any)
+      // Signal ONLY AFTER the voucher credential actually exists. A throw in
+      // addRaw or createCredential leaves `paid` false → the caller releases.
+      opts.onCredentialSigned?.()
+      return credential
     },
     onChannelUpdate: async (entry: ChannelEntryLike) => {
       // mppx gives us the just-signed cumulative as a bigint.

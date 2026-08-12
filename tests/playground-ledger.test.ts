@@ -533,6 +533,15 @@ describe('solvency totals', () => {
     expect(parseAtomic(totals.value.outstanding)).toBe(parseUsd('1.98'))
 
     expect(totals.value.consumed_deposits).toHaveLength(2)
+
+    // Each consumed op carries its stored intent's binding fields so recon can
+    // verify the on-chain payment binds to the intent it was credited against,
+    // not merely that the aggregate sums happen to reconcile.
+    for (const dep of totals.value.consumed_deposits) {
+      expect([ALICE, BOB]).toContain(dep.account)
+      expect(dep.amount).toBe(parseUsd('1').toString())
+      expect(dep.memo).toMatch(/^pg-/)
+    }
   })
 })
 
@@ -813,5 +822,27 @@ describe('stale reserved-call reaper (P1)', () => {
         parseAtomic(totals.value.balances_sum) +
         parseAtomic(totals.value.holds_sum),
     )
+  })
+})
+
+describe('reaped settlements are surfaced for recon (accepted crash window)', () => {
+  it('reports reaped commits and releases in totals', async () => {
+    const mock = makePlaygroundLedgerMockWithControls()
+    const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
+    await deposit(env, { usd: '1' })
+
+    const stale = Date.now() - RESERVED_LEASE_MS - 1
+    // One dispatched (→ reaped commit) and one not (→ reaped release).
+    await reserve(env, { callId: 'r-commit', account: ALICE, chip: 'chat', maxPriceAtomic: parseUsd('0.02'), now: stale })
+    await markDispatched(env, 'r-commit')
+    await reserve(env, { callId: 'r-release', account: ALICE, chip: 'chat', maxPriceAtomic: parseUsd('0.02'), now: stale })
+    await mock.runAlarm()
+
+    const totals = await readTotals(env)
+    expect(totals.ok).toBe(true)
+    if (!totals.ok) return
+    expect(totals.value.reaped_committed_count).toBe(1)
+    expect(totals.value.reaped_committed_atomic).toBe(parseUsd('0.02').toString())
+    expect(totals.value.reaped_released_count).toBe(1)
   })
 })

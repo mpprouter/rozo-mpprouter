@@ -206,7 +206,17 @@ export interface LedgerTotals {
   outstanding: string
   balances_sum: string
   holds_sum: string
-  consumed_deposits: { tx_hash: string; op_index: number; intent_id: string }[]
+  reaped_committed_count: number
+  reaped_committed_atomic: string
+  reaped_released_count: number
+  consumed_deposits: {
+    tx_hash: string
+    op_index: number
+    intent_id: string
+    account: string | null
+    amount: string | null
+    memo: string | null
+  }[]
 }
 
 export function readTotals(env: Env): Promise<LedgerResult<LedgerTotals>> {

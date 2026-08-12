@@ -134,7 +134,33 @@ can tell the two cases apart:
 - **dispatched** → the reserve→dispatch window brackets the paid call, so it is
   **committed** at the hold ceiling.
 
-Either way the call is flagged `reaped: true` for support.
+Either way the call is flagged `reaped: true`. If the `dispatched` write itself
+fails, the call **aborts** and refunds the hold before any paid upstream call —
+we never run a paid call with an unpersisted marker.
+
+**Accepted crash window (bounded, recon-monitored).** A worker crash in the gap
+between marking `dispatched` and the actual upstream fetch, and the reaper's
+non-atomic multi-key settlement, are inherent to Worker+DO across awaits and are
+deliberately **not** made crash-atomic. They only fire on a mid-call worker
+termination, their exposure is bounded by a single call's price, and they are
+**not a silent drain**: a reaper-committed call charges a user for upstream
+spend recon cannot confirm on-chain, so `playground-recon.ts` surfaces every
+reaped commit as an explicit review line (count + total), and any invented
+credit shows up in the per-op deposit binding. Reserved/reaped anomalies are
+expected to be rare; treat a non-zero reaped-commit count as a "confirm against
+Tempo spend and issue goodwill credit" task, not an alarm.
+
+### Settlement is decided ONLY by the post-signing `paid` flag
+
+Commit-vs-release has a single source of truth: a call-local `paid` boolean set
+by an `onCredentialSigned` callback that fires **strictly after** the payment
+credential is created (after `createCredential` resolves for charge; after
+`addRaw` + `createCredential` for session). A throw at or before signing leaves
+`paid === false` → release. The exception *type* (budget exceeded, channel
+missing, network error) only picks the error code and HTTP status shown to the
+caller — it never overrides `paid`. So a budget breach on a *second* challenge
+after a *first* already signed commits (money moved), while a budget breach on
+the first challenge releases (nothing signed).
 
 Prices: chat `$0.02` (cheap tier) / `$0.10` (flagship), Blend activity `$0.03`,
 tx-decode `$0.005`. Deposits are `$0.10` or `$1.00` and are **non-refundable

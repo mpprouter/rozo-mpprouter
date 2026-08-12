@@ -197,6 +197,17 @@ export class PlaygroundLedger implements DurableObject {
    * support can find them and issue goodwill credit where the user genuinely
    * got nothing.
    */
+  // KNOWN CRASH WINDOW (accepted, recon-monitored): this reaper settles a call
+  // across several separate storage writes (call record, balance, the two
+  // totals) that are NOT one atomic transaction, and it acts on a `dispatched`
+  // marker that could have been set just before a mid-call worker crash. So a
+  // reaper decision can, in rare mid-call-termination cases, commit a call that
+  // never actually paid upstream (or vice versa). This is inherent to
+  // Worker+DO across awaits and is deliberately NOT made crash-atomic here.
+  // Exposure is bounded by a single call's price, and every such anomaly is
+  // detectable by scripts/admin/playground-recon.ts: a reaper-committed call
+  // with no matching on-chain deposit surfaces as a per-op binding mismatch,
+  // and the committed-total vs on-chain reconciliation flags the aggregate.
   async alarm(): Promise<void> {
     const now = Date.now()
     const calls = await this.storage.list<StoredCall>({ prefix: 'call:' })
@@ -828,7 +839,24 @@ export class PlaygroundLedger implements DurableObject {
       outstanding: string
       balances_sum: string
       holds_sum: string
-      consumed_deposits: { tx_hash: string; op_index: number; intent_id: string }[]
+      /**
+       * Calls the reaper settled (committed or released) rather than their own
+       * request. Surfaced separately because a reaper COMMIT charges the user
+       * for a call whose real upstream spend recon cannot see from on-chain
+       * deposit data — these are the review set for the accepted crash window.
+       */
+      reaped_committed_count: number
+      reaped_committed_atomic: string
+      reaped_released_count: number
+      consumed_deposits: {
+        tx_hash: string
+        op_index: number
+        intent_id: string
+        /** Binding fields from the stored intent, for per-op recon. */
+        account: string | null
+        amount: string | null
+        memo: string | null
+      }[]
     }>
   > {
     const balances = await this.storage.list<string>({ prefix: 'bal:' })
@@ -837,19 +865,41 @@ export class PlaygroundLedger implements DurableObject {
 
     const calls = await this.storage.list<StoredCall>({ prefix: 'call:' })
     let holdsSum = 0n
+    let reapedCommittedCount = 0
+    let reapedCommittedAtomic = 0n
+    let reapedReleasedCount = 0
     for (const c of calls.values()) {
       if (c.status === 'reserved') holdsSum += parseAtomic(c.max_price)
+      if (c.reaped && c.status === 'committed') {
+        reapedCommittedCount++
+        reapedCommittedAtomic += parseAtomic(c.charged)
+      }
+      if (c.reaped && c.status === 'released') reapedReleasedCount++
     }
 
     const consumed = await this.storage.list<string>({ prefix: 'consumed:' })
-    const consumedDeposits: { tx_hash: string; op_index: number; intent_id: string }[] = []
+    const consumedDeposits: {
+      tx_hash: string
+      op_index: number
+      intent_id: string
+      account: string | null
+      amount: string | null
+      memo: string | null
+    }[] = []
     for (const [key, intentId] of consumed) {
       const rest = key.slice('consumed:'.length)
       const sep = rest.lastIndexOf(':')
+      // Attach the stored intent's binding fields so recon can verify that the
+      // on-chain payment behind each credit really binds to the intent it was
+      // credited against — not just that the aggregate sums happen to match.
+      const intent = await this.storage.get<StoredIntent>(`intent:${intentId}`)
       consumedDeposits.push({
         tx_hash: rest.slice(0, sep),
         op_index: Number(rest.slice(sep + 1)),
         intent_id: intentId,
+        account: intent?.account ?? null,
+        amount: intent?.amount ?? null,
+        memo: intent?.memo ?? null,
       })
     }
 
@@ -861,6 +911,9 @@ export class PlaygroundLedger implements DurableObject {
         outstanding: (await this.readAtomic('total:outstanding')).toString(),
         balances_sum: balancesSum.toString(),
         holds_sum: holdsSum.toString(),
+        reaped_committed_count: reapedCommittedCount,
+        reaped_committed_atomic: reapedCommittedAtomic.toString(),
+        reaped_released_count: reapedReleasedCount,
         consumed_deposits: consumedDeposits,
       },
     }

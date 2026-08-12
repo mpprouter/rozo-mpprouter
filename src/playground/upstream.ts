@@ -267,22 +267,25 @@ export async function callUpstream(
       })
       return { response, paid }
     } catch (e: any) {
+      // SINGLE SOURCE OF TRUTH: commit-vs-release is decided ONLY by the
+      // post-signing `paid` flag, never by the exception type. Because the
+      // callback fires strictly after a credential exists, `paid === true`
+      // means a real signature happened for THIS call — including the case
+      // where a FIRST challenge signed and a SECOND then exceeded budget, which
+      // must commit, not release. The exception type only picks the code and
+      // HTTP status shown to the caller.
+      const evidence: PaymentEvidence = paid ? 'yes' : 'no'
       if (e instanceof ChannelNotInstalledError) {
-        // Operator provisioning gap, not a caller mistake. No channel means no
-        // voucher was ever signed — paid is false, provably unpaid.
-        throw new UpstreamError('session_channel_not_installed', 503, e.message, 'no')
+        throw new UpstreamError('session_channel_not_installed', 503, e.message, evidence)
       }
       if (e instanceof BudgetExceededError) {
-        // Refused inside onChallenge, before signing. paid is false.
-        throw new UpstreamError('upstream_over_budget', 502, e.message, 'no')
+        throw new UpstreamError('upstream_over_budget', 502, e.message, evidence)
       }
-      // Any other failure: `paid` tells us exactly whether the voucher was
-      // signed for this call before it blew up. No watermark read, no guess.
       throw new UpstreamError(
         'upstream_unreachable',
         502,
         e?.message ?? 'session upstream call failed',
-        paid ? 'yes' : 'no',
+        evidence,
       )
     }
   }
@@ -292,19 +295,14 @@ export async function callUpstream(
     const response = await payMerchant(env, merchantUrl, init, { maxAmountRaw, onCredentialSigned })
     return { response, paid }
   } catch (e: any) {
+    // Same single source of truth: `paid` alone decides settlement. A budget
+    // exceeded on a later challenge after an earlier one already signed leaves
+    // paid===true → commit.
+    const evidence: PaymentEvidence = paid ? 'yes' : 'no'
     if (e instanceof BudgetExceededError) {
-      throw new UpstreamError('upstream_over_budget', 502, e.message, 'no')
+      throw new UpstreamError('upstream_over_budget', 502, e.message, evidence)
     }
-    // `paid` disambiguates what would otherwise be a guess: false means mppx
-    // died before answering any 402 (no credential signed); true means it
-    // signed and submitted the transfer and the failure came after, so the
-    // money may have moved.
-    throw new UpstreamError(
-      'upstream_unreachable',
-      502,
-      e?.message ?? 'upstream call failed',
-      paid ? 'yes' : 'no',
-    )
+    throw new UpstreamError('upstream_unreachable', 502, e?.message ?? 'upstream call failed', evidence)
   }
 }
 

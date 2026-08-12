@@ -721,3 +721,81 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
     expect(account.value.calls[0].status).toBe('released')
   })
 })
+
+describe('paid flag is the single source of truth (settlement precision)', () => {
+  it('RELEASES when createCredential throws — nothing was ever signed', async () => {
+    // The callback fires only AFTER createCredential returns. A throw inside it
+    // leaves paid=false, so the user is refunded. This models the seam's real
+    // ordering; the mock does NOT call onCredentialSigned.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockImplementation(async () => {
+      // createCredential threw inside onChallenge → no signal, then reject.
+      throw new Error('createCredential failed to sign')
+    })
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'sign-threw'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    expect((await response.json()).charged_usd).toBe('0.00')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
+    expect(account.value.calls[0].status).toBe('released')
+  })
+
+  it('COMMITS a budget-exceeded failure when an EARLIER challenge already signed', async () => {
+    // A first challenge signs (onCredentialSigned fires), a second challenge
+    // then exceeds budget and throws BudgetExceededError. Because settlement is
+    // keyed on the paid flag — not the exception type — this must COMMIT, not
+    // release: money already moved on the first voucher.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchantSession.mockImplementation(async (_e, _id, _u, _i, opts) => {
+      // Simulate the seam signing once, then a later challenge over budget.
+      opts?.onCredentialSigned?.()
+      throw new BudgetExceededError('https://openai.example', '9999999', '80000')
+    })
+
+    const response = await handlePlaygroundChat(
+      chatRequest('gpt-4o-mini', bearer, 'budget-after-sign'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    expect((await response.json()).error).toBe('upstream_over_budget')
+    // Charged, because a credential was signed before the budget breach.
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('0.98').toString())
+    expect(account.value.calls.find(c => c.call_id === 'budget-after-sign')!.status).toBe(
+      'committed',
+    )
+  })
+
+  it('still RELEASES a budget-exceeded failure when NOTHING was signed first', async () => {
+    // The common case: budget exceeded on the very first challenge, no
+    // signature. paid=false → release.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockRejectedValue(
+      new BudgetExceededError('https://groq.example', '9999999', '20000'),
+    )
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'budget-no-sign'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    expect((await response.json()).charged_usd).toBe('0.00')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
+  })
+})

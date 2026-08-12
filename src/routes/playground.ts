@@ -327,9 +327,11 @@ export async function handlePlaygroundIntent(request: Request, env: Env): Promis
   }
 
   const destination = env.STELLAR_ROUTER_PUBLIC
-  if (!destination || !G_ADDRESS.test(destination)) {
-    // Without a receiving address there is nothing to quote, and quoting a
-    // wrong one would send a real user's funds somewhere unrecoverable.
+  // Full StrKey checksum validation, not just the shape regex: this is the
+  // address we tell a real user to send funds to. A misconfigured value that
+  // passed a loose regex but failed its checksum would quote an unrecoverable
+  // destination. Fail closed rather than quote a bad address.
+  if (!destination || !isValidStellarAccount(destination)) {
     return fail(503, 'not_configured', 'playground deposit destination is not configured')
   }
 
@@ -677,16 +679,33 @@ async function beginCall(
     })
   }
 
-  // Mark the call dispatched BEFORE any upstream/payment attempt. This is the
-  // fresh reservation (not a duplicate, not insufficient), so the very next
-  // thing the caller does is the upstream call. The marker lets the reaper
-  // distinguish "died before paying" (release) from "died after paying"
-  // (commit). A failure to mark is non-fatal: it only makes the reaper more
-  // conservative (an unmarked stranded call is released), so we log and go on
-  // rather than aborting a call whose hold is already taken.
-  const marked = await markDispatched(env, args.callId)
+  // Persist the dispatched marker BEFORE any upstream/payment attempt. It is
+  // the flag the reaper uses to tell "died before paying" (release) from "died
+  // after paying" (commit). If this write fails we must NOT proceed to a paid
+  // upstream call with an unpersisted marker — a later crash would then leave
+  // a genuinely-paid call looking never-dispatched and get it wrongly
+  // released. So on a marker failure we release the reservation and abort.
+  //
+  // KNOWN CRASH WINDOW (accepted, recon-monitored): a worker crash in the gap
+  // between this write landing and the upstream call firing is inherent to
+  // Worker+DO across awaits. Its exposure is bounded by one call's price and
+  // detected by scripts/admin/playground-recon.ts (a reaper-committed call
+  // with no matching on-chain payment shows up as a per-op binding mismatch).
+  let marked
+  try {
+    marked = await markDispatched(env, args.callId)
+  } catch (e: any) {
+    marked = { ok: false as const, code: 'dispatch_threw', message: e?.message ?? 'threw' }
+  }
   if (!marked.ok) {
     console.error(`[playground] markDispatched failed for ${args.callId}: ${marked.code}`)
+    // Nothing was dispatched or paid yet — safe to release the hold in full.
+    await release(env, args.callId, 'dispatch_mark_failed').catch(err =>
+      console.error(`[playground] release after dispatch failure threw: ${err?.message}`),
+    )
+    return fail(503, 'dispatch_failed', 'could not start the call; no charge was made', {
+      call_id: args.callId,
+    })
   }
 
   return {

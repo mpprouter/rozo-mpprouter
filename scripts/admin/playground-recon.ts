@@ -30,14 +30,17 @@
  *      legitimately leaves on-chain ahead of credited. Credited ahead of
  *      on-chain is never legitimate and is the condition worth paging on.
  *
- *   C. per-`(tx_hash, op_index)` verification
+ *   C. per-`(tx_hash, op_index)` intent-binding verification
  *      Aggregate sums can net out: one credit invented and another one missed
  *      leaves totals looking perfect. So every consumed deposit op the ledger
- *      recorded is fetched back from Horizon and checked individually —
- *      transaction successful, playground-shaped MEMO_TEXT, operation at that
- *      exact index a USDC payment from Circle's issuer to the receiving
- *      account. Any credit without a matching on-chain payment, and any
- *      duplicate consumption, is reported per-row.
+ *      recorded is fetched back from Horizon and BOUND to its own stored
+ *      intent on all of: transaction successful; MEMO_TEXT == the intent's
+ *      memo nonce; operation at that exact index a Circle-USDC payment to the
+ *      receiving account; op source == the intent's account; and on-chain
+ *      amount == the credited amount, to the stroop. Any credit that fails to
+ *      bind on any of these — and any duplicate consumed pair — is reported
+ *      per-row. This is the real solvency detector; the aggregate sums are
+ *      only a coarse first pass.
  *
  * Usage:
  *   npx tsx scripts/admin/playground-recon.ts --api https://apiserver.mpprouter.dev
@@ -101,6 +104,8 @@ interface HorizonPayment {
   asset_code?: string
   asset_issuer?: string
   to?: string
+  from?: string
+  source_account?: string
   amount?: string
   transaction_hash?: string
 }
@@ -166,7 +171,17 @@ interface LedgerTotals {
   outstanding: string
   balances_sum: string
   holds_sum: string
-  consumed_deposits: { tx_hash: string; op_index: number; intent_id: string }[]
+  reaped_committed_count: number
+  reaped_committed_atomic: string
+  reaped_released_count: number
+  consumed_deposits: {
+    tx_hash: string
+    op_index: number
+    intent_id: string
+    account: string | null
+    amount: string | null
+    memo: string | null
+  }[]
 }
 
 async function main(): Promise<number> {
@@ -300,6 +315,26 @@ async function main(): Promise<number> {
     failures += badOps + duplicates
   }
 
+  // ---- (D) reaper-settled calls -----------------------------------------
+  // The per-op binding above reconciles deposits IN. It cannot see whether a
+  // reaper-COMMITTED call actually paid upstream, because that spend is
+  // Tempo-side and not indexed here. A reaper commit charges the user for a
+  // call whose upstream delivery we could not confirm, so it is the review set
+  // for the accepted mid-call crash window. Surface it explicitly rather than
+  // letting it hide inside the aggregate: it is not a hard failure (a reaped
+  // commit may well have paid), but a non-zero count wants human eyes.
+  console.log('')
+  console.log('Reaper-settled calls (accepted crash-window review set)')
+  console.log(`  reaped commits : ${totals.reaped_committed_count} (${fmt(BigInt(totals.reaped_committed_atomic))} charged)`)
+  console.log(`  reaped releases: ${totals.reaped_released_count}`)
+  if (totals.reaped_committed_count > 0) {
+    console.warn(
+      '  REVIEW: reaper-committed calls charged users for upstream spend recon ' +
+        'cannot verify on-chain. Bounded by per-call price; confirm against Tempo ' +
+        'spend and issue goodwill credit where a user got nothing.',
+    )
+  }
+
   console.log('')
   console.log(failures === 0 ? 'RECON PASSED' : `RECON FAILED — ${failures} mismatch(es)`)
   return failures === 0 ? 0 : 1
@@ -315,10 +350,22 @@ async function main(): Promise<number> {
 async function verifyConsumedOp(
   horizon: string,
   account: string,
-  entry: { tx_hash: string; op_index: number },
+  entry: {
+    tx_hash: string
+    op_index: number
+    intent_id: string
+    account: string | null
+    amount: string | null
+    memo: string | null
+  },
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   if (!/^[0-9a-f]{64}$/i.test(entry.tx_hash)) {
     return { ok: false, reason: 'malformed transaction hash in ledger' }
+  }
+  // The intent must still be readable — a credit whose intent has vanished
+  // cannot be bound to anything and is itself a red flag.
+  if (!entry.account || !entry.amount || !entry.memo) {
+    return { ok: false, reason: `intent ${entry.intent_id} is missing binding fields` }
   }
   try {
     const txResp = await fetch(`${horizon}/transactions/${entry.tx_hash}`)
@@ -333,6 +380,12 @@ async function verifyConsumedOp(
     if (tx.memo_type !== 'text' || !tx.memo || !PLAYGROUND_MEMO.test(tx.memo)) {
       return { ok: false, reason: `memo is not a playground nonce (${tx.memo_type}:${tx.memo})` }
     }
+    // BIND memo: the on-chain memo must be the nonce recorded on THIS intent.
+    // A playground-shaped memo that isn't this intent's means the credit was
+    // bound to the wrong payment.
+    if (tx.memo !== entry.memo) {
+      return { ok: false, reason: `memo ${tx.memo} != intent memo ${entry.memo}` }
+    }
 
     const opsResp = await fetch(
       `${horizon}/transactions/${entry.tx_hash}/operations?limit=200&order=asc`,
@@ -345,6 +398,22 @@ async function verifyConsumedOp(
     if (op.to !== account) return { ok: false, reason: 'payment was not to the receiving account' }
     if (op.asset_code !== 'USDC' || op.asset_issuer !== USDC_ISSUER) {
       return { ok: false, reason: 'asset is not Circle-issued USDC' }
+    }
+    // BIND source: the payment must originate from the intent's account. This
+    // is what stops one account's payment being credited to another intent.
+    const opSource = op.source_account ?? op.from
+    if (opSource !== entry.account) {
+      return { ok: false, reason: `op source ${opSource} != intent account ${entry.account}` }
+    }
+    // BIND amount: the credited (intent) amount must equal the on-chain amount
+    // to the stroop. A mismatch means we credited a different figure than
+    // actually arrived.
+    const onChainAtomic = horizonToAtomic(op.amount ?? '0')
+    if (onChainAtomic !== BigInt(entry.amount)) {
+      return {
+        ok: false,
+        reason: `credited ${entry.amount} != on-chain ${onChainAtomic} atomic`,
+      }
     }
     return { ok: true }
   } catch (e: any) {

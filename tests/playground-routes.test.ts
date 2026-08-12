@@ -24,7 +24,7 @@ import {
 } from '../src/routes/playground'
 import { parseUsd } from '../src/playground/amount'
 import { PLAYGROUND_MODELS } from '../src/playground/models'
-import { createIntent, getIntent, openIntent } from '../src/playground/ledger-client'
+import { createIntent, getIntent, openIntent, readAccount } from '../src/playground/ledger-client'
 import { mintSessionToken } from '../src/playground/session-token'
 import { makePlaygroundLedgerMock } from './helpers/playground-ledger-mock'
 import {
@@ -193,6 +193,20 @@ describe('POST /v1/playground/session/intent', () => {
   it('refuses to quote when no receiving account is configured', async () => {
     // Quoting a wrong destination would send a real user's funds nowhere.
     const env = makeEnv({ STELLAR_ROUTER_PUBLIC: undefined })
+    const r = await handlePlaygroundIntent(
+      post('/v1/playground/session/intent', { account: ALICE }),
+      env,
+    )
+    expect(r.status).toBe(503)
+    expect((await r.json()).error).toBe('not_configured')
+  })
+
+  it('fails closed on a shape-valid but non-checksummed receiving account', async () => {
+    // StrKey checksum, not just the regex: a misconfigured destination that
+    // passed a loose shape check would quote an unrecoverable address.
+    const env = makeEnv({
+      STELLAR_ROUTER_PUBLIC: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+    })
     const r = await handlePlaygroundIntent(
       post('/v1/playground/session/intent', { account: ALICE }),
       env,
@@ -697,5 +711,42 @@ describe('session renewal within the hard window mints a fresh token (P1)', () =
 
     nowSpy.mockRestore()
     spy.mockRestore()
+  })
+})
+
+describe('dispatch-marker failure aborts before any paid upstream call', () => {
+  it('releases the reservation and returns 503 when the DO dispatch write fails', async () => {
+    // If the dispatched marker can't be persisted, proceeding to a paid call
+    // would risk a later crash wrongly releasing a genuinely-paid call. So the
+    // call aborts, refunding the hold, before anything upstream runs.
+    const env = makeEnv()
+    await fund(env, '1')
+    const token = await sessionFor(env)
+
+    // Make ONLY the /dispatch DO op throw, leaving reserve/settle working.
+    const realGet = (env as any).PLAYGROUND_LEDGER.get
+    ;(env as any).PLAYGROUND_LEDGER.get = (id: unknown) => {
+      const stub = realGet.call((env as any).PLAYGROUND_LEDGER, id)
+      const realFetch = stub.fetch.bind(stub)
+      stub.fetch = (input: Request | string, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input.url
+        if (url.endsWith('/dispatch')) return Promise.reject(new Error('DO dispatch down'))
+        return realFetch(input, init)
+      }
+      return stub
+    }
+
+    const r = await handlePlaygroundChat(
+      post('/v1/playground/chat', { model: 'llama-3.1-8b-instant', call_id: 'dispatch-fail', messages: [{ role: 'user', content: 'hi' }] }, token),
+      env,
+    )
+    expect(r.status).toBe(503)
+    expect((await r.json()).error).toBe('dispatch_failed')
+
+    // Hold refunded — no charge, no upstream call.
+    ;(env as any).PLAYGROUND_LEDGER.get = realGet
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
   })
 })
