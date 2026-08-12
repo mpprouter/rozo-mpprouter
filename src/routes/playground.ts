@@ -59,6 +59,7 @@ import {
   commit,
   createIntent,
   getIntent,
+  markDispatched,
   openIntent,
   readAccount,
   readTotals,
@@ -674,6 +675,18 @@ async function beginCall(
       balance_remaining: formatUsd(parseAtomic(held.value.balance)),
       price_usd: formatUsd(args.priceAtomic),
     })
+  }
+
+  // Mark the call dispatched BEFORE any upstream/payment attempt. This is the
+  // fresh reservation (not a duplicate, not insufficient), so the very next
+  // thing the caller does is the upstream call. The marker lets the reaper
+  // distinguish "died before paying" (release) from "died after paying"
+  // (commit). A failure to mark is non-fatal: it only makes the reaper more
+  // conservative (an unmarked stranded call is released), so we log and go on
+  // rather than aborting a call whose hold is already taken.
+  const marked = await markDispatched(env, args.callId)
+  if (!marked.ok) {
+    console.error(`[playground] markDispatched failed for ${args.callId}: ${marked.code}`)
   }
 
   return {

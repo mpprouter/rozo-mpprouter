@@ -269,7 +269,12 @@ describe('channel not installed', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchant.mockResolvedValue(new Response('nope', { status: 500 }))
+    // A 402→pay→retry that ends 5xx: the credential WAS signed, so the seam
+    // fires onCredentialSigned before returning the failing response.
+    payMerchant.mockImplementation(async (_e, _u, _i, opts) => {
+      opts?.onCredentialSigned?.()
+      return new Response('nope', { status: 500 })
+    })
 
     const response = await handlePlaygroundChat(
       chatRequest('llama-3.1-8b-instant', bearer, 'call-500'),
@@ -291,7 +296,12 @@ describe('channel not installed', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchant.mockRejectedValue(new Error('network timeout after dispatch'))
+    // Credential signed, then the connection died before the response — the
+    // "money may have moved" case, which must charge.
+    payMerchant.mockImplementation(async (_e, _u, _i, opts) => {
+      opts?.onCredentialSigned?.()
+      throw new Error('network timeout after dispatch')
+    })
 
     const response = await handlePlaygroundChat(
       chatRequest('llama-3.1-8b-instant', bearer, 'call-timeout'),
@@ -305,19 +315,15 @@ describe('channel not installed', () => {
     expect(account.value.balance).toBe(parseUsd('0.98').toString())
   })
 
-  it('CHARGES a session failure once the voucher watermark has advanced', async () => {
-    // The voucher is signed before the merchant's final response is known, so
-    // an advanced cumulative is proof the money is already committed.
-    const key = 'tempoChannel:openai_chat'
-    const env = makeEnv({ [key]: JSON.stringify({ channelId: '0xabc', cumulativeRaw: '1000' }) })
+  it('CHARGES a session failure once the voucher has been signed', async () => {
+    // The signal is call-local: onCredentialSigned fires the moment the
+    // voucher is signed, before the merchant's final response. A failure after
+    // that must charge — the money committed.
+    const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchantSession.mockImplementation(async () => {
-      // Simulate onChannelUpdate having bumped the watermark before the throw.
-      await (env as any).MPP_STORE.put(
-        key,
-        JSON.stringify({ channelId: '0xabc', cumulativeRaw: '21000' }),
-      )
+    payMerchantSession.mockImplementation(async (_e, _id, _u, _i, opts) => {
+      opts?.onCredentialSigned?.()
       throw new Error('merchant connection reset after voucher')
     })
 
@@ -333,10 +339,10 @@ describe('channel not installed', () => {
     expect(account.value.balance).toBe(parseUsd('0.98').toString())
   })
 
-  it('RELEASES a session failure when the watermark never moved', async () => {
-    // Nothing was signed, so nothing was paid — the user keeps their credit.
-    const key = 'tempoChannel:openai_chat'
-    const env = makeEnv({ [key]: JSON.stringify({ channelId: '0xabc', cumulativeRaw: '1000' }) })
+  it('RELEASES a session failure when no voucher was ever signed', async () => {
+    // onCredentialSigned never fires (e.g. an initial non-402 error), so
+    // nothing was paid — the user keeps their full credit.
+    const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
     payMerchantSession.mockRejectedValue(new Error('merchant refused the connection'))
@@ -549,7 +555,7 @@ describe('upstream budget ceiling (P0-2)', () => {
     await callUpstream(env, { route, body: {}, budgetAtomic: parseUsd('0.02') })
 
     // $0.02 = 200000 atomic (7dp) = 20000 base units (6dp).
-    expect(payMerchant.mock.calls[0][3]).toEqual({ maxAmountRaw: '20000' })
+    expect(payMerchant.mock.calls[0][3]).toMatchObject({ maxAmountRaw: '20000' })
   })
 
   it('passes the ceiling to payMerchantSession too', async () => {
@@ -562,7 +568,7 @@ describe('upstream budget ceiling (P0-2)', () => {
 
     await callUpstream(env, { route, body: {}, budgetAtomic: parseUsd('0.08') })
 
-    expect(payMerchantSession.mock.calls[0][4]).toEqual({ maxAmountRaw: '80000' })
+    expect(payMerchantSession.mock.calls[0][4]).toMatchObject({ maxAmountRaw: '80000' })
   })
 
   it('releases the hold when the merchant asks for more than budget', async () => {
@@ -629,5 +635,89 @@ describe('router-held-credential routes never charge the user on failure', () =>
     if (!account.ok) return
     expect(account.value.balance).toBe(parseUsd('1').toString())
     fetchSpy.mockRestore()
+  })
+})
+
+describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () => {
+  it('concurrent same-route calls do not cross-charge on one failing', async () => {
+    // The old watermark inference was route-wide: a concurrent call advancing
+    // the channel cumulative could make an UNPAID sibling look paid. With a
+    // call-local signing flag, each call's outcome depends only on whether ITS
+    // OWN credential was signed.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+
+    // Call A signs a voucher then fails (must charge). Call B never signs
+    // (must release). They run against the same route concurrently. The mock
+    // branches on the request body's marker message — NOT on invocation order,
+    // which races under Promise.all — so the outcome is deterministic and the
+    // test actually isolates call-locality rather than scheduling luck.
+    payMerchantSession.mockImplementation(async (_e, _id, _u, init, opts) => {
+      const sentBody = String((init as any)?.body ?? '')
+      if (sentBody.includes('SIGN_THEN_FAIL')) {
+        opts?.onCredentialSigned?.()
+        throw new Error('A: reset after voucher')
+      }
+      throw new Error('B: refused before any voucher')
+    })
+
+    const reqA = new Request('https://apiserver.example/v1/playground/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        call_id: 'concurrent-A',
+        messages: [{ role: 'user', content: 'SIGN_THEN_FAIL' }],
+      }),
+    })
+    const reqB = new Request('https://apiserver.example/v1/playground/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        call_id: 'concurrent-B',
+        messages: [{ role: 'user', content: 'REFUSE_BEFORE_SIGN' }],
+      }),
+    })
+    const [ra, rb] = await Promise.all([
+      handlePlaygroundChat(reqA, env),
+      handlePlaygroundChat(reqB, env),
+    ])
+    const [ba, bb] = [await ra.json(), await rb.json()]
+
+    // A signed → charged; B never signed → refunded. No cross-contamination.
+    expect(ba.charged_usd).toBe('0.02')
+    expect(bb.charged_usd).toBe('0.00')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    const callA = account.value.calls.find(c => c.call_id === 'concurrent-A')!
+    const callB = account.value.calls.find(c => c.call_id === 'concurrent-B')!
+    expect(callA.status).toBe('committed')
+    expect(callB.status).toBe('released')
+    // Exactly one $0.02 charge landed.
+    expect(account.value.balance).toBe(parseUsd('0.98').toString())
+  })
+
+  it('an initial non-402 500 releases (no credential ever signed)', async () => {
+    // mppx returns the merchant's 500 without ever raising a 402, so
+    // onChallenge — and onCredentialSigned — never fire.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockResolvedValue(new Response('down', { status: 500 }))
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'initial-500'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    expect((await response.json()).charged_usd).toBe('0.00')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
+    expect(account.value.calls[0].status).toBe('released')
   })
 })

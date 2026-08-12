@@ -627,3 +627,75 @@ describe('session lifetime on re-open (P1)', () => {
     spy.mockRestore()
   })
 })
+
+describe('session renewal within the hard window mints a fresh token (P1)', () => {
+  const HORIZON_TX = 'b'.repeat(64)
+
+  function stubHorizon(memo: string, confirmedAt: string) {
+    return vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/operations')) {
+        return new Response(
+          JSON.stringify({
+            _embedded: {
+              records: [
+                {
+                  type: 'payment',
+                  asset_code: 'USDC',
+                  asset_issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+                  from: ALICE,
+                  to: ROUTER,
+                  amount: '1.0000000',
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(
+        JSON.stringify({ successful: true, memo_type: 'text', memo, created_at: confirmedAt }),
+        { status: 200 },
+      )
+    }) as any)
+  }
+
+  it('re-open after session expiry (but within 30d) returns a NEW token and preserves the balance', async () => {
+    const env = makeEnv()
+    // Quote and open normally, but with a session that has already expired.
+    const quoted = await (
+      await handlePlaygroundIntent(
+        post('/v1/playground/session/intent', { account: ALICE, amount_usd: '1' }),
+        env,
+      )
+    ).json()
+
+    // Confirmed just now so the deposit is inside the intent window.
+    const spy = stubHorizon(quoted.memo, new Date().toISOString())
+    const body = { intent_id: quoted.intent_id, tx_hash: HORIZON_TX }
+
+    const first = await (
+      await handlePlaygroundOpen(post('/v1/playground/session/open', body), env)
+    ).json()
+    expect(first.balance_usd).toBe('1.00')
+
+    // Fast-forward past the 7-day token TTL but well within the 30-day
+    // renewal cap by advancing the clock.
+    const eightDays = Date.now() + 8 * 24 * 60 * 60 * 1000
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(eightDays)
+
+    const renewed = await (
+      await handlePlaygroundOpen(post('/v1/playground/session/open', body), env)
+    ).json()
+
+    // A fresh, valid token — not a 410, not the stale expired one.
+    expect(renewed.session_token).toBeDefined()
+    expect(renewed.session_token).not.toBe(first.session_token)
+    expect(Date.parse(renewed.expires_at)).toBeGreaterThan(eightDays)
+    // Balance is not re-credited, but it is preserved (not stranded).
+    expect(renewed.balance_usd).toBe('1.00')
+
+    nowSpy.mockRestore()
+    spy.mockRestore()
+  })
+})

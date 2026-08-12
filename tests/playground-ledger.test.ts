@@ -17,6 +17,7 @@ import { formatUsd, formatUsdc7, parseAtomic, parseUsd } from '../src/playground
 import {
   commit,
   createIntent,
+  markDispatched,
   globalCapAtomic,
   openIntent,
   readAccount,
@@ -81,7 +82,9 @@ async function deposit(
     now,
     confirmedAt: now,
     sessionJti: 'jti-1',
-    sessionExp: Math.floor(now / 1000) + 3600,
+    // Anchored to real time, not the fixed fixture `now`, so a same-instant
+    // replay in the idempotency test still sees a valid (unexpired) session.
+    sessionExp: Math.floor(Date.now() / 1000) + 3600,
   })
   return { intent: intent.value, opened }
 }
@@ -696,7 +699,7 @@ describe('stale reserved-call reaper (P1)', () => {
    * `call_id` retry short-circuit keeps returning `duplicate` for a call that
    * never produced a result.
    */
-  it('commits calls stranded in reserved past the lease, and flags them for support', async () => {
+  it('COMMITS a dispatched call stranded past the lease, and flags it for support', async () => {
     const mock = makePlaygroundLedgerMockWithControls()
     const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
     await deposit(env, { usd: '1' })
@@ -709,6 +712,8 @@ describe('stale reserved-call reaper (P1)', () => {
       maxPriceAtomic: parseUsd('0.02'),
       now: staleAt,
     })
+    // The upstream call was attempted — dispatch was marked before it.
+    await markDispatched(env, 'stranded')
 
     await mock.runAlarm()
 
@@ -716,13 +721,41 @@ describe('stale reserved-call reaper (P1)', () => {
     expect(account.ok).toBe(true)
     if (!account.ok) return
     const call = account.value.calls.find(c => c.call_id === 'stranded')!
-    // Committed, not released: the reserve->settle window brackets the paid
-    // upstream call, so a stranded call most likely cost the router money.
+    // Committed, not released: the reserve->dispatch window brackets the paid
+    // upstream call, so a dispatched stranded call most likely cost money.
     expect(call.status).toBe('committed')
     expect(call.charged).toBe(parseUsd('0.02').toString())
     expect(call.reaped).toBe(true)
     // The hold is gone from the balance exactly once.
     expect(account.value.balance).toBe(parseUsd('0.98').toString())
+  })
+
+  it('RELEASES a call stranded BEFORE it was ever dispatched (P0)', async () => {
+    // The worker died between reserve and the upstream call — no payment was
+    // ever attempted, so committing would charge for nothing.
+    const mock = makePlaygroundLedgerMockWithControls()
+    const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
+    await deposit(env, { usd: '1' })
+
+    await reserve(env, {
+      callId: 'never-dispatched',
+      account: ALICE,
+      chip: 'chat',
+      maxPriceAtomic: parseUsd('0.02'),
+      now: Date.now() - RESERVED_LEASE_MS - 1000,
+    })
+    // NOT marked dispatched.
+
+    await mock.runAlarm()
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    const call = account.value.calls.find(c => c.call_id === 'never-dispatched')!
+    expect(call.status).toBe('released')
+    expect(call.charged).toBe('0')
+    expect(call.reaped).toBe(true)
+    // Full hold refunded.
+    expect(account.value.balance).toBe(parseUsd('1').toString())
   })
 
   it('leaves healthy in-flight calls alone', async () => {
@@ -770,6 +803,7 @@ describe('stale reserved-call reaper (P1)', () => {
       maxPriceAtomic: parseUsd('0.02'),
       now: Date.now() - RESERVED_LEASE_MS - 1,
     })
+    await markDispatched(env, 'stranded-2')
     await mock.runAlarm()
 
     const totals = await readTotals(env)

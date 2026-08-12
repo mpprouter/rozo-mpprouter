@@ -84,18 +84,20 @@ twice.
 
 ### Commit vs release on failure
 
-A failed call is **not** automatically refunded. For a session call the voucher
-is signed — and the cumulative watermark advanced — *before* the merchant's
-final response is known, so a late failure means the router has already paid.
-Refunding there would hand out free upstream calls to anyone who can make the
-response leg fail. The rule is: **release only when we can prove no payment
-happened.**
+A failed call is **not** automatically refunded. Settlement turns on a
+**call-local, signing-correlated** fact: was a paid credential actually signed
+for *this* request? Both payment seams fire an `onCredentialSigned` callback
+synchronously inside `onChallenge` — the exact moment `createCredential` runs —
+and the playground captures it in a per-call `paid` flag.
 
-| Evidence | Situation | Outcome |
+The KV channel watermark is **never** read to decide this. It is async-written
+(mppx does not await `onChannelUpdate`), route-wide (a concurrent call moves
+it), and blind to an initial non-402 500/404 — three ways to mis-settle.
+
+| `paid` | Situation | Outcome |
 | --- | --- | --- |
-| `no` | Refused before dispatch (unknown/unverified route, rate limit, over-budget refusal, missing session channel), or a Mercury route that never pays | **release** |
-| `yes` | Session voucher signed (watermark advanced), or merchant answered our paid retry with a bad status / unparseable body | **commit** |
-| `maybe` | Lost response or timeout after dispatch | **commit** |
+| false | No credential signed: pre-dispatch refusal, initial non-402 error, missing channel, over-budget, or a Mercury route that never pays | **release** |
+| true | A credential was signed for this call; a later failure means the money committed (or may have) | **commit** |
 
 Charged failures return `charged_usd` plus a `support_note` telling the user
 plainly they were billed for a call that did not deliver, and log at error level
@@ -123,10 +125,16 @@ raised.
 
 ### Stranded calls
 
-A DO alarm reaps calls stuck in `reserved` past a 5-minute lease. They are
-**committed**, not released — the reserve→settle window brackets the paid
-upstream call — and flagged `reaped: true` so support can issue goodwill credit
-where the user genuinely got nothing.
+A DO alarm reaps calls stuck in `reserved` past a 5-minute lease. Each call is
+marked `dispatched` atomically right before its upstream fetch, so the reaper
+can tell the two cases apart:
+
+- **not dispatched** → the worker died before any upstream/payment attempt, so
+  the hold is **released** in full.
+- **dispatched** → the reserve→dispatch window brackets the paid call, so it is
+  **committed** at the hold ceiling.
+
+Either way the call is flagged `reaped: true` for support.
 
 Prices: chat `$0.02` (cheap tier) / `$0.10` (flagship), Blend activity `$0.03`,
 tx-decode `$0.005`. Deposits are `$0.10` or `$1.00` and are **non-refundable

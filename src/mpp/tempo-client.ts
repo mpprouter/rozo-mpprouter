@@ -438,14 +438,31 @@ export async function payMerchant(
      * all, so the proxy's payment path is untouched.
      */
     maxAmountRaw?: string
+    /**
+     * Fired SYNCHRONOUSLY at the exact moment a paid credential is signed for
+     * THIS call — inside `onChallenge`, right before `createCredential`. This
+     * is the only reliable per-call, call-correlated signal that money is
+     * committed: unlike the KV channel watermark it is not async-written, not
+     * route-wide, and only fires when a real 402 challenge is answered (so an
+     * initial non-402 500/404 never trips it).
+     *
+     * Installing this callback forces an `onChallenge` hook even without a
+     * budget; the hook still does the default passthrough sign, so behaviour
+     * for a paying call is unchanged.
+     */
+    onCredentialSigned?: () => void
   } = {},
 ): Promise<Response> {
+  const needsHook = Boolean(opts.maxAmountRaw || opts.onCredentialSigned)
   const client = createTempoClientInternal(
     env,
-    opts.maxAmountRaw
+    needsHook
       ? {
           onChallenge: async (challenge, { createCredential }) => {
-            assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw!)
+            if (opts.maxAmountRaw) assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw)
+            // Signal BEFORE createCredential returns: from here on a payment
+            // credential exists for this request, so the money may have moved.
+            opts.onCredentialSigned?.()
             // No context: tempo.charge signs its default single-shot intent.
             return createCredential()
           },
@@ -507,6 +524,8 @@ export async function payMerchantSession(
   opts: {
     /** See `payMerchant`. Checked before the voucher is signed. */
     maxAmountRaw?: string
+    /** See `payMerchant`. Fired synchronously when the voucher is signed. */
+    onCredentialSigned?: () => void
   } = {},
 ): Promise<{ response: Response; channelBefore: TempoChannelState }> {
   const channel = await getTempoChannel(env, merchantId)
@@ -534,6 +553,10 @@ export async function payMerchantSession(
       if (opts.maxAmountRaw) {
         assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw)
       }
+      // Signal BEFORE the voucher is built: past this point a paid credential
+      // exists for THIS call. Call-local and signing-correlated, unlike the
+      // KV watermark.
+      opts.onCredentialSigned?.()
       const newCumulativeRaw = addRaw(channel.cumulativeRaw, delta)
       // Manual-mode context: tell mppx "sign a voucher action on
       // channel X at the new cumulative".

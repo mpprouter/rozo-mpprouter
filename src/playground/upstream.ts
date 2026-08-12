@@ -37,15 +37,18 @@
  *
  * On the cumulative watermark: `payMerchantSession` installs an
  * `onChannelUpdate` hook that persists the just-signed cumulative via
- * `bumpCumulative`, which is monotone — a slower concurrent write sees an equal
- * or higher value and drops rather than rewinding. The playground relies on
- * that hook alone and deliberately does NOT replicate the extra post-2xx
- * `bumpCumulative` the proxy performs: that call derives its delta from
- * `parsed.request.amount` off the live 402, which the playground never sees
- * because `payMerchantSession` handles the challenge internally. Since the
- * in-client hook already persisted the authoritative value, the proxy's second
- * bump is belt-and-braces, and skipping it keeps the playground from becoming
- * an independent writer of a watermark it cannot compute correctly.
+ * `bumpCumulative`, which is monotone. The playground relies on that hook alone
+ * and deliberately does NOT replicate the extra post-2xx `bumpCumulative` the
+ * proxy performs: that call derives its delta from `parsed.request.amount` off
+ * the live 402, which the playground never sees because `payMerchantSession`
+ * handles the challenge internally, so replicating it would make the playground
+ * an independent writer of a value it cannot compute correctly.
+ *
+ * The watermark is NEVER read back to decide settlement. It is async-written
+ * (mppx does not await `onChannelUpdate`), route-wide (a concurrent call moves
+ * it), and blind to initial non-402 failures — three ways to mis-settle. The
+ * playground instead uses a call-local `paid` flag flipped synchronously the
+ * instant a credential is signed for THIS request (see `onCredentialSigned`).
  *
  * A merchant with no channel installed raises `ChannelNotInstalledError`. That
  * is an operator-provisioning gap, not a user error, so it maps to a 503 and
@@ -62,25 +65,27 @@ import {
   payMerchant,
   payMerchantSession,
 } from '../mpp/tempo-client'
-import { getTempoChannel } from '../mpp/channel-store'
 import { toTempoRaw6 } from './amount'
 import { checkAndBumpDailyLimit, utcDateKey } from '../mpp/rate-limit-do'
 
 /**
- * Did the router's money move?
+ * Did a paid credential get signed for this call?
  *
  * This is the single most consequential fact about a failed playground call,
- * because it decides whether the user's hold is refunded or charged:
+ * because it decides whether the user's hold is refunded or charged. It is
+ * derived from the call-local `paid` flag (see `onCredentialSigned`), so it is
+ * a real per-call fact, not an inference:
  *
- *   - `'no'`    — provably no payment. Safe to release the hold in full.
- *   - `'maybe'` — we cannot prove the transfer did NOT happen (lost response,
- *                 timeout after dispatch). Treated as `'yes'`.
- *   - `'yes'`   — payment definitely committed (a voucher was signed, or the
- *                 merchant answered our paid retry).
+ *   - `'no'`  — no credential was signed for THIS call. Provably unpaid; the
+ *               hold is released. Covers pre-dispatch refusals, initial non-402
+ *               errors, and router-held-credential (Mercury) routes.
+ *   - `'yes'` — a credential was signed for this call. The money committed (or,
+ *               for a failure right after signing, may have), so charge.
  *
- * Anything other than `'no'` must COMMIT. Releasing on an ambiguous failure
- * means the router pays the merchant and hands the user their credit back —
- * free API calls for anyone who can make the response leg fail.
+ * `'maybe'` remains in the union only as the constructor default for a raw
+ * error that predates classification; the settlement layer treats it the same
+ * as `'yes'` (commit), because an unclassified failure must not release funds
+ * that may have moved. No code path in this module emits it deliberately.
  */
 export type PaymentEvidence = 'no' | 'maybe' | 'yes'
 
@@ -164,6 +169,21 @@ async function consumeUpstreamRateLimit(env: Env, route: PublicServiceRoute): Pr
  * query string. `body` is JSON-serialised for POST routes. Nothing from the
  * end user reaches here except through the caller's own validation.
  */
+/**
+ * The result of one upstream call: the merchant's response, plus whether a
+ * paid credential was actually signed for THIS call.
+ *
+ * `paid` is the call-local, signing-correlated payment signal — set from a
+ * callback fired synchronously inside the payment seam's `onChallenge`, the
+ * exact moment a credential is created. It replaces the old KV-watermark
+ * inference, which was async-written, route-wide (a concurrent call moved it),
+ * and blind to initial non-402 failures.
+ */
+export interface UpstreamCall {
+  response: Response
+  paid: boolean
+}
+
 export async function callUpstream(
   env: Env,
   args: {
@@ -178,7 +198,7 @@ export async function callUpstream(
      */
     budgetAtomic?: bigint
   },
-): Promise<Response> {
+): Promise<UpstreamCall> {
   const { route } = args
   const searchParams = new URLSearchParams(args.query ?? {})
   const { path, consumed } = resolveUpstreamPath(route, searchParams)
@@ -198,9 +218,18 @@ export async function callUpstream(
   const signal = AbortSignal.timeout(args.timeoutMs ?? 30_000)
 
   if (route.upstreamAuth) {
+    // Router-held-credential route (Mercury): no Tempo payment ever happens,
+    // so no credential is signed and `paid` is unconditionally false — every
+    // failure here is provably unpaid and releases.
     await consumeUpstreamRateLimit(env, route)
     const authed = injectUpstreamAuth(headers, route, env)
-    return fetch(merchantUrl, { method: route.method, headers: authed, body: payload, signal })
+    const response = await fetch(merchantUrl, {
+      method: route.method,
+      headers: authed,
+      body: payload,
+      signal,
+    })
+    return { response, paid: false }
   }
 
   const init: RequestInit = { method: route.method, headers, body: payload, signal }
@@ -218,85 +247,64 @@ export async function callUpstream(
   }
   const maxAmountRaw = toTempoRaw6(args.budgetAtomic)
 
+  // Call-local signing flag. Flipped true SYNCHRONOUSLY inside the seam's
+  // onChallenge, the moment a credential is created for THIS request. Captured
+  // in this closure so it is per-call and cannot be moved by a concurrent
+  // call on the same route.
+  let paid = false
+  const onCredentialSigned = () => {
+    paid = true
+  }
+
   if (route.upstreamPaymentMethod === 'tempo.session') {
     // Mirrors proxy.ts:659. The channel is keyed by `route.id`; the cumulative
     // watermark is persisted by payMerchantSession's own onChannelUpdate hook
     // (see the module header for why we do not bump it a second time).
-    //
-    // The watermark is read BEFORE the call so a failure can be classified:
-    // if the cumulative advanced, a voucher was signed and the money is
-    // committed no matter how the response leg ended.
-    const before = await getTempoChannel(env, route.id).catch(() => null)
     try {
       const { response } = await payMerchantSession(env, route.id, merchantUrl, init, {
         maxAmountRaw,
+        onCredentialSigned,
       })
-      return response
+      return { response, paid }
     } catch (e: any) {
       if (e instanceof ChannelNotInstalledError) {
         // Operator provisioning gap, not a caller mistake. No channel means no
-        // voucher was ever signed, so this is provably unpaid.
+        // voucher was ever signed — paid is false, provably unpaid.
         throw new UpstreamError('session_channel_not_installed', 503, e.message, 'no')
       }
       if (e instanceof BudgetExceededError) {
-        // Refused inside onChallenge, before signing. Provably unpaid.
+        // Refused inside onChallenge, before signing. paid is false.
         throw new UpstreamError('upstream_over_budget', 502, e.message, 'no')
       }
-      // Any other failure: did the voucher get signed before it blew up?
-      const evidence = await sessionPaymentEvidence(env, route.id, before)
+      // Any other failure: `paid` tells us exactly whether the voucher was
+      // signed for this call before it blew up. No watermark read, no guess.
       throw new UpstreamError(
         'upstream_unreachable',
         502,
         e?.message ?? 'session upstream call failed',
-        evidence,
+        paid ? 'yes' : 'no',
       )
     }
   }
 
   // tempo.charge — the router pays this call out of its own pool.
   try {
-    return await payMerchant(env, merchantUrl, init, { maxAmountRaw })
+    const response = await payMerchant(env, merchantUrl, init, { maxAmountRaw, onCredentialSigned })
+    return { response, paid }
   } catch (e: any) {
     if (e instanceof BudgetExceededError) {
       throw new UpstreamError('upstream_over_budget', 502, e.message, 'no')
     }
-    // A charge failure is genuinely ambiguous: mppx may have died before the
-    // 402, or after signing and submitting the transfer with the response
-    // lost. We cannot tell from here, and we must not guess in the direction
-    // that gives away free calls.
+    // `paid` disambiguates what would otherwise be a guess: false means mppx
+    // died before answering any 402 (no credential signed); true means it
+    // signed and submitted the transfer and the failure came after, so the
+    // money may have moved.
     throw new UpstreamError(
       'upstream_unreachable',
       502,
       e?.message ?? 'upstream call failed',
-      'maybe',
+      paid ? 'yes' : 'no',
     )
-  }
-}
-
-/**
- * Decide whether a session voucher was signed, by comparing the channel's
- * cumulative watermark before and after a failed call.
- *
- * `payMerchantSession` persists the new cumulative from its `onChannelUpdate`
- * hook the moment a voucher is signed — which happens BEFORE the merchant's
- * final response is known. So an advanced watermark is proof the money is
- * committed even though the call failed.
- *
- * If the watermark cannot be read at all we return `'maybe'`, never `'no'`:
- * an unreadable channel is not evidence of a missing payment.
- */
-async function sessionPaymentEvidence(
-  env: Env,
-  merchantId: string,
-  before: { cumulativeRaw: string } | null,
-): Promise<PaymentEvidence> {
-  if (!before) return 'maybe'
-  try {
-    const after = await getTempoChannel(env, merchantId)
-    if (!after) return 'maybe'
-    return BigInt(after.cumulativeRaw) > BigInt(before.cumulativeRaw) ? 'yes' : 'no'
-  } catch {
-    return 'maybe'
   }
 }
 
@@ -314,46 +322,38 @@ export async function callUpstreamJson<T = unknown>(
   env: Env,
   args: Parameters<typeof callUpstream>[1],
 ): Promise<T> {
-  // Router-held-credential routes (Mercury) involve no Tempo payment at all,
-  // so every failure on them is provably unpaid and safe to release.
-  const unpaidRoute = Boolean(args.route.upstreamAuth)
-
-  let response: Response
+  let call: UpstreamCall
   try {
-    response = await callUpstream(env, args)
+    call = await callUpstream(env, args)
   } catch (e: any) {
-    if (e instanceof UpstreamError) {
-      throw unpaidRoute
-        ? new UpstreamError(e.code, e.status, e.message, 'no')
-        : e
-    }
-    throw new UpstreamError(
-      'upstream_unreachable',
-      502,
-      e?.message ?? 'upstream call failed',
-      unpaidRoute ? 'no' : 'maybe',
-    )
+    // callUpstream already stamped the right evidence from its call-local
+    // signing flag. Anything that is not an UpstreamError never dispatched.
+    if (e instanceof UpstreamError) throw e
+    throw new UpstreamError('upstream_unreachable', 502, e?.message ?? 'upstream call failed', 'no')
   }
 
-  // Reaching a RESPONSE means the merchant answered our paid retry — the
-  // payment went through and the failure is downstream of it. These must be
-  // charged, not refunded.
-  if (!response.ok) {
+  // A response-level failure (bad status, non-JSON) is settled by whether a
+  // credential was actually signed for THIS call — NOT by "we got a response".
+  // An initial non-402 500/404 returns a response with `paid === false`, and
+  // that must release, not charge.
+  const evidence: PaymentEvidence = call.paid ? 'yes' : 'no'
+
+  if (!call.response.ok) {
     throw new UpstreamError(
       'upstream_error',
       502,
-      `upstream ${args.route.id} returned ${response.status}`,
-      unpaidRoute ? 'no' : 'yes',
+      `upstream ${args.route.id} returned ${call.response.status}`,
+      evidence,
     )
   }
   try {
-    return (await response.json()) as T
+    return (await call.response.json()) as T
   } catch {
     throw new UpstreamError(
       'upstream_bad_body',
       502,
       `upstream ${args.route.id} returned non-JSON`,
-      unpaidRoute ? 'no' : 'yes',
+      evidence,
     )
   }
 }

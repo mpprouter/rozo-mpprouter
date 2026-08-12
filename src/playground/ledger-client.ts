@@ -166,6 +166,20 @@ export function reserve(
   })
 }
 
+/**
+ * Mark a reserved call as dispatched, immediately before the upstream fetch.
+ *
+ * Fire-and-await this after `reserve` and before any payment attempt: it is
+ * the marker the reaper uses to decide release (never dispatched) vs commit
+ * (dispatched, so the paid call was bracketed).
+ */
+export function markDispatched(
+  env: Env,
+  callId: string,
+): Promise<LedgerResult<{ marked: boolean }>> {
+  return doPost(env, '/dispatch', { call_id: callId })
+}
+
 export function commit(
   env: Env,
   callId: string,

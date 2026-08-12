@@ -112,11 +112,18 @@ export interface StoredCall {
   /** Atomic string: the amount actually charged (0 until committed). */
   charged: string
   at: number
+  /**
+   * Set atomically right BEFORE the upstream fetch. The reaper needs this to
+   * tell "the worker died before any payment attempt" (release — nothing was
+   * ever dispatched or paid) from "the worker died mid/post upstream call"
+   * (commit — the reserve→dispatch window brackets the paid call).
+   */
+  dispatched?: boolean
   /** Set when released, for operator forensics. */
   release_reason?: string
   /**
-   * Set when a call was committed by the stale-call reaper rather than by its
-   * own request. Support uses this to find calls whose user may deserve a
+   * Set when a call was committed OR released by the stale-call reaper rather
+   * than by its own request. Support uses this to find calls whose user may deserve a
    * goodwill credit — the router paid upstream, but the response never reached
    * the user.
    */
@@ -204,8 +211,36 @@ export class PlaygroundLedger implements DurableObject {
       const held = parseAtomic(call.max_price)
       const balKey = `bal:${call.account}`
       const balance = parseAtomic((await this.storage.get<string>(balKey)) ?? '0')
-      // Committed at the full hold: we have no evidence of the actual price,
-      // and the hold is the ceiling the user already agreed to.
+      const ageSec = Math.round((now - call.at) / 1000)
+
+      if (!call.dispatched) {
+        // The worker died AFTER reserving but BEFORE marking dispatch, so no
+        // upstream request — and no payment — was ever attempted. Refund the
+        // full hold.
+        await this.storage.put(key, {
+          ...call,
+          status: 'released',
+          charged: '0',
+          release_reason: 'reaped_never_dispatched',
+          reaped: true,
+        } satisfies StoredCall)
+        await this.storage.put(balKey, (balance + held).toString())
+        await this.storage.put(
+          'total:outstanding',
+          (parseAtomic((await this.storage.get<string>('total:outstanding')) ?? '0') - held).toString(),
+        )
+        console.warn(
+          `[playground-ledger] reaped UNDISPATCHED call ${call.call_id} (chip=${call.chip}) ` +
+            `after ${ageSec}s; released ${held} atomic`,
+        )
+        continue
+      }
+
+      // Dispatched but never settled: the reserve→dispatch window brackets the
+      // paid upstream call, so this most likely cost the router money.
+      // Committed at the full hold — no evidence of the actual price, and the
+      // hold is the ceiling the user already agreed to. Releasing would hand
+      // out free calls to anyone who can strand a call after dispatch.
       await this.storage.put(key, {
         ...call,
         status: 'committed',
@@ -222,8 +257,8 @@ export class PlaygroundLedger implements DurableObject {
         (parseAtomic((await this.storage.get<string>('total:outstanding')) ?? '0') - held).toString(),
       )
       console.warn(
-        `[playground-ledger] reaped stranded call ${call.call_id} (chip=${call.chip}) ` +
-          `after ${Math.round((now - call.at) / 1000)}s; committed ${held} atomic`,
+        `[playground-ledger] reaped DISPATCHED call ${call.call_id} (chip=${call.chip}) ` +
+          `after ${ageSec}s; committed ${held} atomic`,
       )
     }
 
@@ -254,6 +289,8 @@ export class PlaygroundLedger implements DurableObject {
         return Response.json(await this.account(body))
       case '/reserve':
         return Response.json(await this.reserve(body))
+      case '/dispatch':
+        return Response.json(await this.markDispatched(body))
       case '/settle':
         return Response.json(await this.settle(body))
       case '/totals':
@@ -438,9 +475,21 @@ export class PlaygroundLedger implements DurableObject {
         // intent. Otherwise someone is trying to reuse a spent intent.
         if (intent.tx_hash === body.tx_hash && intent.op_index === body.op_index) {
           const balance = parseAtomic((await txn.get<string>(`bal:${intent.account}`)) ?? '0')
+          // Session RENEWAL. While the recorded session is still valid we hand
+          // back the SAME identity, so a retry cannot mint a second token or
+          // extend the TTL. But once it has expired, re-opening within the
+          // hard renewal window (enforced by the route via body.session_exp)
+          // must issue a FRESH session — returning the stale, already-expired
+          // jti/exp here is what stranded the balance behind a permanent 410.
+          const renew =
+            intent.session_exp === undefined || intent.session_exp <= body.now / 1000
+          const returned: StoredIntent = renew
+            ? { ...intent, session_jti: body.session_jti, session_exp: body.session_exp }
+            : intent
+          if (renew) await txn.put(`intent:${body.intent_id}`, returned)
           return {
             ok: true as const,
-            value: { intent, balance: balance.toString(), replayed: true },
+            value: { intent: returned, balance: balance.toString(), replayed: true },
           }
         }
         return err('intent_already_used', 'this intent has already been claimed')
@@ -469,7 +518,10 @@ export class PlaygroundLedger implements DurableObject {
       // The checks at intent creation are advisory headroom only: they hold
       // nothing, so N intents can each pass them and then all be opened. This
       // is the enforcement point that actually bounds outstanding credit.
-      const depKey = `dep:${intent.account}:${utcDayKey(body.now)}`
+      // Keyed by the ON-CHAIN confirmation day, not the claim day. Keying by
+      // claim time would let an attacker spread claims of same-day deposits
+      // across later calendar days to slip past the per-day cap.
+      const depKey = `dep:${intent.account}:${utcDayKey(body.confirmed_at)}`
       const depositedToday = parseAtomic((await txn.get<string>(depKey)) ?? '0')
       const dayCap = parseAtomic(body.per_account_day_cap)
       const outstanding = parseAtomic((await txn.get<string>('total:outstanding')) ?? '0')
@@ -660,6 +712,28 @@ export class PlaygroundLedger implements DurableObject {
   // -------------------------------------------------------------------------
   // /settle  (commit or release)
   // -------------------------------------------------------------------------
+
+  /**
+   * Mark a reserved call as dispatched, right before the upstream fetch.
+   *
+   * This is what lets the reaper tell a call that died before any payment
+   * attempt (release) from one that died mid/post upstream call (commit). It
+   * is a no-op on a call that has already settled or already been marked, so a
+   * retry is harmless.
+   */
+  private async markDispatched(body: {
+    call_id: string
+  }): Promise<Result<{ marked: boolean }>> {
+    return this.storage.transaction(async txn => {
+      const call = await txn.get<StoredCall>(`call:${body.call_id}`)
+      if (!call) return err('call_not_found', 'unknown call_id')
+      if (call.status !== 'reserved' || call.dispatched) {
+        return { ok: true as const, value: { marked: false } }
+      }
+      await txn.put(`call:${body.call_id}`, { ...call, dispatched: true } satisfies StoredCall)
+      return { ok: true as const, value: { marked: true } }
+    })
+  }
 
   /**
    * Finish a reserved call.
