@@ -14002,8 +14002,8 @@
             "method": "tempo",
             "currency": "usd",
             "decimals": 6,
-            "amount": "500",
-            "description": "Contract events, full history (ledger range + topic filters) - $0.0005 per call"
+            "amount": "1000",
+            "description": "Contract events, full history (ledger range + topic filters) - $0.001 per call"
           }
         },
         {
@@ -14015,8 +14015,8 @@
             "method": "tempo",
             "currency": "usd",
             "decimals": 6,
-            "amount": "500",
-            "description": "Events across a ledger range (from/to) - $0.0005 per call"
+            "amount": "1000",
+            "description": "Events across a ledger range (from/to) - $0.001 per call"
           }
         },
         {
@@ -14028,8 +14028,8 @@
             "method": "tempo",
             "currency": "usd",
             "decimals": 6,
-            "amount": "500",
-            "description": "Soroban transactions for a contract - $0.0005 per call"
+            "amount": "1000",
+            "description": "Soroban transactions for a contract - $0.001 per call"
           }
         },
         {
@@ -14041,8 +14041,8 @@
             "method": "tempo",
             "currency": "usd",
             "decimals": 6,
-            "amount": "500",
-            "description": "Transaction lookup by hash (beyond RPC retention) - $0.0005 per call"
+            "amount": "1000",
+            "description": "Transaction lookup by hash (beyond RPC retention) - $0.001 per call"
           }
         }
       ]

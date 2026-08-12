@@ -39,10 +39,10 @@ describe('Mercury catalog materialization', () => {
     }
   })
 
-  it('every mercury route is fixed-priced at $0.0005 and capped at 1,000/day', () => {
+  it('every mercury route is fixed-priced at $0.001 and capped at 1,000/day', () => {
     for (const id of MERCURY_ROUTE_IDS) {
       const route = PUBLIC_SERVICE_ROUTES.find(r => r.id === id)!
-      expect(route.fixedPricing).toEqual({ amountUsd: '0.0005' })
+      expect(route.fixedPricing).toEqual({ amountUsd: '0.001' })
       expect(route.rateLimit).toEqual({ perDay: 1000 })
     }
   })
