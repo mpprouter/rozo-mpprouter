@@ -1,0 +1,377 @@
+/**
+ * Upstream dispatch: which payment seam a playground call uses, and what
+ * happens to the caller's reservation when a session merchant has no channel.
+ *
+ * `src/mpp/tempo-client.ts` is mocked at the module boundary so the two seams
+ * (`payMerchant` / `payMerchantSession`) are observable without any real
+ * payment machinery. That is the point of these tests: the bug worth catching
+ * is paying a session merchant through the charge seam (or vice versa), which
+ * no amount of testing the seams themselves would reveal.
+ */
+
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+/** Real error class — the dispatcher branches on `instanceof`. */
+class ChannelNotInstalledError extends Error {
+  constructor(public readonly merchantId: string) {
+    super(`No Tempo channel installed for merchant "${merchantId}". Run scripts/open-channel.ts to open one.`)
+    this.name = 'ChannelNotInstalledError'
+  }
+}
+
+const payMerchant = vi.fn()
+const payMerchantSession = vi.fn()
+
+vi.mock('../src/mpp/tempo-client', () => ({
+  ChannelNotInstalledError,
+  payMerchant: (...args: unknown[]) => payMerchant(...args),
+  payMerchantSession: (...args: unknown[]) => payMerchantSession(...args),
+}))
+
+const { callUpstream, resolvePlaygroundRoute, UpstreamError } = await import(
+  '../src/playground/upstream'
+)
+const { handlePlaygroundChat } = await import('../src/routes/playground')
+const { PLAYGROUND_MODELS, TIER_PRICE_USD, findModel } = await import('../src/playground/models')
+const { parseUsd } = await import('../src/playground/amount')
+const { createIntent, openIntent, readAccount } = await import(
+  '../src/playground/ledger-client'
+)
+const { mintSessionToken } = await import('../src/playground/session-token')
+const { makePlaygroundLedgerMock } = await import('./helpers/playground-ledger-mock')
+const { makeAtomicStoreMock } = await import('./helpers/atomic-store-mock')
+import type { Env } from '../src/index'
+
+const SECRET = 'playground-test-secret-not-a-real-key'
+const ALICE = 'GTESTALICEXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+const ROUTER = 'GTESTROUTERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+
+function makeEnv(): Env {
+  return {
+    PLAYGROUND_LEDGER: makePlaygroundLedgerMock(),
+    PLAYGROUND_ENABLED: 'true',
+    PLAYGROUND_SESSION_SECRET: SECRET,
+    STELLAR_ROUTER_PUBLIC: ROUTER,
+  } as unknown as Env
+}
+
+function completion(text = 'hello from the model') {
+  return new Response(JSON.stringify({ choices: [{ message: { content: text } }] }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })
+}
+
+async function fund(env: Env, usd: string) {
+  const now = Date.now()
+  const intent = await createIntent(env, {
+    intentId: `fund-${Math.random().toString(16).slice(2)}`,
+    account: ALICE,
+    amountAtomic: parseUsd(usd),
+    memo: `pg-${Math.random().toString(16).slice(2, 22)}`,
+    now,
+    expiresAt: now + 600_000,
+  })
+  if (!intent.ok) throw new Error(intent.code)
+  await openIntent(env, {
+    intentId: intent.value.intent_id,
+    txHash: Math.random().toString(16).slice(2).padEnd(64, '0').slice(0, 64),
+    opIndex: 0,
+    now,
+    sessionJti: 'j',
+    sessionExp: Math.floor(now / 1000) + 3600,
+  })
+}
+
+async function token(): Promise<string> {
+  const { token } = await mintSessionToken(SECRET, {
+    account: ALICE,
+    jti: 'jti-dispatch',
+    now: Date.now(),
+    ttlSeconds: 3600,
+  })
+  return token
+}
+
+function chatRequest(model: string, bearer: string, callId?: string): Request {
+  return new Request('https://apiserver.example/v1/playground/chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
+    body: JSON.stringify({
+      model,
+      ...(callId ? { call_id: callId } : {}),
+      messages: [{ role: 'user', content: 'hi' }],
+    }),
+  })
+}
+
+beforeEach(() => {
+  payMerchant.mockReset()
+  payMerchantSession.mockReset()
+})
+
+describe('seam selection', () => {
+  it('routes a tempo.charge route through payMerchant', async () => {
+    const env = makeEnv()
+    payMerchant.mockResolvedValue(completion())
+    const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
+    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
+
+    await callUpstream(env, { route, body: { model: 'llama-3.1-8b-instant' } })
+
+    expect(payMerchant).toHaveBeenCalledTimes(1)
+    expect(payMerchantSession).not.toHaveBeenCalled()
+  })
+
+  it('routes a tempo.session route through payMerchantSession, keyed by route.id', async () => {
+    const env = makeEnv()
+    payMerchantSession.mockResolvedValue({ response: completion(), channelBefore: { cumulativeRaw: '0' } })
+    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    expect(route.upstreamPaymentMethod).toBe('tempo.session')
+
+    await callUpstream(env, { route, body: { model: 'claude-opus-5' } })
+
+    expect(payMerchantSession).toHaveBeenCalledTimes(1)
+    expect(payMerchant).not.toHaveBeenCalled()
+    // The channel is keyed by merchant id — a wrong key silently misses the
+    // channel and looks like "not installed".
+    const [, merchantId, merchantUrl] = payMerchantSession.mock.calls[0]
+    expect(merchantId).toBe(route.id)
+    expect(merchantUrl).toContain(route.upstreamHost)
+  })
+
+  it('routes the openai chat route through the session seam too', async () => {
+    const env = makeEnv()
+    payMerchantSession.mockResolvedValue({ response: completion(), channelBefore: { cumulativeRaw: '0' } })
+    const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
+    expect(route.upstreamPaymentMethod).toBe('tempo.session')
+
+    await callUpstream(env, { route, body: { model: 'gpt-4o-mini' } })
+
+    expect(payMerchantSession).toHaveBeenCalledTimes(1)
+    expect(payMerchantSession.mock.calls[0][1]).toBe('openai_chat')
+  })
+
+  it('never pays for a router-held-credential route', async () => {
+    // Mercury is served with the router's own JWT — no Tempo payment at all.
+    // ATOMIC_STORE backs the shared daily rate-limit counter that Mercury
+    // calls consume — see consumeUpstreamRateLimit in upstream.ts.
+    const env = {
+      ...makeEnv(),
+      ATOMIC_STORE: makeAtomicStoreMock(),
+      MERCURYDATA_MAINNET_JWT: 'test-token',
+    } as Env
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(completion())
+    const route = resolvePlaygroundRoute('/v1/services/mercury/txs/by-hash', 'GET')
+
+    await callUpstream(env, { route, query: { tx_hash: 'a'.repeat(64) } })
+
+    expect(payMerchant).not.toHaveBeenCalled()
+    expect(payMerchantSession).not.toHaveBeenCalled()
+    expect(fetchSpy).toHaveBeenCalled()
+    fetchSpy.mockRestore()
+  })
+})
+
+describe('channel not installed', () => {
+  it('maps ChannelNotInstalledError to a 503 UpstreamError', async () => {
+    const env = makeEnv()
+    payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('anthropic_chat_completions'))
+    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+
+    await expect(callUpstream(env, { route, body: {} })).rejects.toMatchObject({
+      code: 'session_channel_not_installed',
+      status: 503,
+    })
+  })
+
+  it('releases the reservation so an unprovisioned channel never bills the user', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('anthropic_chat_completions'))
+
+    const response = await handlePlaygroundChat(chatRequest('claude-opus-5', bearer, 'call-nochan'), env)
+
+    expect(response.status).toBe(503)
+    const body = await response.json()
+    expect(body.error).toBe('session_channel_not_installed')
+    expect(body.charged_usd).toBe('0.00')
+
+    // The whole hold came back — the balance is untouched.
+    const account = await readAccount(env, ALICE)
+    expect(account.ok).toBe(true)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
+    expect(account.value.calls[0].status).toBe('released')
+    expect(account.value.calls[0].charged).toBe('0')
+  })
+
+  it('releases the reservation on a generic upstream failure too', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockResolvedValue(new Response('nope', { status: 500 }))
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-500'),
+      env,
+    )
+    expect(response.status).toBe(502)
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
+  })
+
+  it('does not echo the upstream error body back to the caller', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockResolvedValue(
+      new Response('{"internal":"secret-upstream-detail"}', { status: 500 }),
+    )
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-leak'),
+      env,
+    )
+    expect(await response.text()).not.toContain('secret-upstream-detail')
+  })
+})
+
+describe('tier pricing through the full call path', () => {
+  it('charges the cheap tier price for a cheap model', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockResolvedValue(completion())
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-cheap'),
+      env,
+    )
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body.charged_usd).toBe('0.02')
+    expect(body.balance_usd).toBe('0.98')
+    expect(body.message).toBe('hello from the model')
+  })
+
+  it('charges the flagship tier price for a flagship model', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchantSession.mockResolvedValue({
+      response: completion(),
+      channelBefore: { cumulativeRaw: '0' },
+    })
+
+    const response = await handlePlaygroundChat(
+      chatRequest('claude-opus-5', bearer, 'call-flagship'),
+      env,
+    )
+    expect(response.status).toBe(200)
+    const body = await response.json()
+    expect(body.charged_usd).toBe('0.10')
+    expect(body.balance_usd).toBe('0.90')
+    expect(body.model).toBe('claude-opus-5')
+  })
+
+  it('prices anthropic haiku at the cheap tier despite sharing the flagship route', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchantSession.mockResolvedValue({
+      response: completion(),
+      channelBefore: { cumulativeRaw: '0' },
+    })
+
+    const response = await handlePlaygroundChat(
+      chatRequest('claude-haiku-4-5', bearer, 'call-haiku'),
+      env,
+    )
+    expect((await response.json()).charged_usd).toBe('0.02')
+  })
+
+  it('forces max_tokens and passes through only role/content', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockResolvedValue(completion())
+
+    const request = new Request('https://apiserver.example/v1/playground/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
+      body: JSON.stringify({
+        model: 'llama-3.1-8b-instant',
+        // Every one of these must be dropped: they are the fields that turn a
+        // flat-priced demo call into an unbounded bill.
+        max_tokens: 100000,
+        stream: true,
+        tools: [{ type: 'function' }],
+        n: 50,
+        messages: [{ role: 'user', content: 'hi', extra: 'dropped' }],
+      }),
+    })
+    await handlePlaygroundChat(request, env)
+
+    const sent = JSON.parse(payMerchant.mock.calls[0][2].body)
+    expect(sent.max_tokens).toBe(800)
+    expect(sent.stream).toBe(false)
+    expect(sent.tools).toBeUndefined()
+    expect(sent.n).toBeUndefined()
+    expect(sent.messages).toEqual([{ role: 'user', content: 'hi' }])
+  })
+
+  it('a retried call_id returns the recorded outcome without a second upstream call', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockResolvedValue(completion())
+
+    await handlePlaygroundChat(chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'), env)
+    expect(payMerchant).toHaveBeenCalledTimes(1)
+
+    const retry = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'),
+      env,
+    )
+    const body = await retry.json()
+    expect(body.replayed).toBe(true)
+    expect(body.charged_usd).toBe('0.02')
+    expect(body.balance_usd).toBe('0.98')
+    // The upstream was NOT called a second time.
+    expect(payMerchant).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('model catalog after the session-seam promotion', () => {
+  it('makes the flagship Claude models callable', () => {
+    for (const id of ['claude-opus-5', 'claude-sonnet-5']) {
+      const model = findModel(id)!
+      expect(model.available).toBe(true)
+      expect(model.tier).toBe('flagship')
+      expect(TIER_PRICE_USD[model.tier]).toBe('0.10')
+    }
+  })
+
+  it('pins gpt-4o-mini as the only callable OpenAI model, in the cheap tier', () => {
+    const openai = PLAYGROUND_MODELS.filter(m => m.provider === 'openai')
+    const callable = openai.filter(m => m.available)
+    expect(callable.map(m => m.id)).toEqual(['gpt-4o-mini'])
+    expect(callable[0].tier).toBe('cheap')
+    // The flagship OpenAI slot stays unavailable: no verified id exists.
+    const flagship = openai.filter(m => m.tier === 'flagship')
+    expect(flagship.every(m => !m.available)).toBe(true)
+    expect(flagship[0].unavailableReason).toMatch(/no flagship openai model/i)
+  })
+
+  it('carries no unverified Claude model ids', () => {
+    // Retired/invented ids 404 at the merchant AFTER the router has paid.
+    const verified = new Set(['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'])
+    for (const m of PLAYGROUND_MODELS) {
+      if (m.provider === 'anthropic') expect(verified.has(m.id)).toBe(true)
+    }
+  })
+})

@@ -30,20 +30,33 @@
  *      consumes (see `consumeUpstreamRateLimit`).
  *   2. **tempo.charge** — Groq, DeepSeek. `payMerchant()` pays per call out of
  *      the router's own pool.
+ *   3. **tempo.session** — OpenAI, Anthropic. `payMerchantSession()` signs a
+ *      cumulative voucher against a pre-opened Tempo channel whose state lives
+ *      in `MPP_STORE`. This mirrors the `merchantIntent === 'session'` branch
+ *      in `proxy.ts:659`.
  *
- * `tempo.session` merchants (OpenAI, Anthropic, Gemini, OpenRouter) are
- * rejected here rather than attempted. `payMerchant` registers no session
- * method and passes no `onChallenge`, so it cannot answer a session challenge;
- * driving `payMerchantSession` from here would add a second writer to each
- * merchant's cumulative voucher watermark in KV. See `models.ts` for the
- * user-visible consequence.
+ * On the cumulative watermark: `payMerchantSession` installs an
+ * `onChannelUpdate` hook that persists the just-signed cumulative via
+ * `bumpCumulative`, which is monotone — a slower concurrent write sees an equal
+ * or higher value and drops rather than rewinding. The playground relies on
+ * that hook alone and deliberately does NOT replicate the extra post-2xx
+ * `bumpCumulative` the proxy performs: that call derives its delta from
+ * `parsed.request.amount` off the live 402, which the playground never sees
+ * because `payMerchantSession` handles the challenge internally. Since the
+ * in-client hook already persisted the authoritative value, the proxy's second
+ * bump is belt-and-braces, and skipping it keeps the playground from becoming
+ * an independent writer of a watermark it cannot compute correctly.
+ *
+ * A merchant with no channel installed raises `ChannelNotInstalledError`. That
+ * is an operator-provisioning gap, not a user error, so it maps to a 503 and
+ * the caller's reservation is released — see `failCall` in the route layer.
  */
 
 import type { Env } from '../index'
 import type { PublicServiceRoute } from '../services/merchants-types'
 import { getRouteByPublicPath, resolveUpstreamPath } from '../services/merchants'
 import { injectUpstreamAuth } from '../routes/proxy'
-import { payMerchant } from '../mpp/tempo-client'
+import { ChannelNotInstalledError, payMerchant, payMerchantSession } from '../mpp/tempo-client'
 import { checkAndBumpDailyLimit, utcDateKey } from '../mpp/rate-limit-do'
 
 export class UpstreamError extends Error {
@@ -58,12 +71,16 @@ export class UpstreamError extends Error {
 }
 
 /**
- * Look up a route the playground is allowed to call, refusing anything that
- * the charge seam cannot actually pay for.
+ * Look up a route the playground is allowed to call.
  *
  * The `verifiedMode` check is the same gate the proxy applies: a route that
  * has never completed a real paid call must not be reachable, and the
  * playground is not the place to discover that a merchant is broken.
+ *
+ * Both `tempo.charge` and `tempo.session` are accepted — `callUpstream`
+ * dispatches on the mode. Session routes can still fail at call time if the
+ * operator never opened a channel for them; that is handled where it is
+ * detectable, not guessed at here.
  */
 export function resolvePlaygroundRoute(
   publicPath: string,
@@ -72,13 +89,6 @@ export function resolvePlaygroundRoute(
   const route = getRouteByPublicPath(publicPath, method)
   if (!route) {
     throw new UpstreamError('route_unknown', 500, `playground route ${publicPath} is not registered`)
-  }
-  if (!route.upstreamAuth && route.upstreamPaymentMethod !== 'tempo.charge') {
-    throw new UpstreamError(
-      'route_session_mode',
-      503,
-      `route ${route.id} is ${route.upstreamPaymentMethod}; the playground charge seam cannot pay session-mode merchants`,
-    )
   }
   if (!route.verifiedMode) {
     throw new UpstreamError('route_unverified', 503, `route ${route.id} is not verified`)
@@ -152,13 +162,28 @@ export async function callUpstream(
     return fetch(merchantUrl, { method: route.method, headers: authed, body: payload, signal })
   }
 
+  const init: RequestInit = { method: route.method, headers, body: payload, signal }
+
+  if (route.upstreamPaymentMethod === 'tempo.session') {
+    // Mirrors proxy.ts:659. The channel is keyed by `route.id`; the cumulative
+    // watermark is persisted by payMerchantSession's own onChannelUpdate hook
+    // (see the module header for why we do not bump it a second time).
+    try {
+      const { response } = await payMerchantSession(env, route.id, merchantUrl, init)
+      return response
+    } catch (e: any) {
+      if (e instanceof ChannelNotInstalledError) {
+        // Operator provisioning gap, not a caller mistake. Surfaced as 503 so
+        // the route layer releases the reservation and the frontend can mark
+        // the model unavailable rather than showing a generic failure.
+        throw new UpstreamError('session_channel_not_installed', 503, e.message)
+      }
+      throw e
+    }
+  }
+
   // tempo.charge — the router pays this call out of its own pool.
-  return payMerchant(env, merchantUrl, {
-    method: route.method,
-    headers,
-    body: payload,
-    signal,
-  })
+  return payMerchant(env, merchantUrl, init)
 }
 
 /**

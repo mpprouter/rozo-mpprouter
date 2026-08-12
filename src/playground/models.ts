@@ -15,19 +15,17 @@
  * per tier that the caller cannot influence.
  *
  * ---------------------------------------------------------------------------
- * Why the flagship tier ships unavailable (2026-08-12)
+ * Payment modes, and what is callable (2026-08-13)
  * ---------------------------------------------------------------------------
- * The playground's internal charge seam is `payMerchant()` from
- * `src/mpp/tempo-client.ts`, which registers ONLY the `tempo.charge` mppx
- * method and passes no `onChallenge` hook. It therefore cannot answer a
- * `tempo.session` challenge: session mode needs a pre-opened on-chain Tempo
- * channel, persisted `TempoChannelState` in `MPP_STORE`, and a cumulative
- * voucher watermark (`payMerchantSession` + `bumpCumulative`). Driving that
- * from the playground would add a second writer to each merchant's cumulative
- * watermark, which is exactly the kind of shared-money state this feature was
- * designed to stay away from.
+ * The playground reaches upstreams through two seams, both already used by the
+ * paid proxy and both reused verbatim (see `./upstream.ts`):
  *
- * Both flagship providers resolve to session mode today:
+ *   - `payMerchant()`        — `tempo.charge`. Groq, DeepSeek.
+ *   - `payMerchantSession()` — `tempo.session`. OpenAI, Anthropic. Signs a
+ *     cumulative voucher against a Tempo channel pre-opened by
+ *     `scripts/admin/open-tempo-channel.ts`.
+ *
+ * Both flagship providers resolve to session mode:
  *
  *   - `openai_chat` — `OPERATOR_OVERLAY['openai::/v1/chat/completions']` pins
  *     `upstreamPaymentMethod: 'tempo.session'` explicitly (merchants.ts).
@@ -39,14 +37,44 @@
  *     label, not a payment mode, and the two disagree. Flagged to the operator;
  *     the derived session mode is what actually runs.
  *
- * They are listed here anyway, with `available: false`, because the UI shows
- * them greyed with an honest reason rather than pretending they don't exist.
- * `assertModelCallable()` rejects them, so an unavailable model can never
- * reach the charge seam even if the frontend ignores the flag.
+ * ---------------------------------------------------------------------------
+ * Which model ids are pinned, and on what evidence
+ * ---------------------------------------------------------------------------
+ * Anthropic: `merchants.ts`'s `verifiedNote` for `anthropic_chat_completions`
+ * records real paid calls on 2026-08-09 returning 202 + a completion for six
+ * current model ids, including `claude-opus-5`, `claude-sonnet-5` and
+ * `claude-haiku-4-5`. Those three are pinned here. Retired 2024-era ids 404 at
+ * the merchant, so an id must come from that verified list, never from memory.
  *
- * To promote a model to available: open a Tempo channel for that merchant,
- * teach the playground a session-capable seam, and flip the flag — or wait
- * for the merchant to advertise a `charge` intent.
+ * OpenAI: the ONLY concretely evidenced model id for the `openai_chat` route
+ * anywhere in this repo is `gpt-4o-mini`, and it appears three times
+ * independently — `scripts/admin/open-tempo-channel.ts` (the channel-open
+ * probe body), `scripts/e2e/providers.mjs`, and `scripts/e2e/monitor-verified.mjs`.
+ * `docs/verified-runs.json` records `session_verified_at` for `openai_chat` but
+ * its `runs` array is empty, so it names no model. `gpt-4o-mini` is a small
+ * model, not a flagship one, so it is pinned in the CHEAP tier at $0.02 — tier
+ * follows the model, not the provider, and billing a mini model at the flagship
+ * $0.10 would overcharge for it.
+ *
+ * No flagship OpenAI model id has ever been recorded as verified through this
+ * router, so the flagship OpenAI slot stays `available: false`. It is NOT
+ * guessed at: an unverified id would 404 at the merchant AFTER the router had
+ * already paid for the call. (An earlier revision of this file carried an
+ * invented `gpt-5.2` id with no verification behind it; it has been removed.)
+ *
+ * ---------------------------------------------------------------------------
+ * Unavailable entries are advertised, not hidden
+ * ---------------------------------------------------------------------------
+ * Models we cannot call are still listed, with `available: false` and a reason,
+ * so the UI greys them honestly instead of pretending they don't exist.
+ * `assertModelCallable()` rejects them, so an unavailable model can never reach
+ * a payment seam even if the frontend ignores the flag.
+ *
+ * A session-mode model can also fail at CALL time if the operator never opened
+ * a channel for its route — `scripts/admin/open-tempo-channel.ts` provisions
+ * `anthropic_messages` and `openai_chat`, but not `anthropic_chat_completions`.
+ * That surfaces as a 503 `session_channel_not_installed` with the reservation
+ * released, never as a silent charge.
  */
 
 import { parseUsd } from './amount'
@@ -109,46 +137,61 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     available: true,
   },
   {
+    // Verified 2026-08-09 alongside the flagship Claude ids (merchants.ts
+    // verifiedNote). Session-mode upstream, paid via payMerchantSession.
     id: 'claude-haiku-4-5',
     tier: 'cheap',
     provider: 'anthropic',
     routePublicPath: '/v1/services/anthropic/chat_completions',
     routeMethod: 'POST',
-    available: false,
-    unavailableReason:
-      'Upstream anthropic advertises tempo.session only; the playground charge seam cannot pay session-mode merchants.',
+    available: true,
+  },
+  {
+    // The only OpenAI model id evidenced anywhere in this repo for the
+    // openai_chat route — channel-open probe + both E2E scripts. A small
+    // model, so it is priced in the cheap tier, not flagship.
+    id: 'gpt-4o-mini',
+    tier: 'cheap',
+    provider: 'openai',
+    routePublicPath: '/v1/services/openai/chat',
+    routeMethod: 'POST',
+    available: true,
   },
 
-  // ---- flagship tier: session-mode upstreams, shown but not callable ----
+  // ---- flagship tier ----
   {
+    // Verified with a real paid call 2026-08-09 (202 + completion).
     id: 'claude-opus-5',
     tier: 'flagship',
     provider: 'anthropic',
     routePublicPath: '/v1/services/anthropic/chat_completions',
     routeMethod: 'POST',
-    available: false,
-    unavailableReason:
-      'Upstream anthropic advertises tempo.session only; the playground charge seam cannot pay session-mode merchants.',
+    available: true,
   },
   {
+    // Verified with a real paid call 2026-08-09 (202 + completion).
     id: 'claude-sonnet-5',
     tier: 'flagship',
     provider: 'anthropic',
     routePublicPath: '/v1/services/anthropic/chat_completions',
     routeMethod: 'POST',
-    available: false,
-    unavailableReason:
-      'Upstream anthropic advertises tempo.session only; the playground charge seam cannot pay session-mode merchants.',
+    available: true,
   },
   {
-    id: 'gpt-5.2',
+    // Placeholder id, NOT a callable model. No flagship OpenAI model has ever
+    // been verified through this router: verified-runs.json records a session
+    // verification for openai_chat but names no model, and every concrete id
+    // in the repo is gpt-4o-mini. Pinning a guessed flagship id here would
+    // 404 at the merchant AFTER the router paid for the call. Replace this
+    // entry with a real id only once a paid run records one.
+    id: 'openai-flagship-pending-verification',
     tier: 'flagship',
     provider: 'openai',
     routePublicPath: '/v1/services/openai/chat',
     routeMethod: 'POST',
     available: false,
     unavailableReason:
-      'Upstream openai route is pinned to tempo.session in the operator overlay; the playground charge seam cannot pay session-mode merchants.',
+      'No flagship OpenAI model id has been verified through this router yet. gpt-4o-mini (cheap tier) is the only evidenced OpenAI model.',
   },
 ] as const
 

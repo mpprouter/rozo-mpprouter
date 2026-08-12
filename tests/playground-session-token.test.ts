@@ -153,15 +153,23 @@ describe('model allow-list', () => {
     }
   })
 
-  it('rejects a listed-but-session-mode model with a distinct reason', () => {
-    // Flagship models are advertised so the UI can grey them, but they must
-    // never reach the charge seam — see models.ts.
+  it('accepts a session-mode flagship model now that the session seam exists', () => {
+    // claude-opus-5 is paid via payMerchantSession — see upstream.ts.
+    const model = assertModelCallable('claude-opus-5')
+    expect(model.tier).toBe('flagship')
+    expect(TIER_PRICE_USD[model.tier]).toBe('0.10')
+  })
+
+  it('rejects a listed-but-unavailable model with a distinct reason', () => {
+    // The flagship OpenAI slot has no verified model id, so it is advertised
+    // for the UI to grey but must never reach a payment seam.
+    const placeholder = PLAYGROUND_MODELS.find(m => !m.available)!
     try {
-      assertModelCallable('claude-opus-5')
+      assertModelCallable(placeholder.id)
       throw new Error('expected rejection')
     } catch (e) {
       expect((e as ModelNotAllowedError).code).toBe('model_unavailable')
-      expect((e as ModelNotAllowedError).message).toMatch(/session/i)
+      expect((e as ModelNotAllowedError).message).toMatch(/verified/i)
     }
   })
 

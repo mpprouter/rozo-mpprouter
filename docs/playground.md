@@ -81,14 +81,49 @@ Prices: chat `$0.02` (cheap tier) / `$0.10` (flagship), Blend activity `$0.03`,
 tx-decode `$0.005`. Deposits are `$0.10` or `$1.00` and are **non-refundable
 demo credit**.
 
+## Upstream payment seams
+
+Playground calls reach upstreams three ways, all reusing existing router
+machinery (`src/playground/upstream.ts`):
+
+| Route kind | Seam | Merchants |
+| --- | --- | --- |
+| `route.upstreamAuth` | direct `fetch` with the router-held JWT, no payment | Mercury |
+| `tempo.charge` | `payMerchant()` | Groq, DeepSeek |
+| `tempo.session` | `payMerchantSession()` (mirrors `proxy.ts:659`) | Anthropic, OpenAI |
+
+Session mode signs a cumulative voucher against a channel pre-opened by
+`scripts/admin/open-tempo-channel.ts`, keyed by `route.id`. The playground
+relies on `payMerchantSession`'s own `onChannelUpdate` → `bumpCumulative` hook
+to persist the watermark and does **not** replicate the proxy's extra post-2xx
+bump, which derives its delta from a live-402 `parsed.request.amount` the
+playground never sees.
+
+⚠️ `open-tempo-channel.ts` provisions `anthropic_messages` and `openai_chat`,
+but **not** `anthropic_chat_completions` — the route the Claude models use. If
+no channel has been opened for it, those calls return 503
+`session_channel_not_installed` with the reservation released (the user is
+never billed). Open that channel before enabling the flagship models.
+
 ## Model availability
 
-Flagship models (`claude-opus-5`, `claude-sonnet-5`, `gpt-5.2`) and
-`claude-haiku-4-5` are advertised by `/config` but ship **unavailable**. Their
-upstream routes resolve to `tempo.session`, and the playground's charge seam
-(`payMerchant()`) registers only `tempo.charge` with no `onChallenge` hook, so
-it cannot answer a session challenge. Callable today: `llama-3.1-8b-instant`
-(Groq) and `deepseek-v4-flash` (DeepSeek). Full reasoning in
+| Model | Tier | Price | Callable | Route |
+| --- | --- | --- | --- | --- |
+| `llama-3.1-8b-instant` | cheap | $0.02 | yes | groq (charge) |
+| `deepseek-v4-flash` | cheap | $0.02 | yes | deepseek (charge) |
+| `claude-haiku-4-5` | cheap | $0.02 | yes | anthropic chat_completions (session) |
+| `gpt-4o-mini` | cheap | $0.02 | yes | openai chat (session) |
+| `claude-opus-5` | flagship | $0.10 | yes | anthropic chat_completions (session) |
+| `claude-sonnet-5` | flagship | $0.10 | yes | anthropic chat_completions (session) |
+| `openai-flagship-pending-verification` | flagship | $0.10 | **no** | openai chat (session) |
+
+The Claude ids come from the 2026-08-09 paid-verification list in
+`merchants.ts`'s `verifiedNote`; retired ids 404 at the merchant. `gpt-4o-mini`
+is the only OpenAI id evidenced anywhere in the repo (channel-open probe + both
+E2E scripts), and it is a small model, so it sits in the cheap tier — tier
+follows the model, not the provider. No flagship OpenAI model has ever been
+verified through this router, so that slot stays unavailable rather than
+carrying a guessed id that would 404 *after* the router paid. Full reasoning in
 `src/playground/models.ts`.
 
 ## Recon

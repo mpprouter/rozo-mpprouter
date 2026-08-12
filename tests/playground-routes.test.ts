@@ -23,6 +23,7 @@ import {
   handlePlaygroundTxDecode,
 } from '../src/routes/playground'
 import { parseUsd } from '../src/playground/amount'
+import { PLAYGROUND_MODELS } from '../src/playground/models'
 import { createIntent, openIntent } from '../src/playground/ledger-client'
 import { mintSessionToken } from '../src/playground/session-token'
 import { makePlaygroundLedgerMock } from './helpers/playground-ledger-mock'
@@ -308,12 +309,14 @@ describe('POST /v1/playground/chat', () => {
     expect(session.balance_usd).toBe('1.00')
   })
 
-  it('rejects a session-mode flagship model with the unavailable reason', async () => {
+  it('rejects an advertised-but-unavailable model with the unavailable reason', async () => {
     const env = makeEnv()
     await fund(env, '1')
     const token = await sessionFor(env)
+    // The flagship OpenAI slot: advertised so the UI can grey it, never callable.
+    const placeholder = PLAYGROUND_MODELS.find(m => !m.available)!
     const r = await handlePlaygroundChat(
-      post('/v1/playground/chat', { model: 'claude-opus-5', messages: [{ role: 'user', content: 'hi' }] }, token),
+      post('/v1/playground/chat', { model: placeholder.id, messages: [{ role: 'user', content: 'hi' }] }, token),
       env,
     )
     expect(r.status).toBe(400)
