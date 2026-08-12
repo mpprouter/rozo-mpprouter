@@ -126,10 +126,10 @@ describe('seam selection', () => {
   it('routes a tempo.session route through payMerchantSession, keyed by route.id', async () => {
     const env = makeEnv()
     payMerchantSession.mockResolvedValue({ response: completion(), channelBefore: { cumulativeRaw: '0' } })
-    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
 
-    await callUpstream(env, { route, body: { model: 'claude-opus-5' } })
+    await callUpstream(env, { route, body: { model: 'gpt-4o-mini' } })
 
     expect(payMerchantSession).toHaveBeenCalledTimes(1)
     expect(payMerchant).not.toHaveBeenCalled()
@@ -138,6 +138,21 @@ describe('seam selection', () => {
     const [, merchantId, merchantUrl] = payMerchantSession.mock.calls[0]
     expect(merchantId).toBe(route.id)
     expect(merchantUrl).toContain(route.upstreamHost)
+  })
+
+  it('routes the anthropic chat_completions route through the CHARGE seam', async () => {
+    // The overlay pins tempo.charge because production KV holds no channel
+    // for this route, yet its 2026-08-09 paid verification succeeded. Sending
+    // these models down the session path would 503 in production.
+    const env = makeEnv()
+    payMerchant.mockResolvedValue(completion())
+    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
+
+    await callUpstream(env, { route, body: { model: 'claude-opus-5' } })
+
+    expect(payMerchant).toHaveBeenCalledTimes(1)
+    expect(payMerchantSession).not.toHaveBeenCalled()
   })
 
   it('routes the openai chat route through the session seam too', async () => {
@@ -176,8 +191,8 @@ describe('seam selection', () => {
 describe('channel not installed', () => {
   it('maps ChannelNotInstalledError to a 503 UpstreamError', async () => {
     const env = makeEnv()
-    payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('anthropic_chat_completions'))
-    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('openai_chat'))
+    const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
 
     await expect(callUpstream(env, { route, body: {} })).rejects.toMatchObject({
       code: 'session_channel_not_installed',
@@ -189,9 +204,9 @@ describe('channel not installed', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('anthropic_chat_completions'))
+    payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('openai_chat'))
 
-    const response = await handlePlaygroundChat(chatRequest('claude-opus-5', bearer, 'call-nochan'), env)
+    const response = await handlePlaygroundChat(chatRequest('gpt-4o-mini', bearer, 'call-nochan'), env)
 
     expect(response.status).toBe(503)
     const body = await response.json()
@@ -262,10 +277,7 @@ describe('tier pricing through the full call path', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchantSession.mockResolvedValue({
-      response: completion(),
-      channelBefore: { cumulativeRaw: '0' },
-    })
+    payMerchant.mockResolvedValue(completion())
 
     const response = await handlePlaygroundChat(
       chatRequest('claude-opus-5', bearer, 'call-flagship'),
@@ -282,10 +294,7 @@ describe('tier pricing through the full call path', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchantSession.mockResolvedValue({
-      response: completion(),
-      channelBefore: { cumulativeRaw: '0' },
-    })
+    payMerchant.mockResolvedValue(completion())
 
     const response = await handlePlaygroundChat(
       chatRequest('claude-haiku-4-5', bearer, 'call-haiku'),
@@ -365,6 +374,34 @@ describe('model catalog after the session-seam promotion', () => {
     const flagship = openai.filter(m => m.tier === 'flagship')
     expect(flagship.every(m => !m.available)).toBe(true)
     expect(flagship[0].unavailableReason).toMatch(/no flagship openai model/i)
+  })
+
+  it('keeps every callable model on a seam that can actually pay in production', () => {
+    // A model whose route resolves to tempo.session needs a channel in KV.
+    // As of 2026-08-13 production has channels for openai_chat,
+    // anthropic_messages, openrouter_chat, gemini_generate, dune_execute and
+    // tempo_rpc — notably NOT anthropic_chat_completions, which is why that
+    // route is pinned to tempo.charge in the overlay.
+    const CHANNELS = new Set([
+      'openai_chat',
+      'anthropic_messages',
+      'openrouter_chat',
+      'gemini_generate',
+      'dune_execute',
+      'tempo_rpc',
+    ])
+    for (const model of PLAYGROUND_MODELS.filter(m => m.available)) {
+      const route = resolvePlaygroundRoute(model.routePublicPath, model.routeMethod)
+      if (route.upstreamPaymentMethod === 'tempo.session') {
+        expect(CHANNELS.has(route.id)).toBe(true)
+      }
+    }
+  })
+
+  it('pins anthropic chat_completions to charge, matching the missing prod channel', () => {
+    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
+    expect(route.verifiedMode).toBe('charge')
   })
 
   it('carries no unverified Claude model ids', () => {

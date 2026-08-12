@@ -25,17 +25,19 @@
  *     cumulative voucher against a Tempo channel pre-opened by
  *     `scripts/admin/open-tempo-channel.ts`.
  *
- * Both flagship providers resolve to session mode:
+ * The two flagship providers resolve differently:
  *
  *   - `openai_chat` — `OPERATOR_OVERLAY['openai::/v1/chat/completions']` pins
- *     `upstreamPaymentMethod: 'tempo.session'` explicitly (merchants.ts).
- *   - `anthropic_chat_completions` — the overlay sets no explicit method, so
- *     `pickUpstreamPaymentMethod()` (build-routes.ts) derives it from the
- *     catalog snapshot, where the `anthropic` service advertises
- *     `methods.tempo.intents = ["session"]` and nothing else. Note the overlay
- *     ALSO carries `verifiedMode: 'charge'` — that field is a verification
- *     label, not a payment mode, and the two disagree. Flagged to the operator;
- *     the derived session mode is what actually runs.
+ *     `upstreamPaymentMethod: 'tempo.session'` explicitly, and production KV
+ *     holds a `tempoChannel:openai_chat` entry, so the session seam works.
+ *   - `anthropic_chat_completions` — now pinned to `tempo.charge` in the
+ *     overlay (2026-08-13). The catalog snapshot advertises session at the
+ *     SERVICE level, but the 2026-08-09 real paid calls could not have used
+ *     session mode: production KV has no channel for this route, and
+ *     `payMerchantSession` hard-fails without one. The proxy hid the bad
+ *     derivation by dispatching on the live 402 intent; the playground reads
+ *     the hint statically, so the hint had to be corrected. Full evidence is
+ *     in the comment above that overlay entry in `merchants.ts`.
  *
  * ---------------------------------------------------------------------------
  * Which model ids are pinned, and on what evidence
@@ -70,11 +72,11 @@
  * `assertModelCallable()` rejects them, so an unavailable model can never reach
  * a payment seam even if the frontend ignores the flag.
  *
- * A session-mode model can also fail at CALL time if the operator never opened
- * a channel for its route — `scripts/admin/open-tempo-channel.ts` provisions
- * `anthropic_messages` and `openai_chat`, but not `anthropic_chat_completions`.
- * That surfaces as a 503 `session_channel_not_installed` with the reservation
- * released, never as a silent charge.
+ * A session-mode model can still fail at CALL time if the operator never
+ * opened a channel for its route. That surfaces as a 503
+ * `session_channel_not_installed` with the reservation released, never as a
+ * silent charge. Of the callable models only `gpt-4o-mini` takes the session
+ * path, and production KV does hold `tempoChannel:openai_chat`.
  */
 
 import { parseUsd } from './amount'
@@ -138,7 +140,7 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
   },
   {
     // Verified 2026-08-09 alongside the flagship Claude ids (merchants.ts
-    // verifiedNote). Session-mode upstream, paid via payMerchantSession.
+    // verifiedNote). Charge-mode upstream — see the overlay pin.
     id: 'claude-haiku-4-5',
     tier: 'cheap',
     provider: 'anthropic',

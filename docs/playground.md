@@ -90,7 +90,7 @@ machinery (`src/playground/upstream.ts`):
 | --- | --- | --- |
 | `route.upstreamAuth` | direct `fetch` with the router-held JWT, no payment | Mercury |
 | `tempo.charge` | `payMerchant()` | Groq, DeepSeek |
-| `tempo.session` | `payMerchantSession()` (mirrors `proxy.ts:659`) | Anthropic, OpenAI |
+| `tempo.session` | `payMerchantSession()` (mirrors `proxy.ts:659`) | OpenAI |
 
 Session mode signs a cumulative voucher against a channel pre-opened by
 `scripts/admin/open-tempo-channel.ts`, keyed by `route.id`. The playground
@@ -99,11 +99,19 @@ to persist the watermark and does **not** replicate the proxy's extra post-2xx
 bump, which derives its delta from a live-402 `parsed.request.amount` the
 playground never sees.
 
-⚠️ `open-tempo-channel.ts` provisions `anthropic_messages` and `openai_chat`,
-but **not** `anthropic_chat_completions` — the route the Claude models use. If
-no channel has been opened for it, those calls return 503
-`session_channel_not_installed` with the reservation released (the user is
-never billed). Open that channel before enabling the flagship models.
+Production KV (read 2026-08-13) holds channels for `anthropic_messages`,
+`dune_execute`, `gemini_generate`, `openai_chat`, `openrouter_chat` and
+`tempo_rpc`. Of the callable playground models only `gpt-4o-mini` uses the
+session path, and `tempoChannel:openai_chat` exists — so **no operator channel
+work is required** to enable the playground. A regression test asserts this
+invariant for every callable model.
+
+`anthropic_chat_completions` has **no** channel, which is why its overlay entry
+is now pinned to `tempo.charge`: its 2026-08-09 real-money verification
+succeeded, and a session call is impossible without a channel, so those calls
+must have gone through charge. The proxy had been masking the bad
+catalog-derived hint by dispatching on the live 402 intent. See the evidence
+block above that entry in `merchants.ts`.
 
 ## Model availability
 
@@ -111,10 +119,10 @@ never billed). Open that channel before enabling the flagship models.
 | --- | --- | --- | --- | --- |
 | `llama-3.1-8b-instant` | cheap | $0.02 | yes | groq (charge) |
 | `deepseek-v4-flash` | cheap | $0.02 | yes | deepseek (charge) |
-| `claude-haiku-4-5` | cheap | $0.02 | yes | anthropic chat_completions (session) |
+| `claude-haiku-4-5` | cheap | $0.02 | yes | anthropic chat_completions (charge) |
 | `gpt-4o-mini` | cheap | $0.02 | yes | openai chat (session) |
-| `claude-opus-5` | flagship | $0.10 | yes | anthropic chat_completions (session) |
-| `claude-sonnet-5` | flagship | $0.10 | yes | anthropic chat_completions (session) |
+| `claude-opus-5` | flagship | $0.10 | yes | anthropic chat_completions (charge) |
+| `claude-sonnet-5` | flagship | $0.10 | yes | anthropic chat_completions (charge) |
 | `openai-flagship-pending-verification` | flagship | $0.10 | **no** | openai chat (session) |
 
 The Claude ids come from the 2026-08-09 paid-verification list in
