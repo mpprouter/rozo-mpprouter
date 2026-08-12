@@ -5,12 +5,60 @@
  * Content adapted from the landingpage repo's public/llms.txt,
  * trimmed to the essentials an agent needs to discover and use
  * the router's services.
+ *
+ * Endpoint counts and the services list below are derived live from
+ * `listPublicCatalog` / `PUBLIC_SERVICE_ROUTES` — the same source
+ * `/v1/services/catalog` reads — so this file never drifts from the
+ * real catalog (see docs/service-probe-2026-07-31.md for the history
+ * of hand-typed numbers going stale).
  */
+import { listPublicCatalog, PUBLIC_SERVICE_ROUTES } from '../services/merchants'
+
+/**
+ * `route.name` is `${service.name} – ${endpoint description}` for
+ * endpoint-specific routes, or bare `service.name` otherwise (see
+ * `build-routes.ts`). Splitting on the em-dash separator recovers the
+ * service's display name without a separate services export.
+ */
+function serviceDisplayName(route: { name: string }): string {
+  const sep = route.name.indexOf(' – ')
+  return sep === -1 ? route.name : route.name.slice(0, sep)
+}
 
 export function handleLlmsTxt(): Response {
+  const catalog = listPublicCatalog()
+  const payable = catalog.filter(entry => entry.payment_status !== 'unavailable')
+  const routeById = new Map(PUBLIC_SERVICE_ROUTES.map(route => [route.id, route]))
+
+  const serviceNameBySlug = new Map<string, string>()
+  const payableServiceSlugs = new Set<string>()
+  const verifiedServiceSlugs = new Set<string>()
+  for (const entry of payable) {
+    const route = routeById.get(entry.id)
+    if (!route) continue
+    payableServiceSlugs.add(route.service)
+    if (!serviceNameBySlug.has(route.service)) {
+      serviceNameBySlug.set(route.service, serviceDisplayName(route))
+    }
+    if (entry.payment_status === 'verified') {
+      verifiedServiceSlugs.add(route.service)
+    }
+  }
+
+  const totalPayable = payable.length
+  const totalServices = payableServiceSlugs.size
+  const verifiedNames = [...verifiedServiceSlugs]
+    .map(slug => serviceNameBySlug.get(slug)!)
+    .sort((a, b) => a.localeCompare(b))
+  const remainingServices = totalServices - verifiedNames.length
+  const servicesLine =
+    remainingServices > 0
+      ? `Services include ${verifiedNames.join(', ')}, and ${remainingServices} more services.`
+      : `Services include ${verifiedNames.join(', ')}.`
+
   const body = `# MPP Router — Pay-per-call API Proxy
 
-> 489 paid API endpoints across 88 services, payable with Stellar USDC.
+> ${totalPayable} paid API endpoints across ${totalServices} services, payable with Stellar USDC.
 > One wallet, one hostname, no bridging, no gas.
 
 Base URL: https://apiserver.mpprouter.dev
@@ -19,9 +67,7 @@ Base URL: https://apiserver.mpprouter.dev
 
 MPP Router is a Stellar-to-Tempo payment proxy. Agents pay the router
 once in USDC on Stellar (via x402 v2 or legacy mppx), and the router
-pays the underlying merchant on Tempo. Services include OpenAI,
-OpenRouter, Anthropic, fal.ai, Replicate, Exa, Firecrawl, Perplexity,
-Stability AI, Suno, Grok, Brave Search, Alchemy, and more.
+pays the underlying merchant on Tempo. ${servicesLine}
 
 ## Payment preference (important)
 
@@ -58,7 +104,7 @@ loop for both x402 v2 and legacy mppx.
 
 ## Discovery endpoints
 
-GET /v1/services/catalog      — Full catalog (489 entries)
+GET /v1/services/catalog      — Full catalog (${totalPayable} entries)
 GET /v1/services/search       — Search/filter catalog (?q=, ?category=, ?status=)
 GET /openapi.json             — OpenAPI 3.1 spec
 GET /.well-known/ai-plugin.json — AI plugin manifest
