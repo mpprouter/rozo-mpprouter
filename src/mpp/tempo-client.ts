@@ -27,6 +27,7 @@
 import { Mppx, tempo, sessionLegacy as legacySession, Transport } from 'mppx/client'
 import { privateKeyToAccount } from 'viem/accounts'
 import type { Env } from '../index'
+import { getTempoClient } from './tempo-rpc'
 import {
   bumpCumulative,
   getTempoChannel,
@@ -304,6 +305,15 @@ function createTempoClientInternal(
 ) {
   const account = privateKeyToAccount(env.TEMPO_ROUTER_PRIVATE_KEY as `0x${string}`)
 
+  // Shared, isolate-lived viem client. This is the ONLY supported way to
+  // get `env.TEMPO_RPC_URL` into the payment path: none of the three
+  // methods below accepts an `rpcUrl` parameter — they each call
+  // `Client.getResolver({ rpcUrl: defaults.rpcUrl })` with mppx's own
+  // hardcoded map and would otherwise always hit the public endpoint.
+  // Passing `getClient` also stops us building a new client (and opening
+  // a new connection) on every single 402. See src/mpp/tempo-rpc.ts.
+  const getClient = () => getTempoClient(env.TEMPO_RPC_URL)
+
   // Three methods registered:
   //
   // 1. `tempo.charge` — single-shot intent, unchanged.
@@ -332,13 +342,15 @@ function createTempoClientInternal(
   // mode where our `onChallenge` hook controls every voucher.
   const mppx = Mppx.create({
     methods: [
-      tempo.charge({ account }),
+      tempo.charge({ account, getClient }),
       tempo.session({
         account,
+        getClient,
         onChannelUpdate: opts.onChannelUpdate,
       }),
       legacySession({
         account,
+        getClient,
         onChannelUpdate: opts.onChannelUpdate as any,
       }),
     ],
