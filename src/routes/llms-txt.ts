@@ -104,7 +104,7 @@ loop for both x402 v2 and legacy mppx.
 
 ## Discovery endpoints
 
-GET /v1/services/catalog      — Full catalog (${totalPayable} entries)
+GET /v1/services/catalog      — Full catalog (${catalog.length} entries)
 GET /v1/services/search       — Search/filter catalog (?q=, ?category=, ?status=)
 GET /openapi.json             — OpenAPI 3.1 spec
 GET /.well-known/ai-plugin.json — AI plugin manifest
