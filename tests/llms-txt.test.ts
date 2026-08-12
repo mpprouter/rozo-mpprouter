@@ -22,7 +22,7 @@ describe('GET /llms.txt', () => {
 
     expect(payableCount).toBeGreaterThan(0)
     expect(body).toContain(`> ${payableCount} paid API endpoints`)
-    expect(body).toContain(`Full catalog (${payableCount} entries)`)
+    expect(body).toContain(`Full catalog (${catalog.length} entries)`)
     // The stale hardcoded number must be gone.
     expect(body).not.toContain('489 paid API endpoints')
     expect(body).not.toContain('(489 entries)')
