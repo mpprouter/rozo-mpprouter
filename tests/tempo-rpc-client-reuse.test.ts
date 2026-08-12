@@ -31,6 +31,7 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import {
   getTempoClient,
   resetTempoClients,
+  parseRpcUrls,
   DEFAULT_TEMPO_RPC_URL,
 } from '../src/mpp/tempo-rpc'
 import {
@@ -210,5 +211,143 @@ describe('Tempo balance pre-flight caching', () => {
     // 2 per uncached attempt (tempo_getBalance + eth_call fallback);
     // the point is the second call adds none.
     expect(failing).toHaveBeenCalledTimes(2)
+  })
+})
+
+/**
+ * Endpoint rotation.
+ *
+ * Public Tempo endpoints limit per source IP, and on Workers we share an
+ * egress IP across the colo — we can't raise the quota, so we spread across
+ * several providers instead. The distinction that matters here: viem's
+ * built-in `fallback()` only moves on *after* an endpoint errors, which
+ * pins all traffic to endpoint #1 and its single quota. These tests pin the
+ * spreading behaviour, not just the failover behaviour.
+ */
+describe('RPC endpoint rotation', () => {
+  // Paths, not bare hosts: `fetch` normalizes "https://a.example" to
+  // "https://a.example/", which would make these assertions compare
+  // different strings for the same endpoint.
+  const POOL = ['https://a.example/rpc', 'https://b.example/rpc', 'https://c.example/rpc']
+
+  let hits: string[]
+  let failing: Set<string>
+
+  beforeEach(() => {
+    resetTempoClients()
+    hits = []
+    failing = new Set()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: any) => {
+        const u = String(url)
+        hits.push(u)
+        if (failing.has(u)) return new Response('rate limited', { status: 429 })
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }),
+    )
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  // A method that is never cached, so each call must reach an endpoint.
+  const uncached = { method: 'eth_getTransactionCount', params: ['0xabc', 'pending'] }
+
+  it('parses a comma-separated pool and tolerates whitespace', () => {
+    expect(parseRpcUrls('https://a.example/rpc, https://b.example/rpc')).toEqual([
+      'https://a.example/rpc',
+      'https://b.example/rpc',
+    ])
+    expect(parseRpcUrls('https://a.example/rpc')).toEqual(['https://a.example/rpc'])
+    expect(parseRpcUrls(undefined)).toEqual([DEFAULT_TEMPO_RPC_URL])
+    expect(parseRpcUrls('')).toEqual([DEFAULT_TEMPO_RPC_URL])
+    expect(parseRpcUrls('  ,  ')).toEqual([DEFAULT_TEMPO_RPC_URL])
+  })
+
+  it('spreads requests across the pool instead of hammering the first', async () => {
+    const client = getTempoClient(POOL.join(','))
+
+    for (let i = 0; i < 9; i++) await client.request(uncached as any)
+
+    // 9 requests over 3 endpoints — each should carry a third.
+    for (const url of POOL) {
+      expect(hits.filter((h) => h === url)).toHaveLength(3)
+    }
+  })
+
+  it('does not pin traffic to one endpoint (the fallback() failure mode)', async () => {
+    const client = getTempoClient(POOL.join(','))
+
+    for (let i = 0; i < 6; i++) await client.request(uncached as any)
+
+    expect(new Set(hits).size).toBe(3)
+  })
+
+  it('fails over to a healthy endpoint when one is rate-limited', async () => {
+    failing.add('https://a.example/rpc')
+    const client = getTempoClient(POOL.join(','))
+
+    const result = await client.request(uncached as any)
+
+    expect(result).toBe('0x1')
+    expect(hits).toContain('https://a.example/rpc')
+  })
+
+  it('stops sending traffic to a failed endpoint (cooldown)', async () => {
+    failing.add('https://a.example/rpc')
+    const client = getTempoClient(POOL.join(','))
+
+    // First pass discovers a is bad.
+    for (let i = 0; i < 3; i++) await client.request(uncached as any)
+    hits.length = 0
+    // Subsequent traffic should route around it entirely.
+    for (let i = 0; i < 6; i++) await client.request(uncached as any)
+
+    expect(hits.filter((h) => h === 'https://a.example/rpc')).toHaveLength(0)
+    expect(new Set(hits).size).toBe(2)
+  })
+
+  it('still attempts every endpoint when all are cooled down, rather than failing fast', async () => {
+    POOL.forEach((u) => failing.add(u))
+    const client = getTempoClient(POOL.join(','))
+
+    await expect(client.request(uncached as any)).rejects.toBeTruthy()
+
+    hits.length = 0
+    failing.clear() // quota recovered
+    const result = await client.request(uncached as any)
+
+    expect(result).toBe('0x1')
+  })
+
+  it('throws when every endpoint fails, surfacing the error', async () => {
+    POOL.forEach((u) => failing.add(u))
+    const client = getTempoClient(POOL.join(','))
+
+    await expect(client.request(uncached as any)).rejects.toBeTruthy()
+    // Every endpoint was tried before giving up.
+    expect(new Set(hits).size).toBe(3)
+  })
+
+  it('serves cached blocks without spending any endpoint quota', async () => {
+    const client = getTempoClient(POOL.join(','))
+
+    await client.request({ method: 'eth_getBlockByNumber', params: ['latest', false] } as any)
+    hits.length = 0
+    await client.request({ method: 'eth_getBlockByNumber', params: ['latest', false] } as any)
+    await client.request({ method: 'eth_getBlockByNumber', params: ['latest', false] } as any)
+
+    expect(hits).toHaveLength(0)
+  })
+
+  it('keys the client by the whole pool, so changing the pool builds a new client', () => {
+    const a = getTempoClient(POOL.join(','))
+    const b = getTempoClient(POOL.slice(0, 2).join(','))
+    expect(a).not.toBe(b)
   })
 })
