@@ -100,6 +100,11 @@ import {
   resolvePlaygroundRoute,
 } from '../playground/upstream'
 import { StrKey } from '@stellar/stellar-sdk'
+import {
+  PLAYGROUND_TURNSTILE_ACTION,
+  isPlaygroundTurnstileDisabled,
+  verifyPlaygroundTurnstile,
+} from '../playground/turnstile'
 
 // ---------------------------------------------------------------------------
 // small response helpers
@@ -233,8 +238,17 @@ function ledgerErrorResponse(e: Extract<LedgerResult<unknown>, { ok: false }>): 
  * grey them honestly instead of hiding them.
  */
 export function handlePlaygroundConfig(env: Env): Response {
+  const turnstileDisabled = isPlaygroundTurnstileDisabled(env)
   return json({
     enabled: playgroundEnabled(env),
+    turnstile: {
+      // The frontend renders a widget only when required is true; the site key
+      // is public and safe to expose. When disabled (staged rollout) the
+      // frontend can skip the widget and omit turnstile_token.
+      required: !turnstileDisabled,
+      site_key: env.PLAYGROUND_TURNSTILE_SITE_KEY ?? null,
+      action: PLAYGROUND_TURNSTILE_ACTION,
+    },
     models: PLAYGROUND_MODELS.map(m => ({
       id: m.id,
       tier: m.tier,
@@ -281,6 +295,22 @@ export async function handlePlaygroundIntent(request: Request, env: Env): Promis
   const account = typeof body.account === 'string' ? body.account.trim() : ''
   if (!isValidStellarAccount(account)) {
     return fail(400, 'invalid_account', 'account must be a valid Stellar public address (G...)')
+  }
+
+  // Turnstile gate. This is the front door to an on-chain deposit, so it is
+  // fail-closed: an unconfigured secret blocks the request unless Turnstile is
+  // explicitly disabled for a staged rollout. Verified against Cloudflare
+  // server-side with the action and hostname pinned — a browser-only check is
+  // worthless because an attacker scripts this POST directly.
+  const turnstileToken = typeof body.turnstile_token === 'string' ? body.turnstile_token : null
+  const turnstile = await verifyPlaygroundTurnstile(
+    env,
+    turnstileToken,
+    request.headers.get('cf-connecting-ip'),
+  )
+  if (!turnstile.ok) {
+    const status = turnstile.reason === 'not_configured' || turnstile.reason === 'unreachable' ? 503 : 403
+    return fail(status, `turnstile_${turnstile.reason}`, 'human verification failed')
   }
 
   const amountUsd =

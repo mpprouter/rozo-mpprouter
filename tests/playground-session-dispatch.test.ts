@@ -81,6 +81,8 @@ function makeEnv(kvSeed: Record<string, string> = {}): Env {
     PLAYGROUND_LEDGER: makePlaygroundLedgerMock(),
     PLAYGROUND_ENABLED: 'true',
     PLAYGROUND_SESSION_SECRET: SECRET,
+    // Turnstile off by default in tests; the dedicated suite flips it on.
+    PLAYGROUND_TURNSTILE_DISABLED: 'true',
     STELLAR_ROUTER_PUBLIC: ROUTER,
     MPP_STORE: makeKv(kvSeed),
   } as unknown as Env

@@ -104,6 +104,17 @@ export interface Env {
   // 404s, so it is absent rather than open by default.
   // Set via: wrangler secret put PLAYGROUND_RECON_TOKEN
   PLAYGROUND_RECON_TOKEN?: string
+  // Cloudflare Turnstile secret for the deposit-intent gate. Unset ⇒ intent
+  // creation fails closed (503) unless PLAYGROUND_TURNSTILE_DISABLED is
+  // explicitly 'true'. Set via: wrangler secret put PLAYGROUND_TURNSTILE_SECRET
+  PLAYGROUND_TURNSTILE_SECRET?: string
+  // Public Turnstile SITE key, echoed by GET /v1/playground/config so the
+  // frontend can render the widget. Not a secret; plain var.
+  PLAYGROUND_TURNSTILE_SITE_KEY?: string
+  // Explicit, auditable off switch for the intent Turnstile gate. Only the
+  // exact string 'true' disables it — a missing/typo'd secret still fails
+  // closed. For staged rollout before the frontend widget ships.
+  PLAYGROUND_TURNSTILE_DISABLED?: string
 
   // Stellar Router Pool (receives agent USDC payments)
   // Secret NOT in env — operator manages offline. Only public key needed.

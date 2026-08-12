@@ -12,7 +12,7 @@ was added there, no cache or refund behaviour was touched.
 | Method | Path | Auth | Purpose |
 | --- | --- | --- | --- |
 | `GET` | `/v1/playground/config` | none | Live model / chip / deposit catalog. Single source for the frontend. |
-| `POST` | `/v1/playground/session/intent` | none | Quote a deposit → `{intent_id, memo, destination, amount_usdc, expires_at}` |
+| `POST` | `/v1/playground/session/intent` | Turnstile | Quote a deposit → `{intent_id, memo, destination, amount_usdc, expires_at}` |
 | `POST` | `/v1/playground/session/open` | none | Claim a paid deposit → `{session_token, balance_usd, expires_at}` |
 | `GET` | `/v1/playground/session` | Bearer | Masked account, balance, last 20 calls |
 | `POST` | `/v1/playground/chat` | Bearer | One chat turn against an allow-listed model |
@@ -31,6 +31,8 @@ global allow-list, and all playground routes are `GET`/`POST`.
 | --- | --- | --- |
 | `PLAYGROUND_ENABLED` | `"false"` | Kill switch. Every `/v1/playground/*` route 404s unless this is **exactly** `"true"`. Flip + redeploy to pull the feature with no code rollback. |
 | `PLAYGROUND_GLOBAL_CAP_USD` | `"200"` | Global outstanding-credit ceiling. Deposit intents are refused once `Σ balances + Σ open holds + the new deposit` would exceed it. An unparseable value falls back to `$200`, never to "unlimited". |
+| `PLAYGROUND_TURNSTILE_SITE_KEY` | unset | Public Cloudflare Turnstile site key, echoed by `/config` so the frontend renders the widget. |
+| `PLAYGROUND_TURNSTILE_DISABLED` | unset | Only the exact string `"true"` disables the intent Turnstile gate (staged rollout). Any other value keeps it on. Leave unset in production. |
 
 ### Secrets (`wrangler secret put <NAME>`)
 
@@ -38,6 +40,7 @@ global allow-list, and all playground routes are `GET`/`POST`.
 | --- | --- | --- |
 | `PLAYGROUND_SESSION_SECRET` | yes | HMAC key for session tokens, min 16 chars. **Not** `MPP_SECRET_KEY` — rotating that one invalidates every outstanding 402 challenge on the paid proxy, so the playground must be rotatable alone. Unset ⇒ mint/verify fail closed with a 503 and the feature is inert. |
 | `PLAYGROUND_RECON_TOKEN` | for recon | Operator bearer token for `/v1/playground/admin/totals`. Unset ⇒ that endpoint 404s. |
+| `PLAYGROUND_TURNSTILE_SECRET` | yes (prod) | Cloudflare Turnstile secret for the deposit-intent gate. **Fail-closed**: unset ⇒ `/session/intent` returns 503, unless `PLAYGROUND_TURNSTILE_DISABLED="true"`. The verifier pins action `playground_intent` and hostname `www.mpprouter.dev`. |
 | `STELLAR_ROUTER_PUBLIC` | already set | The existing router USDC receiving account. Deposits land here; no new hot-wallet capability is created. |
 
 Optional: `PLAYGROUND_HORIZON_URL` (defaults to `https://horizon.stellar.org`).
@@ -55,6 +58,9 @@ openssl rand -hex 32 | wrangler secret put PLAYGROUND_SESSION_SECRET
    then returns a memo nonce (`pg-` + 20 hex, 23 bytes — fits `MEMO_TEXT`'s 28).
 2. The user's wallet sends **exactly** the quoted USDC amount to
    `STELLAR_ROUTER_PUBLIC` with that memo. (They need a little XLM for the fee.)
+   The intent request carries a `turnstile_token` from the widget; it is
+   re-verified server-side against Cloudflare with the action and hostname
+   pinned, and the gate is fail-closed.
 3. Client `POST`s `{intent_id, tx_hash}` to `/session/open`. The Worker verifies
    against Horizon that the transaction succeeded, the memo matches, and a
    payment operation has the exact destination, Circle's pubnet USDC issuer,

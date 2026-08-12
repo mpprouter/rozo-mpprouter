@@ -198,8 +198,21 @@ PLAYGROUND_ENABLED = "false"
 # than to "unlimited" — see globalCapAtomic() in src/playground/ledger-client.ts.
 PLAYGROUND_GLOBAL_CAP_USD = "200"
 
+# Public Cloudflare Turnstile SITE key for the deposit-intent widget. Echoed by
+# GET /v1/playground/config so the frontend renders the widget; not a secret.
+# PLAYGROUND_TURNSTILE_SITE_KEY = "0x..."
+
+# Explicit off switch for the intent Turnstile gate, for staged rollout before
+# the frontend widget ships. ONLY the exact string "true" disables it — a
+# missing/typo'd secret still fails closed. Leave unset in production.
+# PLAYGROUND_TURNSTILE_DISABLED = "true"
+
 # Secrets (set via: wrangler secret put <NAME>)
 #
+# PLAYGROUND_TURNSTILE_SECRET    — Cloudflare Turnstile secret key for the
+#                                  deposit-intent gate. Unset ⇒ intent creation
+#                                  fails CLOSED (503) unless
+#                                  PLAYGROUND_TURNSTILE_DISABLED="true".
 # PLAYGROUND_SESSION_SECRET      — random string (min 16 chars) that HMACs
 #                                  playground session tokens. Deliberately
 #                                  NOT MPP_SECRET_KEY: rotating that one
