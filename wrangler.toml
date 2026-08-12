@@ -98,7 +98,17 @@ migrations_dir = "migrations"
 [vars]
 STELLAR_NETWORK = "stellar:pubnet"
 STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
-TEMPO_RPC_URL = "https://rpc.tempo.xyz"
+# Comma-separated POOL, round-robined per request (src/mpp/tempo-rpc.ts).
+# Public Tempo endpoints rate-limit per source IP, and on Workers the egress
+# IP is shared across the colo — we don't control it and can't raise the
+# quota. Spreading over several independent providers multiplies the
+# effective quota without needing an API key from any of them. A failing
+# endpoint is skipped for 15s and traffic routes around it.
+# All four verified 2026-08-12 to serve eth_getTransactionCount /
+# eth_estimateGas / eth_getBlockByNumber on chain 4217.
+# Replace with a single keyed endpoint if we ever buy one — one URL is
+# still valid here.
+TEMPO_RPC_URL = "https://1rpc.io/tempo,https://tempo-rpc.publicnode.com,https://rpc.tempo.xyz,https://tempo.drpc.org"
 # UNUSED as of 2026-04-10. No code path reads this. See src/index.ts and
 # notes.md for context. Intended to skip Soroban simulation for sub-$0.05
 # charges; never implemented.

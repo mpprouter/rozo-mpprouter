@@ -62,6 +62,86 @@ import { tempo as tempoChain } from 'viem/tempo/chains'
 export const DEFAULT_TEMPO_RPC_URL = 'https://rpc.tempo.xyz'
 
 /**
+ * `TEMPO_RPC_URL` accepts a comma-separated pool, not just one URL.
+ *
+ * Public Tempo endpoints rate-limit **per source IP**, and on Workers the
+ * egress IP is shared across the whole colo — we do not control it and
+ * cannot raise the quota. Spreading requests over several independent
+ * providers multiplies the effective quota without needing an API key from
+ * any of them.
+ *
+ * Note this is deliberately NOT viem's `fallback()` transport. `fallback`
+ * only advances to the next endpoint *after* the current one fails, so
+ * every request piles onto the first URL until it starts erroring — that is
+ * failover, not load spreading, and it would keep us pinned to one IP quota.
+ * We round-robin instead, and additionally fail over on error.
+ */
+export function parseRpcUrls(raw: string | undefined): string[] {
+  const urls = (raw ?? '')
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean)
+  return urls.length > 0 ? urls : [DEFAULT_TEMPO_RPC_URL]
+}
+
+/**
+ * How long an endpoint is skipped after it fails.
+ *
+ * A rate-limited endpoint stays limited for a while, so continuing to send
+ * it its share of traffic just burns latency on requests that will fail.
+ * Short enough that a brief blip doesn't take a provider out for long.
+ */
+const ENDPOINT_COOLDOWN_MS = 15_000
+
+/**
+ * Round-robin across the pool, skipping endpoints in cooldown, failing over
+ * to the remaining ones if the chosen endpoint errors.
+ *
+ * Every request starts at a different endpoint, so with N healthy providers
+ * each sees roughly 1/N of the traffic — that is the part that prevents the
+ * limit rather than reacting to it.
+ *
+ * If every endpoint is in cooldown we still attempt the full rotation
+ * rather than failing fast: an expired quota may have recovered, and a
+ * late-but-successful payment beats a certain failure.
+ */
+function rotatingTransport(urls: string[]): Transport {
+  const cooldownUntil = new Map<string, number>()
+  let cursor = 0
+
+  return (opts) => {
+    const inner = urls.map((url) => ({ url, transport: http(url)(opts) }))
+
+    const request: EIP1193RequestFn = (async (args: any, reqOpts?: any) => {
+      const start = cursor++ % inner.length
+      const now = Date.now()
+
+      const order = Array.from({ length: inner.length }, (_, i) => inner[(start + i) % inner.length])
+      const healthy = order.filter((e) => (cooldownUntil.get(e.url) ?? 0) <= now)
+      const attempts = healthy.length > 0 ? healthy : order
+
+      let lastError: unknown
+      for (const entry of attempts) {
+        try {
+          const result = await (entry.transport.request as EIP1193RequestFn)(args, reqOpts)
+          cooldownUntil.delete(entry.url)
+          return result
+        } catch (err) {
+          lastError = err
+          cooldownUntil.set(entry.url, Date.now() + ENDPOINT_COOLDOWN_MS)
+        }
+      }
+      throw lastError
+    }) as EIP1193RequestFn
+
+    return { ...inner[0].transport, request }
+  }
+}
+
+/** Test seam: current cooldown state is internal; exposed only for reset. */
+export const RPC_ENDPOINT_COOLDOWN_MS = ENDPOINT_COOLDOWN_MS
+
+/**
  * How long a `latest` block is reused for fee estimation.
  *
  * Deliberately short. This is only ever used to read `baseFeePerGas`; it is
@@ -121,29 +201,35 @@ function withBlockCache(inner: Transport): Transport {
 }
 
 /**
- * One client per RPC URL, for the life of the isolate.
+ * One client per configured pool, for the life of the isolate.
  */
 const clients = new Map<string, Client>()
 
 /**
- * Get the shared Tempo viem client for `rpcUrl`.
+ * Get the shared Tempo viem client for `rpcUrl`, which may be a single URL
+ * or a comma-separated pool.
  *
  * Pass the result to mppx as `getClient`. mppx will graft the Tempo chain
  * serializers on if they are missing, but we build with `tempoChain`
  * already so `Client.getResolver` returns our client untouched.
+ *
+ * Layering matters: the block cache sits OUTSIDE the rotation, so a cached
+ * `latest` block costs no endpoint quota at all rather than merely being
+ * spread across the pool.
  */
 export function getTempoClient(rpcUrl?: string): Client {
-  const url = rpcUrl || DEFAULT_TEMPO_RPC_URL
+  const urls = parseRpcUrls(rpcUrl)
+  const key = urls.join(',')
 
-  const existing = clients.get(url)
+  const existing = clients.get(key)
   if (existing) return existing
 
   const client = createClient({
     chain: tempoChain,
-    transport: withBlockCache(http(url)),
+    transport: withBlockCache(rotatingTransport(urls)),
   })
 
-  clients.set(url, client)
+  clients.set(key, client)
   return client
 }
 
