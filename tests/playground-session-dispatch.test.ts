@@ -22,7 +22,20 @@ class ChannelNotInstalledError extends Error {
 const payMerchant = vi.fn()
 const payMerchantSession = vi.fn()
 
+/** Real error class — the dispatcher branches on `instanceof` for this too. */
+class BudgetExceededError extends Error {
+  constructor(
+    public readonly merchantUrl: string,
+    public readonly requestedRaw: string,
+    public readonly maxRaw: string,
+  ) {
+    super(`Merchant asked for ${requestedRaw} but ceiling is ${maxRaw}.`)
+    this.name = 'BudgetExceededError'
+  }
+}
+
 vi.mock('../src/mpp/tempo-client', () => ({
+  BudgetExceededError,
   ChannelNotInstalledError,
   payMerchant: (...args: unknown[]) => payMerchant(...args),
   payMerchantSession: (...args: unknown[]) => payMerchantSession(...args),
@@ -31,7 +44,9 @@ vi.mock('../src/mpp/tempo-client', () => ({
 const { callUpstream, resolvePlaygroundRoute, UpstreamError } = await import(
   '../src/playground/upstream'
 )
-const { handlePlaygroundChat } = await import('../src/routes/playground')
+const { handlePlaygroundChat, handlePlaygroundTxDecode } = await import(
+  '../src/routes/playground'
+)
 const { PLAYGROUND_MODELS, TIER_PRICE_USD, findModel } = await import('../src/playground/models')
 const { parseUsd } = await import('../src/playground/amount')
 const { createIntent, openIntent, readAccount } = await import(
@@ -43,17 +58,36 @@ const { makeAtomicStoreMock } = await import('./helpers/atomic-store-mock')
 import type { Env } from '../src/index'
 
 const SECRET = 'playground-test-secret-not-a-real-key'
-const ALICE = 'GTESTALICEXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
-const ROUTER = 'GTESTROUTERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+const ALICE = 'GA6SKSJLJ3E33KKDNB3UDBRIECIBQKGYLGXLCBTXNQ7WWJ27BMDUH6JW'
+const ROUTER = 'GBJ7NMENUWLOA5Z5UC3YQROMMY3XKHZYAOYOFL2SXJUGNRVZVG5GAYBV'
 
-function makeEnv(): Env {
+/**
+ * Minimal KV mock. `getTempoChannel` reads channel state from MPP_STORE, and
+ * the session failure path compares the cumulative watermark before and after
+ * to decide whether a voucher was signed — so these tests need a real store.
+ */
+function makeKv(seed: Record<string, string> = {}) {
+  const map = new Map(Object.entries(seed))
+  return {
+    store: map,
+    get: async (k: string) => map.get(k) ?? null,
+    put: async (k: string, v: string) => void map.set(k, v),
+    delete: async (k: string) => void map.delete(k),
+  }
+}
+
+function makeEnv(kvSeed: Record<string, string> = {}): Env {
   return {
     PLAYGROUND_LEDGER: makePlaygroundLedgerMock(),
     PLAYGROUND_ENABLED: 'true',
     PLAYGROUND_SESSION_SECRET: SECRET,
     STELLAR_ROUTER_PUBLIC: ROUTER,
+    MPP_STORE: makeKv(kvSeed),
   } as unknown as Env
 }
+
+/** A $1 ceiling — far above any real playground price, for seam-selection tests. */
+const ANY_BUDGET = parseUsd('1')
 
 function completion(text = 'hello from the model') {
   return new Response(JSON.stringify({ choices: [{ message: { content: text } }] }), {
@@ -69,6 +103,7 @@ async function fund(env: Env, usd: string) {
     account: ALICE,
     amountAtomic: parseUsd(usd),
     memo: `pg-${Math.random().toString(16).slice(2, 22)}`,
+    destination: ROUTER,
     now,
     expiresAt: now + 600_000,
   })
@@ -78,6 +113,7 @@ async function fund(env: Env, usd: string) {
     txHash: Math.random().toString(16).slice(2).padEnd(64, '0').slice(0, 64),
     opIndex: 0,
     now,
+    confirmedAt: now,
     sessionJti: 'j',
     sessionExp: Math.floor(now / 1000) + 3600,
   })
@@ -117,7 +153,7 @@ describe('seam selection', () => {
     const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.charge')
 
-    await callUpstream(env, { route, body: { model: 'llama-3.1-8b-instant' } })
+    await callUpstream(env, { route, body: { model: 'llama-3.1-8b-instant' }, budgetAtomic: ANY_BUDGET })
 
     expect(payMerchant).toHaveBeenCalledTimes(1)
     expect(payMerchantSession).not.toHaveBeenCalled()
@@ -129,7 +165,7 @@ describe('seam selection', () => {
     const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
 
-    await callUpstream(env, { route, body: { model: 'gpt-4o-mini' } })
+    await callUpstream(env, { route, body: { model: 'gpt-4o-mini' }, budgetAtomic: ANY_BUDGET })
 
     expect(payMerchantSession).toHaveBeenCalledTimes(1)
     expect(payMerchant).not.toHaveBeenCalled()
@@ -149,7 +185,7 @@ describe('seam selection', () => {
     const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.charge')
 
-    await callUpstream(env, { route, body: { model: 'claude-opus-5' } })
+    await callUpstream(env, { route, body: { model: 'claude-opus-5' }, budgetAtomic: ANY_BUDGET })
 
     expect(payMerchant).toHaveBeenCalledTimes(1)
     expect(payMerchantSession).not.toHaveBeenCalled()
@@ -161,7 +197,7 @@ describe('seam selection', () => {
     const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
 
-    await callUpstream(env, { route, body: { model: 'gpt-4o-mini' } })
+    await callUpstream(env, { route, body: { model: 'gpt-4o-mini' }, budgetAtomic: ANY_BUDGET })
 
     expect(payMerchantSession).toHaveBeenCalledTimes(1)
     expect(payMerchantSession.mock.calls[0][1]).toBe('openai_chat')
@@ -179,7 +215,7 @@ describe('seam selection', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(completion())
     const route = resolvePlaygroundRoute('/v1/services/mercury/txs/by-hash', 'GET')
 
-    await callUpstream(env, { route, query: { tx_hash: 'a'.repeat(64) } })
+    await callUpstream(env, { route, query: { tx_hash: 'a'.repeat(64) }, budgetAtomic: ANY_BUDGET })
 
     expect(payMerchant).not.toHaveBeenCalled()
     expect(payMerchantSession).not.toHaveBeenCalled()
@@ -194,7 +230,9 @@ describe('channel not installed', () => {
     payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('openai_chat'))
     const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
 
-    await expect(callUpstream(env, { route, body: {} })).rejects.toMatchObject({
+    await expect(
+      callUpstream(env, { route, body: {}, budgetAtomic: ANY_BUDGET }),
+    ).rejects.toMatchObject({
       code: 'session_channel_not_installed',
       status: 503,
     })
@@ -222,7 +260,10 @@ describe('channel not installed', () => {
     expect(account.value.calls[0].charged).toBe('0')
   })
 
-  it('releases the reservation on a generic upstream failure too', async () => {
+  it('CHARGES a paid call whose merchant answered with a 5xx', async () => {
+    // P0-3: reaching a response means the merchant answered our PAID retry.
+    // The money left the router, so refunding the user here would hand out
+    // free upstream calls to anyone who can make the response leg fail.
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
@@ -233,10 +274,82 @@ describe('channel not installed', () => {
       env,
     )
     expect(response.status).toBe(502)
+    const body = await response.json()
+    expect(body.charged_usd).toBe('0.02')
+    expect(body.support_note).toMatch(/paid but did not return/i)
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('0.98').toString())
+    expect(account.value.calls[0].status).toBe('committed')
+  })
+
+  it('CHARGES an ambiguous charge-mode failure (lost response / timeout)', async () => {
+    // We cannot prove the transfer did not happen, so we must not refund.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockRejectedValue(new Error('network timeout after dispatch'))
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-timeout'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    expect((await response.json()).charged_usd).toBe('0.02')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('0.98').toString())
+  })
+
+  it('CHARGES a session failure once the voucher watermark has advanced', async () => {
+    // The voucher is signed before the merchant's final response is known, so
+    // an advanced cumulative is proof the money is already committed.
+    const key = 'tempoChannel:openai_chat'
+    const env = makeEnv({ [key]: JSON.stringify({ channelId: '0xabc', cumulativeRaw: '1000' }) })
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchantSession.mockImplementation(async () => {
+      // Simulate onChannelUpdate having bumped the watermark before the throw.
+      await (env as any).MPP_STORE.put(
+        key,
+        JSON.stringify({ channelId: '0xabc', cumulativeRaw: '21000' }),
+      )
+      throw new Error('merchant connection reset after voucher')
+    })
+
+    const response = await handlePlaygroundChat(
+      chatRequest('gpt-4o-mini', bearer, 'call-voucher-signed'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    expect((await response.json()).charged_usd).toBe('0.02')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('0.98').toString())
+  })
+
+  it('RELEASES a session failure when the watermark never moved', async () => {
+    // Nothing was signed, so nothing was paid — the user keeps their credit.
+    const key = 'tempoChannel:openai_chat'
+    const env = makeEnv({ [key]: JSON.stringify({ channelId: '0xabc', cumulativeRaw: '1000' }) })
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchantSession.mockRejectedValue(new Error('merchant refused the connection'))
+
+    const response = await handlePlaygroundChat(
+      chatRequest('gpt-4o-mini', bearer, 'call-no-voucher'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    expect((await response.json()).charged_usd).toBe('0.00')
 
     const account = await readAccount(env, ALICE)
     if (!account.ok) return
     expect(account.value.balance).toBe(parseUsd('1').toString())
+    expect(account.value.calls[0].status).toBe('released')
   })
 
   it('does not echo the upstream error body back to the caller', async () => {
@@ -410,5 +523,109 @@ describe('model catalog after the session-seam promotion', () => {
     for (const m of PLAYGROUND_MODELS) {
       if (m.provider === 'anthropic') expect(verified.has(m.id)).toBe(true)
     }
+  })
+})
+
+describe('upstream budget ceiling (P0-2)', () => {
+  it('refuses to call a paid route with no budget set', async () => {
+    // A missing ceiling is a programming error, and defaulting to "unlimited"
+    // is exactly the failure the ceiling exists to prevent.
+    const env = makeEnv()
+    const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
+    await expect(callUpstream(env, { route, body: {} })).rejects.toMatchObject({
+      code: 'budget_not_set',
+      paymentEvidence: 'no',
+    })
+    expect(payMerchant).not.toHaveBeenCalled()
+  })
+
+  it('passes the ceiling to payMerchant as USDC-6 base units', async () => {
+    const env = makeEnv()
+    payMerchant.mockResolvedValue(completion())
+    const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
+
+    await callUpstream(env, { route, body: {}, budgetAtomic: parseUsd('0.02') })
+
+    // $0.02 = 200000 atomic (7dp) = 20000 base units (6dp).
+    expect(payMerchant.mock.calls[0][3]).toEqual({ maxAmountRaw: '20000' })
+  })
+
+  it('passes the ceiling to payMerchantSession too', async () => {
+    const env = makeEnv()
+    payMerchantSession.mockResolvedValue({
+      response: completion(),
+      channelBefore: { cumulativeRaw: '0' },
+    })
+    const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
+
+    await callUpstream(env, { route, body: {}, budgetAtomic: parseUsd('0.08') })
+
+    expect(payMerchantSession.mock.calls[0][4]).toEqual({ maxAmountRaw: '80000' })
+  })
+
+  it('releases the hold when the merchant asks for more than budget', async () => {
+    // Refused inside onChallenge, before signing — provably unpaid.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockRejectedValue(
+      new BudgetExceededError('https://groq.example', '5000000', '20000'),
+    )
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-overbudget'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    const body = await response.json()
+    expect(body.error).toBe('upstream_over_budget')
+    expect(body.charged_usd).toBe('0.00')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
+  })
+
+  it('never charges the user more than the flat tier price even if upstream costs more', async () => {
+    // The user price and the router's exposure are independent constants.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockResolvedValue(completion())
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-flat'),
+      env,
+    )
+    expect((await response.json()).charged_usd).toBe(TIER_PRICE_USD.cheap)
+  })
+})
+
+describe('router-held-credential routes never charge the user on failure', () => {
+  it('releases the hold when Mercury fails — no payment is ever made there', async () => {
+    const env = {
+      ...makeEnv(),
+      ATOMIC_STORE: makeAtomicStoreMock(),
+      MERCURYDATA_MAINNET_JWT: 'test-token',
+    } as Env
+    await fund(env, '1')
+    const bearer = await token()
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response('upstream down', { status: 503 }))
+
+    const request = new Request('https://apiserver.example/v1/playground/tx-decode', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
+      body: JSON.stringify({ call_id: 'call-mercury', tx_hash: 'a'.repeat(64) }),
+    })
+    const response = await handlePlaygroundTxDecode(request, env)
+    expect(response.status).toBe(502)
+    expect((await response.json()).charged_usd).toBe('0.00')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
+    fetchSpy.mockRestore()
   })
 })

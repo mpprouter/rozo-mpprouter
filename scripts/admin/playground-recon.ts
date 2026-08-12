@@ -30,6 +30,15 @@
  *      legitimately leaves on-chain ahead of credited. Credited ahead of
  *      on-chain is never legitimate and is the condition worth paging on.
  *
+ *   C. per-`(tx_hash, op_index)` verification
+ *      Aggregate sums can net out: one credit invented and another one missed
+ *      leaves totals looking perfect. So every consumed deposit op the ledger
+ *      recorded is fetched back from Horizon and checked individually —
+ *      transaction successful, playground-shaped MEMO_TEXT, operation at that
+ *      exact index a USDC payment from Circle's issuer to the receiving
+ *      account. Any credit without a matching on-chain payment, and any
+ *      duplicate consumption, is reported per-row.
+ *
  * Usage:
  *   npx tsx scripts/admin/playground-recon.ts --api https://apiserver.mpprouter.dev
  *   npx tsx scripts/admin/playground-recon.ts --horizon https://horizon.stellar.org
@@ -253,9 +262,94 @@ async function main(): Promise<number> {
     console.log(`OK (B): on-chain >= credited (unclaimed/expired deposits ${fmt(unclaimed)})`)
   }
 
+  // ---- (C) per-operation verification ------------------------------------
+  console.log('')
+  console.log(`Per-operation verification (${totals.consumed_deposits.length} credited ops)`)
+
+  const seen = new Map<string, string>()
+  let badOps = 0
+  let duplicates = 0
+
+  for (const entry of totals.consumed_deposits) {
+    const key = `${entry.tx_hash}:${entry.op_index}`
+
+    // Duplicate consumption. The DO keys on this pair so it should be
+    // impossible — which is exactly why it is worth asserting rather than
+    // assuming: a storage bug here mints free credit.
+    const prior = seen.get(key)
+    if (prior) {
+      console.error(`  DUPLICATE ${key}: credited by both ${prior} and ${entry.intent_id}`)
+      duplicates++
+      continue
+    }
+    seen.set(key, entry.intent_id)
+
+    const verdict = await verifyConsumedOp(horizon, account, entry)
+    if (!verdict.ok) {
+      console.error(`  BAD ${key} (intent ${entry.intent_id}): ${verdict.reason}`)
+      badOps++
+    }
+  }
+
+  if (badOps === 0 && duplicates === 0) {
+    console.log('  OK: every credited op matches a real on-chain memo\'d payment')
+  } else {
+    console.error(
+      `  ${badOps} credit(s) without a valid matching payment, ${duplicates} duplicate(s)`,
+    )
+    failures += badOps + duplicates
+  }
+
   console.log('')
   console.log(failures === 0 ? 'RECON PASSED' : `RECON FAILED — ${failures} mismatch(es)`)
   return failures === 0 ? 0 : 1
+}
+
+/**
+ * Verify one credited `(tx_hash, op_index)` against the chain.
+ *
+ * Re-applies the same rules `verifyDeposit` applies at claim time. Anything
+ * that fails here is credit the ledger issued for a payment that does not
+ * exist as recorded — the single most important thing recon can find.
+ */
+async function verifyConsumedOp(
+  horizon: string,
+  account: string,
+  entry: { tx_hash: string; op_index: number },
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (!/^[0-9a-f]{64}$/i.test(entry.tx_hash)) {
+    return { ok: false, reason: 'malformed transaction hash in ledger' }
+  }
+  try {
+    const txResp = await fetch(`${horizon}/transactions/${entry.tx_hash}`)
+    if (txResp.status === 404) return { ok: false, reason: 'transaction not found on Horizon' }
+    if (!txResp.ok) return { ok: false, reason: `Horizon ${txResp.status} on transaction` }
+    const tx = (await txResp.json()) as {
+      successful?: boolean
+      memo_type?: string
+      memo?: string
+    }
+    if (tx.successful !== true) return { ok: false, reason: 'transaction did not succeed' }
+    if (tx.memo_type !== 'text' || !tx.memo || !PLAYGROUND_MEMO.test(tx.memo)) {
+      return { ok: false, reason: `memo is not a playground nonce (${tx.memo_type}:${tx.memo})` }
+    }
+
+    const opsResp = await fetch(
+      `${horizon}/transactions/${entry.tx_hash}/operations?limit=200&order=asc`,
+    )
+    if (!opsResp.ok) return { ok: false, reason: `Horizon ${opsResp.status} on operations` }
+    const ops = (await opsResp.json()) as { _embedded?: { records?: HorizonPayment[] } }
+    const op = ops._embedded?.records?.[entry.op_index]
+    if (!op) return { ok: false, reason: `no operation at index ${entry.op_index}` }
+    if (op.type !== 'payment') return { ok: false, reason: `operation is ${op.type}, not payment` }
+    if (op.to !== account) return { ok: false, reason: 'payment was not to the receiving account' }
+    if (op.asset_code !== 'USDC' || op.asset_issuer !== USDC_ISSUER) {
+      return { ok: false, reason: 'asset is not Circle-issued USDC' }
+    }
+    return { ok: true }
+  } catch (e: any) {
+    return { ok: false, reason: `verification error: ${e.message}` }
+  }
 }
 
 main()

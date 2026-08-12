@@ -78,8 +78,10 @@ import {
   ModelNotAllowedError,
   PLAYGROUND_CHIPS,
   PLAYGROUND_MODELS,
+  SESSION_RENEWAL_CAP_SECONDS,
   SESSION_TTL_SECONDS,
   TIER_PRICE_USD,
+  TIER_UPSTREAM_BUDGET_USD,
   assertModelCallable,
   findChip,
   findModel,
@@ -87,6 +89,7 @@ import {
 } from '../playground/models'
 import {
   bearerFrom,
+  isSessionSecretUsable,
   maskAccount,
   mintSessionToken,
   verifySessionToken,
@@ -96,6 +99,7 @@ import {
   callUpstreamJson,
   resolvePlaygroundRoute,
 } from '../playground/upstream'
+import { StrKey } from '@stellar/stellar-sdk'
 
 // ---------------------------------------------------------------------------
 // small response helpers
@@ -131,6 +135,30 @@ function disabled(): Response {
 
 /** Stellar public account ids: 'G' + 55 base32 chars. */
 const G_ADDRESS = /^G[A-Z2-7]{55}$/
+
+/**
+ * Full StrKey validation, including the CRC16 checksum.
+ *
+ * The shape regex alone accepts ~2^275 well-formed-looking strings that are
+ * not real accounts. Since the account is a DO storage key, accepting them
+ * lets an attacker mint intents against unbounded distinct "addresses" and
+ * grow storage for free. The checksum cuts that to real, typo-free accounts —
+ * and it is also the only thing that stops a user's funds being quoted against
+ * an address that cannot receive them.
+ *
+ * Note this does NOT prove the caller controls the address; intent creation is
+ * unauthenticated by design. Address ownership is proven later, on-chain, by
+ * the deposit's operation source. What bounds abuse here is the hourly rate
+ * limit plus MAX_OPEN_INTENTS_PER_ACCOUNT.
+ */
+function isValidStellarAccount(account: string): boolean {
+  if (!G_ADDRESS.test(account)) return false
+  try {
+    return StrKey.isValidEd25519PublicKey(account)
+  } catch {
+    return false
+  }
+}
 
 /** Accept only ids we could have issued, since they index DO storage. */
 const ID_PATTERN = /^[A-Za-z0-9_-]{8,64}$/
@@ -179,6 +207,15 @@ function ledgerErrorResponse(e: Extract<LedgerResult<unknown>, { ok: false }>): 
     case 'intent_already_used':
     case 'payment_already_claimed':
       return fail(409, e.code, e.message)
+    case 'too_many_open_intents':
+      return fail(429, e.code, e.message, e.detail ?? {})
+    case 'deposit_exceeds_cap':
+      // The money is already on-chain. This is terminal and needs a human.
+      return fail(409, e.code, e.message, {
+        ...(e.detail ?? {}),
+        support_note:
+          'Your deposit was received on-chain but exceeds the playground credit cap, so it was not credited. Contact support for a refund.',
+      })
     default:
       return fail(400, e.code, e.message)
   }
@@ -232,10 +269,18 @@ export function handlePlaygroundConfig(env: Env): Response {
 export async function handlePlaygroundIntent(request: Request, env: Env): Promise<Response> {
   if (!playgroundEnabled(env)) return disabled()
 
+  // Refuse to quote a deposit at all if we could not mint the session that
+  // pays for it. Checking this only at /open would mean taking a real
+  // on-chain payment for credit we cannot issue.
+  if (!isSessionSecretUsable(env.PLAYGROUND_SESSION_SECRET)) {
+    console.error('[playground] PLAYGROUND_SESSION_SECRET missing or too short; refusing intents')
+    return fail(503, 'not_configured', 'playground session signing is not configured')
+  }
+
   const body = await readJsonBody(request)
   const account = typeof body.account === 'string' ? body.account.trim() : ''
-  if (!G_ADDRESS.test(account)) {
-    return fail(400, 'invalid_account', 'account must be a Stellar public address (G...)')
+  if (!isValidStellarAccount(account)) {
+    return fail(400, 'invalid_account', 'account must be a valid Stellar public address (G...)')
   }
 
   const amountUsd =
@@ -264,6 +309,9 @@ export async function handlePlaygroundIntent(request: Request, env: Env): Promis
     account,
     amountAtomic: parseUsd(amountUsd),
     memo: generateMemo(),
+    // Recorded so /open verifies against the address the user was actually
+    // quoted, surviving a rotation of STELLAR_ROUTER_PUBLIC.
+    destination,
     now,
     expiresAt,
   })
@@ -273,7 +321,7 @@ export async function handlePlaygroundIntent(request: Request, env: Env): Promis
     intent_id: created.value.intent_id,
     memo: created.value.memo,
     memo_type: 'text',
-    destination,
+    destination: created.value.destination,
     amount_usdc: formatUsd(parseAtomic(created.value.amount)),
     asset: 'USDC',
     asset_issuer: STELLAR_PUBNET_USDC_ISSUER,
@@ -314,11 +362,19 @@ export async function handlePlaygroundOpen(request: Request, env: Env): Promise<
     return fail(400, 'invalid_request', 'tx_hash must be a 64-character hex transaction hash')
   }
 
+  // Never consume a deposit we cannot mint a session for.
+  if (!isSessionSecretUsable(env.PLAYGROUND_SESSION_SECRET)) {
+    console.error('[playground] PLAYGROUND_SESSION_SECRET missing or too short; refusing open')
+    return fail(503, 'not_configured', 'playground session signing is not configured')
+  }
+
   const found = await getIntent(env, intentId)
   if (!found.ok) return ledgerErrorResponse(found)
   const intent = found.value
 
-  const destination = env.STELLAR_ROUTER_PUBLIC
+  // The destination recorded when the user was quoted — NOT the live env var.
+  // Rotating STELLAR_ROUTER_PUBLIC must not brick deposits already in flight.
+  const destination = intent.destination
   if (!destination) {
     return fail(503, 'not_configured', 'playground deposit destination is not configured')
   }
@@ -329,9 +385,16 @@ export async function handlePlaygroundOpen(request: Request, env: Env): Promise<
   const isExactReplay =
     intent.status === 'consumed' && intent.tx_hash === txHash && intent.session_jti !== undefined
 
+  const now = Date.now()
+  const nowSec = Math.floor(now / 1000)
+
   let opIndex: number
+  let confirmedAt: number
   if (isExactReplay) {
     opIndex = intent.op_index ?? 0
+    // Already verified once; the recorded creation time is inside the window
+    // by construction, so re-verifying against Horizon would be a wasted trip.
+    confirmedAt = intent.created_at
   } else {
     const verified = await verifyDeposit({
       horizonUrl: horizonUrl(env),
@@ -349,33 +412,68 @@ export async function handlePlaygroundOpen(request: Request, env: Env): Promise<
       )
     }
     opIndex = verified.opIndex
+    confirmedAt = verified.confirmedAt
   }
 
-  const now = Date.now()
-  // Reuse the jti recorded on a consumed intent so a retry yields a
-  // byte-identical token rather than a second valid session.
-  const jti = intent.session_jti ?? crypto.randomUUID()
-  const sessionExp = intent.session_exp ?? Math.floor(now / 1000) + SESSION_TTL_SECONDS
+  // ---- Session identity and lifetime -------------------------------------
+  // Three cases, and the middle one used to be a bug: `Math.max(1, expired)`
+  // minted a token that expired one second later.
+  //
+  //   1. First open           → fresh jti, full TTL.
+  //   2. Re-open, still valid → SAME jti, the REMAINING TTL. A retry must not
+  //                             extend the session, and must return the same
+  //                             token the first call did.
+  //   3. Re-open, expired     → fresh jti and a full TTL, but only inside a
+  //                             hard cap measured from intent creation, so one
+  //                             deposit cannot renew a session forever.
+  let jti: string
+  let sessionExp: number
+  if (intent.session_jti && intent.session_exp && intent.session_exp > nowSec) {
+    jti = intent.session_jti
+    sessionExp = intent.session_exp
+  } else {
+    const renewalDeadline = Math.floor(intent.created_at / 1000) + SESSION_RENEWAL_CAP_SECONDS
+    if (intent.session_jti && nowSec > renewalDeadline) {
+      return fail(
+        410,
+        'session_renewal_expired',
+        'this deposit is too old to open a new session; the balance remains credited to the account',
+      )
+    }
+    jti = crypto.randomUUID()
+    sessionExp = Math.min(nowSec + SESSION_TTL_SECONDS, renewalDeadline)
+  }
 
   const opened = await openIntent(env, {
     intentId,
     txHash,
     opIndex,
     now,
+    confirmedAt,
     sessionJti: jti,
     sessionExp,
   })
   if (!opened.ok) return ledgerErrorResponse(opened)
 
+  // The DO is authoritative: on a replay it returns the ORIGINALLY recorded
+  // jti/exp, so a retry cannot mint a second, longer-lived session.
+  const grantedJti = opened.value.intent.session_jti ?? jti
+  const grantedExp = opened.value.intent.session_exp ?? sessionExp
+  const ttl = grantedExp - nowSec
+  if (ttl <= 0) {
+    return fail(
+      410,
+      'session_renewal_expired',
+      'this deposit is too old to open a new session; the balance remains credited to the account',
+    )
+  }
+
   let token: string
   try {
-    // TTL is derived from the recorded exp so a replayed open cannot extend a
-    // session indefinitely by being retried.
-    const ttl = Math.max(1, opened.value.intent.session_exp! - Math.floor(now / 1000))
     token = (
       await mintSessionToken(env.PLAYGROUND_SESSION_SECRET, {
         account: opened.value.intent.account,
-        jti: opened.value.intent.session_jti!,
+        jti: grantedJti,
         now,
         ttlSeconds: ttl,
       })
@@ -389,7 +487,7 @@ export async function handlePlaygroundOpen(request: Request, env: Env): Promise<
     session_token: token,
     account_masked: maskAccount(opened.value.intent.account),
     balance_usd: formatUsd(parseAtomic(opened.value.balance)),
-    expires_at: new Date(opened.value.intent.session_exp! * 1000).toISOString(),
+    expires_at: new Date(grantedExp * 1000).toISOString(),
     replayed: opened.value.replayed,
   })
 }
@@ -555,15 +653,83 @@ async function beginCall(
   }
 }
 
-/** Translate an upstream failure into a response, refunding the hold first. */
-async function failCall(env: Env, callId: string, e: unknown): Promise<Response> {
+/**
+ * Settle a failed call, deciding between refund and charge on EVIDENCE of
+ * whether the router's money actually moved.
+ *
+ * This is the single most important branch in the playground. The naive
+ * version — always release on failure — is wrong, and dangerously so: for a
+ * session call the voucher is signed (and the cumulative watermark advanced)
+ * BEFORE the merchant's final response is known, so a timeout or 5xx after
+ * that point means the router has already paid. Refunding the user there hands
+ * out free upstream calls to anyone who can make the response leg fail.
+ *
+ * The rule is therefore: release ONLY when we can prove no payment happened.
+ *
+ *   - `'no'`    → release. Provable non-payment: refused before dispatch
+ *                 (unknown/unverified route, rate limit, over-budget refusal
+ *                 inside onChallenge, missing session channel), or a route
+ *                 that never pays at all (Mercury's router-held credential).
+ *   - `'yes'`   → commit. A voucher was signed (watermark advanced), or the
+ *                 merchant answered our paid retry with a bad status or an
+ *                 unparseable body.
+ *   - `'maybe'` → commit. A lost response or a timeout after dispatch. We
+ *                 cannot prove the transfer did not happen, and the safe
+ *                 direction for an ambiguous settlement is to charge.
+ *
+ * Charged failures return the price in `charged_usd` and a `support_note` so
+ * the user is told plainly they were billed for a call that did not deliver,
+ * and they are logged at error level for support to find.
+ */
+async function failCall(
+  env: Env,
+  callId: string,
+  e: unknown,
+  priceAtomic: bigint,
+): Promise<Response> {
   const upstream = e instanceof UpstreamError ? e : null
   const code = upstream?.code ?? 'upstream_error'
-  await release(env, callId, code)
-  const refreshedStatus = upstream?.status ?? 502
-  return fail(refreshedStatus, code, upstream?.message ?? 'upstream call failed', {
+  const status = upstream?.status ?? 502
+  const message = upstream?.message ?? 'upstream call failed'
+  // Anything that is not a recognised UpstreamError is treated as ambiguous.
+  const evidence = upstream?.paymentEvidence ?? 'maybe'
+  const shouldCommit = evidence !== 'no'
+
+  let charged = 0n
+  let balanceAtomic: bigint | null = null
+  try {
+    const settled = shouldCommit
+      ? await commit(env, callId, priceAtomic)
+      : await release(env, callId, code)
+    if (settled.ok) {
+      charged = parseAtomic(settled.value.call.charged)
+      balanceAtomic = parseAtomic(settled.value.balance)
+    } else {
+      console.error(`[playground] settle failed for ${callId}: ${settled.code} ${settled.message}`)
+    }
+  } catch (settleError: any) {
+    // Never let a settle failure mask the upstream error. The call is left
+    // `reserved` and the DO alarm reaper will settle it — see ledger-do.ts.
+    console.error(`[playground] settle threw for ${callId}: ${settleError?.message}`)
+  }
+
+  if (shouldCommit) {
+    console.error(
+      `[playground] PAID-BUT-FAILED call ${callId}: ${code} (${message}); ` +
+        `evidence=${evidence}; charged ${charged} atomic. Support may owe goodwill credit.`,
+    )
+  }
+
+  return fail(status, code, message, {
     call_id: callId,
-    charged_usd: '0.00',
+    charged_usd: formatUsd(charged),
+    ...(balanceAtomic !== null ? { balance_usd: formatUsd(balanceAtomic) } : {}),
+    ...(shouldCommit
+      ? {
+          support_note:
+            'The upstream provider was paid but did not return a usable result, so this call was charged. Contact support if you would like it reviewed.',
+        }
+      : {}),
   })
 }
 
@@ -670,17 +836,23 @@ export async function handlePlaygroundChat(request: Request, env: Env): Promise<
         max_tokens: FORCED_MAX_TOKENS,
         stream: false,
       },
+      // Hard ceiling on what the ROUTER pays, independent of the flat price
+      // the user pays and of whatever the merchant's live 402 asks for.
+      budgetAtomic: parseUsd(TIER_UPSTREAM_BUDGET_USD[model.tier]),
     })
   } catch (e) {
-    return failCall(env, id, e)
+    return failCall(env, id, e, priceAtomic)
   }
 
   const text = completion.choices?.[0]?.message?.content
   if (typeof text !== 'string' || text.length === 0) {
+    // The merchant answered our PAID retry — the money moved, the content
+    // just wasn't usable. Charged, not refunded.
     return failCall(
       env,
       id,
-      new UpstreamError('upstream_empty', 502, 'upstream returned no completion'),
+      new UpstreamError('upstream_empty', 502, 'upstream returned no completion', 'yes'),
+      priceAtomic,
     )
   }
 
@@ -746,9 +918,10 @@ export async function handlePlaygroundBlendActivity(
         contract_id: BLEND_MAIN_POOL_CONTRACT_ID,
         limit: String(BLEND_EVENT_LIMIT),
       },
+      budgetAtomic: parseUsd(chip.budgetUsd),
     })
   } catch (e) {
-    return failCall(env, id, e)
+    return failCall(env, id, e, priceAtomic)
   }
 
   const aggregate = aggregateBlendEvents(extractEvents(raw), BLEND_MAIN_POOL_CONTRACT_ID)
@@ -768,6 +941,7 @@ export async function handlePlaygroundBlendActivity(
           stream: false,
         },
         timeoutMs: 15_000,
+        budgetAtomic: parseUsd(TIER_UPSTREAM_BUDGET_USD[summaryModel.tier]),
       })
       const text = completion.choices?.[0]?.message?.content
       if (typeof text === 'string' && text.trim().length > 0) summary = text.trim()
@@ -827,9 +1001,13 @@ export async function handlePlaygroundTxDecode(request: Request, env: Env): Prom
 
   let result: unknown
   try {
-    result = await callUpstreamJson(env, { route, query: { tx_hash: txHash } })
+    result = await callUpstreamJson(env, {
+      route,
+      query: { tx_hash: txHash },
+      budgetAtomic: parseUsd(chip.budgetUsd),
+    })
   } catch (e) {
-    return failCall(env, id, e)
+    return failCall(env, id, e, priceAtomic)
   }
 
   const settled = await commit(env, id, priceAtomic)

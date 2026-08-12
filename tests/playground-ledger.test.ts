@@ -6,8 +6,9 @@
  * (see `helpers/playground-ledger-mock.ts`), so the arithmetic under test is
  * the arithmetic that runs in production.
  *
- * Fixture addresses are obviously-fake G-addresses ("GTEST…") — never a real
- * or blacklisted account.
+ * Fixture addresses are randomly generated Stellar public keys, valid StrKey
+ * (the routes now enforce the CRC16 checksum) but with no private key retained
+ * and no funds — never a real or blacklisted account.
  */
 
 import { describe, expect, it } from 'vitest'
@@ -24,10 +25,15 @@ import {
   reserve,
 } from '../src/playground/ledger-client'
 import { INTENT_RATE_PER_HOUR } from '../src/playground/models'
-import { makePlaygroundLedgerMock } from './helpers/playground-ledger-mock'
+import { RESERVED_LEASE_MS } from '../src/playground/ledger-do'
+import {
+  makePlaygroundLedgerMock,
+  makePlaygroundLedgerMockWithControls,
+} from './helpers/playground-ledger-mock'
 
-const ALICE = 'GTESTALICEXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
-const BOB = 'GTESTBOBXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+const ALICE = 'GA6SKSJLJ3E33KKDNB3UDBRIECIBQKGYLGXLCBTXNQ7WWJ27BMDUH6JW'
+const BOB = 'GCO6S4R5NIFYKXTAMLLLHIMK2VXEYCEZS3JCPWENX3525WSAA7LNUMHH'
+const ROUTER = 'GBJ7NMENUWLOA5Z5UC3YQROMMY3XKHZYAOYOFL2SXJUGNRVZVG5GAYBV'
 const TX_A = 'a'.repeat(64)
 const TX_B = 'b'.repeat(64)
 
@@ -54,6 +60,7 @@ async function mintIntent(
     account: args.account ?? ALICE,
     amountAtomic: parseUsd(args.usd ?? '1'),
     memo: args.memo ?? `pg-${nextId()}`,
+    destination: ROUTER,
     now,
     expiresAt: now + 30 * 60 * 1000,
   })
@@ -72,6 +79,7 @@ async function deposit(
     txHash: args.txHash ?? TX_A,
     opIndex: args.opIndex ?? 0,
     now,
+    confirmedAt: now,
     sessionJti: 'jti-1',
     sessionExp: Math.floor(now / 1000) + 3600,
   })
@@ -135,6 +143,7 @@ describe('deposit intents', () => {
         account,
         amountAtomic: parseUsd('1'),
         memo: `pg-${nextId()}`,
+        destination: ROUTER,
         now,
         expiresAt: now + 30 * 60 * 1000,
       })
@@ -145,6 +154,7 @@ describe('deposit intents', () => {
         txHash,
         opIndex: hour,
         now,
+        confirmedAt: now,
         sessionJti: 'j',
         sessionExp: 1,
       })
@@ -215,6 +225,7 @@ describe('deposit intents', () => {
       txHash: TX_A,
       opIndex: 0,
       now: Date.now(),
+      confirmedAt: Date.now(),
       sessionJti: 'different-jti',
       sessionExp: 999,
     })
@@ -237,6 +248,7 @@ describe('deposit intents', () => {
       txHash: TX_A,
       opIndex: 0,
       now: Date.now(),
+      confirmedAt: Date.now(),
       sessionJti: 'j2',
       sessionExp: 1,
     })
@@ -263,6 +275,7 @@ describe('deposit intents', () => {
       txHash: TX_B,
       opIndex: 0,
       now: Date.now(),
+      confirmedAt: Date.now(),
       sessionJti: 'j',
       sessionExp: 1,
     })
@@ -276,17 +289,43 @@ describe('deposit intents', () => {
     const now = Date.UTC(2026, 7, 12, 10, 0, 0)
     const intent = await mintIntent(env, { usd: '1', now })
     if (!intent.ok) return
+    // Expiry is judged by the ON-CHAIN confirmation time, not by when the
+    // claim arrives: a deposit that confirmed after the window is late.
     const late = await openIntent(env, {
       intentId: intent.value.intent_id,
       txHash: TX_A,
       opIndex: 0,
       now: now + 60 * 60 * 1000,
+      confirmedAt: now + 60 * 60 * 1000,
       sessionJti: 'j',
       sessionExp: 1,
     })
     expect(late.ok).toBe(false)
     if (late.ok) return
     expect(late.code).toBe('intent_expired')
+  })
+
+  it('credits a deposit confirmed inside the window but claimed long after', async () => {
+    // The bug this locks out: judging expiry by Date.now() at claim time would
+    // throw away a deposit that settled on-chain while the intent was valid.
+    const env = makeEnv()
+    const now = Date.UTC(2026, 7, 12, 10, 0, 0)
+    const intent = await mintIntent(env, { usd: '1', now })
+    if (!intent.ok) return
+    const claimed = await openIntent(env, {
+      intentId: intent.value.intent_id,
+      txHash: TX_A,
+      opIndex: 0,
+      // Claimed a day late...
+      now: now + 24 * 60 * 60 * 1000,
+      // ...but confirmed on-chain one minute after the intent was minted.
+      confirmedAt: now + 60 * 1000,
+      sessionJti: 'j',
+      sessionExp: 1,
+    })
+    expect(claimed.ok).toBe(true)
+    if (!claimed.ok) return
+    expect(claimed.value.balance).toBe(parseUsd('1').toString())
   })
 
   it('reports an unknown intent rather than crediting anything', async () => {
@@ -296,6 +335,7 @@ describe('deposit intents', () => {
       txHash: TX_A,
       opIndex: 0,
       now: Date.now(),
+      confirmedAt: Date.now(),
       sessionJti: 'j',
       sessionExp: 1,
     })
@@ -490,5 +530,254 @@ describe('solvency totals', () => {
     expect(parseAtomic(totals.value.outstanding)).toBe(parseUsd('1.98'))
 
     expect(totals.value.consumed_deposits).toHaveLength(2)
+  })
+})
+
+describe('caps are enforced at CREDIT MINT, not just at intent creation (P0-1)', () => {
+  /**
+   * The attack this closes: the checks at intent creation hold nothing, so an
+   * attacker can mint many intents while each individually looks under the
+   * cap, pay them all, and then open them all. Enforcement has to happen where
+   * credit is actually created.
+   */
+  it('refuses to credit an open that would breach the per-account daily cap', async () => {
+    const env = makeEnv()
+    // Mint ELEVEN intents up front, spaced to dodge the hourly rate limit.
+    // Every one passes the advisory check because nothing is credited yet.
+    const ids: string[] = []
+    for (let hour = 0; hour < 11; hour++) {
+      const now = Date.UTC(2026, 7, 12, hour, 0, 0)
+      const r = await createIntent(env, {
+        intentId: nextId(),
+        account: ALICE,
+        amountAtomic: parseUsd('1'),
+        memo: `pg-${nextId()}`,
+        destination: ROUTER,
+        now,
+        expiresAt: now + 24 * 60 * 60 * 1000,
+      })
+      expect(r.ok).toBe(true)
+      if (!r.ok) return
+      ids.push(r.value.intent_id)
+    }
+
+    // Now open all eleven. The first ten fit the $10/day cap; the eleventh
+    // must be refused rather than silently credited.
+    const at = Date.UTC(2026, 7, 12, 12, 0, 0)
+    for (let i = 0; i < 10; i++) {
+      const opened = await openIntent(env, {
+        intentId: ids[i],
+        txHash: 'e'.repeat(64),
+        opIndex: i,
+        now: at,
+        confirmedAt: at,
+        sessionJti: 'j',
+        sessionExp: 1,
+      })
+      expect(opened.ok).toBe(true)
+    }
+
+    const over = await openIntent(env, {
+      intentId: ids[10],
+      txHash: 'e'.repeat(64),
+      opIndex: 10,
+      now: at,
+      confirmedAt: at,
+      sessionJti: 'j',
+      sessionExp: 1,
+    })
+    expect(over.ok).toBe(false)
+    if (over.ok) return
+    expect(over.code).toBe('deposit_exceeds_cap')
+    expect(over.detail?.reason).toBe('deposit_cap_exceeded')
+
+    // The balance stopped at the cap — the eleventh deposit was NOT credited.
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('10').toString())
+  })
+
+  it('refuses to credit an open that would breach the global ceiling', async () => {
+    const env = makeEnv({ PLAYGROUND_GLOBAL_CAP_USD: '1' } as any)
+    const now = Date.UTC(2026, 7, 12, 10, 0, 0)
+    // Two intents minted while the ledger is empty: both pass the advisory check.
+    const a = await mintIntent(env, { usd: '1', now })
+    const b = await mintIntent(env, { account: BOB, usd: '1', now })
+    expect(a.ok && b.ok).toBe(true)
+    if (!a.ok || !b.ok) return
+
+    const first = await openIntent(env, {
+      intentId: a.value.intent_id,
+      txHash: TX_A,
+      opIndex: 0,
+      now,
+      confirmedAt: now,
+      sessionJti: 'j',
+      sessionExp: 1,
+    })
+    expect(first.ok).toBe(true)
+
+    const second = await openIntent(env, {
+      intentId: b.value.intent_id,
+      txHash: TX_B,
+      opIndex: 0,
+      now,
+      confirmedAt: now,
+      sessionJti: 'j',
+      sessionExp: 1,
+    })
+    expect(second.ok).toBe(false)
+    if (second.ok) return
+    expect(second.code).toBe('deposit_exceeds_cap')
+    expect(second.detail?.reason).toBe('global_cap_exceeded')
+  })
+
+  it('records an over-cap deposit as terminal and idempotent, never silently credited', async () => {
+    const env = makeEnv({ PLAYGROUND_GLOBAL_CAP_USD: '1' } as any)
+    const now = Date.UTC(2026, 7, 12, 10, 0, 0)
+    await deposit(env, { usd: '1' })
+    const b = await mintIntent(env, { account: BOB, usd: '1', now })
+    if (!b.ok) return
+
+    const args = {
+      intentId: b.value.intent_id,
+      txHash: TX_B,
+      opIndex: 0,
+      now,
+      confirmedAt: now,
+      sessionJti: 'j',
+      sessionExp: 1,
+    }
+    const first = await openIntent(env, args)
+    expect(first.ok).toBe(false)
+
+    // Re-submitting reports the same terminal state rather than re-running the
+    // cap check (which could later pass and credit a deposit support may
+    // already have refunded).
+    const again = await openIntent(env, args)
+    expect(again.ok).toBe(false)
+    if (again.ok) return
+    expect(again.code).toBe('deposit_exceeds_cap')
+
+    const account = await readAccount(env, BOB)
+    if (!account.ok) return
+    expect(account.value.balance).toBe('0')
+  })
+
+  it('caps the number of unclaimed intents an account can accumulate', async () => {
+    // Bounds total DO storage growth, not just its rate.
+    const env = makeEnv()
+    let refusal: string | undefined
+    for (let hour = 0; hour < 40; hour++) {
+      const now = Date.UTC(2026, 7, 12, 0, 0, 0) + hour * 3_600_000
+      const r = await createIntent(env, {
+        intentId: nextId(),
+        account: ALICE,
+        amountAtomic: parseUsd('0.1'),
+        memo: `pg-${nextId()}`,
+        destination: ROUTER,
+        now,
+        expiresAt: now + 1_000,
+      })
+      if (!r.ok) {
+        refusal = r.code
+        break
+      }
+    }
+    expect(refusal).toBe('too_many_open_intents')
+  })
+})
+
+describe('stale reserved-call reaper (P1)', () => {
+  /**
+   * A call is stranded when the request dies between taking the hold and
+   * settling it — most often a commit that failed AFTER the upstream had
+   * already delivered. Without a reaper the hold is frozen forever AND the
+   * `call_id` retry short-circuit keeps returning `duplicate` for a call that
+   * never produced a result.
+   */
+  it('commits calls stranded in reserved past the lease, and flags them for support', async () => {
+    const mock = makePlaygroundLedgerMockWithControls()
+    const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
+    await deposit(env, { usd: '1' })
+
+    const staleAt = Date.now() - RESERVED_LEASE_MS - 1000
+    await reserve(env, {
+      callId: 'stranded',
+      account: ALICE,
+      chip: 'chat',
+      maxPriceAtomic: parseUsd('0.02'),
+      now: staleAt,
+    })
+
+    await mock.runAlarm()
+
+    const account = await readAccount(env, ALICE)
+    expect(account.ok).toBe(true)
+    if (!account.ok) return
+    const call = account.value.calls.find(c => c.call_id === 'stranded')!
+    // Committed, not released: the reserve->settle window brackets the paid
+    // upstream call, so a stranded call most likely cost the router money.
+    expect(call.status).toBe('committed')
+    expect(call.charged).toBe(parseUsd('0.02').toString())
+    expect(call.reaped).toBe(true)
+    // The hold is gone from the balance exactly once.
+    expect(account.value.balance).toBe(parseUsd('0.98').toString())
+  })
+
+  it('leaves healthy in-flight calls alone', async () => {
+    const mock = makePlaygroundLedgerMockWithControls()
+    const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
+    await deposit(env, { usd: '1' })
+    await reserve(env, {
+      callId: 'in-flight',
+      account: ALICE,
+      chip: 'chat',
+      maxPriceAtomic: parseUsd('0.02'),
+      now: Date.now(),
+    })
+
+    await mock.runAlarm()
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.calls[0].status).toBe('reserved')
+  })
+
+  it('arms an alarm when a hold is taken', async () => {
+    const mock = makePlaygroundLedgerMockWithControls()
+    const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
+    await deposit(env, { usd: '1' })
+    expect(mock.getAlarm()).toBeNull()
+    await reserve(env, {
+      callId: 'arms-alarm',
+      account: ALICE,
+      chip: 'chat',
+      maxPriceAtomic: parseUsd('0.02'),
+      now: Date.now(),
+    })
+    expect(mock.getAlarm()).not.toBeNull()
+  })
+
+  it('keeps the ledger self-consistent after reaping', async () => {
+    const mock = makePlaygroundLedgerMockWithControls()
+    const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
+    await deposit(env, { usd: '1' })
+    await reserve(env, {
+      callId: 'stranded-2',
+      account: ALICE,
+      chip: 'chat',
+      maxPriceAtomic: parseUsd('0.02'),
+      now: Date.now() - RESERVED_LEASE_MS - 1,
+    })
+    await mock.runAlarm()
+
+    const totals = await readTotals(env)
+    if (!totals.ok) return
+    expect(parseAtomic(totals.value.credited)).toBe(
+      parseAtomic(totals.value.committed) +
+        parseAtomic(totals.value.balances_sum) +
+        parseAtomic(totals.value.holds_sum),
+    )
   })
 })

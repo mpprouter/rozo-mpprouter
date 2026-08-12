@@ -71,11 +71,56 @@ idempotent and returns the original session; anything else is a 409.
 Every amount is a 7-decimal USDC atomic `bigint`. No `number` amount exists in
 the subsystem — see `src/playground/amount.ts`.
 
-Each call is `reserve(call_id, max_price)` → upstream → `commit(actual)` or
-`release`. The hold is taken **before** the upstream call, so a balance can
-never go negative; a 4xx/5xx/timeout releases it in full, so a failed call is
-never billed. A retried `call_id` returns the recorded outcome and never
-charges twice.
+Each call is `reserve(call_id, max_price)` → upstream → `commit` or `release`.
+The hold is taken **before** the upstream call, so a balance can never go
+negative. A retried `call_id` returns the recorded outcome and never charges
+twice.
+
+### Commit vs release on failure
+
+A failed call is **not** automatically refunded. For a session call the voucher
+is signed — and the cumulative watermark advanced — *before* the merchant's
+final response is known, so a late failure means the router has already paid.
+Refunding there would hand out free upstream calls to anyone who can make the
+response leg fail. The rule is: **release only when we can prove no payment
+happened.**
+
+| Evidence | Situation | Outcome |
+| --- | --- | --- |
+| `no` | Refused before dispatch (unknown/unverified route, rate limit, over-budget refusal, missing session channel), or a Mercury route that never pays | **release** |
+| `yes` | Session voucher signed (watermark advanced), or merchant answered our paid retry with a bad status / unparseable body | **commit** |
+| `maybe` | Lost response or timeout after dispatch | **commit** |
+
+Charged failures return `charged_usd` plus a `support_note` telling the user
+plainly they were billed for a call that did not deliver, and log at error level
+with `PAID-BUT-FAILED` for support to find.
+
+### Upstream spend ceiling
+
+Every paid call passes a `maxAmountRaw` ceiling into `payMerchant` /
+`payMerchantSession`, enforced in an `onChallenge` hook that throws
+**before any credential is signed** if the merchant's live 402 asks for more.
+The ceilings are backend constants (`TIER_UPSTREAM_BUDGET_USD`, chip
+`budgetUsd`), independent of the flat price charged to the user, so an
+allow-listed merchant that reprices or is compromised cannot drain the Tempo
+pool. A call with no budget set is refused rather than defaulting to unlimited.
+
+### Deposit caps
+
+The checks at intent creation are advisory headroom only — they hold nothing.
+The **enforcement point is `/open`**, inside the DO transaction that mints
+credit, because otherwise many intents could each pass the check and then all
+be opened. An over-cap deposit is recorded as a terminal `over_cap` intent plus
+an `overcap:` record for support; the `(tx, op)` pair is deliberately **not**
+consumed, so an operator can still credit it manually once the ceiling is
+raised.
+
+### Stranded calls
+
+A DO alarm reaps calls stuck in `reserved` past a 5-minute lease. They are
+**committed**, not released — the reserve→settle window brackets the paid
+upstream call — and flagged `reaped: true` so support can issue goodwill credit
+where the user genuinely got nothing.
 
 Prices: chat `$0.02` (cheap tier) / `$0.10` (flagship), Blend activity `$0.03`,
 tx-decode `$0.005`. Deposits are `$0.10` or `$1.00` and are **non-refundable

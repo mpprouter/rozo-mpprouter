@@ -71,7 +71,7 @@ export function utcHourKey(now: number): string {
   return new Date(now).toISOString().slice(0, 13)
 }
 
-export type IntentStatus = 'open' | 'consumed' | 'expired'
+export type IntentStatus = 'open' | 'consumed' | 'expired' | 'over_cap'
 
 export interface StoredIntent {
   intent_id: string
@@ -79,6 +79,15 @@ export interface StoredIntent {
   /** Atomic 7-decimal USDC string. */
   amount: string
   memo: string
+  /**
+   * The receiving address quoted to the user AT INTENT CREATION.
+   *
+   * `session/open` verifies the on-chain payment against this, not against the
+   * live `STELLAR_ROUTER_PUBLIC`. Otherwise rotating the router's receiving
+   * account would brick every deposit already in flight: the user paid the
+   * address we told them, and that promise has to outlive a config change.
+   */
+  destination: string
   created_at: number
   expires_at: number
   status: IntentStatus
@@ -105,6 +114,13 @@ export interface StoredCall {
   at: number
   /** Set when released, for operator forensics. */
   release_reason?: string
+  /**
+   * Set when a call was committed by the stale-call reaper rather than by its
+   * own request. Support uses this to find calls whose user may deserve a
+   * goodwill credit — the router paid upstream, but the response never reached
+   * the user.
+   */
+  reaped?: boolean
 }
 
 export interface ReserveOutcome {
@@ -138,11 +154,82 @@ function err(code: string, message: string, detail?: Record<string, string | num
   return { ok: false, code, message, detail }
 }
 
+/**
+ * How long a call may sit in `reserved` before the reaper settles it.
+ *
+ * Comfortably longer than the 30s upstream timeout plus retries, so a healthy
+ * in-flight call is never reaped out from under itself.
+ */
+export const RESERVED_LEASE_MS = 5 * 60 * 1000
+
+/** How often the reaper wakes while any reserved call exists. */
+export const REAPER_INTERVAL_MS = 60 * 1000
+
 export class PlaygroundLedger implements DurableObject {
   private readonly storage: DurableObjectStorage
 
   constructor(state: DurableObjectState) {
     this.storage = state.storage
+  }
+
+  /**
+   * Reaper for calls stranded in `reserved`.
+   *
+   * A call is stranded when the request died between taking the hold and
+   * settling it — most often a commit that failed AFTER the upstream had
+   * already delivered. Left alone the hold is frozen forever and, worse, the
+   * `call_id` retry short-circuit returns `duplicate` for a call that never
+   * produced a result.
+   *
+   * Stale reserved calls are COMMITTED, not released. The reserve→settle
+   * window brackets the paid upstream call, so a call that entered it and
+   * never came back most likely did dispatch and cost the router real money.
+   * Releasing would hand out free API calls to anyone who can make the
+   * response leg fail; committing is the same "when in doubt, the money moved"
+   * rule the failure path uses. Each reaped call is flagged `reaped: true` so
+   * support can find them and issue goodwill credit where the user genuinely
+   * got nothing.
+   */
+  async alarm(): Promise<void> {
+    const now = Date.now()
+    const calls = await this.storage.list<StoredCall>({ prefix: 'call:' })
+    let remaining = 0
+
+    for (const [key, call] of calls) {
+      if (call.status !== 'reserved') continue
+      if (now - call.at < RESERVED_LEASE_MS) {
+        remaining++
+        continue
+      }
+      const held = parseAtomic(call.max_price)
+      const balKey = `bal:${call.account}`
+      const balance = parseAtomic((await this.storage.get<string>(balKey)) ?? '0')
+      // Committed at the full hold: we have no evidence of the actual price,
+      // and the hold is the ceiling the user already agreed to.
+      await this.storage.put(key, {
+        ...call,
+        status: 'committed',
+        charged: held.toString(),
+        reaped: true,
+      } satisfies StoredCall)
+      await this.storage.put(balKey, balance.toString())
+      await this.storage.put(
+        'total:committed',
+        (parseAtomic((await this.storage.get<string>('total:committed')) ?? '0') + held).toString(),
+      )
+      await this.storage.put(
+        'total:outstanding',
+        (parseAtomic((await this.storage.get<string>('total:outstanding')) ?? '0') - held).toString(),
+      )
+      console.warn(
+        `[playground-ledger] reaped stranded call ${call.call_id} (chip=${call.chip}) ` +
+          `after ${Math.round((now - call.at) / 1000)}s; committed ${held} atomic`,
+      )
+    }
+
+    // Keep waking while anything is still in flight; otherwise let the alarm
+    // lapse so an idle DO costs nothing.
+    if (remaining > 0) await this.storage.setAlarm(now + REAPER_INTERVAL_MS)
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -210,11 +297,13 @@ export class PlaygroundLedger implements DurableObject {
     account: string
     amount: string
     memo: string
+    destination: string
     now: number
     expires_at: number
     per_account_day_cap: string
     global_cap: string
     intents_per_hour: number
+    max_open_intents: number
   }): Promise<Result<StoredIntent>> {
     const amount = parseAtomic(body.amount)
     if (amount <= 0n) return err('invalid_amount', 'deposit amount must be positive')
@@ -251,6 +340,19 @@ export class PlaygroundLedger implements DurableObject {
         })
       }
 
+      // Hard ceiling on stored intents per account. The hourly rate limit
+      // bounds the RATE of storage growth; this bounds the TOTAL, so an
+      // attacker cycling addresses cannot grow DO storage without bound by
+      // minting intents forever and never claiming them.
+      const openKey = `open:${body.account}`
+      const openCount = parseAtomic((await txn.get<string>(openKey)) ?? '0')
+      if (openCount >= BigInt(body.max_open_intents)) {
+        return err('too_many_open_intents', 'too many unclaimed deposit intents for this account', {
+          open_intents: openCount.toString(),
+          max: body.max_open_intents,
+        })
+      }
+
       // Memo collision would make two intents indistinguishable on-chain.
       // Astronomically unlikely with a 128-bit nonce, fatal if it happened.
       if (await txn.get<string>(`memo:${body.memo}`)) {
@@ -262,6 +364,7 @@ export class PlaygroundLedger implements DurableObject {
         account: body.account,
         amount: amount.toString(),
         memo: body.memo,
+        destination: body.destination,
         created_at: body.now,
         expires_at: body.expires_at,
         status: 'open',
@@ -269,6 +372,7 @@ export class PlaygroundLedger implements DurableObject {
       await txn.put(`intent:${body.intent_id}`, intent)
       await txn.put(`memo:${body.memo}`, body.intent_id)
       await txn.put(rlKey, (used + 1n).toString())
+      await txn.put(openKey, (openCount + 1n).toString())
       return { ok: true as const, value: intent }
     })
   }
@@ -306,8 +410,12 @@ export class PlaygroundLedger implements DurableObject {
     tx_hash: string
     op_index: number
     now: number
+    /** On-chain ledger close time of the deposit, ms. Compared to expiry. */
+    confirmed_at: number
     session_jti: string
     session_exp: number
+    per_account_day_cap: string
+    global_cap: string
   }): Promise<Result<{ intent: StoredIntent; balance: string; replayed: boolean }>> {
     return this.storage.transaction(async txn => {
       const intent = await txn.get<StoredIntent>(`intent:${body.intent_id}`)
@@ -315,6 +423,15 @@ export class PlaygroundLedger implements DurableObject {
 
       const consumedKey = `consumed:${body.tx_hash}:${body.op_index}`
       const consumedBy = await txn.get<string>(consumedKey)
+
+      if (intent.status === 'over_cap') {
+        // Terminal: the deposit landed on-chain but crediting it would breach
+        // a ceiling. Re-submitting must keep reporting the same thing rather
+        // than retrying the cap check, so support has one stable state.
+        return err('deposit_exceeds_cap', 'deposit exceeds the playground credit cap', {
+          intent_id: intent.intent_id,
+        })
+      }
 
       if (intent.status === 'consumed') {
         // Idempotent replay only if it is the same payment against the same
@@ -335,19 +452,62 @@ export class PlaygroundLedger implements DurableObject {
         return err('payment_already_claimed', 'this payment operation was already credited')
       }
 
-      if (body.now > intent.expires_at) {
+      // Expiry is judged by when the payment CONFIRMED on-chain, not by when
+      // the user got around to claiming it. A deposit that settled inside the
+      // window is the user's money regardless of how long the claim took;
+      // using claim time would silently swallow late-claimed valid deposits.
+      if (body.confirmed_at > intent.expires_at) {
         // Mark it so a later read reports the real reason rather than "open".
         await txn.put(`intent:${body.intent_id}`, { ...intent, status: 'expired' as const })
-        return err('intent_expired', 'deposit intent expired before it was claimed')
+        await this.releaseOpenSlot(txn, intent.account)
+        return err('intent_expired', 'deposit was confirmed on-chain after the intent expired')
       }
 
       const amount = parseAtomic(intent.amount)
 
-      // Re-check the daily cap at credit time. The cap check at intent time
-      // was advisory (headroom, not a hold), so several intents minted under
-      // the cap could otherwise all land and blow past it together.
+      // ---- Ceilings, enforced HERE at credit mint ------------------------
+      // The checks at intent creation are advisory headroom only: they hold
+      // nothing, so N intents can each pass them and then all be opened. This
+      // is the enforcement point that actually bounds outstanding credit.
       const depKey = `dep:${intent.account}:${utcDayKey(body.now)}`
       const depositedToday = parseAtomic((await txn.get<string>(depKey)) ?? '0')
+      const dayCap = parseAtomic(body.per_account_day_cap)
+      const outstanding = parseAtomic((await txn.get<string>('total:outstanding')) ?? '0')
+      const globalCap = parseAtomic(body.global_cap)
+
+      const overDay = depositedToday + amount > dayCap
+      const overGlobal = outstanding + amount > globalCap
+      if (overDay || overGlobal) {
+        // The money is already on-chain, so this cannot be a soft refusal that
+        // leaves the intent claimable. Record a terminal state plus everything
+        // support needs to refund out of band, and do NOT consume the
+        // (tx, op) pair — leaving it unconsumed keeps the door open for an
+        // operator to credit it manually once the ceiling is raised.
+        const overCap: StoredIntent = {
+          ...intent,
+          status: 'over_cap',
+          tx_hash: body.tx_hash,
+          op_index: body.op_index,
+        }
+        await txn.put(`intent:${body.intent_id}`, overCap)
+        await this.releaseOpenSlot(txn, intent.account)
+        await txn.put(`overcap:${body.intent_id}`, {
+          intent_id: body.intent_id,
+          account: intent.account,
+          amount: intent.amount,
+          tx_hash: body.tx_hash,
+          op_index: body.op_index,
+          reason: overDay ? 'deposit_cap_exceeded' : 'global_cap_exceeded',
+          at: body.now,
+        })
+        return err('deposit_exceeds_cap', 'deposit exceeds the playground credit cap', {
+          reason: overDay ? 'deposit_cap_exceeded' : 'global_cap_exceeded',
+          deposited_today: depositedToday.toString(),
+          day_cap: dayCap.toString(),
+          outstanding: outstanding.toString(),
+          global_cap: globalCap.toString(),
+        })
+      }
 
       const balKey = `bal:${intent.account}`
       const balance = parseAtomic((await txn.get<string>(balKey)) ?? '0')
@@ -363,22 +523,27 @@ export class PlaygroundLedger implements DurableObject {
 
       await txn.put(consumedKey, body.intent_id)
       await txn.put(`intent:${body.intent_id}`, updated)
+      await this.releaseOpenSlot(txn, intent.account)
       await txn.put(balKey, (balance + amount).toString())
       await txn.put(depKey, (depositedToday + amount).toString())
       await txn.put(
         'total:credited',
         (parseAtomic((await txn.get<string>('total:credited')) ?? '0') + amount).toString(),
       )
-      await txn.put(
-        'total:outstanding',
-        (parseAtomic((await txn.get<string>('total:outstanding')) ?? '0') + amount).toString(),
-      )
+      await txn.put('total:outstanding', (outstanding + amount).toString())
 
       return {
         ok: true as const,
         value: { intent: updated, balance: (balance + amount).toString(), replayed: false },
       }
     })
+  }
+
+  /** Give back one open-intent slot when an intent reaches a terminal state. */
+  private async releaseOpenSlot(txn: DurableObjectTransaction, account: string): Promise<void> {
+    const key = `open:${account}`
+    const current = parseAtomic((await txn.get<string>(key)) ?? '0')
+    await txn.put(key, (current > 0n ? current - 1n : 0n).toString())
   }
 
   // -------------------------------------------------------------------------
@@ -428,7 +593,7 @@ export class PlaygroundLedger implements DurableObject {
     const maxPrice = parseAtomic(body.max_price)
     if (maxPrice < 0n) return err('invalid_amount', 'max_price must not be negative')
 
-    return this.storage.transaction(async txn => {
+    const result = await this.storage.transaction(async txn => {
       const existing = await txn.get<StoredCall>(`call:${body.call_id}`)
       if (existing) {
         const balance = parseAtomic((await txn.get<string>(`bal:${existing.account}`)) ?? '0')
@@ -482,6 +647,14 @@ export class PlaygroundLedger implements DurableObject {
         value: { ok: true, call, balance: remaining.toString(), duplicate: false },
       }
     })
+
+    if (result.ok && result.value.ok && !result.value.duplicate) {
+      // Arm the reaper outside the transaction. setAlarm is idempotent-ish —
+      // an existing earlier alarm is kept so we never push the deadline out.
+      const existing = await this.storage.getAlarm()
+      if (existing === null) await this.storage.setAlarm(body.now + REAPER_INTERVAL_MS)
+    }
+    return result
   }
 
   // -------------------------------------------------------------------------

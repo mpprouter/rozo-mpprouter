@@ -81,13 +81,25 @@ function timingSafeEqual(a: Uint8Array, b: Uint8Array): boolean {
   return diff === 0
 }
 
+/**
+ * Is the configured signing secret usable?
+ *
+ * Exported so the route layer can refuse to ISSUE a deposit intent when the
+ * secret is missing — checking only at mint time would mean taking a real
+ * on-chain payment for credit we then cannot hand out.
+ */
+export function isSessionSecretUsable(secret: string | undefined): boolean {
+  return typeof secret === 'string' && secret.length >= 16
+}
+
 function requireSecret(secret: string | undefined): string {
-  if (!secret || secret.length < 16) {
-    // Fail closed and loudly. A missing/short secret must never degrade into
-    // "issue tokens anyway" — that would make every session forgeable.
+  if (!isSessionSecretUsable(secret)) {
+    // Fail closed and loudly — see below.
+    // A missing/short secret must never degrade into "issue tokens anyway" —
+    // that would make every session forgeable.
     throw new Error('PLAYGROUND_SESSION_SECRET is not configured (min 16 chars)')
   }
-  return secret
+  return secret as string
 }
 
 /** Mint a session token for `account`, valid for `ttlSeconds`. */

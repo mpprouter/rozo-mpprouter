@@ -11,7 +11,7 @@
  * seam itself is exercised by the live smoketest, not by mocking mppx.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { Env } from '../src/index'
 import {
   handlePlaygroundBlendActivity,
@@ -24,7 +24,7 @@ import {
 } from '../src/routes/playground'
 import { parseUsd } from '../src/playground/amount'
 import { PLAYGROUND_MODELS } from '../src/playground/models'
-import { createIntent, openIntent } from '../src/playground/ledger-client'
+import { createIntent, getIntent, openIntent } from '../src/playground/ledger-client'
 import { mintSessionToken } from '../src/playground/session-token'
 import { makePlaygroundLedgerMock } from './helpers/playground-ledger-mock'
 import {
@@ -37,8 +37,8 @@ import {
 } from '../src/playground/blend'
 
 const SECRET = 'playground-test-secret-not-a-real-key'
-const ROUTER = 'GTESTROUTERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
-const ALICE = 'GTESTALICEXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+const ROUTER = 'GBJ7NMENUWLOA5Z5UC3YQROMMY3XKHZYAOYOFL2SXJUGNRVZVG5GAYBV'
+const ALICE = 'GA6SKSJLJ3E33KKDNB3UDBRIECIBQKGYLGXLCBTXNQ7WWJ27BMDUH6JW'
 
 function makeEnv(overrides: Record<string, unknown> = {}): Env {
   return {
@@ -85,6 +85,7 @@ async function fund(env: Env, usd: string, account = ALICE) {
     account,
     amountAtomic: parseUsd(usd),
     memo: `pg-${Math.random().toString(16).slice(2, 22)}`,
+    destination: ROUTER,
     now,
     expiresAt: now + 600_000,
   })
@@ -94,6 +95,7 @@ async function fund(env: Env, usd: string, account = ALICE) {
     txHash: Math.random().toString(16).slice(2).padEnd(64, '0').slice(0, 64),
     opIndex: 0,
     now,
+    confirmedAt: now,
     sessionJti: 'j',
     sessionExp: Math.floor(now / 1000) + 3600,
   })
@@ -473,5 +475,153 @@ describe('Blend aggregation', () => {
   it('produces a truthful sentence with no events at all', () => {
     const agg = aggregateBlendEvents([], 'C')
     expect(describeAggregate(agg)).toMatch(/No recent Blend pool events/)
+  })
+})
+
+describe('account validation (P1)', () => {
+  it('rejects shape-valid G-strings that fail the StrKey checksum', async () => {
+    // These look like addresses and would otherwise become DO storage keys,
+    // letting an attacker grow storage against unbounded fake accounts.
+    const env = makeEnv()
+    const bogus = [
+      'GTESTALICEXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+      'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
+      `${ALICE.slice(0, -1)}${ALICE.at(-1) === 'A' ? 'B' : 'A'}`,
+    ]
+    for (const account of bogus) {
+      const r = await handlePlaygroundIntent(
+        post('/v1/playground/session/intent', { account }),
+        env,
+      )
+      expect(r.status).toBe(400)
+      expect((await r.json()).error).toBe('invalid_account')
+    }
+  })
+
+  it('accepts a real checksummed address', async () => {
+    const env = makeEnv()
+    const r = await handlePlaygroundIntent(
+      post('/v1/playground/session/intent', { account: ALICE }),
+      env,
+    )
+    expect(r.status).toBe(200)
+  })
+})
+
+describe('signing secret is validated before any deposit is quoted (P1)', () => {
+  it('refuses to issue an intent when the secret is unset', async () => {
+    // Quoting a deposit we cannot mint a session for would take real on-chain
+    // money for credit we then cannot hand out.
+    const env = makeEnv({ PLAYGROUND_SESSION_SECRET: undefined })
+    const r = await handlePlaygroundIntent(
+      post('/v1/playground/session/intent', { account: ALICE }),
+      env,
+    )
+    expect(r.status).toBe(503)
+    expect((await r.json()).error).toBe('not_configured')
+  })
+
+  it('refuses to consume a deposit when the secret is unset', async () => {
+    const env = makeEnv({ PLAYGROUND_SESSION_SECRET: 'short' })
+    const r = await handlePlaygroundOpen(
+      post('/v1/playground/session/open', {
+        intent_id: 'anything',
+        tx_hash: 'a'.repeat(64),
+      }),
+      env,
+    )
+    expect(r.status).toBe(503)
+    expect((await r.json()).error).toBe('not_configured')
+  })
+})
+
+describe('deposit destination is pinned at quote time (P1)', () => {
+  it('verifies against the recorded destination, not the live env var', async () => {
+    const env = makeEnv()
+    const quoted = await (
+      await handlePlaygroundIntent(post('/v1/playground/session/intent', { account: ALICE }), env)
+    ).json()
+    expect(quoted.destination).toBe(ROUTER)
+
+    // Operator rotates the receiving account while the deposit is in flight.
+    const rotated = 'GA3OIWUOYWSLWXUYE4JXWUPMKZX5ZIJ2WRXI3BBDMZKNLFREJO672NOH'
+    ;(env as any).STELLAR_ROUTER_PUBLIC = rotated
+
+    const intent = await getIntent(env, quoted.intent_id)
+    expect(intent.ok).toBe(true)
+    if (!intent.ok) return
+    // The user paid the address we quoted; that promise outlives the rotation.
+    expect(intent.value.destination).toBe(ROUTER)
+    expect(intent.value.destination).not.toBe(rotated)
+  })
+})
+
+describe('session lifetime on re-open (P1)', () => {
+  /**
+   * The bug this locks out: `Math.max(1, expiredDelta)` minted a token that
+   * expired one second later, and the code never consulted the recorded
+   * expiry — so a re-open could also silently extend a balance past 7 days.
+   */
+  const HORIZON_TX = 'a'.repeat(64)
+
+  function stubHorizon(env: Env, memo: string, amount: string, confirmedAt: string) {
+    return vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/operations')) {
+        return new Response(
+          JSON.stringify({
+            _embedded: {
+              records: [
+                {
+                  type: 'payment',
+                  asset_code: 'USDC',
+                  asset_issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+                  from: ALICE,
+                  to: ROUTER,
+                  amount,
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        )
+      }
+      return new Response(
+        JSON.stringify({ successful: true, memo_type: 'text', memo, created_at: confirmedAt }),
+        { status: 200 },
+      )
+    }) as any)
+  }
+
+  it('re-open while the session is still valid returns the SAME token, not a longer one', async () => {
+    const env = makeEnv()
+    const quoted = await (
+      await handlePlaygroundIntent(
+        post('/v1/playground/session/intent', { account: ALICE, amount_usd: '1' }),
+        env,
+      )
+    ).json()
+    const spy = stubHorizon(env, quoted.memo, '1.0000000', new Date().toISOString())
+
+    const body = { intent_id: quoted.intent_id, tx_hash: HORIZON_TX }
+    const first = await (
+      await handlePlaygroundOpen(post('/v1/playground/session/open', body), env)
+    ).json()
+    const second = await (
+      await handlePlaygroundOpen(post('/v1/playground/session/open', body), env)
+    ).json()
+
+    expect(second.replayed).toBe(true)
+    // Same token and same expiry — a retry must not extend the session, and
+    // must not mint a second valid one.
+    expect(second.session_token).toBe(first.session_token)
+    expect(second.expires_at).toBe(first.expires_at)
+    // Balance credited exactly once.
+    expect(second.balance_usd).toBe('1.00')
+
+    const ttlSeconds = (Date.parse(first.expires_at) - Date.now()) / 1000
+    expect(ttlSeconds).toBeGreaterThan(6 * 24 * 3600)
+    expect(ttlSeconds).toBeLessThanOrEqual(7 * 24 * 3600)
+    spy.mockRestore()
   })
 })

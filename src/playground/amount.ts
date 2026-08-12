@@ -95,3 +95,15 @@ export function parseAtomic(value: string | null | undefined): bigint {
   }
   return BigInt(value)
 }
+
+/**
+ * Convert a 7-decimal atomic USD amount to Tempo's USDC-6 base units.
+ *
+ * The playground reckons in Stellar's 7-decimal precision; Tempo 402
+ * challenges quote amounts in USDC-6 ("10000" is $0.01). Truncating division
+ * is deliberate and safe in the one place this is used — computing a spend
+ * CEILING — because rounding down can only make the ceiling stricter.
+ */
+export function toTempoRaw6(atomic7: bigint): string {
+  return (atomic7 / 10n).toString()
+}

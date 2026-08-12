@@ -25,7 +25,7 @@ import {
 
 const SECRET = 'playground-test-secret-not-a-real-key'
 const OTHER_SECRET = 'a-different-playground-test-secret!!'
-const ACCOUNT = 'GTESTALICEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+const ACCOUNT = 'GA6SKSJLJ3E33KKDNB3UDBRIECIBQKGYLGXLCBTXNQ7WWJ27BMDUH6JW'
 const NOW = Date.UTC(2026, 7, 12, 12, 0, 0)
 
 async function mint(overrides: { now?: number; ttlSeconds?: number; secret?: string } = {}) {
@@ -62,7 +62,7 @@ describe('session tokens', () => {
       JSON.stringify({
         iss: 'mpprouter-playground',
         aud: 'playground',
-        sub: 'GTESTMALLORYXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX',
+        sub: 'GDOWC3RXCLSDDY2FKUGRWUNQU25AUK3FFVLHGKRIGGIK2EQ6SRX5A76E',
         jti: 'jti-test-1',
         iat: Math.floor(NOW / 1000),
         exp: Math.floor(NOW / 1000) + 3600,

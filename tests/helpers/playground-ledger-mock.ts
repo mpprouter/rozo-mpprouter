@@ -79,13 +79,46 @@ class InMemoryStorage {
   async deleteAll(): Promise<void> {
     this.store.clear()
   }
-  async getAlarm(): Promise<null> {
-    return null
+  alarmAt: number | null = null
+  async getAlarm(): Promise<number | null> {
+    return this.alarmAt
   }
-  async setAlarm(): Promise<void> {}
-  async deleteAlarm(): Promise<void> {}
+  async setAlarm(at: number): Promise<void> {
+    this.alarmAt = at
+  }
+  async deleteAlarm(): Promise<void> {
+    this.alarmAt = null
+  }
   async sync(): Promise<void> {}
 }
+
+/**
+ * Namespace mock that also exposes the live DO instance and its alarm clock,
+ * so tests can drive the stale-call reaper deterministically instead of
+ * waiting on wall time.
+ */
+export interface PlaygroundLedgerMock {
+  namespace: DurableObjectNamespace
+  /** Invoke the DO's alarm handler directly, as the runtime would. */
+  runAlarm(): Promise<void>
+  /** Currently scheduled alarm time, or null. */
+  getAlarm(): number | null
+}
+
+export function makePlaygroundLedgerMockWithControls(): PlaygroundLedgerMock {
+  const ns = makePlaygroundLedgerMock()
+  const control = CONTROLS.get(ns)!
+  return {
+    namespace: ns,
+    runAlarm: () => control.instance.alarm(),
+    getAlarm: () => control.alarm,
+  }
+}
+
+const CONTROLS = new WeakMap<
+  DurableObjectNamespace,
+  { instance: PlaygroundLedger; alarm: number | null }
+>()
 
 export function makePlaygroundLedgerMock(): DurableObjectNamespace {
   const storage = new InMemoryStorage()
@@ -119,6 +152,13 @@ export function makePlaygroundLedgerMock(): DurableObjectNamespace {
     get: () => stub,
     jurisdiction: () => ns,
   } as unknown as DurableObjectNamespace
+
+  CONTROLS.set(ns, {
+    instance,
+    get alarm() {
+      return storage.alarmAt
+    },
+  } as any)
 
   return ns
 }

@@ -59,13 +59,27 @@ export type DepositFailure =
   | 'horizon_unavailable'
 
 export type DepositVerification =
-  | { ok: true; opIndex: number }
+  | {
+      ok: true
+      opIndex: number
+      /**
+       * Ledger close time of the transaction, ms since epoch.
+       *
+       * Intent expiry is judged against THIS, not against the moment the user
+       * happened to call `session/open`. A deposit that confirmed inside the
+       * window is the user's money however long the claim took; using claim
+       * time would silently swallow valid, already-settled deposits.
+       */
+      confirmedAt: number
+    }
   | { ok: false; reason: DepositFailure; detail?: string }
 
 interface HorizonTransaction {
   successful?: boolean
   memo_type?: string
   memo?: string
+  /** ISO-8601 ledger close time. */
+  created_at?: string
 }
 
 interface HorizonOperation {
@@ -133,6 +147,12 @@ export async function verifyDeposit(args: {
   const tx = (await txResp.json()) as HorizonTransaction
   if (tx.successful !== true) return { ok: false, reason: 'tx_failed' }
 
+  // Ledger close time. A transaction on Horizon always carries one; if it is
+  // ever missing or unparseable we fall back to "now", which can only make the
+  // expiry check STRICTER, never more permissive.
+  const closedAt = tx.created_at ? Date.parse(tx.created_at) : Number.NaN
+  const confirmedAt = Number.isFinite(closedAt) ? closedAt : Date.now()
+
   // MEMO_TEXT only. A hash/id memo cannot carry our nonce, and accepting one
   // would mean accepting a transaction whose memo we never actually matched.
   if (tx.memo_type !== 'text' || tx.memo !== args.memo) {
@@ -167,7 +187,7 @@ export async function verifyDeposit(args: {
     if (opSource !== args.account) continue
     if (!op.amount) continue
     if (horizonAmountToAtomic(op.amount) !== args.amountAtomic) continue
-    return { ok: true, opIndex: index }
+    return { ok: true, opIndex: index, confirmedAt }
   }
 
   return { ok: false, reason: 'no_matching_payment' }

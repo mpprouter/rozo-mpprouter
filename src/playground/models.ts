@@ -108,6 +108,22 @@ export const TIER_PRICE_USD: Record<ModelTier, string> = {
 }
 
 /**
+ * Hard ceiling on what the ROUTER may pay upstream for one chat message, by
+ * tier. Enforced before any credential is signed (see `upstream.ts`), so an
+ * allow-listed merchant that reprices — or is compromised — cannot drain the
+ * Tempo pool while we charge the user a flat $0.02.
+ *
+ * Set above the observed price of these models but far below the flat customer
+ * price times any plausible abuse volume. The user price is the revenue side;
+ * THIS is the exposure side, and it must be a backend constant rather than
+ * whatever the live 402 happens to ask for.
+ */
+export const TIER_UPSTREAM_BUDGET_USD: Record<ModelTier, string> = {
+  cheap: '0.02',
+  flagship: '0.08',
+}
+
+/**
  * Server-forced completion length. Not caller-controllable: token count is the
  * only meaningful lever on what the router pays the upstream, and the flat
  * per-message playground price only stays profitable if that lever is ours.
@@ -314,6 +330,21 @@ export const DEFAULT_GLOBAL_CAP_USD = '200'
 
 /** Intents an account may create per UTC hour. Fail-closed on error. */
 export const INTENT_RATE_PER_HOUR = 6
+
+/**
+ * Hard ceiling on unclaimed intents stored per account. The hourly rate limit
+ * bounds the RATE of DO storage growth; this bounds the TOTAL, so an attacker
+ * minting intents against addresses they do not control cannot grow storage
+ * without bound.
+ */
+export const MAX_OPEN_INTENTS_PER_ACCOUNT = 20
+
+/**
+ * Hard cap on how long after intent creation a session may still be minted by
+ * re-opening. Past this, re-open refuses rather than issuing a fresh 7-day
+ * token — otherwise a single deposit could keep renewing a session forever.
+ */
+export const SESSION_RENEWAL_CAP_SECONDS = 30 * 24 * 60 * 60
 
 /** Session token lifetime. */
 export const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60

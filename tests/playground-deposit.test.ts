@@ -17,11 +17,11 @@ import {
   verifyDeposit,
 } from '../src/playground/deposit'
 
-const ROUTER = 'GTESTROUTERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
-const PAYER = 'GTESTPAYERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
-const STRANGER = 'GTESTSTRANGERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+const ROUTER = 'GBJ7NMENUWLOA5Z5UC3YQROMMY3XKHZYAOYOFL2SXJUGNRVZVG5GAYBV'
+const PAYER = 'GD42CKPIJSO5SKLTFU4WEO7MAUGJQ3EQM2FAAVMSVJCBQ4TOEX7RV4JF'
+const STRANGER = 'GA3OIWUOYWSLWXUYE4JXWUPMKZX5ZIJ2WRXI3BBDMZKNLFREJO672NOH'
 /** A worthless self-issued asset that also calls itself "USDC". */
-const FAKE_ISSUER = 'GTESTFAKEISSUERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'
+const FAKE_ISSUER = 'GCFQWQC6NYQEPOX2Q2ITUZHYW3ZU6Y3KO6FEQWBENHH35YY5ZWAA3A3W'
 
 const TX = 'a'.repeat(64)
 const MEMO = 'pg-0123456789abcdef0123'
@@ -64,12 +64,26 @@ function verify(fetchImpl: typeof fetch, overrides: Record<string, unknown> = {}
   } as any)
 }
 
-const GOOD_TX = { successful: true, memo_type: 'text', memo: MEMO }
+const CLOSED_AT = '2026-08-12T10:00:00Z'
+const GOOD_TX = { successful: true, memo_type: 'text', memo: MEMO, created_at: CLOSED_AT }
 
 describe('verifyDeposit — happy path', () => {
   it('accepts a matching payment and returns its operation index', async () => {
     const result = await verify(stubHorizon(GOOD_TX, [goodPaymentOp()]))
-    expect(result).toEqual({ ok: true, opIndex: 0 })
+    // confirmedAt is the LEDGER CLOSE TIME, which is what intent expiry is
+    // judged against — not the moment the claim arrived.
+    expect(result).toEqual({ ok: true, opIndex: 0, confirmedAt: Date.parse(CLOSED_AT) })
+  })
+
+  it('falls back to now when Horizon omits created_at, never to a permissive value', async () => {
+    const before = Date.now()
+    const result = await verify(
+      stubHorizon({ successful: true, memo_type: 'text', memo: MEMO }, [goodPaymentOp()]),
+    )
+    expect(result.ok).toBe(true)
+    if (!result.ok) return
+    // "now" can only make the expiry check stricter than a real close time.
+    expect(result.confirmedAt).toBeGreaterThanOrEqual(before)
   })
 
   it('finds the matching payment among other operations in a multi-op tx', async () => {
@@ -80,7 +94,7 @@ describe('verifyDeposit — happy path', () => {
         goodPaymentOp(),
       ]),
     )
-    expect(result).toEqual({ ok: true, opIndex: 2 })
+    expect(result).toMatchObject({ ok: true, opIndex: 2 })
   })
 
   it('accepts an integer-formatted Horizon amount', async () => {

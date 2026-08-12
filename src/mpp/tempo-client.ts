@@ -70,6 +70,51 @@ type ChannelEntryLike = {
  * to the agent with a clear "session not installed" message so the
  * operator knows to run `scripts/open-channel.ts`.
  */
+/**
+ * Thrown when a merchant's live 402 asks for more than the caller's declared
+ * ceiling. Raised from the `onChallenge` hook, i.e. BEFORE any credential is
+ * signed, so no money moves: an over-priced or compromised merchant cannot
+ * drain the router's pool just because a route is on an allow-list.
+ *
+ * Only callers that pass `maxAmountRaw` can see this. Callers that omit it
+ * (the public proxy) keep their existing unbounded behaviour byte-for-byte.
+ */
+export class BudgetExceededError extends Error {
+  constructor(
+    public readonly merchantUrl: string,
+    public readonly requestedRaw: string,
+    public readonly maxRaw: string,
+  ) {
+    super(
+      `Merchant asked for ${requestedRaw} base units but the caller's ceiling is ${maxRaw}. ` +
+        `Refusing to sign a credential.`,
+    )
+    this.name = 'BudgetExceededError'
+  }
+}
+
+/**
+ * Read the merchant-requested amount out of a 402 challenge.
+ *
+ * Both tempo.charge and tempo.session put a base-unit integer string in
+ * `challenge.request.amount` (USDC-6, so "10000" is $0.01). A challenge we
+ * cannot parse is treated as a budget violation rather than waved through —
+ * an unreadable price is exactly when we least want to sign blind.
+ */
+function assertWithinBudget(
+  challenge: unknown,
+  merchantUrl: string,
+  maxAmountRaw: string,
+): void {
+  const requested = (challenge as any)?.request?.amount
+  if (typeof requested !== 'string' || !/^\d+$/.test(requested)) {
+    throw new BudgetExceededError(merchantUrl, String(requested), maxAmountRaw)
+  }
+  if (BigInt(requested) > BigInt(maxAmountRaw)) {
+    throw new BudgetExceededError(merchantUrl, requested, maxAmountRaw)
+  }
+}
+
 export class ChannelNotInstalledError extends Error {
   constructor(public readonly merchantId: string) {
     super(
@@ -382,8 +427,31 @@ export async function payMerchant(
   env: Env,
   merchantUrl: string,
   init?: RequestInit,
+  opts: {
+    /**
+     * Optional hard ceiling on what this single call may cost, as a USDC-6
+     * base-unit integer string. When set, an `onChallenge` hook inspects the
+     * merchant's 402 and throws `BudgetExceededError` before signing anything
+     * if the merchant wants more.
+     *
+     * Omit it and behaviour is exactly as before — no hook is installed at
+     * all, so the proxy's payment path is untouched.
+     */
+    maxAmountRaw?: string
+  } = {},
 ): Promise<Response> {
-  const client = createTempoClientInternal(env)
+  const client = createTempoClientInternal(
+    env,
+    opts.maxAmountRaw
+      ? {
+          onChallenge: async (challenge, { createCredential }) => {
+            assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw!)
+            // No context: tempo.charge signs its default single-shot intent.
+            return createCredential()
+          },
+        }
+      : {},
+  )
   return client.fetch(merchantUrl, init)
 }
 
@@ -436,6 +504,10 @@ export async function payMerchantSession(
   merchantId: string,
   merchantUrl: string,
   init: RequestInit = {},
+  opts: {
+    /** See `payMerchant`. Checked before the voucher is signed. */
+    maxAmountRaw?: string
+  } = {},
 ): Promise<{ response: Response; channelBefore: TempoChannelState }> {
   const channel = await getTempoChannel(env, merchantId)
   if (!channel) {
@@ -455,6 +527,12 @@ export async function payMerchantSession(
         throw new Error(
           `tempo.session challenge for ${merchantId} missing valid base-unit amount: ${delta}`,
         )
+      }
+      // Budget ceiling, checked before the voucher is signed. Once signed the
+      // cumulative has advanced and the money is committed, so this is the
+      // last point at which refusing is free.
+      if (opts.maxAmountRaw) {
+        assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw)
       }
       const newCumulativeRaw = addRaw(channel.cumulativeRaw, delta)
       // Manual-mode context: tell mppx "sign a voucher action on

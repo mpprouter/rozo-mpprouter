@@ -17,6 +17,7 @@ import {
   DEFAULT_GLOBAL_CAP_USD,
   DEPOSIT_CAP_PER_ACCOUNT_PER_DAY_USD,
   INTENT_RATE_PER_HOUR,
+  MAX_OPEN_INTENTS_PER_ACCOUNT,
 } from './models'
 import { parseUsd } from './amount'
 
@@ -84,6 +85,7 @@ export function createIntent(
     account: string
     amountAtomic: bigint
     memo: string
+    destination: string
     now: number
     expiresAt: number
   },
@@ -93,11 +95,13 @@ export function createIntent(
     account: args.account,
     amount: args.amountAtomic.toString(),
     memo: args.memo,
+    destination: args.destination,
     now: args.now,
     expires_at: args.expiresAt,
     per_account_day_cap: parseUsd(DEPOSIT_CAP_PER_ACCOUNT_PER_DAY_USD).toString(),
     global_cap: globalCapAtomic(env).toString(),
     intents_per_hour: INTENT_RATE_PER_HOUR,
+    max_open_intents: MAX_OPEN_INTENTS_PER_ACCOUNT,
   })
 }
 
@@ -112,17 +116,24 @@ export function openIntent(
     txHash: string
     opIndex: number
     now: number
+    /** On-chain ledger close time of the deposit (ms), for the expiry check. */
+    confirmedAt: number
     sessionJti: string
     sessionExp: number
   },
 ): Promise<LedgerResult<{ intent: StoredIntent; balance: string; replayed: boolean }>> {
+  // The ceilings are passed on every open because THIS is where they are
+  // actually enforced — the checks at intent creation hold nothing.
   return doPost(env, '/open', {
     intent_id: args.intentId,
     tx_hash: args.txHash,
     op_index: args.opIndex,
     now: args.now,
+    confirmed_at: args.confirmedAt,
     session_jti: args.sessionJti,
     session_exp: args.sessionExp,
+    per_account_day_cap: parseUsd(DEPOSIT_CAP_PER_ACCOUNT_PER_DAY_USD).toString(),
+    global_cap: globalCapAtomic(env).toString(),
   })
 }
 
