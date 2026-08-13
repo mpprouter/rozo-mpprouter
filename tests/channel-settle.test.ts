@@ -200,6 +200,38 @@ describe('settleOneChannel', () => {
     expect(atomic.backing.get(`pg:channel:closed:${CHANNEL}`)).toBeTruthy()
   })
 
+  it('closes with a fee-bump signer so the tx is never stuck at the 100-stroop default fee', async () => {
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: 12345,
+      currentLedger: 12000,
+    })
+    await settleOneChannel(e, CHANNEL, deps)
+    const arg = closeMock.mock.calls[0][0]
+    expect(arg.feePayer.feeBumpSigner).toBe(COLLECTOR_SECRET)
+    expect(arg.maxFeeBumpStroops).toBe(10_000_000)
+  })
+
+  it('writes off (marks settled) when the funder already refunded the channel', async () => {
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: 12345,
+      currentLedger: 12000,
+    })
+    closeMock.mockRejectedValue(new Error('HostError: "balance is not sufficient to spend"'))
+    expect(await settleOneChannel(e, CHANNEL, deps)).toBeNull()
+    // Marked settled so the cron stops retrying a dead channel forever.
+    expect((await getLatestVoucher(e, CHANNEL))!.lastSettledRaw).toBe('5000000')
+  })
+
+  it('does NOT write off on other close failures — retries next tick', async () => {
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: 12345,
+      currentLedger: 12000,
+    })
+    closeMock.mockRejectedValue(new Error('rpc timeout'))
+    await expect(settleOneChannel(e, CHANNEL, deps)).rejects.toThrow('rpc timeout')
+    expect((await getLatestVoucher(e, CHANNEL))!.lastSettledRaw ?? '0').toBe('0')
+  })
+
   it('P0-1: closes with the LATEST voucher read under the lock, not a stale one', async () => {
     ;(deps.getChannelState as any).mockResolvedValue({
       closeEffectiveAtLedger: 12345,
