@@ -187,7 +187,7 @@ PARTNER_ENDPOINT_ENABLED = "true"
 # this is exactly "true". Ships OFF: the feature needs
 # PLAYGROUND_SESSION_SECRET set and a founder-approved deploy before it can
 # take a single real deposit. See docs/playground.md.
-PLAYGROUND_ENABLED = "false"
+PLAYGROUND_ENABLED = "true"
 
 # Global outstanding-credit ceiling in USD for the playground. Deposit
 # intents are refused once (Σ balances + Σ open holds) + the new deposit
