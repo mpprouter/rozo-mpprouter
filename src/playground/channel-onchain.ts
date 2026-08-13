@@ -47,19 +47,34 @@ export interface OnChainChannel {
   commitmentKeyHex: string
   /** refund_waiting_period in ledgers. */
   refundWaitingPeriod: number
-  /** Current on-chain channel balance, 7-decimal USDC atomic units, as string. */
+  /**
+   * The channel's REAL balance in the USDC SAC, 7-decimal atomic units, as a
+   * string. This is the SAC contract's `balance(channelAddress)` — NOT the
+   * channel's own self-reported `balance()`, which a fake contract could lie
+   * about. A fake contract holding no real USDC shows 0 here.
+   */
   balanceRaw: string
+  /**
+   * Lowercase hex of the contract's on-chain executable WASM hash, or '' if the
+   * contract is not a WASM contract (e.g. a built-in SAC). Compared against our
+   * known channel WASM hash for provenance — this is what stops an attacker
+   * deploying a look-alike contract that self-reports valid params.
+   */
+  wasmHash: string
 }
 
 /** What the router requires the on-chain channel to look like. */
 export interface ChannelExpectation {
-  routerPublic: string
+  /** The dedicated hot collector account the channel must pay TO. */
+  collector: string
   usdcSac: string
   funder: string
   /** Submitted commitment key in G-strkey form. */
   commitmentKeyG: string
   refundWaitingPeriod: number
   minDepositRaw: bigint
+  /** Our known channel WASM hash (lowercase hex) — provenance anchor. */
+  wasmHash: string
 }
 
 export type ChannelCheck =
@@ -76,11 +91,27 @@ export function checkChannelMatches(
   onchain: OnChainChannel,
   expected: ChannelExpectation,
 ): ChannelCheck {
-  if (onchain.to !== expected.routerPublic) {
+  // Provenance FIRST: a contract that is not our known channel WASM can lie
+  // about every other field, so reject it before trusting anything it reports.
+  if (!expected.wasmHash) {
+    return {
+      ok: false,
+      reason: 'wasm_not_configured',
+      detail: 'router channel WASM hash is not configured',
+    }
+  }
+  if (onchain.wasmHash.toLowerCase() !== expected.wasmHash.toLowerCase()) {
+    return {
+      ok: false,
+      reason: 'wasm_mismatch',
+      detail: 'channel contract WASM hash does not match the router channel contract',
+    }
+  }
+  if (onchain.to !== expected.collector) {
     return {
       ok: false,
       reason: 'recipient_mismatch',
-      detail: 'channel recipient (to) is not this router',
+      detail: 'channel recipient (to) is not the playground collector',
     }
   }
   if (onchain.token !== expected.usdcSac) {
@@ -160,12 +191,14 @@ function dataKeyName(key: xdr.ScVal): string | null {
 export async function readChannelOnChain(
   env: { STELLAR_RPC_URL: string; STELLAR_NETWORK: string; STELLAR_ROUTER_PUBLIC: string },
   channelContract: string,
+  usdcSac: string,
 ): Promise<OnChainChannel> {
   const server = new rpc.Server(env.STELLAR_RPC_URL, {
     allowHttp: env.STELLAR_RPC_URL.startsWith('http://'),
   })
 
-  // 1) Contract instance entry — carries all `.instance()` storage in one read.
+  // 1) Contract instance entry — carries all `.instance()` storage AND the
+  //    executable (WASM hash) in one read.
   const instanceKey = xdr.LedgerKey.contractData(
     new xdr.LedgerKeyContractData({
       contract: new Address(channelContract).toScAddress(),
@@ -182,8 +215,17 @@ export async function readChannelOnChain(
   if (instanceVal.switch().name !== 'scvContractInstance') {
     throw new Error('unexpected instance ledger entry shape')
   }
-  const storage = instanceVal.instance().storage() ?? []
+  const instance = instanceVal.instance()
 
+  // Executable → WASM hash for provenance. A built-in SAC (stellarAsset) has no
+  // WASM hash and yields '' — which will fail the provenance check upstream.
+  const executable = instance.executable()
+  const wasmHash =
+    executable.switch().name === 'contractExecutableWasm'
+      ? Buffer.from(executable.wasmHash()).toString('hex')
+      : ''
+
+  const storage = instance.storage() ?? []
   const config: Partial<Record<string, xdr.ScVal>> = {}
   for (const mapEntry of storage) {
     const name = dataKeyName(mapEntry.key())
@@ -205,25 +247,27 @@ export async function readChannelOnChain(
   const commitmentKeyHex = Buffer.from(commitScv.bytes()).toString('hex')
   const refundWaitingPeriod = Number(scValToNative(periodScv))
 
-  // 2) balance() — read-only simulate, no signing, no fee spent.
-  const contract = new Contract(channelContract)
+  // 2) REAL balance — query the USDC SAC's balance OF the channel address, NOT
+  //    the channel's self-reported balance(). A fake contract not actually
+  //    holding USDC in the real SAC then shows 0 here and is rejected.
+  const sac = new Contract(usdcSac)
   const source = new Account(env.STELLAR_ROUTER_PUBLIC, '0')
   const tx = new TransactionBuilder(source, {
     fee: '100',
     networkPassphrase: networkPassphrase(env.STELLAR_NETWORK),
   })
-    .addOperation(contract.call('balance'))
+    .addOperation(sac.call('balance', new Address(channelContract).toScVal()))
     .setTimeout(30)
     .build()
   const sim = await server.simulateTransaction(tx)
   if (rpc.Api.isSimulationError(sim)) {
-    throw new Error(`balance() simulation failed: ${sim.error}`)
+    throw new Error(`USDC SAC balance() simulation failed: ${sim.error}`)
   }
   const retval = sim.result?.retval
   if (!retval) {
-    throw new Error('balance() simulation returned no value')
+    throw new Error('USDC SAC balance() simulation returned no value')
   }
   const balanceRaw = BigInt(scValToNative(retval) as bigint | number | string).toString()
 
-  return { token, from, to, commitmentKeyHex, refundWaitingPeriod, balanceRaw }
+  return { token, from, to, commitmentKeyHex, refundWaitingPeriod, balanceRaw, wasmHash }
 }

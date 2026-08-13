@@ -112,6 +112,7 @@ import {
   CHANNEL_MAX_DEPOSIT_USD,
   CHANNEL_MIN_DEPOSIT_USD,
   CHANNEL_REFUND_WAITING_PERIOD,
+  channelCollector,
   channelFactoryAddress,
   channelHorizonUrl,
   channelNetworkPassphrase,
@@ -260,6 +261,9 @@ export function handlePlaygroundConfig(env: Env): Response {
       enabled: channelPlaygroundEnabled(env),
       factory_contract: channelFactoryAddress(env),
       token_sac: getStellarUsdcSac(env),
+      // The collector the frontend must pass as factory.open `to`. Distinct
+      // from router_recipient (the treasury), which is kept for reference.
+      channel_to: channelCollector(env),
       router_recipient: env.STELLAR_ROUTER_PUBLIC,
       network: env.STELLAR_NETWORK,
       network_passphrase: channelNetworkPassphrase(env),

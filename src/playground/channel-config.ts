@@ -46,8 +46,11 @@
 
 import { formatUsd, formatUsdc7, parseUsd } from './amount'
 import {
+  BLEND_SUMMARY_MODEL_ID,
   PLAYGROUND_CHIPS,
   PLAYGROUND_MODELS,
+  TIER_UPSTREAM_BUDGET_USD,
+  findModel,
   type PlaygroundChip,
   type PlaygroundModel,
 } from './models'
@@ -98,62 +101,63 @@ export function channelHorizonUrl(env: { PLAYGROUND_HORIZON_URL?: string }): str
   return env.PLAYGROUND_HORIZON_URL?.trim() || DEFAULT_HORIZON_URL
 }
 
-/** Markup applied on top of the known upstream cost. */
+/** Markup applied on top of the MAX possible upstream cost. */
 const CHANNEL_MARKUP_BPS = 1000n // 10%
 const CHANNEL_MARKUP_MIN_RAW = parseUsd('0.001') // $0.001 floor
 
 /**
- * Known upstream cost per callable model id, in 7-decimal USDC atomic units.
- * Individual per-model — the whole point of real-cost metering is that a small
- * model is not billed like a flagship one. Conservative estimates, reconciled
- * against the live captured cost on every call (see module header).
+ * Add the markup to a base amount. markup = max(10% of base, $0.001). All
+ * bigint 7-decimal atomic math — no float ever touches a price.
  */
-const MODEL_UPSTREAM_COST_RAW: Record<string, bigint> = {
-  'llama-3.1-8b-instant': parseUsd('0.0004'),
-  'deepseek-v4-flash': parseUsd('0.0006'),
-  'claude-haiku-4-5': parseUsd('0.004'),
-  'gpt-4o-mini': parseUsd('0.002'),
-  'claude-opus-5': parseUsd('0.03'),
-  'claude-sonnet-5': parseUsd('0.012'),
-}
-
-/** Known upstream cost per chip id, in 7-decimal USDC atomic units. */
-const CHIP_UPSTREAM_COST_RAW: Record<string, bigint> = {
-  'blend-activity': parseUsd('0.02'),
-  'tx-decode': parseUsd('0.005'),
-}
-
-/**
- * Add the markup to a known upstream cost. markup = max(10% of cost, $0.001).
- * All bigint 7-decimal atomic math — no float ever touches a price.
- */
-export function applyMarkup(costRaw: bigint): bigint {
-  const pct = (costRaw * CHANNEL_MARKUP_BPS) / 10_000n
+export function applyMarkup(baseRaw: bigint): bigint {
+  const pct = (baseRaw * CHANNEL_MARKUP_BPS) / 10_000n
   const markup = pct > CHANNEL_MARKUP_MIN_RAW ? pct : CHANNEL_MARKUP_MIN_RAW
-  return costRaw + markup
+  return baseRaw + markup
 }
 
 export interface ChannelPrice {
-  /** Known upstream cost, 7-decimal atomic. */
-  costRaw: bigint
-  /** Effective price charged to the channel (cost + markup), 7-decimal atomic. */
+  /**
+   * The MAXIMUM the router could pay upstream for this call, 7-decimal atomic.
+   * This is the enforced budget ceiling (see TIER_UPSTREAM_BUDGET_USD / chip
+   * budgetUsd), NOT a point estimate. The voucher quote is built from this so
+   * the charged amount ALWAYS covers the real cost — the router can never pay
+   * upstream more than the user signed for.
+   */
+  maxUpstreamRaw: bigint
+  /** Effective price charged to the channel (maxUpstream + markup), 7-dec atomic. */
   priceRaw: bigint
 }
 
 /**
- * Effective price for a chat model. Falls back to a safe non-zero default for
- * any allow-listed model that lacks an explicit cost entry, so a new model can
- * never accidentally be served for free.
+ * The narration model the Blend chip may additionally call. Its cost must be
+ * folded into the Blend quote so a chip that makes TWO paid upstream calls is
+ * never under-quoted.
  */
-export function channelPriceForModel(model: PlaygroundModel): ChannelPrice {
-  const costRaw = MODEL_UPSTREAM_COST_RAW[model.id] ?? parseUsd('0.01')
-  return { costRaw, priceRaw: applyMarkup(costRaw) }
+function blendNarrationMaxRaw(): bigint {
+  const narrationModel = findModel(BLEND_SUMMARY_MODEL_ID)
+  const tier = narrationModel?.tier ?? 'cheap'
+  return parseUsd(TIER_UPSTREAM_BUDGET_USD[tier])
 }
 
-/** Effective price for a chip. */
+/**
+ * Quote for a chat model = the tier's enforced upstream budget ceiling +
+ * markup. Because the metered call passes exactly this ceiling as the upstream
+ * budget, actual spend can never exceed it, so the quote can never be
+ * under-charged.
+ */
+export function channelPriceForModel(model: PlaygroundModel): ChannelPrice {
+  const maxUpstreamRaw = parseUsd(TIER_UPSTREAM_BUDGET_USD[model.tier])
+  return { maxUpstreamRaw, priceRaw: applyMarkup(maxUpstreamRaw) }
+}
+
+/**
+ * Quote for a chip = the chip's upstream budget ceiling (+ the Blend narration
+ * ceiling for the blend chip, which makes a second paid call) + markup.
+ */
 export function channelPriceForChip(chip: PlaygroundChip): ChannelPrice {
-  const costRaw = CHIP_UPSTREAM_COST_RAW[chip.id] ?? parseUsd('0.01')
-  return { costRaw, priceRaw: applyMarkup(costRaw) }
+  let maxUpstreamRaw = parseUsd(chip.budgetUsd)
+  if (chip.id === 'blend-activity') maxUpstreamRaw += blendNarrationMaxRaw()
+  return { maxUpstreamRaw, priceRaw: applyMarkup(maxUpstreamRaw) }
 }
 
 /**
@@ -182,39 +186,62 @@ export function channelFactoryAddress(env: {
 }
 
 /**
+ * The dedicated hot collector account (G...) every playground channel must pay
+ * TO (Option A). Kept DISTINCT from STELLAR_ROUTER_PUBLIC (the treasury): the
+ * collector holds only spent playground cents and its key is the only one that
+ * ever signs a settle/close. Returns null if unset/invalid → register and
+ * settlement fail closed.
+ */
+export function channelCollector(env: { PLAYGROUND_CHANNEL_TO?: string }): string | null {
+  const v = env.PLAYGROUND_CHANNEL_TO?.trim()
+  return v && /^G[A-Z2-7]{55}$/.test(v) ? v : null
+}
+
+/**
+ * Our known channel-contract WASM hash (lowercase hex) — the provenance anchor.
+ * Null until the founder uploads the channel WASM and sets the var; register
+ * MUST fail closed while it is null (an attacker could otherwise register a
+ * look-alike contract).
+ */
+export function channelWasmHash(env: { PLAYGROUND_CHANNEL_WASM_HASH?: string }): string | null {
+  const v = env.PLAYGROUND_CHANNEL_WASM_HASH?.trim().toLowerCase()
+  return v && /^[0-9a-f]{64}$/.test(v) ? v : null
+}
+
+/**
  * The `models` + `chips` blocks for GET /v1/playground/config, annotated with
  * the real-cost effective price so the UI shows honest per-call pricing.
  */
 export function channelPricingConfig() {
   return {
     models: PLAYGROUND_MODELS.map(m => {
-      const { costRaw, priceRaw } = channelPriceForModel(m)
+      const { maxUpstreamRaw, priceRaw } = channelPriceForModel(m)
       return {
         id: m.id,
         tier: m.tier,
         provider: m.provider,
-        upstream_cost_usd: formatUsd(costRaw),
-        markup_usd: formatUsd(priceRaw - costRaw),
+        max_upstream_cost_usd: formatUsd(maxUpstreamRaw),
+        markup_usd: formatUsd(priceRaw - maxUpstreamRaw),
         price_usd: formatUsd(priceRaw),
         available: m.available,
         ...(m.unavailableReason ? { unavailable_reason: m.unavailableReason } : {}),
       }
     }),
     chips: PLAYGROUND_CHIPS.map(c => {
-      const { costRaw, priceRaw } = channelPriceForChip(c)
+      const { maxUpstreamRaw, priceRaw } = channelPriceForChip(c)
       return {
         id: c.id,
         label: c.label,
-        upstream_cost_usd: formatUsd(costRaw),
-        markup_usd: formatUsd(priceRaw - costRaw),
+        max_upstream_cost_usd: formatUsd(maxUpstreamRaw),
+        markup_usd: formatUsd(priceRaw - maxUpstreamRaw),
         price_usd: formatUsd(priceRaw),
         description: c.description,
       }
     }),
     pricing: {
       model: 'real-cost',
-      markup: '10% of upstream cost, minimum $0.001',
-      note: 'Each call is priced at the known upstream cost for that route plus markup. The voucher cumulative advances by exactly the charged amount; failed calls are rolled back and never billed.',
+      markup: '10% of max upstream cost, minimum $0.001',
+      note: 'Each call is quoted at the MAX upstream cost the router could pay for that route (the enforced budget ceiling, including the Blend narration call) plus markup, so the charged amount always covers the real cost. The voucher cumulative advances by exactly the charged amount; failed calls are rolled back and never billed.',
     },
   }
 }

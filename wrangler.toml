@@ -216,6 +216,20 @@ PLAYGROUND_CHANNEL_ENABLED = "false"
 # Empty until the founder deploys the factory on mainnet (L3). Advertised (as
 # null when unset) by GET /v1/playground/config.
 PLAYGROUND_CHANNEL_FACTORY = ""
+# Dedicated hot COLLECTOR account every playground channel pays TO (Option A).
+# DISTINCT from STELLAR_ROUTER_PUBLIC (treasury); holds only spent playground
+# cents. Its secret is the Worker secret PLAYGROUND_CHANNEL_SIGNER_SECRET, used
+# only to sign settle/close. XLM-funded on mainnet by the founder before go-live.
+PLAYGROUND_CHANNEL_TO = "GBD64XFGJHG42CEVQKH4TYCIAMEHVBMW7A24KS22TKOSSA73IVW3CYIK"
+# Known channel-contract WASM hash (lowercase hex) — provenance anchor. register
+# REJECTS any contract whose on-chain WASM hash differs. Empty until the founder
+# uploads the channel WASM on mainnet; register fails closed while empty.
+PLAYGROUND_CHANNEL_WASM_HASH = ""
+#
+# Secret (set via: wrangler secret put PLAYGROUND_CHANNEL_SIGNER_SECRET):
+#   PLAYGROUND_CHANNEL_SIGNER_SECRET — S... key of the collector account above.
+#     Signs ONLY on-chain settle/close of playground channels. Unset ⇒ the
+#     settlement cron skips (fail-safe).
 
 # Secrets (set via: wrangler secret put <NAME>)
 #

@@ -26,7 +26,7 @@ import { Credential } from 'mppx'
 import { Store } from 'mppx/server'
 import type { Env } from '../index'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
-import { getRouterStellarAddress, getStellarUsdcSac } from '../mpp/stellar-server'
+import { getStellarUsdcSac } from '../mpp/stellar-server'
 import {
   acquireChannelDeliveryLock,
   releaseChannelDeliveryLock,
@@ -51,11 +51,11 @@ import {
 import {
   CHANNEL_MIN_DEPOSIT_RAW,
   CHANNEL_REFUND_WAITING_PERIOD,
-  channelFactoryAddress,
+  channelCollector,
   channelPlaygroundEnabled,
   channelPriceForChip,
   channelPriceForModel,
-  channelPricingConfig,
+  channelWasmHash,
   priceToChannelAmount,
 } from '../playground/channel-config'
 import {
@@ -63,6 +63,7 @@ import {
   readChannelOnChain,
   type OnChainChannel,
 } from '../playground/channel-onchain'
+import { putLatestVoucher } from '../playground/channel-voucher-store'
 import {
   BLEND_SUMMARY_MODEL_ID,
   FORCED_MAX_TOKENS,
@@ -129,20 +130,22 @@ function callId(body: Record<string, unknown>): string | null {
 
 /** Injectable on-chain reader so tests need no live RPC. */
 export interface ChannelRegisterDeps {
-  readChannelOnChain: (env: Env, channelContract: string) => Promise<OnChainChannel>
+  readChannelOnChain: (env: Env, channelContract: string, usdcSac: string) => Promise<OnChainChannel>
 }
 
 const DEFAULT_DEPS: ChannelRegisterDeps = {
-  readChannelOnChain: (env, c) => readChannelOnChain(env, c),
+  readChannelOnChain: (env, c, usdcSac) => readChannelOnChain(env, c, usdcSac),
 }
 
 /**
  * Register a channel the client opened on-chain. Unlike the trusting admin
  * script (scripts/admin/register-stellar-channel.ts) this VERIFIES the channel
- * on-chain before writing KV: the on-chain `to` must be this router, the token
+ * on-chain before writing KV: the contract's WASM hash must equal our known
+ * channel WASM (provenance), the on-chain `to` must be the collector, the token
  * must be the pubnet USDC SAC, the funder + commitment key must match what the
  * client claims, the refund period must be the required value, and the channel
- * must actually hold a deposit above the minimum. Only then do we write the
+ * must hold a REAL USDC balance (queried from the SAC, not self-reported) above
+ * the minimum. Only then do we write the
  * `stellarChannel:<C>` / `stellarAgent:<G>` records that make the router honor
  * this channel's vouchers.
  *
@@ -197,7 +200,17 @@ export async function handleChannelRegister(
   }
 
   const usdcSac = getStellarUsdcSac(env)
-  const routerPublic = getRouterStellarAddress(env)
+
+  // Fail closed unless the collector account AND our channel WASM hash are
+  // configured — without them there is no trust anchor to verify against.
+  const collector = channelCollector(env)
+  if (!collector) {
+    return fail(503, 'collector_not_configured', 'playground collector account is not configured')
+  }
+  const wasmHash = channelWasmHash(env)
+  if (!wasmHash) {
+    return fail(503, 'wasm_not_configured', 'playground channel WASM hash is not configured')
+  }
 
   // Only USDC channels in the playground (design Q5). Reject a mismatched
   // currency early so we never register an XLM channel the metered path
@@ -230,19 +243,20 @@ export async function handleChannelRegister(
   // 502; we never trust the client's word for what the channel contains.
   let onchain: OnChainChannel
   try {
-    onchain = await deps.readChannelOnChain(env, channelContract)
+    onchain = await deps.readChannelOnChain(env, channelContract, usdcSac)
   } catch (e: any) {
     console.error(`[channel] on-chain read failed for ${channelContract}: ${e?.message}`)
     return fail(502, 'onchain_read_failed', 'could not read the channel on-chain')
   }
 
   const check = checkChannelMatches(onchain, {
-    routerPublic,
+    collector,
     usdcSac,
     funder: agentAccount,
     commitmentKeyG: commitmentKey,
     refundWaitingPeriod: CHANNEL_REFUND_WAITING_PERIOD,
     minDepositRaw: CHANNEL_MIN_DEPOSIT_RAW,
+    wasmHash,
   })
   if (!check.ok) {
     return fail(400, check.reason, check.detail)
@@ -279,6 +293,10 @@ interface ChannelVoucher {
   acceptedAmount: string
   previousAmount: string
   action: 'voucher' | 'close'
+  /** The cumulative amount the client signed, as the decimal channel string. */
+  amountDecimal: string
+  /** Raw ed25519 signature over the commitment (as the credential carried it). */
+  signature: string
 }
 
 /**
@@ -367,6 +385,8 @@ async function verifyChannelVoucher(
         acceptedAmount: String(payment.credential.payload.amount),
         previousAmount,
         action,
+        amountDecimal: String(payment.credential.payload.amount),
+        signature: String(payment.credential.payload.signature ?? ''),
       }
     })
   }
@@ -404,6 +424,8 @@ async function verifyChannelVoucher(
         acceptedAmount: String(credential.payload.amount),
         previousAmount,
         action,
+        amountDecimal: String(credential.payload.amount),
+        signature: String(credential.payload.signature ?? ''),
       }
     } catch (e: any) {
       console.error(`[channel] voucher recovery failed: ${e?.message}`)
@@ -478,26 +500,55 @@ async function rollbackAndRelease(
   return rolledBack
 }
 
+/**
+ * Commit path: the charge stands (cumulative advanced). Persist the latest
+ * voucher signature so the settlement cron can COLLECT it on-chain, then
+ * release the delivery lock. Persisting under the lock keeps it single-writer.
+ */
+async function commitVoucher(
+  env: Env,
+  channelContract: string,
+  voucher: ChannelVoucher,
+  lockId: string,
+): Promise<void> {
+  if (voucher.signature) {
+    try {
+      await putLatestVoucher(env, channelContract, {
+        amountDecimal: voucher.amountDecimal,
+        cumulativeRaw: parseUsd(voucher.amountDecimal).toString(),
+        signature: voucher.signature,
+      })
+    } catch (e: any) {
+      console.error(`[channel] voucher persist failed for ${channelContract}: ${e?.message}`)
+    }
+  } else {
+    console.warn(`[channel] no signature on kept voucher for ${channelContract}; cannot settle`)
+  }
+  await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
+}
+
 /** Effective charge/cost figures for a response body. */
-function pricingFields(priceRaw: bigint, costRaw: bigint, upstreamCostRaw?: string) {
-  // Reconcile: the real cost captured from the charge seam is USDC-6; convert
-  // to the playground's 7-decimal atomic. Fall back to the known estimate.
-  let realCostRaw = costRaw
+function pricingFields(priceRaw: bigint, maxUpstreamRaw: bigint, upstreamCostRaw?: string) {
+  // The captured real cost (USDC-6 from the charge seam) is for display only —
+  // convert to 7-decimal atomic. The CHARGE is always the quote (priceRaw),
+  // which the client signed and which by construction (quote = maxUpstream +
+  // markup, and the upstream budget == maxUpstream) always covers the real
+  // cost. A captured cost above the quote would mean the budget guard was
+  // bypassed — that is a bug, logged loudly, never silently absorbed as policy.
+  let realCostRaw = maxUpstreamRaw
   if (upstreamCostRaw && /^\d+$/.test(upstreamCostRaw)) {
     realCostRaw = BigInt(upstreamCostRaw) * 10n // USDC-6 → 7-decimal atomic
     if (realCostRaw > priceRaw) {
-      // The quote should always cover the real cost. If it does not, the
-      // router absorbs the (budget-bounded) difference — the client only ever
-      // authorized `priceRaw`, so this can never overcharge. Log for recon.
-      console.warn(
-        `[channel] real cost ${realCostRaw} exceeded quote ${priceRaw}; router absorbs difference`,
+      console.error(
+        `[channel] BUG: real upstream cost ${realCostRaw} exceeded quote ${priceRaw}. ` +
+          `The budget ceiling should make this impossible; the user is still only charged the quote.`,
       )
     }
   }
   return {
     charged_usd: formatUsd(priceRaw),
     upstream_cost_usd: formatUsd(realCostRaw),
-    markup_usd: formatUsd(priceRaw - costRaw),
+    markup_usd: formatUsd(priceRaw - maxUpstreamRaw),
   }
 }
 
@@ -565,7 +616,7 @@ export async function handleChannelChat(request: Request, env: Env): Promise<Res
     return fail(e?.status ?? 503, e?.code ?? 'route_unavailable', e?.message ?? 'route unavailable')
   }
 
-  const { costRaw, priceRaw } = channelPriceForModel(model)
+  const { maxUpstreamRaw, priceRaw } = channelPriceForModel(model)
 
   const verify = await verifyChannelVoucher(request, env, priceRaw, id)
   if (verify.kind === 'respond') return verify.response
@@ -603,24 +654,24 @@ export async function handleChannelChat(request: Request, env: Env): Promise<Res
   if (typeof text !== 'string' || text.length === 0) {
     // paid === true: the router DID pay upstream, the content was just
     // unusable. Keep the charge (commit) with a support note.
-    await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
+    await commitVoucher(env, channelContract, voucher, lockId)
     return withReceipt(
       fail(502, 'upstream_empty', 'upstream returned no completion', {
         call_id: id,
-        ...pricingFields(priceRaw, costRaw, upstreamCostRaw),
+        ...pricingFields(priceRaw, maxUpstreamRaw, upstreamCostRaw),
         support_note:
           'The upstream provider was paid but did not return a usable result, so this call was charged.',
       }),
     )
   }
 
-  await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
+  await commitVoucher(env, channelContract, voucher, lockId)
   return withReceipt(
     json({
       call_id: id,
       message: text,
       model: model.id,
-      ...pricingFields(priceRaw, costRaw, upstreamCostRaw),
+      ...pricingFields(priceRaw, maxUpstreamRaw, upstreamCostRaw),
     }),
   )
 }
@@ -637,7 +688,7 @@ export async function handleChannelBlendActivity(request: Request, env: Env): Pr
   if (!id) return fail(400, 'invalid_request', 'call_id must be an opaque id of 8-64 characters')
 
   const chip = findChip('blend-activity')!
-  const { costRaw, priceRaw } = channelPriceForChip(chip)
+  const { maxUpstreamRaw, priceRaw } = channelPriceForChip(chip)
 
   let eventsRoute
   try {
@@ -699,7 +750,7 @@ export async function handleChannelBlendActivity(request: Request, env: Env): Pr
     }
   }
 
-  await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
+  await commitVoucher(env, channelContract, voucher, lockId)
   return withReceipt(
     json({
       call_id: id,
@@ -710,7 +761,7 @@ export async function handleChannelBlendActivity(request: Request, env: Env): Pr
         ledger_range: aggregate.ledger_range,
         rows: aggregate.rows,
       },
-      ...pricingFields(priceRaw, costRaw, upstreamCostRaw),
+      ...pricingFields(priceRaw, maxUpstreamRaw, upstreamCostRaw),
     }),
   )
 }
@@ -732,7 +783,7 @@ export async function handleChannelTxDecode(request: Request, env: Env): Promise
   }
 
   const chip = findChip('tx-decode')!
-  const { costRaw, priceRaw } = channelPriceForChip(chip)
+  const { maxUpstreamRaw, priceRaw } = channelPriceForChip(chip)
 
   let route
   try {
@@ -768,13 +819,13 @@ export async function handleChannelTxDecode(request: Request, env: Env): Promise
     )
   }
 
-  await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
+  await commitVoucher(env, channelContract, voucher, lockId)
   return withReceipt(
     json({
       call_id: id,
       tx_hash: txHash,
       transaction: result,
-      ...pricingFields(priceRaw, costRaw, upstreamCostRaw),
+      ...pricingFields(priceRaw, maxUpstreamRaw, upstreamCostRaw),
     }),
   )
 }
@@ -799,8 +850,9 @@ async function settleUpstreamError(
   const shouldCommit = upstream?.paymentEvidence === 'yes'
 
   if (shouldCommit) {
-    // Money moved: leave the voucher cumulative advanced, just release the lock.
-    await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
+    // Money moved: leave the voucher cumulative advanced and persist it, then
+    // release the lock so the settlement cron can collect it.
+    await commitVoucher(env, channelContract, voucher, lockId)
     return fail(status, code, message, {
       support_note:
         'The upstream provider was paid but did not return a usable result, so this call was charged.',

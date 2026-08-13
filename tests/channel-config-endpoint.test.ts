@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest'
 import { handlePlaygroundConfig } from '../src/routes/playground'
 
 const ROUTER = 'GBJ7NMENUWLOA5Z5UC3YQROMMY3XKHZYAOYOFL2SXJUGNRVZVG5GAYBV'
+const COLLECTOR = 'GBD64XFGJHG42CEVQKH4TYCIAMEHVBMW7A24KS22TKOSSA73IVW3CYIK'
 const USDC_SAC = 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75'
 const FACTORY = 'C' + 'D'.repeat(55)
 
@@ -14,6 +15,7 @@ function env(overrides: Record<string, unknown> = {}) {
     PLAYGROUND_ENABLED: 'true',
     PLAYGROUND_CHANNEL_ENABLED: 'true',
     PLAYGROUND_CHANNEL_FACTORY: FACTORY,
+    PLAYGROUND_CHANNEL_TO: COLLECTOR,
     STELLAR_NETWORK: 'stellar:pubnet',
     STELLAR_ROUTER_PUBLIC: ROUTER,
     STELLAR_RPC_URL: 'https://soroban-rpc.example',
@@ -29,6 +31,8 @@ describe('playground config — channel block', () => {
     expect(ch.enabled).toBe(true)
     expect(ch.factory_contract).toBe(FACTORY)
     expect(ch.token_sac).toBe(USDC_SAC)
+    // The collector the frontend must use as factory.open `to`.
+    expect(ch.channel_to).toBe(COLLECTOR)
     expect(ch.router_recipient).toBe(ROUTER)
     expect(ch.network).toBe('stellar:pubnet')
     expect(ch.network_passphrase).toBe('Public Global Stellar Network ; September 2015')

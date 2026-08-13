@@ -20,12 +20,20 @@ const CHANNEL = 'C' + 'A'.repeat(55)
 const FUNDER = 'GBJ7NMENUWLOA5Z5UC3YQROMMY3XKHZYAOYOFL2SXJUGNRVZVG5GAYBV'
 const USDC_SAC = 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75'
 
+const SIG_HEX = 'aa'.repeat(64) // 128 hex chars = 64-byte ed25519 sig
+
 const h = vi.hoisted(() => ({
   state: {
     sufficient: true,
     capturedAmount: '',
-    acceptedAmount: '30000',
-  } as { sufficient: boolean; capturedAmount: string; acceptedAmount: string },
+    acceptedAmount: '0.0220000',
+    signature: 'aa'.repeat(64),
+  } as {
+    sufficient: boolean
+    capturedAmount: string
+    acceptedAmount: string
+    signature: string
+  },
   acquire: vi.fn(async () => true),
   release: vi.fn(async () => {}),
   rollback: vi.fn(async () => true),
@@ -59,7 +67,11 @@ vi.mock('../src/mpp/stellar-channel-dispatch', () => {
           cb?.({
             challenge: { id: 'chal-1' },
             credential: {
-              payload: { action: 'voucher', amount: h.state.acceptedAmount },
+              payload: {
+                action: 'voucher',
+                amount: h.state.acceptedAmount,
+                signature: h.state.signature,
+              },
               source: `did:pkh:stellar:pubnet:${FUNDER}`,
             },
             receipt: { reference: 'rcpt-1' },
@@ -103,11 +115,25 @@ vi.mock('../src/playground/upstream', () => ({
 import { handleChannelChat } from '../src/routes/playground-channel'
 import { UpstreamError } from '../src/playground/upstream'
 
+function makeKv() {
+  const m = new Map<string, string>()
+  return {
+    map: m,
+    get: async (k: string) => m.get(k) ?? null,
+    put: async (k: string, v: string) => {
+      m.set(k, v)
+    },
+  }
+}
+
+let kv: ReturnType<typeof makeKv>
+
 function env() {
   return {
     STELLAR_NETWORK: 'stellar:pubnet',
     STELLAR_ROUTER_PUBLIC: FUNDER,
     ATOMIC_STORE: {},
+    MPP_STORE: kv,
     PLAYGROUND_CHANNEL_ENABLED: 'true',
   } as any
 }
@@ -127,9 +153,11 @@ function chatReq() {
 }
 
 beforeEach(() => {
+  kv = makeKv()
   h.state.sufficient = true
   h.state.capturedAmount = ''
-  h.state.acceptedAmount = '30000'
+  h.state.acceptedAmount = '0.0220000'
+  h.state.signature = SIG_HEX
   h.acquire.mockClear()
   h.release.mockClear()
   h.rollback.mockClear()
@@ -142,24 +170,29 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(res.status).toBe(404)
   })
 
-  it('charges EXACTLY the real-cost price (cost + markup) and reports the live cost', async () => {
-    // llama-3.1-8b-instant: cost $0.0004 + markup max(10%,$0.001)=$0.001 → $0.0014
+  it('quotes the MAX upstream cost (budget ceiling) + markup and persists the voucher', async () => {
+    // llama-3.1-8b-instant: cheap-tier budget ceiling $0.02 + markup
+    // max(10%,$0.001)=$0.002 → quote $0.022. Never under-quoted.
+    const e = env()
     h.callUpstream.mockResolvedValue({
       value: { choices: [{ message: { content: 'hi there' } }] },
       paid: true,
-      upstreamCostRaw: '500', // USDC-6 → $0.0005
+      upstreamCostRaw: '500', // USDC-6 → $0.0005 real
     })
-    const res = await handleChannelChat(chatReq(), env())
+    const res = await handleChannelChat(chatReq(), e)
     expect(res.status).toBe(200)
     const json = (await res.json()) as any
     expect(json.message).toBe('hi there')
-    // The voucher delta the router demanded == the effective price.
-    expect(h.state.capturedAmount).toBe('0.0014000')
-    expect(json.charged_usd).toBe('0.0014')
-    expect(json.upstream_cost_usd).toBe('0.0005') // live captured cost, reconciled
-    // Paid success → the cumulative stays advanced (no rollback), lock released.
+    // The voucher delta the router demanded == the quote (max upstream + markup).
+    expect(h.state.capturedAmount).toBe('0.0220000')
+    expect(json.charged_usd).toBe('0.022')
+    expect(json.upstream_cost_usd).toBe('0.0005') // live captured cost, display only
     expect(h.rollback).not.toHaveBeenCalled()
     expect(h.release).toHaveBeenCalled()
+    // Latest voucher signature persisted for the settlement cron.
+    const stored = JSON.parse(kv.map.get(`playgroundVoucher:${CHANNEL}`)!)
+    expect(stored.signature).toBe(SIG_HEX)
+    expect(stored.amountDecimal).toBe('0.0220000')
   })
 
   it('rejects an insufficient voucher delta with the mppx 402 (unbilled)', async () => {
@@ -182,7 +215,7 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     const json = (await res.json()) as any
     expect(json.error).toBe('upstream_unpaid')
     expect(json.charged_usd).toBe('0.00')
-    expect(h.rollback).toHaveBeenCalledWith(expect.anything(), CHANNEL, '30000', '0', 'chal-1')
+    expect(h.rollback).toHaveBeenCalledWith(expect.anything(), CHANNEL, '0.0220000', '0', 'chal-1')
   })
 
   it('keeps the charge when a paid credential was signed but upstream then failed (evidence=yes)', async () => {

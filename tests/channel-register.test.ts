@@ -2,9 +2,10 @@
  * Non-custodial channel playground — register endpoint on-chain verification.
  *
  * The endpoint is the trust boundary between an anonymous browser and the
- * router's money: it must confirm the channel really pays the router, in USDC,
- * funded by the claimed account with the claimed commitment key, above a
- * minimum deposit — BEFORE writing KV. The on-chain read is injected so these
+ * router's money. It must confirm PROVENANCE (the contract is our known channel
+ * WASM), that the channel pays the dedicated COLLECTOR, in USDC, funded by the
+ * claimed account with the claimed commitment key, and holds a REAL SAC balance
+ * above a minimum — BEFORE writing KV. The on-chain read is injected so these
  * tests need no live RPC.
  */
 
@@ -21,7 +22,10 @@ import { checkChannelMatches, type OnChainChannel } from '../src/playground/chan
 import { handleChannelRegister } from '../src/routes/playground-channel'
 
 const USDC_SAC = 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75'
-const ROUTER = 'GBJ7NMENUWLOA5Z5UC3YQROMMY3XKHZYAOYOFL2SXJUGNRVZVG5GAYBV'
+// Dedicated hot collector (Option A) — the channel must pay TO this.
+const COLLECTOR = 'GBD64XFGJHG42CEVQKH4TYCIAMEHVBMW7A24KS22TKOSSA73IVW3CYIK'
+// Our known channel WASM hash (lowercase hex) — the provenance anchor.
+const WASM_HASH = 'ab'.repeat(32)
 
 // Valid channel contract address (C..., 56 chars). Deterministic fixture.
 const CHANNEL = 'C' + 'A'.repeat(55)
@@ -36,21 +40,23 @@ function goodOnChain(overrides: Partial<OnChainChannel> = {}): OnChainChannel {
   return {
     token: USDC_SAC,
     from: FUNDER,
-    to: ROUTER,
+    to: COLLECTOR,
     commitmentKeyHex: COMMIT_HEX,
     refundWaitingPeriod: 100,
-    balanceRaw: '2000000', // 0.2 USDC — above the 0.1 minimum
+    balanceRaw: '2000000', // 0.2 USDC — REAL SAC balance, above the 0.1 minimum
+    wasmHash: WASM_HASH,
     ...overrides,
   }
 }
 
 const EXPECTED = {
-  routerPublic: ROUTER,
+  collector: COLLECTOR,
   usdcSac: USDC_SAC,
   funder: FUNDER,
   commitmentKeyG: COMMIT_G,
   refundWaitingPeriod: 100,
   minDepositRaw: 1_000_000n, // 0.1 USDC
+  wasmHash: WASM_HASH,
 }
 
 describe('checkChannelMatches (pure on-chain comparison)', () => {
@@ -58,7 +64,25 @@ describe('checkChannelMatches (pure on-chain comparison)', () => {
     expect(checkChannelMatches(goodOnChain(), EXPECTED).ok).toBe(true)
   })
 
-  it('rejects wrong recipient (to != router)', () => {
+  it('rejects a WASM-hash mismatch (fake look-alike contract)', () => {
+    const r = checkChannelMatches(goodOnChain({ wasmHash: 'cd'.repeat(32) }), EXPECTED)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('wasm_mismatch')
+  })
+
+  it('rejects a contract with no WASM hash (e.g. a built-in SAC)', () => {
+    const r = checkChannelMatches(goodOnChain({ wasmHash: '' }), EXPECTED)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('wasm_mismatch')
+  })
+
+  it('fails closed when our WASM hash is not configured', () => {
+    const r = checkChannelMatches(goodOnChain(), { ...EXPECTED, wasmHash: '' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('wasm_not_configured')
+  })
+
+  it('rejects when `to` is not the collector', () => {
     const r = checkChannelMatches(goodOnChain({ to: FUNDER }), EXPECTED)
     expect(r.ok).toBe(false)
     if (!r.ok) expect(r.reason).toBe('recipient_mismatch')
@@ -89,7 +113,7 @@ describe('checkChannelMatches (pure on-chain comparison)', () => {
     if (!r.ok) expect(r.reason).toBe('refund_period_mismatch')
   })
 
-  it('rejects an unfunded channel (deposit below minimum)', () => {
+  it('rejects a channel whose REAL SAC balance is zero', () => {
     const r = checkChannelMatches(goodOnChain({ balanceRaw: '0' }), EXPECTED)
     expect(r.ok).toBe(false)
     if (!r.ok) expect(r.reason).toBe('insufficient_deposit')
@@ -111,11 +135,13 @@ function makeKv() {
 function makeEnv(kv: ReturnType<typeof makeKv>) {
   return {
     STELLAR_NETWORK: 'stellar:pubnet',
-    STELLAR_ROUTER_PUBLIC: ROUTER,
+    STELLAR_ROUTER_PUBLIC: 'GBJ7NMENUWLOA5Z5UC3YQROMMY3XKHZYAOYOFL2SXJUGNRVZVG5GAYBV',
     STELLAR_RPC_URL: 'https://rpc.example',
     MPP_STORE: kv,
     ATOMIC_STORE: {},
     PLAYGROUND_CHANNEL_ENABLED: 'true',
+    PLAYGROUND_CHANNEL_TO: COLLECTOR,
+    PLAYGROUND_CHANNEL_WASM_HASH: WASM_HASH,
   } as any
 }
 
@@ -151,6 +177,24 @@ describe('handleChannelRegister', () => {
     expect(res.status).toBe(404)
   })
 
+  it('fails closed (503) when the collector is not configured', async () => {
+    const env = { ...makeEnv(kv), PLAYGROUND_CHANNEL_TO: '' }
+    const res = await handleChannelRegister(registerReq(GOOD_BODY), env, {
+      readChannelOnChain: async () => goodOnChain(),
+    })
+    expect(res.status).toBe(503)
+    expect((await res.json()).error).toBe('collector_not_configured')
+  })
+
+  it('fails closed (503) when the WASM hash is not configured', async () => {
+    const env = { ...makeEnv(kv), PLAYGROUND_CHANNEL_WASM_HASH: '' }
+    const res = await handleChannelRegister(registerReq(GOOD_BODY), env, {
+      readChannelOnChain: async () => goodOnChain(),
+    })
+    expect(res.status).toBe(503)
+    expect((await res.json()).error).toBe('wasm_not_configured')
+  })
+
   it('writes KV after a passing on-chain verification', async () => {
     const env = makeEnv(kv)
     const read = vi.fn(async () => goodOnChain())
@@ -165,8 +209,8 @@ describe('handleChannelRegister', () => {
     expect(json.funder).toBe(FUNDER)
     expect(json.commitment_key).toBe(COMMIT_G)
     expect(read).toHaveBeenCalledOnce()
-    // Primary + agent index written. deposit persisted from the ON-CHAIN
-    // balance, not the client's claim.
+    // Primary + agent index written. deposit persisted from the REAL on-chain
+    // SAC balance, not the client's claim.
     expect(kv.map.get(`stellarChannel:${CHANNEL}`)).toBeTruthy()
     expect(kv.map.get(`stellarAgent:${FUNDER}`)).toBe(CHANNEL)
     const stored = JSON.parse(kv.map.get(`stellarChannel:${CHANNEL}`)!)
@@ -174,7 +218,17 @@ describe('handleChannelRegister', () => {
     expect(stored.commitmentKey).toBe(COMMIT_G)
   })
 
-  it('rejects when on-chain recipient is not the router (no KV write)', async () => {
+  it('rejects a fake look-alike contract (WASM-hash mismatch), no KV write', async () => {
+    const env = makeEnv(kv)
+    const res = await handleChannelRegister(registerReq(GOOD_BODY), env, {
+      readChannelOnChain: async () => goodOnChain({ wasmHash: 'cd'.repeat(32) }),
+    })
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toBe('wasm_mismatch')
+    expect(kv.map.size).toBe(0)
+  })
+
+  it('rejects when on-chain `to` is not the collector (no KV write)', async () => {
     const env = makeEnv(kv)
     const res = await handleChannelRegister(registerReq(GOOD_BODY), env, {
       readChannelOnChain: async () => goodOnChain({ to: FUNDER }),
@@ -204,7 +258,7 @@ describe('handleChannelRegister', () => {
     expect(kv.map.size).toBe(0)
   })
 
-  it('rejects an unfunded channel (no KV write)', async () => {
+  it('rejects a self-reported deposit whose REAL SAC balance is zero (no KV write)', async () => {
     const env = makeEnv(kv)
     const res = await handleChannelRegister(registerReq(GOOD_BODY), env, {
       readChannelOnChain: async () => goodOnChain({ balanceRaw: '0' }),
@@ -226,7 +280,6 @@ describe('handleChannelRegister', () => {
     })
     expect(second.status).toBe(200)
     expect((await second.json()).replayed).toBe(true)
-    // Second call short-circuits on the existing KV record — no second read.
     expect(read).toHaveBeenCalledOnce()
   })
 

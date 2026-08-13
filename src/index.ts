@@ -72,6 +72,7 @@ import {
   handleChannelRegister,
   handleChannelTxDecode,
 } from './routes/playground-channel'
+import { settlePlaygroundChannels } from './playground/channel-settle'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
 import { handlePreflight, withCors } from './utils/cors'
@@ -133,6 +134,24 @@ export interface Env {
   // until the founder deploys the factory on mainnet (an L3 on-chain action);
   // GET /v1/playground/config advertises it (null until set). Plain var.
   PLAYGROUND_CHANNEL_FACTORY?: string
+  // Dedicated hot COLLECTOR account (G...) every playground channel pays TO
+  // (Option A). Kept DISTINCT from STELLAR_ROUTER_PUBLIC (the treasury): it
+  // holds only spent playground cents. Register verifies the channel's on-chain
+  // `to` equals this. Plain var; register + settlement fail closed when unset.
+  PLAYGROUND_CHANNEL_TO?: string
+  // Our known channel-contract WASM hash (lowercase hex) — the provenance
+  // anchor. register REJECTS any contract whose on-chain WASM hash differs, so
+  // an attacker cannot register a look-alike contract that self-reports valid
+  // params. May be set after the founder uploads the channel WASM; register
+  // fails closed while unset. Plain var.
+  PLAYGROUND_CHANNEL_WASM_HASH?: string
+  // Secret key (S...) of the COLLECTOR account. Used ONLY as the envelope
+  // signer for on-chain settle/close of playground channels (collecting spent
+  // funds to the collector) — it never touches the treasury and can only move
+  // funds out of a channel that already pays TO the collector. Unset ⇒ the
+  // settlement cron skips (fail-safe, bounded loss).
+  // Set via: wrangler secret put PLAYGROUND_CHANNEL_SIGNER_SECRET
+  PLAYGROUND_CHANNEL_SIGNER_SECRET?: string
 
   // Stellar Router Pool (receives agent USDC payments)
   // Secret NOT in env — operator manages offline. Only public key needed.
@@ -334,6 +353,10 @@ export default {
   },
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(reconcileAsyncRefunds(env))
+    // Option A online settlement: collect spent channel funds to the collector
+    // before users can unilaterally refund. No-op unless the channel playground
+    // is enabled AND the collector signer secret is set.
+    ctx.waitUntil(settlePlaygroundChannels(env))
   },
 }
 
