@@ -43,6 +43,7 @@ import {
 import {
   acquireChannelDeliveryLock,
   releaseChannelDeliveryLock,
+  revalidateChannelDeliveryLock,
 } from '../mpp/stellar-channel-dispatch'
 
 /** Collect once the unsettled amount reaches this, even without a close_start. */
@@ -134,6 +135,18 @@ export async function settleOneChannel(
     })
     const closing = state.closeEffectiveAtLedger != null
     if (!closing && unsettled < SETTLE_THRESHOLD_RAW) return null
+
+    // P0-3: getChannelState is a network RPC that could stall past the lock TTL,
+    // during which a replacement call may pay/persist a higher voucher. Re-check
+    // the fencing token immediately before the (final, irreversible) close — if
+    // superseded, abort and let the next cron tick retry under a fresh lock and
+    // a fresh latest-voucher read, rather than close with a now-stale voucher.
+    if (!(await revalidateChannelDeliveryLock(env, channelContract, lockId))) {
+      console.warn(
+        `[channel-settle] lock superseded before close on ${channelContract}; retrying next tick`,
+      )
+      return null
+    }
 
     // Mark closed BEFORE the (final) close so any call that acquires the lock
     // after we release it rejects instead of paying upstream. Write BOTH the

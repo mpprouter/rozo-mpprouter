@@ -49,11 +49,13 @@ const h = vi.hoisted(() => ({
     capturedAmount: '',
     acceptedAmount: '0.0220000',
     signature: 'aa'.repeat(64),
+    depositRaw: '100000000', // $10 — plenty unless a test lowers it
   } as {
     sufficient: boolean
     capturedAmount: string
     acceptedAmount: string
     signature: string
+    depositRaw: string
   },
   acquire: vi.fn(async () => true),
   release: vi.fn(async () => {}),
@@ -118,6 +120,7 @@ vi.mock('../src/playground/channel-pg-dispatch', () => {
       channelContract: CHANNEL,
       agentAccount: FUNDER,
       channelCurrency: USDC_SAC,
+      depositRaw: h.state.depositRaw,
     }),
   }
 })
@@ -186,6 +189,7 @@ beforeEach(() => {
   h.state.capturedAmount = ''
   h.state.acceptedAmount = '0.0220000'
   h.state.signature = SIG_HEX
+  h.state.depositRaw = '100000000'
   h.acquire.mockClear()
   h.release.mockClear()
   h.revalidate.mockReset()
@@ -357,9 +361,9 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(h.release).toHaveBeenCalled()
   })
 
-  it('P0-2: when the atomic fence fails, the durable KV fence still blocks the next call', async () => {
-    // Unpaid + rollback fails → must fence; the atomic marker write also fails,
-    // so only the durable KV fence lands.
+  it('P0-2/P0-6: when the atomic closed-marker fails, the durable atomic fence still blocks', async () => {
+    // Unpaid + rollback fails → must fence. The fast closed-marker write fails,
+    // so only the durable fence (separate atomic key) lands.
     h.callUpstream.mockResolvedValue({
       value: { choices: [{ message: { content: 'x' } }] },
       paid: false,
@@ -368,8 +372,8 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     atomic.state.failClosedUpdate = true
     const first = await handleChannelChat(chatReq(), env())
     expect((await first.json()).error).toBe('upstream_unpaid')
-    // The durable KV fence landed even though the atomic marker write threw.
-    expect(kv.map.get(`channelFenced:${CHANNEL}`)).toBeTruthy()
+    // The durable atomic fence landed even though the closed-marker write threw.
+    expect(atomic.backing.get(`pg:channel:fenced:${CHANNEL}`)).toBeTruthy()
 
     // A subsequent call is rejected by the dispatch gate regardless of lock state.
     atomic.state.failClosedUpdate = false
@@ -377,6 +381,59 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     const second = await handleChannelChat(chatReq(), env())
     expect(second.status).toBe(410)
     expect((await second.json()).error).toBe('channel_closed')
+    expect(h.callUpstream).not.toHaveBeenCalled()
+  })
+
+  it('P0-5: an ambiguous persist error whose readback shows the voucher IS stored charges the quote', async () => {
+    // A voucher covering this call's cumulative is already stored (the write may
+    // have landed before the error). The persist "throws" but readback confirms
+    // coverage → treat as committed, charge the quote, never report $0.
+    atomic.backing.set(`pg:channel:voucher:${CHANNEL}`, {
+      cumulativeRaw: '220000',
+      amountDecimal: '0.0220000',
+      signature: SIG_HEX,
+      lastSettledRaw: '0',
+      updatedAt: 'now',
+    })
+    atomic.state.failVoucherUpdate = true // the write path throws (ambiguous)
+    h.callUpstream.mockResolvedValue({
+      value: { choices: [{ message: { content: 'hi' } }] },
+      paid: true,
+      upstreamCostRaw: '500',
+    })
+    const res = await handleChannelChat(chatReq(), env())
+    expect(res.status).toBe(200)
+    expect((await res.json()).charged_usd).toBe('0.022') // redeemable → charged, not $0
+    expect(h.rollback).not.toHaveBeenCalled()
+  })
+
+  it('P0-1: rejects a call whose new cumulative would exceed the channel deposit', async () => {
+    h.state.depositRaw = '100000' // $0.01 deposit; quote is $0.022 → over
+    const res = await handleChannelChat(chatReq(), env())
+    expect(res.status).toBe(402)
+    const json = (await res.json()) as any
+    expect(json.error).toBe('insufficient_channel_balance')
+    expect(json.remaining_usd).toBe('0.01')
+    expect(h.callUpstream).not.toHaveBeenCalled() // never paid
+  })
+
+  it('P0-1: the deposit caps total spend — a second call past the deposit is rejected', async () => {
+    // Deposit funds exactly one $0.022 call ($0.03). First call succeeds.
+    h.state.depositRaw = '300000'
+    h.callUpstream.mockResolvedValue({
+      value: { choices: [{ message: { content: 'ok' } }] },
+      paid: true,
+      upstreamCostRaw: '500',
+    })
+    const first = await handleChannelChat(chatReq(), env())
+    expect(first.status).toBe(200)
+    // Reflect the first call's advance in the cumulative watermark the gate reads.
+    atomic.backing.set(`stellar:channel:cumulative:${CHANNEL}`, { amount: '220000' })
+    // Second call: 220000 + 220000 > 300000 → rejected, cap holds.
+    h.callUpstream.mockClear()
+    const second = await handleChannelChat(chatReq(), env())
+    expect(second.status).toBe(402)
+    expect((await second.json()).error).toBe('insufficient_channel_balance')
     expect(h.callUpstream).not.toHaveBeenCalled()
   })
 })

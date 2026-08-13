@@ -45,6 +45,7 @@ function goodOnChain(overrides: Partial<OnChainChannel> = {}): OnChainChannel {
     refundWaitingPeriod: 100,
     balanceRaw: '2000000', // 0.2 USDC — REAL SAC balance, above the 0.1 minimum
     wasmHash: WASM_HASH,
+    closeEffectiveAtLedger: null, // fully open
     ...overrides,
   }
 }
@@ -117,6 +118,12 @@ describe('checkChannelMatches (pure on-chain comparison)', () => {
     const r = checkChannelMatches(goodOnChain({ balanceRaw: '0' }), EXPECTED)
     expect(r.ok).toBe(false)
     if (!r.ok) expect(r.reason).toBe('insufficient_deposit')
+  })
+
+  it('rejects a channel already in close_start (P0-2)', () => {
+    const r = checkChannelMatches(goodOnChain({ closeEffectiveAtLedger: 123456 }), EXPECTED)
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.reason).toBe('channel_closing')
   })
 })
 
@@ -292,6 +299,16 @@ describe('handleChannelRegister', () => {
     })
     expect(res.status).toBe(400)
     expect((await res.json()).error).toBe('funder_mismatch')
+    expect(kv.map.size).toBe(0)
+  })
+
+  it('rejects a channel already in close_start (no KV write) (P0-2)', async () => {
+    const env = makeEnv(kv)
+    const res = await handleChannelRegister(registerReq(GOOD_BODY), env, {
+      readChannelOnChain: async () => goodOnChain({ closeEffectiveAtLedger: 999999 }),
+    })
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toBe('channel_closing')
     expect(kv.map.size).toBe(0)
   })
 

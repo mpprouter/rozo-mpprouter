@@ -33,6 +33,10 @@ export async function resolvePgChannelMppx(
   channelContract: string
   agentAccount: string
   channelCurrency: string
+  /** On-chain USDC deposit captured at register (7-decimal atomic string). The
+   * hard cap on cumulative spend — the router must reject any voucher whose new
+   * cumulative would exceed it. */
+  depositRaw: string
 }> {
   const agentAccount = extractAgentAccount(authHeader) ?? agentHint ?? null
   if (!agentAccount) {
@@ -62,5 +66,6 @@ export async function resolvePgChannelMppx(
     channelContract,
     agentAccount: state.agentAccount,
     channelCurrency: state.currency,
+    depositRaw: state.depositRaw,
   }
 }

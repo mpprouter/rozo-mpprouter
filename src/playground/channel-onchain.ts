@@ -61,6 +61,13 @@ export interface OnChainChannel {
    * deploying a look-alike contract that self-reports valid params.
    */
   wasmHash: string
+  /**
+   * The ledger at which a started close becomes effective, or null if the
+   * channel is still fully open. Set once the funder has called close_start —
+   * a channel already closing is near its refund window and must NOT be
+   * registered (the funder could spend then refund before the cron settles).
+   */
+  closeEffectiveAtLedger: number | null
 }
 
 /** What the router requires the on-chain channel to look like. */
@@ -112,6 +119,16 @@ export function checkChannelMatches(
       ok: false,
       reason: 'recipient_mismatch',
       detail: 'channel recipient (to) is not the playground collector',
+    }
+  }
+  // A channel that has already entered close_start is heading for refund; the
+  // funder could spend and then refund before the settlement cron collects.
+  // Only register fully-open channels with the whole refund window ahead.
+  if (onchain.closeEffectiveAtLedger != null) {
+    return {
+      ok: false,
+      reason: 'channel_closing',
+      detail: 'channel is already in close_start / refund pending',
     }
   }
   if (onchain.token !== expected.usdcSac) {
@@ -246,6 +263,10 @@ export async function readChannelOnChain(
   const to = String(scValToNative(toScv))
   const commitmentKeyHex = Buffer.from(commitScv.bytes()).toString('hex')
   const refundWaitingPeriod = Number(scValToNative(periodScv))
+  // CloseEffectiveAtLedger is only present in instance storage once close_start
+  // has run; its absence means the channel is fully open.
+  const closeScv = config['CloseEffectiveAtLedger']
+  const closeEffectiveAtLedger = closeScv ? Number(scValToNative(closeScv)) : null
 
   // 2) REAL balance — query the USDC SAC's balance OF the channel address, NOT
   //    the channel's self-reported balance(). A fake contract not actually
@@ -269,5 +290,14 @@ export async function readChannelOnChain(
   }
   const balanceRaw = BigInt(scValToNative(retval) as bigint | number | string).toString()
 
-  return { token, from, to, commitmentKeyHex, refundWaitingPeriod, balanceRaw, wasmHash }
+  return {
+    token,
+    from,
+    to,
+    commitmentKeyHex,
+    refundWaitingPeriod,
+    balanceRaw,
+    wasmHash,
+    closeEffectiveAtLedger,
+  }
 }

@@ -109,27 +109,31 @@ export async function isChannelClosed(env: Env, channelContract: string): Promis
 }
 
 // ---------------------------------------------------------------------------
-// Lock-INDEPENDENT persistent fence (P0-2). Kept in KV, separate from the
-// atomic closed marker, so that even if the atomic store write fails the fence
-// still lands. The dispatch gate checks BOTH markers on every call, so a fenced
-// channel rejects regardless of lock state — a released or taken-over lock can
-// never let a call advance a fenced channel.
+// Lock-INDEPENDENT persistent fence (P0-2 / P0-6). Kept on the STRONGLY
+// consistent atomic DO store — NOT eventually-consistent KV, which could leave
+// a fence invisible cross-colo and let a call in another colo absorb the
+// uncharged increment. The dispatch gate checks the closed marker AND this
+// fence on every call, so a fenced channel rejects immediately everywhere,
+// regardless of lock state — a released/taken-over lock can never let a call
+// advance a fenced channel.
 // ---------------------------------------------------------------------------
 
-const fenceKey = (c: string) => `channelFenced:${c}`
+const fencedKey = (c: string) => `pg:channel:fenced:${c}`
 
 /**
- * Durably fence a channel, retrying a few times. Returns true iff the marker was
- * written. The caller logs CRITICAL when this returns false — that is the only
- * (astronomically rare, both-stores-down) case where the fence could be missed.
+ * Durably fence a channel on the atomic store, retrying a few times. Returns
+ * true iff the marker was written. The caller logs CRITICAL when this returns
+ * false — the only (astronomically rare, store-down) case where it could miss.
  */
 export async function fenceChannelPersistent(env: Env, channelContract: string): Promise<boolean> {
+  const s = store(env)
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      await env.MPP_STORE.put(
-        fenceKey(channelContract),
-        JSON.stringify({ fencedAt: new Date().toISOString() }),
-      )
+      await (s.update as any)(fencedKey(channelContract), () => ({
+        op: 'set',
+        value: { fencedAt: new Date().toISOString() },
+        result: true,
+      }))
       return true
     } catch (e: any) {
       console.error(`[channel] persistent fence write attempt ${attempt + 1} failed: ${e?.message}`)
@@ -140,12 +144,14 @@ export async function fenceChannelPersistent(env: Env, channelContract: string):
 
 /**
  * A channel is BLOCKED for new calls if either the fast atomic closed marker OR
- * the durable KV fence is set. The dispatch gate calls this on every request.
+ * the durable atomic fence is set. The dispatch gate calls this on every
+ * request. Both reads hit the strongly-consistent store, so a fence is visible
+ * immediately in every colo.
  */
 export async function isChannelBlocked(env: Env, channelContract: string): Promise<boolean> {
-  if (await isChannelClosed(env, channelContract)) return true
-  const f = await env.MPP_STORE.get(fenceKey(channelContract))
-  return f != null
+  const s = store(env)
+  const [closed, fenced] = await Promise.all([s.get(closedKey(channelContract)), s.get(fencedKey(channelContract))])
+  return closed != null || fenced != null
 }
 
 // ---------------------------------------------------------------------------
