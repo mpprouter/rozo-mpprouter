@@ -188,7 +188,7 @@ function chatReq() {
       Authorization: 'Payment fake-voucher-credential',
     },
     body: JSON.stringify({
-      model: 'llama-3.1-8b-instant',
+      model: 'claude-haiku-4-5',
       messages: [{ role: 'user', content: 'hello' }],
     }),
   })

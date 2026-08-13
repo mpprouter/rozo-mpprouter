@@ -389,7 +389,7 @@ describe('reserve / commit / release', () => {
       callId: 'call-1',
       account: ALICE,
       chip: 'chat',
-      model: 'llama-3.1-8b-instant',
+      model: 'claude-haiku-4-5',
       maxPriceAtomic: parseUsd('0.10'),
       now,
     })
