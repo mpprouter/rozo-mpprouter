@@ -184,3 +184,73 @@ export async function getSupersededAbortCount(env: Env): Promise<number> {
   const v = (await store(env).get(RECON_SUPERSEDE_KEY)) as any
   return v?.count ?? 0
 }
+
+const writeoffKey = (c: string) => `pg:channel:writeoff:${c}`
+
+export interface VoucherWriteoff {
+  /** The signed cumulative that was NOT collectable on-chain, base-unit stroops. */
+  cumulativeRaw: string
+  reason: string
+  at: string
+}
+
+/**
+ * Terminal write-off record: the funder's unilateral refund emptied the channel
+ * before the collector's close landed, so this cumulative is forgiven debt, NOT
+ * settled funds. Kept under its own key so reconciliation can distinguish
+ * collected from written-off amounts; the caller ALSO advances lastSettledRaw
+ * (documented there as "no longer collectable") purely to stop the cron
+ * retrying a dead channel.
+ */
+const RECON_WRITEOFF_KEY = 'pg:channel:recon:writeoffs'
+
+export async function markVoucherWrittenOff(
+  env: Env,
+  channelContract: string,
+  cumulativeRaw: string,
+  reason: string,
+): Promise<void> {
+  const s = store(env)
+  // Per-channel terminal record — idempotent set, order-independent of the
+  // aggregate below.
+  await (s.update as any)(writeoffKey(channelContract), (current: any) =>
+    current
+      ? { op: 'noop', result: false }
+      : {
+          op: 'set',
+          value: { cumulativeRaw, reason, at: new Date().toISOString() } satisfies VoucherWriteoff,
+          result: true,
+        },
+  )
+  // Global recon aggregate. The dedup set lives INSIDE the aggregate value, so
+  // count/totalRaw/membership advance in ONE CAS — a crash between the two
+  // writes above/below can only cause a retry that no-ops here, never a
+  // permanent undercount or a double-count. Bounded: one entry per playground
+  // channel that was ever written off (rare by design).
+  await (s.update as any)(RECON_WRITEOFF_KEY, (current: any) => {
+    const channels: Record<string, string> = current?.channels ?? {}
+    if (channels[channelContract] !== undefined) return { op: 'noop', result: false }
+    return {
+      op: 'set',
+      value: {
+        count: (current?.count ?? 0) + 1,
+        totalRaw: (BigInt(current?.totalRaw ?? '0') + BigInt(cumulativeRaw)).toString(),
+        channels: { ...channels, [channelContract]: cumulativeRaw },
+      },
+      result: true,
+    }
+  })
+}
+
+export async function getWriteoffTotals(env: Env): Promise<{ count: number; totalRaw: string }> {
+  const v = (await store(env).get(RECON_WRITEOFF_KEY)) as any
+  return { count: v?.count ?? 0, totalRaw: v?.totalRaw ?? '0' }
+}
+
+export async function getVoucherWriteoff(
+  env: Env,
+  channelContract: string,
+): Promise<VoucherWriteoff | null> {
+  const v = (await store(env).get(writeoffKey(channelContract))) as VoucherWriteoff | null
+  return v && typeof v === 'object' ? v : null
+}

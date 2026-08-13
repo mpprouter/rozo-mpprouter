@@ -39,6 +39,7 @@ import {
   getLatestVoucher,
   markChannelClosed,
   markVoucherSettled,
+  markVoucherWrittenOff,
 } from './channel-voucher-store'
 import {
   acquireChannelDeliveryLock,
@@ -60,7 +61,8 @@ export interface SettleDeps {
     channel: string
     amount: bigint
     signature: Uint8Array
-    feePayer: { envelopeSigner: string }
+    feePayer: { envelopeSigner: string; feeBumpSigner?: string }
+    maxFeeBumpStroops?: number
     network?: string
     rpcUrl?: string
   }) => Promise<string>
@@ -163,14 +165,52 @@ export async function settleOneChannel(
     await fenceChannelPersistent(env, channelContract)
 
     const signature = decodeVoucherSignature(voucher.signature)
-    const txHash = await deps.close({
-      channel: channelContract,
-      amount: cumulativeRaw,
-      signature,
-      feePayer: { envelopeSigner: env.PLAYGROUND_CHANNEL_SIGNER_SECRET! },
-      network: env.STELLAR_NETWORK,
-      rpcUrl: env.STELLAR_RPC_URL,
-    })
+    let txHash: string
+    try {
+      txHash = await deps.close({
+        channel: channelContract,
+        amount: cumulativeRaw,
+        signature,
+        // feeBumpSigner wraps the close in a FeeBumpTransaction at 10x the
+        // inner fee (capped below). Without it the SDK builds the inner tx at
+        // DEFAULT_FEE=100 stroops inclusion — the known mainnet-Soroban
+        // timeout trap (same root cause as the frontend open/close fee bug):
+        // the 2026-08-13 e2e run's $0.211 voucher was never collected because
+        // every cron close timed out unincluded until the funder's refund
+        // window elapsed.
+        feePayer: {
+          envelopeSigner: env.PLAYGROUND_CHANNEL_SIGNER_SECRET!,
+          feeBumpSigner: env.PLAYGROUND_CHANNEL_SIGNER_SECRET!,
+        },
+        maxFeeBumpStroops: 10_000_000, // 1 XLM cap on the bumped fee
+        network: env.STELLAR_NETWORK,
+        rpcUrl: env.STELLAR_RPC_URL,
+      })
+    } catch (err: any) {
+      // The funder's unilateral refund already emptied the channel: the close's
+      // token transfer fails with "balance is not sufficient". The debt is
+      // unrecoverable ON-CHAIN (bounded loss by design — deposit cap), so mark
+      // it settled to stop the cron retrying a dead channel every 2 minutes,
+      // and log the write-off amount for the operator ledger.
+      if (String(err?.message ?? err).includes('balance is not sufficient')) {
+        // Terminal write-off record FIRST (reconciliation source of truth:
+        // forgiven debt, not collected funds), then advance the settled
+        // watermark only to stop the cron retrying a dead channel.
+        await markVoucherWrittenOff(
+          env,
+          channelContract,
+          cumulativeRaw.toString(),
+          'funder refunded before collection',
+        )
+        await markVoucherSettled(env, channelContract, cumulativeRaw.toString())
+        console.error(
+          `[channel-settle] WRITE-OFF ${voucher.amountDecimal} on ${channelContract}: ` +
+            'channel already refunded by the funder before collection (bounded loss)',
+        )
+        return null
+      }
+      throw err
+    }
     await markVoucherSettled(env, channelContract, cumulativeRaw.toString())
     console.log(
       `[channel-settle] collected ${voucher.amountDecimal} on ${channelContract} tx=${txHash}`,
