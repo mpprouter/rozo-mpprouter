@@ -98,6 +98,23 @@ function completion(text = 'hello from the model') {
   })
 }
 
+
+/**
+ * A successful CHARGE-mode upstream: fires onCredentialSigned (a real credential
+ * was signed) then returns a good completion. This is what a healthy paid call
+ * looks like, and it is required now that commit is gated on paid === true.
+ */
+const paidCharge = async (_e: unknown, _u: unknown, _i: unknown, opts: any) => {
+  opts?.onCredentialSigned?.()
+  return completion()
+}
+
+/** A successful SESSION-mode upstream: signs a voucher, returns a completion. */
+const paidSession = async (_e: unknown, _id: unknown, _u: unknown, _i: unknown, opts: any) => {
+  opts?.onCredentialSigned?.()
+  return { response: completion(), channelBefore: { cumulativeRaw: '0' } }
+}
+
 async function fund(env: Env, usd: string) {
   const now = Date.now()
   const intent = await createIntent(env, {
@@ -151,7 +168,7 @@ beforeEach(() => {
 describe('seam selection', () => {
   it('routes a tempo.charge route through payMerchant', async () => {
     const env = makeEnv()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
     const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.charge')
 
@@ -163,7 +180,7 @@ describe('seam selection', () => {
 
   it('routes a tempo.session route through payMerchantSession, keyed by route.id', async () => {
     const env = makeEnv()
-    payMerchantSession.mockResolvedValue({ response: completion(), channelBefore: { cumulativeRaw: '0' } })
+    payMerchantSession.mockImplementation(paidSession)
     const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
 
@@ -183,7 +200,7 @@ describe('seam selection', () => {
     // for this route, yet its 2026-08-09 paid verification succeeded. Sending
     // these models down the session path would 503 in production.
     const env = makeEnv()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
     const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.charge')
 
@@ -195,7 +212,7 @@ describe('seam selection', () => {
 
   it('routes the openai chat route through the session seam too', async () => {
     const env = makeEnv()
-    payMerchantSession.mockResolvedValue({ response: completion(), channelBefore: { cumulativeRaw: '0' } })
+    payMerchantSession.mockImplementation(paidSession)
     const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
 
@@ -381,7 +398,7 @@ describe('tier pricing through the full call path', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
       chatRequest('llama-3.1-8b-instant', bearer, 'call-cheap'),
@@ -398,7 +415,7 @@ describe('tier pricing through the full call path', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
       chatRequest('claude-opus-5', bearer, 'call-flagship'),
@@ -415,7 +432,7 @@ describe('tier pricing through the full call path', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
       chatRequest('claude-haiku-4-5', bearer, 'call-haiku'),
@@ -428,7 +445,7 @@ describe('tier pricing through the full call path', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
 
     const request = new Request('https://apiserver.example/v1/playground/chat', {
       method: 'POST',
@@ -458,7 +475,7 @@ describe('tier pricing through the full call path', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
 
     await handlePlaygroundChat(chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'), env)
     expect(payMerchant).toHaveBeenCalledTimes(1)
@@ -549,7 +566,7 @@ describe('upstream budget ceiling (P0-2)', () => {
 
   it('passes the ceiling to payMerchant as USDC-6 base units', async () => {
     const env = makeEnv()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
     const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
 
     await callUpstream(env, { route, body: {}, budgetAtomic: parseUsd('0.02') })
@@ -599,7 +616,7 @@ describe('upstream budget ceiling (P0-2)', () => {
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchant.mockResolvedValue(completion())
+    payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
       chatRequest('llama-3.1-8b-instant', bearer, 'call-flat'),
@@ -797,5 +814,101 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     const account = await readAccount(env, ALICE)
     if (!account.ok) return
     expect(account.value.balance).toBe(parseUsd('1').toString())
+  })
+})
+
+describe('the ONLY commit predicate is paid === true', () => {
+  it('initial non-402 2xx with paid===false → RELEASED, user not charged', async () => {
+    // Merchant served a usable 2xx body but never issued a 402, so no
+    // credential was signed. The router paid nothing; the user must not be
+    // charged even though the body looks fine.
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    payMerchant.mockResolvedValue(completion('a real-looking answer')) // no onCredentialSigned
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'unpaid-2xx'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    const body = await response.json()
+    expect(body.error).toBe('upstream_unpaid')
+    expect(body.charged_usd).toBe('0.00')
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('1').toString())
+    expect(account.value.calls[0].status).toBe('released')
+  })
+
+  it('paid===true + empty body → COMMITTED (we paid; user gets error + charge + support_note)', async () => {
+    const env = makeEnv()
+    await fund(env, '1')
+    const bearer = await token()
+    // Signs a credential, then returns an EMPTY completion.
+    payMerchant.mockImplementation(async (_e: unknown, _u: unknown, _i: unknown, opts: any) => {
+      opts?.onCredentialSigned?.()
+      return new Response(JSON.stringify({ choices: [{ message: { content: '' } }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    })
+
+    const response = await handlePlaygroundChat(
+      chatRequest('llama-3.1-8b-instant', bearer, 'paid-empty'),
+      env,
+    )
+    expect(response.status).toBe(502)
+    const body = await response.json()
+    expect(body.error).toBe('upstream_empty')
+    expect(body.charged_usd).toBe('0.02')
+    expect(body.support_note).toMatch(/paid but did not return/i)
+
+    const account = await readAccount(env, ALICE)
+    if (!account.ok) return
+    expect(account.value.balance).toBe(parseUsd('0.98').toString())
+    expect(account.value.calls[0].status).toBe('committed')
+  })
+
+  it('Mercury (router-held credential) commits on a 2xx and releases on a 5xx', async () => {
+    // Mercury never signs a Tempo credential; paid = response.ok. A success is
+    // billable, a failure is our quota loss, never the user's.
+    const okEnv = { ...makeEnv(), ATOMIC_STORE: makeAtomicStoreMock(), MERCURYDATA_MAINNET_JWT: 't' } as Env
+    await fund(okEnv, '1')
+    const okToken = await token()
+    const okSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(JSON.stringify({ events: [] }), { status: 200 }))
+    const okResp = await handlePlaygroundTxDecode(
+      new Request('https://x/v1/playground/tx-decode', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${okToken}` },
+        body: JSON.stringify({ call_id: 'mercury-ok', tx_hash: 'a'.repeat(64) }),
+      }),
+      okEnv,
+    )
+    expect(okResp.status).toBe(200)
+    expect((await okResp.json()).charged_usd).toBe('0.005')
+    okSpy.mockRestore()
+
+    const badEnv = { ...makeEnv(), ATOMIC_STORE: makeAtomicStoreMock(), MERCURYDATA_MAINNET_JWT: 't' } as Env
+    await fund(badEnv, '1')
+    const badToken = await token()
+    const badSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('down', { status: 503 }))
+    const badResp = await handlePlaygroundTxDecode(
+      new Request('https://x/v1/playground/tx-decode', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${badToken}` },
+        body: JSON.stringify({ call_id: 'mercury-bad', tx_hash: 'a'.repeat(64) }),
+      }),
+      badEnv,
+    )
+    expect(badResp.status).toBe(502)
+    expect((await badResp.json()).charged_usd).toBe('0.00')
+    const acct = await readAccount(badEnv, ALICE)
+    if (!acct.ok) return
+    expect(acct.value.balance).toBe(parseUsd('1').toString())
+    badSpy.mockRestore()
   })
 })

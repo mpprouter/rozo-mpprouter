@@ -206,9 +206,8 @@ export interface LedgerTotals {
   outstanding: string
   balances_sum: string
   holds_sum: string
-  reaped_committed_count: number
-  reaped_committed_atomic: string
   reaped_released_count: number
+  reaped_release_possible_paid_count: number
   consumed_deposits: {
     tx_hash: string
     op_index: number

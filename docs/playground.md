@@ -30,7 +30,7 @@ global allow-list, and all playground routes are `GET`/`POST`.
 | Name | Default | Meaning |
 | --- | --- | --- |
 | `PLAYGROUND_ENABLED` | `"false"` | Kill switch. Every `/v1/playground/*` route 404s unless this is **exactly** `"true"`. Flip + redeploy to pull the feature with no code rollback. |
-| `PLAYGROUND_GLOBAL_CAP_USD` | `"200"` | Global outstanding-credit ceiling. Deposit intents are refused once `Σ balances + Σ open holds + the new deposit` would exceed it. An unparseable value falls back to `$200`, never to "unlimited". |
+| `PLAYGROUND_GLOBAL_CAP_USD` | `"1000"` | Global outstanding-credit ceiling — the total blast radius (most unspent playground credit that can exist at once). Deposit intents are refused once `Σ balances + Σ open holds + the new deposit` would exceed it. An unparseable value falls back to the compiled-in `$1000` default, never to "unlimited". **Set this to whatever total outstanding-credit exposure you're comfortable with**; with $100 deposits the old $200 default held only two max depositors. |
 | `PLAYGROUND_TURNSTILE_SITE_KEY` | unset | Public Cloudflare Turnstile site key, echoed by `/config` so the frontend renders the widget. |
 | `PLAYGROUND_TURNSTILE_DISABLED` | unset | Only the exact string `"true"` disables the intent Turnstile gate (staged rollout). Any other value keeps it on. Leave unset in production. |
 
@@ -163,7 +163,10 @@ after a *first* already signed commits (money moved), while a budget breach on
 the first challenge releases (nothing signed).
 
 Prices: chat `$0.02` (cheap tier) / `$0.10` (flagship), Blend activity `$0.03`,
-tx-decode `$0.005`. Deposits are `$0.10` or `$1.00` and are **non-refundable
+tx-decode `$0.005`. Deposit tiers are `$0.10`, `$1`, `$10`, `$100` (max single
+deposit $100; per-account cap $100/day), served live via `GET /config`
+`deposit_options` so the frontend needs no change to pick them up. Deposits are
+**non-refundable
 demo credit**.
 
 ## Upstream payment seams

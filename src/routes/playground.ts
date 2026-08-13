@@ -716,32 +716,24 @@ async function beginCall(
 }
 
 /**
- * Settle a failed call, deciding between refund and charge on EVIDENCE of
- * whether the router's money actually moved.
+ * Settle a FAILED call. The commit decision is `paymentEvidence === 'yes'` and
+ * nothing else — no exception type, no response shape, no default-to-commit.
  *
- * This is the single most important branch in the playground. The naive
- * version — always release on failure — is wrong, and dangerously so: for a
- * session call the voucher is signed (and the cumulative watermark advanced)
- * BEFORE the merchant's final response is known, so a timeout or 5xx after
- * that point means the router has already paid. Refunding the user there hands
- * out free upstream calls to anyone who can make the response leg fail.
+ * `paymentEvidence` is set upstream strictly from the call-local `paid` flag
+ * (`paid ? 'yes' : 'no'`), which is true only when the router actually incurred
+ * billable cost for THIS call: a credential was signed (Tempo) or the metered
+ * call succeeded (Mercury). So:
  *
- * The rule is therefore: release ONLY when we can prove no payment happened.
+ *   - `'yes'` → commit. The money moved (a credential was signed and the
+ *               response then failed — bad status, empty/garbage body, timeout
+ *               after signing). The user is charged, told so via `support_note`,
+ *               and the event logged for support.
+ *   - anything else (`'no'`, `'maybe'`, a non-UpstreamError) → release. The
+ *               user is not charged.
  *
- *   - `'no'`    → release. Provable non-payment: refused before dispatch
- *                 (unknown/unverified route, rate limit, over-budget refusal
- *                 inside onChallenge, missing session channel), or a route
- *                 that never pays at all (Mercury's router-held credential).
- *   - `'yes'`   → commit. A voucher was signed (watermark advanced), or the
- *                 merchant answered our paid retry with a bad status or an
- *                 unparseable body.
- *   - `'maybe'` → commit. A lost response or a timeout after dispatch. We
- *                 cannot prove the transfer did not happen, and the safe
- *                 direction for an ambiguous settlement is to charge.
- *
- * Charged failures return the price in `charged_usd` and a `support_note` so
- * the user is told plainly they were billed for a call that did not deliver,
- * and they are logged at error level for support to find.
+ * The success-path counterpart is `releaseUnpaid`, used when a call returns a
+ * usable body but `paid === false` (e.g. an initial non-402 2xx). Between the
+ * two, `paid === true` is the ONLY thing anywhere that can lead to a charge.
  */
 async function failCall(
   env: Env,
@@ -753,9 +745,12 @@ async function failCall(
   const code = upstream?.code ?? 'upstream_error'
   const status = upstream?.status ?? 502
   const message = upstream?.message ?? 'upstream call failed'
-  // Anything that is not a recognised UpstreamError is treated as ambiguous.
-  const evidence = upstream?.paymentEvidence ?? 'maybe'
-  const shouldCommit = evidence !== 'no'
+  // THE ONLY COMMIT PREDICATE: a credential was provably signed for this call
+  // (paymentEvidence === 'yes', set from the call-local `paid` flag). Every
+  // other outcome — 'no', 'maybe', a non-UpstreamError, an unknown default —
+  // RELEASES. There is no default-to-commit and no exception-type or
+  // response-shape heuristic anywhere in this decision.
+  const shouldCommit = upstream?.paymentEvidence === 'yes'
 
   let charged = 0n
   let balanceAtomic: bigint | null = null
@@ -778,7 +773,7 @@ async function failCall(
   if (shouldCommit) {
     console.error(
       `[playground] PAID-BUT-FAILED call ${callId}: ${code} (${message}); ` +
-        `evidence=${evidence}; charged ${charged} atomic. Support may owe goodwill credit.`,
+        `paymentEvidence=yes; charged ${charged} atomic. Support may owe goodwill credit.`,
     )
   }
 
@@ -792,6 +787,30 @@ async function failCall(
             'The upstream provider was paid but did not return a usable result, so this call was charged. Contact support if you would like it reviewed.',
         }
       : {}),
+  })
+}
+
+/**
+ * A usable response came back but NO credential was signed for this call
+ * (`paid === false`) — e.g. an initial non-402 2xx where the merchant served
+ * us without a payment challenge. The router paid nothing, so the user is
+ * never charged: release the hold and report a neutral error. This is the
+ * success-path counterpart to `failCall`'s release branch, and it exists so
+ * that `paid === true` is the ONLY thing that can lead to a charge.
+ */
+async function releaseUnpaid(env: Env, callId: string): Promise<Response> {
+  let balanceAtomic: bigint | null = null
+  try {
+    const settled = await release(env, callId, 'no_credential_signed')
+    if (settled.ok) balanceAtomic = parseAtomic(settled.value.balance)
+    else console.error(`[playground] release(unpaid) failed for ${callId}: ${settled.code}`)
+  } catch (err: any) {
+    console.error(`[playground] release(unpaid) threw for ${callId}: ${err?.message}`)
+  }
+  return fail(502, 'upstream_unpaid', 'the call did not complete a payment; you were not charged', {
+    call_id: callId,
+    charged_usd: '0.00',
+    ...(balanceAtomic !== null ? { balance_usd: formatUsd(balanceAtomic) } : {}),
   })
 }
 
@@ -887,8 +906,9 @@ export async function handlePlaygroundChat(request: Request, env: Env): Promise<
   if (started instanceof Response) return started
 
   let completion: ChatCompletion
+  let paid: boolean
   try {
-    completion = await callUpstreamJson<ChatCompletion>(env, {
+    ;({ value: completion, paid } = await callUpstreamJson<ChatCompletion>(env, {
       route,
       body: {
         model: model.id,
@@ -901,15 +921,19 @@ export async function handlePlaygroundChat(request: Request, env: Env): Promise<
       // Hard ceiling on what the ROUTER pays, independent of the flat price
       // the user pays and of whatever the merchant's live 402 asks for.
       budgetAtomic: parseUsd(TIER_UPSTREAM_BUDGET_USD[model.tier]),
-    })
+    }))
   } catch (e) {
     return failCall(env, id, e, priceAtomic)
   }
 
+  // A 2xx body with no signed credential means the router paid nothing — do
+  // not charge, regardless of what the body contains.
+  if (!paid) return releaseUnpaid(env, id)
+
   const text = completion.choices?.[0]?.message?.content
   if (typeof text !== 'string' || text.length === 0) {
-    // The merchant answered our PAID retry — the money moved, the content
-    // just wasn't usable. Charged, not refunded.
+    // paid === true here: we DID sign a credential, the content just wasn't
+    // usable. Charge (with a support_note), because the money moved.
     return failCall(
       env,
       id,
@@ -973,18 +997,23 @@ export async function handlePlaygroundBlendActivity(
   if (started instanceof Response) return started
 
   let raw: unknown
+  let paid: boolean
   try {
-    raw = await callUpstreamJson(env, {
+    ;({ value: raw, paid } = await callUpstreamJson(env, {
       route: eventsRoute,
       query: {
         contract_id: BLEND_MAIN_POOL_CONTRACT_ID,
         limit: String(BLEND_EVENT_LIMIT),
       },
       budgetAtomic: parseUsd(chip.budgetUsd),
-    })
+    }))
   } catch (e) {
     return failCall(env, id, e, priceAtomic)
   }
+
+  // The indexer call is the billable leg. If the router incurred no cost for
+  // it (paid === false), do not charge — regardless of the body.
+  if (!paid) return releaseUnpaid(env, id)
 
   const aggregate = aggregateBlendEvents(extractEvents(raw), BLEND_MAIN_POOL_CONTRACT_ID)
 
@@ -994,7 +1023,7 @@ export async function handlePlaygroundBlendActivity(
   if (summaryModel?.available && aggregate.events_examined > 0) {
     try {
       const route = resolvePlaygroundRoute(summaryModel.routePublicPath, summaryModel.routeMethod)
-      const completion = await callUpstreamJson<ChatCompletion>(env, {
+      const { value: completion } = await callUpstreamJson<ChatCompletion>(env, {
         route,
         body: {
           model: summaryModel.id,
@@ -1062,15 +1091,18 @@ export async function handlePlaygroundTxDecode(request: Request, env: Env): Prom
   if (started instanceof Response) return started
 
   let result: unknown
+  let paid: boolean
   try {
-    result = await callUpstreamJson(env, {
+    ;({ value: result, paid } = await callUpstreamJson(env, {
       route,
       query: { tx_hash: txHash },
       budgetAtomic: parseUsd(chip.budgetUsd),
-    })
+    }))
   } catch (e) {
     return failCall(env, id, e, priceAtomic)
   }
+
+  if (!paid) return releaseUnpaid(env, id)
 
   const settled = await commit(env, id, priceAtomic)
   if (!settled.ok) return ledgerErrorResponse(settled)

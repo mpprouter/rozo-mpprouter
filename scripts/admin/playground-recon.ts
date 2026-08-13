@@ -171,9 +171,8 @@ interface LedgerTotals {
   outstanding: string
   balances_sum: string
   holds_sum: string
-  reaped_committed_count: number
-  reaped_committed_atomic: string
   reaped_released_count: number
+  reaped_release_possible_paid_count: number
   consumed_deposits: {
     tx_hash: string
     op_index: number
@@ -315,23 +314,22 @@ async function main(): Promise<number> {
     failures += badOps + duplicates
   }
 
-  // ---- (D) reaper-settled calls -----------------------------------------
-  // The per-op binding above reconciles deposits IN. It cannot see whether a
-  // reaper-COMMITTED call actually paid upstream, because that spend is
-  // Tempo-side and not indexed here. A reaper commit charges the user for a
-  // call whose upstream delivery we could not confirm, so it is the review set
-  // for the accepted mid-call crash window. Surface it explicitly rather than
-  // letting it hide inside the aggregate: it is not a hard failure (a reaped
-  // commit may well have paid), but a non-zero count wants human eyes.
+  // ---- (D) reaper-released calls ----------------------------------------
+  // The reaper NEVER charges — it always releases a stranded call, so no user
+  // is ever billed for a call we cannot prove delivered. The only residual is
+  // OUR bounded loss: a released call that had been dispatched MIGHT have paid
+  // upstream before the crash (one call's price). Surface that subset for
+  // operator review. This is never a hard failure — it is expected, rare, and
+  // costs the user nothing.
   console.log('')
-  console.log('Reaper-settled calls (accepted crash-window review set)')
-  console.log(`  reaped commits : ${totals.reaped_committed_count} (${fmt(BigInt(totals.reaped_committed_atomic))} charged)`)
-  console.log(`  reaped releases: ${totals.reaped_released_count}`)
-  if (totals.reaped_committed_count > 0) {
+  console.log('Reaper-released calls (never charged to users)')
+  console.log(`  reaped releases              : ${totals.reaped_released_count}`)
+  console.log(`  of which upstream MAY be paid: ${totals.reaped_release_possible_paid_count} (our bounded loss)`)
+  if (totals.reaped_release_possible_paid_count > 0) {
     console.warn(
-      '  REVIEW: reaper-committed calls charged users for upstream spend recon ' +
-        'cannot verify on-chain. Bounded by per-call price; confirm against Tempo ' +
-        'spend and issue goodwill credit where a user got nothing.',
+      '  NOTE: dispatched-then-crashed calls were released to users but may have ' +
+        'cost the router one call each upstream. Bounded loss, no user impact; ' +
+        'confirm against Tempo spend if the count is unexpectedly high.',
     )
   }
 

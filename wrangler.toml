@@ -196,7 +196,7 @@ PLAYGROUND_ENABLED = "false"
 # most the playground can cost us is roughly this, plus committed spend.
 # An unparseable value falls back to the compiled-in $200 default rather
 # than to "unlimited" — see globalCapAtomic() in src/playground/ledger-client.ts.
-PLAYGROUND_GLOBAL_CAP_USD = "200"
+PLAYGROUND_GLOBAL_CAP_USD = "1000"
 
 # Public Cloudflare Turnstile SITE key for the deposit-intent widget. Echoed by
 # GET /v1/playground/config so the frontend renders the widget; not a secret.

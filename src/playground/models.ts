@@ -309,7 +309,7 @@ export function findChip(id: string): PlaygroundChip | undefined {
  * on-chain match in `session/open`, and a free-form amount would let a caller
  * mint an intent that matches a payment they were going to make anyway.
  */
-export const DEPOSIT_OPTIONS_USD: readonly string[] = ['0.1', '1'] as const
+export const DEPOSIT_OPTIONS_USD: readonly string[] = ['0.1', '1', '10', '100'] as const
 
 export function isDepositOption(amountUsd: string): boolean {
   // Compare numerically-as-atomic so "1", "1.0" and "1.00" all match.
@@ -322,11 +322,21 @@ export function isDepositOption(amountUsd: string): boolean {
   return DEPOSIT_OPTIONS_USD.some(opt => parseUsd(opt) === wanted)
 }
 
-/** Per-account deposit ceiling per UTC day. */
-export const DEPOSIT_CAP_PER_ACCOUNT_PER_DAY_USD = '10'
+/**
+ * Per-account deposit ceiling per UTC day. Sized to admit exactly one $100
+ * deposit (the largest tier), enforced atomically at credit mint in the DO.
+ */
+export const DEPOSIT_CAP_PER_ACCOUNT_PER_DAY_USD = '100'
 
-/** Default global outstanding-credit ceiling; overridable via env. */
-export const DEFAULT_GLOBAL_CAP_USD = '200'
+/**
+ * Default global outstanding-credit ceiling; overridable via
+ * `PLAYGROUND_GLOBAL_CAP_USD`. This is the total blast radius of the feature —
+ * the most unspent playground credit that can exist at once. With $100 deposits
+ * the old $200 default held only two max depositors, so the default is $1000.
+ * The founder should set the env var to whatever total outstanding-credit
+ * exposure they are comfortable with.
+ */
+export const DEFAULT_GLOBAL_CAP_USD = '1000'
 
 /** Intents an account may create per UTC hour. Fail-closed on error. */
 export const INTENT_RATE_PER_HOUR = 6

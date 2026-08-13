@@ -113,21 +113,26 @@ export interface StoredCall {
   charged: string
   at: number
   /**
-   * Set atomically right BEFORE the upstream fetch. The reaper needs this to
-   * tell "the worker died before any payment attempt" (release — nothing was
-   * ever dispatched or paid) from "the worker died mid/post upstream call"
-   * (commit — the reserve→dispatch window brackets the paid call).
+   * Set atomically right BEFORE the upstream fetch. Marks that an upstream
+   * request was about to be attempted. NOTE: it is set BEFORE credential
+   * signing, so it is NOT proof of payment — the reaper never commits on it,
+   * it only uses it to flag a released call as "upstream may have been paid".
    */
   dispatched?: boolean
   /** Set when released, for operator forensics. */
   release_reason?: string
   /**
-   * Set when a call was committed OR released by the stale-call reaper rather
-   * than by its own request. Support uses this to find calls whose user may deserve a
-   * goodwill credit — the router paid upstream, but the response never reached
-   * the user.
+   * Set when a call was settled by the stale-call reaper rather than by its
+   * own request. The reaper always RELEASES, so a reaped call is never a
+   * charge to the user.
    */
   reaped?: boolean
+  /**
+   * A reaped RELEASE where the call had been dispatched, so the router MIGHT
+   * have paid upstream before the crash (bounded loss to us, never to the
+   * user). Recon surfaces these for operator review.
+   */
+  reaped_release_possible_paid?: boolean
 }
 
 export interface ReserveOutcome {
@@ -197,17 +202,25 @@ export class PlaygroundLedger implements DurableObject {
    * support can find them and issue goodwill credit where the user genuinely
    * got nothing.
    */
-  // KNOWN CRASH WINDOW (accepted, recon-monitored): this reaper settles a call
-  // across several separate storage writes (call record, balance, the two
-  // totals) that are NOT one atomic transaction, and it acts on a `dispatched`
-  // marker that could have been set just before a mid-call worker crash. So a
-  // reaper decision can, in rare mid-call-termination cases, commit a call that
-  // never actually paid upstream (or vice versa). This is inherent to
-  // Worker+DO across awaits and is deliberately NOT made crash-atomic here.
-  // Exposure is bounded by a single call's price, and every such anomaly is
-  // detectable by scripts/admin/playground-recon.ts: a reaper-committed call
-  // with no matching on-chain deposit surfaces as a per-op binding mismatch,
-  // and the committed-total vs on-chain reconciliation flags the aggregate.
+  // A stranded reserved call is ALWAYS RELEASED, never committed.
+  //
+  // The only thing that can justify a charge is proof a credential was signed
+  // for this call (`paid === true` in the request path). The reaper has no such
+  // proof: `dispatched` is set BEFORE signing, so a crash between marking
+  // dispatch and signing would let a commit-on-dispatched rule charge a user
+  // who paid us nothing and may have received nothing. For a trust-building
+  // demo, occasionally eating one call's tiny upstream cost is far better than
+  // ever charging for a call we cannot prove delivered. So: reserved && stale
+  // → release, full stop.
+  //
+  // A dispatched-but-unsettled call MIGHT have paid upstream before the crash
+  // (bounded loss of one call's price to us). We flag those
+  // `reaped_release_possible_paid` so recon surfaces them for operator review,
+  // but we still release the user.
+  //
+  // Ledger invariant: `outstanding == Σ balances + Σ holds`. A release moves a
+  // hold back into available balance — the credit still exists, just unspent —
+  // so it restores the balance and MUST NOT touch `total:outstanding`.
   async alarm(): Promise<void> {
     const now = Date.now()
     const calls = await this.storage.list<StoredCall>({ prefix: 'call:' })
@@ -223,53 +236,22 @@ export class PlaygroundLedger implements DurableObject {
       const balKey = `bal:${call.account}`
       const balance = parseAtomic((await this.storage.get<string>(balKey)) ?? '0')
       const ageSec = Math.round((now - call.at) / 1000)
+      const possiblyPaid = call.dispatched === true
 
-      if (!call.dispatched) {
-        // The worker died AFTER reserving but BEFORE marking dispatch, so no
-        // upstream request — and no payment — was ever attempted. Refund the
-        // full hold.
-        await this.storage.put(key, {
-          ...call,
-          status: 'released',
-          charged: '0',
-          release_reason: 'reaped_never_dispatched',
-          reaped: true,
-        } satisfies StoredCall)
-        await this.storage.put(balKey, (balance + held).toString())
-        await this.storage.put(
-          'total:outstanding',
-          (parseAtomic((await this.storage.get<string>('total:outstanding')) ?? '0') - held).toString(),
-        )
-        console.warn(
-          `[playground-ledger] reaped UNDISPATCHED call ${call.call_id} (chip=${call.chip}) ` +
-            `after ${ageSec}s; released ${held} atomic`,
-        )
-        continue
-      }
-
-      // Dispatched but never settled: the reserve→dispatch window brackets the
-      // paid upstream call, so this most likely cost the router money.
-      // Committed at the full hold — no evidence of the actual price, and the
-      // hold is the ceiling the user already agreed to. Releasing would hand
-      // out free calls to anyone who can strand a call after dispatch.
       await this.storage.put(key, {
         ...call,
-        status: 'committed',
-        charged: held.toString(),
+        status: 'released',
+        charged: '0',
+        release_reason: possiblyPaid ? 'reaped_dispatched' : 'reaped_never_dispatched',
         reaped: true,
+        ...(possiblyPaid ? { reaped_release_possible_paid: true } : {}),
       } satisfies StoredCall)
-      await this.storage.put(balKey, balance.toString())
-      await this.storage.put(
-        'total:committed',
-        (parseAtomic((await this.storage.get<string>('total:committed')) ?? '0') + held).toString(),
-      )
-      await this.storage.put(
-        'total:outstanding',
-        (parseAtomic((await this.storage.get<string>('total:outstanding')) ?? '0') - held).toString(),
-      )
+      // Restore balance; DO NOT touch total:outstanding (the credit is unspent).
+      await this.storage.put(balKey, (balance + held).toString())
       console.warn(
-        `[playground-ledger] reaped DISPATCHED call ${call.call_id} (chip=${call.chip}) ` +
-          `after ${ageSec}s; committed ${held} atomic`,
+        `[playground-ledger] reaped ${possiblyPaid ? 'DISPATCHED' : 'UNDISPATCHED'} call ` +
+          `${call.call_id} (chip=${call.chip}) after ${ageSec}s; released ${held} atomic` +
+          (possiblyPaid ? ' (upstream MAY have been paid — recon review)' : ''),
       )
     }
 
@@ -840,14 +822,13 @@ export class PlaygroundLedger implements DurableObject {
       balances_sum: string
       holds_sum: string
       /**
-       * Calls the reaper settled (committed or released) rather than their own
-       * request. Surfaced separately because a reaper COMMIT charges the user
-       * for a call whose real upstream spend recon cannot see from on-chain
-       * deposit data — these are the review set for the accepted crash window.
+       * Calls the reaper released. The reaper NEVER commits, so a reaped call
+       * is never a charge to the user. `reaped_release_possible_paid_count` is
+       * the review subset: releases where the call had been dispatched, so the
+       * router may have paid upstream (bounded loss to us, never to the user).
        */
-      reaped_committed_count: number
-      reaped_committed_atomic: string
       reaped_released_count: number
+      reaped_release_possible_paid_count: number
       consumed_deposits: {
         tx_hash: string
         op_index: number
@@ -865,16 +846,14 @@ export class PlaygroundLedger implements DurableObject {
 
     const calls = await this.storage.list<StoredCall>({ prefix: 'call:' })
     let holdsSum = 0n
-    let reapedCommittedCount = 0
-    let reapedCommittedAtomic = 0n
     let reapedReleasedCount = 0
+    let reapedReleasePossiblePaidCount = 0
     for (const c of calls.values()) {
       if (c.status === 'reserved') holdsSum += parseAtomic(c.max_price)
-      if (c.reaped && c.status === 'committed') {
-        reapedCommittedCount++
-        reapedCommittedAtomic += parseAtomic(c.charged)
+      if (c.reaped && c.status === 'released') {
+        reapedReleasedCount++
+        if (c.reaped_release_possible_paid) reapedReleasePossiblePaidCount++
       }
-      if (c.reaped && c.status === 'released') reapedReleasedCount++
     }
 
     const consumed = await this.storage.list<string>({ prefix: 'consumed:' })
@@ -911,9 +890,8 @@ export class PlaygroundLedger implements DurableObject {
         outstanding: (await this.readAtomic('total:outstanding')).toString(),
         balances_sum: balancesSum.toString(),
         holds_sum: holdsSum.toString(),
-        reaped_committed_count: reapedCommittedCount,
-        reaped_committed_atomic: reapedCommittedAtomic.toString(),
         reaped_released_count: reapedReleasedCount,
+        reaped_release_possible_paid_count: reapedReleasePossiblePaidCount,
         consumed_deposits: consumedDeposits,
       },
     }

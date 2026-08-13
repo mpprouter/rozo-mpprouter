@@ -111,10 +111,10 @@ describe('global cap resolution', () => {
   it('falls back to the default rather than to "unlimited" on a bad value', () => {
     expect(globalCapAtomic(makeEnv({ PLAYGROUND_GLOBAL_CAP_USD: '50' } as any))).toBe(parseUsd('50'))
     expect(globalCapAtomic(makeEnv({ PLAYGROUND_GLOBAL_CAP_USD: 'oops' } as any))).toBe(
-      parseUsd('200'),
+      parseUsd('1000'),
     )
-    expect(globalCapAtomic(makeEnv({ PLAYGROUND_GLOBAL_CAP_USD: '0' } as any))).toBe(parseUsd('200'))
-    expect(globalCapAtomic(makeEnv())).toBe(parseUsd('200'))
+    expect(globalCapAtomic(makeEnv({ PLAYGROUND_GLOBAL_CAP_USD: '0' } as any))).toBe(parseUsd('1000'))
+    expect(globalCapAtomic(makeEnv())).toBe(parseUsd('1000'))
   })
 })
 
@@ -130,7 +130,7 @@ describe('deposit intents', () => {
   })
 
   /**
-   * Fill an account's daily deposit allowance with $1 deposits.
+   * Fill an account's $100/day deposit allowance with ten $10 deposits.
    *
    * One deposit per UTC hour, deliberately: the intent rate limit is a 6/hour
    * fixed window, so ten intents in one hour would be refused by the RATE
@@ -144,7 +144,7 @@ describe('deposit intents', () => {
       const r = await createIntent(env, {
         intentId: nextId(),
         account,
-        amountAtomic: parseUsd('1'),
+        amountAtomic: parseUsd('10'),
         memo: `pg-${nextId()}`,
         destination: ROUTER,
         now,
@@ -165,7 +165,7 @@ describe('deposit intents', () => {
     }
   }
 
-  it('enforces the $10/day per-account deposit cap', async () => {
+  it('enforces the $100/day per-account deposit cap', async () => {
     const env = makeEnv()
     await fillDailyCap(env, ALICE, 'c'.repeat(64))
 
@@ -188,6 +188,36 @@ describe('deposit intents', () => {
       now: Date.UTC(2026, 7, 12, 11, 0, 0),
     })
     expect(bob.ok).toBe(true)
+  })
+
+  it('accepts a single $100 deposit up to the daily cap', async () => {
+    // The largest tier must fit the per-day cap exactly.
+    const env = makeEnv()
+    const now = Date.UTC(2026, 7, 12, 9, 0, 0)
+    const r = await createIntent(env, {
+      intentId: nextId(),
+      account: ALICE,
+      amountAtomic: parseUsd('100'),
+      memo: `pg-${nextId()}`,
+      destination: ROUTER,
+      now,
+      expiresAt: now + 30 * 60 * 1000,
+    })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const opened = await openIntent(env, {
+      intentId: r.value.intent_id,
+      txHash: 'f'.repeat(64),
+      opIndex: 0,
+      now,
+      confirmedAt: now,
+      sessionJti: 'j',
+      sessionExp: 1,
+    })
+    expect(opened.ok).toBe(true)
+    // A second deposit the same day is over the $100 cap.
+    const over = await mintIntent(env, { usd: '0.1', now: Date.UTC(2026, 7, 12, 10, 0, 0) })
+    expect(over.ok).toBe(false)
   })
 
   it('refuses intents once the global outstanding-credit cap is reached', async () => {
@@ -495,6 +525,65 @@ describe('reserve / commit / release', () => {
   })
 })
 
+describe('outstanding is invariant across reserve→release (P0-1)', () => {
+  it('a release restores balance and leaves total:outstanding UNCHANGED', async () => {
+    const env = makeEnv()
+    await deposit(env, { usd: '1' })
+
+    const before = await readTotals(env)
+    if (!before.ok) return
+    const outstanding0 = parseAtomic(before.value.outstanding)
+    expect(outstanding0).toBe(parseUsd('1'))
+
+    // Reserve then release many times. Each cycle moves a hold out of balance
+    // and back; outstanding (minted-but-unspent credit) must never move.
+    for (let i = 0; i < 20; i++) {
+      const id = `cycle-${i}`
+      await reserve(env, {
+        callId: id,
+        account: ALICE,
+        chip: 'chat',
+        maxPriceAtomic: parseUsd('0.02'),
+        now: Date.now(),
+      })
+      await release(env, id, 'test')
+      const t = await readTotals(env)
+      if (!t.ok) return
+      // Invariant: outstanding == balances + holds, and it equals the start.
+      expect(parseAtomic(t.value.outstanding)).toBe(outstanding0)
+      expect(parseAtomic(t.value.outstanding)).toBe(
+        parseAtomic(t.value.balances_sum) + parseAtomic(t.value.holds_sum),
+      )
+    }
+  })
+
+  it('the global cap still binds after many releases (no downward drift)', async () => {
+    // With a $1 global ceiling and a $1 balance already outstanding, a second
+    // depositor is refused. Repeated reserve/release of the first account must
+    // NOT free up headroom by drifting outstanding down.
+    const env = makeEnv({ PLAYGROUND_GLOBAL_CAP_USD: '1' } as any)
+    await deposit(env, { usd: '1' })
+
+    for (let i = 0; i < 10; i++) {
+      const id = `drift-${i}`
+      await reserve(env, {
+        callId: id,
+        account: ALICE,
+        chip: 'chat',
+        maxPriceAtomic: parseUsd('0.02'),
+        now: Date.now(),
+      })
+      await release(env, id, 'test')
+    }
+
+    // Still at the ceiling — a new depositor is refused.
+    const bob = await mintIntent(env, { account: BOB, usd: '0.1' })
+    expect(bob.ok).toBe(false)
+    if (bob.ok) return
+    expect(bob.code).toBe('global_cap_exceeded')
+  })
+})
+
 describe('solvency totals', () => {
   it('keeps the incremental counters consistent with a full rescan', async () => {
     const env = makeEnv()
@@ -554,7 +643,7 @@ describe('caps are enforced at CREDIT MINT, not just at intent creation (P0-1)',
    */
   it('refuses to credit an open that would breach the per-account daily cap', async () => {
     const env = makeEnv()
-    // Mint ELEVEN intents up front, spaced to dodge the hourly rate limit.
+    // Mint ELEVEN $10 intents up front, spaced to dodge the hourly rate limit.
     // Every one passes the advisory check because nothing is credited yet.
     const ids: string[] = []
     for (let hour = 0; hour < 11; hour++) {
@@ -562,7 +651,7 @@ describe('caps are enforced at CREDIT MINT, not just at intent creation (P0-1)',
       const r = await createIntent(env, {
         intentId: nextId(),
         account: ALICE,
-        amountAtomic: parseUsd('1'),
+        amountAtomic: parseUsd('10'),
         memo: `pg-${nextId()}`,
         destination: ROUTER,
         now,
@@ -573,8 +662,8 @@ describe('caps are enforced at CREDIT MINT, not just at intent creation (P0-1)',
       ids.push(r.value.intent_id)
     }
 
-    // Now open all eleven. The first ten fit the $10/day cap; the eleventh
-    // must be refused rather than silently credited.
+    // Now open all eleven. The first ten fit the $100/day cap ($10 each); the
+    // eleventh must be refused rather than silently credited.
     const at = Date.UTC(2026, 7, 12, 12, 0, 0)
     for (let i = 0; i < 10; i++) {
       const opened = await openIntent(env, {
@@ -606,7 +695,7 @@ describe('caps are enforced at CREDIT MINT, not just at intent creation (P0-1)',
     // The balance stopped at the cap — the eleventh deposit was NOT credited.
     const account = await readAccount(env, ALICE)
     if (!account.ok) return
-    expect(account.value.balance).toBe(parseUsd('10').toString())
+    expect(account.value.balance).toBe(parseUsd('100').toString())
   })
 
   it('refuses to credit an open that would breach the global ceiling', async () => {
@@ -708,7 +797,11 @@ describe('stale reserved-call reaper (P1)', () => {
    * `call_id` retry short-circuit keeps returning `duplicate` for a call that
    * never produced a result.
    */
-  it('COMMITS a dispatched call stranded past the lease, and flags it for support', async () => {
+  it('RELEASES a dispatched stranded call (never commits), flagging possible-paid', async () => {
+    // P0: the reaper NEVER commits. A dispatched-but-unsettled call is released
+    // to the user — we cannot prove it paid, and charging a user who may have
+    // gotten nothing is worse than eating one call's tiny cost. It is flagged
+    // reaped_release_possible_paid so recon surfaces OUR bounded loss.
     const mock = makePlaygroundLedgerMockWithControls()
     const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
     await deposit(env, { usd: '1' })
@@ -721,7 +814,8 @@ describe('stale reserved-call reaper (P1)', () => {
       maxPriceAtomic: parseUsd('0.02'),
       now: staleAt,
     })
-    // The upstream call was attempted — dispatch was marked before it.
+    // The upstream call was attempted — dispatch was marked before it — but the
+    // request never settled (worker crash).
     await markDispatched(env, 'stranded')
 
     await mock.runAlarm()
@@ -730,18 +824,15 @@ describe('stale reserved-call reaper (P1)', () => {
     expect(account.ok).toBe(true)
     if (!account.ok) return
     const call = account.value.calls.find(c => c.call_id === 'stranded')!
-    // Committed, not released: the reserve->dispatch window brackets the paid
-    // upstream call, so a dispatched stranded call most likely cost money.
-    expect(call.status).toBe('committed')
-    expect(call.charged).toBe(parseUsd('0.02').toString())
+    expect(call.status).toBe('released')
+    expect(call.charged).toBe('0')
     expect(call.reaped).toBe(true)
-    // The hold is gone from the balance exactly once.
-    expect(account.value.balance).toBe(parseUsd('0.98').toString())
+    expect(call.reaped_release_possible_paid).toBe(true)
+    // Full hold refunded — the user is NOT charged.
+    expect(account.value.balance).toBe(parseUsd('1').toString())
   })
 
-  it('RELEASES a call stranded BEFORE it was ever dispatched (P0)', async () => {
-    // The worker died between reserve and the upstream call — no payment was
-    // ever attempted, so committing would charge for nothing.
+  it('RELEASES a call stranded BEFORE it was ever dispatched, without the possible-paid flag', async () => {
     const mock = makePlaygroundLedgerMockWithControls()
     const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
     await deposit(env, { usd: '1' })
@@ -763,6 +854,7 @@ describe('stale reserved-call reaper (P1)', () => {
     expect(call.status).toBe('released')
     expect(call.charged).toBe('0')
     expect(call.reaped).toBe(true)
+    expect(call.reaped_release_possible_paid).toBeUndefined()
     // Full hold refunded.
     expect(account.value.balance).toBe(parseUsd('1').toString())
   })
@@ -826,23 +918,27 @@ describe('stale reserved-call reaper (P1)', () => {
 })
 
 describe('reaped settlements are surfaced for recon (accepted crash window)', () => {
-  it('reports reaped commits and releases in totals', async () => {
+  it('reports reaped releases and the possible-paid subset in totals — never a commit', async () => {
     const mock = makePlaygroundLedgerMockWithControls()
     const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
     await deposit(env, { usd: '1' })
 
     const stale = Date.now() - RESERVED_LEASE_MS - 1
-    // One dispatched (→ reaped commit) and one not (→ reaped release).
-    await reserve(env, { callId: 'r-commit', account: ALICE, chip: 'chat', maxPriceAtomic: parseUsd('0.02'), now: stale })
-    await markDispatched(env, 'r-commit')
-    await reserve(env, { callId: 'r-release', account: ALICE, chip: 'chat', maxPriceAtomic: parseUsd('0.02'), now: stale })
+    // Both are released by the reaper. The dispatched one is flagged
+    // possible-paid (OUR bounded loss); neither charges the user.
+    await reserve(env, { callId: 'r-dispatched', account: ALICE, chip: 'chat', maxPriceAtomic: parseUsd('0.02'), now: stale })
+    await markDispatched(env, 'r-dispatched')
+    await reserve(env, { callId: 'r-undispatched', account: ALICE, chip: 'chat', maxPriceAtomic: parseUsd('0.02'), now: stale })
     await mock.runAlarm()
 
     const totals = await readTotals(env)
     expect(totals.ok).toBe(true)
     if (!totals.ok) return
-    expect(totals.value.reaped_committed_count).toBe(1)
-    expect(totals.value.reaped_committed_atomic).toBe(parseUsd('0.02').toString())
-    expect(totals.value.reaped_released_count).toBe(1)
+    // The reaper committed nothing.
+    expect(parseAtomic(totals.value.committed)).toBe(0n)
+    expect(totals.value.reaped_released_count).toBe(2)
+    expect(totals.value.reaped_release_possible_paid_count).toBe(1)
+    // Both holds returned to balance — the deposit is whole again.
+    expect(totals.value.balances_sum).toBe(parseUsd('1').toString())
   })
 })

@@ -195,11 +195,15 @@ describe('deposit options', () => {
     expect(isDepositOption('1.00')).toBe(true)
     expect(isDepositOption('0.1')).toBe(true)
     expect(isDepositOption('0.10')).toBe(true)
+    expect(isDepositOption('10')).toBe(true)
+    expect(isDepositOption('100')).toBe(true)
+    expect(isDepositOption('100.00')).toBe(true)
   })
 
   it('refuses amounts we do not offer, including free-form and malformed ones', () => {
     expect(isDepositOption('0.5')).toBe(false)
-    expect(isDepositOption('100')).toBe(false)
+    expect(isDepositOption('50')).toBe(false)
+    expect(isDepositOption('1000')).toBe(false)
     expect(isDepositOption('0')).toBe(false)
     expect(isDepositOption('-1')).toBe(false)
     expect(isDepositOption('abc')).toBe(false)

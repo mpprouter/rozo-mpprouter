@@ -69,32 +69,33 @@ import { toTempoRaw6 } from './amount'
 import { checkAndBumpDailyLimit, utcDateKey } from '../mpp/rate-limit-do'
 
 /**
- * Did a paid credential get signed for this call?
+ * Did the router incur a billable upstream cost for this call?
  *
- * This is the single most consequential fact about a failed playground call,
- * because it decides whether the user's hold is refunded or charged. It is
- * derived from the call-local `paid` flag (see `onCredentialSigned`), so it is
- * a real per-call fact, not an inference:
+ * This is the single fact that decides commit-vs-release, and it is ALWAYS the
+ * call-local `paid` flag — never an exception type, a response status, or a
+ * default. `paid` is set from `onCredentialSigned` for Tempo routes (a
+ * credential was signed for THIS call) and from `response.ok` for router-held
+ * credential (Mercury) routes (the metered call succeeded). See `callUpstream`.
  *
- *   - `'no'`  — no credential was signed for THIS call. Provably unpaid; the
- *               hold is released. Covers pre-dispatch refusals, initial non-402
- *               errors, and router-held-credential (Mercury) routes.
- *   - `'yes'` — a credential was signed for this call. The money committed (or,
- *               for a failure right after signing, may have), so charge.
+ *   - `'no'`  — the router incurred no billable cost. RELEASE. Covers
+ *               pre-dispatch refusals, budget refusals, missing channels,
+ *               initial non-402 errors, an unpaid 2xx, and any failed Mercury
+ *               call.
+ *   - `'yes'` — the router incurred cost (credential signed, or Mercury 2xx).
+ *               COMMIT. This is the ONLY value that leads to a charge.
  *
- * `'maybe'` remains in the union only as the constructor default for a raw
- * error that predates classification; the settlement layer treats it the same
- * as `'yes'` (commit), because an unclassified failure must not release funds
- * that may have moved. No code path in this module emits it deliberately.
+ * `'maybe'` is retained only for source compatibility. It is NEVER emitted and
+ * NEVER commits: the settlement layer commits iff `paymentEvidence === 'yes'`,
+ * so a stray 'maybe' releases. The constructor default is `'no'` (fail safe).
  */
 export type PaymentEvidence = 'no' | 'maybe' | 'yes'
 
 export class UpstreamError extends Error {
   readonly code: string
   readonly status: number
-  /** Whether the router's payment went through. Drives commit-vs-release. */
+  /** Whether the router incurred billable cost. Drives commit-vs-release. */
   readonly paymentEvidence: PaymentEvidence
-  constructor(code: string, status: number, message: string, paymentEvidence: PaymentEvidence = 'maybe') {
+  constructor(code: string, status: number, message: string, paymentEvidence: PaymentEvidence = 'no') {
     super(message)
     this.name = 'UpstreamError'
     this.code = code
@@ -218,9 +219,15 @@ export async function callUpstream(
   const signal = AbortSignal.timeout(args.timeoutMs ?? 30_000)
 
   if (route.upstreamAuth) {
-    // Router-held-credential route (Mercury): no Tempo payment ever happens,
-    // so no credential is signed and `paid` is unconditionally false — every
-    // failure here is provably unpaid and releases.
+    // Router-held-credential route (Mercury): the router pays per successful
+    // metered call with its own scoped JWT — there is no Tempo 402 handshake
+    // and no credential to sign. For this route class the billable cost is
+    // incurred exactly when the metered fetch returns a usable (2xx) result,
+    // so `paid` is `response.ok`. A non-2xx (or a throw before this returns)
+    // leaves paid=false and the user is released — we eat the quota slot
+    // rather than charge for a call that delivered nothing. This keeps the
+    // single commit predicate — `paid === true` — meaning the same thing for
+    // both route classes: "the router incurred a billable upstream cost".
     await consumeUpstreamRateLimit(env, route)
     const authed = injectUpstreamAuth(headers, route, env)
     const response = await fetch(merchantUrl, {
@@ -229,7 +236,7 @@ export async function callUpstream(
       body: payload,
       signal,
     })
-    return { response, paid: false }
+    return { response, paid: response.ok }
   }
 
   const init: RequestInit = { method: route.method, headers, body: payload, signal }
@@ -319,7 +326,7 @@ export async function callUpstream(
 export async function callUpstreamJson<T = unknown>(
   env: Env,
   args: Parameters<typeof callUpstream>[1],
-): Promise<T> {
+): Promise<{ value: T; paid: boolean }> {
   let call: UpstreamCall
   try {
     call = await callUpstream(env, args)
@@ -333,7 +340,8 @@ export async function callUpstreamJson<T = unknown>(
   // A response-level failure (bad status, non-JSON) is settled by whether a
   // credential was actually signed for THIS call — NOT by "we got a response".
   // An initial non-402 500/404 returns a response with `paid === false`, and
-  // that must release, not charge.
+  // that must release, not charge. The evidence is ALWAYS call.paid — never a
+  // response-shape heuristic.
   const evidence: PaymentEvidence = call.paid ? 'yes' : 'no'
 
   if (!call.response.ok) {
@@ -345,7 +353,9 @@ export async function callUpstreamJson<T = unknown>(
     )
   }
   try {
-    return (await call.response.json()) as T
+    // Return the parsed body AND the call-local paid flag so the caller makes
+    // its commit-vs-release decision on `paid` alone, even on a 2xx body.
+    return { value: (await call.response.json()) as T, paid: call.paid }
   } catch {
     throw new UpstreamError(
       'upstream_bad_body',

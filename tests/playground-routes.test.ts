@@ -132,7 +132,7 @@ describe('GET /v1/playground/config', () => {
     const body = await handlePlaygroundConfig(makeEnv()).json()
     expect(body.enabled).toBe(true)
     expect(body.blend_pool_contract_id).toBe(BLEND_MAIN_POOL_CONTRACT_ID)
-    expect(body.deposit_options.map((d: any) => d.amount_usd)).toEqual(['0.1', '1'])
+    expect(body.deposit_options.map((d: any) => d.amount_usd)).toEqual(['0.1', '1', '10', '100'])
     expect(body.refundable).toBe(false)
 
     const available = body.models.filter((m: any) => m.available)
