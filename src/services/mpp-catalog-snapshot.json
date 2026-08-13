@@ -13983,7 +13983,8 @@
       ],
       "status": "active",
       "docs": {
-        "homepage": "https://docs.mercurydata.app/"
+        "homepage": "https://docs.mercurydata.app/",
+        "llmsTxt": "https://docs.mercurydata.app/llms.txt"
       },
       "methods": {
         "tempo": {
