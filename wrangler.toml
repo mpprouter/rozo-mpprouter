@@ -207,6 +207,30 @@ PLAYGROUND_TURNSTILE_SITE_KEY = "0x4AAAAAAEOlP1MJ1iX6PnZl"
 # missing/typo'd secret still fails closed. Leave unset in production.
 # PLAYGROUND_TURNSTILE_DISABLED = "true"
 
+# ---- Non-custodial channel playground (built alongside the custodial one) ----
+# Kill switch for every /v1/playground/channel/* route. Ships OFF; flip to
+# "true" only after the channel WASM + factory are deployed on mainnet and the
+# path is verified. See src/routes/playground-channel.ts.
+PLAYGROUND_CHANNEL_ENABLED = "false"
+# Channel-factory contract address (C...) the frontend calls `open` against.
+# Empty until the founder deploys the factory on mainnet (L3). Advertised (as
+# null when unset) by GET /v1/playground/config.
+PLAYGROUND_CHANNEL_FACTORY = ""
+# Dedicated hot COLLECTOR account every playground channel pays TO (Option A).
+# DISTINCT from STELLAR_ROUTER_PUBLIC (treasury); holds only spent playground
+# cents. Its secret is the Worker secret PLAYGROUND_CHANNEL_SIGNER_SECRET, used
+# only to sign settle/close. XLM-funded on mainnet by the founder before go-live.
+PLAYGROUND_CHANNEL_TO = "GBD64XFGJHG42CEVQKH4TYCIAMEHVBMW7A24KS22TKOSSA73IVW3CYIK"
+# Known channel-contract WASM hash (lowercase hex) — provenance anchor. register
+# REJECTS any contract whose on-chain WASM hash differs. Empty until the founder
+# uploads the channel WASM on mainnet; register fails closed while empty.
+PLAYGROUND_CHANNEL_WASM_HASH = ""
+#
+# Secret (set via: wrangler secret put PLAYGROUND_CHANNEL_SIGNER_SECRET):
+#   PLAYGROUND_CHANNEL_SIGNER_SECRET — S... key of the collector account above.
+#     Signs ONLY on-chain settle/close of playground channels. Unset ⇒ the
+#     settlement cron skips (fail-safe).
+
 # Secrets (set via: wrangler secret put <NAME>)
 #
 # PLAYGROUND_TURNSTILE_SECRET    — Cloudflare Turnstile secret key for the

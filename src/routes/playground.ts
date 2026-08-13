@@ -106,6 +106,20 @@ import {
   isPlaygroundTurnstileDisabled,
   verifyPlaygroundTurnstile,
 } from '../playground/turnstile'
+import { getStellarUsdcSac } from '../mpp/stellar-server'
+import { getSupersededAbortCount } from '../playground/channel-voucher-store'
+import {
+  CHANNEL_DEPOSIT_OPTIONS,
+  CHANNEL_MAX_DEPOSIT_USD,
+  CHANNEL_MIN_DEPOSIT_USD,
+  CHANNEL_REFUND_WAITING_PERIOD,
+  channelCollector,
+  channelFactoryAddress,
+  channelHorizonUrl,
+  channelNetworkPassphrase,
+  channelPlaygroundEnabled,
+  channelPricingConfig,
+} from '../playground/channel-config'
 
 // ---------------------------------------------------------------------------
 // small response helpers
@@ -242,6 +256,26 @@ export function handlePlaygroundConfig(env: Env): Response {
   const turnstileDisabled = isPlaygroundTurnstileDisabled(env)
   return json({
     enabled: playgroundEnabled(env),
+    // Non-custodial channel mode, advertised alongside the custodial fields so
+    // the frontend can offer both during the cutover. See channel-config.ts.
+    channel: {
+      enabled: channelPlaygroundEnabled(env),
+      factory_contract: channelFactoryAddress(env),
+      token_sac: getStellarUsdcSac(env),
+      // The collector the frontend must pass as factory.open `to`. Distinct
+      // from router_recipient (the treasury), which is kept for reference.
+      channel_to: channelCollector(env),
+      router_recipient: env.STELLAR_ROUTER_PUBLIC,
+      network: env.STELLAR_NETWORK,
+      network_passphrase: channelNetworkPassphrase(env),
+      soroban_rpc_url: env.STELLAR_RPC_URL,
+      horizon_url: channelHorizonUrl(env),
+      refund_waiting_period: CHANNEL_REFUND_WAITING_PERIOD,
+      deposit_options: CHANNEL_DEPOSIT_OPTIONS,
+      min_deposit_usd: CHANNEL_MIN_DEPOSIT_USD,
+      max_deposit_usd: CHANNEL_MAX_DEPOSIT_USD,
+      ...channelPricingConfig(),
+    },
     turnstile: {
       // The frontend renders a widget only when required is true; the site key
       // is public and safe to expose. When disabled (staged rollout) the
@@ -608,7 +642,19 @@ export async function handlePlaygroundAdminTotals(
 
   const totals = await readTotals(env)
   if (!totals.ok) return ledgerErrorResponse(totals)
-  return json({ ok: true, value: totals.value })
+  // Channel recon: surface the count of paid-then-superseded aborts (the
+  // documented bounded router loss) so it is operator-visible, never silent.
+  let supersededAborts = 0
+  try {
+    supersededAborts = await getSupersededAbortCount(env)
+  } catch (e: any) {
+    console.error('[playground] reading channel recon counter failed:', e?.message)
+  }
+  return json({
+    ok: true,
+    value: totals.value,
+    channel: { superseded_aborts: supersededAborts },
+  })
 }
 
 /**

@@ -183,6 +183,14 @@ async function consumeUpstreamRateLimit(env: Env, route: PublicServiceRoute): Pr
 export interface UpstreamCall {
   response: Response
   paid: boolean
+  /**
+   * The base-unit (USDC-6) amount the router actually paid the merchant for
+   * THIS call, captured from the 402 challenge at signing time. Present only
+   * for Tempo charge/session routes that signed a credential; undefined for
+   * router-held-credential (Mercury) routes, which have no per-call Tempo
+   * price. Used by the channel playground for real-cost reconciliation.
+   */
+  upstreamCostRaw?: string
 }
 
 export async function callUpstream(
@@ -259,8 +267,10 @@ export async function callUpstream(
   // in this closure so it is per-call and cannot be moved by a concurrent
   // call on the same route.
   let paid = false
-  const onCredentialSigned = () => {
+  let upstreamCostRaw: string | undefined
+  const onCredentialSigned = (amountRaw?: string) => {
     paid = true
+    if (amountRaw && /^\d+$/.test(amountRaw)) upstreamCostRaw = amountRaw
   }
 
   if (route.upstreamPaymentMethod === 'tempo.session') {
@@ -272,7 +282,7 @@ export async function callUpstream(
         maxAmountRaw,
         onCredentialSigned,
       })
-      return { response, paid }
+      return { response, paid, upstreamCostRaw }
     } catch (e: any) {
       // SINGLE SOURCE OF TRUTH: commit-vs-release is decided ONLY by the
       // post-signing `paid` flag, never by the exception type. Because the
@@ -300,7 +310,7 @@ export async function callUpstream(
   // tempo.charge — the router pays this call out of its own pool.
   try {
     const response = await payMerchant(env, merchantUrl, init, { maxAmountRaw, onCredentialSigned })
-    return { response, paid }
+    return { response, paid, upstreamCostRaw }
   } catch (e: any) {
     // Same single source of truth: `paid` alone decides settlement. A budget
     // exceeded on a later challenge after an earlier one already signed leaves
@@ -326,7 +336,7 @@ export async function callUpstream(
 export async function callUpstreamJson<T = unknown>(
   env: Env,
   args: Parameters<typeof callUpstream>[1],
-): Promise<{ value: T; paid: boolean }> {
+): Promise<{ value: T; paid: boolean; upstreamCostRaw?: string }> {
   let call: UpstreamCall
   try {
     call = await callUpstream(env, args)
@@ -355,7 +365,11 @@ export async function callUpstreamJson<T = unknown>(
   try {
     // Return the parsed body AND the call-local paid flag so the caller makes
     // its commit-vs-release decision on `paid` alone, even on a 2xx body.
-    return { value: (await call.response.json()) as T, paid: call.paid }
+    return {
+      value: (await call.response.json()) as T,
+      paid: call.paid,
+      upstreamCostRaw: call.upstreamCostRaw,
+    }
   } catch {
     throw new UpstreamError(
       'upstream_bad_body',
