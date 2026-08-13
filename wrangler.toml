@@ -81,6 +81,20 @@ class_name = "AtomicStoreDO"
 tag = "v1"
 new_classes = ["AtomicStoreDO"]
 
+# Playground prepaid credit ledger. Holds every playground balance, deposit
+# intent, consumed (tx_hash, op_index) pair and call record. All playground
+# state lives in ONE instance (idFromName("playground")) because the global
+# outstanding-credit cap and the deposit replay guard are both global
+# invariants — sharding by account would break both. Class exported from
+# src/index.ts (re-exported from src/playground/ledger-do.ts).
+[[durable_objects.bindings]]
+name = "PLAYGROUND_LEDGER"
+class_name = "PlaygroundLedger"
+
+[[migrations]]
+tag = "v2"
+new_classes = ["PlaygroundLedger"]
+
 # MPPRouter-specific D1 for the coupon security audit log (design 20260722).
 # Historical, redacted (keyed-HMAC only) record of every /coupon/redeem outcome.
 # This is NOT the Rozo Intents Supabase. Provision before deploy:
@@ -168,7 +182,45 @@ PARTNER_ENDPOINT_ENABLED = "true"
 # the partner pages is the Intercom launcher now, so a hostname-shaped contact
 # string here would only ever go stale and send someone to a dead channel.
 
+# Playground kill switch. Every /v1/playground/* route 404s (not 403s — a
+# disabled playground should look like one that was never deployed) unless
+# this is exactly "true". Ships OFF: the feature needs
+# PLAYGROUND_SESSION_SECRET set and a founder-approved deploy before it can
+# take a single real deposit. See docs/playground.md.
+PLAYGROUND_ENABLED = "false"
+
+# Global outstanding-credit ceiling in USD for the playground. Deposit
+# intents are refused once (Σ balances + Σ open holds) + the new deposit
+# would exceed it. This is the single number bounding total exposure of the
+# feature: the router pays every upstream call out of its own pool, so the
+# most the playground can cost us is roughly this, plus committed spend.
+# An unparseable value falls back to the compiled-in $200 default rather
+# than to "unlimited" — see globalCapAtomic() in src/playground/ledger-client.ts.
+PLAYGROUND_GLOBAL_CAP_USD = "1000"
+
+# Public Cloudflare Turnstile SITE key for the deposit-intent widget. Echoed by
+# GET /v1/playground/config so the frontend renders the widget; not a secret.
+# PLAYGROUND_TURNSTILE_SITE_KEY = "0x..."
+
+# Explicit off switch for the intent Turnstile gate, for staged rollout before
+# the frontend widget ships. ONLY the exact string "true" disables it — a
+# missing/typo'd secret still fails closed. Leave unset in production.
+# PLAYGROUND_TURNSTILE_DISABLED = "true"
+
 # Secrets (set via: wrangler secret put <NAME>)
+#
+# PLAYGROUND_TURNSTILE_SECRET    — Cloudflare Turnstile secret key for the
+#                                  deposit-intent gate. Unset ⇒ intent creation
+#                                  fails CLOSED (503) unless
+#                                  PLAYGROUND_TURNSTILE_DISABLED="true".
+# PLAYGROUND_SESSION_SECRET      — random string (min 16 chars) that HMACs
+#                                  playground session tokens. Deliberately
+#                                  NOT MPP_SECRET_KEY: rotating that one
+#                                  invalidates every outstanding 402
+#                                  challenge on the paid proxy, so the
+#                                  playground must be rotatable alone.
+#                                  Unset ⇒ session mint/verify fail closed
+#                                  (503), so the feature is inert until set.
 #
 # STELLAR_ROUTER_PUBLIC          — G... Router pool address (receives agent USDC via mppx)
 # STELLAR_GAS_SECRET             — S... Gas sponsor keypair (pays tx fees, low-value)

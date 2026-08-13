@@ -178,9 +178,43 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // calls (202, completion returned) on: claude-sonnet-4-5,
   // claude-haiku-4-5, claude-opus-4-5, claude-opus-4-8, claude-sonnet-5,
   // claude-opus-5.
+  //
+  // upstreamPaymentMethod pinned to tempo.charge (2026-08-13). Without this
+  // pin, `pickUpstreamPaymentMethod()` derives `tempo.session` from the
+  // catalog snapshot, where the anthropic SERVICE advertises
+  // `methods.tempo.intents = ["session"]`. That derivation is wrong for this
+  // route, and three independent facts prove it:
+  //
+  //   1. The 2026-08-09 verification above made REAL PAID CALLS that returned
+  //      202 with completions (commit 4810293).
+  //   2. Production KV holds no `tempoChannel:anthropic_chat_completions`
+  //      entry (operator read, 2026-08-13). Channels exist only for
+  //      anthropic_messages, dune_execute, gemini_generate, openai_chat,
+  //      openrouter_chat and tempo_rpc.
+  //   3. `payMerchantSession()` throws ChannelNotInstalledError immediately
+  //      when no channel is installed — it cannot pay without one.
+  //
+  // A session-mode call was therefore impossible, so those paid calls went
+  // through charge. They succeeded because the proxy dispatches on the
+  // merchant's LIVE 402 `parsed.intent` and only treats this field as a hint
+  // (proxy.ts:645-655), auto-correcting the bad derivation at runtime and
+  // logging a mismatch note each time.
+  //
+  // Pinning it changes no proxy behaviour: `upstreamPaymentMethod` is read
+  // nowhere in proxy.ts except that log line, and the public catalog derives
+  // `payment_hints` from `verifiedMode` via `stellarIntentsFor`, never from
+  // this field. What it does fix is every consumer that reads the hint
+  // STATICALLY rather than from a live challenge — the playground's upstream
+  // dispatch does exactly that, and would otherwise send these models down
+  // the session path and 503 on the missing channel.
+  //
+  // If the merchant ever starts advertising `charge` at the service level, or
+  // an operator opens a channel for this route, revisit — but the proxy will
+  // keep auto-correcting either way.
   'anthropic::/v1/chat/completions': {
     id: 'anthropic_chat_completions',
     publicPath: '/v1/services/anthropic/chat_completions',
+    upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-09T04:19:00Z',

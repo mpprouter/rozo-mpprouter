@@ -54,6 +54,18 @@ import {
 import { renderPartnerExplainerPage, renderPartnerAppPage } from './partner-ui'
 // P1-3: export DO class so wrangler can bind it via [[durable_objects.bindings]]
 export { AtomicStoreDO } from './mpp/atomic-store-do'
+// Playground prepaid credit ledger — same requirement, bound as PLAYGROUND_LEDGER.
+export { PlaygroundLedger } from './playground/ledger-do'
+import {
+  handlePlaygroundAdminTotals,
+  handlePlaygroundBlendActivity,
+  handlePlaygroundChat,
+  handlePlaygroundConfig,
+  handlePlaygroundIntent,
+  handlePlaygroundOpen,
+  handlePlaygroundSession,
+  handlePlaygroundTxDecode,
+} from './routes/playground'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
 import { handlePreflight, withCors } from './utils/cors'
@@ -65,6 +77,44 @@ export interface Env {
   // Replaces the non-atomic KV-based update() in the mppx Store adapter.
   // Bound via [[durable_objects.bindings]] in wrangler.toml.
   ATOMIC_STORE: DurableObjectNamespace
+
+  // ---- Playground (self-serve prepaid demo sessions) --------------------
+  // Durable Object holding every playground balance, deposit intent and call
+  // record. One instance (idFromName('playground')) — the global credit cap
+  // and the (tx_hash, op_index) replay guard are both global invariants and
+  // cannot be sharded. See src/playground/ledger-do.ts.
+  PLAYGROUND_LEDGER: DurableObjectNamespace
+  // Kill switch. Every /v1/playground/* route 404s unless this is exactly
+  // 'true'. Plain var, not a secret; flip + redeploy to pull the feature.
+  PLAYGROUND_ENABLED?: string
+  // HMAC key for playground session tokens. Deliberately NOT MPP_SECRET_KEY:
+  // rotating that one invalidates every outstanding 402 challenge on the paid
+  // proxy, so the playground must be rotatable on its own.
+  // Set via: wrangler secret put PLAYGROUND_SESSION_SECRET
+  PLAYGROUND_SESSION_SECRET?: string
+  // Global outstanding-credit ceiling in USD. Deposit intents are refused
+  // beyond it. Defaults to $200; an unparseable value falls back to the
+  // default rather than to "unlimited".
+  PLAYGROUND_GLOBAL_CAP_USD?: string
+  // Horizon base URL for deposit verification. Defaults to the public
+  // https://horizon.stellar.org; override only to point at a private Horizon.
+  PLAYGROUND_HORIZON_URL?: string
+  // Operator bearer token for GET /v1/playground/admin/totals, the solvency
+  // read used by scripts/admin/playground-recon.ts. Unset ⇒ that endpoint
+  // 404s, so it is absent rather than open by default.
+  // Set via: wrangler secret put PLAYGROUND_RECON_TOKEN
+  PLAYGROUND_RECON_TOKEN?: string
+  // Cloudflare Turnstile secret for the deposit-intent gate. Unset ⇒ intent
+  // creation fails closed (503) unless PLAYGROUND_TURNSTILE_DISABLED is
+  // explicitly 'true'. Set via: wrangler secret put PLAYGROUND_TURNSTILE_SECRET
+  PLAYGROUND_TURNSTILE_SECRET?: string
+  // Public Turnstile SITE key, echoed by GET /v1/playground/config so the
+  // frontend can render the widget. Not a secret; plain var.
+  PLAYGROUND_TURNSTILE_SITE_KEY?: string
+  // Explicit, auditable off switch for the intent Turnstile gate. Only the
+  // exact string 'true' disables it — a missing/typo'd secret still fails
+  // closed. For staged rollout before the frontend widget ships.
+  PLAYGROUND_TURNSTILE_DISABLED?: string
 
   // Stellar Router Pool (receives agent USDC payments)
   // Secret NOT in env — operator manages offline. Only public key needed.
@@ -338,6 +388,40 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return handleX402Supported(env)
       }
 
+      // ---- Playground: self-serve prepaid demo sessions ------------------
+      // Purpose-built endpoints, deliberately NOT part of the paid proxy —
+      // see the header of src/routes/playground.ts. Every one of these is
+      // gated on PLAYGROUND_ENABLED === 'true' inside the handler and 404s
+      // otherwise, so the whole family can be pulled with one var flip.
+      // `/v1/playground/*` does not collide with the `/v1/services/`
+      // catch-all further down.
+      if (url.pathname === '/v1/playground/config' && request.method === 'GET') {
+        return handlePlaygroundConfig(env)
+      }
+      if (url.pathname === '/v1/playground/session/intent' && request.method === 'POST') {
+        return handlePlaygroundIntent(request, env)
+      }
+      if (url.pathname === '/v1/playground/session/open' && request.method === 'POST') {
+        return handlePlaygroundOpen(request, env)
+      }
+      if (url.pathname === '/v1/playground/session' && request.method === 'GET') {
+        return handlePlaygroundSession(request, env)
+      }
+      if (url.pathname === '/v1/playground/chat' && request.method === 'POST') {
+        return handlePlaygroundChat(request, env)
+      }
+      if (url.pathname === '/v1/playground/blend-activity' && request.method === 'POST') {
+        return handlePlaygroundBlendActivity(request, env)
+      }
+      if (url.pathname === '/v1/playground/tx-decode' && request.method === 'POST') {
+        return handlePlaygroundTxDecode(request, env)
+      }
+      // Operator-only solvency read for scripts/admin/playground-recon.ts.
+      // 404s unless PLAYGROUND_RECON_TOKEN is configured AND presented.
+      if (url.pathname === '/v1/playground/admin/totals' && request.method === 'GET') {
+        return handlePlaygroundAdminTotals(request, env)
+      }
+
       const refundStatusMatch = url.pathname.match(/^\/v1\/refunds\/([0-9a-f-]{36})$/)
       if (refundStatusMatch && request.method === 'GET') {
         return handleRefundStatus(env, refundStatusMatch[1])
@@ -551,7 +635,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         '  GET /.well-known/ai-plugin.json      - AI plugin manifest\n' +
         '  POST /v1/services/<service>/<op>     - Call a paid service\n' +
         '  GET  /v1/services/<svc>/jobs/<id>/challenge - Get ownership nonce\n' +
-        '  GET  /v1/services/<svc>/jobs/<id>   - Poll async job (signed)\n\n' +
+        '  GET  /v1/services/<svc>/jobs/<id>   - Poll async job (signed)\n' +
+        '  GET  /v1/playground/config           - Playground models/chips/deposits\n\n' +
         'Docs: https://mpprouter.dev\n',
         { status: 404, headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
       )
