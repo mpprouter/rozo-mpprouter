@@ -274,7 +274,7 @@ export function handlePlaygroundConfig(env: Env): Response {
       deposit_options: CHANNEL_DEPOSIT_OPTIONS,
       min_deposit_usd: CHANNEL_MIN_DEPOSIT_USD,
       max_deposit_usd: CHANNEL_MAX_DEPOSIT_USD,
-      ...channelPricingConfig(),
+      ...channelPricingConfig(env),
     },
     turnstile: {
       // The frontend renders a widget only when required is true; the site key

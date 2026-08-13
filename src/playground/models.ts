@@ -366,3 +366,17 @@ export const INTENT_TTL_SECONDS = 30 * 60
 
 /** How many recent calls `GET /v1/playground/session` returns. */
 export const CALL_HISTORY_LIMIT = 20
+
+/**
+ * Emergency stop for paid chat models (env-driven so tests and normal
+ * operation are unaffected). While an upstream merchant accepts payment but
+ * fails the call (403-after-pay), every chat attempt would charge the user
+ * for nothing — so the chat handler rejects BEFORE payment when this is on,
+ * and /config marks the models unavailable with the reason below.
+ */
+export const CHAT_OUTAGE_REASON =
+  'Paid chat calls are temporarily paused: the upstream model provider is rejecting calls after accepting payment (observed 2026-08-13). Disabled so you are never charged for a call that cannot succeed.'
+
+export function chatModelsDisabled(env: { PLAYGROUND_CHAT_MODELS_DISABLED?: string }): boolean {
+  return env.PLAYGROUND_CHAT_MODELS_DISABLED === 'true'
+}

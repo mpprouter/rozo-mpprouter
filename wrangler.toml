@@ -212,6 +212,13 @@ PLAYGROUND_TURNSTILE_DISABLED = "true"
 # "true" only after the channel WASM + factory are deployed on mainnet and the
 # path is verified. See src/routes/playground-channel.ts.
 PLAYGROUND_CHANNEL_ENABLED = "true"
+# Emergency stop for PAID chat models only (tx-decode stays up). ON since
+# 2026-08-13: the Anthropic upstream merchant accepts payment then 403s
+# ("Request not allowed", reproduced bypassing the router via
+# scripts/admin/probe-merchant-direct.ts) — every chat attempt would charge
+# the user ~$0.10 for nothing. Flip to "false" + redeploy once a real paid
+# probe succeeds again.
+PLAYGROUND_CHAT_MODELS_DISABLED = "true"
 # Channel-factory contract address (C...) the frontend calls `open` against.
 # Empty until the founder deploys the factory on mainnet (L3). Advertised (as
 # null when unset) by GET /v1/playground/config.
