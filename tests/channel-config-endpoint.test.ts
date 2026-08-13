@@ -42,8 +42,8 @@ describe('playground config — channel block', () => {
     expect(ch.deposit_options).toEqual([0.5, 1, 2])
     expect(ch.min_deposit_usd).toBe('0.1')
     expect(ch.max_deposit_usd).toBe('10')
-    // Real-cost metering still advertised.
-    expect(ch.pricing?.model).toBe('real-cost')
+    // Flat uniform per-call pricing advertised (founder 2026-08-13).
+    expect(ch.pricing?.model).toBe('flat')
     expect(Array.isArray(ch.models)).toBe(true)
   })
 
