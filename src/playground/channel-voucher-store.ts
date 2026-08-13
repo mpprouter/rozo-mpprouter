@@ -202,6 +202,8 @@ export interface VoucherWriteoff {
  * (documented there as "no longer collectable") purely to stop the cron
  * retrying a dead channel.
  */
+const RECON_WRITEOFF_KEY = 'pg:channel:recon:writeoffs'
+
 export async function markVoucherWrittenOff(
   env: Env,
   channelContract: string,
@@ -209,11 +211,33 @@ export async function markVoucherWrittenOff(
   reason: string,
 ): Promise<void> {
   const s = store(env)
-  await (s.update as any)(writeoffKey(channelContract), () => ({
-    op: 'set',
-    value: { cumulativeRaw, reason, at: new Date().toISOString() } satisfies VoucherWriteoff,
-    result: true,
-  }))
+  // Per-channel terminal record (idempotent set) ...
+  const wrote = await (s.update as any)(writeoffKey(channelContract), (current: any) =>
+    current
+      ? { op: 'noop', result: false }
+      : {
+          op: 'set',
+          value: { cumulativeRaw, reason, at: new Date().toISOString() } satisfies VoucherWriteoff,
+          result: true,
+        },
+  )
+  // ...plus a global recon aggregate (count + total raw), bumped only on the
+  // FIRST write for a channel so a retried write-off never double-counts.
+  if (wrote) {
+    await (s.update as any)(RECON_WRITEOFF_KEY, (current: any) => ({
+      op: 'set',
+      value: {
+        count: (current?.count ?? 0) + 1,
+        totalRaw: (BigInt(current?.totalRaw ?? '0') + BigInt(cumulativeRaw)).toString(),
+      },
+      result: true,
+    }))
+  }
+}
+
+export async function getWriteoffTotals(env: Env): Promise<{ count: number; totalRaw: string }> {
+  const v = (await store(env).get(RECON_WRITEOFF_KEY)) as any
+  return { count: v?.count ?? 0, totalRaw: v?.totalRaw ?? '0' }
 }
 
 export async function getVoucherWriteoff(

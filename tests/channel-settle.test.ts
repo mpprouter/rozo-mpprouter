@@ -39,6 +39,7 @@ import {
   markVoucherSettled,
   getSupersededAbortCount,
   incrSupersededAbort,
+  getVoucherWriteoff,
 } from '../src/playground/channel-voucher-store'
 import { putPgChannel, PG_PROVENANCE_VERSION } from '../src/playground/channel-pg-store'
 import {
