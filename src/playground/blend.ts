@@ -19,6 +19,40 @@
  * cannot change what the model is asked to do.
  */
 
+import { scValToNative, xdr } from '@stellar/stellar-sdk'
+
+/**
+ * Decode a Mercury topic/data field — a base64-XDR-encoded Soroban `ScVal` —
+ * into its native JS value (bigint / string strkey / array / object). Pure and
+ * total: any malformed input yields `undefined` rather than throwing, so a
+ * partially-decodable feed degrades to missing samples instead of a crash.
+ */
+function decodeScVal(b64: unknown): unknown {
+  if (typeof b64 !== 'string' || b64.length === 0) return undefined
+  try {
+    return scValToNative(xdr.ScVal.fromXDR(b64, 'base64'))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Decode a base64-XDR topic and return its symbol string ONLY if the ScVal is
+ * genuinely an `scvSymbol`. Anything else (an ScString/ScBytes whose raw bytes
+ * merely contain a known word, a non-symbol scalar, or undecodable input)
+ * yields null — so a hostile payload cannot spoof an event classification.
+ */
+function decodeSymbol(b64: string): string | null {
+  try {
+    const scv = xdr.ScVal.fromXDR(b64, 'base64')
+    if (scv.switch() !== xdr.ScValType.scvSymbol()) return null
+    const native = scValToNative(scv)
+    return typeof native === 'string' ? native : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * Blend mainnet "Fixed XLM-USDC Pool" — the protocol's primary lending pool.
  *
@@ -52,6 +86,34 @@ const ACTION_BY_EVENT: Record<string, BlendAction> = {
   repay: 'repay',
 }
 
+/**
+ * Every Blend pool event symbol we can recognise by name — the four classified
+ * actions plus the auction/admin events the pool also emits. Recognising the
+ * latter lets `other`-bucketed events be reported by their real name (e.g.
+ * "fill_auction") instead of an opaque "unknown", so a paid call is never
+ * rendered as empty just because the recent window was all liquidations.
+ *
+ * Longer names come first: the topic scan matches the first substring hit, and
+ * "supply_collateral" contains "supply", so the specific name must win.
+ */
+const KNOWN_EVENT_NAMES: readonly string[] = [
+  'supply_collateral',
+  'withdraw_collateral',
+  'delete_liquidation_auction',
+  'new_liquidation_auction',
+  'new_auction',
+  'fill_auction',
+  'bad_debt',
+  'supply',
+  'withdraw',
+  'deposit',
+  'borrow',
+  'repay',
+]
+
+/** Exact-match lookup for known event symbols (lower-cased). */
+const KNOWN_EVENT_SET = new Set(KNOWN_EVENT_NAMES)
+
 export type BlendAction = 'deposit' | 'withdraw' | 'borrow' | 'repay' | 'other'
 
 export interface BlendAggregate {
@@ -61,6 +123,13 @@ export interface BlendAggregate {
   /** Ledger range covered by those events, if the indexer reported ledgers. */
   ledger_range: { first: number; last: number } | null
   rows: BlendActionRow[]
+  /**
+   * Distinct event-type names seen among events that did NOT classify into one
+   * of the four actions (e.g. "fill_auction", "unknown"). Bounded and derived
+   * only from the fixed known-symbol scan, so it is safe to show the user and
+   * guarantees a paid call is never reported as empty. Ordered by frequency.
+   */
+  other_event_names: string[]
 }
 
 export interface BlendActionRow {
@@ -82,6 +151,13 @@ interface RawEvent {
   ledger?: unknown
   ledger_sequence?: unknown
   contract_id?: unknown
+  /**
+   * Mercury's `/rest/events/by-contract` delivers topics as flat, individually
+   * base64-XDR-encoded fields `topic1`…`topic10` (null for unused positions) —
+   * NOT a `topics` array. It also carries `tx` / `event_index`. Kept as an
+   * index signature so those typecheck without hard-coding ten keys.
+   */
+  [key: string]: unknown
 }
 
 /**
@@ -94,44 +170,70 @@ interface RawEvent {
  * as an honest "no activity found" rather than a crash.
  */
 export function extractEvents(body: unknown): RawEvent[] {
-  if (Array.isArray(body)) return body as RawEvent[]
+  if (Array.isArray(body)) return onlyObjects(body)
   if (!body || typeof body !== 'object') return []
   const o = body as Record<string, unknown>
   for (const key of ['data', 'events', 'results', 'records']) {
-    if (Array.isArray(o[key])) return o[key] as RawEvent[]
+    if (Array.isArray(o[key])) return onlyObjects(o[key] as unknown[])
   }
   const embedded = o._embedded as Record<string, unknown> | undefined
-  if (embedded && Array.isArray(embedded.records)) return embedded.records as RawEvent[]
+  if (embedded && Array.isArray(embedded.records)) return onlyObjects(embedded.records)
   return []
 }
 
 /**
- * Best-effort extraction of the event name from a topic list.
+ * Keep only real event objects. Null / primitive array elements (a malformed or
+ * hostile feed) are dropped here so they can never reach the field-access code
+ * in `topicList` and throw AFTER the indexer call was paid for.
+ */
+function onlyObjects(arr: unknown[]): RawEvent[] {
+  return arr.filter((e): e is RawEvent => e !== null && typeof e === 'object')
+}
+
+/**
+ * Extraction of the event name from a topic list.
  *
  * Soroban's first topic is conventionally a symbol naming the event. Mercury
- * may deliver it already decoded ("supply") or still base64 XDR-encoded. Rather
- * than pull in an XDR decoder for a demo chip, a base64 topic is scanned for a
- * known event name appearing as readable ASCII — symbols are stored as literal
- * bytes inside the ScVal, so this matches reliably without a decoder, and a
- * miss simply lands the event in `other`.
+ * may deliver it already decoded ("supply") or still base64-XDR-encoded. Either
+ * way the value is XDR-decoded and required to be an ScVal *symbol* that
+ * EXACTLY equals a known event name — a substring or byte-containment match
+ * would let attacker-controlled payload spoof a classification. A miss simply
+ * lands the event in `other`.
  */
 export function eventName(event: RawEvent): string {
-  const topics = event.topics ?? event.topic
-  const list = Array.isArray(topics) ? topics : topics === undefined ? [] : [topics]
+  return firstKnownName(topicList(event))
+}
+
+/**
+ * Assemble the topic values from every envelope shape we've seen: a `topics`
+ * array or single `topic` (older/normalised feeds) AND Mercury's flat
+ * `topic1`…`topic10` fields. Missing Mercury topics before deploying this read
+ * were the reason every event fell through to `other`.
+ */
+function topicList(event: RawEvent): unknown[] {
+  const arrayTopics = event.topics ?? event.topic
+  const list: unknown[] = Array.isArray(arrayTopics)
+    ? [...arrayTopics]
+    : arrayTopics === undefined
+      ? []
+      : [arrayTopics]
+  for (let i = 1; i <= 10; i++) {
+    const t = event[`topic${i}`]
+    if (t !== undefined && t !== null) list.push(t)
+  }
+  return list
+}
+
+function firstKnownName(list: unknown[]): string {
   for (const topic of list) {
     if (typeof topic !== 'string') continue
+    // Already-decoded feeds: the topic IS the literal symbol name.
     const lower = topic.toLowerCase()
-    if (Object.prototype.hasOwnProperty.call(ACTION_BY_EVENT, lower)) return lower
-    // Encoded topic: look for a known symbol embedded in the decoded bytes.
-    let decoded = ''
-    try {
-      decoded = atob(topic.replace(/-/g, '+').replace(/_/g, '/')).toLowerCase()
-    } catch {
-      continue
-    }
-    for (const known of Object.keys(ACTION_BY_EVENT)) {
-      if (decoded.includes(known)) return known
-    }
+    if (KNOWN_EVENT_SET.has(lower)) return lower
+    // Mercury: base64-XDR ScVal. Accept only a genuine symbol that exactly
+    // matches a known name — never a substring/byte-containment match.
+    const sym = decodeSymbol(topic)
+    if (sym && KNOWN_EVENT_SET.has(sym.toLowerCase())) return sym.toLowerCase()
   }
   return 'unknown'
 }
@@ -162,6 +264,16 @@ export function extractAmount(event: RawEvent): bigint | null {
     if (typeof c === 'number' && Number.isSafeInteger(c) && c >= 0) return BigInt(c)
     if (typeof c === 'string' && /^\d+$/.test(c)) return BigInt(c)
   }
+  // Mercury: `data` is a base64-XDR ScVal. Blend's supply/withdraw/borrow/repay
+  // events all lead their data tuple with the underlying i128 `amount` in
+  // stroops, followed by the b_/d_token delta. Decode that EXACT position —
+  // never scan for a "first non-negative", which would pick the wrong field.
+  const native = decodeScVal(data)
+  if (Array.isArray(native) && typeof native[0] === 'bigint') {
+    return native[0] >= 0n ? native[0] : null
+  }
+  // Some feeds may encode a bare i128 rather than a tuple.
+  if (typeof native === 'bigint') return native >= 0n ? native : null
   return null
 }
 
@@ -174,11 +286,24 @@ function extractParticipant(event: RawEvent): string | null {
       if (typeof v === 'string' && v.length > 0) return v
     }
   }
-  const topics = Array.isArray(event.topics) ? event.topics : []
-  for (const t of topics) {
-    if (typeof t === 'string' && /^[GC][A-Z2-7]{55}$/.test(t)) return t
+  // Topics carry the participating addresses. Blend orders them
+  // (event_symbol, reserve_asset, from), so prefer an account (`G…`) strkey —
+  // the real user — over a contract (`C…`) asset address when both appear.
+  let account: string | null = null
+  let anyAddr: string | null = null
+  for (const t of topicList(event)) {
+    if (typeof t !== 'string') continue
+    const strkey = /^[GC][A-Z2-7]{55}$/.test(t)
+      ? t // already-decoded feeds
+      : (() => {
+          const native = decodeScVal(t)
+          return typeof native === 'string' && /^[GC][A-Z2-7]{55}$/.test(native) ? native : null
+        })()
+    if (!strkey) continue
+    if (strkey[0] === 'G' && !account) account = strkey
+    if (!anyAddr) anyAddr = strkey
   }
-  return null
+  return account ?? anyAddr
 }
 
 function extractLedger(event: RawEvent): number | null {
@@ -209,25 +334,38 @@ export function aggregateBlendEvents(events: RawEvent[], contractId: string): Bl
 
   let firstLedger: number | null = null
   let lastLedger: number | null = null
+  const otherNames = new Map<string, number>()
 
   for (const event of events) {
-    const action = classify(eventName(event))
-    const bucket = buckets.get(action)!
-    bucket.count += 1
+    // One malformed or hostile event must never fail the whole paid call: any
+    // throw is contained here and the event is bucketed as unparseable `other`,
+    // so every event still increments exactly one bucket (counts reconcile).
+    try {
+      // Do ALL parsing first, into locals — mutate no bucket until every
+      // throwing operation has succeeded, so a mid-parse throw cannot leave an
+      // event half-counted (which would then also be counted by the catch).
+      const name = eventName(event)
+      const action = classify(name)
+      const amount = extractAmount(event)
+      const participant = extractParticipant(event)
+      const ledger = extractLedger(event)
 
-    const amount = extractAmount(event)
-    if (amount !== null) {
-      bucket.total += amount
-      bucket.samples += 1
-    }
-
-    const participant = extractParticipant(event)
-    if (participant) bucket.participants.add(participant)
-
-    const ledger = extractLedger(event)
-    if (ledger !== null) {
-      if (firstLedger === null || ledger < firstLedger) firstLedger = ledger
-      if (lastLedger === null || ledger > lastLedger) lastLedger = ledger
+      // Parsing done — now apply exactly one bucket increment.
+      const bucket = buckets.get(action)!
+      bucket.count += 1
+      if (action === 'other') otherNames.set(name, (otherNames.get(name) ?? 0) + 1)
+      if (amount !== null) {
+        bucket.total += amount
+        bucket.samples += 1
+      }
+      if (participant) bucket.participants.add(participant)
+      if (ledger !== null) {
+        if (firstLedger === null || ledger < firstLedger) firstLedger = ledger
+        if (lastLedger === null || ledger > lastLedger) lastLedger = ledger
+      }
+    } catch {
+      buckets.get('other')!.count += 1
+      otherNames.set('unparseable', (otherNames.get('unparseable') ?? 0) + 1)
     }
   }
 
@@ -248,6 +386,10 @@ export function aggregateBlendEvents(events: RawEvent[], contractId: string): Bl
         unique_participants: b.participants.size,
       }
     }),
+    other_event_names: [...otherNames.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 8)
+      .map(([name]) => name),
   }
 }
 
@@ -267,7 +409,14 @@ export function describeAggregate(agg: BlendAggregate): string {
     ? ` across ledgers ${agg.ledger_range.first}–${agg.ledger_range.last}`
     : ''
   if (parts.length === 0) {
-    return `Examined ${agg.events_examined} recent Blend pool events${range}; none matched a known deposit/withdraw/borrow/repay action.`
+    // The indexer call was paid for — never render it as empty. Report the real
+    // count, the ledger range, and the event types that actually came back
+    // (auctions, admin ops, or symbols we don't yet name) instead of a bare
+    // "none matched".
+    const types = agg.other_event_names.length > 0
+      ? ` The recent window was other event types: ${agg.other_event_names.join(', ')}.`
+      : ''
+    return `Examined ${agg.events_examined} recent Blend pool events${range}; none were deposit/withdraw/borrow/repay.${types}`
   }
   return `Recent Blend pool activity${range}: ${parts.join(', ')} across ${agg.events_examined} events.`
 }
@@ -286,6 +435,7 @@ export function buildSummaryPrompt(agg: BlendAggregate): string {
       total_amount_stroops: r.total_amount,
       unique_participants: r.unique_participants,
     })),
+    other_event_names: agg.other_event_names,
   }
   return (
     'Write one or two plain sentences summarising this Blend lending-pool activity on Stellar. ' +
