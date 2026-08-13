@@ -209,13 +209,50 @@ describe('handleChannelRegister', () => {
     expect(json.funder).toBe(FUNDER)
     expect(json.commitment_key).toBe(COMMIT_G)
     expect(read).toHaveBeenCalledOnce()
-    // Primary + agent index written. deposit persisted from the REAL on-chain
-    // SAC balance, not the client's claim.
-    expect(kv.map.get(`stellarChannel:${CHANNEL}`)).toBeTruthy()
-    expect(kv.map.get(`stellarAgent:${FUNDER}`)).toBe(CHANNEL)
-    const stored = JSON.parse(kv.map.get(`stellarChannel:${CHANNEL}`)!)
+    // Written to the ISOLATED playground namespace (pgChannel/pgAgent), NOT the
+    // production stellarChannel/stellarAgent path. deposit persisted from the
+    // REAL on-chain SAC balance, not the client's claim.
+    expect(kv.map.get(`pgChannel:${CHANNEL}`)).toBeTruthy()
+    expect(kv.map.get(`pgAgent:${FUNDER}`)).toBe(CHANNEL)
+    // Production registry untouched.
+    expect(kv.map.get(`stellarChannel:${CHANNEL}`)).toBeUndefined()
+    expect(kv.map.get(`stellarAgent:${FUNDER}`)).toBeUndefined()
+    const stored = JSON.parse(kv.map.get(`pgChannel:${CHANNEL}`)!)
     expect(stored.depositRaw).toBe('2000000')
     expect(stored.commitmentKey).toBe(COMMIT_G)
+    expect(stored.to).toBe(COLLECTOR)
+    expect(stored.wasmHash).toBe(WASM_HASH)
+    expect(stored.provenanceVersion).toBe(1)
+  })
+
+  it('does NOT replay a stored record that predates provenance — re-verifies on-chain', async () => {
+    const env = makeEnv(kv)
+    // Seed a stale record (provenanceVersion 0) with the same params.
+    kv.map.set(
+      `pgChannel:${CHANNEL}`,
+      JSON.stringify({
+        channelContract: CHANNEL,
+        commitmentKey: COMMIT_G,
+        agentAccount: FUNDER,
+        currency: USDC_SAC,
+        network: 'stellar:pubnet',
+        depositRaw: '2000000',
+        to: COLLECTOR,
+        wasmHash: WASM_HASH,
+        provenanceVersion: 0,
+        openedAt: 'old',
+      }),
+    )
+    const read = vi.fn(async () => goodOnChain())
+    const res = await handleChannelRegister(registerReq(GOOD_BODY), env, {
+      readChannelOnChain: read,
+    })
+    expect(res.status).toBe(200)
+    // Re-verified on-chain (NOT a blind replay short-circuit)...
+    expect(read).toHaveBeenCalledOnce()
+    expect((await res.json()).replayed).toBe(false)
+    // ...and the record was upgraded to the current provenance version.
+    expect(JSON.parse(kv.map.get(`pgChannel:${CHANNEL}`)!).provenanceVersion).toBe(1)
   })
 
   it('rejects a fake look-alike contract (WASM-hash mismatch), no KV write', async () => {

@@ -1,83 +1,109 @@
 /**
- * Latest-voucher store for the channel playground (Option A online settlement).
+ * Latest-voucher store + channel closed-marker for Option A settlement.
  *
- * The mppx atomic store tracks the cumulative WATERMARK, but to actually
- * COLLECT what a user spent the router must re-present the latest signed
- * commitment on-chain via the channel's `settle`/`close`. That needs the raw
- * ed25519 SIGNATURE plus the cumulative amount — neither of which the mppx
- * watermark keeps. So on every KEPT charge we persist the latest voucher here,
- * keyed by channel, and the every-2-minutes settlement cron reads it.
+ * To COLLECT what a user spent, the router must re-present the latest signed
+ * commitment on-chain via `settle`/`close`. That needs the raw ed25519
+ * SIGNATURE plus the cumulative amount — which the mppx cumulative watermark
+ * does not keep. So on every KEPT charge we persist the latest voucher here.
  *
- * Key: `playgroundVoucher:<channelContract>` in MPP_STORE. Distinct from the
- * `stellarChannel:*` metadata and mppx's `stellar:channel:*` prefixes.
+ * P0-C fix: this is backed by the SAME DO atomic store as the cumulative
+ * watermark (`Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))`), NOT plain
+ * KV get/put. Every write is a linearizable compare-and-set, so a slower
+ * concurrent call can never clobber a newer voucher or rewind the settled
+ * watermark. The same store also holds a per-channel `closed` flag that fences
+ * calls against an in-flight / completed settlement.
+ *
+ * DO keys (distinct from mppx's `stellar:channel:cumulative:*` and
+ * `stellar:channel:challenge:*`):
+ *   pg:channel:voucher:<C>  → { amountDecimal, cumulativeRaw, signature, lastSettledRaw, updatedAt }
+ *   pg:channel:closed:<C>   → { closedAt }
  */
 
+import { Store } from 'mppx/server'
 import type { Env } from '../index'
+import { doAtomicParams } from '../mpp/kv-atomic-store'
 
 export interface LatestVoucher {
-  /** Cumulative amount as the decimal string the client signed (channel units). */
   amountDecimal: string
-  /** Cumulative amount in 7-decimal atomic base units (for the on-chain i128). */
   cumulativeRaw: string
-  /** Raw ed25519 signature over the commitment, as the credential carried it. */
   signature: string
-  /** Highest cumulative already settled on-chain, atomic base units. */
   lastSettledRaw: string
   updatedAt: string
 }
 
-const PREFIX = 'playgroundVoucher:'
+const voucherKey = (c: string) => `pg:channel:voucher:${c}`
+const closedKey = (c: string) => `pg:channel:closed:${c}`
 
-function key(channelContract: string): string {
-  return `${PREFIX}${channelContract}`
+function store(env: Env) {
+  return Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
 }
 
-export async function getLatestVoucher(
-  env: Env,
-  channelContract: string,
-): Promise<LatestVoucher | null> {
-  const raw = await env.MPP_STORE.get(key(channelContract))
-  if (!raw) return null
-  try {
-    return JSON.parse(raw) as LatestVoucher
-  } catch {
-    return null
-  }
+export async function getLatestVoucher(env: Env, channelContract: string): Promise<LatestVoucher | null> {
+  const v = (await store(env).get(voucherKey(channelContract))) as LatestVoucher | null
+  return v && typeof v === 'object' ? v : null
 }
 
 /**
- * Record the latest voucher, but only if it advances the cumulative (monotone)
- * — a stale write from a slower concurrent call must never lower the amount the
- * router can collect. Preserves the existing `lastSettledRaw`.
+ * Persist the latest voucher via atomic CAS. Monotone: a lower cumulative never
+ * overwrites a higher one (a stale concurrent write is dropped). Throws on a
+ * store failure so the caller can FAIL CLOSED (roll back the charge) rather
+ * than leave a paid call with no redeemable voucher.
  */
 export async function putLatestVoucher(
   env: Env,
   channelContract: string,
   v: { amountDecimal: string; cumulativeRaw: string; signature: string },
 ): Promise<void> {
-  const existing = await getLatestVoucher(env, channelContract)
-  if (existing && BigInt(existing.cumulativeRaw) >= BigInt(v.cumulativeRaw)) return
-  const next: LatestVoucher = {
-    amountDecimal: v.amountDecimal,
-    cumulativeRaw: v.cumulativeRaw,
-    signature: v.signature,
-    lastSettledRaw: existing?.lastSettledRaw ?? '0',
-    updatedAt: new Date().toISOString(),
-  }
-  await env.MPP_STORE.put(key(channelContract), JSON.stringify(next))
+  const s = store(env)
+  await (s.update as any)(voucherKey(channelContract), (current: LatestVoucher | null) => {
+    if (current && BigInt(current.cumulativeRaw) >= BigInt(v.cumulativeRaw)) {
+      // A voucher at least this high is already stored — still redeemable.
+      return { op: 'noop', result: true }
+    }
+    return {
+      op: 'set',
+      value: {
+        amountDecimal: v.amountDecimal,
+        cumulativeRaw: v.cumulativeRaw,
+        signature: v.signature,
+        lastSettledRaw: current?.lastSettledRaw ?? '0',
+        updatedAt: new Date().toISOString(),
+      },
+      result: true,
+    }
+  })
 }
 
-/** Mark a cumulative amount as settled on-chain so the cron does not re-settle it. */
+/** Monotonically record a cumulative amount as settled on-chain (atomic CAS). */
 export async function markVoucherSettled(
   env: Env,
   channelContract: string,
   settledRaw: string,
 ): Promise<void> {
-  const existing = await getLatestVoucher(env, channelContract)
-  if (!existing) return
-  if (BigInt(existing.lastSettledRaw) >= BigInt(settledRaw)) return
-  await env.MPP_STORE.put(
-    key(channelContract),
-    JSON.stringify({ ...existing, lastSettledRaw: settledRaw, updatedAt: new Date().toISOString() }),
-  )
+  const s = store(env)
+  await (s.update as any)(voucherKey(channelContract), (current: LatestVoucher | null) => {
+    if (!current) return { op: 'noop', result: false }
+    if (BigInt(current.lastSettledRaw) >= BigInt(settledRaw)) return { op: 'noop', result: false }
+    return {
+      op: 'set',
+      value: { ...current, lastSettledRaw: settledRaw, updatedAt: new Date().toISOString() },
+      result: true,
+    }
+  })
+}
+
+/** Atomically mark a channel closed (settlement in progress / done). */
+export async function markChannelClosed(env: Env, channelContract: string): Promise<void> {
+  const s = store(env)
+  await (s.update as any)(closedKey(channelContract), () => ({
+    op: 'set',
+    value: { closedAt: new Date().toISOString() },
+    result: true,
+  }))
+}
+
+/** True once a channel has been marked closed — calls must reject afterwards. */
+export async function isChannelClosed(env: Env, channelContract: string): Promise<boolean> {
+  const v = await store(env).get(closedKey(channelContract))
+  return v != null
 }

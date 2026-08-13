@@ -5,21 +5,23 @@
  * happen in a later step once this path is verified live. Every route here
  * 404s unless PLAYGROUND_CHANNEL_ENABLED === 'true'.
  *
- * Model: the router is the channel PAYEE. A user opens a Soroban channel with
- * Freighter (router = `to`), then spends by signing cumulative ed25519
- * vouchers with a browser-ephemeral commitment key. The router verifies each
- * voucher with the EXISTING production dispatch engine
- * (src/mpp/stellar-channel-dispatch.ts) — the same engine the paid proxy uses
- * — pays the upstream out of its own pool, and returns the result. On any
- * upstream failure the voucher is rolled back so nothing is billed.
+ * Model: the router is the channel PAYEE (a dedicated collector). A user opens a
+ * Soroban channel with Freighter (to = collector), then spends by signing
+ * cumulative ed25519 vouchers with a browser-ephemeral commitment key.
  *
- * This module deliberately reuses, without reinventing:
- *   - resolveStellarChannelMppx / rollbackFailedChannelVoucher /
- *     acquire/releaseChannelDeliveryLock  (stellar-channel-dispatch.ts)
- *   - putStellarChannel / getStellarChannel                (stellar-channel-store.ts)
- *   - callUpstreamJson / resolvePlaygroundRoute            (playground/upstream.ts)
- *   - the model/chip allow-list + sanitiser                (playground/models.ts, playground.ts helpers)
- *   - real-cost pricing                                    (playground/channel-config.ts)
+ * ISOLATION (P0-A): playground channels live in their OWN registry namespace
+ * (pgChannel:* / pgAgent:*, see channel-pg-store.ts) and are resolved by their
+ * OWN dispatch (channel-pg-dispatch.ts), NEVER the production
+ * stellarChannel/stellarAgent registry the paid proxy trusts. The mppx VERIFY
+ * primitive (createStellarChannelPayment) and the delivery-lock / rollback
+ * helpers are reused because they are generic over (channel, commitmentKey) and
+ * keyed by the unique contract address — but the registry is fully separate.
+ *
+ * Also reused: callUpstreamJson / resolvePlaygroundRoute (playground/upstream.ts),
+ * the model/chip allow-list (playground/models.ts), real-cost pricing
+ * (playground/channel-config.ts). On any upstream failure the voucher is rolled
+ * back so nothing is billed; a kept charge persists its signature atomically or
+ * fails closed (channel-voucher-store.ts).
  */
 
 import { Credential } from 'mppx'
@@ -30,15 +32,17 @@ import { getStellarUsdcSac } from '../mpp/stellar-server'
 import {
   acquireChannelDeliveryLock,
   releaseChannelDeliveryLock,
-  resolveStellarChannelMppx,
   rollbackFailedChannelVoucher,
   StellarChannelNotRegisteredError,
 } from '../mpp/stellar-channel-dispatch'
+import { resolvePgChannelMppx } from '../playground/channel-pg-dispatch'
 import {
-  getStellarChannel,
-  putStellarChannel,
-  type StellarChannelState,
-} from '../mpp/stellar-channel-store'
+  getPgChannel,
+  putPgChannel,
+  pgChannelProvenanceOk,
+  PG_PROVENANCE_VERSION,
+  type PgChannelState,
+} from '../playground/channel-pg-store'
 import { formatUsd, parseAtomic, parseUsd } from '../playground/amount'
 import {
   BLEND_EVENT_LIMIT,
@@ -63,7 +67,7 @@ import {
   readChannelOnChain,
   type OnChainChannel,
 } from '../playground/channel-onchain'
-import { putLatestVoucher } from '../playground/channel-voucher-store'
+import { isChannelClosed, putLatestVoucher } from '../playground/channel-voucher-store'
 import {
   BLEND_SUMMARY_MODEL_ID,
   FORCED_MAX_TOKENS,
@@ -145,9 +149,10 @@ const DEFAULT_DEPS: ChannelRegisterDeps = {
  * must be the pubnet USDC SAC, the funder + commitment key must match what the
  * client claims, the refund period must be the required value, and the channel
  * must hold a REAL USDC balance (queried from the SAC, not self-reported) above
- * the minimum. Only then do we write the
- * `stellarChannel:<C>` / `stellarAgent:<G>` records that make the router honor
- * this channel's vouchers.
+ * the minimum. Only then do we write the ISOLATED `pgChannel:<C>` /
+ * `pgAgent:<G>` records (never the production stellarChannel/stellarAgent path)
+ * that make the router honor this channel's vouchers, stamping the provenance
+ * so dispatch + settlement can re-assert it on use.
  *
  * Idempotent: re-registering an identical channel returns 200 { replayed:true }.
  * Rate-limited per IP, fail-closed.
@@ -222,11 +227,19 @@ export async function handleChannelRegister(
     return fail(400, 'network_mismatch', `network must be ${env.STELLAR_NETWORK}`)
   }
 
-  // Idempotency / conflict: an existing record for this contract with the same
-  // funder + commitment key is a replay (200). A different one is a conflict.
-  const existing = await getStellarChannel(env, channelContract)
+  // Idempotency / conflict. A replay short-circuit MUST only hold to a record
+  // that still passes provenance (P0-A): a stored record with different params
+  // is a conflict; one whose provenance is stale (predates verification, or
+  // config drifted) is NOT trusted — we fall through to full on-chain
+  // re-verification and overwrite it.
+  const existing = await getPgChannel(env, channelContract)
   if (existing) {
-    if (existing.agentAccount === agentAccount && existing.commitmentKey === commitmentKey) {
+    const sameParams =
+      existing.agentAccount === agentAccount && existing.commitmentKey === commitmentKey
+    if (!sameParams) {
+      return fail(409, 'channel_conflict', 'this channel is already registered with different parameters')
+    }
+    if (pgChannelProvenanceOk(existing, env)) {
       return json({
         ok: true,
         replayed: true,
@@ -236,7 +249,7 @@ export async function handleChannelRegister(
         deposit_usd: formatUsd(parseAtomic(existing.depositRaw)),
       })
     }
-    return fail(409, 'channel_conflict', 'this channel is already registered with different parameters')
+    // else: same params but un-provenanced record → re-verify on-chain below.
   }
 
   // On-chain verification — the trust boundary. Any RPC/decode failure is a
@@ -262,17 +275,23 @@ export async function handleChannelRegister(
     return fail(400, check.reason, check.detail)
   }
 
-  // Persist. depositRaw is the ON-CHAIN balance, not the client's claim.
-  const state: StellarChannelState = {
+  // Persist into the ISOLATED playground registry (never the production
+  // stellarChannel/stellarAgent path). depositRaw is the ON-CHAIN balance, not
+  // the client's claim. Stamp the provenance we just verified so dispatch +
+  // settlement can re-assert it on use.
+  const state: PgChannelState = {
     channelContract,
     commitmentKey,
     agentAccount,
     currency: usdcSac,
     network: env.STELLAR_NETWORK,
     depositRaw: onchain.balanceRaw,
+    to: collector,
+    wasmHash,
+    provenanceVersion: PG_PROVENANCE_VERSION,
     openedAt: new Date().toISOString(),
   }
-  await putStellarChannel(env, channelContract, state)
+  await putPgChannel(env, state)
 
   return json({
     ok: true,
@@ -332,7 +351,7 @@ async function verifyChannelVoucher(
 
   let resolved
   try {
-    resolved = await resolveStellarChannelMppx(env, authHeader, agentHint)
+    resolved = await resolvePgChannelMppx(env, authHeader, agentHint)
   } catch (err: any) {
     if (err instanceof StellarChannelNotRegisteredError) {
       return {
@@ -372,6 +391,16 @@ async function verifyChannelVoucher(
         response: fail(409, 'delivery_in_progress', 'another channel delivery is in progress', {
           retry_after: 2,
         }),
+      }
+    }
+    // Fence against settlement (P0-C): once the settlement cron has marked the
+    // channel closed (or is mid-close under the same lock), no new call may pay
+    // upstream — the on-chain close is final and would strand this charge.
+    if (await isChannelClosed(env, channelContract)) {
+      await releaseChannelDeliveryLock(env, channelContract, lockId)
+      return {
+        kind: 'respond',
+        response: fail(410, 'channel_closed', 'this channel has been settled/closed; open a new one'),
       }
     }
     const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
@@ -504,27 +533,50 @@ async function rollbackAndRelease(
  * Commit path: the charge stands (cumulative advanced). Persist the latest
  * voucher signature so the settlement cron can COLLECT it on-chain, then
  * release the delivery lock. Persisting under the lock keeps it single-writer.
+ *
+ * P0-B: FAIL CLOSED. If there is no signature, or the atomic persist throws, we
+ * must NOT finalize the charge — a paid call with no redeemable voucher lets
+ * the user refund while the collector cannot settle. On failure we roll the
+ * voucher back (restore the cumulative) and return false; the caller turns that
+ * into an error, reversing the charge. The router may eat the already-paid
+ * upstream cost in that rare case — the safe direction.
  */
 async function commitVoucher(
   env: Env,
   channelContract: string,
   voucher: ChannelVoucher,
   lockId: string,
-): Promise<void> {
-  if (voucher.signature) {
-    try {
-      await putLatestVoucher(env, channelContract, {
-        amountDecimal: voucher.amountDecimal,
-        cumulativeRaw: parseUsd(voucher.amountDecimal).toString(),
-        signature: voucher.signature,
-      })
-    } catch (e: any) {
-      console.error(`[channel] voucher persist failed for ${channelContract}: ${e?.message}`)
-    }
-  } else {
-    console.warn(`[channel] no signature on kept voucher for ${channelContract}; cannot settle`)
+): Promise<boolean> {
+  if (!voucher.signature) {
+    console.error(`[channel] no signature on kept voucher for ${channelContract}; failing closed`)
+    await rollbackAndRelease(env, channelContract, voucher, lockId)
+    return false
+  }
+  try {
+    await putLatestVoucher(env, channelContract, {
+      amountDecimal: voucher.amountDecimal,
+      cumulativeRaw: parseUsd(voucher.amountDecimal).toString(),
+      signature: voucher.signature,
+    })
+  } catch (e: any) {
+    console.error(
+      `[channel] voucher persist failed for ${channelContract}: ${e?.message}; failing closed`,
+    )
+    await rollbackAndRelease(env, channelContract, voucher, lockId)
+    return false
   }
   await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
+  return true
+}
+
+/** Response when the settlement voucher could not be persisted (charge reversed). */
+function settlementFailed(id: string): Response {
+  return fail(
+    502,
+    'settlement_persist_failed',
+    'could not persist the settlement voucher; the charge was reversed',
+    { call_id: id, charged_usd: '0.00' },
+  )
 }
 
 /** Effective charge/cost figures for a response body. */
@@ -654,7 +706,9 @@ export async function handleChannelChat(request: Request, env: Env): Promise<Res
   if (typeof text !== 'string' || text.length === 0) {
     // paid === true: the router DID pay upstream, the content was just
     // unusable. Keep the charge (commit) with a support note.
-    await commitVoucher(env, channelContract, voucher, lockId)
+    if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
+      return withReceipt(settlementFailed(id))
+    }
     return withReceipt(
       fail(502, 'upstream_empty', 'upstream returned no completion', {
         call_id: id,
@@ -665,7 +719,9 @@ export async function handleChannelChat(request: Request, env: Env): Promise<Res
     )
   }
 
-  await commitVoucher(env, channelContract, voucher, lockId)
+  if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
+    return withReceipt(settlementFailed(id))
+  }
   return withReceipt(
     json({
       call_id: id,
@@ -750,7 +806,9 @@ export async function handleChannelBlendActivity(request: Request, env: Env): Pr
     }
   }
 
-  await commitVoucher(env, channelContract, voucher, lockId)
+  if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
+    return withReceipt(settlementFailed(id))
+  }
   return withReceipt(
     json({
       call_id: id,
@@ -819,7 +877,9 @@ export async function handleChannelTxDecode(request: Request, env: Env): Promise
     )
   }
 
-  await commitVoucher(env, channelContract, voucher, lockId)
+  if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
+    return withReceipt(settlementFailed(id))
+  }
   return withReceipt(
     json({
       call_id: id,
@@ -852,7 +912,9 @@ async function settleUpstreamError(
   if (shouldCommit) {
     // Money moved: leave the voucher cumulative advanced and persist it, then
     // release the lock so the settlement cron can collect it.
-    await commitVoucher(env, channelContract, voucher, lockId)
+    if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
+      return settlementFailed('')
+    }
     return fail(status, code, message, {
       support_note:
         'The upstream provider was paid but did not return a usable result, so this call was charged.',
