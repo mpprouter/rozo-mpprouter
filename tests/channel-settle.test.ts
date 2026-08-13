@@ -258,6 +258,20 @@ describe('settleOneChannel', () => {
     expect(atomic.backing.get(`pg:channel:closed:${CHANNEL}`)).toBeUndefined()
   })
 
+  it('R8: fences the channel the moment close_start is detected (even when fully settled)', async () => {
+    // Channel is closing but already fully settled → nothing to collect...
+    await markVoucherSettled(e, CHANNEL, '5000000')
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: 12345,
+      currentLedger: 12000,
+    })
+    const tx = await settleOneChannel(e, CHANNEL, deps)
+    expect(tx).toBeNull() // nothing to settle
+    expect(closeMock).not.toHaveBeenCalled()
+    // ...but the cron still durably fenced it so later calls reject without RPC.
+    expect(atomic.backing.get(`pg:channel:fenced:${CHANNEL}`)).toBeTruthy()
+  })
+
   it('P0-3: takes over an EXPIRED (leaked) lock and settles', async () => {
     ;(deps.getChannelState as any).mockResolvedValue({
       closeEffectiveAtLedger: 12345,

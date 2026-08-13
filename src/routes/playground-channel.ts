@@ -37,6 +37,7 @@ import {
   StellarChannelNotRegisteredError,
 } from '../mpp/stellar-channel-dispatch'
 import { resolvePgChannelMppx } from '../playground/channel-pg-dispatch'
+import { channelClosingForSpend } from '../playground/channel-close-guard'
 import {
   getPgChannel,
   putPgChannel,
@@ -409,7 +410,7 @@ async function verifyChannelVoucher(
       }
     }
     // Fence gate (P0-C / P0-2): reject if the channel is blocked by EITHER the
-    // fast atomic closed marker OR the durable KV fence — independent of lock
+    // fast atomic closed marker OR the durable atomic fence — independent of lock
     // state, so a released/taken-over lock can never let a call advance a fenced
     // channel.
     if (await isChannelBlocked(env, channelContract)) {
@@ -417,6 +418,20 @@ async function verifyChannelVoucher(
       return {
         kind: 'respond',
         response: fail(410, 'channel_closed', 'this channel has been settled/closed; open a new one'),
+      }
+    }
+
+    // Close-state gate (round-8 TOCTOU): before paying upstream, verify the
+    // channel has NOT entered close_start. A closing channel could be refunded
+    // (emptied) before the settlement cron collects, so we must not spend on it.
+    // On detection we ALSO durably fence it so subsequent calls reject without
+    // an RPC. Fail-closed: an unreadable close state refuses the call.
+    if (await channelClosingForSpend(env, channelContract)) {
+      await fenceChannelPersistent(env, channelContract).catch(() => {})
+      await releaseChannelDeliveryLock(env, channelContract, lockId)
+      return {
+        kind: 'respond',
+        response: fail(410, 'channel_closing', 'this channel is closing/refundable; open a new one'),
       }
     }
     const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))

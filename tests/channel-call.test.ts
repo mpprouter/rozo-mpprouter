@@ -71,6 +71,11 @@ const h = vi.hoisted(() => ({
   revalidate: vi.fn(async () => true),
   rollback: vi.fn(async () => true),
   callUpstream: vi.fn(),
+  closing: vi.fn(async () => false),
+}))
+
+vi.mock('../src/playground/channel-close-guard', () => ({
+  channelClosingForSpend: h.closing,
 }))
 
 vi.mock('mppx', () => ({
@@ -208,6 +213,8 @@ beforeEach(() => {
   h.rollback.mockReset()
   h.rollback.mockResolvedValue(true)
   h.callUpstream.mockReset()
+  h.closing.mockReset()
+  h.closing.mockResolvedValue(false)
 })
 
 describe('handleChannelChat — real-cost voucher metering', () => {
@@ -332,6 +339,29 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(res.status).toBe(502)
     expect((await res.json()).charged_usd).toBe('0.00')
     expect(h.release).toHaveBeenCalled() // finally always releases
+  })
+
+  it('R8: rejects a call on a channel already in close_start (410, no upstream pay, fenced)', async () => {
+    h.closing.mockResolvedValue(true) // channel has entered close_start / within margin
+    const res = await handleChannelChat(chatReq(), env())
+    expect(res.status).toBe(410)
+    expect((await res.json()).error).toBe('channel_closing')
+    // Never paid upstream on a refundable channel...
+    expect(h.callUpstream).not.toHaveBeenCalled()
+    // ...and it is durably fenced so later calls reject without another RPC.
+    expect(atomic.backing.get(`pg:channel:fenced:${CHANNEL}`)).toBeTruthy()
+    expect(h.release).toHaveBeenCalled()
+  })
+
+  it('R8: once the cron has fenced a detected close_start, the next call is rejected without an RPC', async () => {
+    // Simulate the cron having durably fenced the channel on close_start detection.
+    atomic.backing.set(`pg:channel:fenced:${CHANNEL}`, { fencedAt: 'now' })
+    const res = await handleChannelChat(chatReq(), env())
+    expect(res.status).toBe(410)
+    expect((await res.json()).error).toBe('channel_closed')
+    // The blocked gate short-circuits BEFORE the close-state RPC and before pay.
+    expect(h.closing).not.toHaveBeenCalled()
+    expect(h.callUpstream).not.toHaveBeenCalled()
   })
 
   it('rejects a call once the channel has been marked closed (settlement fence)', async () => {

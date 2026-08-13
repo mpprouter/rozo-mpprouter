@@ -124,9 +124,6 @@ export async function settleOneChannel(
     // Authoritative read UNDER the lock — this is the latest committed voucher.
     const voucher = await getLatestVoucher(env, channelContract)
     if (!voucher) return null
-    const cumulativeRaw = BigInt(voucher.cumulativeRaw)
-    const unsettled = cumulativeRaw - BigInt(voucher.lastSettledRaw || '0')
-    if (unsettled <= 0n) return null
 
     const state = await deps.getChannelState({
       channel: channelContract,
@@ -134,6 +131,16 @@ export async function settleOneChannel(
       rpcUrl: env.STELLAR_RPC_URL,
     })
     const closing = state.closeEffectiveAtLedger != null
+
+    // Round-8: the moment the cron observes close_start, durably fence the
+    // channel so ALL subsequent calls reject immediately (410) WITHOUT an RPC —
+    // even if there is nothing to settle this tick. This closes the TOCTOU where
+    // a funder spends on a closing channel and refunds before we collect.
+    if (closing) await fenceChannelPersistent(env, channelContract)
+
+    const cumulativeRaw = BigInt(voucher.cumulativeRaw)
+    const unsettled = cumulativeRaw - BigInt(voucher.lastSettledRaw || '0')
+    if (unsettled <= 0n) return null
     if (!closing && unsettled < SETTLE_THRESHOLD_RAW) return null
 
     // P0-3: getChannelState is a network RPC that could stall past the lock TTL,
