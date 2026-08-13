@@ -233,8 +233,8 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(res.status).toBe(200)
     const json = (await res.json()) as any
     expect(json.message).toBe('hi there')
-    expect(h.state.capturedAmount).toBe('0.0220000')
-    expect(json.charged_usd).toBe('0.022')
+    expect(h.state.capturedAmount).toBe('0.1000000')
+    expect(json.charged_usd).toBe('0.10')
     expect(json.upstream_cost_usd).toBe('0.0005')
     expect(h.rollback).not.toHaveBeenCalled()
     // Latest voucher persisted in the ATOMIC store (not plain KV).
@@ -309,7 +309,7 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     const json = (await res.json()) as any
     expect(json.error).toBe('upstream_empty')
     // Money moved → charge stands at the quote.
-    expect(json.charged_usd).toBe('0.022')
+    expect(json.charged_usd).toBe('0.10')
     // Voucher persisted (collector can redeem) and lock released, despite the
     // unusable body — never thrown out of the paid section.
     expect(atomic.backing.get(`pg:channel:voucher:${CHANNEL}`)?.signature).toBe(SIG_HEX)
@@ -510,8 +510,8 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     // have landed before the error). The persist "throws" but readback confirms
     // coverage → treat as committed, charge the quote, never report $0.
     atomic.backing.set(`pg:channel:voucher:${CHANNEL}`, {
-      cumulativeRaw: '220000',
-      amountDecimal: '0.0220000',
+      cumulativeRaw: '1000000',
+      amountDecimal: '0.1000000',
       signature: SIG_HEX,
       lastSettledRaw: '0',
       updatedAt: 'now',
@@ -524,12 +524,12 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     })
     const res = await handleChannelChat(chatReq(), env())
     expect(res.status).toBe(200)
-    expect((await res.json()).charged_usd).toBe('0.022') // redeemable → charged, not $0
+    expect((await res.json()).charged_usd).toBe('0.10') // redeemable → charged, not $0
     expect(h.rollback).not.toHaveBeenCalled()
   })
 
   it('P0-1: rejects a call whose new cumulative would exceed the channel deposit', async () => {
-    h.state.depositRaw = '100000' // $0.01 deposit; quote is $0.022 → over
+    h.state.depositRaw = '100000' // $0.01 deposit; flat quote is $0.10 → over
     const res = await handleChannelChat(chatReq(), env())
     expect(res.status).toBe(402)
     const json = (await res.json()) as any
@@ -539,8 +539,8 @@ describe('handleChannelChat — real-cost voucher metering', () => {
   })
 
   it('P0-1: the deposit caps total spend — a second call past the deposit is rejected', async () => {
-    // Deposit funds exactly one $0.022 call ($0.03). First call succeeds.
-    h.state.depositRaw = '300000'
+    // Deposit funds exactly one $0.10 flat call ($0.15). First call succeeds.
+    h.state.depositRaw = '1500000'
     h.callUpstream.mockResolvedValue({
       value: { choices: [{ message: { content: 'ok' } }] },
       paid: true,
@@ -549,8 +549,8 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     const first = await handleChannelChat(chatReq(), env())
     expect(first.status).toBe(200)
     // Reflect the first call's advance in the cumulative watermark the gate reads.
-    atomic.backing.set(`stellar:channel:cumulative:${CHANNEL}`, { amount: '220000' })
-    // Second call: 220000 + 220000 > 300000 → rejected, cap holds.
+    atomic.backing.set(`stellar:channel:cumulative:${CHANNEL}`, { amount: '1000000' })
+    // Second call: 1000000 + 1000000 > 1500000 → rejected, cap holds.
     h.callUpstream.mockClear()
     const second = await handleChannelChat(chatReq(), env())
     expect(second.status).toBe(402)
