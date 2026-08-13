@@ -211,8 +211,9 @@ export async function markVoucherWrittenOff(
   reason: string,
 ): Promise<void> {
   const s = store(env)
-  // Per-channel terminal record (idempotent set) ...
-  const wrote = await (s.update as any)(writeoffKey(channelContract), (current: any) =>
+  // Per-channel terminal record — idempotent set, order-independent of the
+  // aggregate below.
+  await (s.update as any)(writeoffKey(channelContract), (current: any) =>
     current
       ? { op: 'noop', result: false }
       : {
@@ -221,18 +222,24 @@ export async function markVoucherWrittenOff(
           result: true,
         },
   )
-  // ...plus a global recon aggregate (count + total raw), bumped only on the
-  // FIRST write for a channel so a retried write-off never double-counts.
-  if (wrote) {
-    await (s.update as any)(RECON_WRITEOFF_KEY, (current: any) => ({
+  // Global recon aggregate. The dedup set lives INSIDE the aggregate value, so
+  // count/totalRaw/membership advance in ONE CAS — a crash between the two
+  // writes above/below can only cause a retry that no-ops here, never a
+  // permanent undercount or a double-count. Bounded: one entry per playground
+  // channel that was ever written off (rare by design).
+  await (s.update as any)(RECON_WRITEOFF_KEY, (current: any) => {
+    const channels: Record<string, string> = current?.channels ?? {}
+    if (channels[channelContract] !== undefined) return { op: 'noop', result: false }
+    return {
       op: 'set',
       value: {
         count: (current?.count ?? 0) + 1,
         totalRaw: (BigInt(current?.totalRaw ?? '0') + BigInt(cumulativeRaw)).toString(),
+        channels: { ...channels, [channelContract]: cumulativeRaw },
       },
       result: true,
-    }))
-  }
+    }
+  })
 }
 
 export async function getWriteoffTotals(env: Env): Promise<{ count: number; totalRaw: string }> {
