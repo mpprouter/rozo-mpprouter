@@ -56,7 +56,7 @@ const h = vi.hoisted(() => ({
   state: {
     sufficient: true,
     capturedAmount: '',
-    acceptedAmount: '220000',
+    acceptedAmount: '1000000',
     signature: 'aa'.repeat(64),
     depositRaw: '100000000', // $10 — plenty unless a test lowers it
   } as {
@@ -203,7 +203,7 @@ beforeEach(() => {
   atomic.state.failFenceUpdate = false
   h.state.sufficient = true
   h.state.capturedAmount = ''
-  h.state.acceptedAmount = '220000'
+  h.state.acceptedAmount = '1000000'
   h.state.signature = SIG_HEX
   h.state.depositRaw = '100000000'
   h.acquire.mockClear()
@@ -243,7 +243,7 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     // R7-P0-1: the stored cumulative equals the signed voucher's BASE-UNIT
     // amount EXACTLY — no 10^7 drift from re-scaling an already-base-unit value.
     expect(stored.cumulativeRaw).toBe(h.state.acceptedAmount)
-    expect(stored.cumulativeRaw).toBe('220000')
+    expect(stored.cumulativeRaw).toBe('1000000')
   })
 
   it('rejects an insufficient voucher delta with the mppx 402 (unbilled)', async () => {
@@ -264,7 +264,7 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(res.status).toBe(502)
     const json = (await res.json()) as any
     expect(json.error).toBe('upstream_unpaid')
-    expect(h.rollback).toHaveBeenCalledWith(expect.anything(), CHANNEL, '220000', '0', 'chal-1')
+    expect(h.rollback).toHaveBeenCalledWith(expect.anything(), CHANNEL, '1000000', '0', 'chal-1')
   })
 
   it('keeps the charge when a credential was signed but upstream then failed (evidence=yes)', async () => {
