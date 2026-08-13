@@ -26,12 +26,19 @@ const ALLOWED_REQUEST_HEADERS = [
   'content-type',
   'payment-signature',
   'x-request-id',
+  // mppx/x402 channel-voucher retry sends the credential in these headers
+  'accept-payment',
+  'x-payment',
+  'payment',
 ].join(', ')
 
 const EXPOSED_RESPONSE_HEADERS = [
   'www-authenticate',
   'payment-required',
   'x-request-id',
+  // 402 challenge headers the browser mppx client must read
+  'accept-payment',
+  'payment',
 ].join(', ')
 
 const ALLOWED_METHODS = 'GET, POST, OPTIONS'
