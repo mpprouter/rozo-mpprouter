@@ -107,6 +107,7 @@ import {
   verifyPlaygroundTurnstile,
 } from '../playground/turnstile'
 import { getStellarUsdcSac } from '../mpp/stellar-server'
+import { getSupersededAbortCount } from '../playground/channel-voucher-store'
 import {
   CHANNEL_DEPOSIT_OPTIONS,
   CHANNEL_MAX_DEPOSIT_USD,
@@ -641,7 +642,19 @@ export async function handlePlaygroundAdminTotals(
 
   const totals = await readTotals(env)
   if (!totals.ok) return ledgerErrorResponse(totals)
-  return json({ ok: true, value: totals.value })
+  // Channel recon: surface the count of paid-then-superseded aborts (the
+  // documented bounded router loss) so it is operator-visible, never silent.
+  let supersededAborts = 0
+  try {
+    supersededAborts = await getSupersededAbortCount(env)
+  } catch (e: any) {
+    console.error('[playground] reading channel recon counter failed:', e?.message)
+  }
+  return json({
+    ok: true,
+    value: totals.value,
+    channel: { superseded_aborts: supersededAborts },
+  })
 }
 
 /**

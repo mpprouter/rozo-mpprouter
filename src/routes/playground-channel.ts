@@ -32,6 +32,7 @@ import { getStellarUsdcSac } from '../mpp/stellar-server'
 import {
   acquireChannelDeliveryLock,
   releaseChannelDeliveryLock,
+  revalidateChannelDeliveryLock,
   rollbackFailedChannelVoucher,
   StellarChannelNotRegisteredError,
 } from '../mpp/stellar-channel-dispatch'
@@ -68,7 +69,9 @@ import {
   type OnChainChannel,
 } from '../playground/channel-onchain'
 import {
-  isChannelClosed,
+  fenceChannelPersistent,
+  incrSupersededAbort,
+  isChannelBlocked,
   markChannelClosed,
   putLatestVoucher,
 } from '../playground/channel-voucher-store'
@@ -397,10 +400,11 @@ async function verifyChannelVoucher(
         }),
       }
     }
-    // Fence against settlement (P0-C): once the settlement cron has marked the
-    // channel closed (or is mid-close under the same lock), no new call may pay
-    // upstream — the on-chain close is final and would strand this charge.
-    if (await isChannelClosed(env, channelContract)) {
+    // Fence gate (P0-C / P0-2): reject if the channel is blocked by EITHER the
+    // fast atomic closed marker OR the durable KV fence — independent of lock
+    // state, so a released/taken-over lock can never let a call advance a fenced
+    // channel.
+    if (await isChannelBlocked(env, channelContract)) {
       await releaseChannelDeliveryLock(env, channelContract, lockId)
       return {
         kind: 'respond',
@@ -536,10 +540,21 @@ async function reverseChargeOrFence(
     console.error(`[channel] voucher rollback threw for ${channelContract}: ${e?.message}`)
   }
   if (!rolledBack) {
-    // Could not cleanly restore the watermark → fence so no later call can
+    // Could not cleanly restore the watermark → FENCE so no later call can
     // advance from this stale watermark and absorb the un-charged increment.
+    // The durable KV fence is independent of the lock and retried, so it holds
+    // even if the fast atomic marker write fails and even after the lock later
+    // releases or is taken over. Fail-closed: a fence that cannot be written at
+    // all is logged CRITICAL (astronomically rare — both stores down).
     console.error(`[channel] rollback did not restore watermark for ${channelContract}; fencing`)
     await markChannelClosed(env, channelContract).catch(() => {})
+    const fenced = await fenceChannelPersistent(env, channelContract)
+    if (!fenced) {
+      console.error(
+        `[channel] CRITICAL: could not persist fence for ${channelContract}; ` +
+          `a later call could advance a stale watermark until an operator fences it`,
+      )
+    }
   }
 }
 
@@ -571,6 +586,42 @@ async function persistVoucherOrReverse(
     await reverseChargeOrFence(env, channelContract, voucher)
     return false
   }
+}
+
+/**
+ * Persist a PAID call's voucher, but only if we still hold the fencing token.
+ * Returns a Response to return immediately on failure/supersede, or null on
+ * success (the charge stands, caller continues to build the body).
+ *
+ * The token is re-validated at the last instant before the money-mutating
+ * persist. A supersede HERE means we paid upstream and then a TTL takeover
+ * happened (only possible after a multi-minute hang) — the DOCUMENTED, bounded,
+ * recon-monitored residual: we abort our own persist (a new holder owns the
+ * channel and may have advanced past us), eating this one call's upstream cost.
+ * We count it so an operator can see it; we never write stale state.
+ */
+async function commitPaidVoucher(
+  env: Env,
+  channelContract: string,
+  voucher: ChannelVoucher,
+  lockId: string,
+  id: string,
+): Promise<Response | null> {
+  if (!(await revalidateChannelDeliveryLock(env, channelContract, lockId))) {
+    await incrSupersededAbort(env).catch(() => {})
+    console.error(
+      `[channel] paid-then-superseded on ${channelContract}: aborting persist ` +
+        `(bounded router loss of one call's upstream cost; recon-counted)`,
+    )
+    return fail(409, 'lock_superseded_after_pay', 'this call was superseded after payment; you were not charged', {
+      call_id: id,
+      charged_usd: '0.00',
+    })
+  }
+  if (!(await persistVoucherOrReverse(env, channelContract, voucher))) {
+    return settlementFailed(id)
+  }
+  return null
 }
 
 /** Response when the settlement voucher could not be persisted (charge reversed). */
@@ -845,6 +896,19 @@ async function executeMeteredChannelCall(
   }
 
   try {
+    // Re-validate the fencing token BEFORE spending money. If a TTL takeover
+    // superseded us, abort WITHOUT paying — no router loss, no charge. A success
+    // also refreshes the lock TTL so the pay+persist that follow can't be raced.
+    if (!(await revalidateChannelDeliveryLock(env, channelContract, lockId))) {
+      await reverseChargeOrFence(env, channelContract, voucher)
+      return withReceipt(
+        fail(409, 'lock_superseded', 'this call was superseded before payment; you were not charged', {
+          call_id: id,
+          charged_usd: '0.00',
+        }),
+      )
+    }
+
     let up: { value: unknown; paid: boolean; upstreamCostRaw?: string }
     try {
       up = await doUpstream()
@@ -855,10 +919,10 @@ async function executeMeteredChannelCall(
           : new UpstreamError('upstream_error', 502, (e as any)?.message ?? 'upstream call failed', 'no')
       if (ue.paymentEvidence === 'yes') {
         // Money moved → the charge stands. Persist the redeemable voucher
-        // BEFORE returning (never leave an advanced, uncollectable cumulative).
-        if (!(await persistVoucherOrReverse(env, channelContract, voucher))) {
-          return withReceipt(settlementFailed(id))
-        }
+        // BEFORE returning (never leave an advanced, uncollectable cumulative),
+        // re-checking the fencing token first.
+        const r = await commitPaidVoucher(env, channelContract, voucher, lockId, id)
+        if (r) return withReceipt(r)
         return withReceipt(
           fail(ue.status, ue.code, ue.message, {
             call_id: id,
@@ -883,9 +947,11 @@ async function executeMeteredChannelCall(
       )
     }
 
-    // PAID → persist the redeemable voucher BEFORE inspecting the body (P0-4).
-    if (!(await persistVoucherOrReverse(env, channelContract, voucher))) {
-      return withReceipt(settlementFailed(id))
+    // PAID → persist the redeemable voucher BEFORE inspecting the body (P0-4),
+    // re-checking the fencing token first (P0-1).
+    {
+      const r = await commitPaidVoucher(env, channelContract, voucher, lockId, id)
+      if (r) return withReceipt(r)
     }
 
     // Parse AFTER persist. A garbage/null body must not escape the paid section;

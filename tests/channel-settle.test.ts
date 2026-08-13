@@ -37,6 +37,8 @@ import {
   getLatestVoucher,
   putLatestVoucher,
   markVoucherSettled,
+  getSupersededAbortCount,
+  incrSupersededAbort,
 } from '../src/playground/channel-voucher-store'
 import { putPgChannel, PG_PROVENANCE_VERSION } from '../src/playground/channel-pg-store'
 import {
@@ -148,6 +150,16 @@ describe('atomic voucher store', () => {
     expect(v?.cumulativeRaw).toBe('500000')
     await markVoucherSettled(e, CHANNEL, '500000')
     expect((await getLatestVoucher(e, CHANNEL))?.lastSettledRaw).toBe('500000')
+  })
+})
+
+describe('recon superseded-abort counter (P0-1 residual visibility)', () => {
+  it('starts at 0 and increments monotonically', async () => {
+    const e = env(makeKv())
+    expect(await getSupersededAbortCount(e)).toBe(0)
+    await incrSupersededAbort(e)
+    await incrSupersededAbort(e)
+    expect(await getSupersededAbortCount(e)).toBe(2)
   })
 })
 

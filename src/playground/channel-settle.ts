@@ -34,7 +34,12 @@ import type { Env } from '../index'
 import { parseUsd } from './amount'
 import { channelCollector, channelPlaygroundEnabled } from './channel-config'
 import { listPgChannels, pgChannelProvenanceOk } from './channel-pg-store'
-import { getLatestVoucher, markChannelClosed, markVoucherSettled } from './channel-voucher-store'
+import {
+  fenceChannelPersistent,
+  getLatestVoucher,
+  markChannelClosed,
+  markVoucherSettled,
+} from './channel-voucher-store'
 import {
   acquireChannelDeliveryLock,
   releaseChannelDeliveryLock,
@@ -131,8 +136,11 @@ export async function settleOneChannel(
     if (!closing && unsettled < SETTLE_THRESHOLD_RAW) return null
 
     // Mark closed BEFORE the (final) close so any call that acquires the lock
-    // after we release it rejects instead of paying upstream.
+    // after we release it rejects instead of paying upstream. Write BOTH the
+    // fast atomic marker and the durable KV fence so the dispatch gate rejects
+    // regardless of lock state even after we release.
     await markChannelClosed(env, channelContract)
+    await fenceChannelPersistent(env, channelContract)
 
     const signature = decodeVoucherSignature(voucher.signature)
     const txHash = await deps.close({

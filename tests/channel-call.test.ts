@@ -24,11 +24,12 @@ const SIG_HEX = 'aa'.repeat(64)
 // In-memory atomic store standing in for the DO-backed Store.cloudflare(...).
 const atomic = vi.hoisted(() => {
   const backing = new Map<string, any>()
-  const state = { failVoucherUpdate: false }
+  const state = { failVoucherUpdate: false, failClosedUpdate: false }
   const store = {
     get: async (k: string) => (backing.has(k) ? backing.get(k) : null),
     update: async (k: string, cb: (cur: any) => any) => {
       if (state.failVoucherUpdate && k.includes('voucher')) throw new Error('atomic update failed')
+      if (state.failClosedUpdate && k.includes('closed')) throw new Error('atomic closed update failed')
       const cur = backing.has(k) ? backing.get(k) : null
       const r = cb(cur)
       if (r.op === 'set') backing.set(k, r.value)
@@ -56,6 +57,7 @@ const h = vi.hoisted(() => ({
   },
   acquire: vi.fn(async () => true),
   release: vi.fn(async () => {}),
+  revalidate: vi.fn(async () => true),
   rollback: vi.fn(async () => true),
   callUpstream: vi.fn(),
 }))
@@ -74,6 +76,7 @@ vi.mock('../src/mpp/kv-atomic-store', () => ({ doAtomicParams: () => ({}) }))
 vi.mock('../src/mpp/stellar-channel-dispatch', () => ({
   acquireChannelDeliveryLock: h.acquire,
   releaseChannelDeliveryLock: h.release,
+  revalidateChannelDeliveryLock: h.revalidate,
   rollbackFailedChannelVoucher: h.rollback,
   StellarChannelNotRegisteredError: class StellarChannelNotRegisteredError extends Error {},
 }))
@@ -138,11 +141,24 @@ vi.mock('../src/playground/upstream', () => ({
 import { handleChannelChat } from '../src/routes/playground-channel'
 import { UpstreamError } from '../src/playground/upstream'
 
+let kv: { map: Map<string, string>; get: any; put: any }
+function makeKv() {
+  const m = new Map<string, string>()
+  return {
+    map: m,
+    get: async (k: string) => m.get(k) ?? null,
+    put: async (k: string, v: string) => {
+      m.set(k, v)
+    },
+  }
+}
+
 function env() {
   return {
     STELLAR_NETWORK: 'stellar:pubnet',
     STELLAR_ROUTER_PUBLIC: FUNDER,
     ATOMIC_STORE: {},
+    MPP_STORE: kv,
     PLAYGROUND_CHANNEL_ENABLED: 'true',
   } as any
 }
@@ -163,14 +179,19 @@ function chatReq() {
 
 beforeEach(() => {
   atomic.backing.clear()
+  kv = makeKv()
   atomic.state.failVoucherUpdate = false
+  atomic.state.failClosedUpdate = false
   h.state.sufficient = true
   h.state.capturedAmount = ''
   h.state.acceptedAmount = '0.0220000'
   h.state.signature = SIG_HEX
   h.acquire.mockClear()
   h.release.mockClear()
-  h.rollback.mockClear()
+  h.revalidate.mockReset()
+  h.revalidate.mockResolvedValue(true)
+  h.rollback.mockReset()
+  h.rollback.mockResolvedValue(true)
   h.callUpstream.mockReset()
 })
 
@@ -302,5 +323,60 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect((await res.json()).error).toBe('channel_closed')
     expect(h.callUpstream).not.toHaveBeenCalled()
     expect(h.release).toHaveBeenCalled()
+  })
+
+  it('P0-1: superseded token BEFORE payment aborts without paying (charged 0)', async () => {
+    h.revalidate.mockResolvedValue(false) // taken over before we pay
+    const res = await handleChannelChat(chatReq(), env())
+    expect(res.status).toBe(409)
+    const json = (await res.json()) as any
+    expect(json.error).toBe('lock_superseded')
+    expect(json.charged_usd).toBe('0.00')
+    expect(h.callUpstream).not.toHaveBeenCalled() // never paid
+    expect(atomic.backing.get(`pg:channel:voucher:${CHANNEL}`)).toBeUndefined()
+    expect(h.release).toHaveBeenCalled()
+  })
+
+  it('P0-1: superseded AFTER payment aborts persist, counts the recon abort (bounded router loss)', async () => {
+    // Owns the lock at pay-time, superseded by the persist-time re-check.
+    h.revalidate.mockResolvedValueOnce(true).mockResolvedValueOnce(false)
+    h.callUpstream.mockResolvedValue({
+      value: { choices: [{ message: { content: 'hi' } }] },
+      paid: true,
+      upstreamCostRaw: '500',
+    })
+    const res = await handleChannelChat(chatReq(), env())
+    expect(res.status).toBe(409)
+    const json = (await res.json()) as any
+    expect(json.error).toBe('lock_superseded_after_pay')
+    expect(json.charged_usd).toBe('0.00')
+    expect(h.callUpstream).toHaveBeenCalledOnce() // we DID pay
+    // Did NOT persist a stale voucher; recon counter incremented so the loss is visible.
+    expect(atomic.backing.get(`pg:channel:voucher:${CHANNEL}`)).toBeUndefined()
+    expect(atomic.backing.get('pg:channel:recon:superseded-aborts').count).toBe(1)
+    expect(h.release).toHaveBeenCalled()
+  })
+
+  it('P0-2: when the atomic fence fails, the durable KV fence still blocks the next call', async () => {
+    // Unpaid + rollback fails → must fence; the atomic marker write also fails,
+    // so only the durable KV fence lands.
+    h.callUpstream.mockResolvedValue({
+      value: { choices: [{ message: { content: 'x' } }] },
+      paid: false,
+    })
+    h.rollback.mockResolvedValue(false)
+    atomic.state.failClosedUpdate = true
+    const first = await handleChannelChat(chatReq(), env())
+    expect((await first.json()).error).toBe('upstream_unpaid')
+    // The durable KV fence landed even though the atomic marker write threw.
+    expect(kv.map.get(`channelFenced:${CHANNEL}`)).toBeTruthy()
+
+    // A subsequent call is rejected by the dispatch gate regardless of lock state.
+    atomic.state.failClosedUpdate = false
+    h.callUpstream.mockClear()
+    const second = await handleChannelChat(chatReq(), env())
+    expect(second.status).toBe(410)
+    expect((await second.json()).error).toBe('channel_closed')
+    expect(h.callUpstream).not.toHaveBeenCalled()
   })
 })

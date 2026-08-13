@@ -102,8 +102,71 @@ export async function markChannelClosed(env: Env, channelContract: string): Prom
   }))
 }
 
-/** True once a channel has been marked closed — calls must reject afterwards. */
+/** True once a channel has been marked closed (fast atomic marker). */
 export async function isChannelClosed(env: Env, channelContract: string): Promise<boolean> {
   const v = await store(env).get(closedKey(channelContract))
   return v != null
+}
+
+// ---------------------------------------------------------------------------
+// Lock-INDEPENDENT persistent fence (P0-2). Kept in KV, separate from the
+// atomic closed marker, so that even if the atomic store write fails the fence
+// still lands. The dispatch gate checks BOTH markers on every call, so a fenced
+// channel rejects regardless of lock state — a released or taken-over lock can
+// never let a call advance a fenced channel.
+// ---------------------------------------------------------------------------
+
+const fenceKey = (c: string) => `channelFenced:${c}`
+
+/**
+ * Durably fence a channel, retrying a few times. Returns true iff the marker was
+ * written. The caller logs CRITICAL when this returns false — that is the only
+ * (astronomically rare, both-stores-down) case where the fence could be missed.
+ */
+export async function fenceChannelPersistent(env: Env, channelContract: string): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await env.MPP_STORE.put(
+        fenceKey(channelContract),
+        JSON.stringify({ fencedAt: new Date().toISOString() }),
+      )
+      return true
+    } catch (e: any) {
+      console.error(`[channel] persistent fence write attempt ${attempt + 1} failed: ${e?.message}`)
+    }
+  }
+  return false
+}
+
+/**
+ * A channel is BLOCKED for new calls if either the fast atomic closed marker OR
+ * the durable KV fence is set. The dispatch gate calls this on every request.
+ */
+export async function isChannelBlocked(env: Env, channelContract: string): Promise<boolean> {
+  if (await isChannelClosed(env, channelContract)) return true
+  const f = await env.MPP_STORE.get(fenceKey(channelContract))
+  return f != null
+}
+
+// ---------------------------------------------------------------------------
+// Recon: count of paid-then-superseded aborts (the documented bounded router
+// loss — a call that paid upstream, hung past the lock TTL, was superseded, and
+// aborted its own persist). Surfaced via the operator totals endpoint so it is
+// recon-visible, never a silent hole.
+// ---------------------------------------------------------------------------
+
+const RECON_SUPERSEDE_KEY = 'pg:channel:recon:superseded-aborts'
+
+export async function incrSupersededAbort(env: Env): Promise<void> {
+  const s = store(env)
+  await (s.update as any)(RECON_SUPERSEDE_KEY, (current: any) => ({
+    op: 'set',
+    value: { count: (current?.count ?? 0) + 1 },
+    result: true,
+  }))
+}
+
+export async function getSupersededAbortCount(env: Env): Promise<number> {
+  const v = (await store(env).get(RECON_SUPERSEDE_KEY)) as any
+  return v?.count ?? 0
 }

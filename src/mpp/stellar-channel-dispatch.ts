@@ -211,12 +211,43 @@ export async function rollbackFailedChannelVoucher(
 
 /**
  * TTL after which a delivery lock is considered leaked and may be taken over.
- * Set well above the longest critical section (an upstream call + settle,
- * ~tens of seconds) so a live holder is never displaced, but well below the
- * ~10-minute (100-ledger) refund window so a leaked lock self-heals in time for
- * the settlement cron (which runs every 2 minutes) to still collect.
+ * Set FAR above the longest real critical section (an upstream call + persist is
+ * seconds) so takeover only ever hits a genuinely dead/hung holder — never a
+ * merely-slow one — yet well below the ~600s (100-ledger) refund window so a
+ * leaked lock self-heals in time for the settlement cron (every 2 min) to still
+ * collect. Money-mutating steps additionally re-validate the fencing token
+ * (revalidateChannelDeliveryLock) so a superseded holder aborts instead of
+ * writing stale state.
  */
-export const DELIVERY_LOCK_TTL_MS = 120_000
+export const DELIVERY_LOCK_TTL_MS = 300_000
+
+/**
+ * Re-validate that `lockId` still owns the lock AND refresh its TTL, atomically.
+ * Called immediately before any money-mutating step (pay / persist). Returns
+ * false when the lock was taken over (this holder was superseded) — the caller
+ * MUST then abort without paying or persisting. On success the TTL is extended
+ * so no concurrent takeover can race the mutation that follows.
+ */
+export async function revalidateChannelDeliveryLock(
+  env: Env,
+  channelContract: string,
+  lockId: string,
+): Promise<boolean> {
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+  const now = Date.now()
+  return (store.update as any)(`refund:channel-lock:${channelContract}`, (current: any) => {
+    if (!current || current.id !== lockId) return { op: 'noop', result: false }
+    return {
+      op: 'set',
+      value: {
+        id: lockId,
+        acquiredAt: current.acquiredAt ?? new Date(now).toISOString(),
+        expiresAt: now + DELIVERY_LOCK_TTL_MS,
+      },
+      result: true,
+    }
+  })
+}
 
 export async function acquireChannelDeliveryLock(
   env: Env,
