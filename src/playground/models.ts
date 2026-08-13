@@ -144,6 +144,30 @@ export const MAX_MESSAGES_PER_TURN = 12
 export const MAX_MESSAGE_CHARS = 8_000
 
 export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
+  // ---- cheap / fast tier ----
+  {
+    // Re-verified 2026-08-13 with a REAL PAID CALL bypassing the router
+    // (probe-merchant-direct.ts → groq.mpp.paywithlocus.com/groq/chat,
+    // HTTP 200 + completion). Re-added while the Anthropic Tempo merchant is
+    // down (403-after-pay) — the paywithlocus merchants are healthy.
+    id: 'llama-3.1-8b-instant',
+    tier: 'cheap',
+    provider: 'groq',
+    routePublicPath: '/v1/services/groq/chat',
+    routeMethod: 'POST',
+    available: true,
+  },
+  {
+    // Re-verified 2026-08-13 with a REAL PAID CALL bypassing the router
+    // (probe-merchant-direct.ts → deepseek.mpp.paywithlocus.com/deepseek/chat,
+    // HTTP 200 + completion, id echoed back verbatim).
+    id: 'deepseek-v4-flash',
+    tier: 'cheap',
+    provider: 'deepseek',
+    routePublicPath: '/v1/services/deepseek/chat',
+    routeMethod: 'POST',
+    available: true,
+  },
   // ---- cheap / fast tier: one current-gen, charge-verified, callable model ----
   {
     // Verified 2026-08-09 alongside the flagship Claude ids (merchants.ts
@@ -377,6 +401,14 @@ export const CALL_HISTORY_LIMIT = 20
 export const CHAT_OUTAGE_REASON =
   'Paid chat calls are temporarily paused: the upstream model provider is rejecting calls after accepting payment (observed 2026-08-13). Disabled so you are never charged for a call that cannot succeed.'
 
-export function chatModelsDisabled(env: { PLAYGROUND_CHAT_MODELS_DISABLED?: string }): boolean {
-  return env.PLAYGROUND_CHAT_MODELS_DISABLED === 'true'
+export function chatModelsDisabled(
+  env: { PLAYGROUND_CHAT_MODELS_DISABLED?: string },
+  provider?: string,
+): boolean {
+  const v = env.PLAYGROUND_CHAT_MODELS_DISABLED?.trim()
+  if (!v || v === 'false') return false
+  if (v === 'true') return true // blanket stop, all providers
+  // CSV of provider names, e.g. "anthropic,openai" — scoped outage stop.
+  const set = v.split(',').map(x => x.trim().toLowerCase()).filter(Boolean)
+  return provider !== undefined ? set.includes(provider.toLowerCase()) : false
 }

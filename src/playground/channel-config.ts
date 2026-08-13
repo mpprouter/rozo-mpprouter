@@ -227,12 +227,12 @@ export function channelWasmHash(env: { PLAYGROUND_CHANNEL_WASM_HASH?: string }):
  * the real-cost effective price so the UI shows honest per-call pricing.
  */
 export function channelPricingConfig(env: { PLAYGROUND_CHAT_MODELS_DISABLED?: string } = {}) {
-  const chatOutage = chatModelsDisabled(env)
   return {
     models: PLAYGROUND_MODELS.map(m => {
       const { maxUpstreamRaw, priceRaw } = channelPriceForModel(m)
-      const available = m.available && !chatOutage
-      const reason = !m.available ? m.unavailableReason : chatOutage ? CHAT_OUTAGE_REASON : undefined
+      const outage = chatModelsDisabled(env, m.provider)
+      const available = m.available && !outage
+      const reason = !m.available ? m.unavailableReason : outage ? CHAT_OUTAGE_REASON : undefined
       return {
         id: m.id,
         tier: m.tier,
