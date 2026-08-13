@@ -84,6 +84,8 @@ import {
   TIER_PRICE_USD,
   TIER_UPSTREAM_BUDGET_USD,
   assertModelCallable,
+  CHAT_OUTAGE_REASON,
+  chatModelsDisabled,
   findChip,
   findModel,
   isDepositOption,
@@ -284,14 +286,18 @@ export function handlePlaygroundConfig(env: Env): Response {
       site_key: env.PLAYGROUND_TURNSTILE_SITE_KEY ?? null,
       action: PLAYGROUND_TURNSTILE_ACTION,
     },
-    models: PLAYGROUND_MODELS.map(m => ({
-      id: m.id,
-      tier: m.tier,
-      provider: m.provider,
-      price_usd: TIER_PRICE_USD[m.tier],
-      available: m.available,
-      ...(m.unavailableReason ? { unavailable_reason: m.unavailableReason } : {}),
-    })),
+    models: PLAYGROUND_MODELS.map(m => {
+      const outage = chatModelsDisabled(env, m.provider)
+      const reason = !m.available ? m.unavailableReason : outage ? CHAT_OUTAGE_REASON : undefined
+      return {
+        id: m.id,
+        tier: m.tier,
+        provider: m.provider,
+        price_usd: TIER_PRICE_USD[m.tier],
+        available: m.available && !outage,
+        ...(reason ? { unavailable_reason: reason } : {}),
+      }
+    }),
     chips: PLAYGROUND_CHIPS.map(c => ({
       id: c.id,
       label: c.label,
@@ -931,6 +937,10 @@ export async function handlePlaygroundChat(request: Request, env: Env): Promise<
   let model
   try {
     model = assertModelCallable(body.model)
+    // Provider-scoped outage stop — reject BEFORE any charge work.
+    if (chatModelsDisabled(env, model.provider)) {
+      return fail(503, 'model_unavailable', CHAT_OUTAGE_REASON)
+    }
   } catch (e) {
     if (e instanceof ModelNotAllowedError) {
       return fail(400, e.code, e.message, {
