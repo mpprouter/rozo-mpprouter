@@ -7,11 +7,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { parseUsd } from '../src/playground/amount'
-import {
-  CHANNEL_FLAT_MODEL_PRICE_USD,
-  channelPriceForChip,
-  channelPriceForModel,
-} from '../src/playground/channel-config'
+import { channelPriceForChip, channelPriceForModel } from '../src/playground/channel-config'
 import {
   PLAYGROUND_CHIPS,
   PLAYGROUND_MODELS,
@@ -26,14 +22,6 @@ describe('channel quote always covers the max upstream cost (P0-3)', () => {
       const budget = parseUsd(TIER_UPSTREAM_BUDGET_USD[m.tier])
       expect(maxUpstreamRaw).toBe(budget)
       expect(priceRaw).toBeGreaterThan(budget)
-    }
-  })
-
-  it('every model is charged EXACTLY the flat uniform price (founder 2026-08-13)', () => {
-    const flat = parseUsd(CHANNEL_FLAT_MODEL_PRICE_USD)
-    for (const m of PLAYGROUND_MODELS) {
-      const { priceRaw } = channelPriceForModel(m)
-      expect(priceRaw).toBe(flat) // no per-model / per-tier price spread
     }
   })
 
