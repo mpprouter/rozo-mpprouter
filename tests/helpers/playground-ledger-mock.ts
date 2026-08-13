@@ -17,13 +17,31 @@ import { PlaygroundLedger } from '../../src/playground/ledger-do'
 
 class InMemoryStorage {
   readonly store = new Map<string, unknown>()
+  /**
+   * Fault-injection hook for torn-write tests. When set, it is called before
+   * each `put` with the keys about to be written; throwing simulates a storage
+   * write failure at that point.
+   */
+  failPut: ((keys: string[]) => void) | null = null
 
   async get<T>(key: string): Promise<T | undefined> {
     return this.store.get(key) as T | undefined
   }
 
-  async put<T>(key: string, value: T): Promise<void> {
-    this.store.set(key, value)
+  async put<T>(keyOrEntries: string | Record<string, T>, value?: T): Promise<void> {
+    // Faithful to the DO API: a multi-key object put is atomic (all-or-nothing).
+    // We apply into a staging copy first so a mid-apply throw (the torn-write
+    // simulation) leaves the store fully pre-transition, never half.
+    if (typeof keyOrEntries === 'string') {
+      this.failPut?.([keyOrEntries])
+      this.store.set(keyOrEntries, value)
+      return
+    }
+    this.failPut?.(Object.keys(keyOrEntries))
+    const staged = new Map(this.store)
+    for (const [k, v] of Object.entries(keyOrEntries)) staged.set(k, v)
+    this.store.clear()
+    for (const [k, v] of staged) this.store.set(k, v)
   }
 
   async delete(key: string): Promise<boolean> {
@@ -40,9 +58,15 @@ class InMemoryStorage {
   }
 
   /**
-   * `transaction()` runs the closure against the live store and undoes its
-   * writes on `rollback()`. The real runtime serialises requests at the DO
-   * boundary; tests are single-threaded, so ordering is equivalent.
+   * Faithful to the DO `transaction()` contract: all writes commit atomically
+   * when the closure returns, and a THROW rolls back every write made inside
+   * the transaction (serializable, all-or-nothing). The real runtime also
+   * serialises requests at the DO boundary; tests are single-threaded, so
+   * ordering is equivalent.
+   *
+   * The auto-rollback-on-throw is what makes the torn-write test meaningful: a
+   * transition whose second write fails must leave the store fully
+   * pre-transition, never half-applied.
    */
   async transaction<T>(closure: (txn: DurableObjectTransaction) => Promise<T>): Promise<T> {
     const written = new Map<string, { prev: unknown; existed: boolean }>()
@@ -51,29 +75,44 @@ class InMemoryStorage {
         written.set(k, { prev: this.store.get(k), existed: this.store.has(k) })
       }
     }
+    const rollback = () => {
+      for (const [k, { prev, existed }] of written) {
+        if (existed) this.store.set(k, prev)
+        else this.store.delete(k)
+      }
+    }
     const txn = {
       get: <V>(key: string) => Promise.resolve(this.store.get(key) as V | undefined),
-      put: async <V>(key: string, value: V) => {
-        remember(key)
-        this.store.set(key, value)
+      put: async <V>(keyOrEntries: string | Record<string, V>, value?: V) => {
+        const keys = typeof keyOrEntries === 'string' ? [keyOrEntries] : Object.keys(keyOrEntries)
+        // Record undo state BEFORE the fault hook so an in-transaction throw
+        // still rolls back cleanly (matching CF auto-rollback).
+        for (const k of keys) remember(k)
+        this.failPut?.(keys)
+        if (typeof keyOrEntries === 'string') {
+          this.store.set(keyOrEntries, value)
+        } else {
+          for (const [k, v] of Object.entries(keyOrEntries)) this.store.set(k, v)
+        }
       },
       delete: async (key: string) => {
         remember(key)
         return this.store.delete(key)
       },
       list: async () => new Map(),
-      rollback: () => {
-        for (const [k, { prev, existed }] of written) {
-          if (existed) this.store.set(k, prev)
-          else this.store.delete(k)
-        }
-      },
+      rollback,
       getAlarm: async () => null,
       setAlarm: async () => {},
       deleteAlarm: async () => {},
     } as unknown as DurableObjectTransaction
 
-    return closure(txn)
+    try {
+      return await closure(txn)
+    } catch (e) {
+      // CF DO transactions auto-roll-back on an uncaught throw.
+      rollback()
+      throw e
+    }
   }
 
   async deleteAll(): Promise<void> {
@@ -103,6 +142,14 @@ export interface PlaygroundLedgerMock {
   runAlarm(): Promise<void>
   /** Currently scheduled alarm time, or null. */
   getAlarm(): number | null
+  /**
+   * Install a fault that throws on the next `put` touching any of `keys`
+   * (single-shot). Used by torn-write tests to prove a transition either
+   * fully applies or fully rolls back.
+   */
+  failNextPutTouching(keys: string[]): void
+  /** Raw store snapshot, for asserting no half-applied state. */
+  snapshot(): Map<string, unknown>
 }
 
 export function makePlaygroundLedgerMockWithControls(): PlaygroundLedgerMock {
@@ -112,12 +159,21 @@ export function makePlaygroundLedgerMockWithControls(): PlaygroundLedgerMock {
     namespace: ns,
     runAlarm: () => control.instance.alarm(),
     getAlarm: () => control.alarm,
+    failNextPutTouching: (keys: string[]) => {
+      control.storage.failPut = (written: string[]) => {
+        if (written.some(k => keys.includes(k))) {
+          control.storage.failPut = null
+          throw new Error(`simulated storage write failure on ${written.join(',')}`)
+        }
+      }
+    },
+    snapshot: () => new Map(control.storage.store),
   }
 }
 
 const CONTROLS = new WeakMap<
   DurableObjectNamespace,
-  { instance: PlaygroundLedger; alarm: number | null }
+  { instance: PlaygroundLedger; alarm: number | null; storage: InMemoryStorage }
 >()
 
 export function makePlaygroundLedgerMock(): DurableObjectNamespace {
@@ -155,6 +211,7 @@ export function makePlaygroundLedgerMock(): DurableObjectNamespace {
 
   CONTROLS.set(ns, {
     instance,
+    storage,
     get alarm() {
       return storage.alarmAt
     },

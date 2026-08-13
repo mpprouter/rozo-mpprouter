@@ -238,16 +238,24 @@ export class PlaygroundLedger implements DurableObject {
       const ageSec = Math.round((now - call.at) / 1000)
       const possiblyPaid = call.dispatched === true
 
-      await this.storage.put(key, {
+      const settled: StoredCall = {
         ...call,
         status: 'released',
         charged: '0',
         release_reason: possiblyPaid ? 'reaped_dispatched' : 'reaped_never_dispatched',
         reaped: true,
         ...(possiblyPaid ? { reaped_release_possible_paid: true } : {}),
-      } satisfies StoredCall)
-      // Restore balance; DO NOT touch total:outstanding (the credit is unspent).
-      await this.storage.put(balKey, (balance + held).toString())
+      }
+      // SINGLE atomic write: the released call record and the restored balance
+      // land together or not at all. Two separate awaited puts could tear on a
+      // crash between them, permanently losing the hold and breaking the
+      // invariant `outstanding == Σ balances + Σ holds`. A multi-key object put
+      // is all-or-nothing in a Durable Object. total:outstanding is
+      // deliberately NOT touched — a release returns unspent credit to balance.
+      await this.storage.put({
+        [key]: settled,
+        [balKey]: (balance + held).toString(),
+      })
       console.warn(
         `[playground-ledger] reaped ${possiblyPaid ? 'DISPATCHED' : 'UNDISPATCHED'} call ` +
           `${call.call_id} (chip=${call.chip}) after ${ageSec}s; released ${held} atomic` +
@@ -299,12 +307,6 @@ export class PlaygroundLedger implements DurableObject {
 
   private async readAtomic(key: string): Promise<bigint> {
     return parseAtomic(await this.storage.get<string>(key))
-  }
-
-  private async addAtomic(key: string, delta: bigint): Promise<bigint> {
-    const next = (await this.readAtomic(key)) + delta
-    await this.storage.put(key, next.toString())
-    return next
   }
 
   // -------------------------------------------------------------------------

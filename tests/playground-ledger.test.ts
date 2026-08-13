@@ -942,3 +942,116 @@ describe('reaped settlements are surfaced for recon (accepted crash window)', ()
     expect(totals.value.balances_sum).toBe(parseUsd('1').toString())
   })
 })
+
+describe('multi-key transitions are atomic (P0-1 torn-write safety)', () => {
+  /**
+   * The invariant `outstanding == Σ balances + Σ holds` must hold after EVERY
+   * transition — reserve, commit, release, credit-on-open — because each is a
+   * single atomic put/transaction. This walks a full sequence and re-checks
+   * the invariant after every step.
+   */
+  it('holds the outstanding invariant after every step of a mixed sequence', async () => {
+    const env = makeEnv()
+
+    async function assertInvariant() {
+      const t = await readTotals(env)
+      expect(t.ok).toBe(true)
+      if (!t.ok) return
+      expect(parseAtomic(t.value.outstanding)).toBe(
+        parseAtomic(t.value.balances_sum) + parseAtomic(t.value.holds_sum),
+      )
+    }
+
+    // credit-on-open x2
+    await deposit(env, { account: ALICE, usd: '1', txHash: TX_A, opIndex: 0 })
+    await assertInvariant()
+    await deposit(env, { account: BOB, usd: '1', txHash: TX_B, opIndex: 0 })
+    await assertInvariant()
+
+    // reserve → commit (partial charge)
+    await reserve(env, { callId: 's1', account: ALICE, chip: 'chat', maxPriceAtomic: parseUsd('0.10'), now: Date.now() })
+    await assertInvariant()
+    await commit(env, 's1', parseUsd('0.02'))
+    await assertInvariant()
+
+    // reserve → release (full refund)
+    await reserve(env, { callId: 's2', account: BOB, chip: 'chat', maxPriceAtomic: parseUsd('0.10'), now: Date.now() })
+    await assertInvariant()
+    await release(env, 's2', 'test')
+    await assertInvariant()
+
+    // A committed charge left the outstanding pool for good.
+    const t = await readTotals(env)
+    if (!t.ok) return
+    expect(parseAtomic(t.value.committed)).toBe(parseUsd('0.02'))
+    expect(parseAtomic(t.value.outstanding)).toBe(parseUsd('1.98'))
+  })
+
+  it('a torn reaper release leaves state fully pre-transition (no lost hold)', async () => {
+    const mock = makePlaygroundLedgerMockWithControls()
+    const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
+    await deposit(env, { usd: '1' })
+
+    await reserve(env, {
+      callId: 'torn',
+      account: ALICE,
+      chip: 'chat',
+      maxPriceAtomic: parseUsd('0.02'),
+      now: Date.now() - RESERVED_LEASE_MS - 1,
+    })
+    await markDispatched(env, 'torn')
+
+    const balKey = `bal:${ALICE}`
+    const before = mock.snapshot()
+
+    // Fail on the BALANCE key only. This is the true torn-write discriminator:
+    // the old code wrote the 'released' call record FIRST and refunded the
+    // balance in a SECOND put, so failing the balance write left the call
+    // released with the hold permanently lost. The single object put touches
+    // both keys together, so this fault throws before EITHER is written.
+    mock.failNextPutTouching([balKey])
+    await expect(mock.runAlarm()).rejects.toThrow(/simulated storage write/)
+
+    // All-or-nothing: the call is STILL reserved and the balance is UNCHANGED —
+    // never half-released with a lost hold.
+    const after = await readAccount(env, ALICE)
+    if (!after.ok) return
+    const call = after.value.calls.find(c => c.call_id === 'torn')!
+    expect(call.status).toBe('reserved')
+    // Balance unchanged from the pre-alarm snapshot (hold still withheld).
+    expect(after.value.balance).toBe(String(before.get(balKey)))
+
+    // Invariant still holds after the failed transition.
+    const t = await readTotals(env)
+    if (!t.ok) return
+    expect(parseAtomic(t.value.outstanding)).toBe(
+      parseAtomic(t.value.balances_sum) + parseAtomic(t.value.holds_sum),
+    )
+  })
+
+  it('a torn commit transaction rolls back (invariant preserved)', async () => {
+    const mock = makePlaygroundLedgerMockWithControls()
+    const env = { PLAYGROUND_LEDGER: mock.namespace } as unknown as Env
+    await deposit(env, { usd: '1' })
+    await reserve(env, { callId: 'tc', account: ALICE, chip: 'chat', maxPriceAtomic: parseUsd('0.10'), now: Date.now() })
+
+    const before = await readTotals(env)
+    if (!before.ok) return
+
+    // Fail a write inside the commit transaction (the outstanding counter).
+    mock.failNextPutTouching(['total:outstanding'])
+    await expect(commit(env, 'tc', parseUsd('0.02'))).rejects.toThrow(/simulated storage write/)
+
+    // Transaction auto-rolled-back: the call is still reserved, nothing charged.
+    const acct = await readAccount(env, ALICE)
+    if (!acct.ok) return
+    expect(acct.value.calls.find(c => c.call_id === 'tc')!.status).toBe('reserved')
+
+    const after = await readTotals(env)
+    if (!after.ok) return
+    expect(after.value.committed).toBe(before.value.committed)
+    expect(parseAtomic(after.value.outstanding)).toBe(
+      parseAtomic(after.value.balances_sum) + parseAtomic(after.value.holds_sum),
+    )
+  })
+})
