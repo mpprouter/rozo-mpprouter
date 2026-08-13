@@ -127,13 +127,14 @@ function registerReq(body: unknown) {
   })
 }
 
+// Frontend (PR #20) snake_case contract.
 const GOOD_BODY = {
-  channelContract: CHANNEL,
-  agentAccount: FUNDER,
-  commitmentKey: COMMIT_G,
-  currency: USDC_SAC,
+  channel_contract: CHANNEL,
+  funder: FUNDER,
+  commitment_key: COMMIT_G,
+  token: USDC_SAC,
   network: 'stellar:pubnet',
-  depositRaw: '2000000',
+  deposit_raw: '2000000',
 }
 
 describe('handleChannelRegister', () => {
@@ -160,6 +161,9 @@ describe('handleChannelRegister', () => {
     const json = (await res.json()) as any
     expect(json.ok).toBe(true)
     expect(json.replayed).toBe(false)
+    expect(json.channel).toBe(CHANNEL)
+    expect(json.funder).toBe(FUNDER)
+    expect(json.commitment_key).toBe(COMMIT_G)
     expect(read).toHaveBeenCalledOnce()
     // Primary + agent index written. deposit persisted from the ON-CHAIN
     // balance, not the client's claim.
@@ -231,7 +235,7 @@ describe('handleChannelRegister', () => {
     await handleChannelRegister(registerReq(GOOD_BODY), env, {
       readChannelOnChain: async () => goodOnChain(),
     })
-    const conflicting = { ...GOOD_BODY, agentAccount: Keypair.random().publicKey() }
+    const conflicting = { ...GOOD_BODY, funder: Keypair.random().publicKey() }
     const res = await handleChannelRegister(registerReq(conflicting), env, {
       readChannelOnChain: async () => goodOnChain(),
     })
@@ -243,7 +247,7 @@ describe('handleChannelRegister', () => {
     const env = makeEnv(kv)
     const read = vi.fn(async () => goodOnChain())
     const res = await handleChannelRegister(
-      registerReq({ ...GOOD_BODY, currency: 'C' + 'C'.repeat(55) }),
+      registerReq({ ...GOOD_BODY, token: 'C' + 'C'.repeat(55) }),
       env,
       { readChannelOnChain: read },
     )

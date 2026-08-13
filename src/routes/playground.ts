@@ -108,10 +108,13 @@ import {
 } from '../playground/turnstile'
 import { getStellarUsdcSac } from '../mpp/stellar-server'
 import {
+  CHANNEL_DEPOSIT_OPTIONS,
   CHANNEL_MAX_DEPOSIT_USD,
   CHANNEL_MIN_DEPOSIT_USD,
   CHANNEL_REFUND_WAITING_PERIOD,
   channelFactoryAddress,
+  channelHorizonUrl,
+  channelNetworkPassphrase,
   channelPlaygroundEnabled,
   channelPricingConfig,
 } from '../playground/channel-config'
@@ -256,10 +259,14 @@ export function handlePlaygroundConfig(env: Env): Response {
     channel: {
       enabled: channelPlaygroundEnabled(env),
       factory_contract: channelFactoryAddress(env),
-      usdc_sac: getStellarUsdcSac(env),
+      token_sac: getStellarUsdcSac(env),
       router_recipient: env.STELLAR_ROUTER_PUBLIC,
       network: env.STELLAR_NETWORK,
+      network_passphrase: channelNetworkPassphrase(env),
+      soroban_rpc_url: env.STELLAR_RPC_URL,
+      horizon_url: channelHorizonUrl(env),
       refund_waiting_period: CHANNEL_REFUND_WAITING_PERIOD,
+      deposit_options: CHANNEL_DEPOSIT_OPTIONS,
       min_deposit_usd: CHANNEL_MIN_DEPOSIT_USD,
       max_deposit_usd: CHANNEL_MAX_DEPOSIT_USD,
       ...channelPricingConfig(),

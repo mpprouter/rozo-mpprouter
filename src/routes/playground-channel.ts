@@ -173,12 +173,18 @@ export async function handleChannelRegister(
     return fail(503, 'rate_limit_unavailable', 'could not check rate limit; try again shortly')
   }
 
+  // Frontend (PR #20) contract: snake_case body.
+  //   { channel_contract, funder, commitment_key, token, network, deposit_raw, open_tx_hash? }
   const body = await readJsonBody(request)
-  const channelContract = typeof body.channelContract === 'string' ? body.channelContract.trim() : ''
-  const agentAccount = typeof body.agentAccount === 'string' ? body.agentAccount.trim() : ''
-  const commitmentKey = typeof body.commitmentKey === 'string' ? body.commitmentKey.trim() : ''
-  const currency = typeof body.currency === 'string' ? body.currency.trim() : ''
+  const channelContract = typeof body.channel_contract === 'string' ? body.channel_contract.trim() : ''
+  const agentAccount = typeof body.funder === 'string' ? body.funder.trim() : ''
+  const commitmentKey = typeof body.commitment_key === 'string' ? body.commitment_key.trim() : ''
+  const currency = typeof body.token === 'string' ? body.token.trim() : ''
   const network = typeof body.network === 'string' ? body.network.trim() : env.STELLAR_NETWORK
+  // open_tx_hash is accepted for client correlation/logging only — the trust
+  // comes from the on-chain read below, never from a client-supplied tx hash.
+  const openTxHash = typeof body.open_tx_hash === 'string' ? body.open_tx_hash.trim() : ''
+  if (openTxHash) console.log(`[channel] register ${channelContract} open_tx=${openTxHash}`)
 
   if (!C_ADDRESS.test(channelContract)) {
     return fail(400, 'invalid_channel', 'channelContract must be a Soroban contract address (C...)')
@@ -211,11 +217,10 @@ export async function handleChannelRegister(
       return json({
         ok: true,
         replayed: true,
-        channel_contract: channelContract,
+        channel: channelContract,
         funder: agentAccount,
-        currency: existing.currency,
+        commitment_key: commitmentKey,
         deposit_usd: formatUsd(parseAtomic(existing.depositRaw)),
-        refund_waiting_period: CHANNEL_REFUND_WAITING_PERIOD,
       })
     }
     return fail(409, 'channel_conflict', 'this channel is already registered with different parameters')
@@ -258,12 +263,10 @@ export async function handleChannelRegister(
   return json({
     ok: true,
     replayed: false,
-    channel_contract: channelContract,
+    channel: channelContract,
     funder: agentAccount,
     commitment_key: commitmentKey,
-    currency: usdcSac,
     deposit_usd: formatUsd(parseAtomic(onchain.balanceRaw)),
-    refund_waiting_period: CHANNEL_REFUND_WAITING_PERIOD,
   })
 }
 

@@ -77,6 +77,27 @@ export const CHANNEL_MIN_DEPOSIT_RAW = parseUsd(CHANNEL_MIN_DEPOSIT_USD)
  */
 export const CHANNEL_MAX_DEPOSIT_USD = '10'
 
+/** Deposit amounts (USD) the frontend offers for opening a channel. */
+export const CHANNEL_DEPOSIT_OPTIONS: readonly number[] = [0.5, 1, 2]
+
+/** Stellar mainnet Horizon, used by the frontend to submit open/close txs. */
+const DEFAULT_HORIZON_URL = 'https://horizon.stellar.org'
+
+/**
+ * Network passphrase the frontend must build the Soroban open tx against.
+ * Pubnet unless the router is explicitly on testnet.
+ */
+export function channelNetworkPassphrase(env: { STELLAR_NETWORK?: string }): string {
+  return env.STELLAR_NETWORK === 'stellar:testnet'
+    ? 'Test SDF Network ; September 2015'
+    : 'Public Global Stellar Network ; September 2015'
+}
+
+/** Horizon base URL advertised to the frontend (override via PLAYGROUND_HORIZON_URL). */
+export function channelHorizonUrl(env: { PLAYGROUND_HORIZON_URL?: string }): string {
+  return env.PLAYGROUND_HORIZON_URL?.trim() || DEFAULT_HORIZON_URL
+}
+
 /** Markup applied on top of the known upstream cost. */
 const CHANNEL_MARKUP_BPS = 1000n // 10%
 const CHANNEL_MARKUP_MIN_RAW = parseUsd('0.001') // $0.001 floor
