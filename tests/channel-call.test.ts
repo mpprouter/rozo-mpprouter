@@ -24,9 +24,12 @@ const SIG_HEX = 'aa'.repeat(64)
 // In-memory atomic store standing in for the DO-backed Store.cloudflare(...).
 const atomic = vi.hoisted(() => {
   const backing = new Map<string, any>()
-  const state = { failVoucherUpdate: false, failClosedUpdate: false }
+  const state = { failVoucherUpdate: false, failClosedUpdate: false, failVoucherGet: false }
   const store = {
-    get: async (k: string) => (backing.has(k) ? backing.get(k) : null),
+    get: async (k: string) => {
+      if (state.failVoucherGet && k.includes('voucher')) throw new Error('atomic get failed')
+      return backing.has(k) ? backing.get(k) : null
+    },
     update: async (k: string, cb: (cur: any) => any) => {
       if (state.failVoucherUpdate && k.includes('voucher')) throw new Error('atomic update failed')
       if (state.failClosedUpdate && k.includes('closed')) throw new Error('atomic closed update failed')
@@ -185,6 +188,7 @@ beforeEach(() => {
   kv = makeKv()
   atomic.state.failVoucherUpdate = false
   atomic.state.failClosedUpdate = false
+  atomic.state.failVoucherGet = false
   h.state.sufficient = true
   h.state.capturedAmount = ''
   h.state.acceptedAmount = '0.0220000'
@@ -382,6 +386,48 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(second.status).toBe(410)
     expect((await second.json()).error).toBe('channel_closed')
     expect(h.callUpstream).not.toHaveBeenCalled()
+  })
+
+  it('R6-P0-1: definite post-pay persist-fail FENCES even when rollback succeeds (capacity not reusable)', async () => {
+    h.callUpstream.mockResolvedValue({
+      value: { choices: [{ message: { content: 'ok' } }] },
+      paid: true,
+      upstreamCostRaw: '500',
+    })
+    atomic.state.failVoucherUpdate = true // persist throws; backing empty → 'not'
+    h.rollback.mockResolvedValue(true) // rollback SUCCEEDS (frees capacity)
+    const first = await handleChannelChat(chatReq(), env())
+    expect(first.status).toBe(502)
+    const j = (await first.json()) as any
+    expect(j.error).toBe('settlement_persist_failed')
+    expect(j.charged_usd).toBe('0.00')
+    // Even though rollback freed the capacity, the channel is FENCED so it can't
+    // be re-spent — this is what keeps the router loss bounded by the deposit.
+    expect(atomic.backing.get(`pg:channel:fenced:${CHANNEL}`)).toBeTruthy()
+    expect(atomic.backing.get('pg:channel:recon:superseded-aborts').count).toBe(1)
+
+    // The next call is rejected — freed capacity is NOT reusable.
+    atomic.state.failVoucherUpdate = false
+    h.callUpstream.mockClear()
+    const second = await handleChannelChat(chatReq(), env())
+    expect(second.status).toBe(410)
+    expect(h.callUpstream).not.toHaveBeenCalled()
+  })
+
+  it('R6-P0-2: an UNKNOWN persist (readback also fails) fences + reports $0, never charged', async () => {
+    h.callUpstream.mockResolvedValue({
+      value: { choices: [{ message: { content: 'ok' } }] },
+      paid: true,
+      upstreamCostRaw: '500',
+    })
+    atomic.state.failVoucherUpdate = true // persist throws
+    atomic.state.failVoucherGet = true // readback ALSO fails → 'unknown'
+    const res = await handleChannelChat(chatReq(), env())
+    // Unknown is NOT reported as committed — $0, fenced, absorbed.
+    expect(res.status).toBe(502)
+    expect((await res.json()).charged_usd).toBe('0.00')
+    expect(atomic.backing.get(`pg:channel:fenced:${CHANNEL}`)).toBeTruthy()
+    expect(atomic.backing.get('pg:channel:recon:superseded-aborts').count).toBe(1)
   })
 
   it('P0-5: an ambiguous persist error whose readback shows the voucher IS stored charges the quote', async () => {

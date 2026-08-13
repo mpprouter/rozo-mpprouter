@@ -588,9 +588,9 @@ async function reverseChargeOrFence(
  *   'covered'  — stored cumulative ≥ ours: the collector CAN redeem this call.
  *   'not'      — stored cumulative < ours: confirmed nothing covers this call.
  *   'unknown'  — the readback itself failed: we cannot confirm either way.
- * P0-5 biases 'unknown' toward "committed": we only ever report $0 when we can
- * CONFIRM nothing was stored ('not'), never while a redeemable voucher might
- * exist.
+ * Round-6 rule: a charge stands ONLY on a CONFIRMED 'covered'. Both 'not' and
+ * 'unknown' are treated as "no confirmed redeemable voucher" → absorb + fence +
+ * report $0. We never report a charge unless coverage is positively confirmed.
  */
 async function checkCovered(
   env: Env,
@@ -609,13 +609,53 @@ async function checkCovered(
 type PersistOutcome = 'committed' | 'reversed'
 
 /**
- * P0-B / P0-5: persist the redeemable latest voucher, FAIL CLOSED but never
- * lie. 'committed' → the charge stands (a redeemable voucher exists). 'reversed'
- * → confirmed nothing was stored, the charge is reversed and the router absorbs
- * this paid call (recon-counted). An AMBIGUOUS persist error (the DO write may
- * have landed) is resolved by a read-back: only a CONFIRMED "nothing stored"
- * reverses; 'covered' or 'unknown' is treated as committed. Never releases the
- * lock.
+ * Post-pay absorb: the router PAID upstream but no redeemable voucher for this
+ * call is confirmed stored. Roll the watermark back for accounting AND — the
+ * round-6 rule — ALWAYS fence the channel so the freed capacity can never be
+ * re-spent. Without the fence, an attacker could pay → fail-to-persist →
+ * rollback-frees-capacity → repeat, driving cumulative router loss PAST the
+ * deposit (unbounded). With the fence, no further call touches this channel, so
+ * the loss stays bounded to `deposit + this one in-flight call`. Recon-counted.
+ * Never releases the lock — the caller's finally owns that.
+ */
+async function absorbPaidCallAndFence(
+  env: Env,
+  channelContract: string,
+  voucher: ChannelVoucher,
+): Promise<void> {
+  // Best-effort watermark rollback (accounting hygiene). Safe even when
+  // superseded: rollbackFailedChannelVoucher CAS-checks the current amount and
+  // no-ops if a newer holder already advanced past us.
+  try {
+    await rollbackFailedChannelVoucher(
+      env,
+      channelContract,
+      voucher.acceptedAmount,
+      voucher.previousAmount,
+      voucher.challengeId,
+    )
+  } catch (e: any) {
+    console.error(`[channel] absorb rollback threw for ${channelContract}: ${e?.message}`)
+  }
+  // ALWAYS fence — the freed capacity must not be re-spendable.
+  const fenced = await fenceChannelPersistent(env, channelContract)
+  if (!fenced) {
+    console.error(
+      `[channel] CRITICAL: could not fence ${channelContract} after a post-pay persist failure; ` +
+        `freed capacity could be re-spent until an operator fences it`,
+    )
+  }
+  await incrSupersededAbort(env).catch(() => {})
+}
+
+/**
+ * Persist the redeemable latest voucher for a PAID call. Round-6 invariant: a
+ * charge stands ('committed') ONLY when a redeemable voucher for this call is
+ * CONFIRMED stored — the write returned success, or an ambiguous write is proven
+ * landed by a positive read-back ('covered'). EVERY other outcome (no signature,
+ * confirmed-not-stored, or an unconfirmable 'unknown' read-back) absorbs this
+ * paid call and FENCES the channel, then reports 'reversed' ($0). Never releases
+ * the lock.
  */
 async function persistVoucherOrReverse(
   env: Env,
@@ -623,8 +663,8 @@ async function persistVoucherOrReverse(
   voucher: ChannelVoucher,
 ): Promise<PersistOutcome> {
   if (!voucher.signature) {
-    console.error(`[channel] no signature on kept voucher for ${channelContract}; failing closed`)
-    await reverseChargeOrFence(env, channelContract, voucher)
+    console.error(`[channel] no signature on kept voucher for ${channelContract}; absorbing + fencing`)
+    await absorbPaidCallAndFence(env, channelContract, voucher)
     return 'reversed'
   }
   const ourCumulative = parseUsd(voucher.amountDecimal)
@@ -636,22 +676,23 @@ async function persistVoucherOrReverse(
     })
     return 'committed'
   } catch (e: any) {
-    // Ambiguous: the atomic write may still have landed. Read back before
-    // deciding — never report $0 while a redeemable voucher might exist.
+    // The atomic write threw. Read back: only a CONFIRMED positive read-back may
+    // report the charge. 'not' AND 'unknown' both absorb + fence (P0-1/P0-2) —
+    // we never report a charge without a confirmed redeemable voucher.
     const cov = await checkCovered(env, channelContract, ourCumulative)
-    if (cov === 'not') {
-      console.error(
-        `[channel] voucher persist DEFINITELY failed for ${channelContract}: ${e?.message}; ` +
-          `router absorbs this paid call (recon-counted)`,
+    if (cov === 'covered') {
+      console.warn(
+        `[channel] voucher persist ambiguous for ${channelContract} but read-back confirms ` +
+          `stored; charge stands`,
       )
-      await incrSupersededAbort(env).catch(() => {})
-      await reverseChargeOrFence(env, channelContract, voucher)
-      return 'reversed'
+      return 'committed'
     }
-    console.warn(
-      `[channel] voucher persist ambiguous for ${channelContract} (${cov}); treating as committed`,
+    console.error(
+      `[channel] voucher persist failed for ${channelContract} (${cov}): ${e?.message}; ` +
+        `absorbing this paid call + fencing (recon-counted)`,
     )
-    return 'committed'
+    await absorbPaidCallAndFence(env, channelContract, voucher)
+    return 'reversed'
   }
 }
 
@@ -660,13 +701,12 @@ async function persistVoucherOrReverse(
  * Returns a Response to return immediately (failure/supersede) or null on
  * success (the charge stands; caller builds the body).
  *
- * P0-4 routes BOTH the still-owned and the superseded paths through fail-closed
- * handling — no CAS rejection silently escapes. If we still hold the token we
- * persist (P0-5 semantics). If a TTL takeover superseded us AFTER we paid, we
- * read back: if a newer holder already covers our cumulative ('covered'/
- * 'unknown') the charge stands; only when we CONFIRM nothing covers us do we
- * absorb this call (recon-counted) AND fence the channel — so no later call can
- * advance a watermark that already includes our unredeemed increment.
+ * No CAS rejection silently escapes. If we still hold the token we persist
+ * (round-6 semantics above). If a TTL takeover superseded us AFTER we paid, we
+ * read back: ONLY a CONFIRMED positive read-back ('covered') lets the charge
+ * stand; 'not' AND 'unknown' both absorb this call + FENCE the channel + report
+ * $0 — never a charge without a confirmed redeemable voucher, never freed
+ * capacity that can be re-spent.
  */
 async function commitPaidVoucher(
   env: Env,
@@ -685,23 +725,21 @@ async function commitPaidVoucher(
   // 300s TTL). Do NOT persist stale state.
   const ourCumulative = parseUsd(voucher.amountDecimal)
   const cov = await checkCovered(env, channelContract, ourCumulative)
-  if (cov !== 'not') {
-    // A redeemable voucher for this cumulative exists (us earlier, or the newer
-    // holder). The charge stands — never report $0 while it is redeemable.
+  if (cov === 'covered') {
+    // A redeemable voucher for this cumulative is CONFIRMED stored (a newer
+    // holder). The charge stands — it is genuinely redeemable.
     console.warn(
-      `[channel] superseded-after-pay on ${channelContract} but a stored voucher covers ` +
-        `this call (${cov}); charge stands`,
+      `[channel] superseded-after-pay on ${channelContract} but read-back confirms a stored ` +
+        `voucher covers this call; charge stands`,
     )
     return null
   }
-  // Confirmed nothing covers us: DOCUMENTED bounded router loss. Recon-count and
-  // FENCE so a later call cannot advance a watermark that already includes this
-  // unredeemed increment.
-  await incrSupersededAbort(env).catch(() => {})
-  await fenceChannelPersistent(env, channelContract).catch(() => {})
+  // 'not' OR 'unknown' → cannot confirm a redeemable voucher → DOCUMENTED bounded
+  // router loss. Absorb + fence so no later call re-spends this channel.
+  await absorbPaidCallAndFence(env, channelContract, voucher)
   console.error(
-    `[channel] paid-then-superseded on ${channelContract}: not covered; absorbing this call's ` +
-      `upstream cost + fencing (recon-counted)`,
+    `[channel] paid-then-superseded on ${channelContract} (${cov}): not confirmed redeemable; ` +
+      `absorbing + fencing (recon-counted)`,
   )
   return fail(409, 'lock_superseded_after_pay', 'this call was superseded after payment; you were not charged', {
     call_id: id,
