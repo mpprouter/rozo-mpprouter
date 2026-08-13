@@ -323,6 +323,28 @@ export async function callUpstream(
   }
 }
 
+
+/**
+ * paywithlocus merchants (groq, deepseek) wrap the raw provider response in a
+ * `{ success: true, data: {...} }` envelope; Tempo merchants return the
+ * provider body bare. Consumers (chat/blend extraction) expect the provider
+ * shape (`choices[0].message.content`), so a wrapped 200 read as "paid but no
+ * usable result" and charged the user for nothing (observed live 2026-08-13,
+ * bug 12). Unwrap exactly this envelope; anything else passes through as-is.
+ */
+export function unwrapMerchantEnvelope(body: unknown): unknown {
+  if (
+    body !== null &&
+    typeof body === 'object' &&
+    (body as any).success === true &&
+    (body as any).data !== null &&
+    typeof (body as any).data === 'object'
+  ) {
+    return (body as any).data
+  }
+  return body
+}
+
 /**
  * Call an upstream route and parse a JSON body, mapping every failure to an
  * `UpstreamError` so the route layer has exactly one thing to catch (and
@@ -366,7 +388,7 @@ export async function callUpstreamJson<T = unknown>(
     // Return the parsed body AND the call-local paid flag so the caller makes
     // its commit-vs-release decision on `paid` alone, even on a 2xx body.
     return {
-      value: (await call.response.json()) as T,
+      value: unwrapMerchantEnvelope(await call.response.json()) as T,
       paid: call.paid,
       upstreamCostRaw: call.upstreamCostRaw,
     }
