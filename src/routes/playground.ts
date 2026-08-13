@@ -106,6 +106,15 @@ import {
   isPlaygroundTurnstileDisabled,
   verifyPlaygroundTurnstile,
 } from '../playground/turnstile'
+import { getStellarUsdcSac } from '../mpp/stellar-server'
+import {
+  CHANNEL_MAX_DEPOSIT_USD,
+  CHANNEL_MIN_DEPOSIT_USD,
+  CHANNEL_REFUND_WAITING_PERIOD,
+  channelFactoryAddress,
+  channelPlaygroundEnabled,
+  channelPricingConfig,
+} from '../playground/channel-config'
 
 // ---------------------------------------------------------------------------
 // small response helpers
@@ -242,6 +251,19 @@ export function handlePlaygroundConfig(env: Env): Response {
   const turnstileDisabled = isPlaygroundTurnstileDisabled(env)
   return json({
     enabled: playgroundEnabled(env),
+    // Non-custodial channel mode, advertised alongside the custodial fields so
+    // the frontend can offer both during the cutover. See channel-config.ts.
+    channel: {
+      enabled: channelPlaygroundEnabled(env),
+      factory_contract: channelFactoryAddress(env),
+      usdc_sac: getStellarUsdcSac(env),
+      router_recipient: env.STELLAR_ROUTER_PUBLIC,
+      network: env.STELLAR_NETWORK,
+      refund_waiting_period: CHANNEL_REFUND_WAITING_PERIOD,
+      min_deposit_usd: CHANNEL_MIN_DEPOSIT_USD,
+      max_deposit_usd: CHANNEL_MAX_DEPOSIT_USD,
+      ...channelPricingConfig(),
+    },
     turnstile: {
       // The frontend renders a widget only when required is true; the site key
       // is public and safe to expose. When disabled (staged rollout) the

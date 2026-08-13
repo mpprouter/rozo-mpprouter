@@ -449,8 +449,13 @@ export async function payMerchant(
      * Installing this callback forces an `onChallenge` hook even without a
      * budget; the hook still does the default passthrough sign, so behaviour
      * for a paying call is unchanged.
+     *
+     * The callback receives the base-unit (USDC-6) amount the router is paying
+     * the merchant for THIS call, read from the merchant's 402 challenge. This
+     * is the real per-call upstream cost, used by the channel playground for
+     * real-cost reconciliation. Existing no-arg callers ignore it.
      */
-    onCredentialSigned?: () => void
+    onCredentialSigned?: (amountRaw?: string) => void
   } = {},
 ): Promise<Response> {
   const needsHook = Boolean(opts.maxAmountRaw || opts.onCredentialSigned)
@@ -465,7 +470,7 @@ export async function payMerchant(
             // Signal ONLY AFTER the credential actually exists. If
             // createCredential throws, `paid` stays false and the caller
             // releases — there is no "paid=true but nothing signed" window.
-            opts.onCredentialSigned?.()
+            opts.onCredentialSigned?.(String((challenge as any).request?.amount ?? ''))
             return credential
           },
         }
@@ -526,8 +531,11 @@ export async function payMerchantSession(
   opts: {
     /** See `payMerchant`. Checked before the voucher is signed. */
     maxAmountRaw?: string
-    /** See `payMerchant`. Fired synchronously when the voucher is signed. */
-    onCredentialSigned?: () => void
+    /**
+     * See `payMerchant`. Fired synchronously when the voucher is signed, with
+     * the base-unit (USDC-6) delta the router is paying for THIS call.
+     */
+    onCredentialSigned?: (amountRaw?: string) => void
   } = {},
 ): Promise<{ response: Response; channelBefore: TempoChannelState }> {
   const channel = await getTempoChannel(env, merchantId)
@@ -580,7 +588,7 @@ export async function payMerchantSession(
       } as any)
       // Signal ONLY AFTER the voucher credential actually exists. A throw in
       // addRaw or createCredential leaves `paid` false → the caller releases.
-      opts.onCredentialSigned?.()
+      opts.onCredentialSigned?.(delta)
       return credential
     },
     onChannelUpdate: async (entry: ChannelEntryLike) => {

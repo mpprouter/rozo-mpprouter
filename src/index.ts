@@ -66,6 +66,12 @@ import {
   handlePlaygroundSession,
   handlePlaygroundTxDecode,
 } from './routes/playground'
+import {
+  handleChannelBlendActivity,
+  handleChannelChat,
+  handleChannelRegister,
+  handleChannelTxDecode,
+} from './routes/playground-channel'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
 import { handlePreflight, withCors } from './utils/cors'
@@ -115,6 +121,18 @@ export interface Env {
   // exact string 'true' disables it — a missing/typo'd secret still fails
   // closed. For staged rollout before the frontend widget ships.
   PLAYGROUND_TURNSTILE_DISABLED?: string
+
+  // ---- Non-custodial channel playground ---------------------------------
+  // Kill switch for the entire /v1/playground/channel/* surface. Every route
+  // there 404s unless this is exactly 'true'. Separate from PLAYGROUND_ENABLED
+  // so the custodial and channel playgrounds roll out/pull independently.
+  // Plain var, default OFF; flip + redeploy. See playground/channel-config.ts.
+  PLAYGROUND_CHANNEL_ENABLED?: string
+  // Channel-factory contract address (C...) the frontend calls `open` against
+  // to deploy a per-user channel in one Freighter-signed invoke. May be empty
+  // until the founder deploys the factory on mainnet (an L3 on-chain action);
+  // GET /v1/playground/config advertises it (null until set). Plain var.
+  PLAYGROUND_CHANNEL_FACTORY?: string
 
   // Stellar Router Pool (receives agent USDC payments)
   // Secret NOT in env — operator manages offline. Only public key needed.
@@ -420,6 +438,23 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // 404s unless PLAYGROUND_RECON_TOKEN is configured AND presented.
       if (url.pathname === '/v1/playground/admin/totals' && request.method === 'GET') {
         return handlePlaygroundAdminTotals(request, env)
+      }
+
+      // ---- Non-custodial channel playground (Stellar payment channel) ----
+      // Built ALONGSIDE the custodial routes above; every one 404s unless
+      // PLAYGROUND_CHANNEL_ENABLED === 'true'. Cutover + removal of the
+      // custodial path happens in a later step. See routes/playground-channel.ts.
+      if (url.pathname === '/v1/playground/channel/register' && request.method === 'POST') {
+        return handleChannelRegister(request, env)
+      }
+      if (url.pathname === '/v1/playground/channel/chat' && request.method === 'POST') {
+        return handleChannelChat(request, env)
+      }
+      if (url.pathname === '/v1/playground/channel/blend-activity' && request.method === 'POST') {
+        return handleChannelBlendActivity(request, env)
+      }
+      if (url.pathname === '/v1/playground/channel/tx-decode' && request.method === 'POST') {
+        return handleChannelTxDecode(request, env)
       }
 
       const refundStatusMatch = url.pathname.match(/^\/v1\/refunds\/([0-9a-f-]{36})$/)

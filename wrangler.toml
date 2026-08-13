@@ -207,6 +207,16 @@ PLAYGROUND_TURNSTILE_SITE_KEY = "0x4AAAAAAEOlP1MJ1iX6PnZl"
 # missing/typo'd secret still fails closed. Leave unset in production.
 # PLAYGROUND_TURNSTILE_DISABLED = "true"
 
+# ---- Non-custodial channel playground (built alongside the custodial one) ----
+# Kill switch for every /v1/playground/channel/* route. Ships OFF; flip to
+# "true" only after the channel WASM + factory are deployed on mainnet and the
+# path is verified. See src/routes/playground-channel.ts.
+PLAYGROUND_CHANNEL_ENABLED = "false"
+# Channel-factory contract address (C...) the frontend calls `open` against.
+# Empty until the founder deploys the factory on mainnet (L3). Advertised (as
+# null when unset) by GET /v1/playground/config.
+PLAYGROUND_CHANNEL_FACTORY = ""
+
 # Secrets (set via: wrangler secret put <NAME>)
 #
 # PLAYGROUND_TURNSTILE_SECRET    — Cloudflare Turnstile secret key for the
