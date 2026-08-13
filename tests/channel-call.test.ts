@@ -528,6 +528,19 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(h.rollback).not.toHaveBeenCalled()
   })
 
+  it('outage stop: PLAYGROUND_CHAT_MODELS_DISABLED=true 503s BEFORE any payment work', async () => {
+    const e = { ...env(), PLAYGROUND_CHAT_MODELS_DISABLED: 'true' }
+    const res = await handleChannelChat(chatReq(), e)
+    expect(res.status).toBe(503)
+    expect((await res.json()).error).toBe('model_unavailable')
+    // No voucher, lock, upstream, or settlement seam was ever touched.
+    expect(h.acquire).not.toHaveBeenCalled()
+    expect(h.callUpstream).not.toHaveBeenCalled()
+    expect(h.release).not.toHaveBeenCalled()
+    expect(h.rollback).not.toHaveBeenCalled()
+    expect(atomic.backing.get(`pg:channel:voucher:${CHANNEL}`)).toBeUndefined()
+  })
+
   it('P0-1: rejects a call whose new cumulative would exceed the channel deposit', async () => {
     h.state.depositRaw = '100000' // $0.01 deposit; flat quote is $0.10 → over
     const res = await handleChannelChat(chatReq(), env())

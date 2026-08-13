@@ -129,6 +129,12 @@ export interface Env {
   // so the custodial and channel playgrounds roll out/pull independently.
   // Plain var, default OFF; flip + redeploy. See playground/channel-config.ts.
   PLAYGROUND_CHANNEL_ENABLED?: string
+  // Emergency stop for PAID chat models only (tx-decode and the rest of the
+  // channel surface stay up). Set to 'true' while an upstream LLM merchant is
+  // accepting payment but failing calls (e.g. the 2026-08-13 Anthropic
+  // merchant 403 outage) so no user is ever charged for a doomed call. The
+  // chat handler rejects BEFORE any payment; /config marks models unavailable.
+  PLAYGROUND_CHAT_MODELS_DISABLED?: string
   // Channel-factory contract address (C...) the frontend calls `open` against
   // to deploy a per-user channel in one Freighter-signed invoke. May be empty
   // until the founder deploys the factory on mainnet (an L3 on-chain action);

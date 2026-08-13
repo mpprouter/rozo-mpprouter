@@ -47,6 +47,8 @@
 import { formatUsd, formatUsdc7, parseUsd } from './amount'
 import {
   BLEND_SUMMARY_MODEL_ID,
+  CHAT_OUTAGE_REASON,
+  chatModelsDisabled,
   PLAYGROUND_CHIPS,
   PLAYGROUND_MODELS,
   TIER_UPSTREAM_BUDGET_USD,
@@ -224,10 +226,13 @@ export function channelWasmHash(env: { PLAYGROUND_CHANNEL_WASM_HASH?: string }):
  * The `models` + `chips` blocks for GET /v1/playground/config, annotated with
  * the real-cost effective price so the UI shows honest per-call pricing.
  */
-export function channelPricingConfig() {
+export function channelPricingConfig(env: { PLAYGROUND_CHAT_MODELS_DISABLED?: string } = {}) {
+  const chatOutage = chatModelsDisabled(env)
   return {
     models: PLAYGROUND_MODELS.map(m => {
       const { maxUpstreamRaw, priceRaw } = channelPriceForModel(m)
+      const available = m.available && !chatOutage
+      const reason = !m.available ? m.unavailableReason : chatOutage ? CHAT_OUTAGE_REASON : undefined
       return {
         id: m.id,
         tier: m.tier,
@@ -235,8 +240,8 @@ export function channelPricingConfig() {
         max_upstream_cost_usd: formatUsd(maxUpstreamRaw),
         markup_usd: formatUsd(priceRaw - maxUpstreamRaw),
         price_usd: formatUsd(priceRaw),
-        available: m.available,
-        ...(m.unavailableReason ? { unavailable_reason: m.unavailableReason } : {}),
+        available,
+        ...(reason ? { unavailable_reason: reason } : {}),
       }
     }),
     chips: PLAYGROUND_CHIPS.map(c => {

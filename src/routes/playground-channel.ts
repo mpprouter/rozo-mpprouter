@@ -86,6 +86,8 @@ import {
   PLAYGROUND_MODELS,
   TIER_UPSTREAM_BUDGET_USD,
   assertModelCallable,
+  CHAT_OUTAGE_REASON,
+  chatModelsDisabled,
   findChip,
   findModel,
 } from '../playground/models'
@@ -851,6 +853,9 @@ interface ChatCompletion {
 
 export async function handleChannelChat(request: Request, env: Env): Promise<Response> {
   if (!channelPlaygroundEnabled(env)) return disabled()
+  // Outage stop: reject BEFORE any voucher/payment work so a user can never
+  // be charged while the upstream merchant is failing paid calls.
+  if (chatModelsDisabled(env)) return fail(503, 'model_unavailable', CHAT_OUTAGE_REASON)
 
   const body = await readJsonBody(request)
   const id = callId(body)
