@@ -220,6 +220,11 @@ describe('settleOneChannel', () => {
     expect(await settleOneChannel(e, CHANNEL, deps)).toBeNull()
     // Marked settled so the cron stops retrying a dead channel forever.
     expect((await getLatestVoucher(e, CHANNEL))!.lastSettledRaw).toBe('5000000')
+    // And a terminal write-off record distinguishes forgiven debt from
+    // collected funds for reconciliation.
+    const wo = await getVoucherWriteoff(e, CHANNEL)
+    expect(wo!.cumulativeRaw).toBe('5000000')
+    expect(wo!.reason).toContain('refunded')
   })
 
   it('does NOT write off on other close failures — retries next tick', async () => {

@@ -184,3 +184,42 @@ export async function getSupersededAbortCount(env: Env): Promise<number> {
   const v = (await store(env).get(RECON_SUPERSEDE_KEY)) as any
   return v?.count ?? 0
 }
+
+const writeoffKey = (c: string) => `pg:channel:writeoff:${c}`
+
+export interface VoucherWriteoff {
+  /** The signed cumulative that was NOT collectable on-chain, base-unit stroops. */
+  cumulativeRaw: string
+  reason: string
+  at: string
+}
+
+/**
+ * Terminal write-off record: the funder's unilateral refund emptied the channel
+ * before the collector's close landed, so this cumulative is forgiven debt, NOT
+ * settled funds. Kept under its own key so reconciliation can distinguish
+ * collected from written-off amounts; the caller ALSO advances lastSettledRaw
+ * (documented there as "no longer collectable") purely to stop the cron
+ * retrying a dead channel.
+ */
+export async function markVoucherWrittenOff(
+  env: Env,
+  channelContract: string,
+  cumulativeRaw: string,
+  reason: string,
+): Promise<void> {
+  const s = store(env)
+  await (s.update as any)(writeoffKey(channelContract), () => ({
+    op: 'set',
+    value: { cumulativeRaw, reason, at: new Date().toISOString() } satisfies VoucherWriteoff,
+    result: true,
+  }))
+}
+
+export async function getVoucherWriteoff(
+  env: Env,
+  channelContract: string,
+): Promise<VoucherWriteoff | null> {
+  const v = (await store(env).get(writeoffKey(channelContract))) as VoucherWriteoff | null
+  return v && typeof v === 'object' ? v : null
+}

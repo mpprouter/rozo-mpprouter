@@ -39,6 +39,7 @@ import {
   getLatestVoucher,
   markChannelClosed,
   markVoucherSettled,
+  markVoucherWrittenOff,
 } from './channel-voucher-store'
 import {
   acquireChannelDeliveryLock,
@@ -192,6 +193,15 @@ export async function settleOneChannel(
       // it settled to stop the cron retrying a dead channel every 2 minutes,
       // and log the write-off amount for the operator ledger.
       if (String(err?.message ?? err).includes('balance is not sufficient')) {
+        // Terminal write-off record FIRST (reconciliation source of truth:
+        // forgiven debt, not collected funds), then advance the settled
+        // watermark only to stop the cron retrying a dead channel.
+        await markVoucherWrittenOff(
+          env,
+          channelContract,
+          cumulativeRaw.toString(),
+          'funder refunded before collection',
+        )
         await markVoucherSettled(env, channelContract, cumulativeRaw.toString())
         console.error(
           `[channel-settle] WRITE-OFF ${voucher.amountDecimal} on ${channelContract}: ` +
