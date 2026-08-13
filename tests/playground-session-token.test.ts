@@ -139,7 +139,7 @@ describe('account masking', () => {
 
 describe('model allow-list', () => {
   it('accepts a charge-verified model', () => {
-    const model = assertModelCallable('llama-3.1-8b-instant')
+    const model = assertModelCallable('claude-haiku-4-5')
     expect(model.tier).toBe('cheap')
     expect(TIER_PRICE_USD[model.tier]).toBe('0.02')
   })

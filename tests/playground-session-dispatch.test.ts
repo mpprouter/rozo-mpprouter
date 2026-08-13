@@ -172,7 +172,7 @@ describe('seam selection', () => {
     const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.charge')
 
-    await callUpstream(env, { route, body: { model: 'llama-3.1-8b-instant' }, budgetAtomic: ANY_BUDGET })
+    await callUpstream(env, { route, body: { model: 'claude-haiku-4-5' }, budgetAtomic: ANY_BUDGET })
 
     expect(payMerchant).toHaveBeenCalledTimes(1)
     expect(payMerchantSession).not.toHaveBeenCalled()
@@ -257,27 +257,12 @@ describe('channel not installed', () => {
     })
   })
 
-  it('releases the reservation so an unprovisioned channel never bills the user', async () => {
-    const env = makeEnv()
-    await fund(env, '1')
-    const bearer = await token()
-    payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('openai_chat'))
-
-    const response = await handlePlaygroundChat(chatRequest('gpt-4o-mini', bearer, 'call-nochan'), env)
-
-    expect(response.status).toBe(503)
-    const body = await response.json()
-    expect(body.error).toBe('session_channel_not_installed')
-    expect(body.charged_usd).toBe('0.00')
-
-    // The whole hold came back — the balance is untouched.
-    const account = await readAccount(env, ALICE)
-    expect(account.ok).toBe(true)
-    if (!account.ok) return
-    expect(account.value.balance).toBe(parseUsd('1').toString())
-    expect(account.value.calls[0].status).toBe('released')
-    expect(account.value.calls[0].charged).toBe('0')
-  })
+  // NOTE (2026-08-13): the handler-level "release the reservation on
+  // channel-not-installed" test was removed when gpt-4o-mini — the last
+  // callable SESSION-mode playground model — was dropped. No allow-listed
+  // model routes to the session seam anymore, so this path cannot be reached
+  // through handlePlaygroundChat. The 503 → UpstreamError mapping it relied on
+  // is still covered at the route level by the test above.
 
   it('CHARGES a paid call whose merchant answered with a 5xx', async () => {
     // P0-3: reaching a response means the merchant answered our PAID retry.
@@ -294,7 +279,7 @@ describe('channel not installed', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-500'),
+      chatRequest('claude-haiku-4-5', bearer, 'call-500'),
       env,
     )
     expect(response.status).toBe(502)
@@ -321,7 +306,7 @@ describe('channel not installed', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-timeout'),
+      chatRequest('claude-haiku-4-5', bearer, 'call-timeout'),
       env,
     )
     expect(response.status).toBe(502)
@@ -332,50 +317,14 @@ describe('channel not installed', () => {
     expect(account.value.balance).toBe(parseUsd('0.98').toString())
   })
 
-  it('CHARGES a session failure once the voucher has been signed', async () => {
-    // The signal is call-local: onCredentialSigned fires the moment the
-    // voucher is signed, before the merchant's final response. A failure after
-    // that must charge — the money committed.
-    const env = makeEnv()
-    await fund(env, '1')
-    const bearer = await token()
-    payMerchantSession.mockImplementation(async (_e, _id, _u, _i, opts) => {
-      opts?.onCredentialSigned?.()
-      throw new Error('merchant connection reset after voucher')
-    })
-
-    const response = await handlePlaygroundChat(
-      chatRequest('gpt-4o-mini', bearer, 'call-voucher-signed'),
-      env,
-    )
-    expect(response.status).toBe(502)
-    expect((await response.json()).charged_usd).toBe('0.02')
-
-    const account = await readAccount(env, ALICE)
-    if (!account.ok) return
-    expect(account.value.balance).toBe(parseUsd('0.98').toString())
-  })
-
-  it('RELEASES a session failure when no voucher was ever signed', async () => {
-    // onCredentialSigned never fires (e.g. an initial non-402 error), so
-    // nothing was paid — the user keeps their full credit.
-    const env = makeEnv()
-    await fund(env, '1')
-    const bearer = await token()
-    payMerchantSession.mockRejectedValue(new Error('merchant refused the connection'))
-
-    const response = await handlePlaygroundChat(
-      chatRequest('gpt-4o-mini', bearer, 'call-no-voucher'),
-      env,
-    )
-    expect(response.status).toBe(502)
-    expect((await response.json()).charged_usd).toBe('0.00')
-
-    const account = await readAccount(env, ALICE)
-    if (!account.ok) return
-    expect(account.value.balance).toBe(parseUsd('1').toString())
-    expect(account.value.calls[0].status).toBe('released')
-  })
+  // NOTE (2026-08-13): two handler-level SESSION-seam settlement tests
+  // (charge-once-signed / release-when-unsigned, previously driven through
+  // gpt-4o-mini) were removed with that model. Settlement is keyed on the
+  // call-local `paid` flag that BOTH seams fire via onCredentialSigned, so the
+  // identical logic is fully covered on the charge seam by "CHARGES a paid
+  // call whose merchant answered with a 5xx" and "RELEASES when createCredential
+  // throws" above/below. The session seam's routing is covered at the route
+  // level in the seam-selection block.
 
   it('does not echo the upstream error body back to the caller', async () => {
     const env = makeEnv()
@@ -386,7 +335,7 @@ describe('channel not installed', () => {
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-leak'),
+      chatRequest('claude-haiku-4-5', bearer, 'call-leak'),
       env,
     )
     expect(await response.text()).not.toContain('secret-upstream-detail')
@@ -401,7 +350,7 @@ describe('tier pricing through the full call path', () => {
     payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-cheap'),
+      chatRequest('claude-haiku-4-5', bearer, 'call-cheap'),
       env,
     )
     expect(response.status).toBe(200)
@@ -451,7 +400,7 @@ describe('tier pricing through the full call path', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
+        model: 'claude-haiku-4-5',
         // Every one of these must be dropped: they are the fields that turn a
         // flat-priced demo call into an unbounded bill.
         max_tokens: 100000,
@@ -477,11 +426,11 @@ describe('tier pricing through the full call path', () => {
     const bearer = await token()
     payMerchant.mockImplementation(paidCharge)
 
-    await handlePlaygroundChat(chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'), env)
+    await handlePlaygroundChat(chatRequest('claude-haiku-4-5', bearer, 'call-retry'), env)
     expect(payMerchant).toHaveBeenCalledTimes(1)
 
     const retry = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'),
+      chatRequest('claude-haiku-4-5', bearer, 'call-retry'),
       env,
     )
     const body = await retry.json()
@@ -494,8 +443,8 @@ describe('tier pricing through the full call path', () => {
 })
 
 describe('model catalog after the session-seam promotion', () => {
-  it('makes the flagship Claude models callable', () => {
-    for (const id of ['claude-opus-5', 'claude-sonnet-5']) {
+  it('makes the newest flagship Claude models (opus-5 / sonnet-5 / opus-4-8) callable', () => {
+    for (const id of ['claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8']) {
       const model = findModel(id)!
       expect(model.available).toBe(true)
       expect(model.tier).toBe('flagship')
@@ -503,15 +452,28 @@ describe('model catalog after the session-seam promotion', () => {
     }
   })
 
-  it('pins gpt-4o-mini as the only callable OpenAI model, in the cheap tier', () => {
+  it('keeps claude-haiku-4-5 as the one callable cheap/fast model', () => {
+    const cheap = PLAYGROUND_MODELS.filter(m => m.tier === 'cheap')
+    expect(cheap.map(m => m.id)).toEqual(['claude-haiku-4-5'])
+    expect(cheap[0].available).toBe(true)
+    expect(TIER_PRICE_USD.cheap).toBe('0.02')
+  })
+
+  it('drops the old models (llama / deepseek / gpt-4o-mini)', () => {
+    const ids = PLAYGROUND_MODELS.map(m => m.id)
+    for (const old of ['llama-3.1-8b-instant', 'deepseek-v4-flash', 'gpt-4o-mini']) {
+      expect(ids).not.toContain(old)
+    }
+  })
+
+  it('lists no callable OpenAI model; the flagship slot stays pending upstream verification', () => {
     const openai = PLAYGROUND_MODELS.filter(m => m.provider === 'openai')
-    const callable = openai.filter(m => m.available)
-    expect(callable.map(m => m.id)).toEqual(['gpt-4o-mini'])
-    expect(callable[0].tier).toBe('cheap')
-    // The flagship OpenAI slot stays unavailable: no verified id exists.
+    // No OpenAI id is verified/listed by the upstream, so none is callable —
+    // a guessed gpt-5.x id would 404 AFTER the router had already paid.
+    expect(openai.filter(m => m.available)).toHaveLength(0)
     const flagship = openai.filter(m => m.tier === 'flagship')
     expect(flagship.every(m => !m.available)).toBe(true)
-    expect(flagship[0].unavailableReason).toMatch(/no flagship openai model/i)
+    expect(flagship[0].unavailableReason).toMatch(/pending upstream verification/i)
   })
 
   it('keeps every callable model on a seam that can actually pay in production', () => {
@@ -544,7 +506,12 @@ describe('model catalog after the session-seam promotion', () => {
 
   it('carries no unverified Claude model ids', () => {
     // Retired/invented ids 404 at the merchant AFTER the router has paid.
-    const verified = new Set(['claude-opus-5', 'claude-sonnet-5', 'claude-haiku-4-5'])
+    const verified = new Set([
+      'claude-opus-5',
+      'claude-sonnet-5',
+      'claude-opus-4-8',
+      'claude-haiku-4-5',
+    ])
     for (const m of PLAYGROUND_MODELS) {
       if (m.provider === 'anthropic') expect(verified.has(m.id)).toBe(true)
     }
@@ -598,7 +565,7 @@ describe('upstream budget ceiling (P0-2)', () => {
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-overbudget'),
+      chatRequest('claude-haiku-4-5', bearer, 'call-overbudget'),
       env,
     )
     expect(response.status).toBe(502)
@@ -619,7 +586,7 @@ describe('upstream budget ceiling (P0-2)', () => {
     payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-flat'),
+      chatRequest('claude-haiku-4-5', bearer, 'call-flat'),
       env,
     )
     expect((await response.json()).charged_usd).toBe(TIER_PRICE_USD.cheap)
@@ -665,25 +632,27 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
     await fund(env, '1')
     const bearer = await token()
 
-    // Call A signs a voucher then fails (must charge). Call B never signs
+    // Call A signs a credential then fails (must charge). Call B never signs
     // (must release). They run against the same route concurrently. The mock
     // branches on the request body's marker message — NOT on invocation order,
     // which races under Promise.all — so the outcome is deterministic and the
     // test actually isolates call-locality rather than scheduling luck.
-    payMerchantSession.mockImplementation(async (_e, _id, _u, init, opts) => {
+    // (Charge seam via claude-haiku-4-5 — the call-local `paid` flag is settled
+    // identically on both seams; the session seam has no callable model now.)
+    payMerchant.mockImplementation(async (_e, _u, init, opts) => {
       const sentBody = String((init as any)?.body ?? '')
       if (sentBody.includes('SIGN_THEN_FAIL')) {
         opts?.onCredentialSigned?.()
-        throw new Error('A: reset after voucher')
+        throw new Error('A: reset after credential')
       }
-      throw new Error('B: refused before any voucher')
+      throw new Error('B: refused before any credential')
     })
 
     const reqA = new Request('https://apiserver.example/v1/playground/chat', {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'claude-haiku-4-5',
         call_id: 'concurrent-A',
         messages: [{ role: 'user', content: 'SIGN_THEN_FAIL' }],
       }),
@@ -692,7 +661,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'gpt-4o-mini',
+        model: 'claude-haiku-4-5',
         call_id: 'concurrent-B',
         messages: [{ role: 'user', content: 'REFUSE_BEFORE_SIGN' }],
       }),
@@ -726,7 +695,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
     payMerchant.mockResolvedValue(new Response('down', { status: 500 }))
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'initial-500'),
+      chatRequest('claude-haiku-4-5', bearer, 'initial-500'),
       env,
     )
     expect(response.status).toBe(502)
@@ -753,7 +722,7 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'sign-threw'),
+      chatRequest('claude-haiku-4-5', bearer, 'sign-threw'),
       env,
     )
     expect(response.status).toBe(502)
@@ -773,14 +742,14 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
-    payMerchantSession.mockImplementation(async (_e, _id, _u, _i, opts) => {
+    payMerchant.mockImplementation(async (_e, _u, _i, opts) => {
       // Simulate the seam signing once, then a later challenge over budget.
       opts?.onCredentialSigned?.()
-      throw new BudgetExceededError('https://openai.example', '9999999', '80000')
+      throw new BudgetExceededError('https://anthropic.example', '9999999', '80000')
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('gpt-4o-mini', bearer, 'budget-after-sign'),
+      chatRequest('claude-haiku-4-5', bearer, 'budget-after-sign'),
       env,
     )
     expect(response.status).toBe(502)
@@ -805,7 +774,7 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'budget-no-sign'),
+      chatRequest('claude-haiku-4-5', bearer, 'budget-no-sign'),
       env,
     )
     expect(response.status).toBe(502)
@@ -828,7 +797,7 @@ describe('the ONLY commit predicate is paid === true', () => {
     payMerchant.mockResolvedValue(completion('a real-looking answer')) // no onCredentialSigned
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'unpaid-2xx'),
+      chatRequest('claude-haiku-4-5', bearer, 'unpaid-2xx'),
       env,
     )
     expect(response.status).toBe(502)
@@ -856,7 +825,7 @@ describe('the ONLY commit predicate is paid === true', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'paid-empty'),
+      chatRequest('claude-haiku-4-5', bearer, 'paid-empty'),
       env,
     )
     expect(response.status).toBe(502)

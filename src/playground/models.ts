@@ -20,7 +20,9 @@
  * The playground reaches upstreams through two seams, both already used by the
  * paid proxy and both reused verbatim (see `./upstream.ts`):
  *
- *   - `payMerchant()`        — `tempo.charge`. Groq, DeepSeek.
+ *   - `payMerchant()`        — `tempo.charge`. All current playground models
+ *     resolve here (Anthropic chat_completions is pinned to charge; the old
+ *     Groq/DeepSeek entries were dropped 2026-08-13).
  *   - `payMerchantSession()` — `tempo.session`. OpenAI, Anthropic. Signs a
  *     cumulative voucher against a Tempo channel pre-opened by
  *     `scripts/admin/open-tempo-channel.ts`.
@@ -44,25 +46,29 @@
  * ---------------------------------------------------------------------------
  * Anthropic: `merchants.ts`'s `verifiedNote` for `anthropic_chat_completions`
  * records real paid calls on 2026-08-09 returning 202 + a completion for six
- * current model ids, including `claude-opus-5`, `claude-sonnet-5` and
- * `claude-haiku-4-5`. Those three are pinned here. Retired 2024-era ids 404 at
- * the merchant, so an id must come from that verified list, never from memory.
+ * current model ids: claude-sonnet-4-5, claude-haiku-4-5, claude-opus-4-5,
+ * claude-opus-4-8, claude-sonnet-5, claude-opus-5. Four are pinned here — the
+ * flagship 5.0/4.8 generation (`claude-opus-5`, `claude-sonnet-5`,
+ * `claude-opus-4-8`) plus `claude-haiku-4-5` as the one fast/cheap option.
+ * Retired 2024-era ids 404 at the merchant, so an id must come from that
+ * verified list, never from memory.
  *
- * OpenAI: the ONLY concretely evidenced model id for the `openai_chat` route
- * anywhere in this repo is `gpt-4o-mini`, and it appears three times
- * independently — `scripts/admin/open-tempo-channel.ts` (the channel-open
- * probe body), `scripts/e2e/providers.mjs`, and `scripts/e2e/monitor-verified.mjs`.
- * `docs/verified-runs.json` records `session_verified_at` for `openai_chat` but
- * its `runs` array is empty, so it names no model. `gpt-4o-mini` is a small
- * model, not a flagship one, so it is pinned in the CHEAP tier at $0.02 — tier
- * follows the model, not the provider, and billing a mini model at the flagship
- * $0.10 would overcharge for it.
+ * Dropped 2026-08-13 (founder: "no old models"): `llama-3.1-8b-instant` (groq),
+ * `deepseek-v4-flash` (deepseek) and `gpt-4o-mini` (openai) — all previous-gen.
+ * The routes still exist for the paid proxy; they are just no longer FEATURED
+ * in the playground allow-list.
  *
- * No flagship OpenAI model id has ever been recorded as verified through this
- * router, so the flagship OpenAI slot stays `available: false`. It is NOT
+ * OpenAI: the founder wants a GPT-5.x flagship (gpt-5.5 / gpt-5.6), but NO such
+ * id is evidenced anywhere in this repo. The catalog snapshot's openai service
+ * lists no gpt-5.x model id (its tags name only gpt-4o), `docs/verified-runs.json`
+ * records a `session_verified_at` for `openai_chat` with an EMPTY `runs` array
+ * (so it names no model), and the only concrete openai id in the repo was
+ * `gpt-4o-mini` — now dropped as an old model. So the flagship OpenAI slot stays
+ * `available: false` with a "pending upstream verification" reason. It is NOT
  * guessed at: an unverified id would 404 at the merchant AFTER the router had
- * already paid for the call. (An earlier revision of this file carried an
- * invented `gpt-5.2` id with no verification behind it; it has been removed.)
+ * already paid for the call. (An earlier revision carried an invented `gpt-5.2`
+ * id with no verification behind it; it was removed. Do not re-add a gpt-5.x id
+ * until a paid run or an upstream catalog entry records a concrete one.)
  *
  * ---------------------------------------------------------------------------
  * Unavailable entries are advertised, not hidden
@@ -75,8 +81,9 @@
  * A session-mode model can still fail at CALL time if the operator never
  * opened a channel for its route. That surfaces as a 503
  * `session_channel_not_installed` with the reservation released, never as a
- * silent charge. Of the callable models only `gpt-4o-mini` takes the session
- * path, and production KV does hold `tempoChannel:openai_chat`.
+ * silent charge. As of 2026-08-13 every callable playground model resolves to
+ * the anthropic chat_completions CHARGE route, so none take the session path;
+ * the session seam is still exercised at the route level in the dispatch tests.
  */
 
 import { parseUsd } from './amount'
@@ -137,26 +144,15 @@ export const MAX_MESSAGES_PER_TURN = 12
 export const MAX_MESSAGE_CHARS = 8_000
 
 export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
-  // ---- cheap tier: both charge-verified, both actually callable ----
-  {
-    id: 'llama-3.1-8b-instant',
-    tier: 'cheap',
-    provider: 'groq',
-    routePublicPath: '/v1/services/groq/chat',
-    routeMethod: 'POST',
-    available: true,
-  },
-  {
-    id: 'deepseek-v4-flash',
-    tier: 'cheap',
-    provider: 'deepseek',
-    routePublicPath: '/v1/services/deepseek/chat',
-    routeMethod: 'POST',
-    available: true,
-  },
+  // ---- cheap / fast tier: one current-gen, charge-verified, callable model ----
   {
     // Verified 2026-08-09 alongside the flagship Claude ids (merchants.ts
-    // verifiedNote). Charge-mode upstream — see the overlay pin.
+    // verifiedNote): real paid call, 202 + completion. Current-generation
+    // (4.5) model, kept as the single fast/cheap option. Charge-mode upstream —
+    // see the anthropic_chat_completions overlay pin. The retired 2024-era
+    // models that used to sit here (llama-3.1-8b-instant, deepseek-v4-flash,
+    // gpt-4o-mini) were dropped 2026-08-13: the founder wants only current-gen
+    // models featured.
     id: 'claude-haiku-4-5',
     tier: 'cheap',
     provider: 'anthropic',
@@ -164,19 +160,8 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     routeMethod: 'POST',
     available: true,
   },
-  {
-    // The only OpenAI model id evidenced anywhere in this repo for the
-    // openai_chat route — channel-open probe + both E2E scripts. A small
-    // model, so it is priced in the cheap tier, not flagship.
-    id: 'gpt-4o-mini',
-    tier: 'cheap',
-    provider: 'openai',
-    routePublicPath: '/v1/services/openai/chat',
-    routeMethod: 'POST',
-    available: true,
-  },
 
-  // ---- flagship tier ----
+  // ---- flagship tier: newest verified Claude (4.8 / 5.0 generation) ----
   {
     // Verified with a real paid call 2026-08-09 (202 + completion).
     id: 'claude-opus-5',
@@ -196,12 +181,25 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     available: true,
   },
   {
-    // Placeholder id, NOT a callable model. No flagship OpenAI model has ever
-    // been verified through this router: verified-runs.json records a session
-    // verification for openai_chat but names no model, and every concrete id
-    // in the repo is gpt-4o-mini. Pinning a guessed flagship id here would
-    // 404 at the merchant AFTER the router paid for the call. Replace this
-    // entry with a real id only once a paid run records one.
+    // Verified with a real paid call 2026-08-09 (202 + completion). The "4.8"
+    // the founder wants featured alongside the 5.0 flagships.
+    id: 'claude-opus-4-8',
+    tier: 'flagship',
+    provider: 'anthropic',
+    routePublicPath: '/v1/services/anthropic/chat_completions',
+    routeMethod: 'POST',
+    available: true,
+  },
+  {
+    // Placeholder id, NOT a callable model. The founder asked to feature a
+    // GPT-5.x flagship (gpt-5.5 / gpt-5.6), but NO flagship OpenAI model id is
+    // evidenced anywhere in this router: the catalog snapshot lists no gpt-5.x
+    // id (its openai tags only mention gpt-4o), verified-runs.json records a
+    // session verification for openai_chat but names no model, and every
+    // concrete id in the repo is gpt-4o-mini (now dropped as an old model).
+    // Pinning a guessed flagship id here would 404 at the merchant AFTER the
+    // router had already paid for the call. Left available:false until a paid
+    // run — or an upstream catalog entry — records a concrete gpt-5.x id.
     id: 'openai-flagship-pending-verification',
     tier: 'flagship',
     provider: 'openai',
@@ -209,12 +207,16 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     routeMethod: 'POST',
     available: false,
     unavailableReason:
-      'No flagship OpenAI model id has been verified through this router yet. gpt-4o-mini (cheap tier) is the only evidenced OpenAI model.',
+      'No flagship OpenAI model id (e.g. gpt-5.5 / gpt-5.6) has been verified or listed by the upstream through this router yet. Pending upstream verification.',
   },
 ] as const
 
-/** Model used for the optional one-line narrative in the Blend chip. */
-export const BLEND_SUMMARY_MODEL_ID = 'llama-3.1-8b-instant'
+/**
+ * Model used for the optional one-line narrative in the Blend chip. Points at
+ * the cheap-tier claude-haiku-4-5 (charge-verified) now that the old
+ * llama-3.1-8b-instant model has been dropped.
+ */
+export const BLEND_SUMMARY_MODEL_ID = 'claude-haiku-4-5'
 
 export function findModel(id: string): PlaygroundModel | undefined {
   return PLAYGROUND_MODELS.find(m => m.id === id)
