@@ -62,14 +62,15 @@ async function main() {
   // mirrors what open-tempo-channel.ts does. maxDeposit caps it at
   // $1 so we don't accidentally drain the pool. The session manager
   // will reuse an existing channel if it finds one on-chain.
-  const sm = tempo.session({
-    account,
-    decimals: 6,
-    maxDeposit: '1',
-  })
+  // mppx 0.7.0: methods are registered on an Mppx client; tempo.charge is the
+  // stateless per-call intent (what the router's playground path uses).
+  const sm = Mppx.create({
+    methods: [tempo.charge({ account })],
+    polyfill: false,
+  }) as any
 
-  console.log('→ Sending request via mppx auto-session...')
-  let response: Awaited<ReturnType<typeof sm.fetch>>
+  console.log('→ Sending request via mppx tempo.charge...')
+  let response: Response
   try {
     response = await sm.fetch(merchantUrl, {
       method,
@@ -83,8 +84,6 @@ async function main() {
   }
 
   console.log(`← HTTP ${response.status}`)
-  console.log(`  channelId: ${sm.channelId ?? '(none)'}`)
-  console.log(`  cumulative: ${sm.cumulative}`)
   console.log('')
   const text = await response.text()
   console.log(`  body (first 1000 chars):`)
