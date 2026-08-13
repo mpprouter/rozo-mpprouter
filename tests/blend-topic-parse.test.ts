@@ -107,6 +107,26 @@ describe('Blend chip reads Mercury topic1..N', () => {
     expect(total).toBe(events.events_examined)
   })
 
+  it('counts each event exactly once even when parsing throws mid-event', () => {
+    const good = supplyEvent(Keypair.random().publicKey(), 1_000_000n)
+    // A valid symbol (so it classifies as deposit), but `data` throws when read
+    // during extractAmount — AFTER classification. The old code counted it in
+    // `deposit` before the throw, then the catch counted it again in `other`.
+    const throwsMidParse: Record<string, unknown> = { topic1: sym('supply') }
+    Object.defineProperty(throwsMidParse, 'data', {
+      enumerable: true,
+      get() {
+        throw new Error('hostile field access')
+      },
+    })
+    const agg = aggregateBlendEvents([good, throwsMidParse], CONTRACT)
+    expect(agg.events_examined).toBe(2)
+    const total = agg.rows.reduce((n, r) => n + r.count, 0)
+    expect(total).toBe(2) // exactly one bucket per event, no double-count
+    expect(agg.rows.find(r => r.action === 'deposit')!.count).toBe(1)
+    expect(agg.rows.find(r => r.action === 'other')!.count).toBe(1)
+  })
+
   it('does not let a non-symbol payload containing "supply" spoof a deposit', () => {
     // ScString whose bytes literally contain "supply" — a byte-substring match
     // would misclassify this as a supply/deposit. Exact symbol match must not.

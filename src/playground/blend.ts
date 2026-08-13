@@ -341,22 +341,24 @@ export function aggregateBlendEvents(events: RawEvent[], contractId: string): Bl
     // throw is contained here and the event is bucketed as unparseable `other`,
     // so every event still increments exactly one bucket (counts reconcile).
     try {
+      // Do ALL parsing first, into locals — mutate no bucket until every
+      // throwing operation has succeeded, so a mid-parse throw cannot leave an
+      // event half-counted (which would then also be counted by the catch).
       const name = eventName(event)
       const action = classify(name)
+      const amount = extractAmount(event)
+      const participant = extractParticipant(event)
+      const ledger = extractLedger(event)
+
+      // Parsing done — now apply exactly one bucket increment.
       const bucket = buckets.get(action)!
       bucket.count += 1
       if (action === 'other') otherNames.set(name, (otherNames.get(name) ?? 0) + 1)
-
-      const amount = extractAmount(event)
       if (amount !== null) {
         bucket.total += amount
         bucket.samples += 1
       }
-
-      const participant = extractParticipant(event)
       if (participant) bucket.participants.add(participant)
-
-      const ledger = extractLedger(event)
       if (ledger !== null) {
         if (firstLedger === null || ledger < firstLedger) firstLedger = ledger
         if (lastLedger === null || ledger > lastLedger) lastLedger = ledger
