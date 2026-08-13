@@ -1,0 +1,32 @@
+name: Security - Semgrep CE
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 13 * * 2,5'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semgrep-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  semgrep:
+    name: semgrep-ce/scan
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan TypeScript, Node.js, and secrets (advisory baseline)
+        run: >-
+          semgrep scan
+          --config p/typescript
+          --config p/nodejs
+          --config p/secrets
