@@ -24,9 +24,17 @@ import type { Env } from '../index'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
 
 export interface LatestVoucher {
+  /** Human/display USD string (e.g. "0.02"). Never used for arithmetic. */
   amountDecimal: string
+  /**
+   * The signed cumulative in BASE-UNIT stroops (7-decimal USDC) — the exact
+   * integer the client signed and the collector redeems on-chain. Settlement
+   * submits this value verbatim as the `close` amount. Must match the voucher's
+   * `payload.amount` with NO re-scaling.
+   */
   cumulativeRaw: string
   signature: string
+  /** Highest cumulative already settled on-chain, base-unit stroops. */
   lastSettledRaw: string
   updatedAt: string
 }

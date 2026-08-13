@@ -317,11 +317,18 @@ export async function handleChannelRegister(
 
 interface ChannelVoucher {
   challengeId: string
+  /**
+   * The cumulative amount the client signed, in BASE-UNIT stroops (7-decimal
+   * USDC) exactly as the credential's `payload.amount` carries it. This is an
+   * integer string like "220000" (= $0.022), NOT a decimal — it must NOT be
+   * re-scaled through parseUsd. It is the value the collector redeems on-chain,
+   * so the stored cumulative, the capacity gate, and the settlement amount all
+   * use this same base-unit number end to end.
+   */
   acceptedAmount: string
+  /** Previous cumulative watermark, base-unit stroops. */
   previousAmount: string
   action: 'voucher' | 'close'
-  /** The cumulative amount the client signed, as the decimal channel string. */
-  amountDecimal: string
   /** Raw ed25519 signature over the commitment (as the credential carried it). */
   signature: string
 }
@@ -446,7 +453,6 @@ async function verifyChannelVoucher(
         acceptedAmount: String(payment.credential.payload.amount),
         previousAmount,
         action,
-        amountDecimal: String(payment.credential.payload.amount),
         signature: String(payment.credential.payload.signature ?? ''),
       }
     })
@@ -485,7 +491,6 @@ async function verifyChannelVoucher(
         acceptedAmount: String(credential.payload.amount),
         previousAmount,
         action,
-        amountDecimal: String(credential.payload.amount),
         signature: String(credential.payload.signature ?? ''),
       }
     } catch (e: any) {
@@ -610,22 +615,40 @@ type PersistOutcome = 'committed' | 'reversed'
 
 /**
  * Post-pay absorb: the router PAID upstream but no redeemable voucher for this
- * call is confirmed stored. Roll the watermark back for accounting AND — the
- * round-6 rule — ALWAYS fence the channel so the freed capacity can never be
- * re-spent. Without the fence, an attacker could pay → fail-to-persist →
- * rollback-frees-capacity → repeat, driving cumulative router loss PAST the
- * deposit (unbounded). With the fence, no further call touches this channel, so
- * the loss stays bounded to `deposit + this one in-flight call`. Recon-counted.
- * Never releases the lock — the caller's finally owns that.
+ * call is confirmed stored. The freed capacity must never be re-spendable, so we
+ * FENCE the channel FIRST (P0-2 ordering) and only THEN roll the watermark back
+ * for accounting. There is deliberately NO window where capacity is freed while
+ * the channel is unfenced: a crash between the two steps leaves the channel
+ * fenced (capacity still consumed — safe). If the fence write cannot be
+ * confirmed, we do NOT roll back — the capacity stays consumed so it can't be
+ * re-spent — and log CRITICAL. Without the fence, an attacker could pay →
+ * fail-to-persist → rollback-frees-capacity → repeat, driving router loss PAST
+ * the deposit (unbounded); with fence-first the loss stays bounded to
+ * `deposit + this one in-flight call`. Recon-counted. Never releases the lock.
  */
 async function absorbPaidCallAndFence(
   env: Env,
   channelContract: string,
   voucher: ChannelVoucher,
 ): Promise<void> {
-  // Best-effort watermark rollback (accounting hygiene). Safe even when
-  // superseded: rollbackFailedChannelVoucher CAS-checks the current amount and
-  // no-ops if a newer holder already advanced past us.
+  await incrSupersededAbort(env).catch(() => {})
+
+  // FENCE FIRST — durable atomic fence, before any capacity is freed.
+  const fenced = await fenceChannelPersistent(env, channelContract)
+  if (!fenced) {
+    // Cannot confirm the fence → leave the capacity CONSUMED (do not roll back)
+    // so it cannot be re-spent. Bounded and fail-closed.
+    console.error(
+      `[channel] CRITICAL: could not fence ${channelContract} after a post-pay persist failure; ` +
+        `leaving capacity consumed (NOT rolling back) so it cannot be re-spent`,
+    )
+    return
+  }
+
+  // Fence durably set → now it is safe to roll back for accounting. Freeing the
+  // capacity is harmless because the fence rejects every further call. Safe even
+  // when superseded: rollbackFailedChannelVoucher CAS-checks the current amount
+  // and no-ops if a newer holder already advanced past us.
   try {
     await rollbackFailedChannelVoucher(
       env,
@@ -637,15 +660,6 @@ async function absorbPaidCallAndFence(
   } catch (e: any) {
     console.error(`[channel] absorb rollback threw for ${channelContract}: ${e?.message}`)
   }
-  // ALWAYS fence — the freed capacity must not be re-spendable.
-  const fenced = await fenceChannelPersistent(env, channelContract)
-  if (!fenced) {
-    console.error(
-      `[channel] CRITICAL: could not fence ${channelContract} after a post-pay persist failure; ` +
-        `freed capacity could be re-spent until an operator fences it`,
-    )
-  }
-  await incrSupersededAbort(env).catch(() => {})
 }
 
 /**
@@ -667,11 +681,14 @@ async function persistVoucherOrReverse(
     await absorbPaidCallAndFence(env, channelContract, voucher)
     return 'reversed'
   }
-  const ourCumulative = parseUsd(voucher.amountDecimal)
+  // acceptedAmount is ALREADY base-unit stroops — parse as an integer, never
+  // re-scale through parseUsd. The stored cumulative equals the signed voucher
+  // amount exactly, so the collector can redeem precisely what we recorded.
+  const ourCumulative = parseAtomic(voucher.acceptedAmount)
   try {
     await putLatestVoucher(env, channelContract, {
-      amountDecimal: voucher.amountDecimal,
-      cumulativeRaw: ourCumulative.toString(),
+      amountDecimal: formatUsd(ourCumulative),
+      cumulativeRaw: voucher.acceptedAmount,
       signature: voucher.signature,
     })
     return 'committed'
@@ -722,8 +739,8 @@ async function commitPaidVoucher(
   }
 
   // Superseded AFTER payment (only reachable after a multi-minute hang past the
-  // 300s TTL). Do NOT persist stale state.
-  const ourCumulative = parseUsd(voucher.amountDecimal)
+  // 300s TTL). Do NOT persist stale state. acceptedAmount is base-unit stroops.
+  const ourCumulative = parseAtomic(voucher.acceptedAmount)
   const cov = await checkCovered(env, channelContract, ourCumulative)
   if (cov === 'covered') {
     // A redeemable voucher for this cumulative is CONFIRMED stored (a newer
