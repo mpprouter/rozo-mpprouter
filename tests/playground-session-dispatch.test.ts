@@ -452,18 +452,21 @@ describe('model catalog after the session-seam promotion', () => {
     }
   })
 
-  it('keeps claude-haiku-4-5 as the one callable cheap/fast model', () => {
+  it('cheap tier: groq + deepseek (re-verified 2026-08-13) + claude-haiku-4-5', () => {
     const cheap = PLAYGROUND_MODELS.filter(m => m.tier === 'cheap')
-    expect(cheap.map(m => m.id)).toEqual(['claude-haiku-4-5'])
+    expect(cheap.map(m => m.id)).toEqual(['llama-3.1-8b-instant', 'deepseek-v4-flash', 'claude-haiku-4-5'])
     expect(cheap[0].available).toBe(true)
     expect(TIER_PRICE_USD.cheap).toBe('0.02')
   })
 
-  it('drops the old models (llama / deepseek / gpt-4o-mini)', () => {
+  it('keeps gpt-4o-mini dropped; groq/deepseek re-added after 2026-08-13 re-verification', () => {
     const ids = PLAYGROUND_MODELS.map(m => m.id)
-    for (const old of ['llama-3.1-8b-instant', 'deepseek-v4-flash', 'gpt-4o-mini']) {
-      expect(ids).not.toContain(old)
-    }
+    // gpt-4o-mini stays out (openai merchant region-blocked, mpp#852).
+    expect(ids).not.toContain('gpt-4o-mini')
+    // groq + deepseek were re-added with real-paid-call evidence when the
+    // Anthropic Tempo merchant went down (403-after-pay).
+    expect(ids).toContain('llama-3.1-8b-instant')
+    expect(ids).toContain('deepseek-v4-flash')
   })
 
   it('lists no callable OpenAI model; the flagship slot stays pending upstream verification', () => {

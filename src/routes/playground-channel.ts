@@ -864,6 +864,11 @@ export async function handleChannelChat(request: Request, env: Env): Promise<Res
   let model
   try {
     model = assertModelCallable(body.model)
+    // Provider-scoped outage stop (PLAYGROUND_CHAT_MODELS_DISABLED as a CSV of
+    // providers): reject BEFORE any voucher/payment work.
+    if (chatModelsDisabled(env, model.provider)) {
+      return fail(503, 'model_unavailable', CHAT_OUTAGE_REASON)
+    }
   } catch (e) {
     if (e instanceof ModelNotAllowedError) {
       return fail(400, e.code, e.message, {
