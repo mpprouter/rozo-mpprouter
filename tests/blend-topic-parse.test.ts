@@ -16,6 +16,7 @@ import {
   classify,
   aggregateBlendEvents,
   describeAggregate,
+  extractEvents,
 } from '../src/playground/blend'
 
 const sym = (name: string) => xdr.ScVal.scvSymbol(name).toXDR('base64')
@@ -89,5 +90,46 @@ describe('Blend chip reads Mercury topic1..N', () => {
     expect(classify(eventName(ev))).toBe('borrow')
     const agg = aggregateBlendEvents([ev], CONTRACT)
     expect(agg.rows.find(r => r.action === 'borrow')!.total_amount).toBe('4200')
+  })
+
+  it('does not crash on a malformed/null event — skips it as unparseable', () => {
+    const good = supplyEvent(Keypair.random().publicKey(), 1_000_000n)
+    // extractEvents drops null/primitive elements; a decode-hostile OBJECT that
+    // slips through must be contained by the per-event guard.
+    const raw = [null, 42, 'nope', { topic1: 12345 /* not a string */ }, good]
+    const events = aggregateBlendEvents(extractEvents(raw), CONTRACT)
+    // null/primitives filtered out; only the two objects remain examined
+    expect(events.events_examined).toBe(2)
+    // the good one still classifies; nothing threw
+    expect(events.rows.find(r => r.action === 'deposit')!.count).toBe(1)
+    // counts reconcile to events_examined
+    const total = events.rows.reduce((n, r) => n + r.count, 0)
+    expect(total).toBe(events.events_examined)
+  })
+
+  it('does not let a non-symbol payload containing "supply" spoof a deposit', () => {
+    // ScString whose bytes literally contain "supply" — a byte-substring match
+    // would misclassify this as a supply/deposit. Exact symbol match must not.
+    const spoof = {
+      contract_id: CONTRACT,
+      topic1: xdr.ScVal.scvString('please_count_this_as_supply').toXDR('base64'),
+      data: tuple(9_999_999n),
+    }
+    expect(eventName(spoof)).toBe('unknown')
+    expect(classify(eventName(spoof))).toBe('other')
+    const agg = aggregateBlendEvents([spoof], CONTRACT)
+    expect(agg.rows.find(r => r.action === 'deposit')!.count).toBe(0)
+    expect(agg.rows.find(r => r.action === 'other')!.count).toBe(1)
+  })
+
+  it('takes the amount from tuple position 0, not the first non-negative', () => {
+    // data = (-1, 999): a first-non-negative scan would wrongly pick 999.
+    const ev = { contract_id: CONTRACT, topic1: sym('borrow'), data: tuple(-1n, 999n) }
+    const agg = aggregateBlendEvents([ev], CONTRACT)
+    const borrow = agg.rows.find(r => r.action === 'borrow')!
+    expect(borrow.count).toBe(1)
+    // position 0 is negative → amount rejected, not silently replaced by 999
+    expect(borrow.total_amount).toBe('0')
+    expect(borrow.amount_samples).toBe(0)
   })
 })

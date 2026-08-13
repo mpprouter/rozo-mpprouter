@@ -36,18 +36,21 @@ function decodeScVal(b64: unknown): unknown {
   }
 }
 
-/** First non-negative integer found in a decoded ScVal (scalar or nested). */
-function firstNonNegBigInt(v: unknown): bigint | null {
-  if (typeof v === 'bigint') return v >= 0n ? v : null
-  if (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0) return BigInt(v)
-  if (typeof v === 'string' && /^\d+$/.test(v)) return BigInt(v)
-  if (Array.isArray(v)) {
-    for (const el of v) {
-      const r = firstNonNegBigInt(el)
-      if (r !== null) return r
-    }
+/**
+ * Decode a base64-XDR topic and return its symbol string ONLY if the ScVal is
+ * genuinely an `scvSymbol`. Anything else (an ScString/ScBytes whose raw bytes
+ * merely contain a known word, a non-symbol scalar, or undecodable input)
+ * yields null — so a hostile payload cannot spoof an event classification.
+ */
+function decodeSymbol(b64: string): string | null {
+  try {
+    const scv = xdr.ScVal.fromXDR(b64, 'base64')
+    if (scv.switch() !== xdr.ScValType.scvSymbol()) return null
+    const native = scValToNative(scv)
+    return typeof native === 'string' ? native : null
+  } catch {
+    return null
   }
-  return null
 }
 
 /**
@@ -108,6 +111,9 @@ const KNOWN_EVENT_NAMES: readonly string[] = [
   'repay',
 ]
 
+/** Exact-match lookup for known event symbols (lower-cased). */
+const KNOWN_EVENT_SET = new Set(KNOWN_EVENT_NAMES)
+
 export type BlendAction = 'deposit' | 'withdraw' | 'borrow' | 'repay' | 'other'
 
 export interface BlendAggregate {
@@ -164,26 +170,35 @@ interface RawEvent {
  * as an honest "no activity found" rather than a crash.
  */
 export function extractEvents(body: unknown): RawEvent[] {
-  if (Array.isArray(body)) return body as RawEvent[]
+  if (Array.isArray(body)) return onlyObjects(body)
   if (!body || typeof body !== 'object') return []
   const o = body as Record<string, unknown>
   for (const key of ['data', 'events', 'results', 'records']) {
-    if (Array.isArray(o[key])) return o[key] as RawEvent[]
+    if (Array.isArray(o[key])) return onlyObjects(o[key] as unknown[])
   }
   const embedded = o._embedded as Record<string, unknown> | undefined
-  if (embedded && Array.isArray(embedded.records)) return embedded.records as RawEvent[]
+  if (embedded && Array.isArray(embedded.records)) return onlyObjects(embedded.records)
   return []
 }
 
 /**
- * Best-effort extraction of the event name from a topic list.
+ * Keep only real event objects. Null / primitive array elements (a malformed or
+ * hostile feed) are dropped here so they can never reach the field-access code
+ * in `topicList` and throw AFTER the indexer call was paid for.
+ */
+function onlyObjects(arr: unknown[]): RawEvent[] {
+  return arr.filter((e): e is RawEvent => e !== null && typeof e === 'object')
+}
+
+/**
+ * Extraction of the event name from a topic list.
  *
  * Soroban's first topic is conventionally a symbol naming the event. Mercury
- * may deliver it already decoded ("supply") or still base64 XDR-encoded. Rather
- * than pull in an XDR decoder for a demo chip, a base64 topic is scanned for a
- * known event name appearing as readable ASCII — symbols are stored as literal
- * bytes inside the ScVal, so this matches reliably without a decoder, and a
- * miss simply lands the event in `other`.
+ * may deliver it already decoded ("supply") or still base64-XDR-encoded. Either
+ * way the value is XDR-decoded and required to be an ScVal *symbol* that
+ * EXACTLY equals a known event name — a substring or byte-containment match
+ * would let attacker-controlled payload spoof a classification. A miss simply
+ * lands the event in `other`.
  */
 export function eventName(event: RawEvent): string {
   return firstKnownName(topicList(event))
@@ -212,20 +227,13 @@ function topicList(event: RawEvent): unknown[] {
 function firstKnownName(list: unknown[]): string {
   for (const topic of list) {
     if (typeof topic !== 'string') continue
+    // Already-decoded feeds: the topic IS the literal symbol name.
     const lower = topic.toLowerCase()
-    if (Object.prototype.hasOwnProperty.call(ACTION_BY_EVENT, lower)) return lower
-    // Encoded topic: look for a known symbol embedded in the decoded bytes.
-    // Soroban symbols are stored as literal ASCII inside the ScVal, so a
-    // base64-XDR topic still contains the readable name — no XDR decoder needed.
-    let decoded = ''
-    try {
-      decoded = atob(topic.replace(/-/g, '+').replace(/_/g, '/')).toLowerCase()
-    } catch {
-      continue
-    }
-    for (const known of KNOWN_EVENT_NAMES) {
-      if (decoded.includes(known)) return known
-    }
+    if (KNOWN_EVENT_SET.has(lower)) return lower
+    // Mercury: base64-XDR ScVal. Accept only a genuine symbol that exactly
+    // matches a known name — never a substring/byte-containment match.
+    const sym = decodeSymbol(topic)
+    if (sym && KNOWN_EVENT_SET.has(sym.toLowerCase())) return sym.toLowerCase()
   }
   return 'unknown'
 }
@@ -256,9 +264,17 @@ export function extractAmount(event: RawEvent): bigint | null {
     if (typeof c === 'number' && Number.isSafeInteger(c) && c >= 0) return BigInt(c)
     if (typeof c === 'string' && /^\d+$/.test(c)) return BigInt(c)
   }
-  // Mercury: `data` is a base64-XDR ScVal — typically a tuple whose first
-  // element is the i128 amount in stroops (e.g. supply = (amount, b_tokens)).
-  return firstNonNegBigInt(decodeScVal(data))
+  // Mercury: `data` is a base64-XDR ScVal. Blend's supply/withdraw/borrow/repay
+  // events all lead their data tuple with the underlying i128 `amount` in
+  // stroops, followed by the b_/d_token delta. Decode that EXACT position —
+  // never scan for a "first non-negative", which would pick the wrong field.
+  const native = decodeScVal(data)
+  if (Array.isArray(native) && typeof native[0] === 'bigint') {
+    return native[0] >= 0n ? native[0] : null
+  }
+  // Some feeds may encode a bare i128 rather than a tuple.
+  if (typeof native === 'bigint') return native >= 0n ? native : null
+  return null
 }
 
 function extractParticipant(event: RawEvent): string | null {
@@ -321,25 +337,33 @@ export function aggregateBlendEvents(events: RawEvent[], contractId: string): Bl
   const otherNames = new Map<string, number>()
 
   for (const event of events) {
-    const name = eventName(event)
-    const action = classify(name)
-    const bucket = buckets.get(action)!
-    bucket.count += 1
-    if (action === 'other') otherNames.set(name, (otherNames.get(name) ?? 0) + 1)
+    // One malformed or hostile event must never fail the whole paid call: any
+    // throw is contained here and the event is bucketed as unparseable `other`,
+    // so every event still increments exactly one bucket (counts reconcile).
+    try {
+      const name = eventName(event)
+      const action = classify(name)
+      const bucket = buckets.get(action)!
+      bucket.count += 1
+      if (action === 'other') otherNames.set(name, (otherNames.get(name) ?? 0) + 1)
 
-    const amount = extractAmount(event)
-    if (amount !== null) {
-      bucket.total += amount
-      bucket.samples += 1
-    }
+      const amount = extractAmount(event)
+      if (amount !== null) {
+        bucket.total += amount
+        bucket.samples += 1
+      }
 
-    const participant = extractParticipant(event)
-    if (participant) bucket.participants.add(participant)
+      const participant = extractParticipant(event)
+      if (participant) bucket.participants.add(participant)
 
-    const ledger = extractLedger(event)
-    if (ledger !== null) {
-      if (firstLedger === null || ledger < firstLedger) firstLedger = ledger
-      if (lastLedger === null || ledger > lastLedger) lastLedger = ledger
+      const ledger = extractLedger(event)
+      if (ledger !== null) {
+        if (firstLedger === null || ledger < firstLedger) firstLedger = ledger
+        if (lastLedger === null || ledger > lastLedger) lastLedger = ledger
+      }
+    } catch {
+      buckets.get('other')!.count += 1
+      otherNames.set('unparseable', (otherNames.get('unparseable') ?? 0) + 1)
     }
   }
 
