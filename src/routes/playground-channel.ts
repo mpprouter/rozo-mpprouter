@@ -67,7 +67,11 @@ import {
   readChannelOnChain,
   type OnChainChannel,
 } from '../playground/channel-onchain'
-import { isChannelClosed, putLatestVoucher } from '../playground/channel-voucher-store'
+import {
+  isChannelClosed,
+  markChannelClosed,
+  putLatestVoucher,
+} from '../playground/channel-voucher-store'
 import {
   BLEND_SUMMARY_MODEL_ID,
   FORCED_MAX_TOKENS,
@@ -501,18 +505,24 @@ async function verifyChannelVoucher(
 }
 
 /**
- * Settle after the upstream call, preserving the single source of truth from
- * the custodial path: a charge stands ONLY when a credential was provably
- * signed for this call (`paid === true`, or an UpstreamError whose
- * paymentEvidence is 'yes'). Everything else rolls the voucher back so the
- * cumulative returns to `previousAmount` and nothing is billed.
+ * Reverse the charge for a call that must NOT stand (unpaid, or a paid call
+ * whose voucher could not be persisted). Rolls the mppx cumulative back to the
+ * previous watermark so the NEXT call's quote starts from the right place.
+ *
+ * P0-2: if the rollback itself fails, the watermark is left advanced while the
+ * stored (redeemable) voucher is still the PREVIOUS one — a subsequent call
+ * would then absorb this failed increment into its own cumulative. To stop
+ * that, we FENCE the channel (mark it closed) so no further call proceeds. The
+ * money statement stays accurate either way: the collector redeems only the
+ * stored voucher, which never includes this un-persisted increment, so the
+ * caller reports charged_usd = 0 for this call. Never releases the lock — the
+ * caller's finally owns that.
  */
-async function rollbackAndRelease(
+async function reverseChargeOrFence(
   env: Env,
   channelContract: string,
   voucher: ChannelVoucher,
-  lockId: string,
-): Promise<boolean> {
+): Promise<void> {
   let rolledBack = false
   try {
     rolledBack = await rollbackFailedChannelVoucher(
@@ -523,33 +533,30 @@ async function rollbackAndRelease(
       voucher.challengeId,
     )
   } catch (e: any) {
-    console.error(`[channel] voucher rollback failed: ${e?.message}`)
+    console.error(`[channel] voucher rollback threw for ${channelContract}: ${e?.message}`)
   }
-  await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
-  return rolledBack
+  if (!rolledBack) {
+    // Could not cleanly restore the watermark → fence so no later call can
+    // advance from this stale watermark and absorb the un-charged increment.
+    console.error(`[channel] rollback did not restore watermark for ${channelContract}; fencing`)
+    await markChannelClosed(env, channelContract).catch(() => {})
+  }
 }
 
 /**
- * Commit path: the charge stands (cumulative advanced). Persist the latest
- * voucher signature so the settlement cron can COLLECT it on-chain, then
- * release the delivery lock. Persisting under the lock keeps it single-writer.
- *
- * P0-B: FAIL CLOSED. If there is no signature, or the atomic persist throws, we
- * must NOT finalize the charge — a paid call with no redeemable voucher lets
- * the user refund while the collector cannot settle. On failure we roll the
- * voucher back (restore the cumulative) and return false; the caller turns that
- * into an error, reversing the charge. The router may eat the already-paid
- * upstream cost in that rare case — the safe direction.
+ * P0-B: persist the redeemable latest voucher, FAIL CLOSED. Returns true iff the
+ * signature is present AND the atomic write succeeded. On any failure the charge
+ * is reversed (or the channel fenced) so a paid call is never left with an
+ * advanced-but-uncollectable cumulative. Never releases the lock.
  */
-async function commitVoucher(
+async function persistVoucherOrReverse(
   env: Env,
   channelContract: string,
   voucher: ChannelVoucher,
-  lockId: string,
 ): Promise<boolean> {
   if (!voucher.signature) {
     console.error(`[channel] no signature on kept voucher for ${channelContract}; failing closed`)
-    await rollbackAndRelease(env, channelContract, voucher, lockId)
+    await reverseChargeOrFence(env, channelContract, voucher)
     return false
   }
   try {
@@ -558,15 +565,12 @@ async function commitVoucher(
       cumulativeRaw: parseUsd(voucher.amountDecimal).toString(),
       signature: voucher.signature,
     })
+    return true
   } catch (e: any) {
-    console.error(
-      `[channel] voucher persist failed for ${channelContract}: ${e?.message}; failing closed`,
-    )
-    await rollbackAndRelease(env, channelContract, voucher, lockId)
+    console.error(`[channel] voucher persist failed for ${channelContract}: ${e?.message}`)
+    await reverseChargeOrFence(env, channelContract, voucher)
     return false
   }
-  await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
-  return true
 }
 
 /** Response when the settlement voucher could not be persisted (charge reversed). */
@@ -670,65 +674,23 @@ export async function handleChannelChat(request: Request, env: Env): Promise<Res
 
   const { maxUpstreamRaw, priceRaw } = channelPriceForModel(model)
 
-  const verify = await verifyChannelVoucher(request, env, priceRaw, id)
-  if (verify.kind === 'respond') return verify.response
-  const { channelContract, voucher, lockId, withReceipt } = verify
-
-  let completion: ChatCompletion
-  let paid: boolean
-  let upstreamCostRaw: string | undefined
-  try {
-    ;({ value: completion, paid, upstreamCostRaw } = await callUpstreamJson<ChatCompletion>(env, {
-      route,
-      body: {
-        model: model.id,
-        messages,
-        max_tokens: FORCED_MAX_TOKENS,
-        stream: false,
-      },
-      budgetAtomic: parseUsd(TIER_UPSTREAM_BUDGET_USD[model.tier]),
-    }))
-  } catch (e) {
-    return withReceipt(await settleUpstreamError(env, channelContract, voucher, lockId, e))
-  }
-
-  if (!paid) {
-    await rollbackAndRelease(env, channelContract, voucher, lockId)
-    return withReceipt(
-      fail(502, 'upstream_unpaid', 'the call did not complete a payment; you were not charged', {
-        call_id: id,
-        charged_usd: '0.00',
+  return executeMeteredChannelCall(
+    request,
+    env,
+    id,
+    priceRaw,
+    maxUpstreamRaw,
+    () =>
+      callUpstreamJson<ChatCompletion>(env, {
+        route,
+        body: { model: model.id, messages, max_tokens: FORCED_MAX_TOKENS, stream: false },
+        budgetAtomic: parseUsd(TIER_UPSTREAM_BUDGET_USD[model.tier]),
       }),
-    )
-  }
-
-  const text = completion.choices?.[0]?.message?.content
-  if (typeof text !== 'string' || text.length === 0) {
-    // paid === true: the router DID pay upstream, the content was just
-    // unusable. Keep the charge (commit) with a support note.
-    if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
-      return withReceipt(settlementFailed(id))
-    }
-    return withReceipt(
-      fail(502, 'upstream_empty', 'upstream returned no completion', {
-        call_id: id,
-        ...pricingFields(priceRaw, maxUpstreamRaw, upstreamCostRaw),
-        support_note:
-          'The upstream provider was paid but did not return a usable result, so this call was charged.',
-      }),
-    )
-  }
-
-  if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
-    return withReceipt(settlementFailed(id))
-  }
-  return withReceipt(
-    json({
-      call_id: id,
-      message: text,
-      model: model.id,
-      ...pricingFields(priceRaw, maxUpstreamRaw, upstreamCostRaw),
-    }),
+    async value => {
+      const text = (value as ChatCompletion).choices?.[0]?.message?.content
+      if (typeof text !== 'string' || text.length === 0) return null
+      return { message: text, model: model.id }
+    },
   )
 }
 
@@ -753,74 +715,58 @@ export async function handleChannelBlendActivity(request: Request, env: Env): Pr
     return fail(e?.status ?? 503, e?.code ?? 'route_unavailable', e?.message ?? 'route unavailable')
   }
 
-  const verify = await verifyChannelVoucher(request, env, priceRaw, id)
-  if (verify.kind === 'respond') return verify.response
-  const { channelContract, voucher, lockId, withReceipt } = verify
-
-  let raw: unknown
-  let paid: boolean
-  let upstreamCostRaw: string | undefined
-  try {
-    ;({ value: raw, paid, upstreamCostRaw } = await callUpstreamJson(env, {
-      route: eventsRoute,
-      query: { contract_id: BLEND_MAIN_POOL_CONTRACT_ID, limit: String(BLEND_EVENT_LIMIT) },
-      budgetAtomic: parseUsd(chip.budgetUsd),
-    }))
-  } catch (e) {
-    return withReceipt(await settleUpstreamError(env, channelContract, voucher, lockId, e))
-  }
-
-  if (!paid) {
-    await rollbackAndRelease(env, channelContract, voucher, lockId)
-    return withReceipt(
-      fail(502, 'upstream_unpaid', 'the call did not complete a payment; you were not charged', {
-        call_id: id,
-        charged_usd: '0.00',
+  return executeMeteredChannelCall(
+    request,
+    env,
+    id,
+    priceRaw,
+    maxUpstreamRaw,
+    () =>
+      callUpstreamJson(env, {
+        route: eventsRoute,
+        query: { contract_id: BLEND_MAIN_POOL_CONTRACT_ID, limit: String(BLEND_EVENT_LIMIT) },
+        budgetAtomic: parseUsd(chip.budgetUsd),
       }),
-    )
-  }
-
-  const aggregate = aggregateBlendEvents(extractEvents(raw), BLEND_MAIN_POOL_CONTRACT_ID)
-
-  // Narration: bounded, optional, best-effort — mirrors the custodial chip.
-  let summary = describeAggregate(aggregate)
-  const summaryModel = findModel(BLEND_SUMMARY_MODEL_ID)
-  if (summaryModel?.available && aggregate.events_examined > 0) {
-    try {
-      const nRoute = resolvePlaygroundRoute(summaryModel.routePublicPath, summaryModel.routeMethod)
-      const { value: nCompletion } = await callUpstreamJson<ChatCompletion>(env, {
-        route: nRoute,
-        body: {
-          model: summaryModel.id,
-          messages: [{ role: 'user', content: buildSummaryPrompt(aggregate) }],
-          max_tokens: 200,
-          stream: false,
+    async raw => {
+      const aggregate = aggregateBlendEvents(extractEvents(raw), BLEND_MAIN_POOL_CONTRACT_ID)
+      // Narration: bounded, optional, best-effort. Runs AFTER the voucher is
+      // persisted (charge already stands); a failure is swallowed. Its max cost
+      // is already folded into the quote (channel-config.ts).
+      let summary = describeAggregate(aggregate)
+      const summaryModel = findModel(BLEND_SUMMARY_MODEL_ID)
+      if (summaryModel?.available && aggregate.events_examined > 0) {
+        try {
+          const nRoute = resolvePlaygroundRoute(
+            summaryModel.routePublicPath,
+            summaryModel.routeMethod,
+          )
+          const { value: nCompletion } = await callUpstreamJson<ChatCompletion>(env, {
+            route: nRoute,
+            body: {
+              model: summaryModel.id,
+              messages: [{ role: 'user', content: buildSummaryPrompt(aggregate) }],
+              max_tokens: 200,
+              stream: false,
+            },
+            timeoutMs: 15_000,
+            budgetAtomic: parseUsd(TIER_UPSTREAM_BUDGET_USD[summaryModel.tier]),
+          })
+          const t = nCompletion.choices?.[0]?.message?.content
+          if (typeof t === 'string' && t.trim().length > 0) summary = t.trim()
+        } catch (e: any) {
+          console.warn('[channel] blend narration skipped:', e?.message)
+        }
+      }
+      return {
+        summary,
+        events_table: {
+          contract_id: aggregate.contract_id,
+          events_examined: aggregate.events_examined,
+          ledger_range: aggregate.ledger_range,
+          rows: aggregate.rows,
         },
-        timeoutMs: 15_000,
-        budgetAtomic: parseUsd(TIER_UPSTREAM_BUDGET_USD[summaryModel.tier]),
-      })
-      const t = nCompletion.choices?.[0]?.message?.content
-      if (typeof t === 'string' && t.trim().length > 0) summary = t.trim()
-    } catch (e: any) {
-      console.warn('[channel] blend narration skipped:', e?.message)
-    }
-  }
-
-  if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
-    return withReceipt(settlementFailed(id))
-  }
-  return withReceipt(
-    json({
-      call_id: id,
-      summary,
-      events_table: {
-        contract_id: aggregate.contract_id,
-        events_examined: aggregate.events_examined,
-        ledger_range: aggregate.ledger_range,
-        rows: aggregate.rows,
-      },
-      ...pricingFields(priceRaw, maxUpstreamRaw, upstreamCostRaw),
-    }),
+      }
+    },
   )
 }
 
@@ -850,80 +796,122 @@ export async function handleChannelTxDecode(request: Request, env: Env): Promise
     return fail(e?.status ?? 503, e?.code ?? 'route_unavailable', e?.message ?? 'route unavailable')
   }
 
-  const verify = await verifyChannelVoucher(request, env, priceRaw, id)
-  if (verify.kind === 'respond') return verify.response
-  const { channelContract, voucher, lockId, withReceipt } = verify
-
-  let result: unknown
-  let paid: boolean
-  let upstreamCostRaw: string | undefined
-  try {
-    ;({ value: result, paid, upstreamCostRaw } = await callUpstreamJson(env, {
-      route,
-      query: { tx_hash: txHash },
-      budgetAtomic: parseUsd(chip.budgetUsd),
-    }))
-  } catch (e) {
-    return withReceipt(await settleUpstreamError(env, channelContract, voucher, lockId, e))
-  }
-
-  if (!paid) {
-    await rollbackAndRelease(env, channelContract, voucher, lockId)
-    return withReceipt(
-      fail(502, 'upstream_unpaid', 'the call did not complete a payment; you were not charged', {
-        call_id: id,
-        charged_usd: '0.00',
+  return executeMeteredChannelCall(
+    request,
+    env,
+    id,
+    priceRaw,
+    maxUpstreamRaw,
+    () =>
+      callUpstreamJson(env, {
+        route,
+        query: { tx_hash: txHash },
+        budgetAtomic: parseUsd(chip.budgetUsd),
       }),
-    )
-  }
-
-  if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
-    return withReceipt(settlementFailed(id))
-  }
-  return withReceipt(
-    json({
-      call_id: id,
-      tx_hash: txHash,
-      transaction: result,
-      ...pricingFields(priceRaw, maxUpstreamRaw, upstreamCostRaw),
-    }),
+    async result => ({ tx_hash: txHash, transaction: result }),
   )
 }
 
 /**
- * Map an upstream throw to a settled Response. THE ONLY thing that keeps a
- * charge is `paymentEvidence === 'yes'` (a credential was provably signed) —
- * every other outcome rolls the voucher back. This is the exact single source
- * of truth from the custodial `failCall`.
+ * The one place the metered-call money invariant is enforced. Post-verify work
+ * runs inside a try/FINALLY so the delivery lock is ALWAYS released (P0-3a), and
+ * the ordering guarantees that once upstream is PAID the redeemable voucher is
+ * persisted BEFORE the response body is ever inspected (P0-4). On every path the
+ * user's charged_usd equals what the collector can redeem.
+ *
+ * `doUpstream` performs the (possibly-throwing) paid call; `buildBody` turns a
+ * successful upstream value into the response fields, or null when the paid body
+ * is unusable (garbage/empty) — it must not throw the caller out of the paid
+ * section (we catch it defensively and treat it as unusable).
  */
-async function settleUpstreamError(
+async function executeMeteredChannelCall(
+  request: Request,
   env: Env,
-  channelContract: string,
-  voucher: ChannelVoucher,
-  lockId: string,
-  e: unknown,
+  id: string,
+  priceRaw: bigint,
+  maxUpstreamRaw: bigint,
+  doUpstream: () => Promise<{ value: unknown; paid: boolean; upstreamCostRaw?: string }>,
+  buildBody: (value: unknown) => Promise<Record<string, unknown> | null>,
 ): Promise<Response> {
-  const upstream = e instanceof UpstreamError ? e : null
-  const code = upstream?.code ?? 'upstream_error'
-  const status = upstream?.status ?? 502
-  const message = upstream?.message ?? 'upstream call failed'
-  const shouldCommit = upstream?.paymentEvidence === 'yes'
+  const verify = await verifyChannelVoucher(request, env, priceRaw, id)
+  if (verify.kind === 'respond') return verify.response
+  const { channelContract, voucher, lockId, withReceipt } = verify
 
-  if (shouldCommit) {
-    // Money moved: leave the voucher cumulative advanced and persist it, then
-    // release the lock so the settlement cron can collect it.
-    if (!(await commitVoucher(env, channelContract, voucher, lockId))) {
-      return settlementFailed('')
-    }
-    return fail(status, code, message, {
-      support_note:
-        'The upstream provider was paid but did not return a usable result, so this call was charged.',
-    })
+  let released = false
+  const release = async () => {
+    if (released) return
+    released = true
+    await releaseChannelDeliveryLock(env, channelContract, lockId).catch(() => {})
   }
 
-  const rolledBack = await rollbackAndRelease(env, channelContract, voucher, lockId)
-  return fail(status, code, message, {
-    charged_usd: '0.00',
-    refund_status: rolledBack ? 'voucher-not-consumed' : 'manual-review',
-  })
+  try {
+    let up: { value: unknown; paid: boolean; upstreamCostRaw?: string }
+    try {
+      up = await doUpstream()
+    } catch (e) {
+      const ue =
+        e instanceof UpstreamError
+          ? e
+          : new UpstreamError('upstream_error', 502, (e as any)?.message ?? 'upstream call failed', 'no')
+      if (ue.paymentEvidence === 'yes') {
+        // Money moved → the charge stands. Persist the redeemable voucher
+        // BEFORE returning (never leave an advanced, uncollectable cumulative).
+        if (!(await persistVoucherOrReverse(env, channelContract, voucher))) {
+          return withReceipt(settlementFailed(id))
+        }
+        return withReceipt(
+          fail(ue.status, ue.code, ue.message, {
+            call_id: id,
+            ...pricingFields(priceRaw, maxUpstreamRaw, undefined),
+            support_note:
+              'The upstream provider was paid but did not return a usable result, so this call was charged.',
+          }),
+        )
+      }
+      // No credential signed → nothing billed. charged_usd 0 is accurate.
+      await reverseChargeOrFence(env, channelContract, voucher)
+      return withReceipt(fail(ue.status, ue.code, ue.message, { call_id: id, charged_usd: '0.00' }))
+    }
+
+    if (!up.paid) {
+      await reverseChargeOrFence(env, channelContract, voucher)
+      return withReceipt(
+        fail(502, 'upstream_unpaid', 'the call did not complete a payment; you were not charged', {
+          call_id: id,
+          charged_usd: '0.00',
+        }),
+      )
+    }
+
+    // PAID → persist the redeemable voucher BEFORE inspecting the body (P0-4).
+    if (!(await persistVoucherOrReverse(env, channelContract, voucher))) {
+      return withReceipt(settlementFailed(id))
+    }
+
+    // Parse AFTER persist. A garbage/null body must not escape the paid section;
+    // treat any throw or null as an unusable-but-paid result (charge stands).
+    let bodyFields: Record<string, unknown> | null = null
+    try {
+      bodyFields = await buildBody(up.value)
+    } catch (e: any) {
+      console.error(`[channel] response body build threw for ${id}: ${e?.message}`)
+      bodyFields = null
+    }
+    if (!bodyFields) {
+      return withReceipt(
+        fail(502, 'upstream_empty', 'upstream was paid but returned no usable result', {
+          call_id: id,
+          ...pricingFields(priceRaw, maxUpstreamRaw, up.upstreamCostRaw),
+          support_note:
+            'The upstream provider was paid but did not return a usable result, so this call was charged.',
+        }),
+      )
+    }
+    return withReceipt(
+      json({ call_id: id, ...bodyFields, ...pricingFields(priceRaw, maxUpstreamRaw, up.upstreamCostRaw) }),
+    )
+  } finally {
+    // P0-3a: the lock is released on EVERY path — success, error, or throw.
+    await release()
+  }
 }

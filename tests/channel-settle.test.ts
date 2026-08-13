@@ -40,6 +40,10 @@ import {
 } from '../src/playground/channel-voucher-store'
 import { putPgChannel, PG_PROVENANCE_VERSION } from '../src/playground/channel-pg-store'
 import {
+  acquireChannelDeliveryLock,
+  releaseChannelDeliveryLock,
+} from '../src/mpp/stellar-channel-dispatch'
+import {
   collectorKeyMatches,
   decodeVoucherSignature,
   settleOneChannel,
@@ -171,8 +175,7 @@ describe('settleOneChannel', () => {
       closeEffectiveAtLedger: 12345,
       currentLedger: 12000,
     })
-    const voucher = (await getLatestVoucher(e, CHANNEL))!
-    const tx = await settleOneChannel(e, CHANNEL, voucher, deps)
+    const tx = await settleOneChannel(e, CHANNEL, deps)
     expect(tx).toBe('tx-hash-abc')
     expect(closeMock).toHaveBeenCalledOnce()
     const arg = closeMock.mock.calls[0][0]
@@ -185,9 +188,24 @@ describe('settleOneChannel', () => {
     expect(atomic.backing.get(`pg:channel:closed:${CHANNEL}`)).toBeTruthy()
   })
 
+  it('P0-1: closes with the LATEST voucher read under the lock, not a stale one', async () => {
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: 12345,
+      currentLedger: 12000,
+    })
+    // A concurrent call committed a HIGHER cumulative (V2) after V1 was stored.
+    await putLatestVoucher(e, CHANNEL, {
+      amountDecimal: '0.7000000',
+      cumulativeRaw: '7000000',
+      signature: 'ee'.repeat(64),
+    })
+    await settleOneChannel(e, CHANNEL, deps)
+    // Closes with V2 (7,000,000), never the stale V1.
+    expect(closeMock.mock.calls[0][0].amount).toBe(7_000_000n)
+  })
+
   it('settles when unsettled crosses the threshold even without close_start', async () => {
-    const voucher = (await getLatestVoucher(e, CHANNEL))!
-    expect(await settleOneChannel(e, CHANNEL, voucher, deps)).toBe('tx-hash-abc')
+    expect(await settleOneChannel(e, CHANNEL, deps)).toBe('tx-hash-abc')
     expect(closeMock).toHaveBeenCalledOnce()
   })
 
@@ -199,34 +217,72 @@ describe('settleOneChannel', () => {
       cumulativeRaw: '100000',
       signature: SIG_HEX,
     })
-    const voucher = (await getLatestVoucher(e2, CHANNEL2))!
-    expect(await settleOneChannel(e2, CHANNEL2, voucher, deps)).toBeNull()
+    expect(await settleOneChannel(e2, CHANNEL2, deps)).toBeNull()
     expect(closeMock).not.toHaveBeenCalled()
   })
 
   it('does NOT re-settle an already fully-settled cumulative', async () => {
     await markVoucherSettled(e, CHANNEL, '5000000')
-    const voucher = (await getLatestVoucher(e, CHANNEL))!
     ;(deps.getChannelState as any).mockResolvedValue({
       closeEffectiveAtLedger: 12345,
       currentLedger: 12000,
     })
-    expect(await settleOneChannel(e, CHANNEL, voucher, deps)).toBeNull()
+    expect(await settleOneChannel(e, CHANNEL, deps)).toBeNull()
     expect(closeMock).not.toHaveBeenCalled()
   })
 
-  it('yields to an in-flight call: skips when the delivery lock is held', async () => {
+  it('yields to an in-flight call: skips when a LIVE delivery lock is held', async () => {
     ;(deps.getChannelState as any).mockResolvedValue({
       closeEffectiveAtLedger: 12345,
       currentLedger: 12000,
     })
-    // A call holds the same per-channel delivery lock.
-    atomic.backing.set(`refund:channel-lock:${CHANNEL}`, { id: 'call-in-flight' })
-    const voucher = (await getLatestVoucher(e, CHANNEL))!
-    expect(await settleOneChannel(e, CHANNEL, voucher, deps)).toBeNull()
+    // A call holds a live (unexpired) lock.
+    atomic.backing.set(`refund:channel-lock:${CHANNEL}`, {
+      id: 'call-in-flight',
+      expiresAt: Date.now() + 60_000,
+    })
+    expect(await settleOneChannel(e, CHANNEL, deps)).toBeNull()
     expect(closeMock).not.toHaveBeenCalled()
-    // Did not fence the channel — the call proceeds normally.
     expect(atomic.backing.get(`pg:channel:closed:${CHANNEL}`)).toBeUndefined()
+  })
+
+  it('P0-3: takes over an EXPIRED (leaked) lock and settles', async () => {
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: 12345,
+      currentLedger: 12000,
+    })
+    // A prior call leaked the lock; its TTL has elapsed.
+    atomic.backing.set(`refund:channel-lock:${CHANNEL}`, {
+      id: 'leaked',
+      expiresAt: Date.now() - 1_000,
+    })
+    expect(await settleOneChannel(e, CHANNEL, deps)).toBe('tx-hash-abc')
+    expect(closeMock).toHaveBeenCalledOnce()
+  })
+})
+
+describe('delivery lock — TTL + safe takeover (P0-3)', () => {
+  it('acquires when free; blocks a live lock; takes over an expired one', async () => {
+    atomic.backing.clear()
+    const e = env(makeKv())
+    expect(await acquireChannelDeliveryLock(e, CHANNEL, 'a')).toBe(true)
+    // A live lock blocks a different holder.
+    expect(await acquireChannelDeliveryLock(e, CHANNEL, 'b')).toBe(false)
+    // Force the stored lock to expire, then a takeover succeeds.
+    const cur = atomic.backing.get(`refund:channel-lock:${CHANNEL}`)
+    atomic.backing.set(`refund:channel-lock:${CHANNEL}`, { ...cur, expiresAt: Date.now() - 1 })
+    expect(await acquireChannelDeliveryLock(e, CHANNEL, 'c')).toBe(true)
+    expect(atomic.backing.get(`refund:channel-lock:${CHANNEL}`).id).toBe('c')
+  })
+
+  it('release only deletes the lock when the fencing id matches', async () => {
+    atomic.backing.clear()
+    const e = env(makeKv())
+    await acquireChannelDeliveryLock(e, CHANNEL, 'owner')
+    await releaseChannelDeliveryLock(e, CHANNEL, 'not-owner')
+    expect(atomic.backing.get(`refund:channel-lock:${CHANNEL}`)).toBeTruthy() // still held
+    await releaseChannelDeliveryLock(e, CHANNEL, 'owner')
+    expect(atomic.backing.get(`refund:channel-lock:${CHANNEL}`)).toBeUndefined()
   })
 })
 

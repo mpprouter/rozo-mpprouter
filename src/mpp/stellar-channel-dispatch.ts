@@ -209,20 +209,39 @@ export async function rollbackFailedChannelVoucher(
   return String(current?.amount ?? '0') === previousAmount && challenge === null
 }
 
+/**
+ * TTL after which a delivery lock is considered leaked and may be taken over.
+ * Set well above the longest critical section (an upstream call + settle,
+ * ~tens of seconds) so a live holder is never displaced, but well below the
+ * ~10-minute (100-ledger) refund window so a leaked lock self-heals in time for
+ * the settlement cron (which runs every 2 minutes) to still collect.
+ */
+export const DELIVERY_LOCK_TTL_MS = 120_000
+
 export async function acquireChannelDeliveryLock(
   env: Env,
   channelContract: string,
   lockId: string,
 ): Promise<boolean> {
   const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+  const now = Date.now()
   return (store.update as any)(`refund:channel-lock:${channelContract}`, (current: any) => {
-    // No automatic takeover: without a fencing token an old request could
-    // wake up and roll back a newer delivered voucher. Crash recovery is an
-    // explicit operator action; fail closed is safer than incorrect money.
-    if (current) return { op: 'noop', result: false }
+    // Takeover is allowed ONLY of a provably-expired lock (a holder that
+    // crashed/leaked after acquiring). A live, unexpired lock still blocks —
+    // the `id` fencing token in releaseChannelDeliveryLock ensures the old
+    // holder's late release cannot delete the new holder's lock, so there is no
+    // double-entry into the paid section. A lock without an expiresAt (legacy
+    // pre-TTL format) is treated as expired so it, too, can self-heal.
+    if (current && typeof current.expiresAt === 'number' && now < current.expiresAt) {
+      return { op: 'noop', result: false }
+    }
     return {
       op: 'set',
-      value: { id: lockId, acquiredAt: new Date().toISOString() },
+      value: {
+        id: lockId,
+        acquiredAt: new Date(now).toISOString(),
+        expiresAt: now + DELIVERY_LOCK_TTL_MS,
+      },
       result: true,
     }
   })

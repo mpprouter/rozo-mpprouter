@@ -34,12 +34,7 @@ import type { Env } from '../index'
 import { parseUsd } from './amount'
 import { channelCollector, channelPlaygroundEnabled } from './channel-config'
 import { listPgChannels, pgChannelProvenanceOk } from './channel-pg-store'
-import {
-  getLatestVoucher,
-  markChannelClosed,
-  markVoucherSettled,
-  type LatestVoucher,
-} from './channel-voucher-store'
+import { getLatestVoucher, markChannelClosed, markVoucherSettled } from './channel-voucher-store'
 import {
   acquireChannelDeliveryLock,
   releaseChannelDeliveryLock,
@@ -100,37 +95,43 @@ export function collectorKeyMatches(env: Env): boolean {
 }
 
 /**
- * Settle one channel if due. Acquires the delivery lock (skips if a call holds
- * it), marks the channel closed to fence later calls, then submits the
- * collector-signed close with the latest voucher. Returns the tx hash, or null
- * when nothing was due / the lock was busy.
+ * Settle one channel if due. Acquires the delivery lock FIRST (skips if a live
+ * call holds it), then RE-READS the latest voucher UNDER the lock (P0-1) — never
+ * a snapshot taken before the lock was held, which could be stale by a call
+ * that committed a higher cumulative in the meantime. Marks the channel closed
+ * to fence later calls, then submits the collector-signed close with that
+ * latest voucher. Returns the tx hash, or null when nothing was due / the lock
+ * was busy.
  */
 export async function settleOneChannel(
   env: Env,
   channelContract: string,
-  voucher: LatestVoucher,
   deps: SettleDeps = DEFAULT_DEPS,
 ): Promise<string | null> {
-  const cumulativeRaw = BigInt(voucher.cumulativeRaw)
-  const settledRaw = BigInt(voucher.lastSettledRaw || '0')
-  const unsettled = cumulativeRaw - settledRaw
-  if (unsettled <= 0n) return null
-
-  const state = await deps.getChannelState({
-    channel: channelContract,
-    network: env.STELLAR_NETWORK,
-    rpcUrl: env.STELLAR_RPC_URL,
-  })
-  const closing = state.closeEffectiveAtLedger != null
-  if (!closing && unsettled < SETTLE_THRESHOLD_RAW) return null
-
-  // Fence: take the SAME lock calls use. If a call holds it, skip this tick.
+  // Fence: take the SAME lock calls use. A live call holds it → skip this tick;
+  // a leaked/expired lock is taken over (self-heal). Everything below runs
+  // strictly under the lock.
   const lockId = crypto.randomUUID()
   const acquired = await acquireChannelDeliveryLock(env, channelContract, lockId)
   if (!acquired) return null
   try {
-    // Mark closed BEFORE the (final) close so any call that arrives after we
-    // release the lock rejects instead of paying upstream.
+    // Authoritative read UNDER the lock — this is the latest committed voucher.
+    const voucher = await getLatestVoucher(env, channelContract)
+    if (!voucher) return null
+    const cumulativeRaw = BigInt(voucher.cumulativeRaw)
+    const unsettled = cumulativeRaw - BigInt(voucher.lastSettledRaw || '0')
+    if (unsettled <= 0n) return null
+
+    const state = await deps.getChannelState({
+      channel: channelContract,
+      network: env.STELLAR_NETWORK,
+      rpcUrl: env.STELLAR_RPC_URL,
+    })
+    const closing = state.closeEffectiveAtLedger != null
+    if (!closing && unsettled < SETTLE_THRESHOLD_RAW) return null
+
+    // Mark closed BEFORE the (final) close so any call that acquires the lock
+    // after we release it rejects instead of paying upstream.
     await markChannelClosed(env, channelContract)
 
     const signature = decodeVoucherSignature(voucher.signature)
@@ -185,9 +186,11 @@ export async function settlePlaygroundChannels(
     try {
       // Only settle channels that still pass provenance and pay the collector.
       if (!pgChannelProvenanceOk(state, env)) continue
+      // Cheap pre-gate to skip channels with no voucher at all; settleOneChannel
+      // re-reads the authoritative latest voucher UNDER the lock (P0-1).
       const voucher = await getLatestVoucher(env, state.channelContract)
       if (!voucher) continue
-      await settleOneChannel(env, state.channelContract, voucher, deps)
+      await settleOneChannel(env, state.channelContract, deps)
     } catch (e: any) {
       console.error(`[channel-settle] settle failed for ${state.channelContract}: ${e?.message}`)
     }

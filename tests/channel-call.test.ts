@@ -256,6 +256,45 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(atomic.backing.get(`pg:channel:voucher:${CHANNEL}`)).toBeUndefined()
   })
 
+  it('P0-4: a null/garbage body AFTER payment still persists the voucher + releases lock + charges', async () => {
+    h.callUpstream.mockResolvedValue({ value: null, paid: true, upstreamCostRaw: '500' })
+    const res = await handleChannelChat(chatReq(), env())
+    expect(res.status).toBe(502)
+    const json = (await res.json()) as any
+    expect(json.error).toBe('upstream_empty')
+    // Money moved → charge stands at the quote.
+    expect(json.charged_usd).toBe('0.022')
+    // Voucher persisted (collector can redeem) and lock released, despite the
+    // unusable body — never thrown out of the paid section.
+    expect(atomic.backing.get(`pg:channel:voucher:${CHANNEL}`)?.signature).toBe(SIG_HEX)
+    expect(h.release).toHaveBeenCalled()
+    expect(h.rollback).not.toHaveBeenCalled()
+  })
+
+  it('P0-2: rollback-failure fences the channel and reports charged_usd 0 (no lie)', async () => {
+    h.callUpstream.mockResolvedValue({
+      value: { choices: [{ message: { content: 'x' } }] },
+      paid: false,
+    })
+    h.rollback.mockResolvedValue(false) // watermark rollback fails
+    const res = await handleChannelChat(chatReq(), env())
+    const json = (await res.json()) as any
+    expect(json.error).toBe('upstream_unpaid')
+    expect(json.charged_usd).toBe('0.00') // accurate: collector redeems nothing here
+    // Fenced so a later call can't absorb the un-charged increment.
+    expect(atomic.backing.get(`pg:channel:closed:${CHANNEL}`)).toBeTruthy()
+    // No redeemable voucher was stored for this call.
+    expect(atomic.backing.get(`pg:channel:voucher:${CHANNEL}`)).toBeUndefined()
+  })
+
+  it('P0-3: releases the lock even when upstream throws a non-UpstreamError', async () => {
+    h.callUpstream.mockRejectedValue(new Error('kaboom'))
+    const res = await handleChannelChat(chatReq(), env())
+    expect(res.status).toBe(502)
+    expect((await res.json()).charged_usd).toBe('0.00')
+    expect(h.release).toHaveBeenCalled() // finally always releases
+  })
+
   it('rejects a call once the channel has been marked closed (settlement fence)', async () => {
     atomic.backing.set(`pg:channel:closed:${CHANNEL}`, { closedAt: 'now' })
     const res = await handleChannelChat(chatReq(), env())
