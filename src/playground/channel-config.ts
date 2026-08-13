@@ -147,21 +147,13 @@ function blendNarrationMaxRaw(): bigint {
  * budget, actual spend can never exceed it, so the quote can never be
  * under-charged.
  */
-/**
- * Founder decision (2026-08-13): every chat model costs the SAME flat price
- * per call — the dropdown must never show per-model / per-tier price spread.
- * The flat price must still cover the worst-case upstream cost of ANY tier,
- * so it is floored at applyMarkup(maxUpstreamRaw): if a future budget bump
- * pushes cost+markup above the flat price, the larger amount wins and the
- * router can never under-charge.
- */
-export const CHANNEL_FLAT_MODEL_PRICE_USD = '0.10'
-
+// Founder decision (2026-08-13 evening, reverting the same-day flat-$0.10
+// experiment): prices track the UPSTREAM cost dynamically — each model is
+// quoted at its tier's enforced upstream budget ceiling + markup, never a
+// hardcoded flat number.
 export function channelPriceForModel(model: PlaygroundModel): ChannelPrice {
   const maxUpstreamRaw = parseUsd(TIER_UPSTREAM_BUDGET_USD[model.tier])
-  const covered = applyMarkup(maxUpstreamRaw)
-  const flat = parseUsd(CHANNEL_FLAT_MODEL_PRICE_USD)
-  return { maxUpstreamRaw, priceRaw: flat > covered ? flat : covered }
+  return { maxUpstreamRaw, priceRaw: applyMarkup(maxUpstreamRaw) }
 }
 
 /**
@@ -256,8 +248,9 @@ export function channelPricingConfig(env: { PLAYGROUND_CHAT_MODELS_DISABLED?: st
       }
     }),
     pricing: {
-      model: 'flat',
-      note: `Every chat model costs a flat ${CHANNEL_FLAT_MODEL_PRICE_USD} USD per call regardless of model or message length (floored at worst-case upstream cost + markup so the router never under-charges). Chips are quoted at their own budget ceiling + markup. The voucher cumulative advances by exactly the charged amount; failed calls are rolled back and never billed.`,
+      model: 'real-cost',
+      markup: '10% of max upstream cost, minimum $0.001',
+      note: 'Each call is quoted at the MAX upstream cost the router could pay for that route (the enforced budget ceiling, including the Blend narration call) plus markup, so the charged amount always covers the real cost. The voucher cumulative advances by exactly the charged amount; failed calls are rolled back and never billed.',
     },
   }
 }
