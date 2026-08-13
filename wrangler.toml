@@ -205,17 +205,17 @@ PLAYGROUND_TURNSTILE_SITE_KEY = "0x4AAAAAAEOlP1MJ1iX6PnZl"
 # Explicit off switch for the intent Turnstile gate, for staged rollout before
 # the frontend widget ships. ONLY the exact string "true" disables it — a
 # missing/typo'd secret still fails closed. Leave unset in production.
-# PLAYGROUND_TURNSTILE_DISABLED = "true"
+PLAYGROUND_TURNSTILE_DISABLED = "true"
 
 # ---- Non-custodial channel playground (built alongside the custodial one) ----
 # Kill switch for every /v1/playground/channel/* route. Ships OFF; flip to
 # "true" only after the channel WASM + factory are deployed on mainnet and the
 # path is verified. See src/routes/playground-channel.ts.
-PLAYGROUND_CHANNEL_ENABLED = "false"
+PLAYGROUND_CHANNEL_ENABLED = "true"
 # Channel-factory contract address (C...) the frontend calls `open` against.
 # Empty until the founder deploys the factory on mainnet (L3). Advertised (as
 # null when unset) by GET /v1/playground/config.
-PLAYGROUND_CHANNEL_FACTORY = ""
+PLAYGROUND_CHANNEL_FACTORY = "CCR2HE6CAMBYNUQG4N27CH5EAYELGYTQIONTYJ72K63XQZSL23OV7RTX"
 # Dedicated hot COLLECTOR account every playground channel pays TO (Option A).
 # DISTINCT from STELLAR_ROUTER_PUBLIC (treasury); holds only spent playground
 # cents. Its secret is the Worker secret PLAYGROUND_CHANNEL_SIGNER_SECRET, used
@@ -224,7 +224,7 @@ PLAYGROUND_CHANNEL_TO = "GBD64XFGJHG42CEVQKH4TYCIAMEHVBMW7A24KS22TKOSSA73IVW3CYI
 # Known channel-contract WASM hash (lowercase hex) — provenance anchor. register
 # REJECTS any contract whose on-chain WASM hash differs. Empty until the founder
 # uploads the channel WASM on mainnet; register fails closed while empty.
-PLAYGROUND_CHANNEL_WASM_HASH = ""
+PLAYGROUND_CHANNEL_WASM_HASH = "d6717aa80e0a1e6f5e6e6b5a8a4c00219ecbd1d3c5be61a44134324dd56e7df2"
 #
 # Secret (set via: wrangler secret put PLAYGROUND_CHANNEL_SIGNER_SECRET):
 #   PLAYGROUND_CHANNEL_SIGNER_SECRET — S... key of the collector account above.
