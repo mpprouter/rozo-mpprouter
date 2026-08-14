@@ -351,3 +351,255 @@ describe('RPC endpoint rotation', () => {
     expect(a).not.toBe(b)
   })
 })
+
+/**
+ * Priority tiers + graded cooldown (2026-08-14).
+ *
+ * Context: the pool that shipped on 2026-08-12 spread traffic evenly over
+ * four PUBLIC endpoints. Public endpoints meter per source IP, and on
+ * Workers the egress IP belongs to the whole colo — so an even spread
+ * still leaves every request inside a quota we neither own nor control.
+ * A keyed endpoint is metered per KEY, which is the only thing that
+ * actually raises our ceiling, so it must be preferred rather than merely
+ * included.
+ *
+ * The second half of that is cooldown length. Measured against the real
+ * dRPC key on 2026-08-14, paced sequential calls alternated 429 and 200
+ * within the same second. Under the original flat 15s cooldown a single
+ * 429 benched the keyed endpoint and handed its traffic straight back to
+ * the shared-IP pool — paying for a quota and then declining to use it.
+ */
+describe('RPC endpoint priority tiers', () => {
+  const PRIMARY = 'https://keyed.example/rpc/secret-key'
+  const PUBLIC = ['https://pub1.example/rpc', 'https://pub2.example/rpc']
+
+  let hits: string[]
+  let failing: Set<string>
+  let status: number
+  let now: number
+
+  beforeEach(() => {
+    resetTempoClients()
+    // Cooldown is clock-based, not timer-based, so moving Date.now is
+    // enough — and unlike fake timers it leaves the transport's own
+    // promises running normally.
+    now = 1_000_000
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    hits = []
+    failing = new Set()
+    status = 429
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: any) => {
+        const u = String(url)
+        hits.push(u)
+        if (failing.has(u)) return new Response('nope', { status })
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }),
+    )
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllGlobals()
+  })
+
+  const uncached = { method: 'eth_getTransactionCount', params: ['0xabc', 'pending'] }
+
+  it('sends every request to the keyed endpoint while it is healthy', async () => {
+    const client = getTempoClient(PUBLIC.join(','), PRIMARY)
+
+    for (let i = 0; i < 8; i++) await client.request(uncached as any)
+
+    expect(hits.filter((h) => h === PRIMARY)).toHaveLength(8)
+    expect(hits.filter((h) => PUBLIC.includes(h))).toHaveLength(0)
+  })
+
+  it('falls back to the public pool when the keyed endpoint rejects', async () => {
+    failing.add(PRIMARY)
+    const client = getTempoClient(PUBLIC.join(','), PRIMARY)
+
+    const result = await client.request(uncached as any)
+
+    expect(result).toBe('0x1')
+    expect(hits[0]).toBe(PRIMARY)
+    expect(PUBLIC).toContain(hits[1])
+  })
+
+  it('returns to the keyed endpoint ~2s after a 429, not 15s', async () => {
+    failing.add(PRIMARY)
+    const client = getTempoClient(PUBLIC.join(','), PRIMARY)
+    await client.request(uncached as any)
+
+    // Rolling window refills; the endpoint starts answering again.
+    failing.delete(PRIMARY)
+
+    now += 2_500
+    hits.length = 0
+    await client.request(uncached as any)
+
+    expect(hits[0]).toBe(PRIMARY)
+  })
+
+  it('keeps a hard failure benched for the full 15s (429 grace is not a blanket)', async () => {
+    status = 500
+    failing.add(PRIMARY)
+    const client = getTempoClient(PUBLIC.join(','), PRIMARY)
+    await client.request(uncached as any)
+
+    failing.delete(PRIMARY)
+
+    now += 3_000
+    hits.length = 0
+    await client.request(uncached as any)
+
+    // Still benched — a 500 means broken, not "slow down".
+    expect(hits[0]).not.toBe(PRIMARY)
+
+    now += 13_000
+    hits.length = 0
+    await client.request(uncached as any)
+    expect(hits[0]).toBe(PRIMARY)
+  })
+
+  it('still tries the keyed endpoint when the entire pool is cooling down', async () => {
+    failing.add(PRIMARY)
+    PUBLIC.forEach((u) => failing.add(u))
+    const client = getTempoClient(PUBLIC.join(','), PRIMARY)
+
+    await expect(client.request(uncached as any)).rejects.toBeTruthy()
+
+    failing.clear()
+    hits.length = 0
+    await client.request(uncached as any)
+    expect(hits[0]).toBe(PRIMARY)
+  })
+
+  it('behaves exactly as before when no primary is configured', async () => {
+    const client = getTempoClient(PUBLIC.join(','))
+
+    for (let i = 0; i < 4; i++) await client.request(uncached as any)
+
+    expect(new Set(hits)).toEqual(new Set(PUBLIC))
+  })
+
+  it('treats a URL listed in both tiers as one endpoint at the better tier', async () => {
+    const client = getTempoClient([PRIMARY, ...PUBLIC].join(','), PRIMARY)
+
+    for (let i = 0; i < 5; i++) await client.request(uncached as any)
+
+    // Not alternating between "primary" and "fallback" copies of itself.
+    expect(hits.filter((h) => h === PRIMARY)).toHaveLength(5)
+  })
+
+  it('keys the client cache on both tiers, so adding a key is not a no-op', () => {
+    const withKey = getTempoClient(PUBLIC.join(','), PRIMARY)
+    const without = getTempoClient(PUBLIC.join(','))
+    expect(withKey).not.toBe(without)
+  })
+})
+
+/**
+ * The balance pre-flight took the SAME pool string and handed it straight
+ * to `fetch()`. "https://a,https://b" is not a URL, so from 958c56d
+ * (2026-08-12) onward every reading threw and returned null — and null is
+ * indistinguishable from "RPC down" to the caller, which skips both the
+ * low-balance alert and the insufficient-funds rejection. The result was a
+ * 502 at the merchant-payment step where a clean 503 was intended.
+ */
+describe('Tempo balance pre-flight endpoint pool', () => {
+  const POOL = ['https://p1.example/rpc', 'https://p2.example/rpc']
+  const ADDRESS = '0x4374b2072ff9bc5c0e263CaE7866a41a4C601d29'
+  const BALANCE_HEX = '0x0000000000000000000000000000000000000000000000000000000001aa2882'
+
+  let hits: string[]
+
+  beforeEach(() => {
+    resetTempoBalanceCache()
+    hits = []
+  })
+
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('reads a balance from a comma-separated pool (regression: always returned null)', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: any) => {
+        hits.push(String(url))
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, result: BALANCE_HEX }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }),
+    )
+
+    const balance = await getTempoUsdcBalance(POOL.join(','), ADDRESS)
+
+    expect(balance).toBe(BigInt(BALANCE_HEX))
+    expect(hits[0]).toBe(POOL[0])
+  })
+
+  it('falls through to the next endpoint when one is unusable', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: any) => {
+        const u = String(url)
+        hits.push(u)
+        if (u === POOL[0]) return new Response('rate limited', { status: 429 })
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, result: BALANCE_HEX }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }),
+    )
+
+    expect(await getTempoUsdcBalance(POOL.join(','), ADDRESS)).toBe(BigInt(BALANCE_HEX))
+  })
+
+  it('survives a provider that does not implement tempo_getBalance', async () => {
+    // Verified against both rpc.tempo.xyz and the dRPC endpoint on
+    // 2026-08-14: each answers -32601 for tempo_getBalance, so eth_call is
+    // the branch that actually returns a number today.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (_url: any, init: any) => {
+        const body = JSON.parse(init.body)
+        if (body.method === 'tempo_getBalance') {
+          return new Response(
+            JSON.stringify({ jsonrpc: '2.0', id: 1, error: { code: -32601, message: 'method is not available' } }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } },
+          )
+        }
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 2, result: BALANCE_HEX }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }),
+    )
+
+    expect(await getTempoUsdcBalance(POOL.join(','), ADDRESS)).toBe(BigInt(BALANCE_HEX))
+  })
+
+  it('prefers the keyed endpoint here too', async () => {
+    const PRIMARY = 'https://keyed.example/rpc/secret-key'
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: any) => {
+        hits.push(String(url))
+        return new Response(
+          JSON.stringify({ jsonrpc: '2.0', id: 1, result: BALANCE_HEX }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }),
+    )
+
+    await getTempoUsdcBalance(POOL.join(','), ADDRESS, PRIMARY)
+
+    expect(hits[0]).toBe(PRIMARY)
+  })
+})
