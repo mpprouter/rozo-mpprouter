@@ -22,6 +22,7 @@ import {
   UpstreamPathPlaceholderError,
 } from '../services/merchants'
 import { normalizePayInvoiceBody } from './pay-invoice-admin'
+import { recordRouteFailure, recordRouteSuccess } from '../services/route-health'
 import {
   ChannelNotInstalledError,
   payMerchant,
@@ -534,7 +535,42 @@ type MerchantPayResult =
     }
   | { kind: 'error'; response: Response; refundReason?: RefundReason }
 
+/**
+ * Thin wrapper that feeds the catalog's live health signal.
+ *
+ * Wrapped rather than inlined at each `return` because this function has
+ * ten-plus exit points across three payment branches, and a health signal
+ * that silently misses a branch is worse than none — it would report "ok"
+ * for a route that is failing every call, which is precisely the failure
+ * mode `live_status` exists to end. See services/route-health.ts.
+ *
+ * Only `refundReason` is recorded, never the upstream error body: this
+ * string is published in the catalog, and merchant error bodies quote URLs,
+ * request payloads and occasionally credentials.
+ */
 async function payMerchantAndGetBody(
+  env: Env,
+  ctx: ExecutionContext,
+  route: ReturnType<typeof getRouteByPublicPath> & {},
+  parsed: NonNullable<ReturnType<typeof parseTempoChallenge>>,
+  merchantUrl: string,
+  request: Request,
+  requestBody: string | undefined,
+): Promise<MerchantPayResult> {
+  const result = await payMerchantAndGetBodyInner(
+    env, ctx, route, parsed, merchantUrl, request, requestBody,
+  )
+
+  if (result.kind === 'error') {
+    recordRouteFailure(env, ctx, route.id, result.refundReason ?? 'upstream_error')
+  } else {
+    recordRouteSuccess(env, ctx, route.id)
+  }
+
+  return result
+}
+
+async function payMerchantAndGetBodyInner(
   env: Env,
   ctx: ExecutionContext,
   route: ReturnType<typeof getRouteByPublicPath> & {},
@@ -1315,7 +1351,11 @@ export async function handleProxy(
     try { return BigInt(parsed.request.amount) } catch { return null }
   })()
   if (merchantQuoteBaseUnits !== null) {
-    const tempoBalance = await getTempoUsdcBalance(env.TEMPO_RPC_URL, env.TEMPO_ROUTER_ADDRESS)
+    const tempoBalance = await getTempoUsdcBalance(
+      env.TEMPO_RPC_URL,
+      env.TEMPO_ROUTER_ADDRESS,
+      env.TEMPO_RPC_URL_PRIMARY,
+    )
     if (tempoBalance !== null) {
       // Fire DingTalk alert if balance < 5 USDC (fire-and-forget)
       if (tempoBalance < LOW_BALANCE_THRESHOLD && env.DINGTALK_ACCESS_TOKEN) {

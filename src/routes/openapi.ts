@@ -223,6 +223,27 @@ const spec = {
             type: 'string',
             description: 'Explanation for "available"/"unavailable" routes. Omitted when verified.',
           },
+          live_status: {
+            type: 'string',
+            enum: ['ok', 'degraded'],
+            description:
+              'Observed health RIGHT NOW, as opposed to payment_status/charge_rozo_verified, which record whether ' +
+              'an operator has ever real-money verified the route and can be months old. "degraded" = the router has ' +
+              'seen consecutive upstream failures on this route just now; expect 502s and gate accordingly. Set and ' +
+              'cleared automatically: it clears on the next successful call, or after 15 minutes with no further ' +
+              'failure. A route can legitimately be payment_status "verified" AND live_status "degraded" — that pair ' +
+              'means "we proved this works, and it is broken at the moment".',
+          },
+          live_status_reason: {
+            type: 'string',
+            description:
+              'Present only when live_status is "degraded": failure count, coarse failure category, and the time of ' +
+              'the most recent failure. Deliberately coarse — upstream error bodies are never echoed here.',
+          },
+          live_status_since: {
+            type: 'string',
+            description: 'ISO timestamp of the first failure in the current run. Present only when degraded.',
+          },
           recommended: {
             type: 'boolean',
             enum: [true],

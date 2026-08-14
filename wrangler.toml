@@ -120,8 +120,16 @@ STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
 # endpoint is skipped for 15s and traffic routes around it.
 # All four verified 2026-08-12 to serve eth_getTransactionCount /
 # eth_estimateGas / eth_getBlockByNumber on chain 4217.
-# Replace with a single keyed endpoint if we ever buy one — one URL is
-# still valid here.
+#
+# This is now the FALLBACK tier. A keyed endpoint belongs in the
+# TEMPO_RPC_URL_PRIMARY *secret*, which is tried first and is the only tier
+# that actually raises our ceiling (metered per key, not per shared IP).
+# Two reasons it is a separate secret rather than this var:
+#   1. A keyed URL carries its API key in the path, and this file is
+#      committed.
+#   2. A [vars] entry OVERRIDES a secret of the same name on deploy, so
+#      reusing this name would silently discard the key.
+# Set with: wrangler secret put TEMPO_RPC_URL_PRIMARY
 TEMPO_RPC_URL = "https://1rpc.io/tempo,https://tempo-rpc.publicnode.com,https://rpc.tempo.xyz,https://tempo.drpc.org"
 # UNUSED as of 2026-04-10. No code path reads this. See src/index.ts and
 # notes.md for context. Intended to skip Soroban simulation for sub-$0.05

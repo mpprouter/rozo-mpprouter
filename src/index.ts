@@ -176,6 +176,18 @@ export interface Env {
   TEMPO_ROUTER_ADDRESS: string    // 0x... address
   TEMPO_RPC_URL: string
 
+  // Preferred Tempo RPC pool, tried ahead of TEMPO_RPC_URL. Optional —
+  // unset means "public pool only", which is the pre-2026-08-14 behaviour.
+  //
+  // This is a SECRET, not a wrangler.toml var, because a keyed endpoint
+  // carries its API key in the URL path and wrangler.toml is committed.
+  // It is also deliberately a DIFFERENT NAME from TEMPO_RPC_URL: a
+  // plain-text var in wrangler.toml overrides a secret of the same name on
+  // deploy, so reusing the name would silently discard the key.
+  //
+  // Set via: wrangler secret put TEMPO_RPC_URL_PRIMARY
+  TEMPO_RPC_URL_PRIMARY?: string
+
   // HMAC key used by mppx to bind 402 challenges to their contents so
   // that credentials presented back to us can be verified statelessly.
   // Set via: wrangler secret put MPP_SECRET_KEY

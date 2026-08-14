@@ -12,9 +12,10 @@
  */
 
 import { listPublicCatalog } from '../services/merchants'
+import { getDegradedRoutes } from '../services/route-health'
 import type { Env } from '../index'
 
-export function handleServices(env: Env): Response {
+export async function handleServices(env: Env): Promise<Response> {
   // Top-level "what can this router accept from agents" — lets a
   // client tell at a glance which inbound flavor it can build,
   // without walking all 88 entries.
@@ -28,7 +29,19 @@ export function handleServices(env: Env): Response {
     })
   }
 
-  const services = listPublicCatalog(env)
+  // `live_status` is deliberately merged ON TOP of the static catalog
+  // rather than replacing any of it. The two answer different questions and
+  // a client needs both: `payment_status`/`charge_rozo_verified` say "have
+  // we ever proven this route works" (provenance, human-stamped, valid for
+  // months), `live_status` says "is it working right now" (observed, resets
+  // itself). Collapsing them would have hidden the very incident this
+  // field was added for — see services/route-health.ts.
+  const degraded = await getDegradedRoutes(env)
+
+  const services = listPublicCatalog(env).map(s => ({
+    ...s,
+    ...(degraded[s.id] ?? { live_status: 'ok' as const }),
+  }))
 
   // Top-level payment summary so a client (and operators) can see fleet
   // health at a glance without walking every entry: how many routes the
@@ -40,6 +53,7 @@ export function handleServices(env: Env): Response {
     verified: services.filter(s => s.payment_status === 'verified').length,
     available_unverified: services.filter(s => s.payment_status === 'available').length,
     unavailable: services.filter(s => s.payment_status === 'unavailable').length,
+    degraded_now: services.filter(s => s.live_status === 'degraded').length,
   }
 
   return new Response(JSON.stringify({

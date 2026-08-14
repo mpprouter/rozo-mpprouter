@@ -85,13 +85,43 @@ export function parseRpcUrls(raw: string | undefined): string[] {
 }
 
 /**
- * How long an endpoint is skipped after it fails.
- *
- * A rate-limited endpoint stays limited for a while, so continuing to send
- * it its share of traffic just burns latency on requests that will fail.
- * Short enough that a brief blip doesn't take a provider out for long.
+ * How long an endpoint is skipped after a hard failure (connection refused,
+ * DNS, 5xx). Something is actually wrong with it, so stop sending it traffic
+ * for a while. Short enough that a brief blip doesn't take a provider out
+ * for long.
  */
 const ENDPOINT_COOLDOWN_MS = 15_000
+
+/**
+ * How long an endpoint is skipped after a **rate-limit** rejection (429).
+ *
+ * Deliberately far shorter than the hard-failure cooldown, and the reason is
+ * the paid endpoint. Providers meter a key on a short rolling window, so a
+ * 429 means "not this second", not "this endpoint is unhealthy" — measured
+ * against the dRPC key on 2026-08-14, paced sequential calls alternated 429
+ * and 200 within the same second while 5-way concurrency passed clean.
+ *
+ * With the hard cooldown applied to a 429, a single rejection benched our
+ * only *keyed* endpoint for 15s and pushed the traffic it exists to absorb
+ * back onto the shared-IP public pool — i.e. we would pay for a quota and
+ * then decline to use it. Two seconds is long enough for a rolling window
+ * to refill and short enough that the primary stays primary.
+ */
+const RATE_LIMIT_COOLDOWN_MS = 2_000
+
+/**
+ * Did this failure mean "slow down" rather than "you are broken"?
+ *
+ * viem surfaces an HTTP 429 as an `HttpRequestError` carrying `status`, but
+ * some providers answer a limit as a JSON-RPC error instead, so match on the
+ * message too. Misclassifying costs only cooldown length, never correctness.
+ */
+function isRateLimit(err: unknown): boolean {
+  const status = (err as { status?: number } | null)?.status
+  if (status === 429) return true
+  const msg = String((err as { message?: string } | null)?.message ?? err ?? '').toLowerCase()
+  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many')
+}
 
 /**
  * Round-robin across the pool, skipping endpoints in cooldown, failing over
@@ -105,30 +135,62 @@ const ENDPOINT_COOLDOWN_MS = 15_000
  * rather than failing fast: an expired quota may have recovered, and a
  * late-but-successful payment beats a certain failure.
  */
-function rotatingTransport(urls: string[]): Transport {
+function rotatingTransport(primaryUrls: string[], fallbackUrls: string[]): Transport {
   const cooldownUntil = new Map<string, number>()
   let cursor = 0
 
+  // Primary wins ties on identity: if an operator lists the same URL in both
+  // places, it is one endpoint at the better tier, not two.
+  const primarySet = new Set(primaryUrls)
+  const orderedUrls = [...primaryUrls, ...fallbackUrls.filter((u) => !primarySet.has(u))]
+
   return (opts) => {
-    const inner = urls.map((url) => ({ url, transport: http(url)(opts) }))
+    // `retryCount: 0` because failover is OUR job here. viem's default is to
+    // retry the SAME url 3 times with backoff before surfacing the error,
+    // which is the worst possible response to a 429: it spends three more
+    // requests of a quota we have just been told is exhausted, adds its
+    // backoff to the latency of every failed payment, and only then lets us
+    // do the thing that would have worked — ask a different endpoint.
+    const inner = orderedUrls.map((url) => ({
+      url,
+      isPrimary: primarySet.has(url),
+      transport: http(url, { retryCount: 0 })(opts),
+    }))
+    const primaries = inner.filter((e) => e.isPrimary)
+    const fallbacks = inner.filter((e) => !e.isPrimary)
 
     const request: EIP1193RequestFn = (async (args: any, reqOpts?: any) => {
-      const start = cursor++ % inner.length
       const now = Date.now()
+      const healthy = (list: typeof inner) =>
+        list.filter((e) => (cooldownUntil.get(e.url) ?? 0) <= now)
 
-      const order = Array.from({ length: inner.length }, (_, i) => inner[(start + i) % inner.length])
-      const healthy = order.filter((e) => (cooldownUntil.get(e.url) ?? 0) <= now)
-      const attempts = healthy.length > 0 ? healthy : order
+      // Round-robin *within* a tier, but never across one. A keyed endpoint
+      // is metered per key rather than per IP, so it is the one that
+      // actually raises our ceiling; spreading traffic evenly over it and
+      // the public pool would leave most requests back on the shared colo
+      // IP that caused the incident this pool exists to prevent.
+      const rotate = <T,>(list: T[]) => {
+        if (list.length === 0) return list
+        const start = cursor++ % list.length
+        return Array.from({ length: list.length }, (_, i) => list[(start + i) % list.length])
+      }
+
+      // Last resort: everything is cooling down. Attempt the full rotation
+      // anyway — a quota may have refilled, and a late-but-successful
+      // payment beats a certain failure.
+      const attempts = [...rotate(healthy(primaries)), ...rotate(healthy(fallbacks))]
+      const order = attempts.length > 0 ? attempts : [...rotate(primaries), ...rotate(fallbacks)]
 
       let lastError: unknown
-      for (const entry of attempts) {
+      for (const entry of order) {
         try {
           const result = await (entry.transport.request as EIP1193RequestFn)(args, reqOpts)
           cooldownUntil.delete(entry.url)
           return result
         } catch (err) {
           lastError = err
-          cooldownUntil.set(entry.url, Date.now() + ENDPOINT_COOLDOWN_MS)
+          const penalty = isRateLimit(err) ? RATE_LIMIT_COOLDOWN_MS : ENDPOINT_COOLDOWN_MS
+          cooldownUntil.set(entry.url, Date.now() + penalty)
         }
       }
       throw lastError
@@ -217,16 +279,24 @@ const clients = new Map<string, Client>()
  * `latest` block costs no endpoint quota at all rather than merely being
  * spread across the pool.
  */
-export function getTempoClient(rpcUrl?: string): Client {
-  const urls = parseRpcUrls(rpcUrl)
-  const key = urls.join(',')
+export function getTempoClient(rpcUrl?: string, primaryRpcUrl?: string): Client {
+  const fallback = parseRpcUrls(rpcUrl)
+  // No `parseRpcUrls` here: it substitutes the public default for an empty
+  // input, which is right for the fallback pool and wrong for this one —
+  // an unset primary must stay empty so the tier is simply absent.
+  const primary = (primaryRpcUrl ?? '')
+    .split(',')
+    .map((u) => u.trim())
+    .filter(Boolean)
+
+  const key = `${primary.join(',')}|${fallback.join(',')}`
 
   const existing = clients.get(key)
   if (existing) return existing
 
   const client = createClient({
     chain: tempoChain,
-    transport: withBlockCache(rotatingTransport(urls)),
+    transport: withBlockCache(rotatingTransport(primary, fallback)),
   })
 
   clients.set(key, client)

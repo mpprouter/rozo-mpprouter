@@ -357,7 +357,7 @@ function createTempoClientInternal(
   // hardcoded map and would otherwise always hit the public endpoint.
   // Passing `getClient` also stops us building a new client (and opening
   // a new connection) on every single 402. See src/mpp/tempo-rpc.ts.
-  const getClient = () => getTempoClient(env.TEMPO_RPC_URL)
+  const getClient = () => getTempoClient(env.TEMPO_RPC_URL, env.TEMPO_RPC_URL_PRIMARY)
 
   // Three methods registered:
   //

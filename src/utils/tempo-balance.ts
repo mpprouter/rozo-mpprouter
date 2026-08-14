@@ -10,6 +10,8 @@
  * or null if the query fails (network error, unsupported method).
  */
 
+import { parseRpcUrls } from '../mpp/tempo-rpc'
+
 /**
  * Tempo USDC asset handle — the ERC-20-compatible token contract
  * for USDC on Tempo L2. Same constant used in inspect-channels.ts.
@@ -51,8 +53,9 @@ const balanceInFlight = new Map<string, Promise<bigint | null>>()
 export async function getTempoUsdcBalance(
   rpcUrl: string,
   address: string,
+  primaryRpcUrl?: string,
 ): Promise<bigint | null> {
-  const key = `${rpcUrl}|${address}`
+  const key = `${primaryRpcUrl ?? ''}|${rpcUrl}|${address}`
 
   const cached = balanceCache.get(key)
   if (cached && cached.expiresAt > Date.now()) return cached.value
@@ -60,7 +63,7 @@ export async function getTempoUsdcBalance(
   const existing = balanceInFlight.get(key)
   if (existing) return existing
 
-  const pending = fetchTempoUsdcBalance(rpcUrl, address)
+  const pending = fetchTempoUsdcBalance(rpcUrl, address, primaryRpcUrl)
     .then((value) => {
       balanceCache.set(key, { value, expiresAt: Date.now() + BALANCE_CACHE_MS })
       return value
@@ -86,50 +89,50 @@ export function resetTempoBalanceCache(): void {
 async function fetchTempoUsdcBalance(
   rpcUrl: string,
   address: string,
+  primaryRpcUrl?: string,
 ): Promise<bigint | null> {
-  // Try tempo_getBalance first (native Tempo RPC)
-  try {
-    const res = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'tempo_getBalance',
-        params: [address, TEMPO_USDC_HANDLE],
-      }),
-    })
-    if (res.ok) {
-      const json = (await res.json()) as { result?: string; error?: any }
-      if (json.result) return BigInt(json.result)
-    }
-  } catch {
-    // fall through to eth_call
-  }
+  // `rpcUrl` is a comma-separated POOL, not a single endpoint (see
+  // tempo-rpc.ts). This function used to hand it to `fetch()` verbatim,
+  // which made the whole pre-flight dead from the moment the pool landed
+  // (958c56d, 2026-08-12): "https://a,https://b" is not a URL, both
+  // branches threw, and every call returned null. Null is indistinguishable
+  // from "RPC down" to the caller, so it silently skipped BOTH the
+  // low-balance DingTalk alert and the insufficient-funds rejection —
+  // turning a clean 503 into a 502 at the merchant-payment step.
+  // Primary first. Note it is split by hand rather than via `parseRpcUrls`,
+  // which substitutes the public default for empty input — correct for the
+  // fallback pool, wrong here, where "unset" must mean "no primary tier".
+  const primary = (primaryRpcUrl ?? '').split(',').map((u) => u.trim()).filter(Boolean)
+  const urls = [...primary, ...parseRpcUrls(rpcUrl).filter((u) => !primary.includes(u))]
 
-  // Fallback: ERC-20 balanceOf via eth_call
-  try {
-    const data =
-      '0x70a08231' +
-      address.toLowerCase().replace(/^0x/, '').padStart(64, '0')
-    const res = await fetch(rpcUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 2,
-        method: 'eth_call',
-        params: [{ to: TEMPO_USDC_HANDLE, data }, 'latest'],
-      }),
-    })
-    if (res.ok) {
-      const json = (await res.json()) as { result?: string }
-      if (json.result && json.result !== '0x') {
-        return BigInt(json.result)
+  const data =
+    '0x70a08231' + address.toLowerCase().replace(/^0x/, '').padStart(64, '0')
+
+  // Two methods, tried per endpoint. `tempo_getBalance` is the native call
+  // but is NOT enabled on every provider (verified 2026-08-14: both
+  // rpc.tempo.xyz and the dRPC endpoint answer -32601 method-not-available),
+  // so the eth_call path is what actually returns a number today. Keeping
+  // both means a provider that re-enables the native method still works.
+  const bodies = [
+    { jsonrpc: '2.0', id: 1, method: 'tempo_getBalance', params: [address, TEMPO_USDC_HANDLE] },
+    { jsonrpc: '2.0', id: 2, method: 'eth_call', params: [{ to: TEMPO_USDC_HANDLE, data }, 'latest'] },
+  ]
+
+  for (const url of urls) {
+    for (const body of bodies) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        })
+        if (!res.ok) continue
+        const json = (await res.json()) as { result?: string; error?: unknown }
+        if (json.result && json.result !== '0x') return BigInt(json.result)
+      } catch {
+        // try the next method, then the next endpoint
       }
     }
-  } catch {
-    // both methods failed
   }
 
   return null
