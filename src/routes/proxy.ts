@@ -557,9 +557,19 @@ async function payMerchantAndGetBody(
   request: Request,
   requestBody: string | undefined,
 ): Promise<MerchantPayResult> {
-  const result = await payMerchantAndGetBodyInner(
-    env, ctx, route, parsed, merchantUrl, request, requestBody,
-  )
+  let result: MerchantPayResult
+  try {
+    result = await payMerchantAndGetBodyInner(
+      env, ctx, route, parsed, merchantUrl, request, requestBody,
+    )
+  } catch (err) {
+    // A throw is a failure too. The caller catches this and turns it into a
+    // 502 'Merchant delivery failed', so without recording it here a route
+    // could fail every call through that path while still advertising
+    // live_status "ok" — the exact blind spot this field exists to close.
+    recordRouteFailure(env, ctx, route.id, 'timeout')
+    throw err
+  }
 
   if (result.kind === 'error') {
     recordRouteFailure(env, ctx, route.id, result.refundReason ?? 'upstream_error')

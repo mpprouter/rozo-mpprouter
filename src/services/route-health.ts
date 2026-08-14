@@ -170,6 +170,21 @@ export function recordRouteFailure(
  *
  * Returns without touching KV when the route has no incident cached, which
  * is the normal case — success must not cost a write.
+ *
+ * ## Clearing is prompt, not instant, and the bound is CACHE_MS
+ *
+ * Incidents are recorded per isolate, so a success can land on an isolate
+ * whose cache predates another isolate's incident write, and that success
+ * will skip the clear. It cannot persist, though: the guard below requires
+ * a *live* cache entry, so once the entry ages out (CACHE_MS) the next
+ * success re-reads KV and clears. Worst case is therefore CACHE_MS plus
+ * KV's own convergence delay — seconds — not the INCIDENT_TTL_MS ceiling.
+ *
+ * That bound is the price of the success path costing nothing, and it is
+ * the right trade for an advisory field. Removing the guard would put a KV
+ * read on every successful proxied call — the same per-request round-trip
+ * volume that contributed to the rate-limit incident this work is fixing.
+ * Do not "fix" it that way.
  */
 export function recordRouteSuccess(
   env: Env,
@@ -213,8 +228,8 @@ export async function getDegradedRoutes(env: Env): Promise<Record<string, LiveSt
       live_status_reason:
         `${inc.fails} consecutive upstream failures (${inc.reason}); ` +
         `last at ${new Date(inc.lastAt).toISOString()}. ` +
-        `Automatically clears after ${INCIDENT_TTL_MS / 60_000} minutes without a failure, ` +
-        `or on the next successful call.`,
+        `Clears within seconds of a successful call, and in any case after ` +
+        `${INCIDENT_TTL_MS / 60_000} minutes with no further failure.`,
       live_status_since: new Date(inc.since).toISOString(),
     }
   }

@@ -137,6 +137,33 @@ describe('live route health', () => {
     expect(kv.writes + kv.reads).toBe(before)
   })
 
+  it('clears an incident written by ANOTHER isolate within the cache window, not the TTL', async () => {
+    // Codex review flagged the success-path early return as able to strand a
+    // recovered route for the full 15-minute TTL. It cannot: the guard
+    // requires a LIVE cache entry, so the staleness bound is CACHE_MS.
+
+    // This isolate has a fresh, empty view...
+    await getDegradedRoutes(env)
+    // ...while another isolate records an incident straight into KV.
+    kv.store.set('routeHealth:incidents', JSON.stringify({
+      firecrawl_scrape: { fails: 5, since: now, lastAt: now, reason: 'timeout' },
+    }))
+
+    // Within the cache window the success is a no-op, as designed.
+    let { ctx, settle } = makeCtx()
+    recordRouteSuccess(env, ctx, 'firecrawl_scrape')
+    await settle()
+    expect(JSON.parse(kv.store.get('routeHealth:incidents')!)).toHaveProperty('firecrawl_scrape')
+
+    // Once the cache entry ages out, the very next success clears it —
+    // seconds, nowhere near INCIDENT_TTL_MS.
+    now += 11_000
+    ;({ ctx, settle } = makeCtx())
+    recordRouteSuccess(env, ctx, 'firecrawl_scrape')
+    await settle()
+    expect(JSON.parse(kv.store.get('routeHealth:incidents')!)).toEqual({})
+  })
+
   it('never lets a KV outage break the catalog', async () => {
     env.MPP_STORE = {
       get: async () => { throw new Error('KV down') },
