@@ -28,6 +28,7 @@ import {
   payMerchantSession,
 } from '../mpp/tempo-client'
 import { bumpCumulative } from '../mpp/channel-store'
+import { buildIdempotencyKey } from '../mpp/idempotency'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
 import {
   createStellarPayment,
@@ -1051,17 +1052,14 @@ export async function handleProxy(
   })()
   const merchantUrl = buildMerchantUrl(merchantHost, upstreamPath, forwardedSearch)
 
-  // Idempotency check — return cached result on repeat POSTs with same id.
+  // Idempotency id. NOTE: the cache is deliberately NOT consulted here.
+  // This point in the request is pre-auth and pre-charge, so a lookup
+  // keyed on a client-supplied header would hand out paid merchant
+  // responses to anyone who replays an id (and, since the old key was not
+  // bound to the payer, potentially another account's response). The
+  // lookup now happens after the credential is verified and the payer
+  // charged, keyed via buildIdempotencyKey(). See src/mpp/idempotency.ts.
   const requestId = request.headers.get('x-request-id')
-  if (requestId) {
-    const cached = await env.MPP_STORE.get(`idempotency:${requestId}`)
-    if (cached) {
-      return new Response(cached, {
-        status: 200,
-        headers: { 'Content-Type': 'application/json', 'X-Idempotent': 'true' },
-      })
-    }
-  }
 
   // Read the body once; we may need to send it twice (merchant 402 probe + real paid call).
   const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
@@ -1550,14 +1548,18 @@ export async function handleProxy(
       )
     }
 
-    // Idempotency cache + payment log, same shape as the Stellar mppx path.
+    // Payment log. No idempotency cache entry is written on this branch:
+    // the x402 payer account is not decoded here (it lives inside the
+    // signed Soroban XDR — see extractPayloadIdentity, which only hashes
+    // the XDR), and without a verified payer there is no safe key to
+    // scope a cached merchant response to. Writing one under the old
+    // payer-less key is exactly the cross-account disclosure this change
+    // removes. Restoring x402 idempotency requires decoding the source
+    // account from the XDR first; tracked as follow-up, not done here.
     ctx.waitUntil((async () => {
       console.log(
         `[payment] route=${route.id} method=stellar.x402 merchant=${merchantHost} upstreamPath=${upstreamPath}`,
       )
-      if (requestId) {
-        await env.MPP_STORE.put(`idempotency:${requestId}`, payResult.body, { expirationTtl: 86400 })
-      }
     })())
 
     // Per-call order ledger (router-held-credential routes only — Mercury
@@ -1611,6 +1613,10 @@ export async function handleProxy(
   //     internaldocs/v2-stellar-channel-notes.md §N2.
   let mppx: Awaited<ReturnType<typeof resolveStellarChannelMppx>>['mppx']
   let settledPayment: PaymentProof | undefined
+  // Verified payer for the stellar.channel voucher path, which delivers
+  // without producing a PaymentProof. Set only from a credential mppx has
+  // already verified; used to scope the idempotency key.
+  let verifiedChannelPayer: string | undefined
   let channelVoucher: {
     challengeId: string
     acceptedAmount: string
@@ -1807,6 +1813,10 @@ export async function handleProxy(
         channelPreviousAmount = previousAmount
         ;(mppx as any).onPaymentSuccess((payment: any) => {
           const action = payment.credential.payload.action === 'close' ? 'close' : 'voucher'
+          // See the recovery path below: 'voucher' produces no
+          // PaymentProof, so capture the verified payer here for the
+          // idempotency key.
+          verifiedChannelPayer = payerAccount(payment.credential.source)
           channelVoucher = {
             challengeId: payment.challenge.id,
             acceptedAmount: String(payment.credential.payload.amount),
@@ -1942,6 +1952,12 @@ export async function handleProxy(
       const credential = Credential.deserialize(authHeader) as any
       const receipt = Receipt.fromResponse(verifyResult.withReceipt(new Response(null)))
       const action = credential.payload.action === 'close' ? 'close' : 'voucher'
+      // The plain 'voucher' action never builds a settledPayment (only
+      // 'close' does), so without this the channel path would have no
+      // payer to scope an idempotency key to and would lose retry
+      // protection entirely. `credential` here has already been verified
+      // by mppx above — same trust level the close branch relies on.
+      verifiedChannelPayer = payerAccount(credential.source)
       channelVoucher = {
         challengeId: credential.challenge.id,
         acceptedAmount: String(credential.payload.amount),
@@ -2037,6 +2053,50 @@ export async function handleProxy(
   // Rate-limit slot consumed HERE (credential just verified above, we
   // are about to make the real upstream call) — never on the
   // unpaid/handshake leg (the earlier peek only). See consumeRateLimitSlotOrReject.
+  // Idempotency lookup. Placement is load-bearing in both directions:
+  //
+  //   - AFTER credential verification and settlement (the payer has
+  //     already been charged by the mppx verify above), so a cache hit is
+  //     never a way to obtain a paid merchant response for free, and the
+  //     key can be scoped to a payer we have actually authenticated.
+  //   - BEFORE the merchant call, so it still does what the cache is for:
+  //     stop a retry from spending the Tempo pool twice on the same
+  //     upstream call.
+  //   - BEFORE the rate-limit slot is consumed, because a hit makes no
+  //     upstream request. Consuming a slot here would let honest retries
+  //     burn the payer's quota, and could even 429 a caller away from a
+  //     response we were about to hand them from KV.
+  //
+  // The key covers everything that can change the merchant response —
+  // payer, route, method, resolved upstream path + forwarded query, and
+  // the body — so a hit can only return this caller's own earlier
+  // response to the very same upstream call.
+  const idempotencyPayer = settledPayment?.payer ?? verifiedChannelPayer
+  const idempotencyKey = requestId && idempotencyPayer
+    ? await buildIdempotencyKey({
+        requestId,
+        routeId: route.id,
+        payer: idempotencyPayer,
+        method: request.method,
+        upstreamPath,
+        forwardedSearch,
+        body: requestBody,
+      })
+    : undefined
+  if (idempotencyKey) {
+    const cached = await env.MPP_STORE.get(idempotencyKey)
+    if (cached) {
+      if (channelContractForVerify && channelDeliveryLockId) {
+        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+        channelDeliveryLockId = undefined
+      }
+      return verifyResult.withReceipt(new Response(cached, {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'X-Idempotent': 'true' },
+      }))
+    }
+  }
+
   const rateLimitRejectMppx = await consumeRateLimitSlotOrReject()
   if (rateLimitRejectMppx) {
     if (channelContractForVerify && channelDeliveryLockId) {
@@ -2147,8 +2207,8 @@ export async function handleProxy(
     console.log(
       `[payment] route=${route.id} merchant=${merchantHost} upstreamPath=${upstreamPath}`,
     )
-    if (requestId) {
-      await env.MPP_STORE.put(`idempotency:${requestId}`, body, { expirationTtl: 86400 })
+    if (idempotencyKey) {
+      await env.MPP_STORE.put(idempotencyKey, body, { expirationTtl: 86400 })
     }
   })())
 
