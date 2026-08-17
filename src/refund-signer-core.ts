@@ -10,6 +10,7 @@ import {
   scValToNative,
   type Transaction,
 } from '@stellar/stellar-sdk'
+import type { RedactedAlert } from './utils/alert-redaction'
 
 export interface Env {
   ROUTER_URL: string
@@ -169,7 +170,13 @@ async function waitForTransaction(server: RefundSignerRpc, hash: string): Promis
   throw new Error(`refund transaction confirmation timed out: ${hash}`)
 }
 
-export async function sendAlert(env: Env, content: string): Promise<void> {
+/**
+ * `content` is a `RedactedAlert`; see `utils/alert-redaction.ts` (threat
+ * `Info.1`). This signer holds its own Stellar secret key, so an alert built
+ * from a caught error here is the single highest-risk disclosure path in the
+ * codebase.
+ */
+export async function sendAlert(env: Env, content: RedactedAlert): Promise<void> {
   const response = await fetch(`https://oapi.dingtalk.com/robot/send?access_token=${env.DINGTALK_ACCESS_TOKEN}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

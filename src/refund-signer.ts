@@ -7,6 +7,7 @@ import {
   type RefundJob,
   type RefundLedger,
 } from './refund-signer-core'
+import { redactForAlert } from './utils/alert-redaction'
 
 export interface Env extends CoreEnv {
   SIGNER_COORDINATOR: DurableObjectNamespace<RefundSignerCoordinator>
@@ -78,7 +79,7 @@ export class RefundSignerCoordinator extends DurableObject<Env> implements Refun
     ).toArray()
     for (const alert of alerts) {
       try {
-        await sendAlert(this.env, alert.content)
+        await sendAlert(this.env, redactForAlert(alert.content))
         this.ctx.storage.sql.exec('UPDATE alert_outbox SET state = ? WHERE alert_key = ?', 'sent', alert.alert_key)
       } catch (error: unknown) {
         console.error(JSON.stringify({

@@ -58,6 +58,7 @@ import { extractStellarAddress, type JobAuthRecord } from './job-status'
 import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
 import { newOrderId, recordOrder, type RefundStatus } from '../services/order-ledger'
 import type { Env } from '../index'
+import { redactForAlert } from '../utils/alert-redaction'
 
 /**
  * Resolve a public Router URL to an internal upstream route.
@@ -1373,10 +1374,10 @@ export async function handleProxy(
         ctx.waitUntil(
           sendDingTalkAlert(
             env.DINGTALK_ACCESS_TOKEN,
-            `[MPP Router] ⚠️ Tempo pool low balance: ${balanceStr} USDC\n` +
+            redactForAlert(`[MPP Router] ⚠️ Tempo pool low balance: ${balanceStr} USDC\n` +
             `Address: ${env.TEMPO_ROUTER_ADDRESS}\n` +
             `Threshold: 5 USDC\n` +
-            `Action needed: top up the Tempo pool to avoid service disruption.`,
+            `Action needed: top up the Tempo pool to avoid service disruption.`),
           ),
         )
       }

@@ -68,6 +68,7 @@ import {
   type AuditResult,
   type CasClient,
 } from './coupon-security'
+import { redactForAlert } from '../utils/alert-redaction'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -461,7 +462,7 @@ async function publicGate(request: Request, env: Env): Promise<Response | null> 
       if (env.DINGTALK_ACCESS_TOKEN) {
         await sendDingTalkAlert(
           env.DINGTALK_ACCESS_TOKEN,
-          `[MPP Router] 🚨 Coupon redeem global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} attempts this hour. Redemption paused for the window.`,
+          redactForAlert(`[MPP Router] 🚨 Coupon redeem global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} attempts this hour. Redemption paused for the window.`),
         )
       }
       return rateLimited()
@@ -817,7 +818,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       // Alert carries only volume/window/time — never a code, payment id, or link.
       await sendDingTalkAlert(
         env.DINGTALK_ACCESS_TOKEN,
-        `[MPP Router] 🚨 Coupon redeem GLOBAL CIRCUIT OPEN at ${new Date(now).toISOString()}: >100 per-IP-allowed redeem POSTs in 10 min across many IPs. Automatic redemption STOPPED until an operator reopens it (POST /admin/coupon/circuit/reopen).`,
+        redactForAlert(`[MPP Router] 🚨 Coupon redeem GLOBAL CIRCUIT OPEN at ${new Date(now).toISOString()}: >100 per-IP-allowed redeem POSTs in 10 min across many IPs. Automatic redemption STOPPED until an operator reopens it (POST /admin/coupon/circuit/reopen).`),
       )
     }
     return done(serviceUnavailable(), 'rejected', 'circuit_open')
@@ -825,7 +826,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   if (traffic.warnFired && env.DINGTALK_ACCESS_TOKEN) {
     await sendDingTalkAlert(
       env.DINGTALK_ACCESS_TOKEN,
-      `[MPP Router] ⚠️ Coupon redeem traffic spike at ${new Date(now).toISOString()}: >20 per-IP-allowed redeem POSTs in 1 min. Throttling tightened; watching for the 10-min circuit threshold.`,
+      redactForAlert(`[MPP Router] ⚠️ Coupon redeem traffic spike at ${new Date(now).toISOString()}: >20 per-IP-allowed redeem POSTs in 1 min. Throttling tightened; watching for the 10-min circuit threshold.`),
     )
   }
 
@@ -1065,7 +1066,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       if (env.DINGTALK_ACCESS_TOKEN) {
         await sendDingTalkAlert(
           env.DINGTALK_ACCESS_TOKEN,
-          `[MPP Router] 🚨 Coupon redeem BLOCKED: insufficient funder balance (${formatUsdc(balance)} USDC on hand) for invoice ${formatUsdc(invoiceAtomic)} USDC. Coupon ${code} rolled back to issued. Top up the funder wallet.`,
+          redactForAlert(`[MPP Router] 🚨 Coupon redeem BLOCKED: insufficient funder balance (${formatUsdc(balance)} USDC on hand) for invoice ${formatUsdc(invoiceAtomic)} USDC. Coupon ${code} rolled back to issued. Top up the funder wallet.`),
         )
       }
       return done(
@@ -1138,7 +1139,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     if (!finalRec && env.DINGTALK_ACCESS_TOKEN) {
       await sendDingTalkAlert(
         env.DINGTALK_ACCESS_TOKEN,
-        `[MPP Router] ⚠️ Coupon ${code} paid successfully but its record was modified mid-payment (admin resolve?). Reconcile manually: invoice ${plId} IS settled.`,
+        redactForAlert(`[MPP Router] ⚠️ Coupon ${code} paid successfully but its record was modified mid-payment (admin resolve?). Reconcile manually: invoice ${plId} IS settled.`),
       )
     }
     return done(
@@ -1168,13 +1169,13 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   if (!parked && env.DINGTALK_ACCESS_TOKEN) {
     await sendDingTalkAlert(
       env.DINGTALK_ACCESS_TOKEN,
-      `[MPP Router] ⚠️ Coupon ${code}: pay-invoice failed (${payResult.status}) AND the record was modified mid-payment. Reconcile ${plId} manually.`,
+      redactForAlert(`[MPP Router] ⚠️ Coupon ${code}: pay-invoice failed (${payResult.status}) AND the record was modified mid-payment. Reconcile ${plId} manually.`),
     )
   }
   if (env.DINGTALK_ACCESS_TOKEN) {
     await sendDingTalkAlert(
       env.DINGTALK_ACCESS_TOKEN,
-      `[MPP Router] 🚨 Coupon redemption needs MANUAL REVIEW: pay-invoice returned ${payResult.status} for coupon ${code} / ${plId} (${rec.amountUsd} USD). Check invoice-status + Coinbase before releasing or marking redeemed (/admin/coupon/resolve).`,
+      redactForAlert(`[MPP Router] 🚨 Coupon redemption needs MANUAL REVIEW: pay-invoice returned ${payResult.status} for coupon ${code} / ${plId} (${rec.amountUsd} USD). Check invoice-status + Coinbase before releasing or marking redeemed (/admin/coupon/resolve).`),
     )
   }
   return done(
@@ -1224,7 +1225,7 @@ export async function handleReopenCircuit(request: Request, env: Env): Promise<R
   if (env.DINGTALK_ACCESS_TOKEN) {
     await sendDingTalkAlert(
       env.DINGTALK_ACCESS_TOKEN,
-      `[MPP Router] ✅ Coupon redeem circuit REOPENED by admin at ${new Date(now).toISOString()} (was ${prior.open ? 'OPEN' : 'already closed'}). Automatic redemption resumed.`,
+      redactForAlert(`[MPP Router] ✅ Coupon redeem circuit REOPENED by admin at ${new Date(now).toISOString()} (was ${prior.open ? 'OPEN' : 'already closed'}). Automatic redemption resumed.`),
     )
   }
 
