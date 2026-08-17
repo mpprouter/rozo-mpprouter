@@ -59,6 +59,13 @@ const CREDENTIAL_RULES: readonly Rule[] = [
   { name: 'stellar-secret', pattern: /\bS[A-Z2-7]{55}\b/g, replacement: '[REDACTED:stellar-secret]' },
 
   // EVM / generic 32-byte private key, with or without 0x.
+  //
+  // A private key and a transaction hash are the SAME SHAPE — 64 hex chars —
+  // so nothing in the string itself distinguishes them. We therefore redact by
+  // default (fail closed) and rely on the label-preservation pass above to
+  // exempt hashes their author explicitly labelled. An unlabelled 64-hex blob
+  // is treated as a key, because guessing wrong in that direction is the only
+  // one that leaks.
   { name: 'hex-private-key', pattern: /\b(?:0x)?[0-9a-fA-F]{64}\b/g, replacement: '[REDACTED:hex-key]' },
 
   // JWT (three base64url segments). Session and service tokens.
@@ -91,20 +98,36 @@ const CREDENTIAL_RULES: readonly Rule[] = [
     replacement: '$1[REDACTED]',
   },
 
-  // Assignments in dumped config / env / JSON.
+  // Quoted assignments in dumped config / env / JSON. This runs BEFORE the
+  // unquoted variant and consumes the WHOLE quoted value, because a secret is
+  // frequently multi-word: `"seed_phrase": "legal winner thank ..."`. Matching
+  // only up to the first space would leave the rest of a recovery phrase in
+  // the alert — the single worst failure this module can have.
+  {
+    name: 'secret-assignment-quoted',
+    pattern:
+      /\b([A-Za-z0-9_.-]*(?:secret|password|passwd|pwd|private[_-]?key|seed|mnemonic|phrase|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token)[A-Za-z0-9_.-]*)(["']?\s*[:=]\s*)(["'])(?:[^"'\\]|\\.)*\3/gi,
+    replacement: '$1$2$3[REDACTED]$3',
+  },
+
+  // Unquoted assignments (env-file / log style), value ends at whitespace.
   {
     name: 'secret-assignment',
     pattern:
-      /\b([A-Za-z0-9_.-]*(?:secret|password|passwd|pwd|private[_-]?key|seed|mnemonic|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token)[A-Za-z0-9_.-]*)\s*(["']?\s*[:=]\s*["']?)([^\s,;}"']+)/gi,
+      /\b([A-Za-z0-9_.-]*(?:secret|password|passwd|pwd|private[_-]?key|seed|mnemonic|phrase|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token)[A-Za-z0-9_.-]*)\s*(["']?\s*[:=]\s*["']?)([^\s,;}"']+)/gi,
     replacement: '$1$2[REDACTED]',
   },
 
   // Anything the author explicitly labelled as a seed phrase / mnemonic:
   // redact to end of line rather than attempting BIP-39 word detection, which
   // both misses non-English wordlists and misfires on ordinary prose.
+  //
+  // The separator class is `[_\s-]*`, not a bare space: field names in dumped
+  // objects are `seed_phrase` / `recovery-phrase`, and a space-only pattern
+  // silently misses every one of them.
   {
     name: 'labelled-mnemonic',
-    pattern: /\b(seed\s*phrase|mnemonic|recovery\s*phrase)\b\s*[:=]?.*/gi,
+    pattern: /\b(seed[_\s-]*phrase|mnemonic|recovery[_\s-]*phrase)\b\s*[:=]?.*/gi,
     replacement: '$1: [REDACTED:mnemonic]',
   },
 
@@ -163,8 +186,45 @@ function maskEmail(match: string): string {
  * pushes the risky step outside the boundary, which is precisely the failure
  * this module exists to prevent.
  */
+/**
+ * A transaction hash and a private key are indistinguishable by shape (both
+ * 64 hex chars), so the credential rules must redact both. But an alert whose
+ * hash has been redacted cannot be checked on-chain, which is most of what an
+ * operator does with a payment alert.
+ *
+ * Resolution: a 64-hex value is preserved only when its author explicitly
+ * labelled it as a hash. Everything unlabelled stays redacted. This keeps the
+ * default fail-closed — a leaked key is never labelled `tx_hash` — while
+ * making the common, deliberate case usable.
+ *
+ * Preservation works by lifting matches out to a sentinel before the
+ * credential rules run and restoring them afterwards. The sentinel uses NUL,
+ * which `stringify` strips from input first, so it cannot be forged by
+ * attacker-influenced content.
+ */
+const HASH_LABEL = /\b((?:source_|destination_|payin_|payout_|refund_)?(?:tx|txid|transaction|hash|tx_hash|ledger|envelope_hash)[\s"']*[:=]?[\s"']*)((?:0x)?[0-9a-fA-F]{64})\b/gi
+
+// NUL-delimited. `stringify` strips NUL from all input, so no attacker-supplied
+// content can forge a sentinel and smuggle arbitrary text past redaction.
+const SENTINEL = (i: number): string => `\u0000H${i}\u0000`
+const SENTINEL_RE = /\u0000H(\d+)\u0000/g
+
+function preserveLabelledHashes(text: string): { text: string; hashes: string[] } {
+  const hashes: string[] = []
+  const out = text.replace(HASH_LABEL, (_m, label: string, hash: string) => {
+    const i = hashes.push(hash) - 1
+    return `${label}${SENTINEL(i)}`
+  })
+  return { text: out, hashes }
+}
+
+function restoreLabelledHashes(text: string, hashes: string[]): string {
+  return text.replace(SENTINEL_RE, (_m, i: string) => hashes[Number(i)] ?? '[REDACTED:hash]')
+}
+
 export function redactForAlert(content: unknown): RedactedAlert {
-  let text = stringify(content)
+  const preserved = preserveLabelledHashes(stringify(content))
+  let text = preserved.text
 
   for (const rule of CREDENTIAL_RULES) {
     text = text.replace(rule.pattern, rule.replacement)
@@ -172,6 +232,8 @@ export function redactForAlert(content: unknown): RedactedAlert {
   for (const rule of IDENTIFIER_RULES) {
     text = text.replace(rule.pattern, rule.mask)
   }
+
+  text = restoreLabelledHashes(text, preserved.hashes)
 
   if (text.length > MAX_ALERT_LENGTH) {
     text = `${text.slice(0, MAX_ALERT_LENGTH)}\n[truncated]`
@@ -186,6 +248,15 @@ export function redactForAlert(content: unknown): RedactedAlert {
  * service on the alert path.
  */
 function stringify(value: unknown): string {
+  return stripNul(stringifyRaw(value))
+}
+
+/** Remove real NUL bytes so attacker content cannot forge a hash sentinel. */
+function stripNul(s: string): string {
+  return s.split('\u0000').join('')
+}
+
+function stringifyRaw(value: unknown): string {
   if (typeof value === 'string') return value
   if (value instanceof Error) return `${value.name}: ${value.message}\n${value.stack ?? ''}`
   if (value === null || value === undefined) return String(value)
