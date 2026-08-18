@@ -1,5 +1,15 @@
 import type { Env } from '../index'
-import { completeRefund, leaseRefund, listRefunds, readRefund, readRefundByPublicId, requeueMalformedRefund } from '../refund/refund'
+import {
+  completeRefund,
+  leaseRefund,
+  listRefunds,
+  readRefund,
+  readRefundByPublicId,
+  refundIdForPaymentTx,
+  requeueMalformedRefund,
+  unparkRefund,
+  type RefundRecord,
+} from '../refund/refund'
 import { hasSorobanTransactionData, isProvablyDeadEnvelope, validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
 import { ReceiptSigningUnavailable, signReceipt } from '../refund/receipt-signer'
 import { rpc } from '@stellar/stellar-sdk'
@@ -65,12 +75,102 @@ export async function handleRefundStatus(env: Env, publicId: string): Promise<Re
   })
 }
 
+/**
+ * A refund is "stuck" once it has existed for longer than the pipeline could
+ * plausibly need and still has not confirmed on chain. Ten minutes is ~10 cron
+ * ticks and ~1 full envelope validity window: a healthy refund confirms in
+ * well under a minute, so anything past this is a real fault, not slowness.
+ */
+export const STUCK_REFUND_THRESHOLD_MS = 10 * 60_000
+
+export interface StuckRefund {
+  refundId: string
+  publicId: string
+  state: string
+  createdAt: string
+  ageMs: number
+  merchant: string
+  refundAmountAtomic: string
+  paymentTx: string
+  orderId?: string
+}
+
+/**
+ * Selects unconfirmed refunds older than the threshold, newest work last so an
+ * operator reads the longest-stranded refund first.
+ *
+ * Deliberately driven off the refund records rather than the public order
+ * ledger: a `refund_pending` ledger row is exactly the projection of a refund
+ * record that has not reached `confirmed`, and scanning refunds is one DO scan
+ * instead of a full KV keyspace walk every minute. The one case this cannot
+ * see is an order row whose refund record was never created at all (the
+ * non-atomic window in proxy.ts); that orphan sweep is tracked separately.
+ */
+export function selectStuckRefunds(
+  records: RefundRecord[],
+  now: number,
+  thresholdMs: number = STUCK_REFUND_THRESHOLD_MS,
+): StuckRefund[] {
+  return records
+    .filter((record) => record.state !== 'confirmed')
+    .map((record) => ({ record, ageMs: now - Date.parse(record.createdAt) }))
+    .filter(({ ageMs }) => Number.isFinite(ageMs) && ageMs >= thresholdMs)
+    .sort((a, b) => b.ageMs - a.ageMs)
+    .map(({ record, ageMs }) => ({
+      refundId: record.refundId,
+      publicId: record.publicId,
+      state: record.state,
+      createdAt: record.createdAt,
+      ageMs,
+      merchant: record.merchant,
+      refundAmountAtomic: record.refundAmountAtomic,
+      paymentTx: record.payment.paymentTx,
+      ...(record.orderId ? { orderId: record.orderId } : {}),
+    }))
+}
+
 export async function handleRefundAdmin(request: Request, env: Env, url: URL): Promise<Response> {
   if (!authorized(request, env)) return json({ error: 'Unauthorized' }, 401)
   if (url.pathname === '/admin/refunds/pending' && request.method === 'GET') {
     const jobs = (await listRefunds(env)).filter((job) =>
       job.state === 'pending' || job.state === 'leased' || job.state === 'submitted')
     return json({ jobs })
+  }
+  if (url.pathname === '/admin/refunds/stuck' && request.method === 'GET') {
+    const minutesRaw = url.searchParams.get('minutes')
+    let thresholdMs = STUCK_REFUND_THRESHOLD_MS
+    if (minutesRaw !== null) {
+      const minutes = Number(minutesRaw)
+      if (!Number.isFinite(minutes) || minutes < 0) return json({ error: 'minutes must be a non-negative number' }, 400)
+      thresholdMs = minutes * 60_000
+    }
+    return json({ jobs: selectStuckRefunds(await listRefunds(env), Date.now(), thresholdMs) })
+  }
+  // Unpark is addressable by the on-chain payment hash, because that is the
+  // only identifier an operator can read off the public ledger row. Parsed
+  // ahead of the shared body guard below, which requires a leaseId that an
+  // out-of-band recovery has no way to hold.
+  if (url.pathname === '/admin/refunds/unpark' && request.method === 'POST') {
+    const payload = await request.json().catch(() => null) as any
+    const paymentTx = typeof payload?.paymentTx === 'string' ? payload.paymentTx.toLowerCase() : null
+    if (paymentTx !== null && !/^[0-9a-f]{64}$/.test(paymentTx)) {
+      return json({ error: 'paymentTx must be a 64-character hex transaction hash' }, 400)
+    }
+    const refundId = typeof payload?.refundId === 'string' && /^[0-9a-f]{64}$/.test(payload.refundId)
+      ? payload.refundId
+      : paymentTx ? await refundIdForPaymentTx(paymentTx) : null
+    if (!refundId) return json({ error: 'refundId or paymentTx required' }, 400)
+    const reason = typeof payload?.reason === 'string' ? payload.reason.slice(0, 200) : undefined
+    const outcome = await unparkRefund(env, refundId, reason)
+    if (!outcome.ok) {
+      return outcome.error === 'not_found'
+        ? json({ error: 'Refund not found' }, 404)
+        : json({ error: `Refusing to unpark a refund in state ${outcome.state}` }, 409)
+    }
+    console.log(JSON.stringify({
+      event: 'refund_unparked', refundId, changed: outcome.changed, state: outcome.record.state,
+    }))
+    return json({ ok: true, changed: outcome.changed, job: outcome.record })
   }
   const body = await request.json().catch(() => null) as any
   if (!body?.refundId || !body?.leaseId) return json({ error: 'refundId and leaseId required' }, 400)

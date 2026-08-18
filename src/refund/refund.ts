@@ -15,6 +15,12 @@ export interface PaymentProof {
   mode: 'charge' | 'channel'
 }
 
+export interface RefundAuditEvent {
+  kind: string
+  at: string
+  detail?: Record<string, unknown>
+}
+
 export interface RefundRecord {
   version: 1
   refundId: string
@@ -34,6 +40,13 @@ export interface RefundRecord {
   orderId?: string
   refundAmountAtomic: string
   createdAt: string
+  /**
+   * Append-only operator audit trail. Only written by out-of-band admin
+   * recovery (today: `/admin/refunds/unpark`), never by the automatic
+   * executor — the state machine itself is already reconstructable from the
+   * refund/order ledgers, so this exists purely to record human intervention.
+   */
+  events?: RefundAuditEvent[]
   lease?: { id: string; until: string }
   refundTx?: string
   signedXdr?: string
@@ -69,6 +82,15 @@ export function payerAccount(source: string): string {
   return account
 }
 
+/**
+ * Deterministic refund id for a settled payment. Exposed so an operator (and
+ * the unpark endpoint) can address a refund by the on-chain payment hash,
+ * which is the only identifier visible on the public ledger row.
+ */
+export async function refundIdForPaymentTx(paymentTx: string): Promise<string> {
+  return sha256(`refund-v1:${paymentTx}:full`)
+}
+
 export async function enqueueRefund(
   env: Env,
   input: {
@@ -82,7 +104,7 @@ export async function enqueueRefund(
   if (!/^[0-9]+$/.test(input.proof.amountAtomic) || BigInt(input.proof.amountAtomic) <= 0n) {
     throw new Error('Refund amount must be positive atomic units')
   }
-  const refundId = await sha256(`refund-v1:${input.proof.paymentTx}:full`)
+  const refundId = await refundIdForPaymentTx(input.proof.paymentTx)
   const publicId = crypto.randomUUID()
   const store = doAtomicParams(env.ATOMIC_STORE)
   const record = await store.update(`${PREFIX}${refundId}`, (current) => {
@@ -203,6 +225,68 @@ export async function completeRefund(
     await updateOrderRefundStatus(env, result.orderId, 'refunded')
   }
   return result
+}
+
+export type UnparkOutcome =
+  | { ok: true; changed: boolean; record: RefundRecord }
+  | { ok: false; error: 'not_found' }
+  | { ok: false; error: 'invalid_state'; state: RefundState }
+
+/**
+ * Operator recovery for `manual_review`, the one state the automatic executor
+ * can enter but never leave: `/admin/refunds/pending` lists only
+ * `pending|leased|submitted`, so a parked job is invisible to every subsequent
+ * cron run. Before this existed a single rejected `sendTransaction` (a stale
+ * sequence number, an expired envelope) stranded customer money permanently,
+ * with no in-band recovery short of hand-signing a payment with the router key.
+ *
+ * Deliberately narrow:
+ *   - the ONLY transition allowed is `manual_review -> pending`. Nothing here
+ *     can resurrect a `confirmed` refund (double-pay) or steal a job from a
+ *     live lease.
+ *   - idempotent: a job already back at `pending` returns ok with
+ *     `changed: false` and appends no second audit event, so a retried or
+ *     duplicated operator call cannot spam the trail or race the executor.
+ *   - the stale envelope is stripped along with the lease, so the pending path
+ *     signs a fresh transaction rather than re-sending one that can only ever
+ *     be rejected. That is safe precisely because the parked envelope was
+ *     never included: a submitted-and-landed refund reaches `confirmed`, and
+ *     `confirmed` is refused here.
+ */
+export async function unparkRefund(
+  env: Env,
+  refundId: string,
+  reason?: string,
+): Promise<UnparkOutcome> {
+  const store = doAtomicParams(env.ATOMIC_STORE)
+  return store.update<UnparkOutcome>(`${PREFIX}${refundId}`, (current) => {
+    const record = parseRecord(current)
+    if (!record) return { op: 'noop', result: { ok: false, error: 'not_found' } }
+    if (record.state === 'pending') {
+      return { op: 'noop', result: { ok: true, changed: false, record } }
+    }
+    if (record.state !== 'manual_review') {
+      return { op: 'noop', result: { ok: false, error: 'invalid_state', state: record.state } }
+    }
+    const { refundTx: _refundTx, signedXdr: _signedXdr, lease: _lease, ...rest } = record
+    const unparked: RefundRecord = {
+      ...rest,
+      state: 'pending',
+      events: [
+        ...(record.events ?? []),
+        {
+          kind: 'admin_unpark',
+          at: new Date().toISOString(),
+          detail: {
+            from: 'manual_review',
+            ...(record.refundTx ? { discardedRefundTx: record.refundTx } : {}),
+            ...(reason ? { reason } : {}),
+          },
+        },
+      ],
+    }
+    return { op: 'set', value: JSON.stringify(unparked), result: { ok: true, changed: true, record: unparked } }
+  })
 }
 
 export async function requeueMalformedRefund(

@@ -1,4 +1,5 @@
 import {
+  Account,
   Address,
   BASE_FEE,
   Contract,
@@ -56,6 +57,66 @@ const POLL_ATTEMPTS = 25
 const HARD_AUTO_REFUND_MAX_ATOMIC = 1_000_000_000n
 const HARD_ALERT_THRESHOLD_ATOMIC = 100_000_000n
 const HARD_MAX_FEE_STROOPS = 10_000_000n
+
+/**
+ * Backwards grace on `minTime`, absorbing modest clock skew between this
+ * worker and the network without widening the inclusion window materially.
+ */
+export const REFUND_TX_MIN_TIME_GRACE_SECONDS = 60
+
+/**
+ * Forward validity of a signed refund envelope.
+ *
+ * WAS 60 seconds, which was shorter than this pipeline's own retry loop:
+ * `waitForTransaction` alone polls for up to 25s, the cron granularity is
+ * 60s, and a submission that fails once cannot be retried before the envelope
+ * is already past `maxTime`. From there every re-send returns `txTooLate` ->
+ * `ERROR` -> `parkRejected` -> `manual_review`, which until now was terminal.
+ * One transient RPC hiccup therefore stranded a customer refund permanently
+ * (investigation: docs/reports/refund-stuck-investigation-2026-08-18.md).
+ *
+ * Ten minutes covers ~10 cron ticks with room for several confirmation polls,
+ * and also makes the "provably dead envelope" retention check satisfiable by
+ * an RPC with a short history window. Widening it is safe: the envelope is
+ * single-use (one sequence number), amount-bound, source-bound and
+ * destination-bound, so a longer window cannot change what it can pay, only
+ * for how long it may still be included.
+ */
+export const REFUND_TX_VALIDITY_SECONDS = 600
+
+/**
+ * Keeps one refund's source-account sequence from colliding with the next
+ * refund's in the same cron run.
+ *
+ * `runRefundSigner` processes jobs sequentially from a SINGLE source account,
+ * re-reading it with `getAccount` before each signature. Soroban RPC does not
+ * guarantee that read reflects a transaction submitted moments earlier, so
+ * refund #2 could be built on refund #1's already-consumed sequence, get
+ * `txBadSeq` on submit, and be parked into `manual_review` on its very first
+ * attempt — the observed "first refund fine, second refund dead" asymmetry.
+ *
+ * The guard only ever moves the sequence FORWARD, and only records a sequence
+ * that the network actually accepted. A rejected submission consumes nothing,
+ * so nothing is recorded and no gap is created for the next job.
+ */
+export class RefundSequenceGuard {
+  private lastAccepted?: bigint
+
+  /** Returns a source account no older than the last sequence the network accepted. */
+  advance(account: Account): Account {
+    const fetched = BigInt(account.sequenceNumber())
+    if (this.lastAccepted !== undefined && fetched < this.lastAccepted) {
+      return new Account(account.accountId(), this.lastAccepted.toString())
+    }
+    return account
+  }
+
+  /** Records a sequence consumed by a transaction the network did NOT reject. */
+  recordAccepted(sequence: string | bigint): void {
+    const value = BigInt(sequence)
+    if (this.lastAccepted === undefined || value > this.lastAccepted) this.lastAccepted = value
+  }
+}
 
 export interface RefundLedger {
   reserve(job: RefundJob, paidAtomic: bigint): Promise<void>
@@ -194,8 +255,9 @@ async function buildSignedRefund(
   signer: Keypair,
   job: RefundJob,
   amount: bigint,
+  sequence: RefundSequenceGuard,
 ): Promise<{ prepared: Transaction; signedXdr: string; refundTx: string }> {
-  const account = await server.getAccount(signer.publicKey())
+  const account = sequence.advance(await server.getAccount(signer.publicKey()))
   const base = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.PUBLIC })
     .addOperation(new Contract(job.payment.asset).call(
       'transfer',
@@ -205,9 +267,12 @@ async function buildSignedRefund(
     ))
     // Explicit minTime: the network enforces it (no ledger with an earlier
     // close time can include this tx), giving the dead-envelope recovery a
-    // clock-independent lower bound for its retention check. 60s of grace
-    // absorbs modest clock skew without widening the window materially.
-    .setTimebounds(Math.floor(Date.now() / 1000) - 60, Math.floor(Date.now() / 1000) + 60)
+    // clock-independent lower bound for its retention check. See
+    // REFUND_TX_VALIDITY_SECONDS for why maxTime is 10 minutes, not 60s.
+    .setTimebounds(
+      Math.floor(Date.now() / 1000) - REFUND_TX_MIN_TIME_GRACE_SECONDS,
+      Math.floor(Date.now() / 1000) + REFUND_TX_VALIDITY_SECONDS,
+    )
     .build()
   const prepared = await server.prepareTransaction(base)
   if (prepared.source !== signer.publicKey()) throw new Error('prepared refund source mismatch')
@@ -229,6 +294,7 @@ async function confirmSubmitted(
   job: RefundJob,
   beforeRouterConfirm: (refundTx: string) => Promise<void>,
   onRejected: (refundTx: string, detail?: string) => Promise<void>,
+  sequence: RefundSequenceGuard,
 ): Promise<string> {
   if (!job.signedXdr || !job.refundTx || !job.lease?.id) throw new Error('submitted refund is incomplete')
   const leaseId = job.lease.id
@@ -279,7 +345,7 @@ async function confirmSubmitted(
       delete requeued.refundTx
       delete requeued.signedXdr
       delete requeued.lease
-      return executePending(env, server, signer, requeued, beforeRouterConfirm, onRejected)
+      return executePending(env, server, signer, requeued, beforeRouterConfirm, onRejected, sequence)
     }
     const send = await server.sendTransaction(tx)
     if (send.status === 'ERROR') {
@@ -287,6 +353,7 @@ async function confirmSubmitted(
       await onRejected(refundTx, String(send.errorResult ?? send.status))
       throw new Error(`submitted refund rejected and parked: ${refundTx}`)
     }
+    sequence.recordAccepted(tx.sequence)
     await waitForTransaction(server, refundTx)
   }
   await beforeRouterConfirm(refundTx)
@@ -311,6 +378,7 @@ async function executePending(
   job: RefundJob,
   beforeRouterConfirm: (refundTx: string) => Promise<void>,
   onRejected: (refundTx: string, detail?: string) => Promise<void>,
+  sequence: RefundSequenceGuard,
 ): Promise<string> {
   const leaseId = crypto.randomUUID()
   const leased = await routerApi<{ job: RefundJob }>(env, '/admin/refunds/lease', {
@@ -318,7 +386,7 @@ async function executePending(
   })
   assertLeasedJobMatches(job, leased.job)
   const amount = validateJob(leased.job, signer)
-  const { prepared, signedXdr, refundTx } = await buildSignedRefund(server, signer, leased.job, amount)
+  const { prepared, signedXdr, refundTx } = await buildSignedRefund(server, signer, leased.job, amount, sequence)
 
   await routerApi(env, '/admin/refunds/complete', {
     method: 'POST',
@@ -330,6 +398,7 @@ async function executePending(
     await onRejected(refundTx, String(send.errorResult ?? send.status))
     throw new Error(`refund transaction rejected and parked: ${refundTx}`)
   }
+  sequence.recordAccepted(prepared.sequence)
   await waitForTransaction(server, refundTx)
   await beforeRouterConfirm(refundTx)
   await routerApi(env, '/admin/refunds/confirm', {
@@ -351,6 +420,10 @@ export async function runRefundSigner(
   }
   const server = serverOverride ?? new rpc.Server(env.STELLAR_RPC_URL)
   const pending = await routerApi<{ jobs: RefundJob[] }>(env, '/admin/refunds/pending')
+  // One guard per run: the jobs below are signed sequentially from this one
+  // account, and only a same-run collision is ours to prevent (across runs the
+  // network has long since caught up).
+  const sequence = new RefundSequenceGuard()
 
   for (const job of pending.jobs) {
     try {
@@ -378,9 +451,9 @@ export async function runRefundSigner(
       }
       let refundTx: string
       if (job.state === 'submitted') {
-        refundTx = await confirmSubmitted(env, server, signer, job, beforeRouterConfirm, rejectedAlert)
+        refundTx = await confirmSubmitted(env, server, signer, job, beforeRouterConfirm, rejectedAlert, sequence)
       } else if (job.state === 'pending' || job.state === 'leased') {
-        refundTx = await executePending(env, server, signer, job, beforeRouterConfirm, rejectedAlert)
+        refundTx = await executePending(env, server, signer, job, beforeRouterConfirm, rejectedAlert, sequence)
       } else {
         continue
       }
@@ -392,5 +465,57 @@ export async function runRefundSigner(
         error: error instanceof Error ? error.message : String(error),
       }))
     }
+  }
+
+  await reportStuckRefunds(env, ledger)
+}
+
+export interface StuckRefund {
+  refundId: string
+  publicId: string
+  state: string
+  ageMs: number
+  merchant: string
+  refundAmountAtomic: string
+  paymentTx: string
+  orderId?: string
+}
+
+/**
+ * Alerts on refunds that have gone quiet, not just on ones that were loudly
+ * rejected.
+ *
+ * `parkRejected` was the ONLY alert on this path, so the two silent failure
+ * shapes — a job that never re-enters `/admin/refunds/pending`, and one that
+ * fails the same way every tick — produced no notification at all. The stuck
+ * refund found on 2026-08-18 was invisible for an hour for exactly that reason.
+ *
+ * Deduplicated by the alert outbox's `INSERT OR IGNORE` on `stuck:<refundId>`,
+ * so a refund that stays stuck across hundreds of one-minute cron ticks
+ * produces exactly one message, not one per tick.
+ *
+ * Never throws: an alerting failure must not abort or fail a run whose actual
+ * job is returning money.
+ */
+export async function reportStuckRefunds(env: Env, ledger: RefundLedger): Promise<void> {
+  try {
+    const stuck = await routerApi<{ jobs: StuckRefund[] }>(env, '/admin/refunds/stuck')
+    for (const job of stuck.jobs) {
+      const minutes = Math.floor(job.ageMs / 60_000)
+      await ledger.enqueueAlert(
+        `stuck:${job.refundId}`,
+        `MPP refund still unpaid after ${minutes}m: state ${job.state}, ` +
+          `$${formatUsdc(BigInt(job.refundAmountAtomic))}, merchant ${job.merchant}, ` +
+          `payment tx ${job.paymentTx}` + (job.orderId ? `, order ${job.orderId}` : '') +
+          (job.state === 'manual_review'
+            ? '. Recover with POST /admin/refunds/unpark {"paymentTx":"<tx>"}'
+            : ''),
+      )
+    }
+  } catch (error: unknown) {
+    console.error(JSON.stringify({
+      event: 'refund_stuck_sweep_failed',
+      error: error instanceof Error ? error.message : String(error),
+    }))
   }
 }
