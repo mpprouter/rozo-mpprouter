@@ -91,3 +91,11 @@ curl https://apiserver.mpprouter.dev/v1/services/catalog
 ```
 
 For integration details, see [docs/integration.md](docs/integration.md).
+
+## Agent framework guides
+
+- [Vercel AI SDK](docs/guides/vercel-ai-sdk.md) — two tools, a Stellar wallet
+  and a hard spending ceiling. Runnable example in
+  [`examples/vercel-ai-sdk/`](examples/vercel-ai-sdk/).
+- [OpenClaw / Claude Code skill](https://github.com/mpprouter/stellar-agent-wallet-skill)
+  — the same protocol packaged as a skill.
