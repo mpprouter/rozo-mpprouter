@@ -11,6 +11,7 @@
  *   GET      /services                      — Public service catalog
  *   GET      /v1/services/catalog           — Versioned public service catalog
  *   GET      /v1/services/search            — Search/filter catalog
+ *   GET      /v1/ledger                     — Public settlement ledger
  *   GET      /llms.txt                      — LLM-readable router description
  *   GET      /openapi.json                  — OpenAPI 3.1 spec
  *   GET      /.well-known/ai-plugin.json    — AI plugin manifest
@@ -21,6 +22,7 @@ import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './ro
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleSearch } from './routes/search'
+import { handleLedger } from './routes/ledger'
 import { handleX402Supported } from './routes/x402-supported'
 import { handleLlmsTxt } from './routes/llms-txt'
 import { handleOpenApi } from './routes/openapi'
@@ -492,6 +494,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return handleSearch(url, env)
       }
 
+      // Public settlement ledger. Unauthenticated and read-only by design —
+      // it is the evidence behind the "all visible on the ledger" claim, so
+      // requiring a key would defeat its purpose. Rate limited to 1 req/s
+      // per IP inside the handler.
+      if (url.pathname === '/v1/ledger' && request.method === 'GET') {
+        return handleLedger(request, env)
+      }
+
       if (url.pathname === '/x402/supported') {
         return handleX402Supported(env)
       }
@@ -754,6 +764,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         '  GET /services                        - Public service catalog\n' +
         '  GET /v1/services/catalog             - Versioned service catalog\n' +
         '  GET /v1/services/search              - Search/filter catalog\n' +
+        '  GET /v1/ledger                       - Public settlement ledger\n' +
         '  GET /x402/supported                  - x402 discovery\n' +
         '  GET /llms.txt                        - LLM-readable description\n' +
         '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +

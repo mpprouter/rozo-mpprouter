@@ -38,6 +38,44 @@ const spec = {
         },
       },
     },
+    '/v1/ledger': {
+      get: {
+        operationId: 'getLedger',
+        summary: 'Public settlement ledger',
+        description:
+          'Append-only, unauthenticated record of settled paid calls: service, ' +
+          'payer address, amount, Stellar settlement transaction, and outcome. ' +
+          'Oldest first; page with `cursor`. Rate limited to 1 request per second per IP.',
+        parameters: [
+          {
+            name: 'limit',
+            in: 'query',
+            description: 'Rows per page, 1-100 (default 25).',
+            schema: { type: 'integer', minimum: 1, maximum: 100, default: 25 },
+          },
+          {
+            name: 'cursor',
+            in: 'query',
+            description: 'Opaque cursor from the previous response `next_cursor`.',
+            schema: { type: 'string' },
+          },
+          {
+            name: 'tx',
+            in: 'query',
+            description:
+              'Look up the single entry settled by this 64-hex Stellar transaction hash. ' +
+              'Mutually exclusive with pagination.',
+            schema: { type: 'string' },
+          },
+        ],
+        responses: {
+          '200': { description: 'A page of ledger entries, or a single entry when `tx` is given.' },
+          '400': { description: 'Malformed limit or tx hash.' },
+          '404': { description: 'No ledger entry for that transaction hash.' },
+          '429': { description: 'Rate limit exceeded (1 request per second per IP).' },
+        },
+      },
+    },
     '/v1/services/search': {
       get: {
         operationId: 'searchServices',

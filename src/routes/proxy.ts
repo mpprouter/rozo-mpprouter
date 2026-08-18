@@ -1613,11 +1613,13 @@ export async function handleProxy(
       )
     })())
 
-    // Per-call order ledger (router-held-credential routes only — Mercury
-    // MVP, design doc §2.9). Payer isn't decoded from the x402 signed XDR
-    // in v1 (see order-ledger.ts note); settlement_ref is the on-chain
-    // settle tx when it succeeded.
-    if (route.upstreamAuth) {
+    // Per-call order ledger (design doc §2.9). Recorded for EVERY settled
+    // call, not only router-held-credential (Mercury) routes: the records
+    // now back the public GET /v1/ledger, and a ledger that silently omits
+    // most of the router's paid traffic misrepresents it. Payer isn't
+    // decoded from the x402 signed XDR in v1 (see order-ledger.ts note);
+    // settlement_ref is the on-chain settle tx when it succeeded.
+    {
       ctx.waitUntil(recordOrder(env, {
         order_id: newOrderId(),
         ts: new Date().toISOString(),
@@ -2263,9 +2265,9 @@ export async function handleProxy(
     }
   })())
 
-  // Per-call order ledger (router-held-credential routes only — Mercury
-  // MVP, design doc §2.9).
-  if (route.upstreamAuth) {
+  // Per-call order ledger (design doc §2.9). Recorded for EVERY settled
+  // call — see the note on the stellar.x402 branch above.
+  {
     ctx.waitUntil(recordOrder(env, {
       order_id: newOrderId(),
       ts: new Date().toISOString(),

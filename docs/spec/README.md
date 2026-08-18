@@ -24,6 +24,7 @@ the five contracts that make that work:
 | [`catalog.md`](./catalog.md) | The machine-readable service catalog: field semantics, price labels, payability, and the verified-flag contract |
 | [`provider-registration.md`](./provider-registration.md) | How a provider/route enters the catalog, the operator overlay, and the real-money verification gate |
 | [`receipts-and-refunds.md`](./receipts-and-refunds.md) | What happens when a paid call does not deliver: non-delivery classification, refund amount and destination, execution bounds, and the signed receipt |
+| [`public-ledger.md`](./public-ledger.md) | The public settlement ledger: `GET /v1/ledger`, its row shape, pagination, rate limit, and the privacy boundary |
 
 ## Design invariants (normative)
 
@@ -58,6 +59,7 @@ These hold across all four documents:
 | `GET /v1/services/catalog` | Versioned machine-readable catalog |
 | `GET /v1/services/search` | Catalog search |
 | `POST\|GET /v1/services/{service}/{operation}` | The paid proxy routes |
+| `GET /v1/ledger` | Public settlement ledger (see `public-ledger.md`) |
 | `GET /x402/supported` | x402 capability discovery |
 | `GET /health` | Router pool status |
 | `GET /llms.txt` | Agent-readable usage guide |
