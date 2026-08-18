@@ -77,6 +77,9 @@ import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
 import { handlePreflight, withCors } from './utils/cors'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
+import { checkGasSponsor } from './utils/stellar-gas-balance'
+import { sendDingTalkAlert } from './utils/dingtalk'
+import { redactForAlert } from './utils/alert-redaction'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -375,7 +378,53 @@ export default {
     // before users can unilaterally refund. No-op unless the channel playground
     // is enabled AND the collector signer secret is set.
     ctx.waitUntil(settlePlaygroundChannels(env))
+    // Gas sponsor low-balance watch (threat DoS.3.R.1, Stellar side). Alerts on
+    // state TRANSITION only — this cron runs every 2 minutes, so a level-based
+    // check would re-send the same warning 720 times a day.
+    ctx.waitUntil(watchGasSponsor(env))
   },
+}
+
+/**
+ * Gas sponsor low-balance watch.
+ *
+ * Deliberately on the cron rather than the request path, unlike the Tempo pool
+ * check: the Tempo balance is consulted per request because it decides whether
+ * that request can be served, whereas the gas sponsor funds no user-facing
+ * quote and would only add a Horizon round-trip to every proxied call.
+ *
+ * Swallows its own errors. A monitor that can break the cron it rides on takes
+ * down refund reconciliation and channel settlement with it — strictly worse
+ * than the gap it was added to close.
+ */
+async function watchGasSponsor(env: Env): Promise<void> {
+  try {
+    if (!env.DINGTALK_ACCESS_TOKEN) {
+      // No alert channel means this monitor cannot do its job. Say so in the
+      // log rather than returning silently: a monitor that is quiet because it
+      // is disabled looks identical to a monitor that is quiet because all is
+      // well, and that is the failure this whole change exists to remove.
+      console.warn('[gas-sponsor-watch] DINGTALK_ACCESS_TOKEN unset — gas sponsor is NOT being monitored')
+      return
+    }
+
+    const result = await checkGasSponsor({
+      kv: env.MPP_STORE,
+      horizonUrl: env.PLAYGROUND_HORIZON_URL ?? 'https://horizon.stellar.org',
+      address: env.STELLAR_GAS_PUBLIC,
+    })
+    if (!result) return
+
+    await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, redactForAlert(result.message))
+
+    // Commit only after the alert has gone out. If the send throws we fall to
+    // the catch below WITHOUT recording the new state, so the next tick sees
+    // the same transition and tries again. Recording first would have deduped
+    // every later attempt and left the monitor permanently silent.
+    await result.commit()
+  } catch (err) {
+    console.warn(`[gas-sponsor-watch] skipped: ${(err as Error).message}`)
+  }
 }
 
 async function route(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
