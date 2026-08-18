@@ -945,7 +945,9 @@ export async function handleStripeCreateInvoice(
     })
   }
 
-  // 3. Discount (unchanged formula; founder decision: Stripe keeps it).
+  // 3. No discount (founder decision 2026-08-18: Stripe line matches the
+  // Coinbase line — caller pays the full invoice amount; discount fields kept
+  // in the response for shape stability but always full amount / "0").
   let invoiceAtomic: bigint
   try {
     invoiceAtomic = BigInt(invoice.stablecoinAmountAtomic)
@@ -955,12 +957,10 @@ export async function handleStripeCreateInvoice(
   if (invoiceAtomic <= 0n) {
     return json(422, { ok: false, provider: 'stripe_crypto', error: 'Invoice amount must be positive.' })
   }
-  const callerPaysAtomic = computeCallerPaysAtomic(invoiceAtomic)
-  const discountAtomic = invoiceAtomic - callerPaysAtomic
-  const callerPays = formatUsdc(callerPaysAtomic)
+  const callerPays = formatUsdc(invoiceAtomic)
   const originalStr = formatUsdc(invoiceAtomic)
-  const discountStr = formatUsdc(discountAtomic)
-  const title = buildTitle(invoice.merchantTitle, invoiceAtomic, callerPaysAtomic)
+  const discountStr = '0'
+  const title = buildFullAmountTitle(invoice.merchantTitle, invoiceAtomic)
 
   // 4. Provider-qualified orderId (design §6): stripe_crypto_<cpis_*>.
   const orderId = stripeOrderId(invoice.invoiceKey)
@@ -985,6 +985,38 @@ export async function handleStripeCreateInvoice(
     }
   } catch {
     // Non-fatal — fall through to create.
+  }
+
+  // Rollout guard (codex P1 on the no-discount change): an unpaid intent
+  // created under the OLD discounted pricing must not be reused — we would
+  // report callerPays as the full amount while the payable link still collects
+  // the discounted one. The row's USD amount lives on destination.amount for
+  // Lightning (exactOut) and source.amount otherwise; anything unparsable is
+  // treated as a mismatch (fail toward honesty, never toward misreporting).
+  if (existing) {
+    const rowUsdRaw =
+      readRowSource(existing).chainId === 'lightning'
+        ? existing?.destination?.amount
+        : existing?.source?.amount
+    const rowUsd = Number(rowUsdRaw)
+    const fullUsd = Number(callerPays)
+    if (!Number.isFinite(rowUsd) || Math.abs(rowUsd - fullUsd) > 0.01) {
+      const legacy = existing
+      existing = null
+      return json(409, {
+        ok: false,
+        provider: 'stripe_crypto',
+        error: {
+          code: 'LEGACY_PRICING_ORDER_PENDING',
+          message:
+            `An unpaid order for this invoice exists under previous pricing and ` +
+            `cannot be reused. Wait for it to expire, then create a new order.`,
+        },
+        invoiceKey: invoice.invoiceKey,
+        rozoPaymentId: legacy?.id ?? null,
+        expiresAt: legacy?.expiresAt ?? null,
+      })
+    }
   }
 
   // Creating again under the same orderId would just 409 orderIdConflict

@@ -632,8 +632,8 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
       expect(json.provider).toBe('stripe_crypto')
       expect(json.invoiceKey).toBe('cpis_test123')
       expect(json.merchantAccount).toBe('acct_test')
-      // discount applied: invoice $10 -> caller pays $9.52 (10*100/105).
-      expect(json.callerPays).toBe('9.523809')
+      // No discount (founder decision 2026-08-18): caller pays the full amount.
+      expect(json.callerPays).toBe('10')
     } finally {
       globalThis.fetch = originalFetch
     }
