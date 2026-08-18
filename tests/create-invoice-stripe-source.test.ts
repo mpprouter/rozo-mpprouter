@@ -276,7 +276,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
       status: 'payment_unpaid',
       paymentLink: 'https://pay.rozo.ai/existing',
       expiresAt: '2999-01-01T00:00:00.000Z',
-      source: { chainId: '8453', tokenSymbol: 'USDC' },
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
     }
     checkoutResponse = () =>
       new Response(
@@ -312,7 +312,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
       status: 'payment_unpaid',
       paymentLink: 'https://pay.rozo.ai/existing',
       expiresAt: '2999-01-01T00:00:00.000Z',
-      source: { chainId: '8453', tokenSymbol: 'USDC' },
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
     }
     checkoutResponse = () =>
       new Response(JSON.stringify({ error: 'checkoutNotAllowed' }), { status: 400 })
@@ -338,7 +338,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
       status: 'payment_unpaid',
       paymentLink: 'https://pay.rozo.ai/existing',
       expiresAt: '2999-01-01T00:00:00.000Z',
-      source: { chainId: '8453', tokenSymbol: 'USDC' },
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
     }
     // A payer funded the order while our /checkout call was in flight: the
     // rotation is refused, and the refetched row is no longer unpaid.
@@ -364,7 +364,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
       status: 'payment_unpaid',
       paymentLink: 'https://pay.rozo.ai/existing',
       expiresAt: '2999-01-01T00:00:00.000Z',
-      source: { chainId: '900', tokenSymbol: 'USDT' },
+      source: { chainId: '900', tokenSymbol: 'USDT', amount: '10' },
     }
 
     const { json } = await createInvoice({
@@ -385,7 +385,7 @@ describe('Stripe create-invoice — an unexpired order that is no longer unpaid'
       status: 'payment_started',
       paymentLink: 'https://pay.rozo.ai/existing',
       expiresAt: '2999-01-01T00:00:00.000Z',
-      source: { chainId: '8453', tokenSymbol: 'USDC' },
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
     }
 
     const { status, json } = await createInvoice({
