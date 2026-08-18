@@ -1,5 +1,6 @@
 import type { Env } from '../index'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
+import { updateOrderRefundStatus } from '../services/order-ledger'
 
 export type RefundReason = 'timeout' | 'upstream_5xx' | 'non_fulfillment' | 'empty_response'
 export type RefundState = 'pending' | 'leased' | 'submitted' | 'confirmed' | 'manual_review'
@@ -24,6 +25,13 @@ export interface RefundRecord {
   payment: PaymentProof
   merchant: string
   routeId: string
+  /**
+   * Order-ledger row this refund belongs to, so the public ledger row can be
+   * moved from `refund_pending` to `refunded` when the return confirms.
+   * Optional: refunds enqueued before this field existed, and any future
+   * caller that has no ledger row, simply skip the write-back.
+   */
+  orderId?: string
   refundAmountAtomic: string
   createdAt: string
   lease?: { id: string; until: string }
@@ -63,7 +71,13 @@ export function payerAccount(source: string): string {
 
 export async function enqueueRefund(
   env: Env,
-  input: { proof: PaymentProof; reason: RefundReason; merchant: string; routeId: string },
+  input: {
+    proof: PaymentProof
+    reason: RefundReason
+    merchant: string
+    routeId: string
+    orderId?: string
+  },
 ): Promise<RefundRecord> {
   if (!/^[0-9]+$/.test(input.proof.amountAtomic) || BigInt(input.proof.amountAtomic) <= 0n) {
     throw new Error('Refund amount must be positive atomic units')
@@ -83,6 +97,7 @@ export async function enqueueRefund(
       payment: input.proof,
       merchant: input.merchant,
       routeId: input.routeId,
+      ...(input.orderId ? { orderId: input.orderId } : {}),
       refundAmountAtomic: input.proof.amountAtomic,
       createdAt: new Date().toISOString(),
     }
@@ -177,6 +192,16 @@ export async function completeRefund(
     }
     return { op: 'set', value: JSON.stringify(next), result: next }
   })
+  // Close the loop on the public ledger: the order row was written as
+  // `refund_pending` when the merchant leg failed, and stays that way until
+  // the return is confirmed on chain. Only `confirmed` flips it — `submitted`
+  // means a tx exists but has not been included, and `manual_review` means it
+  // may never be. Best-effort by design (see updateOrderRefundStatus): the
+  // refund record here, not the KV ledger row, is the source of truth for
+  // whether the money went back, so a KV hiccup must not fail the refund.
+  if (result && result.state === 'confirmed' && result.orderId) {
+    await updateOrderRefundStatus(env, result.orderId, 'refunded')
+  }
   return result
 }
 

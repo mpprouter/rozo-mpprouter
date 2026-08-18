@@ -188,7 +188,12 @@ function chatReq() {
       Authorization: 'Payment fake-voucher-credential',
     },
     body: JSON.stringify({
-      model: 'claude-haiku-4-5',
+      // Generic cheap-tier CHARGE fixture. Was claude-haiku-4-5 until
+      // 2026-08-18, when the anthropic route was delisted (merchant 403s
+      // after taking payment) and every Claude entry became unavailable.
+      // groq is charge-verified and the same $0.02 tier, so nothing this
+      // file asserts changes.
+      model: 'llama-3.1-8b-instant',
       messages: [{ role: 'user', content: 'hello' }],
     }),
   })

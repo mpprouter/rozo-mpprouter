@@ -26,6 +26,24 @@
  * key, NEVER calls pay-per-call. It only issues unauthenticated POSTs that
  * expect a 402 back. It physically cannot move money.
  *
+ * SCOPE — what an unpaid probe can and cannot see (2026-08-18):
+ * Because it stops at the 402, this monitor observes exactly one leg: that the
+ * merchant still offers a payable challenge we can parse. It says nothing
+ * about what happens AFTER a payment settles. A merchant that answers a
+ * healthy 402, accepts the payment, and then fails its own upstream call is
+ * OK by every check here — the challenge is intact, which is all an unpaid
+ * request can establish. That class of failure is only observable from a paid
+ * call (scripts/e2e/charge-e2e.mjs) or from production settlement data, and
+ * anthropic chat_completions sat in it for days: healthy 402, payment
+ * settled, merchant leg 403, automatic refund. Two signals close the gap
+ * without spending money on every route:
+ *   - GET /v1/ledger now records settled-but-undelivered calls with a refund
+ *     status, so a route that refunds every call is visible in the data.
+ *   - services/route-health.ts records the failure reason per route from live
+ *     traffic.
+ * Treat an all-OK run from this script as "the challenge layer is intact",
+ * never as "the route delivers".
+ *
  * Output: JSON report to stdout (consumed by ainative
  * scripts/mpprouter_health_sync.py which writes brain.db + alerts on FAIL).
  * Exit 0 if no FAIL, 1 if any FAIL, 2 on harness error.

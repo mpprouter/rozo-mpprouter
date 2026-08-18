@@ -76,7 +76,7 @@ With `?tx=`, the payload is `{ "ok": true, "entry": { … same row … } }`.
 | `payer` | Stellar `G…` address that paid, or `null` when the payment dialect did not expose it (see limitations). |
 | `amount_usd` | Amount quoted for and charged for this call, in USD, as a decimal string. Router quotes are fixed at 402 time, so quoted and charged are the same number; if that ever diverges this field splits rather than silently changing meaning. |
 | `settlement_tx` | Stellar transaction hash of the settlement, or `null` when settlement produced no hash. |
-| `status` | `delivered` (upstream returned 2xx), `failed` (it did not), `refund_pending`, or `refund_unknown`. |
+| `status` | `delivered` (upstream returned 2xx), `failed` (it did not), `refund_pending` (the payment settled, the call was not delivered, and a refund is queued), `refunded` (that refund confirmed on chain), or `refund_unknown` (settled and undelivered, with no refund queued — needs manual review). |
 | `upstream_status` | HTTP status the upstream service returned. |
 | `internal` | Whether this row is our own probe/test traffic. See below. |
 
@@ -120,6 +120,16 @@ with `payer: null` stay `null` regardless — there is nothing to match on.
 
 - Every settled call through the paid proxy is recorded, on both the MPP
   (`WWW-Authenticate: Payment`) and x402 (`Payment-Required`) legs.
+- **Calls that settled and were not delivered are recorded too** (since
+  2026-08-18). When the payment settles and the upstream leg then fails, the
+  row is written with the merchant's status and `refund_pending`, and moves to
+  `refunded` once the on-chain return confirms. Before that date those rows
+  were missing entirely, so a route that took payment and refunded every call
+  was invisible here. A payment that never settled — the router pays the
+  merchant before settling on the x402 leg, and a channel voucher that is
+  rolled back is never consumed — is not a settlement and is not recorded.
+- Asynchronous (HTTP 202 + poll) jobs are not yet recorded; their settlement
+  happens on a separate delivery path. Tracked as a follow-up.
 - **`payer` is `null` on the x402 leg.** That dialect carries the payer inside
   a signed XDR envelope that the router does not decode at settlement time.
   Those rows still carry `settlement_tx`, so the payer is recoverable from the

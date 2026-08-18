@@ -534,7 +534,21 @@ type MerchantPayResult =
       /** Wall-clock ms for the actual upstream call. Order-ledger use only. */
       latencyMs?: number
     }
-  | { kind: 'error'; response: Response; refundReason?: RefundReason }
+  | {
+      kind: 'error'
+      response: Response
+      refundReason?: RefundReason
+      /**
+       * HTTP status the merchant actually returned, when it returned one at
+       * all. Absent for transport failures/throws, where no upstream status
+       * exists. Kept separate from `response.status` (always the router's own
+       * 502/503) so the order ledger records what the upstream said, not what
+       * we told the caller.
+       */
+      merchantStatus?: number
+      /** Wall-clock ms for the upstream call. Order-ledger use only. */
+      latencyMs?: number
+    }
 
 /**
  * Thin wrapper that feeds the catalog's live health signal.
@@ -630,6 +644,8 @@ async function payMerchantAndGetBodyInner(
       return {
         kind: 'error',
         refundReason: merchantResponse.status >= 500 ? 'upstream_5xx' : 'non_fulfillment',
+        merchantStatus: merchantResponse.status,
+        latencyMs,
         response: new Response(
           JSON.stringify({
             error: 'Upstream request failed',
@@ -676,6 +692,7 @@ async function payMerchantAndGetBodyInner(
       return {
         kind: 'error',
         refundReason: merchantResponse.status >= 500 ? 'upstream_5xx' : 'non_fulfillment',
+        merchantStatus: merchantResponse.status,
         response: new Response(
           JSON.stringify({
             error: 'Merchant admin payment failed',
@@ -773,6 +790,7 @@ async function payMerchantAndGetBodyInner(
     return {
       kind: 'error',
       refundReason: merchantResponse.status >= 500 ? 'upstream_5xx' : 'non_fulfillment',
+      merchantStatus: merchantResponse.status,
       response: new Response(
         JSON.stringify({
           error: 'Merchant payment failed',
@@ -790,6 +808,7 @@ async function payMerchantAndGetBodyInner(
     return {
       kind: 'error',
       refundReason: 'empty_response',
+      merchantStatus: merchantResponse.status,
       response: new Response(JSON.stringify({ error: 'Merchant returned an empty response' }), {
         status: 502,
         headers: { 'Content-Type': 'application/json' },
@@ -2182,6 +2201,37 @@ export async function handleProxy(
     }
   }
   if (payResult.kind === 'error') {
+    // Per-call order ledger, failure leg. Until 2026-08-18 recordOrder was
+    // only reached on the success path, so a call the agent PAID for and did
+    // not receive left no trace in GET /v1/ledger at all — exactly the calls
+    // a settlement ledger exists to show. Reproduced on
+    // /v1/services/anthropic/chat_completions (paid, merchant leg 403, auto-
+    // refunded ~25s later): two settlements, zero ledger rows.
+    //
+    // Recorded only when `settledPayment` exists, i.e. the agent's money
+    // actually moved on chain. A channel voucher that gets rolled back below
+    // never settles, and a merchant failure before settlement (the x402
+    // branch pays the merchant first) costs the agent nothing — neither is a
+    // settlement, so neither belongs in a settlement ledger.
+    const failedLegOrderId = settledPayment ? newOrderId() : undefined
+    const recordFailedLeg = (refundStatus: RefundStatus) => {
+      if (!settledPayment || !failedLegOrderId || payResult.kind !== 'error') return
+      ctx.waitUntil(recordOrder(env, {
+        order_id: failedLegOrderId,
+        ts: new Date().toISOString(),
+        route_id: route.id,
+        payer: settledPayment.payer ?? null,
+        amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+        settlement_ref: settledPayment.paymentTx ?? null,
+        request_path: `${upstreamPath}${forwardedSearch}`,
+        // 0 means "the merchant never answered" (transport error/throw);
+        // every branch where it did answer carries the real status.
+        upstream_status: payResult.merchantStatus ?? 0,
+        latency_ms: payResult.latencyMs ?? 0,
+        refund_status: refundStatus,
+      }))
+    }
+
     if (
       authKind === 'stellar.channel' && channelContractForVerify &&
       channelVoucher?.action === 'voucher'
@@ -2202,6 +2252,11 @@ export async function handleProxy(
       } catch (error: any) {
         console.error(`[refund] channel voucher rollback failed: ${error.message}`)
       }
+      // A rolled-back voucher was never consumed, so nothing settled and
+      // there is nothing to put in the ledger. A rollback that FAILED is the
+      // opposite: value may have left the channel with no refund queued, so
+      // record it as `unknown` if a settlement exists for it.
+      if (!rolledBack) recordFailedLeg('unknown')
       const response = new Response(payResult.response.body, payResult.response)
       response.headers.set('Refund-Mode', 'channel-remainder')
       response.headers.set('Refund-Status', rolledBack ? 'voucher-not-consumed' : 'manual-review')
@@ -2214,7 +2269,11 @@ export async function handleProxy(
         reason: payResult.refundReason,
         merchant: merchantHost,
         routeId: route.id,
+        orderId: failedLegOrderId,
       })
+      // Written before the response goes out so the row exists by the time
+      // the refund executor confirms and flips it to `refunded`.
+      recordFailedLeg('pending')
       if (channelContractForVerify && channelDeliveryLockId) {
         await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
         channelDeliveryLockId = undefined
@@ -2225,6 +2284,10 @@ export async function handleProxy(
       response.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
       return verifyResult.withReceipt(response)
     }
+    // Settled, undelivered, and no refund could be queued (no refundReason,
+    // e.g. a route-level rejection after settlement). `unknown` says so
+    // plainly rather than leaving the call invisible.
+    recordFailedLeg('unknown')
     if (channelContractForVerify && channelDeliveryLockId) {
       await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
       channelDeliveryLockId = undefined

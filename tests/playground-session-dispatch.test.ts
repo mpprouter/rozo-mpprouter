@@ -47,7 +47,13 @@ const { callUpstream, resolvePlaygroundRoute, UpstreamError } = await import(
 const { handlePlaygroundChat, handlePlaygroundTxDecode } = await import(
   '../src/routes/playground'
 )
-const { PLAYGROUND_MODELS, TIER_PRICE_USD, findModel } = await import('../src/playground/models')
+const {
+  BLEND_SUMMARY_MODEL_ID,
+  PLAYGROUND_MODELS,
+  TIER_PRICE_USD,
+  assertModelCallable,
+  findModel,
+} = await import('../src/playground/models')
 const { parseUsd } = await import('../src/playground/amount')
 const { createIntent, openIntent, readAccount } = await import(
   '../src/playground/ledger-client'
@@ -172,7 +178,7 @@ describe('seam selection', () => {
     const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.charge')
 
-    await callUpstream(env, { route, body: { model: 'claude-haiku-4-5' }, budgetAtomic: ANY_BUDGET })
+    await callUpstream(env, { route, body: { model: 'llama-3.1-8b-instant' }, budgetAtomic: ANY_BUDGET })
 
     expect(payMerchant).toHaveBeenCalledTimes(1)
     expect(payMerchantSession).not.toHaveBeenCalled()
@@ -195,18 +201,17 @@ describe('seam selection', () => {
     expect(merchantUrl).toContain(route.upstreamHost)
   })
 
-  it('routes the anthropic chat_completions route through the CHARGE seam', async () => {
-    // The overlay pins tempo.charge because production KV holds no channel
-    // for this route, yet its 2026-08-09 paid verification succeeded. Sending
-    // these models down the session path would 503 in production.
-    const env = makeEnv()
-    payMerchant.mockImplementation(paidCharge)
-    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
-    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
-
-    await callUpstream(env, { route, body: { model: 'claude-opus-5' }, budgetAtomic: ANY_BUDGET })
-
-    expect(payMerchant).toHaveBeenCalledTimes(1)
+  it('refuses the anthropic chat_completions route outright — delisted, not re-seamed', async () => {
+    // Until 2026-08-18 this route was pinned to tempo.charge (production KV
+    // holds no channel for it) and was callable. It is now DELISTED in the
+    // overlay (`verifiedMode: false`): the merchant accepts the payment and
+    // then 403s the call, so every call ended in a router refund. The honest
+    // behaviour is to refuse before any seam is chosen — not to move it to the
+    // other seam, which would still pay for a call that cannot succeed.
+    expect(() => resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')).toThrow(
+      expect.objectContaining({ code: 'route_unverified', status: 503 }),
+    )
+    expect(payMerchant).not.toHaveBeenCalled()
     expect(payMerchantSession).not.toHaveBeenCalled()
   })
 
@@ -279,7 +284,7 @@ describe('channel not installed', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'call-500'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-500'),
       env,
     )
     expect(response.status).toBe(502)
@@ -306,7 +311,7 @@ describe('channel not installed', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'call-timeout'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-timeout'),
       env,
     )
     expect(response.status).toBe(502)
@@ -335,7 +340,7 @@ describe('channel not installed', () => {
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'call-leak'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-leak'),
       env,
     )
     expect(await response.text()).not.toContain('secret-upstream-detail')
@@ -350,7 +355,7 @@ describe('tier pricing through the full call path', () => {
     payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'call-cheap'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-cheap'),
       env,
     )
     expect(response.status).toBe(200)
@@ -360,34 +365,36 @@ describe('tier pricing through the full call path', () => {
     expect(body.message).toBe('hello from the model')
   })
 
-  it('charges the flagship tier price for a flagship model', async () => {
+  it('cannot exercise the flagship tier price: no flagship model is callable', async () => {
+    // There used to be a live flagship charge here (claude-opus-5). Since the
+    // anthropic route was delisted on 2026-08-18 (pay-then-403), every
+    // flagship entry is `available: false` — the three Claude ids plus the
+    // openai placeholder that was never verified. The flagship price constant
+    // still exists, but no model can reach it, and inventing a substitute
+    // flagship id to keep this test "passing" would assert a fiction.
+    const flagship = PLAYGROUND_MODELS.filter(m => m.tier === 'flagship')
+    expect(flagship.length).toBeGreaterThan(0)
+    expect(flagship.filter(m => m.available)).toHaveLength(0)
+    expect(TIER_PRICE_USD.flagship).toBe('0.10')
+  })
+
+  it('prices a second cheap model (deepseek, its own route) at the cheap tier', async () => {
+    // Tier price follows the model entry, not the route: deepseek sits on
+    // /v1/services/deepseek/chat, groq on /v1/services/groq/chat, and both
+    // charge $0.02.
     const env = makeEnv()
     await fund(env, '1')
     const bearer = await token()
     payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-opus-5', bearer, 'call-flagship'),
+      chatRequest('deepseek-v4-flash', bearer, 'call-deepseek'),
       env,
     )
     expect(response.status).toBe(200)
     const body = await response.json()
-    expect(body.charged_usd).toBe('0.10')
-    expect(body.balance_usd).toBe('0.90')
-    expect(body.model).toBe('claude-opus-5')
-  })
-
-  it('prices anthropic haiku at the cheap tier despite sharing the flagship route', async () => {
-    const env = makeEnv()
-    await fund(env, '1')
-    const bearer = await token()
-    payMerchant.mockImplementation(paidCharge)
-
-    const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'call-haiku'),
-      env,
-    )
-    expect((await response.json()).charged_usd).toBe('0.02')
+    expect(body.charged_usd).toBe(TIER_PRICE_USD.cheap)
+    expect(body.model).toBe('deepseek-v4-flash')
   })
 
   it('forces max_tokens and passes through only role/content', async () => {
@@ -400,7 +407,7 @@ describe('tier pricing through the full call path', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5',
+        model: 'llama-3.1-8b-instant',
         // Every one of these must be dropped: they are the fields that turn a
         // flat-priced demo call into an unbounded bill.
         max_tokens: 100000,
@@ -426,11 +433,11 @@ describe('tier pricing through the full call path', () => {
     const bearer = await token()
     payMerchant.mockImplementation(paidCharge)
 
-    await handlePlaygroundChat(chatRequest('claude-haiku-4-5', bearer, 'call-retry'), env)
+    await handlePlaygroundChat(chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'), env)
     expect(payMerchant).toHaveBeenCalledTimes(1)
 
     const retry = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'call-retry'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'),
       env,
     )
     const body = await retry.json()
@@ -442,21 +449,55 @@ describe('tier pricing through the full call path', () => {
   })
 })
 
-describe('model catalog after the session-seam promotion', () => {
-  it('makes the newest flagship Claude models (opus-5 / sonnet-5 / opus-4-8) callable', () => {
+describe('model catalog after the 2026-08-18 anthropic delisting', () => {
+  it('keeps the Claude flagship ids LISTED but not callable', () => {
+    // They stay in the catalog so the UI can grey them out with a reason
+    // instead of silently losing them. They are not callable: the merchant
+    // takes the payment and then 403s, so the router refunds every call.
     for (const id of ['claude-opus-5', 'claude-sonnet-5', 'claude-opus-4-8']) {
       const model = findModel(id)!
-      expect(model.available).toBe(true)
       expect(model.tier).toBe('flagship')
-      expect(TIER_PRICE_USD[model.tier]).toBe('0.10')
+      expect(model.available).toBe(false)
+      expect(model.unavailableReason).toMatch(/403 after payment/i)
     }
   })
 
-  it('cheap tier: groq + deepseek (re-verified 2026-08-13) + claude-haiku-4-5', () => {
+  it('leaves the flagship tier with no callable model at all', () => {
+    // Stated plainly rather than papered over: the only other flagship entry
+    // is the openai placeholder, which was never verified either.
+    const flagship = PLAYGROUND_MODELS.filter(m => m.tier === 'flagship')
+    expect(flagship.filter(m => m.available)).toHaveLength(0)
+  })
+
+  it('cheap tier: groq + deepseek callable, delisted claude-haiku-4-5 still listed', () => {
     const cheap = PLAYGROUND_MODELS.filter(m => m.tier === 'cheap')
-    expect(cheap.map(m => m.id)).toEqual(['llama-3.1-8b-instant', 'deepseek-v4-flash', 'claude-haiku-4-5'])
-    expect(cheap[0].available).toBe(true)
+    expect(cheap.map(m => m.id)).toEqual([
+      'llama-3.1-8b-instant',
+      'deepseek-v4-flash',
+      'claude-haiku-4-5',
+    ])
+    expect(cheap.filter(m => m.available).map(m => m.id)).toEqual([
+      'llama-3.1-8b-instant',
+      'deepseek-v4-flash',
+    ])
+    expect(findModel('claude-haiku-4-5')!.available).toBe(false)
     expect(TIER_PRICE_USD.cheap).toBe('0.02')
+  })
+
+  it('rejects a delisted Claude id at the allow-list gate, before any reservation', () => {
+    // assertModelCallable distinguishes "never heard of it" from "known but
+    // not callable right now" — the UI says different things about those.
+    expect(() => assertModelCallable('claude-haiku-4-5')).toThrow(
+      expect.objectContaining({ code: 'model_unavailable', modelId: 'claude-haiku-4-5' }),
+    )
+  })
+
+  it('keeps the blend summary model off the delisted anthropic route', () => {
+    // The Blend chip used claude-haiku-4-5 until 2026-08-18; it would have
+    // paid for a call the merchant refuses.
+    const blend = findModel(BLEND_SUMMARY_MODEL_ID)!
+    expect(blend.available).toBe(true)
+    expect(blend.provider).not.toBe('anthropic')
   })
 
   it('keeps gpt-4o-mini dropped; groq/deepseek re-added after 2026-08-13 re-verification', () => {
@@ -484,7 +525,9 @@ describe('model catalog after the session-seam promotion', () => {
     // As of 2026-08-13 production has channels for openai_chat,
     // anthropic_messages, openrouter_chat, gemini_generate, dune_execute and
     // tempo_rpc — notably NOT anthropic_chat_completions, which is why that
-    // route is pinned to tempo.charge in the overlay.
+    // route used to be pinned to tempo.charge in the overlay. Since
+    // 2026-08-18 that route is delisted outright, so no callable model points
+    // at it and the seam question no longer arises for it.
     const CHANNELS = new Set([
       'openai_chat',
       'anthropic_messages',
@@ -501,14 +544,20 @@ describe('model catalog after the session-seam promotion', () => {
     }
   })
 
-  it('pins anthropic chat_completions to charge, matching the missing prod channel', () => {
-    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
-    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
-    expect(route.verifiedMode).toBe('charge')
+  it('delists anthropic chat_completions instead of pinning it to a seam', () => {
+    // It was pinned to tempo.charge (production KV holds no channel for it).
+    // Delisted 2026-08-18: the merchant charges and then 403s. The overlay now
+    // sets verifiedMode:false, and resolvePlaygroundRoute — the same gate the
+    // proxy applies — refuses it with a 503 before any payment seam is picked.
+    expect(() => resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')).toThrow(
+      expect.objectContaining({ code: 'route_unverified', status: 503 }),
+    )
   })
 
   it('carries no unverified Claude model ids', () => {
     // Retired/invented ids 404 at the merchant AFTER the router has paid.
+    // These four remain the only anthropic ids that ever passed a paid probe;
+    // all are currently unavailable, but none may be swapped for a guess.
     const verified = new Set([
       'claude-opus-5',
       'claude-sonnet-5',
@@ -568,7 +617,7 @@ describe('upstream budget ceiling (P0-2)', () => {
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'call-overbudget'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-overbudget'),
       env,
     )
     expect(response.status).toBe(502)
@@ -589,7 +638,7 @@ describe('upstream budget ceiling (P0-2)', () => {
     payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'call-flat'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'call-flat'),
       env,
     )
     expect((await response.json()).charged_usd).toBe(TIER_PRICE_USD.cheap)
@@ -640,7 +689,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
     // branches on the request body's marker message — NOT on invocation order,
     // which races under Promise.all — so the outcome is deterministic and the
     // test actually isolates call-locality rather than scheduling luck.
-    // (Charge seam via claude-haiku-4-5 — the call-local `paid` flag is settled
+    // (Charge seam via groq's llama-3.1-8b-instant — the call-local `paid` flag is settled
     // identically on both seams; the session seam has no callable model now.)
     payMerchant.mockImplementation(async (_e, _u, init, opts) => {
       const sentBody = String((init as any)?.body ?? '')
@@ -655,7 +704,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5',
+        model: 'llama-3.1-8b-instant',
         call_id: 'concurrent-A',
         messages: [{ role: 'user', content: 'SIGN_THEN_FAIL' }],
       }),
@@ -664,7 +713,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5',
+        model: 'llama-3.1-8b-instant',
         call_id: 'concurrent-B',
         messages: [{ role: 'user', content: 'REFUSE_BEFORE_SIGN' }],
       }),
@@ -698,7 +747,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
     payMerchant.mockResolvedValue(new Response('down', { status: 500 }))
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'initial-500'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'initial-500'),
       env,
     )
     expect(response.status).toBe(502)
@@ -725,7 +774,7 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'sign-threw'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'sign-threw'),
       env,
     )
     expect(response.status).toBe(502)
@@ -752,7 +801,7 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'budget-after-sign'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'budget-after-sign'),
       env,
     )
     expect(response.status).toBe(502)
@@ -777,7 +826,7 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'budget-no-sign'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'budget-no-sign'),
       env,
     )
     expect(response.status).toBe(502)
@@ -800,7 +849,7 @@ describe('the ONLY commit predicate is paid === true', () => {
     payMerchant.mockResolvedValue(completion('a real-looking answer')) // no onCredentialSigned
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'unpaid-2xx'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'unpaid-2xx'),
       env,
     )
     expect(response.status).toBe(502)
@@ -828,7 +877,7 @@ describe('the ONLY commit predicate is paid === true', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('claude-haiku-4-5', bearer, 'paid-empty'),
+      chatRequest('llama-3.1-8b-instant', bearer, 'paid-empty'),
       env,
     )
     expect(response.status).toBe(502)

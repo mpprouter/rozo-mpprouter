@@ -139,7 +139,8 @@ describe('account masking', () => {
 
 describe('model allow-list', () => {
   it('accepts a charge-verified model', () => {
-    const model = assertModelCallable('claude-haiku-4-5')
+    // Was claude-haiku-4-5 until the 2026-08-18 anthropic delisting.
+    const model = assertModelCallable('llama-3.1-8b-instant')
     expect(model.tier).toBe('cheap')
     expect(TIER_PRICE_USD[model.tier]).toBe('0.02')
   })
@@ -153,23 +154,39 @@ describe('model allow-list', () => {
     }
   })
 
-  it('accepts a session-mode flagship model now that the session seam exists', () => {
-    // claude-opus-5 is paid via payMerchantSession — see upstream.ts.
-    const model = assertModelCallable('claude-opus-5')
-    expect(model.tier).toBe('flagship')
-    expect(TIER_PRICE_USD[model.tier]).toBe('0.10')
+  it('has no callable flagship model, and says so rather than substituting one', () => {
+    // Until 2026-08-18 this asserted that claude-opus-5 was callable. The
+    // anthropic route is now delisted (merchant 403s after taking payment)
+    // and the only other flagship entry is the openai placeholder that was
+    // never verified, so the tier is advertised and entirely uncallable.
+    // Deliberately not repaired by promoting some other model into the tier:
+    // no flagship model has a paid run behind it right now.
+    const flagship = PLAYGROUND_MODELS.filter(m => m.tier === 'flagship')
+    expect(flagship.length).toBeGreaterThan(0)
+    for (const model of flagship) {
+      expect(model.available).toBe(false)
+      expect(() => assertModelCallable(model.id)).toThrow(ModelNotAllowedError)
+    }
+    // The tier itself, and its price, still exist for when one comes back.
+    expect(TIER_PRICE_USD.flagship).toBe('0.10')
   })
 
-  it('rejects a listed-but-unavailable model with a distinct reason', () => {
-    // The flagship OpenAI slot has no verified model id, so it is advertised
-    // for the UI to grey but must never reach a payment seam.
-    const placeholder = PLAYGROUND_MODELS.find(m => !m.available)!
-    try {
-      assertModelCallable(placeholder.id)
-      throw new Error('expected rejection')
-    } catch (e) {
-      expect((e as ModelNotAllowedError).code).toBe('model_unavailable')
-      expect((e as ModelNotAllowedError).message).toMatch(/verified/i)
+  it('rejects every listed-but-unavailable model with a distinct code and a reason', () => {
+    // Unavailable models stay advertised so the UI can grey them honestly.
+    // Asserted over ALL of them rather than the first one: the list order
+    // changed under this test on 2026-08-18, and an order-coupled assertion
+    // silently tests a different model than the one its comment names.
+    const unavailable = PLAYGROUND_MODELS.filter(m => !m.available)
+    expect(unavailable.length).toBeGreaterThan(0)
+    for (const model of unavailable) {
+      expect(model.unavailableReason).toBeTruthy()
+      try {
+        assertModelCallable(model.id)
+        throw new Error(`expected ${model.id} to be rejected`)
+      } catch (e) {
+        expect((e as ModelNotAllowedError).code).toBe('model_unavailable')
+        expect((e as ModelNotAllowedError).message).toBe(model.unavailableReason)
+      }
     }
   })
 

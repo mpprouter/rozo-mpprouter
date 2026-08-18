@@ -320,7 +320,7 @@ describe('POST /v1/playground/chat', () => {
     expect(r.status).toBe(400)
     const body = await r.json()
     expect(body.error).toBe('model_not_allowed')
-    expect(body.allowed_models).toContain('claude-haiku-4-5')
+    expect(body.allowed_models).toContain('llama-3.1-8b-instant')
 
     // Nothing was charged or held.
     const session = await (await handlePlaygroundSession(get('/v1/playground/session', token), env)).json()
@@ -331,7 +331,10 @@ describe('POST /v1/playground/chat', () => {
     const env = makeEnv()
     await fund(env, '1')
     const token = await sessionFor(env)
-    // The flagship OpenAI slot: advertised so the UI can grey it, never callable.
+    // Listed-but-unavailable entries exist so the UI can grey them out rather
+    // than silently dropping them: the OpenAI flagship placeholder, plus the
+    // four Claude ids delisted 2026-08-18 (the merchant takes payment and then
+    // 403s, so the router would have to refund every call).
     const placeholder = PLAYGROUND_MODELS.find(m => !m.available)!
     const r = await handlePlaygroundChat(
       post('/v1/playground/chat', { model: placeholder.id, messages: [{ role: 'user', content: 'hi' }] }, token),
@@ -357,7 +360,7 @@ describe('POST /v1/playground/chat', () => {
     ]
     for (const messages of cases) {
       const r = await handlePlaygroundChat(
-        post('/v1/playground/chat', { model: 'claude-haiku-4-5', messages }, token),
+        post('/v1/playground/chat', { model: 'llama-3.1-8b-instant', messages }, token),
         env,
       )
       expect(r.status).toBe(400)
@@ -376,7 +379,7 @@ describe('POST /v1/playground/chat', () => {
     const r = await handlePlaygroundChat(
       post(
         '/v1/playground/chat',
-        { model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+        { model: 'llama-3.1-8b-instant', messages: [{ role: 'user', content: 'hi' }] },
         emptyToken,
       ),
       empty,
@@ -395,7 +398,7 @@ describe('POST /v1/playground/chat', () => {
     const r = await handlePlaygroundChat(
       post(
         '/v1/playground/chat',
-        { call_id: '../../etc/passwd', model: 'claude-haiku-4-5', messages: [{ role: 'user', content: 'hi' }] },
+        { call_id: '../../etc/passwd', model: 'llama-3.1-8b-instant', messages: [{ role: 'user', content: 'hi' }] },
         token,
       ),
       env,
@@ -737,7 +740,7 @@ describe('dispatch-marker failure aborts before any paid upstream call', () => {
     }
 
     const r = await handlePlaygroundChat(
-      post('/v1/playground/chat', { model: 'claude-haiku-4-5', call_id: 'dispatch-fail', messages: [{ role: 'user', content: 'hi' }] }, token),
+      post('/v1/playground/chat', { model: 'llama-3.1-8b-instant', call_id: 'dispatch-fail', messages: [{ role: 'user', content: 'hi' }] }, token),
       env,
     )
     expect(r.status).toBe(503)

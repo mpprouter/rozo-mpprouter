@@ -20,9 +20,9 @@
  * The playground reaches upstreams through two seams, both already used by the
  * paid proxy and both reused verbatim (see `./upstream.ts`):
  *
- *   - `payMerchant()`        — `tempo.charge`. All current playground models
- *     resolve here (Anthropic chat_completions is pinned to charge; the old
- *     Groq/DeepSeek entries were dropped 2026-08-13).
+ *   - `payMerchant()`        — `tempo.charge`. Every CALLABLE playground model
+ *     resolves here: as of 2026-08-18 that is groq and deepseek, after the
+ *     anthropic route was delisted (see ANTHROPIC_DELISTED_REASON below).
  *   - `payMerchantSession()` — `tempo.session`. OpenAI, Anthropic. Signs a
  *     cumulative voucher against a Tempo channel pre-opened by
  *     `scripts/admin/open-tempo-channel.ts`.
@@ -81,9 +81,9 @@
  * A session-mode model can still fail at CALL time if the operator never
  * opened a channel for its route. That surfaces as a 503
  * `session_channel_not_installed` with the reservation released, never as a
- * silent charge. As of 2026-08-13 every callable playground model resolves to
- * the anthropic chat_completions CHARGE route, so none take the session path;
- * the session seam is still exercised at the route level in the dispatch tests.
+ * silent charge. As of 2026-08-18 every callable playground model resolves to
+ * a CHARGE route (groq, deepseek), so none take the session path; the session
+ * seam is still exercised at the route level in the dispatch tests.
  */
 
 import { parseUsd } from './amount'
@@ -143,6 +143,29 @@ export const MAX_MESSAGES_PER_TURN = 12
 /** Hard cap on total characters across all messages in a turn. */
 export const MAX_MESSAGE_CHARS = 8_000
 
+/**
+ * Why every Claude entry below is `available: false` (2026-08-18).
+ *
+ * The Anthropic Tempo merchant takes the payment and then fails its own
+ * upstream call (403 after pay), so the router refunds instead of delivering.
+ * `PLAYGROUND_CHAT_MODELS_DISABLED` has carried an `anthropic` entry for this
+ * since 2026-08-13, but that is an env killswitch: a deploy to an environment
+ * without it would have started charging for calls that cannot succeed. The
+ * route itself is now delisted in `OPERATOR_OVERLAY` (`verifiedMode: false`),
+ * which `resolvePlaygroundRoute` refuses, so the allow-list is made to agree
+ * with it in code rather than only in configuration.
+ *
+ * Consequence, stated plainly rather than papered over: the flagship tier has
+ * no callable model right now. The honest state is an empty flagship tier the
+ * UI greys out, not a substitute model nobody has paid-verified. Re-enable
+ * these entries together with the overlay, on the evidence of a paid call that
+ * returns a completion.
+ */
+const ANTHROPIC_DELISTED_REASON =
+  'The upstream Anthropic merchant accepts payment and then rejects the call ' +
+  '(403 after payment, re-confirmed with paid probes on 2026-08-18), so the ' +
+  'route is delisted. Unavailable until a paid re-probe returns a completion.'
+
 export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
   // ---- cheap / fast tier ----
   {
@@ -182,7 +205,9 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     provider: 'anthropic',
     routePublicPath: '/v1/services/anthropic/chat_completions',
     routeMethod: 'POST',
-    available: true,
+    // 2026-08-18: unavailable. See ANTHROPIC_DELISTED_REASON.
+    available: false,
+    unavailableReason: ANTHROPIC_DELISTED_REASON,
   },
 
   // ---- flagship tier: newest verified Claude (4.8 / 5.0 generation) ----
@@ -193,7 +218,9 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     provider: 'anthropic',
     routePublicPath: '/v1/services/anthropic/chat_completions',
     routeMethod: 'POST',
-    available: true,
+    // 2026-08-18: unavailable. See ANTHROPIC_DELISTED_REASON.
+    available: false,
+    unavailableReason: ANTHROPIC_DELISTED_REASON,
   },
   {
     // Verified with a real paid call 2026-08-09 (202 + completion).
@@ -202,7 +229,9 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     provider: 'anthropic',
     routePublicPath: '/v1/services/anthropic/chat_completions',
     routeMethod: 'POST',
-    available: true,
+    // 2026-08-18: unavailable. See ANTHROPIC_DELISTED_REASON.
+    available: false,
+    unavailableReason: ANTHROPIC_DELISTED_REASON,
   },
   {
     // Verified with a real paid call 2026-08-09 (202 + completion). The "4.8"
@@ -212,7 +241,9 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     provider: 'anthropic',
     routePublicPath: '/v1/services/anthropic/chat_completions',
     routeMethod: 'POST',
-    available: true,
+    // 2026-08-18: unavailable. See ANTHROPIC_DELISTED_REASON.
+    available: false,
+    unavailableReason: ANTHROPIC_DELISTED_REASON,
   },
   {
     // Placeholder id, NOT a callable model. The founder asked to feature a
@@ -236,11 +267,13 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
 ] as const
 
 /**
- * Model used for the optional one-line narrative in the Blend chip. Points at
- * the cheap-tier claude-haiku-4-5 (charge-verified) now that the old
- * llama-3.1-8b-instant model has been dropped.
+ * Model used for the optional one-line narrative in the Blend chip. Moved off
+ * claude-haiku-4-5 on 2026-08-18 when the anthropic route was delisted — the
+ * chip would otherwise pay for a call the merchant refuses. groq's
+ * llama-3.1-8b-instant is charge-verified and was re-probed with a real paid
+ * call on 2026-08-13.
  */
-export const BLEND_SUMMARY_MODEL_ID = 'claude-haiku-4-5'
+export const BLEND_SUMMARY_MODEL_ID = 'llama-3.1-8b-instant'
 
 export function findModel(id: string): PlaygroundModel | undefined {
   return PLAYGROUND_MODELS.find(m => m.id === id)
