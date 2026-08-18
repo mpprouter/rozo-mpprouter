@@ -173,8 +173,15 @@ Fetch the address from `/health` rather than trusting the copy embedded in the
 receipt you are checking — a forged receipt could carry a forged signer.
 
 ```bash
-curl -s https://apiserver.mpprouter.dev/health | jq -r .stellar.receipt_signer
+curl -s https://apiserver.mpprouter.dev/health \
+  | jq '{current: .stellar.receipt_signer, retired: .stellar.receipt_signer_retired}'
 ```
+
+`/health` publishes the **current** signer plus `receipt_signer_retired`, the
+addresses of any previously-used signers. Rotating the key does not invalidate
+receipts the old key signed, so an older receipt is valid if its signature
+verifies against the current address **or** any retired one. A receipt whose
+signer matches nothing in either list should be rejected outright.
 
 A Stellar `G...` address *is* an Ed25519 public key in strkey encoding; the
 receipt also carries the same 32 bytes as `ed25519_public_key_hex` for
@@ -216,10 +223,15 @@ const refundId = process.argv[2]
 const body = await (await fetch(`${ROUTER}/v1/refunds/${refundId}`)).json()
 if (body.algorithm !== 'Ed25519') throw new Error(`unexpected algorithm ${body.algorithm}`)
 
-// Trust the operator's published address, not the one inside the receipt.
+// Trust the operator's published addresses, not the one inside the receipt.
+// Retired signers stay published so receipts predating a rotation still verify.
 const health = await (await fetch(`${ROUTER}/health`)).json()
-const signer = health.stellar.receipt_signer
-if (signer !== body.signer.stellar_address) throw new Error('signer address mismatch')
+const trusted = [
+  health.stellar.receipt_signer,
+  ...(health.stellar.receipt_signer_retired ?? []),
+].filter(Boolean)
+const signer = body.signer.stellar_address
+if (!trusted.includes(signer)) throw new Error(`untrusted signer ${signer}`)
 
 // Rebuild the exact signed bytes.
 const canonical = {}

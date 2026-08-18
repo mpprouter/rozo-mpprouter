@@ -4,7 +4,7 @@
  */
 
 import type { Env } from '../index'
-import { receiptSignerAddress } from '../refund/receipt-signer'
+import { receiptSignerAddress, retiredReceiptSignerAddresses } from '../refund/receipt-signer'
 
 export async function handleHealth(env: Env): Promise<Response> {
   const results: Record<string, any> = {
@@ -21,6 +21,10 @@ export async function handleHealth(env: Env): Promise<Response> {
     // rather than configured separately so it can never drift from the key
     // that actually signs. Undefined ⇒ receipt signing is not configured.
     receipt_signer: receiptSignerAddress(env.RECEIPT_SIGNING_SECRET),
+    // Addresses of previously-used receipt signers. A rotation does not
+    // invalidate receipts the old key signed, so its public address has to stay
+    // published or those receipts become unverifiable. Public keys only.
+    receipt_signer_retired: retiredReceiptSignerAddresses(env.RECEIPT_SIGNER_RETIRED_ADDRESSES),
   }
 
   // Tempo address

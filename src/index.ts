@@ -209,6 +209,13 @@ export interface Env {
   // Set via: wrangler secret put RECEIPT_SIGNING_SECRET
   RECEIPT_SIGNING_SECRET?: string
 
+  // Comma-separated G... addresses of PREVIOUS receipt signers. Public keys,
+  // so this is a plain var, not a secret. Rotating the signing key does not
+  // invalidate receipts the old key signed; verifiers are told to trust the
+  // addresses /health publishes, so a retired address must stay published or
+  // every receipt it signed silently becomes unverifiable.
+  RECEIPT_SIGNER_RETIRED_ADDRESSES?: string
+
   // Config
   //
   // OPTIMISTIC_THRESHOLD (UNUSED, 2026-04-10): this env var is declared

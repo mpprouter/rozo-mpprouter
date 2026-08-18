@@ -13,6 +13,7 @@ import {
   ReceiptSigningUnavailable,
   canonicalReceiptJson,
   receiptSignerAddress,
+  retiredReceiptSignerAddresses,
   signReceipt,
 } from '../src/refund/receipt-signer'
 import { handleRefundStatus } from '../src/routes/refunds'
@@ -133,6 +134,38 @@ describe('refund receipt Ed25519 signatures', () => {
       expect(error.message).not.toContain(bogus)
     }
     expect(receiptSignerAddress(bogus)).toBeUndefined()
+  })
+})
+
+describe('signer key rotation', () => {
+  it('keeps receipts signed by a retired key verifiable', () => {
+    const retired = Keypair.random()
+    const current = Keypair.random()
+    // A receipt issued before the rotation.
+    const old = signReceipt(receipt, retired.secret())
+
+    const published = [
+      receiptSignerAddress(current.secret()),
+      ...retiredReceiptSignerAddresses(retired.publicKey()),
+    ]
+    // The verification procedure trusts the published set, not the receipt.
+    expect(published).toContain(old.signer.stellar_address)
+    expect(verify(old, old.signer.stellar_address)).toBe(true)
+  })
+
+  it('parses a comma-separated list and drops malformed entries', () => {
+    const a = Keypair.random().publicKey()
+    const b = Keypair.random().publicKey()
+    expect(retiredReceiptSignerAddresses(` ${a} , ${b} `)).toEqual([a, b])
+    // A typo must not throw and take /health down with it.
+    expect(retiredReceiptSignerAddresses(`${a},,not-an-address,GARBAGE`)).toEqual([a])
+    expect(retiredReceiptSignerAddresses(undefined)).toEqual([])
+    expect(retiredReceiptSignerAddresses('')).toEqual([])
+  })
+
+  it('never accepts a secret seed in the retired-address list', () => {
+    // Guards against an operator pasting an S... seed into a public var.
+    expect(retiredReceiptSignerAddresses(Keypair.random().secret())).toEqual([])
   })
 })
 

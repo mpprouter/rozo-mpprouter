@@ -121,3 +121,31 @@ export function receiptSignerAddress(secret: string | undefined): string | undef
     return undefined
   }
 }
+
+/**
+ * Previously-used signer addresses, parsed from a comma-separated list of
+ * `G...` addresses.
+ *
+ * Rotating the signing key does not invalidate receipts signed by the old one,
+ * so the old public address has to stay published or those receipts become
+ * unverifiable — the verification procedure tells a checker to trust the
+ * addresses `/health` advertises, not the one embedded in the receipt. These
+ * are public keys, so listing them grants nothing.
+ *
+ * Malformed entries are dropped rather than throwing: a typo in an operator's
+ * config must not be able to take `/health` down.
+ */
+export function retiredReceiptSignerAddresses(raw: string | undefined): string[] {
+  if (!raw) return []
+  return raw.split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => {
+      if (!entry) return false
+      try {
+        Keypair.fromPublicKey(entry)
+        return true
+      } catch {
+        return false
+      }
+    })
+}
