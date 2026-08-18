@@ -26,6 +26,14 @@
  * appears in a public ledger transaction, and counting distinct payers is
  * exactly the SCF milestone check (>=150 unique external payers).
  *
+ * Accepted tradeoff: the chain proves an address paid the router, but not
+ * WHICH service it called, so publishing `payer` beside `service` creates a
+ * cross-service behavioural profile the chain alone does not. It ships that
+ * way because a ledger that cannot be tied back to verifiable on-chain payers
+ * cannot be audited — which is the whole point here. Documented for callers
+ * in docs/spec/public-ledger.md so anyone who needs unlinkability can pay
+ * from a fresh address; the router never requires a reused one.
+ *
  * Storage is the existing `mercury_order:*` KV keyspace — no new binding, no
  * new dependency. Order ids embed a base36 millisecond timestamp, so KV's
  * lexicographic key order is chronological and its native cursor is a valid
@@ -34,6 +42,7 @@
 
 import type { Env } from '../index'
 import { orderKey, txIndexKey, type OrderLedgerEntry } from '../services/order-ledger'
+import { checkAndBumpWindowLimit } from '../mpp/rate-limit-do'
 
 const DEFAULT_LIMIT = 25
 const MAX_LIMIT = 100
@@ -43,13 +52,17 @@ const MAX_LIMIT = 100
  * it. 1 request per second per IP: generous for a human or a reviewer's
  * script, useless for a scraper trying to enumerate the whole keyspace fast.
  *
- * Implemented as a last-seen timestamp rather than a counter because
- * Cloudflare KV refuses any `expirationTtl` under 60 seconds — a 1-second
- * counter window is simply not expressible. The 60s TTL here is only how long
- * the timestamp is remembered; the enforced spacing is MIN_INTERVAL_MS.
+ * Enforced through the ATOMIC_STORE Durable Object, NOT the KV read-then-put
+ * pattern used by the other throttles in this repo. KV has no conditional
+ * write and is eventually consistent, so a parallel burst all reads the same
+ * value and all proceeds — the limit would exist only against sequential
+ * callers. Here that bypass would let an unauthenticated attacker run
+ * unlimited concurrent list-plus-100-reads against the same KV namespace the
+ * payment path depends on. KV also refuses any TTL under 60 seconds, which
+ * makes a 1-second window inexpressible there in the first place.
  */
-const MIN_INTERVAL_MS = 1000
-const LAST_SEEN_TTL_S = 60
+const WINDOW_MS = 1000
+const REQUESTS_PER_WINDOW = 1
 
 function json(status: number, payload: unknown, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(payload, null, 2), {
@@ -65,20 +78,21 @@ function json(status: number, payload: unknown, extraHeaders: Record<string, str
   })
 }
 
+export type RateLimitVerdict = 'allow' | 'throttle' | 'unavailable'
+
 /**
- * Returns true when the caller may proceed. Fails OPEN on a KV error: a KV
- * outage must not take down a read-only transparency endpoint.
+ * Fails CLOSED (`unavailable` -> 503) when the limiter itself errors. Failing
+ * open here would hand an attacker the bypass back: induce limiter errors,
+ * then pull the endpoint at will. A 503 on a read-only transparency endpoint
+ * during a platform incident is the cheaper failure.
  */
-export async function ledgerRateLimitOk(env: Env, ip: string, now: number = Date.now()): Promise<boolean> {
-  const key = `ratelimit:ledger:${ip}`
+export async function ledgerRateLimit(env: Env, ip: string, now: number = Date.now()): Promise<RateLimitVerdict> {
   try {
-    const raw = await env.MPP_STORE.get(key)
-    const last = raw ? parseInt(raw, 10) : 0
-    if (Number.isFinite(last) && last > 0 && now - last < MIN_INTERVAL_MS) return false
-    await env.MPP_STORE.put(key, String(now), { expirationTtl: LAST_SEEN_TTL_S })
-    return true
-  } catch {
-    return true
+    const r = await checkAndBumpWindowLimit(env, `ratelimit:ledger:${ip}`, REQUESTS_PER_WINDOW, WINDOW_MS, now)
+    return r.ok ? 'allow' : 'throttle'
+  } catch (err: any) {
+    console.warn(`[ledger] rate-limit check failed: ${err?.message}`)
+    return 'unavailable'
   }
 }
 
@@ -172,8 +186,12 @@ export async function handleLedger(request: Request, env: Env): Promise<Response
   const url = new URL(request.url)
 
   const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
-  if (!(await ledgerRateLimitOk(env, ip))) {
+  const verdict = await ledgerRateLimit(env, ip)
+  if (verdict === 'throttle') {
     return json(429, { ok: false, error: 'Rate limit exceeded: 1 request per second.' }, { 'Retry-After': '1' })
+  }
+  if (verdict === 'unavailable') {
+    return json(503, { ok: false, error: 'Rate limiter unavailable; try again shortly.' }, { 'Retry-After': '1' })
   }
 
   const tx = url.searchParams.get('tx')

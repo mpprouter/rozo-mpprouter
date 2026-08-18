@@ -30,10 +30,17 @@ lexicographic key order, so chronological paging comes for free and never
 skips or repeats a row while new ones are being appended at the end.
 
 **Rate limit: 1 request per second, per client IP.** Over that, the endpoint
-returns `429` with `Retry-After: 1`. The endpoint is public and
-unauthenticated, so this is the only wall against a scraper; it is generous
-for a human or a reviewer's script. If the rate-limit store is unavailable the
-endpoint fails open rather than going dark.
+returns `429` with `Retry-After: 1`, and no storage is read at all. The
+endpoint is public and unauthenticated, so this is the only wall against a
+scraper; it is generous for a human or a reviewer's script.
+
+The limit is enforced through a Durable Object compare-and-swap, not a
+read-then-write on the key-value store: the latter has no conditional write
+and is eventually consistent, so a parallel burst would all read the same
+value and all proceed — the limit would exist only against sequential callers.
+If the limiter itself is unavailable the endpoint fails **closed** with a
+`503`; failing open would hand back the same bypass to anyone who can induce
+an error.
 
 ## Response
 
@@ -87,6 +94,15 @@ With `?tx=`, the payload is `{ "ok": true, "entry": { … same row … } }`.
 `payer` *is* exposed on purpose: it is a public Stellar address that already
 appears in a public Stellar transaction, and counting distinct payers is the
 whole point of a transparency ledger.
+
+**Known tradeoff, accepted deliberately.** The Stellar transaction proves that
+an address paid the router; it does not say *which service* the address
+called. Publishing `payer` next to `service` therefore creates a linkage that
+the chain alone does not — a behavioural profile of one address across
+services. It is published anyway because a ledger that cannot be tied back to
+verifiable on-chain payers cannot be audited, which is the entire purpose of
+the endpoint. Callers who need unlinkability should pay from a fresh address
+per service; the router never requires a reused one.
 
 ## The `internal` field
 

@@ -4,9 +4,52 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { handleLedger, toPublicRow } from '../src/routes/ledger'
+import { handleLedger, ledgerRateLimit, toPublicRow } from '../src/routes/ledger'
 import { recordOrder, orderKey, txIndexKey, type OrderLedgerEntry } from '../src/services/order-ledger'
 import type { Env } from '../src/index'
+
+/**
+ * Minimal stand-in for the ATOMIC_STORE Durable Object: a single-threaded
+ * CAS store, which is exactly the guarantee the real DO provides. The public
+ * limiter runs through it, so the tests exercise the real code path rather
+ * than a KV shim that cannot express atomicity.
+ */
+function freshAtomicStore(): { store: Map<string, { value: string; version: number }>; ns: DurableObjectNamespace } {
+  const store = new Map<string, { value: string; version: number }>()
+  const stub = {
+    fetch: async (req: Request) => {
+      const path = new URL(req.url).pathname
+      const body = (await req.json()) as any
+      const cur = store.get(body.key) ?? { value: null as unknown as string, version: 0 }
+      if (path === '/read') {
+        return new Response(JSON.stringify({ value: cur.value ?? null, version: cur.version }))
+      }
+      if (path === '/commit') {
+        if (cur.version !== body.expectedVersion) {
+          return new Response(JSON.stringify({ ok: false, value: cur.value ?? null, version: cur.version }))
+        }
+        store.set(body.key, { value: body.value, version: cur.version + 1 })
+        return new Response(JSON.stringify({ ok: true }))
+      }
+      return new Response('nope', { status: 404 })
+    },
+  }
+  const ns = {
+    idFromName: (name: string) => name,
+    get: () => stub,
+  } as unknown as DurableObjectNamespace
+  return { store, ns }
+}
+
+/** An ATOMIC_STORE whose every call throws, for the fail-closed test. */
+const brokenAtomicStore = {
+  idFromName: (n: string) => n,
+  get: () => ({
+    fetch: async () => {
+      throw new Error('DO unavailable')
+    },
+  }),
+} as unknown as DurableObjectNamespace
 
 /** In-memory KV with a real prefix/cursor `list`, which the endpoint depends on. */
 function freshKv(): { kv: Map<string, string>; ns: KVNamespace } {
@@ -66,7 +109,7 @@ function req(qs = '', ip = '1.2.3.4'): Request {
 describe('GET /v1/ledger — response shape', () => {
   it('returns one public row per order with the settlement fields a reviewer needs', async () => {
     const { ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await seed(env, 3)
 
     const res = await handleLedger(req(), env)
@@ -93,7 +136,7 @@ describe('GET /v1/ledger — response shape', () => {
 
   it('never leaks the upstream request path (it carries caller-supplied content)', async () => {
     const { ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await seed(env, 1)
 
     const text = await (await handleLedger(req(), env)).text()
@@ -123,7 +166,7 @@ describe('GET /v1/ledger — response shape', () => {
 describe('GET /v1/ledger — pagination', () => {
   it('honours limit and walks the whole set with next_cursor', async () => {
     const { ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await seed(env, 5)
 
     const first = (await (await handleLedger(req('?limit=2'), env)).json()) as any
@@ -153,14 +196,14 @@ describe('GET /v1/ledger — pagination', () => {
         return { keys: [], list_complete: true, cursor: '' }
       },
     } as unknown as KVNamespace
-    const env = { MPP_STORE: spy } as unknown as Env
+    const env = { MPP_STORE: spy, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await handleLedger(req('?limit=5000'), env)
     expect(requestedLimit).toBe(100)
   })
 
   it('rejects a nonsense limit with 400', async () => {
     const { ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     expect((await handleLedger(req('?limit=0'), env)).status).toBe(400)
     expect((await handleLedger(req('?limit=abc', '9.9.9.9'), env)).status).toBe(400)
   })
@@ -169,7 +212,7 @@ describe('GET /v1/ledger — pagination', () => {
 describe('GET /v1/ledger?tx=', () => {
   it('finds the single entry that settled with that transaction hash', async () => {
     const { ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await seed(env, 2)
     const tx = String(2).padStart(64, 'a')
 
@@ -181,7 +224,7 @@ describe('GET /v1/ledger?tx=', () => {
 
   it('404s for a well-formed hash that settled nothing here', async () => {
     const { ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await seed(env, 1)
     const res = await handleLedger(req(`?tx=${'b'.repeat(64)}`), env)
     expect(res.status).toBe(404)
@@ -190,7 +233,7 @@ describe('GET /v1/ledger?tx=', () => {
 
   it('404s when the index points at a record that has expired', async () => {
     const { kv, ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await seed(env, 1)
     kv.delete(orderKey('ord_0001'))
     expect((await handleLedger(req(`?tx=${'a'.repeat(63)}1`), env)).status).toBe(404)
@@ -198,13 +241,13 @@ describe('GET /v1/ledger?tx=', () => {
 
   it('rejects a malformed hash before it reaches storage', async () => {
     const { ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     expect((await handleLedger(req('?tx=notahash'), env)).status).toBe(400)
   })
 
   it('writes the tx index alongside the record, and skips it when unsettled', async () => {
     const { kv, ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await recordOrder(env, entry(7))
     expect(kv.get(txIndexKey(String(7).padStart(64, 'a')))).toBe('ord_0007')
 
@@ -216,7 +259,7 @@ describe('GET /v1/ledger?tx=', () => {
 describe('GET /v1/ledger — rate limit', () => {
   it('allows 1 request per second per IP and 429s the second one', async () => {
     const { ns } = freshKv()
-    const env = { MPP_STORE: ns } as unknown as Env
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
     await seed(env, 1)
 
     expect((await handleLedger(req('', '5.5.5.5'), env)).status).toBe(200)
@@ -227,17 +270,49 @@ describe('GET /v1/ledger — rate limit', () => {
     expect((await handleLedger(req('', '6.6.6.6'), env)).status).toBe(200)
   })
 
-  it('fails open when KV is down rather than taking the endpoint offline', async () => {
-    const broken = {
-      get: async () => {
-        throw new Error('kv down')
+  it('holds under a concurrent burst — exactly one request gets through', async () => {
+    const { ns } = freshKv()
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
+    await seed(env, 1)
+
+    const results = await Promise.all(
+      Array.from({ length: 10 }, () => handleLedger(req('', '7.7.7.7'), env)),
+    )
+    const statuses = results.map((r) => r.status)
+    expect(statuses.filter((s) => s === 200)).toHaveLength(1)
+    expect(statuses.filter((s) => s === 429)).toHaveLength(9)
+  })
+
+  it('lets the next window through', async () => {
+    const { ns } = freshKv()
+    const env = { MPP_STORE: ns, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
+    await seed(env, 1)
+    expect(await ledgerRateLimit(env, '8.8.8.8', 1_000_000_000_000)).toBe('allow')
+    expect(await ledgerRateLimit(env, '8.8.8.8', 1_000_000_000_500)).toBe('throttle')
+    expect(await ledgerRateLimit(env, '8.8.8.8', 1_000_000_001_000)).toBe('allow')
+  })
+
+  it('fails CLOSED with 503 when the limiter itself is down', async () => {
+    const { ns } = freshKv()
+    const env = { MPP_STORE: ns, ATOMIC_STORE: brokenAtomicStore } as unknown as Env
+    const res = await handleLedger(req('', '9.1.1.1'), env)
+    expect(res.status).toBe(503)
+    expect(res.headers.get('Retry-After')).toBe('1')
+  })
+
+  it('does not read storage at all once a caller is throttled', async () => {
+    const { ns } = freshKv()
+    let lists = 0
+    const counting = {
+      ...ns,
+      list: async (opts: any) => {
+        lists++
+        return (ns as any).list(opts)
       },
-      put: async () => {
-        throw new Error('kv down')
-      },
-      list: async () => ({ keys: [], list_complete: true, cursor: '' }),
     } as unknown as KVNamespace
-    const env = { MPP_STORE: broken } as unknown as Env
-    expect((await handleLedger(req(), env)).status).toBe(200)
+    const env = { MPP_STORE: counting, ATOMIC_STORE: freshAtomicStore().ns } as unknown as Env
+    await handleLedger(req('', '9.2.2.2'), env)
+    await handleLedger(req('', '9.2.2.2'), env)
+    expect(lists).toBe(1)
   })
 })

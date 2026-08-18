@@ -133,3 +133,53 @@ export function secondsUntilUtcMidnight(now: number = Date.now()): number {
   const nextMidnight = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0)
   return Math.max(1, Math.ceil((nextMidnight - now) / 1000))
 }
+
+/**
+ * Atomically check-and-increment a SHORT fixed window (sub-minute), for
+ * public unauthenticated endpoints that need a per-IP request-per-second
+ * floor.
+ *
+ * Why not the KV read-then-put pattern used elsewhere in this repo: KV has no
+ * conditional write and is eventually consistent across locations, so N
+ * concurrent requests all read the same value and all proceed. That is fine
+ * for a best-effort per-invoice throttle, and NOT fine for the only wall in
+ * front of an unauthenticated endpoint that performs a list plus up to 100
+ * reads against the same KV namespace the payment path uses. The DO gives
+ * real exclusion. It also sidesteps KV's 60-second minimum TTL, which makes a
+ * 1-second window inexpressible in KV at all.
+ *
+ * The window is a floor-division bucket of wall-clock time, so it needs no
+ * cleanup: a new bucket id simply resets the counter. Stale entries are
+ * overwritten in place by the next caller from the same key and never grow
+ * beyond one storage entry per key.
+ */
+export async function checkAndBumpWindowLimit(
+  env: Env,
+  key: string,
+  limit: number,
+  windowMs: number,
+  now: number = Date.now(),
+): Promise<DailyLimitResult> {
+  const bucket = String(Math.floor(now / windowMs))
+  const stub = rateLimitStub(env)
+  let { value, version } = await doPost<ReadResponse>(stub, '/read', { key })
+  for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
+    const c = parseCounter(value)
+    const used = c.day === bucket ? c.n : 0
+    if (used >= limit) {
+      return { ok: false, used, limit }
+    }
+    const result = await doPost<CommitResponse>(stub, '/commit', {
+      key,
+      expectedVersion: version,
+      op: 'set',
+      value: JSON.stringify({ n: used + 1, day: bucket }),
+    })
+    if (result.ok) {
+      return { ok: true, used: used + 1, limit }
+    }
+    value = result.value
+    version = result.version
+  }
+  throw new Error(`rate-limit DO checkAndBumpWindowLimit(${key}): exhausted ${MAX_CAS_RETRIES} retries`)
+}
