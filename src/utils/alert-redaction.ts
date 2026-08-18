@@ -245,8 +245,35 @@ function preserveLabelledHashes(text: string): { text: string; hashes: string[] 
   return { text: out, hashes }
 }
 
+/**
+ * Number of leading hex chars kept from a labelled hash, plus 8 trailing.
+ *
+ * A labelled value is restored TRUNCATED, never verbatim. This is what makes
+ * the exemption structurally safe instead of merely narrow: even if a private
+ * key somehow arrives under a `tx_hash=` label — by our own bug or by content
+ * an attacker steered — what escapes is 24 of 64 hex chars, leaving 40 hex
+ * (160 bits) unknown. That is not a recoverable key by any margin.
+ *
+ * 16 leading chars (64 bits) still identifies a transaction uniquely for any
+ * realistic ledger, so an operator can match it against a log, an explorer
+ * search, or an RPC lookup. The exemption buys back operational usefulness
+ * without ever restoring enough material to be a credential.
+ *
+ * Reviewer note: two independent reviews flagged the verbatim version as P0,
+ * the second one after the label list had already been narrowed. Narrowing the
+ * labels reduced the chance of the bad case; truncation removes its
+ * consequence. The second control is the one that does not rest on an
+ * assumption about what an attacker will label things.
+ */
+const HASH_HEAD = 16
+const HASH_TAIL = 8
+
 function restoreLabelledHashes(text: string, hashes: string[]): string {
-  return text.replace(SENTINEL_RE, (_m, i: string) => hashes[Number(i)] ?? '[REDACTED:hash]')
+  return text.replace(SENTINEL_RE, (_m, i: string) => {
+    const hash = hashes[Number(i)]
+    if (hash === undefined) return '[REDACTED:hash]'
+    return `${hash.slice(0, HASH_HEAD)}...${hash.slice(-HASH_TAIL)}`
+  })
 }
 
 export function redactForAlert(content: unknown): RedactedAlert {

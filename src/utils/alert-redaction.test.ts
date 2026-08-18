@@ -154,12 +154,38 @@ describe('identifiers stay actionable', () => {
   // Codex review P2. The earlier version of this test asserted only that
   // surrounding prose survived, deliberately avoiding a real hash — so it
   // would have passed while every transaction hash was being destroyed.
-  it('preserves a LABELLED transaction hash in full, so it stays verifiable on-chain', () => {
+  it('keeps a LABELLED transaction hash identifiable, truncated not verbatim', () => {
     const hash = fabricate('9c1d4e7a2f8b0356', 'd1e9a4c7b20f8365de4a19c0b7f2e836a5d194c7b20f8365')
     for (const label of ['tx_hash', 'source_tx_hash', 'payout_hash', 'txid', 'ledger_hash']) {
       const out = redactForAlert(`payout failed, ${label}=${hash} on Base`)
-      expect(out).toContain(hash)
+      // Enough to locate the transaction...
+      expect(out).toContain(hash.slice(0, 16))
+      expect(out).toContain(hash.slice(-8))
+      // ...but never the whole value.
+      expect(out).not.toContain(hash)
       expect(out).toContain('on Base')
+    }
+  })
+
+  // Codex review round 3, P0. Narrowing the label list reduced the CHANCE that
+  // a key gets exempted; it did not remove the CONSEQUENCE. Even a correctly
+  // labelled value is now restored truncated, so a key arriving under a
+  // `tx_hash=` label — by our own bug, or via content an attacker steered —
+  // leaks 24 of 64 hex chars, leaving 160 bits unknown. Not a recoverable key.
+  it('never restores a full 64-hex value, even under a valid label', () => {
+    const key = fabricate('a3f1c9d24b8e7051', '6d2f8b04c7e93a1568df402be9c1783a5d0e6f2b94c7a018')
+    for (const label of ['tx_hash', 'source_tx_hash', 'txid', 'ledger_hash', 'envelope_hash']) {
+      const out = redactForAlert(`${label}=${key}`)
+      expect(out).not.toContain(key)
+      // No unbroken run of hex longer than the 16-char head may survive.
+      // (Counting hex CHARACTERS would be wrong — a-f also occur in ordinary
+      // English words, which is how the first version of this assertion
+      // failed.)
+      const longestHexRun = Math.max(
+        0,
+        ...(out.match(/[0-9a-fA-F]+/g) ?? []).map((run) => run.length),
+      )
+      expect(longestHexRun).toBeLessThanOrEqual(16)
     }
   })
 
