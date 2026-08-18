@@ -231,9 +231,10 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // public catalog kept advertising the route.
   //
   // The sibling anthropic_messages route settles through an installed Tempo
-  // channel (session dialect) and is a different upstream path, so it is not
-  // delisted here — but its last paid evidence is 2026-08-09 and it should
-  // be re-probed before it is relied on.
+  // channel (session dialect) and is a different upstream path, so it was not
+  // delisted alongside this one — it was re-probed instead, later the same
+  // day, and failed identically. It is now delisted too; see the evidence in
+  // the comment on that entry below.
   'anthropic::/v1/chat/completions': {
     id: 'anthropic_chat_completions',
     publicPath: '/v1/services/anthropic/chat_completions',
@@ -247,23 +248,53 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'with a real paid call that returns a completion before re-enabling.',
   },
   // Anthropic Messages — the native /v1/messages endpoint.
-  // 2026-08-09: NOT yet re-tested with a current model id. The sibling
-  // chat_completions route above proves the merchant and its key are
-  // healthy, so the 404 recorded below was very likely the same stale
-  // model id, not a broken merchant. Re-test with claude-haiku-4-5 before
-  // assuming otherwise.
+  //
+  // DELISTED 2026-08-18, same day and same failure as the chat_completions
+  // sibling above. When that route was delisted, this one was kept listed on
+  // the argument that it is a different upstream path settling through an
+  // installed Tempo channel (session dialect), so the charge-path failure did
+  // not necessarily apply to it. That argument was explicitly marked as
+  // needing a paid re-probe, because its newest evidence was 2026-08-09.
+  //
+  // The re-probe was run the same day and the argument did not survive it.
+  // Two real paid mainnet calls, both with current-generation model ids that
+  // the merchant is known to serve:
+  //
+  //   claude-haiku-4-5   09:47:30Z  tx 832cd401...fc2152  → 502, merchant 403
+  //   claude-sonnet-4-5  09:48:03Z  tx ef7984cd...da09b69  → 502, merchant 403
+  //
+  // Both settled on chain, both then failed the merchant leg with a byte
+  // identical `{"error":{"type":"forbidden","message":"Request not allowed"}}`,
+  // and both were ledgered with `upstream_status: 403` and handed to the
+  // refund path (`GET /v1/ledger?tx=<hash>`). Two different model ids ruling
+  // out a stale id, and an identical error to the charge route, mean the block
+  // sits at the merchant/provider level rather than on either settlement
+  // path — the session channel is irrelevant to it.
+  //
+  // As with the sibling, the refund path engaged rather than the money being
+  // lost — the first of the two was confirmed `refunded` on chain, and working
+  // refunds are exactly why this looked healthy from the catalog's point of
+  // view. A route that takes payment and gives it back is still a route that
+  // never delivers, so it is not advertised as payable. Re-verify with a paid
+  // call that returns an actual completion before relisting.
+  //
+  // (Refund timing on this session-dialect route ran slower than the ~25s
+  // observed on the charge-dialect sibling; noted in docs/verified-services.md
+  // as a separate question, and immaterial to this delisting either way.)
   'anthropic::/v1/messages': {
     id: 'anthropic_messages',
     publicPath: '/v1/services/anthropic/messages',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-08-09T04:28:00Z',
+    verifiedMode: false,
+    sessionVerified: false,
     verifiedNote:
-      'Verified with a real paid call 2026-08-09 using a current model id ' +
-      '(claude-haiku-4-5): 202 with a real completion in the body. The earlier ' +
-      '404s were retired 2024 model ids, not a broken merchant — callers must ' +
-      'pass a current Claude model.',
+      'DISABLED 2026-08-18: the payment settles and the merchant leg then ' +
+      'fails (403 forbidden) on every call, so the router refunds instead of ' +
+      'delivering. Confirmed with two real paid re-probes on 2026-08-18 using ' +
+      'two different current model ids (claude-haiku-4-5, claude-sonnet-4-5), ' +
+      'identical to the failure on the chat_completions sibling; the earlier ' +
+      '2026-08-09 session verification no longer holds. Re-verify with a real ' +
+      'paid call that returns a completion before re-enabling.',
   },
   // 2026-08-01: disabled. Same shape as openrouter above — the payment
   // settles, then the merchant's own call to OpenAI is refused:
