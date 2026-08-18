@@ -2214,9 +2214,19 @@ export async function handleProxy(
     // branch pays the merchant first) costs the agent nothing — neither is a
     // settlement, so neither belongs in a settlement ledger.
     const failedLegOrderId = settledPayment ? newOrderId() : undefined
-    const recordFailedLeg = (refundStatus: RefundStatus) => {
-      if (!settledPayment || !failedLegOrderId || payResult.kind !== 'error') return
-      ctx.waitUntil(recordOrder(env, {
+    /**
+     * Returns the write so the caller can decide whether to await it. The
+     * refund branch MUST await: `enqueueRefund` makes the job visible to the
+     * refund executor, and an executor that leases and confirms before this
+     * row exists would find nothing to update and leave the call publicly
+     * `refund_pending` forever (codex review, 2026-08-18). One KV put on a
+     * path that already awaits the enqueue is a cheap price for that.
+     */
+    const recordFailedLeg = (refundStatus: RefundStatus): Promise<void> => {
+      if (!settledPayment || !failedLegOrderId || payResult.kind !== 'error') {
+        return Promise.resolve()
+      }
+      return recordOrder(env, {
         order_id: failedLegOrderId,
         ts: new Date().toISOString(),
         route_id: route.id,
@@ -2229,7 +2239,7 @@ export async function handleProxy(
         upstream_status: payResult.merchantStatus ?? 0,
         latency_ms: payResult.latencyMs ?? 0,
         refund_status: refundStatus,
-      }))
+      })
     }
 
     if (
@@ -2256,7 +2266,9 @@ export async function handleProxy(
       // there is nothing to put in the ledger. A rollback that FAILED is the
       // opposite: value may have left the channel with no refund queued, so
       // record it as `unknown` if a settlement exists for it.
-      if (!rolledBack) recordFailedLeg('unknown')
+      // No refund job is created on this branch, so nothing races the write;
+      // keep it off the response path.
+      if (!rolledBack) ctx.waitUntil(recordFailedLeg('unknown'))
       const response = new Response(payResult.response.body, payResult.response)
       response.headers.set('Refund-Mode', 'channel-remainder')
       response.headers.set('Refund-Status', rolledBack ? 'voucher-not-consumed' : 'manual-review')
@@ -2264,6 +2276,8 @@ export async function handleProxy(
       return verifyResult.withReceipt(response)
     }
     if (settledPayment && payResult.refundReason) {
+      // Before the enqueue, not after: see the note on recordFailedLeg.
+      await recordFailedLeg('pending')
       const refund = await enqueueRefund(env, {
         proof: settledPayment,
         reason: payResult.refundReason,
@@ -2271,9 +2285,6 @@ export async function handleProxy(
         routeId: route.id,
         orderId: failedLegOrderId,
       })
-      // Written before the response goes out so the row exists by the time
-      // the refund executor confirms and flips it to `refunded`.
-      recordFailedLeg('pending')
       if (channelContractForVerify && channelDeliveryLockId) {
         await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
         channelDeliveryLockId = undefined
@@ -2286,8 +2297,9 @@ export async function handleProxy(
     }
     // Settled, undelivered, and no refund could be queued (no refundReason,
     // e.g. a route-level rejection after settlement). `unknown` says so
-    // plainly rather than leaving the call invisible.
-    recordFailedLeg('unknown')
+    // plainly rather than leaving the call invisible. No refund job exists to
+    // race this write, so it stays off the response path.
+    ctx.waitUntil(recordFailedLeg('unknown'))
     if (channelContractForVerify && channelDeliveryLockId) {
       await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
       channelDeliveryLockId = undefined
