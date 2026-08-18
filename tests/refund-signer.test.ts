@@ -111,6 +111,7 @@ describe('refund signer policy', () => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url)
       const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : undefined
       requests.push({ path: url.pathname, body })
+      if (url.pathname.endsWith('/stuck')) return Response.json({ jobs: [] })
       if (url.pathname.endsWith('/pending')) return Response.json({ jobs: [pending] })
       if (url.pathname.endsWith('/lease')) return Response.json({ job: { ...pending, state: 'leased', lease: { id: body?.leaseId, until: new Date().toISOString() } } })
       return Response.json({ ok: true })
@@ -122,6 +123,8 @@ describe('refund signer policy', () => {
     expect(requests.map((request) => request.path)).toEqual([
       '/admin/refunds/pending', '/admin/refunds/lease',
       '/admin/refunds/complete', '/admin/refunds/confirm',
+      // Every run closes with the stuck-refund sweep (P1 alerting).
+      '/admin/refunds/stuck',
     ])
     const submitted = requests.find((request) => request.path.endsWith('/complete'))?.body
     const xdr = String(submitted?.signedXdr)
@@ -157,6 +160,7 @@ describe('refund signer policy', () => {
     const { ledger, alerts } = ledgerFixture()
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input : input.url)
+      if (url.pathname.endsWith('/stuck')) return Response.json({ jobs: [] })
       if (url.hostname === 'router.test') return Response.json({ jobs: [held] })
       return Response.json({ errcode: 0 })
     })

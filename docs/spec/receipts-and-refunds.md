@@ -98,6 +98,30 @@ A refund moves through `pending → leased → submitted → confirmed`, or dive
 to `manual_review`. `confirmed` is only reached after Stellar reports the
 transaction successful; the router does not treat submission as completion.
 
+`manual_review` is a diversion, **not** a dead end. `POST /admin/refunds/unpark`
+returns a parked refund to `pending`, discarding its stale
+envelope so the executor signs a fresh one. It is idempotent, records an
+`admin_unpark` audit event on the refund, and permits no other transition —
+`confirmed`, `submitted` and `leased` refunds are refused, so it can never
+re-send money that already went back or steal a job from a live lease.
+
+It is addressable by `refundId` or by the `paymentTx` printed on the public
+ledger row, and it requires the operator's own `ADMIN_TOKEN` — unlike every
+other refund admin route, the signer's `REFUND_EXECUTOR_TOKEN` is refused.
+`manual_review` exists to take a decision away from the automated path, so the
+credential that path carries must not be able to reverse it.
+
+Two properties keep a transient network fault from becoming a stranded refund
+in the first place: signed envelopes are valid for **ten minutes**, comfortably
+longer than the confirmation poll and the one-minute executor tick that both run
+inside that window; and refunds signed back-to-back from the same account never
+reuse a sequence number that the network has already accepted, even when the RPC
+reports a stale account.
+
+Silence is also alerted on, not only rejection: any refund still unconfirmed ten
+minutes after it was queued raises exactly one operator alert, whatever state it
+is sitting in.
+
 ## 6. Receipts
 
 `GET /v1/refunds/{refund_id}`
