@@ -284,8 +284,9 @@ Verifiers should key off the `algorithm` field and **reject anything other than
 `Ed25519`**. Receipts issued before the cutover cannot be verified by a third
 party at all and should be treated as unverified claims; the transaction hashes
 they carry remain checkable on Stellar, which is the stronger evidence in any
-case. Cutover date: _to be filled in on deploy_ — the deploy that first sets
-`RECEIPT_SIGNING_SECRET`.
+case. Cutover date: **2026-08-18** (Worker version `5a5a265a`, the first deploy with
+`RECEIPT_SIGNING_SECRET` set; signer `GACLZFFWWJX33XEY25VNNXUG73EQDGV5KOR6M6EBNTZ3BR4DHROOQFCH`,
+published on `/health`).
 
 ## 7. Worked example (mainnet, 2026-08-09)
 
