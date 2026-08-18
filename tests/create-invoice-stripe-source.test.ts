@@ -213,7 +213,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
     expect(createdIntent.source).toEqual({ chainId: 'lightning', tokenSymbol: 'BTC' })
     // BTC price floats, so no source.amount — the destination pins what we get.
     expect(createdIntent.source.amount).toBeUndefined()
-    expect(createdIntent.destination.amount).toBe('9.523809')
+    expect(createdIntent.destination.amount).toBe('10')
   })
 
   it('rejects an unsupported source explicitly instead of silently ignoring it', async () => {
@@ -264,8 +264,8 @@ describe('Stripe create-invoice — what source must NOT change', () => {
       url: STRIPE_URL,
       source: { chainId: '900', tokenSymbol: 'USDT' },
     })
-    expect(base.json.callerPays).toBe('9.523809')
-    expect(solana.json.callerPays).toBe('9.523809')
+    expect(base.json.callerPays).toBe('10')
+    expect(solana.json.callerPays).toBe('10')
   })
 })
 

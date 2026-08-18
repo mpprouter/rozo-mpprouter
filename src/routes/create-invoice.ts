@@ -945,7 +945,9 @@ export async function handleStripeCreateInvoice(
     })
   }
 
-  // 3. Discount (unchanged formula; founder decision: Stripe keeps it).
+  // 3. No discount (founder decision 2026-08-18: Stripe line matches the
+  // Coinbase line — caller pays the full invoice amount; discount fields kept
+  // in the response for shape stability but always full amount / "0").
   let invoiceAtomic: bigint
   try {
     invoiceAtomic = BigInt(invoice.stablecoinAmountAtomic)
@@ -955,12 +957,10 @@ export async function handleStripeCreateInvoice(
   if (invoiceAtomic <= 0n) {
     return json(422, { ok: false, provider: 'stripe_crypto', error: 'Invoice amount must be positive.' })
   }
-  const callerPaysAtomic = computeCallerPaysAtomic(invoiceAtomic)
-  const discountAtomic = invoiceAtomic - callerPaysAtomic
-  const callerPays = formatUsdc(callerPaysAtomic)
+  const callerPays = formatUsdc(invoiceAtomic)
   const originalStr = formatUsdc(invoiceAtomic)
-  const discountStr = formatUsdc(discountAtomic)
-  const title = buildTitle(invoice.merchantTitle, invoiceAtomic, callerPaysAtomic)
+  const discountStr = '0'
+  const title = buildFullAmountTitle(invoice.merchantTitle, invoiceAtomic)
 
   // 4. Provider-qualified orderId (design §6): stripe_crypto_<cpis_*>.
   const orderId = stripeOrderId(invoice.invoiceKey)
