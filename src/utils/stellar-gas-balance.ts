@@ -59,20 +59,32 @@ export interface GasSponsorBalance {
  * unparseable body, missing native balance line, or a numeric string that does
  * not parse cleanly. The caller must treat null as "unknown", never as zero.
  */
+export const DEFAULT_HORIZON_TIMEOUT_MS = 5_000
+
 export async function getGasSponsorBalance(
   horizonUrl: string | undefined,
   address: string | undefined,
+  timeoutMs: number = DEFAULT_HORIZON_TIMEOUT_MS,
 ): Promise<GasSponsorBalance> {
   if (!horizonUrl) return { stroops: null, reason: 'horizon url not configured' }
   if (!address) return { stroops: null, reason: 'gas sponsor address not configured' }
 
   let res: Response
   try {
+    // Explicit timeout. This runs on the cron shared with refund reconciliation
+    // and channel settlement, so a hung Horizon connection would eat the
+    // invocation's budget and silently starve work that matters more than this
+    // monitor does.
     res = await fetch(`${horizonUrl.replace(/\/$/, '')}/accounts/${address}`, {
       headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs),
     })
   } catch (err) {
-    return { stroops: null, reason: `horizon unreachable: ${(err as Error).message}` }
+    const e = err as Error
+    const reason = e.name === 'TimeoutError' || e.name === 'AbortError'
+      ? `horizon timed out after ${timeoutMs}ms`
+      : `horizon unreachable: ${e.message}`
+    return { stroops: null, reason }
   }
 
   // A 404 is genuinely different from a read failure: it means the account is
@@ -150,47 +162,97 @@ export function classify(balance: GasSponsorBalance): GasSponsorState {
 export interface TransitionDecision {
   /** Whether an alert should be sent for this tick. */
   shouldAlert: boolean
-  /** The state to persist for the next tick. */
-  nextState: GasSponsorState
+  /** The state to persist AFTER the alert is confirmed sent. */
+  nextState: PersistedState
   /** Alert text, already built. Empty when shouldAlert is false. */
   message: string
 }
 
 /**
+ * What we persist between ticks.
+ *
+ * `substantive` deliberately holds only `ok` / `low` — never `unreadable`.
+ *
+ * Codex review finding: with a single flat state, `low -> unreadable -> low`
+ * alerted three times, so one intermittent Horizon blip re-raised an
+ * unchanged low balance. Because Horizon blips are routine and a low balance
+ * can persist for hours, that is not a rare interleaving; it is the normal
+ * case. Keeping "what we last actually knew" on its own track means an
+ * unreadable tick cannot erase it, and returning to the same substantive
+ * state is silent.
+ *
+ * `unreadableStreak` counts consecutive failed reads. `unreadableAlerted`
+ * records whether we already said so, so a Horizon outage produces one
+ * message rather than one every two minutes.
+ */
+export interface PersistedState {
+  substantive: 'ok' | 'low' | null
+  unreadableStreak: number
+  unreadableAlerted: boolean
+}
+
+const EMPTY_STATE: PersistedState = { substantive: null, unreadableStreak: 0, unreadableAlerted: false }
+
+/**
+ * Consecutive failed reads before we say anything.
+ *
+ * A single blip is not worth a message; ~10 minutes of not knowing is. This is
+ * the one alert that reports our own blindness rather than a balance, so it
+ * should be rare enough that it still means something.
+ */
+export const UNREADABLE_ALERT_AFTER = 5
+
+/**
  * Decide whether this tick warrants an alert.
  *
- * Fires only when the state CHANGES, which is what keeps a 2-minute cron from
- * sending the same warning 720 times a day. Recovery is announced too — an
- * operator who was told about a problem is owed the "it is fixed" message, and
- * without it the only way to learn is to go and look.
- *
- * `unreadable` alerts on transition as well, but says plainly that we could
- * not read the balance rather than implying the account is empty. Repeated
- * unreadable ticks stay silent, so a Horizon outage does not become a pager
- * storm.
+ * Alerts on CHANGE, never on level: at 2-minute granularity a level check
+ * would send the same warning 720 times a day for one unresolved condition.
  */
 export function decideTransition(
-  previous: GasSponsorState | null,
+  previous: PersistedState,
   balance: GasSponsorBalance,
   address: string,
 ): TransitionDecision {
-  const nextState = classify(balance)
-  if (previous === nextState) {
-    return { shouldAlert: false, nextState, message: '' }
+  const threshold = formatStroopsAsXlm(GAS_SPONSOR_LOW_THRESHOLD_STROOPS)
+  const observed = classify(balance)
+
+  // ── Could not read ────────────────────────────────────────────────────
+  // Never touches `substantive`: not knowing is not the same as knowing the
+  // state changed, and conflating them is what caused the flapping.
+  if (observed === 'unreadable') {
+    const streak = previous.unreadableStreak + 1
+    const shouldAlert = streak >= UNREADABLE_ALERT_AFTER && !previous.unreadableAlerted
+    return {
+      shouldAlert,
+      nextState: { ...previous, unreadableStreak: streak, unreadableAlerted: previous.unreadableAlerted || shouldAlert },
+      message: shouldAlert
+        ? `[MPP Router] ❓ Stellar gas sponsor balance unreadable for ${streak} consecutive checks: ${balance.reason}\n` +
+          `Account: ${address}\n` +
+          `This is NOT a report that the balance is low — we do not currently know what it is. ` +
+          `Check Horizon availability and that the account address is correct.`
+        : '',
+    }
+  }
+
+  // ── Read succeeded ────────────────────────────────────────────────────
+  const current = formatStroopsAsXlm(balance.stroops!)
+  const base: PersistedState = { substantive: observed, unreadableStreak: 0, unreadableAlerted: false }
+
+  // Same as what we last actually knew → silent, regardless of any unreadable
+  // ticks in between. This is the case the review found re-alerting.
+  if (previous.substantive === observed) {
+    return { shouldAlert: false, nextState: base, message: '' }
   }
 
   // First ever observation of a healthy account is not news.
-  if (previous === null && nextState === 'ok') {
-    return { shouldAlert: false, nextState, message: '' }
+  if (previous.substantive === null && observed === 'ok') {
+    return { shouldAlert: false, nextState: base, message: '' }
   }
 
-  const threshold = formatStroopsAsXlm(GAS_SPONSOR_LOW_THRESHOLD_STROOPS)
-
-  if (nextState === 'low') {
-    const current = formatStroopsAsXlm(balance.stroops!)
+  if (observed === 'low') {
     return {
       shouldAlert: true,
-      nextState,
+      nextState: base,
       message:
         `[MPP Router] ⚠️ Stellar gas sponsor low balance: ${current} XLM\n` +
         `Account: ${address}\n` +
@@ -201,63 +263,75 @@ export function decideTransition(
     }
   }
 
-  if (nextState === 'ok') {
-    const current = formatStroopsAsXlm(balance.stroops!)
-    return {
-      shouldAlert: true,
-      nextState,
-      message:
-        `[MPP Router] ✅ Stellar gas sponsor recovered: ${current} XLM\n` +
-        `Account: ${address}\n` +
-        `Back above the ${threshold} XLM threshold.`,
-    }
-  }
-
+  // Only a genuine low → ok is a "recovery". Reaching `ok` from no prior
+  // knowledge is not, and the review was right that calling it one would be
+  // misleading — it implies a problem that may never have existed.
   return {
     shouldAlert: true,
-    nextState,
+    nextState: base,
     message:
-      `[MPP Router] ❓ Stellar gas sponsor balance could not be read: ${balance.reason}\n` +
+      `[MPP Router] ✅ Stellar gas sponsor recovered: ${current} XLM\n` +
       `Account: ${address}\n` +
-      `This is NOT a report that the balance is low — we do not currently know what it is. ` +
-      `If this persists, check Horizon availability and the account address.`,
+      `Back above the ${threshold} XLM threshold.`,
   }
 }
 
-/** Read the persisted state. Unknown/corrupt values read as null (no history). */
-export async function readState(kv: KVNamespace): Promise<GasSponsorState | null> {
+/** Read persisted state. Anything unrecognised reads as "no history". */
+export async function readState(kv: KVNamespace): Promise<PersistedState> {
   const raw = await kv.get(STATE_KEY)
-  return raw === 'ok' || raw === 'low' || raw === 'unreadable' ? raw : null
+  if (!raw) return { ...EMPTY_STATE }
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedState>
+    return {
+      substantive: parsed.substantive === 'ok' || parsed.substantive === 'low' ? parsed.substantive : null,
+      unreadableStreak: Number.isInteger(parsed.unreadableStreak) ? parsed.unreadableStreak as number : 0,
+      unreadableAlerted: parsed.unreadableAlerted === true,
+    }
+  } catch {
+    return { ...EMPTY_STATE }
+  }
 }
 
-export async function writeState(kv: KVNamespace, state: GasSponsorState): Promise<void> {
-  await kv.put(STATE_KEY, state)
+export async function writeState(kv: KVNamespace, state: PersistedState): Promise<void> {
+  await kv.put(STATE_KEY, JSON.stringify(state))
 }
 
 /**
- * One monitoring tick. Returns the alert to send, or null.
+ * One monitoring tick.
  *
- * The caller sends it — this module never reaches the network on its own, so
- * it stays testable without mocking the alert transport, and the alert goes
- * through `redactForAlert` at the call site like every other alert.
+ * Returns an alert to send plus a `commit()` the caller MUST invoke once the
+ * alert has actually gone out.
+ *
+ * Codex review finding: the first version persisted the new state before the
+ * alert was delivered, so a failed send left `low` recorded and every
+ * subsequent low reading was deduped away — the monitor stayed silent forever
+ * while looking healthy. Committing after delivery means a failed send is
+ * simply retried on the next tick, which is the behaviour you want from
+ * something whose entire job is to speak up.
+ *
+ * When no alert is due, the state is committed immediately: those writes carry
+ * no risk of being lost mid-notification.
  */
 export async function checkGasSponsor(args: {
   kv: KVNamespace
   horizonUrl: string | undefined
   address: string | undefined
-}): Promise<{ message: string; state: GasSponsorState } | null> {
-  const balance = await getGasSponsorBalance(args.horizonUrl, args.address)
+  timeoutMs?: number
+}): Promise<{ message: string; state: PersistedState; commit: () => Promise<void> } | null> {
+  const balance = await getGasSponsorBalance(args.horizonUrl, args.address, args.timeoutMs)
   const previous = await readState(args.kv)
   const decision = decideTransition(previous, balance, args.address ?? '(unset)')
 
-  // Persist even when not alerting: the state machine only works if every
-  // observation is recorded, not just the noisy ones.
-  if (previous !== decision.nextState) {
+  if (!decision.shouldAlert) {
     await writeState(args.kv, decision.nextState)
+    return null
   }
 
-  if (!decision.shouldAlert) return null
-  return { message: decision.message, state: decision.nextState }
+  return {
+    message: decision.message,
+    state: decision.nextState,
+    commit: () => writeState(args.kv, decision.nextState),
+  }
 }
 
 /** Re-exported so the call site's intent is visible in one import. */

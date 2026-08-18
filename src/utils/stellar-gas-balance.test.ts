@@ -6,15 +6,21 @@ import {
   decideTransition,
   checkGasSponsor,
   GAS_SPONSOR_LOW_THRESHOLD_STROOPS,
-  type GasSponsorState,
+  UNREADABLE_ALERT_AFTER,
+  type PersistedState,
 } from './stellar-gas-balance'
+
+/** Build a persisted state without repeating the defaults everywhere. */
+function st(partial: Partial<PersistedState> = {}): PersistedState {
+  return { substantive: null, unreadableStreak: 0, unreadableAlerted: false, ...partial }
+}
 
 const ADDR = 'GB5LCXFTBHXJ32XQBHX4EQKQPCHZRHU3XXHHN54QE3O3QTAN6RQZ3XEE'
 
 /** Minimal in-memory KV, enough for the state machine. */
-function fakeKv(initial?: string) {
+function fakeKv(initial?: PersistedState) {
   const store = new Map<string, string>()
-  if (initial !== undefined) store.set('gas-sponsor:last-alert-state', initial)
+  if (initial !== undefined) store.set('gas-sponsor:last-alert-state', JSON.stringify(initial))
   return {
     kv: {
       get: async (k: string) => store.get(k) ?? null,
@@ -57,9 +63,14 @@ describe('an unreadable balance is never "low"', () => {
   })
 
   it('says "could not read" rather than implying the account is empty', () => {
-    const d = decideTransition('ok', { stroops: null, reason: 'horizon returned 503' }, ADDR)
+    // Alerts only after the streak threshold, so one blip stays quiet.
+    const d = decideTransition(
+      st({ substantive: 'ok', unreadableStreak: UNREADABLE_ALERT_AFTER - 1 }),
+      { stroops: null, reason: 'horizon returned 503' },
+      ADDR,
+    )
     expect(d.shouldAlert).toBe(true)
-    expect(d.message).toContain('could not be read')
+    expect(d.message).toContain('unreadable for')
     expect(d.message).toContain('NOT a report that the balance is low')
     expect(d.message).toContain('503')
     // Must not read as a drain.
@@ -69,14 +80,16 @@ describe('an unreadable balance is never "low"', () => {
 
 describe('alerts fire on transition, not on level', () => {
   it('stays silent while the condition persists', () => {
-    const low = { stroops: 1n, reason: '' }
-    expect(decideTransition('low', low, ADDR).shouldAlert).toBe(false)
-    expect(decideTransition('ok', { stroops: 999_000_000_000n, reason: '' }, ADDR).shouldAlert).toBe(false)
-    expect(decideTransition('unreadable', { stroops: null, reason: 'x' }, ADDR).shouldAlert).toBe(false)
+    expect(decideTransition(st({ substantive: 'low' }), { stroops: 1n, reason: '' }, ADDR).shouldAlert).toBe(false)
+    expect(decideTransition(st({ substantive: 'ok' }), { stroops: 999_000_000_000n, reason: '' }, ADDR).shouldAlert).toBe(false)
+    // Already told them it is unreadable → do not repeat.
+    expect(decideTransition(
+      st({ unreadableStreak: 40, unreadableAlerted: true }), { stroops: null, reason: 'x' }, ADDR,
+    ).shouldAlert).toBe(false)
   })
 
   it('alerts when crossing into low', () => {
-    const d = decideTransition('ok', { stroops: 50_000_000n, reason: '' }, ADDR)
+    const d = decideTransition(st({ substantive: 'ok' }), { stroops: 50_000_000n, reason: '' }, ADDR)
     expect(d.shouldAlert).toBe(true)
     expect(d.message).toContain('low balance: 5 XLM')
     expect(d.message).toContain(ADDR)
@@ -85,17 +98,17 @@ describe('alerts fire on transition, not on level', () => {
   })
 
   it('announces recovery, so nobody has to go and check', () => {
-    const d = decideTransition('low', { stroops: 200_000_000n, reason: '' }, ADDR)
+    const d = decideTransition(st({ substantive: 'low' }), { stroops: 200_000_000n, reason: '' }, ADDR)
     expect(d.shouldAlert).toBe(true)
     expect(d.message).toContain('recovered: 20 XLM')
   })
 
   it('does not announce a healthy account on first ever observation', () => {
-    expect(decideTransition(null, { stroops: 999_000_000n, reason: '' }, ADDR).shouldAlert).toBe(false)
+    expect(decideTransition(st(), { stroops: 999_000_000n, reason: '' }, ADDR).shouldAlert).toBe(false)
   })
 
   it('DOES announce a low account on first ever observation', () => {
-    expect(decideTransition(null, { stroops: 1n, reason: '' }, ADDR).shouldAlert).toBe(true)
+    expect(decideTransition(st(), { stroops: 1n, reason: '' }, ADDR).shouldAlert).toBe(true)
   })
 
   // The concrete anti-spam property: 720 ticks a day against one unresolved
@@ -113,23 +126,23 @@ describe('alerts fire on transition, not on level', () => {
     try {
       for (let i = 0; i < 30; i++) {
         const r = await checkGasSponsor({ kv, horizonUrl: horizon, address: ADDR })
-        if (r) alerts++
+        if (r) { alerts++; await r.commit() }   // caller commits after sending
       }
     } finally {
       globalThis.fetch = realFetch
     }
 
     expect(alerts).toBe(1)
-    expect(store.get('gas-sponsor:last-alert-state')).toBe('low')
+    expect(JSON.parse(store.get('gas-sponsor:last-alert-state')!).substantive).toBe('low')
   })
 
   it('alerts again after recovering and dropping a second time', () => {
-    const seq: Array<[GasSponsorState | null, bigint | null]> = [
-      [null, 1n],            // low      -> alert
-      ['low', 1n],           // still low-> silent
-      ['low', 500_000_000n], // recovered-> alert
-      ['ok', 500_000_000n],  // still ok -> silent
-      ['ok', 1n],            // low again-> alert
+    const seq: Array<[PersistedState, bigint]> = [
+      [st(),                        1n],            // low       -> alert
+      [st({ substantive: 'low' }),  1n],            // still low -> silent
+      [st({ substantive: 'low' }),  500_000_000n],  // recovered -> alert
+      [st({ substantive: 'ok' }),   500_000_000n],  // still ok  -> silent
+      [st({ substantive: 'ok' }),   1n],            // low again -> alert
     ]
     const fired = seq.map(([prev, stroops]) =>
       decideTransition(prev, { stroops, reason: '' }, ADDR).shouldAlert,
@@ -145,51 +158,60 @@ describe('reading from horizon', () => {
     try { await fn() } finally { globalThis.fetch = real }
   }
 
+  /**
+   * Run the tick until it produces an alert, up to `max` times, committing as
+   * a real caller would. Returns the alert or null.
+   *
+   * Needed because an unreadable balance no longer alerts on the first failed
+   * read — it waits for a streak, so one Horizon blip stays quiet.
+   */
+  async function tickUntilAlert(kv: KVNamespace, address: string | undefined, horizonUrl: string | undefined, max = UNREADABLE_ALERT_AFTER + 1) {
+    for (let i = 0; i < max; i++) {
+      const r = await checkGasSponsor({ kv, horizonUrl, address })
+      if (r) { await r.commit(); return r }
+    }
+    return null
+  }
+
   it('distinguishes an unfunded account from a read failure', async () => {
-    const { kv } = fakeKv('ok')
+    const { kv } = fakeKv(st({ substantive: 'ok' }))
     await withFetch((async () => new Response('', { status: 404 })) as typeof fetch, async () => {
-      const r = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
-      expect(r?.state).toBe('unreadable')
+      const r = await tickUntilAlert(kv, ADDR, 'https://h.example')
       expect(r?.message).toContain('never funded, or wrong network')
     })
   })
 
   it('treats a 5xx as unreadable, not as zero', async () => {
-    const { kv } = fakeKv('ok')
+    const { kv } = fakeKv(st({ substantive: 'ok' }))
     await withFetch((async () => new Response('upstream down', { status: 503 })) as typeof fetch, async () => {
-      const r = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
-      expect(r?.state).toBe('unreadable')
+      const r = await tickUntilAlert(kv, ADDR, 'https://h.example')
+      expect(r?.message).toContain('503')
       expect(r?.message).not.toContain('low balance')
     })
   })
 
   it('treats a non-JSON body as unreadable', async () => {
-    const { kv } = fakeKv('ok')
+    const { kv } = fakeKv(st({ substantive: 'ok' }))
     await withFetch((async () => new Response('<html>nope</html>', { status: 200 })) as typeof fetch, async () => {
-      const r = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
-      expect(r?.state).toBe('unreadable')
+      const r = await tickUntilAlert(kv, ADDR, 'https://h.example')
+      expect(r?.message).toContain('not JSON')
     })
   })
 
   it('treats a missing native balance line as unreadable', async () => {
-    const { kv } = fakeKv('ok')
+    const { kv } = fakeKv(st({ substantive: 'ok' }))
     const body = JSON.stringify({ balances: [{ asset_type: 'credit_alphanum4', balance: '5.0' }] })
     await withFetch((async () => new Response(body, { status: 200 })) as typeof fetch, async () => {
-      const r = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
-      expect(r?.state).toBe('unreadable')
+      const r = await tickUntilAlert(kv, ADDR, 'https://h.example')
+      expect(r?.message).toContain('no native balance line')
     })
   })
 
   it('is unreadable — not low — when nothing is configured', async () => {
-    // Separate KVs on purpose: sharing one would have the second call see the
-    // first call's 'unreadable' state and correctly stay silent, which would
-    // test the dedup rather than the missing-config handling.
-    const r = await checkGasSponsor({ kv: fakeKv('ok').kv, horizonUrl: undefined, address: ADDR })
-    expect(r?.state).toBe('unreadable')
+    const r = await tickUntilAlert(fakeKv(st({ substantive: 'ok' })).kv, ADDR, undefined)
     expect(r?.message).toContain('horizon url not configured')
 
-    const r2 = await checkGasSponsor({ kv: fakeKv('ok').kv, horizonUrl: 'https://h.example', address: undefined })
-    expect(r2?.state).toBe('unreadable')
+    const r2 = await tickUntilAlert(fakeKv(st({ substantive: 'ok' })).kv, undefined, 'https://h.example')
     expect(r2?.message).toContain('gas sponsor address not configured')
   })
 
@@ -199,7 +221,74 @@ describe('reading from horizon', () => {
     await withFetch((async () => new Response(body, { status: 200 })) as typeof fetch, async () => {
       const r = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
       expect(r).toBeNull()
-      expect(store.get('gas-sponsor:last-alert-state')).toBe('ok')
+      expect(JSON.parse(store.get('gas-sponsor:last-alert-state')!).substantive).toBe('ok')
     })
+  })
+
+  // Codex review finding: one intermittent Horizon blip must not re-raise an
+  // unchanged low balance. low -> unreadable -> low is ONE alert, not three.
+  it('does not re-alert a low balance across an intermittent read failure', async () => {
+    const { kv } = fakeKv()
+    let mode: 'low' | 'fail' = 'low'
+    let alerts = 0
+    const real = globalThis.fetch
+    globalThis.fetch = (async () =>
+      mode === 'low'
+        ? new Response(JSON.stringify({ balances: [{ asset_type: 'native', balance: '1.0' }] }), { status: 200 })
+        : new Response('', { status: 503 })) as typeof fetch
+
+    try {
+      for (const m of ['low', 'low', 'fail', 'fail', 'low', 'low', 'fail', 'low'] as const) {
+        mode = m
+        const r = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
+        if (r) { alerts++; await r.commit() }
+      }
+    } finally {
+      globalThis.fetch = real
+    }
+
+    expect(alerts).toBe(1)
+  })
+
+  // Codex review finding: committing before the alert is delivered would dedupe
+  // every later attempt and leave the monitor permanently silent.
+  it('retries on the next tick when the caller fails to send', async () => {
+    const { kv } = fakeKv()
+    const real = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ balances: [{ asset_type: 'native', balance: '1.0' }] }), { status: 200 })) as typeof fetch
+
+    try {
+      // First tick produces an alert; the caller "fails to send" so never commits.
+      const first = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
+      expect(first).not.toBeNull()
+
+      // Second tick must offer it again rather than treating it as delivered.
+      const second = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
+      expect(second).not.toBeNull()
+      await second!.commit()
+
+      // Now it is committed, so it goes quiet.
+      const third = await checkGasSponsor({ kv, horizonUrl: 'https://h.example', address: ADDR })
+      expect(third).toBeNull()
+    } finally {
+      globalThis.fetch = real
+    }
+  })
+
+  it('reports a timeout distinctly from an unreachable host', async () => {
+    const { kv } = fakeKv(st({ substantive: 'ok' }))
+    const real = globalThis.fetch
+    globalThis.fetch = (async () => {
+      const e = new Error('The operation was aborted')
+      e.name = 'TimeoutError'
+      throw e
+    }) as typeof fetch
+    try {
+      const r = await tickUntilAlert(kv, ADDR, 'https://h.example')
+      expect(r?.message).toContain('timed out after')
+    } finally {
+      globalThis.fetch = real
+    }
   })
 })

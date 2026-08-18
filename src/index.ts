@@ -399,14 +399,29 @@ export default {
  */
 async function watchGasSponsor(env: Env): Promise<void> {
   try {
-    if (!env.DINGTALK_ACCESS_TOKEN) return
+    if (!env.DINGTALK_ACCESS_TOKEN) {
+      // No alert channel means this monitor cannot do its job. Say so in the
+      // log rather than returning silently: a monitor that is quiet because it
+      // is disabled looks identical to a monitor that is quiet because all is
+      // well, and that is the failure this whole change exists to remove.
+      console.warn('[gas-sponsor-watch] DINGTALK_ACCESS_TOKEN unset — gas sponsor is NOT being monitored')
+      return
+    }
+
     const result = await checkGasSponsor({
       kv: env.MPP_STORE,
       horizonUrl: env.PLAYGROUND_HORIZON_URL ?? 'https://horizon.stellar.org',
       address: env.STELLAR_GAS_PUBLIC,
     })
     if (!result) return
+
     await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, redactForAlert(result.message))
+
+    // Commit only after the alert has gone out. If the send throws we fall to
+    // the catch below WITHOUT recording the new state, so the next tick sees
+    // the same transition and tries again. Recording first would have deduped
+    // every later attempt and left the monitor permanently silent.
+    await result.commit()
   } catch (err) {
     console.warn(`[gas-sponsor-watch] skipped: ${(err as Error).message}`)
   }
