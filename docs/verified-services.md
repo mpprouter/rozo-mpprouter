@@ -186,3 +186,64 @@ First real-money verify runs (payer masked `GD5R4H...BB4U`, $0.0005/call):
 - `mercury_txs_by_hash` — tx `871099bf7ed2f36605ed568aa927d811d43893afc70863fb8a3fdf4279c07cdb` — 200, full envelope+meta
 - `mercury_txs_by_contract` — tx `c82da0fc01501df246df43e5cbfb85d60bc5d9dd7df31a95addeb59af95f4b98` — 200
 - `mercury_events_by_ledger` — NOT verified: mainnet upstream slow (40s+)/500 on 2026-08-11; kept disabled, filed with provider
+
+#### `mercury_events_by_ledger` — re-verification prepared, NOT executed (2026-08-18)
+
+Provider (Federico De Ponti, CTO) reported on 2026-08-15 that by-ledger is fixed and
+deployed: old ledger ranges that used to time out now return in a couple of seconds.
+Very wide ranges remain bounded by a server-side timeout, by design.
+
+Free (zero-cost) checks done on 2026-08-18:
+
+| Check | Result |
+| --- | --- |
+| `GET https://apiserver.mpprouter.dev/v1/services/mercury/events/by-ledger` | **403** `Route not enabled for payment` in **0.86 s** — expected, this is the `verifiedMode: false` gate in `proxy.ts` (SECURITY GATE), not an upstream failure |
+| `GET https://apiserver.mpprouter.dev/v1/services/mercury/events/by-contract?contract_id=…` (a charge-verified sibling, for the 402 shape) | **402** in **1.44 s**, well-formed `application/problem+json`: `{"type":"https://paymentauth.org/problems/payment-required","title":"Payment Required","status":402,"detail":"Payment is required.","challengeId":"…"}` |
+| `GET https://mainnet.mercurydata.app/rest/events/by-ledger?start_ledger=…` unauthenticated | **400** `Missing request header "authorization"` in **1.54 s** — upstream is reachable and responsive; proves nothing about query latency (no query was run) |
+
+**A free 402 on by-ledger itself is not obtainable from production today.** The route is
+403'd before the payment layer by the `verifiedMode: false` gate, and the only escape hatch
+is flipping the `MERCURY_LAUNCH_MODE` Worker var to `verify` — an operator/deploy action.
+The 402 shape for this exact route is however asserted in unit tests
+(`tests/mercury-launch-gate.test.ts:134-145`, `tests/mercury-fixed-price.test.ts:190-206`),
+which confirm it issues the router's own fixed-price 402 without probing upstream.
+
+**Blocked on a real paid mainnet call (founder-only, spends real funds).** Procedure, per
+`docs/SOP-provider-e2e-test.md`:
+
+1. Operator sets the launch gate so the route stops 403ing (this is the documented escape
+   hatch for a never-yet-verified route):
+   ```bash
+   npx wrangler secret put MERCURY_LAUNCH_MODE   # value: verify   (or set as a var + deploy)
+   ```
+2. Extract the E2E Stellar secret to a 0600 temp file (never printed — see SOP §1):
+   ```bash
+   TMP=$(mktemp /tmp/.stkey.XXXXXX); chmod 600 "$TMP"
+   python3 -c "
+   import os
+   for l in open(os.path.expanduser('~/workspace/rozoai/rozoskilltest/.env.e2e-20260703')):
+       if l.startswith('E2E_STELLAR_SECRET='):
+           open('$TMP','w').write(l.split('=',1)[1].strip().strip('\"').strip(\"'\")); break
+   "
+   ```
+3. **The paid call** (this is the one command that spends money):
+   ```bash
+   cd ~/workspace/mpprouter/stellar-agent-wallet-skill/
+   npx tsx skills/pay-per-call/run.ts \
+     "https://apiserver.mpprouter.dev/v1/services/mercury/events/by-ledger?start_ledger=50000000&end_ledger=50000010" \
+     --method GET \
+     --secret-file "$TMP" --network pubnet --max-auto 0.10
+   ```
+   Use a deliberately **narrow** ledger range — wide ranges are still timeout-bounded by
+   design and would be a false negative.
+4. `rm -f "$TMP"` — mandatory.
+5. Unset `MERCURY_LAUNCH_MODE` again.
+6. On a 200: flip `mercury::GET::/events/by-ledger` in `src/services/merchants.ts` to
+   `verifiedMode: 'charge'`, `chargeVerified: true`, `chargeVerifiedAt: '<ISO>'`, replace the
+   pending `verifiedNote` with the standard Mercury MVP note carrying the settling tx hash,
+   and record the tx hash in the list above. That flip alone relists it — `status` /
+   `payment_status` are computed from `verifiedMode` in `src/services/merchants.ts`.
+
+**Expected cost:** one call at the route's fixed price of **$0.001 USDC** plus Stellar
+mainnet fees (~0.00001 XLM), i.e. well under one US cent. `--max-auto 0.10` caps it.
+Payer is the E2E test wallet `GD5R4H...BB4U`.

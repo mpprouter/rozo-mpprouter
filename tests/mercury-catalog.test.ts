@@ -87,6 +87,39 @@ describe('Mercury catalog materialization', () => {
     }
   })
 
+  // Provider feedback (Federico De Ponti, xycloo Labs, 2026-08-13): Mercury
+  // does serve an llms.txt at docs.mercurydata.app/llms.txt. Wiring it into
+  // the snapshot's service-level `docs` is what clears the `limited /
+  // llms_txt not available` flag, because `listPublicCatalog` computes
+  // `status` as `route.docs?.llmsTxt ? 'active' : 'limited'`. This locks in
+  // that the docs link survives future `refresh-mpp-snapshot` runs.
+  it('all 4 mercury routes are status "active" with no llms_txt caveat', () => {
+    const catalog = listPublicCatalog({ STELLAR_NETWORK: 'stellar:pubnet' })
+    for (const id of MERCURY_ROUTE_IDS) {
+      const entry = catalog.find(e => e.id === id)!
+      expect(entry.status).toBe('active')
+      expect(entry.status_note).toBeUndefined()
+    }
+  })
+
+  it('the llms.txt link that clears the flag is threaded onto every mercury route', () => {
+    for (const id of MERCURY_ROUTE_IDS) {
+      const route = PUBLIC_SERVICE_ROUTES.find(r => r.id === id)!
+      expect(route.docs?.llmsTxt).toBe('https://docs.mercurydata.app/llms.txt')
+    }
+  })
+
+  // by-ledger relisting is blocked on a real paid mainnet call (founder-only
+  // — see docs/verified-services.md). This test is the tripwire: it fails the
+  // moment someone flips the route to listed, so the flip cannot land without
+  // also updating the verification record here.
+  it('by-ledger stays delisted until the paid re-verification is actually run', () => {
+    const route = PUBLIC_SERVICE_ROUTES.find(r => r.id === 'mercury_events_by_ledger')!
+    expect(route.verifiedMode).toBe(false)
+    expect(route.chargeVerified ?? false).toBe(false)
+    expect(route.verifiedNote).toMatch(/DISABLED pending re-verification/)
+  })
+
   it('OPERATOR_OVERLAY keys are method-qualified GET keys matching the rewritten upstream path syntax', () => {
     expect(OPERATOR_OVERLAY['mercury::GET::/events/by-contract/{contract_id}']).toBeDefined()
     expect(OPERATOR_OVERLAY['mercury::GET::/events/by-ledger']).toBeDefined()

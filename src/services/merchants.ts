@@ -522,8 +522,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: false,
     launchGate: 'MERCURY_LAUNCH_MODE',
     verifiedNote:
-      'DISABLED: Mercury mainnet /rest/events/by-ledger observed slow (40s+) and 500 on ' +
-      '2026-08-11 paid verify attempt; filed with provider. Other 3 mercury routes are charge-verified.',
+      'DISABLED pending re-verification. Mercury mainnet /rest/events/by-ledger was slow (40s+) ' +
+      'and 500d on the 2026-08-11 paid verify attempt; filed with provider. Provider reported a ' +
+      'fix deployed 2026-08-15 (old ledger ranges now return in seconds; very wide ranges stay ' +
+      'bounded by a server-side timeout, by design). This route stays verifiedMode:false — and ' +
+      'therefore 403 / unlisted — until a real paid mainnet call succeeds through the router. ' +
+      'Re-verify per docs/SOP-provider-e2e-test.md §3 with MERCURY_LAUNCH_MODE=verify, then flip ' +
+      "to verifiedMode: 'charge' + chargeVerified/chargeVerifiedAt + the settling Stellar tx hash, " +
+      'the same way the other 3 mercury routes were verified. Other 3 mercury routes are charge-verified.',
   },
   'mercury::GET::/txs/by-contract/{contract_id}': {
     upstreamPath: '/rest/txs/by-contract/{contract_id}',
