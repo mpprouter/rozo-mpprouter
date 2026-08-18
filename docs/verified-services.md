@@ -185,4 +185,6 @@ First real-money verify runs (payer masked `GD5R4H...BB4U`, $0.0005/call):
 - `mercury_events_by_contract` — tx `8b3a36f2b359328a37652b7f32e89e19b253487e9b28bc01a257161e1cf6b8c6` — 200, real USDC SAC transfer events
 - `mercury_txs_by_hash` — tx `871099bf7ed2f36605ed568aa927d811d43893afc70863fb8a3fdf4279c07cdb` — 200, full envelope+meta
 - `mercury_txs_by_contract` — tx `c82da0fc01501df246df43e5cbfb85d60bc5d9dd7df31a95addeb59af95f4b98` — 200
-- `mercury_events_by_ledger` — NOT verified: mainnet upstream slow (40s+)/500 on 2026-08-11; kept disabled, filed with provider
+- `mercury_events_by_ledger` — **verified 2026-08-18** — tx `5028a601460bc30228b51d62072722b07df8c29b5bdb6100c92fa26d74064f0d` — 200, real Soroban events
+  - History: failed the 2026-08-11 attempt (mainnet upstream slow 40s+/500), kept disabled and filed with the provider. Mercury diagnosed a query-plan issue on ledger ranges away from the chain tip and shipped a fix on 2026-08-15.
+  - Re-verified on a **narrow** range (`start_ledger=50000000`, `end_ledger=50000010`). Very wide ranges stay bounded by a server-side timeout by design, so a wide-range probe would read as a false failure.

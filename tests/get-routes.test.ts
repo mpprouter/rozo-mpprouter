@@ -130,11 +130,9 @@ describe('GET routes — build', () => {
     // paid mainnet calls (tx hashes in docs/verified-services.md); the 4th
     // (events/by-ledger) stayed delisted — upstream 500/slow on the paid attempt.
     //
-    // 448 as of 2026-08-18 (founder call, beta launch): events/by-ledger relisted
-    // after Mercury shipped the ledger-range query-plan fix on 2026-08-15. Its paid
-    // re-verification had NOT run at the time this count changed — see its
-    // verifiedNote. If that probe fails, drop this back to 447 and set the route to
-    // verifiedMode:false.
+    // 448 as of 2026-08-18: events/by-ledger relisted after Mercury shipped the
+    // ledger-range query-plan fix on 2026-08-15, and charge-verified the same day
+    // with a real paid mainnet call (tx 5028a601...4f0d).
     expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(448)
     // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
     // events/by-ledger joined them at the beta launch (see the note above).
@@ -151,10 +149,11 @@ describe('GET routes — build', () => {
     // events/by-ledger) and it is bounded: exactly one route may sit in it,
     // so a second unverified listing fails this test rather than sliding in.
     const listed = getRoutes.filter(r => r.verifiedMode !== false)
-    const pending = listed.filter(r => /re-verification pending/.test(r.verifiedNote ?? ''))
-    expect(pending.length).toBeLessThanOrEqual(1)
+    // Every listed GET route must carry its paid-run evidence. by-ledger briefly
+    // sat listed-but-unverified during the 2026-08-18 launch; that window closed
+    // the same day, so the exception is gone and the bar is uniform again.
     for (const r of listed) {
-      expect(r.verifiedNote).toMatch(/charge-verified|re-verification pending/)
+      expect(r.verifiedNote).toMatch(/charge-verified/)
     }
   })
 })

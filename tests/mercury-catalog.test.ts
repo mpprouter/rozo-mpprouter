@@ -62,11 +62,10 @@ describe('Mercury catalog materialization', () => {
     // This is the honesty invariant — payable and verified are different claims.
     const byLedger = PUBLIC_SERVICE_ROUTES.find(r => r.id === 'mercury_events_by_ledger')!
     expect(byLedger.verifiedMode).toBe('charge')
-    // Tripwire: the moment the paid re-verification lands, chargeVerified /
-    // chargeVerifiedAt and the tx hash must be filled in and this note replaced.
-    // If this assertion starts failing because the note changed, that is the
-    // intended signal — update it together with the recorded tx hash.
-    expect(byLedger.verifiedNote).toMatch(/paid re-verification pending/)
+    // Re-verified 2026-08-18 with a real paid mainnet call, so it now carries the
+    // same evidence bar as the other three.
+    expect(byLedger.chargeVerified).toBe(true)
+    expect(byLedger.verifiedNote).toMatch(/charge-verified 2026-08-18/)
   })
 
   // P1 fix (codex review 2026-08-12): verifiedMode can only ever flip
