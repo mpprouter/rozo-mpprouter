@@ -62,10 +62,9 @@ const CREDENTIAL_RULES: readonly Rule[] = [
   //
   // A private key and a transaction hash are the SAME SHAPE — 64 hex chars —
   // so nothing in the string itself distinguishes them. We therefore redact by
-  // default (fail closed) and rely on the label-preservation pass above to
-  // exempt hashes their author explicitly labelled. An unlabelled 64-hex blob
-  // is treated as a key, because guessing wrong in that direction is the only
-  // one that leaks.
+  // default (fail closed) and exempt only values carrying one of the narrow
+  // compound labels in `HASH_LABEL`. An unlabelled 64-hex blob is treated as a
+  // key, because guessing wrong in that direction is the only one that leaks.
   { name: 'hex-private-key', pattern: /\b(?:0x)?[0-9a-fA-F]{64}\b/g, replacement: '[REDACTED:hex-key]' },
 
   // JWT (three base64url segments). Session and service tokens.
@@ -110,11 +109,19 @@ const CREDENTIAL_RULES: readonly Rule[] = [
     replacement: '$1$2$3[REDACTED]$3',
   },
 
-  // Unquoted assignments (env-file / log style), value ends at whitespace.
+  // Unquoted assignments (env-file / log style). The value ends at whitespace
+  // or a quote — NOT at `,` or `;`.
+  //
+  // Stopping at a comma left a usable suffix: `password=abc,def` redacted only
+  // `abc`, and secrets contain punctuation routinely. Quotes must still
+  // terminate, though: the quoted rule above runs first and rewrites JSON to
+  // `"KEY":"[REDACTED]"`, and JSON has no spaces between fields — a
+  // whitespace-only terminator would then swallow every remaining field in the
+  // object, redacting the non-secret context the alert exists to convey.
   {
     name: 'secret-assignment',
     pattern:
-      /\b([A-Za-z0-9_.-]*(?:secret|password|passwd|pwd|private[_-]?key|seed|mnemonic|phrase|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token)[A-Za-z0-9_.-]*)\s*(["']?\s*[:=]\s*["']?)([^\s,;}"']+)/gi,
+      /\b([A-Za-z0-9_.-]*(?:secret|password|passwd|pwd|private[_-]?key|seed|mnemonic|phrase|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|token)[A-Za-z0-9_.-]*)\s*(["']?\s*[:=]\s*["']?)([^\s"']+)/gi,
     replacement: '$1$2[REDACTED]',
   },
 
@@ -202,7 +209,27 @@ function maskEmail(match: string): string {
  * which `stringify` strips from input first, so it cannot be forged by
  * attacker-influenced content.
  */
-const HASH_LABEL = /\b((?:source_|destination_|payin_|payout_|refund_)?(?:tx|txid|transaction|hash|tx_hash|ledger|envelope_hash)[\s"']*[:=]?[\s"']*)((?:0x)?[0-9a-fA-F]{64})\b/gi
+/**
+ * Labels that exempt a 64-hex value from redaction.
+ *
+ * Deliberately NARROW, and narrowed further after codex review. An earlier
+ * version accepted the bare words `hash`, `tx` and `transaction`, and the
+ * module justified it with "a leaked key is never labelled tx_hash". That is
+ * an ASSUMPTION about attacker behaviour, not a boundary — and alert content
+ * is partly attacker-influenced (upstream error bodies reach alerts), so any
+ * text an attacker can steer could carry an exemption label.
+ *
+ * The list is now restricted to compound field names this codebase actually
+ * emits. A bare `hash:` or `transaction:` no longer exempts anything, so
+ * generic prose — which is the part an attacker can most easily influence —
+ * cannot buy an exemption. A separator is also REQUIRED (`=` or `:`), so a
+ * label merely appearing earlier in a sentence does not exempt a later value.
+ *
+ * Residual risk, stated rather than assumed away: if our own code ever writes
+ * a secret into a field literally named `tx_hash`, this preserves it. That is
+ * a narrow, auditable surface (`grep` the list), unlike the previous version.
+ */
+const HASH_LABEL = /\b((?:source_tx_hash|destination_tx_hash|payin_hash|payout_hash|refund_tx_hash|tx_hash|txid|ledger_hash|envelope_hash)["']?\s*[:=]\s*["']?)((?:0x)?[0-9a-fA-F]{64})\b/gi
 
 // NUL-delimited. `stringify` strips NUL from all input, so no attacker-supplied
 // content can forge a sentinel and smuggle arbitrary text past redaction.
