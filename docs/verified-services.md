@@ -202,6 +202,12 @@ was $2.
 **Result: 15 → 21 distinct verified services.** Tranche 2's commitment of 20 is
 met with one service of headroom.
 
+> **Superseded the same day: the figure is 20, not 21.** Two later delistings
+> on 2026-08-18 removed both anthropic routes (see the round below). Anthropic
+> was one of the 15 carried in, not one of the six added here, so the six
+> results above stand exactly as recorded — but the total they produced does
+> not. The commitment of 20 is still met, with zero headroom instead of one.
+
 #### Probed and rejected — did not pay
 
 These were free-probed first (Step 1 of `docs/SOP-provider-e2e-test.md`, costs
@@ -237,10 +243,116 @@ the Tranche 2 number. Cheap follow-ups whenever route coverage is the goal.
 
 ---
 
+### Run 2026-08-18 (later) — `anthropic_messages` re-probe → delisted
+
+A verification round whose result is a **removal**. Recorded in the same detail
+as a passing round, because a delisting carries the same burden of proof.
+
+**Why it was run.** Earlier that day `anthropic_chat_completions` was delisted:
+paid calls settled and then took a merchant-leg 403, so the router refunded
+instead of delivering. Its sibling `anthropic_messages` was deliberately *not*
+delisted with it, on the argument that it is a different upstream path settling
+through an installed Tempo channel (session dialect) rather than per-request
+charge. That argument was recorded as needing a paid re-probe, since the
+route's newest evidence was a 2026-08-09 paid call. This round is that probe.
+It also decided the headline number: anthropic was the only service keeping the
+count at 21.
+
+**Step 1 — free probe (no money).** `POST /v1/services/anthropic/messages`
+returned `HTTP 402` with a well-formed challenge: `intent="charge"`,
+`amount=10000` ($0.001), asset `CCW67TSZ...O7SJMI75`, recipient
+`GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB` — matching
+`/health.stellar.router_pool` and not on the compromised-address blacklist. The
+quote layer is healthy, which is exactly why a free probe cannot settle this
+question: the failure is downstream of payment.
+
+**Step 2 — paid calls.** Two, on purpose. A single failure could be a
+model-specific rejection, so a second current-generation id was run to rule that
+out. Payer masked `GD5R4H...BB4U`.
+
+| # | Model id | UTC | Amount | Stellar tx | Result |
+|---|---|---|---|---|---|
+| 1 | `claude-haiku-4-5` | 2026-08-18T09:47:30Z | $0.001 | `832cd4012991b9f4cca8a0d9ebfd18479d90c95697910e5d6b74d07961fc2152` | ❌ 502 — settled, merchant leg 403 |
+| 2 | `claude-sonnet-4-5` | 2026-08-18T09:48:03Z | $0.001 | `ef7984cdbb35162331db6d32920beb9dcd96cec60a0513419eba6a9fbda09b69` | ❌ 502 — settled, merchant leg 403 |
+
+Both returned a byte-identical body:
+
+```json
+{"error":"Merchant payment failed","status":403,
+ "detail":"{\n  \"error\": {\n    \"type\": \"forbidden\",\n    \"message\": \"Request not allowed\"\n  }\n}"}
+```
+
+Corroborated independently through `GET /v1/ledger?tx=<hash>`:
+
+```json
+{"order_id":"ord_msyhbhlk_byuqlwpt","service":"anthropic_messages","amount_usd":"0.001",
+ "status":"refund_pending","upstream_status":403}
+{"order_id":"ord_msyhc4td_mh24qvsr","service":"anthropic_messages","amount_usd":"0.001",
+ "status":"refund_pending","upstream_status":403}
+```
+
+**Verdict: delisted.** Two different current model ids failing identically rules
+out the stale-id explanation that rescued this provider back on 2026-08-09, and
+the error is the same `forbidden / Request not allowed` the charge route gets.
+The block therefore sits at the merchant/provider level, above both settlement
+dialects, and the session channel gives this route no immunity. `verifiedMode`
+is now `false`.
+
+**Consequence for the headline number: 21 → 20.** Anthropic had exactly one
+listed route left and now has none, so it drops out of the distinct-verified
+set. `tests/get-routes.test.ts` already anticipated this case in a comment and
+its independent `>= 20` assertion still passes — **the Tranche 2 commitment of
+"top 20 services verified payable" remains met, with zero headroom.** Payable
+routes: 447 → 446.
+
+**Total spend $0.002**, wallet delta `1.9884320 → 1.9864320 USDC` (exact).
+
+#### Refund timing — slower here than on the charge route
+
+Both calls were correctly classified `refund_pending` immediately, and the
+refund path did engage: order `ord_msyhbhlk_byuqlwpt` reached `refunded`, with
+the wallet independently confirming $0.001 coming back (`1.9864320` →
+`1.9874320`). **The money is not lost.** At `09:54Z`, roughly six and a half
+minutes after payment, the second order (`ord_msyhc4td_mh24qvsr`) was still
+`refund_pending`.
+
+Recorded only because it is slower than the one documented data point: the
+`anthropic_chat_completions` refund rehearsed earlier the same day completed on
+chain in **25 seconds** (`docs/grants/scf44/video2-refund-rehearsal.md` §2B,
+refund tx `9df9959e...191c0afb`). The visible difference is the settlement
+dialect — that route is `tempo.charge`, this one is `tempo.session`, whose
+failure path additionally rolls back the channel voucher before enqueuing the
+refund.
+
+Stated deliberately weakly: **two samples against one is not a latency
+regression**, the executor cron is `*/2 * * * *` so several minutes is not by
+itself anomalous, and this round did not wait long enough to establish an
+outer bound. The honest claim is "session-dialect refunds were observed taking
+minutes where the one charge-dialect measurement took seconds, worth a proper
+measurement sometime." Nothing was changed on the basis of it, and it does not
+affect the delisting either way: a route that refunds in 25 seconds and a route
+that refunds in ten minutes are both routes that did not deliver.
+
+#### Playground — evaluated, no change needed
+
+The question this round was meant to answer for the playground was whether the
+Claude tier could be repointed from the dead `chat_completions` route to
+`messages`. **It cannot: `messages` is dead too.** Nothing to reconnect, so
+neither playground switch is touched — `wrangler.toml`'s
+`PLAYGROUND_CHAT_MODELS_DISABLED = "anthropic,openai,gemini"` stays as-is, and
+the `available: false` entries in `src/playground/models.ts` stay as-is. They
+are now simply agreeing with reality on both routes rather than one. The
+flagship playground tier stays empty until the Anthropic merchant is fixed;
+`resolvePlaygroundRoute` refuses `verifiedMode: false` routes anyway, so the
+code switch would block the calls even if the env switch were cleared.
+
+---
+
 ## Changelog
 
 | Date | Who | Change |
 |---|---|---|
+| 2026-08-18 | agent ($0.02 cap, spent $0.002) | Paid re-probe of `anthropic_messages` (the route held back from that morning's delisting pending exactly this test): two calls on two current model ids, both settled then took the merchant's 403, so it is **delisted** and anthropic leaves the verified set. **21 → 20 distinct verified services** (Tranche 2's commitment of 20 still met, now with zero headroom); payable routes 447 → 446. Playground Claude tier evaluated for repointing to this route — not possible, no change made. Noted, not acted on: the refunds engaged correctly (the first confirmed `refunded` on chain, wallet credited) but ran minutes rather than the 25 s measured on the charge-dialect sibling that morning |
 | 2026-08-18 | agent ($2 cap, spent $0.081) | SCF #44 Tranche 2: charge-verified fal, alphavantage, openweather, deepl, mapbox, wolframalpha with real paid mainnet calls. **15 → 21 distinct verified services.** googlemaps deferred (all routes 404 on the deployed build — deploy lag); gemini stays delisted (merchant's Google key invalid, already evidenced by the 2026-08-09 paid re-test). Added a `tests/get-routes.test.ts` guard on the distinct-verified-service count that counts both `charge` and `session` dialects |
 | 2026-08-10 | agent (founder-approved, $1 cap) | Paid verification run: deepseek+tavily PASS, DALL·E upstream-fail, Gemini blocked. Added `verified-runs.json` tx-hash audit trail |
 | 2026-04-12 | muggledev | Smoke test 6/6 passed (3 mppx charge + 3 x402 exact). Deployed `stellarIntentsFor` fix to production |

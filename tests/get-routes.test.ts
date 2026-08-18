@@ -138,7 +138,14 @@ describe('GET routes — build', () => {
     // re-probes showed the merchant leg failing 403 after the payment settled,
     // so every call refunded instead of delivering. Moving this number DOWN is
     // the mechanism working, not a regression.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(447)
+    //
+    // 447 → 446 later the same day: anthropic_messages delisted for the same
+    // reason. It was held back from the first delisting because it settles via
+    // a Tempo channel on a different upstream path; the paid re-probe that
+    // condition was waiting on returned the identical merchant 403 on two
+    // different current model ids (txs 832cd401...fc2152, ef7984cd...da09b69),
+    // so the distinction did not hold. Anthropic now has no listed route.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(446)
     // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
     // events/by-ledger joined them at the beta launch (see the note above).
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
@@ -171,18 +178,24 @@ describe('GET routes — build', () => {
     // service has broken; update this comment with which one and why.
     //
     // 2026-08-18: anthropic chat_completions was delisted (pay-then-403) and
-    // the count did NOT move. That is correct, not a loophole: the unit here
-    // is the SERVICE, and anthropic still has a verified route —
-    // anthropic_messages, a different upstream path that settles through an
-    // installed Tempo channel. Its last paid evidence is 2026-08-09; if a
-    // re-probe shows it broken too, anthropic leaves this set and the number
-    // becomes 20.
+    // the count did NOT move. That was correct, not a loophole: the unit here
+    // is the SERVICE, and anthropic still had a verified route —
+    // anthropic_messages, a different upstream path settling through an
+    // installed Tempo channel — whose last paid evidence was 2026-08-09. The
+    // note left here said that if a re-probe showed it broken too, anthropic
+    // leaves this set and the number becomes 20.
+    //
+    // 21 → 20 on 2026-08-18: that re-probe was run and it did show exactly
+    // that. Two paid mainnet calls on current model ids both settled and then
+    // took the same merchant 403 as the charge route, so anthropic has no
+    // verified route left and drops out of this set. The commitment is still
+    // met, with zero headroom rather than one service of it.
     const verifiedServices = new Set(
       PUBLIC_SERVICE_ROUTES.filter(
         r => r.verifiedMode === 'charge' || r.verifiedMode === 'session',
       ).map(r => r.service),
     )
-    expect(verifiedServices.size).toBe(21)
+    expect(verifiedServices.size).toBe(20)
     // The commitment itself, stated independently of the exact figure above,
     // so a future delisting that drops us under 20 fails loudly.
     expect(verifiedServices.size).toBeGreaterThanOrEqual(20)

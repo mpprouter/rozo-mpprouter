@@ -42,8 +42,27 @@
    "price": "dynamic",
    "public_path": "/v1/services/anthropic/messages",
    "charge_verified_at": null,
-   "session_verified_at": "2026-08-09T04:28:00Z",
-   "runs": []
+   "session_verified_at": null,
+   "runs": [
+    {
+     "date": "2026-08-18",
+     "result": "fail",
+     "http": 502,
+     "amount_usd": "0.001",
+     "tx": "832cd4012991b9f4cca8a0d9ebfd18479d90c95697910e5d6b74d07961fc2152",
+     "note": "model claude-haiku-4-5. Payment settled 09:47:30Z, merchant leg returned 403 forbidden ('Request not allowed'), router replied 502. Ledger order ord_msyhbhlk_byuqlwpt, upstream_status 403, refund confirmed refunded on chain (wallet credited back $0.001)."
+    },
+    {
+     "date": "2026-08-18",
+     "result": "fail",
+     "http": 502,
+     "amount_usd": "0.001",
+     "tx": "ef7984cdbb35162331db6d32920beb9dcd96cec60a0513419eba6a9fbda09b69",
+     "note": "model claude-sonnet-4-5, run to rule out a model-specific rejection. Payment settled 09:48:03Z, byte-identical merchant 403, router 502. Ledger order ord_msyhc4td_mh24qvsr, upstream_status 403, refund_status refund_pending as of 09:54Z."
+    }
+   ],
+   "delisted_at": "2026-08-18",
+   "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), identical to the chat_completions sibling delisted earlier the same day. Two current model ids were tried (claude-haiku-4-5, claude-sonnet-4-5) to rule out a stale id; both failed the same way, so the session dialect and separate upstream path did not make this route immune. verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Anthropic now has no listed route, taking the distinct-verified-service count from 21 to 20. Re-verify with a paid call returning a completion before relisting."
   },
   {
    "id": "coingecko_simple_price",
