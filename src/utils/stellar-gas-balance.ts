@@ -311,6 +311,14 @@ export async function writeState(kv: KVNamespace, state: PersistedState): Promis
  *
  * When no alert is due, the state is committed immediately: those writes carry
  * no risk of being lost mid-notification.
+ *
+ * DELIVERY SEMANTICS ARE AT-LEAST-ONCE, ON PURPOSE. If the alert is delivered
+ * but the commit then fails, the next tick sends it again; two overlapping
+ * cron invocations can likewise both read the old state and both send. The
+ * alternative ordering gives at-most-once, whose failure mode is a monitor
+ * that never speaks again — which is precisely the gap this file was written
+ * to close. A duplicate notification costs someone five seconds; a silent
+ * monitor costs an outage. Do not "fix" the duplicate by committing first.
  */
 export async function checkGasSponsor(args: {
   kv: KVNamespace
