@@ -196,6 +196,19 @@ export interface Env {
   // Set via: wrangler secret put MPP_SECRET_KEY
   MPP_SECRET_KEY: string
 
+  // Stellar S... seed whose Ed25519 key signs refund receipts. Deliberately a
+  // DEDICATED key, not STELLAR_ROUTER_PUBLIC's (that secret is never in the
+  // Worker) and not MPP_SECRET_KEY: a receipt signer holds no funds and grants
+  // no 402 authority, so it can live in the request path.
+  //
+  // Its public address is published on /health as `receipt_signer`, which is
+  // what lets anyone verify a receipt without trusting us. Unset ⇒ the signed
+  // receipt endpoint fails closed with 503 rather than emitting an
+  // unverifiable receipt.
+  //
+  // Set via: wrangler secret put RECEIPT_SIGNING_SECRET
+  RECEIPT_SIGNING_SECRET?: string
+
   // Config
   //
   // OPTIMISTIC_THRESHOLD (UNUSED, 2026-04-10): this env var is declared

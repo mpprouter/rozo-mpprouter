@@ -4,6 +4,7 @@
  */
 
 import type { Env } from '../index'
+import { receiptSignerAddress } from '../refund/receipt-signer'
 
 export async function handleHealth(env: Env): Promise<Response> {
   const results: Record<string, any> = {
@@ -15,6 +16,11 @@ export async function handleHealth(env: Env): Promise<Response> {
     router_pool: env.STELLAR_ROUTER_PUBLIC,    // receives agent USDC via mppx
     gas_sponsor: env.STELLAR_GAS_PUBLIC,       // pays tx fees
     network: env.STELLAR_NETWORK,
+    // Public G... address whose Ed25519 key signs refund receipts. Published
+    // so third parties can verify receipts against it; derived from the secret
+    // rather than configured separately so it can never drift from the key
+    // that actually signs. Undefined ⇒ receipt signing is not configured.
+    receipt_signer: receiptSignerAddress(env.RECEIPT_SIGNING_SECRET),
   }
 
   // Tempo address

@@ -1,6 +1,7 @@
 import type { Env } from '../index'
 import { completeRefund, leaseRefund, listRefunds, readRefund, readRefundByPublicId, requeueMalformedRefund } from '../refund/refund'
 import { hasSorobanTransactionData, isProvablyDeadEnvelope, validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
+import { ReceiptSigningUnavailable, signReceipt } from '../refund/receipt-signer'
 import { rpc } from '@stellar/stellar-sdk'
 
 function json(body: unknown, status = 200): Response {
@@ -15,7 +16,7 @@ function authorized(request: Request, env: Env): boolean {
   )
 }
 
-async function signedReceipt(env: Env, record: NonNullable<Awaited<ReturnType<typeof readRefund>>>) {
+function signedReceipt(env: Env, record: NonNullable<Awaited<ReturnType<typeof readRefund>>>) {
   const receipt = {
     version: 1,
     payment_id: record.payment.paymentId,
@@ -32,20 +33,25 @@ async function signedReceipt(env: Env, record: NonNullable<Awaited<ReturnType<ty
     iat: record.createdAt,
     exp: new Date(Date.parse(record.createdAt) + 86_400_000).toISOString(),
   }
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(env.MPP_SECRET_KEY), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'],
-  )
-  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(JSON.stringify(receipt)))
-  const encoded = btoa(String.fromCharCode(...new Uint8Array(signature)))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-  return { receipt, signature: encoded, algorithm: 'HS256' }
+  return signReceipt(receipt, env.RECEIPT_SIGNING_SECRET)
 }
 
 export async function handleRefundStatus(env: Env, publicId: string): Promise<Response> {
   if (!/^[0-9a-f-]{36}$/.test(publicId)) return json({ error: 'Not found' }, 404)
   const record = await readRefundByPublicId(env, publicId)
   if (!record) return json({ error: 'Not found' }, 404)
-  if (record.state === 'confirmed') return json(await signedReceipt(env, record))
+  if (record.state === 'confirmed') {
+    try {
+      return json(signedReceipt(env, record))
+    } catch (error) {
+      // Fail closed: an unsigned "receipt" would be indistinguishable from a
+      // forgery, so we would rather return nothing than something unverifiable.
+      if (error instanceof ReceiptSigningUnavailable) {
+        return json({ error: 'Receipt signing unavailable' }, 503)
+      }
+      throw error
+    }
+  }
   return json({
     version: 1,
     refund_id: record.publicId,
