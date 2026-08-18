@@ -519,11 +519,22 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
     fixedPricing: { amountUsd: '0.001' },
     rateLimit: { perDay: 1000 },
-    verifiedMode: false,
-    launchGate: 'MERCURY_LAUNCH_MODE',
+    // 2026-08-18 beta launch (founder call). GET routes default to
+    // verifiedMode:false, so 'charge' is the only value that makes this payable —
+    // there is no "payable but unverified" tier available here. That means the
+    // catalog reads `verified` from the moment this deploys, BEFORE the paid
+    // re-verification runs. Accepted deliberately, with the window kept to minutes:
+    // deploy, run the paid probe immediately, and if it fails set this straight back
+    // to `false` and redeploy. Do not leave it in this state unverified.
+    verifiedMode: 'charge',
     verifiedNote:
-      'DISABLED: Mercury mainnet /rest/events/by-ledger observed slow (40s+) and 500 on ' +
-      '2026-08-11 paid verify attempt; filed with provider. Other 3 mercury routes are charge-verified.',
+      'Mercury MVP (~3mo token, renew by ~2026-11-12). Was DISABLED after the 2026-08-11 paid ' +
+      'verify attempt saw slow (40s+) / 500 responses on mainnet /rest/events/by-ledger. ' +
+      'Provider diagnosed it as a query-plan issue on ledger ranges away from the chain tip and ' +
+      'shipped a fix on 2026-08-15. Relisted for the beta launch; paid re-verification pending — ' +
+      'record the tx hash here and in docs/verified-services.md once it lands. ' +
+      'NOTE: very wide ledger ranges remain bounded by a server-side timeout by design, so ' +
+      'verification must use a narrow range. $0.001/call, 1,000/day cap, router-held credential.',
   },
   'mercury::GET::/txs/by-contract/{contract_id}': {
     upstreamPath: '/rest/txs/by-contract/{contract_id}',

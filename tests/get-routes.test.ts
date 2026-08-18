@@ -128,18 +128,33 @@ describe('GET routes — build', () => {
     // an async job id that never resolves, so a 202 alone is not delivery.
     // 447 as of 2026-08-11: +3 mercury GET routes charge-verified with real
     // paid mainnet calls (tx hashes in docs/verified-services.md); the 4th
-    // (events/by-ledger) stays delisted — upstream 500/slow on the paid attempt.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(447)
-    expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(3)
+    // (events/by-ledger) stayed delisted — upstream 500/slow on the paid attempt.
+    //
+    // 448 as of 2026-08-18 (founder call, beta launch): events/by-ledger relisted
+    // after Mercury shipped the ledger-range query-plan fix on 2026-08-15. Its paid
+    // re-verification had NOT run at the time this count changed — see its
+    // verifiedNote. If that probe fails, drop this back to 447 and set the route to
+    // verifiedMode:false.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(448)
+    // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
+    // events/by-ledger joined them at the beta launch (see the note above).
+    expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
   })
 
   it('explains in verifiedNote why each gated-off GET route is gated', () => {
     for (const r of getRoutes.filter(r => r.verifiedMode === false)) {
       expect(r.verifiedNote).toMatch(/not been real-money verified|DISABLED/i)
     }
-    // verified GET routes must carry the paid-run evidence instead
-    for (const r of getRoutes.filter(r => r.verifiedMode !== false)) {
-      expect(r.verifiedNote).toMatch(/charge-verified/)
+    // Listed GET routes must carry the paid-run evidence — or, for a route
+    // listed ahead of its probe, say so explicitly. The second branch is a
+    // deliberate, narrow exception (2026-08-18 beta launch of mercury
+    // events/by-ledger) and it is bounded: exactly one route may sit in it,
+    // so a second unverified listing fails this test rather than sliding in.
+    const listed = getRoutes.filter(r => r.verifiedMode !== false)
+    const pending = listed.filter(r => /re-verification pending/.test(r.verifiedNote ?? ''))
+    expect(pending.length).toBeLessThanOrEqual(1)
+    for (const r of listed) {
+      expect(r.verifiedNote).toMatch(/charge-verified|re-verification pending/)
     }
   })
 })
