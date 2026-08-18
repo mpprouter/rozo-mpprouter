@@ -8,6 +8,8 @@
  * so alert failures can't break the request path.
  */
 
+import type { RedactedAlert } from './alert-redaction'
+
 const DINGTALK_WEBHOOK_URL = 'https://oapi.dingtalk.com/robot/send'
 
 interface DingTalkTextMessage {
@@ -15,9 +17,15 @@ interface DingTalkTextMessage {
   text: { content: string }
 }
 
+/**
+ * `content` is a `RedactedAlert`, not a `string`. Only `redactForAlert` can
+ * produce that type, so there is no call site — present or future — that can
+ * reach this transport with unredacted text. See `utils/alert-redaction.ts`
+ * (threat `Info.1`).
+ */
 export async function sendDingTalkAlert(
   accessToken: string,
-  content: string,
+  content: RedactedAlert,
 ): Promise<void> {
   try {
     const url = `${DINGTALK_WEBHOOK_URL}?access_token=${accessToken}`

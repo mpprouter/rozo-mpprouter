@@ -8,6 +8,7 @@ import {
   loadStripeRecordForStatus,
   pickStripeRouterStateSafe,
 } from './stripe-fulfillment'
+import { redactForAlert } from '../utils/alert-redaction'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -265,7 +266,7 @@ export async function sendInvoiceFailureAlert(
       )
       return
     }
-    await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, buildInvoiceFailureAlert(params))
+    await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, redactForAlert(buildInvoiceFailureAlert(params)))
   } catch (err) {
     console.warn(
       `[webhook] invoice failure alert error (non-fatal): ${

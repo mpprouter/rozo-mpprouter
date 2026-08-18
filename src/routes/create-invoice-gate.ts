@@ -25,6 +25,7 @@
 import type { Env } from '../index'
 import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
 import { sendDingTalkAlert } from '../utils/dingtalk'
+import { redactForAlert } from '../utils/alert-redaction'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 // Per-IP invoice creations per hour. A real payer creates one (occasionally a
@@ -130,7 +131,7 @@ export async function checkCreateInvoiceGate(request: Request, env: Env): Promis
       if (globalCount === GLOBAL_LIMIT_PER_HOUR + 1 && env.DINGTALK_ACCESS_TOKEN) {
         await sendDingTalkAlert(
           env.DINGTALK_ACCESS_TOKEN,
-          `[MPP Router] 🚨 create-invoice global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} invoice creations this hour. New invoice creation paused for the window.`,
+          redactForAlert(`[MPP Router] 🚨 create-invoice global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} invoice creations this hour. New invoice creation paused for the window.`),
         )
       }
       return { ok: false, reason: 'global_circuit_open' }
