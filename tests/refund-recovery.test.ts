@@ -24,6 +24,7 @@ import {
   REFUND_TX_MIN_TIME_GRACE_SECONDS,
   REFUND_TX_VALIDITY_SECONDS,
   RefundSequenceGuard,
+  consumesSequence,
   reportStuckRefunds,
   runRefundSigner,
   type Env as SignerEnv,
@@ -38,7 +39,12 @@ import {
   unparkRefund,
   type RefundRecord,
 } from '../src/refund/refund'
-import { selectStuckRefunds, STUCK_REFUND_THRESHOLD_MS } from '../src/routes/refunds'
+import {
+  handleRefundAdmin,
+  selectStuckRefunds,
+  MAX_STUCK_REFUNDS,
+  STUCK_REFUND_THRESHOLD_MS,
+} from '../src/routes/refunds'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import type { Env } from '../src/index'
 
@@ -154,6 +160,64 @@ describe('unparkRefund — manual_review is no longer terminal', () => {
   })
 })
 
+// ── unpark endpoint: credential boundary and input handling ──────────────────
+
+describe('POST /admin/refunds/unpark', () => {
+  function tokenEnv(): Env {
+    return {
+      ATOMIC_STORE: makeAtomicStoreMock(),
+      ADMIN_TOKEN: 'admin-token',
+      REFUND_EXECUTOR_TOKEN: 'executor-token',
+    } as unknown as Env
+  }
+
+  function call(env: Env, token: string | null, payload: unknown): Promise<Response> {
+    const url = new URL('https://router.test/admin/refunds/unpark')
+    return handleRefundAdmin(new Request(url, {
+      method: 'POST',
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      body: JSON.stringify(payload),
+    }), env, url)
+  }
+
+  it('refuses the executor credential: the machine cannot overturn manual review', async () => {
+    const env = tokenEnv()
+    const record = await parked(env)
+    // The signer holds this token alongside the router's Stellar signing key,
+    // and manual_review exists to take a decision away from it.
+    expect((await call(env, 'executor-token', { refundId: record.refundId })).status).toBe(401)
+    expect((await call(env, null, { refundId: record.refundId })).status).toBe(401)
+    expect((await readRefund(env, record.refundId))?.state).toBe('manual_review')
+
+    expect((await call(env, 'admin-token', { refundId: record.refundId })).status).toBe(200)
+    expect((await readRefund(env, record.refundId))?.state).toBe('pending')
+  })
+
+  it('resolves a payment hash to its refund and rejects a malformed one', async () => {
+    const env = tokenEnv()
+    const paymentTx = 'a'.repeat(64)
+    await parked(env, paymentTx)
+
+    expect((await call(env, 'admin-token', { paymentTx: 'nope' })).status).toBe(400)
+    expect((await call(env, 'admin-token', {})).status).toBe(400)
+
+    const response = await call(env, 'admin-token', { paymentTx: paymentTx.toUpperCase() })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toMatchObject({ ok: true, changed: true })
+  })
+
+  it('reports 404 for an unknown refund and 409 for a state it must not touch', async () => {
+    const env = tokenEnv()
+    expect((await call(env, 'admin-token', { paymentTx: 'b'.repeat(64) })).status).toBe(404)
+
+    const live = await enqueueRefund(env, {
+      proof: proofFor('c'.repeat(64)), reason: 'non_fulfillment', merchant: 'm', routeId: 'r',
+    })
+    await leaseRefund(env, live.refundId, 'l')
+    expect((await call(env, 'admin-token', { refundId: live.refundId })).status).toBe(409)
+  })
+})
+
 // ── P1: stuck-refund alerting ────────────────────────────────────────────────
 
 describe('selectStuckRefunds', () => {
@@ -189,6 +253,37 @@ describe('selectStuckRefunds', () => {
     const justOver = record({ createdAt: new Date(now - STUCK_REFUND_THRESHOLD_MS).toISOString() })
     expect(selectStuckRefunds([justUnder], now)).toEqual([])
     expect(selectStuckRefunds([justOver], now)).toHaveLength(1)
+  })
+
+  it('caps how much a fleet-wide outage can turn one cron tick into', () => {
+    const many = Array.from({ length: MAX_STUCK_REFUNDS + 20 }, (_unused, index) =>
+      record({ refundId: `r${index}`, createdAt: new Date(now - (11 + index) * 60_000).toISOString() }))
+    const stuck = selectStuckRefunds(many, now)
+    expect(stuck).toHaveLength(MAX_STUCK_REFUNDS)
+    // Oldest first, so truncation drops the least-stranded refunds.
+    expect(stuck[0].refundId).toBe(`r${MAX_STUCK_REFUNDS + 19}`)
+  })
+})
+
+describe('GET /admin/refunds/stuck', () => {
+  function call(token: string, query = ''): Promise<Response> {
+    const url = new URL(`https://router.test/admin/refunds/stuck${query}`)
+    return handleRefundAdmin(new Request(url, { headers: { authorization: `Bearer ${token}` } }), {
+      ATOMIC_STORE: makeAtomicStoreMock(), ADMIN_TOKEN: 'admin-token', REFUND_EXECUTOR_TOKEN: 'executor-token',
+    } as unknown as Env, url)
+  }
+
+  it('refuses a threshold below one minute rather than dumping every refund ever', async () => {
+    expect((await call('admin-token', '?minutes=0')).status).toBe(400)
+    expect((await call('admin-token', '?minutes=-5')).status).toBe(400)
+    expect((await call('admin-token', '?minutes=abc')).status).toBe(400)
+    expect((await call('admin-token', '?minutes=1')).status).toBe(200)
+  })
+
+  it('is readable by the executor, which is the sweep that consumes it', async () => {
+    const response = await call('executor-token')
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ jobs: [], truncated: false })
   })
 })
 
@@ -266,6 +361,17 @@ describe('RefundSequenceGuard', () => {
     const id = Keypair.random().publicKey()
     expect(new RefundSequenceGuard().advance(new Account(id, '7')).sequenceNumber()).toBe('7')
   })
+
+  it('only counts a sequence as consumed when the network actually took it', () => {
+    // PENDING/DUPLICATE consumed the sequence. TRY_AGAIN_LATER is
+    // backpressure and ERROR is rejection: neither did, and advancing on
+    // either would leave a gap that wedges every later refund in the run.
+    expect(consumesSequence('PENDING')).toBe(true)
+    expect(consumesSequence('DUPLICATE')).toBe(true)
+    expect(consumesSequence('TRY_AGAIN_LATER')).toBe(false)
+    expect(consumesSequence('ERROR')).toBe(false)
+    expect(consumesSequence('SOME_FUTURE_STATUS')).toBe(false)
+  })
 })
 
 // ── end-to-end signer behaviour: time bounds + back-to-back sequences ────────
@@ -288,7 +394,7 @@ function paymentEnvelope(payer: string, recipient: string, amount: string): Tran
  * transaction submitted a moment earlier. This is the shape that killed the
  * second of two back-to-back refunds.
  */
-function signerHarness(signer: Keypair, amounts: string[]) {
+function signerHarness(signer: Keypair, amounts: string[], sendStatus: (index: number) => string = () => 'PENDING') {
   const jobs = amounts.map((amount, index) => {
     const payer = Keypair.random().publicKey()
     const payment = paymentEnvelope(payer, signer.publicKey(), amount)
@@ -313,8 +419,9 @@ function signerHarness(signer: Keypair, amounts: string[]) {
       fee: '100', sorobanData: new SorobanDataBuilder().build(),
     }).build(),
     sendTransaction: async (tx) => {
+      const status = sendStatus(submitted.length)
       submitted.push(tx as Transaction)
-      return { status: 'PENDING', hash: (tx as Transaction).hash().toString('hex'), latestLedger: 1, latestLedgerCloseTime: 1 } as rpc.Api.SendTransactionResponse
+      return { status, hash: (tx as Transaction).hash().toString('hex'), latestLedger: 1, latestLedgerCloseTime: 1 } as unknown as rpc.Api.SendTransactionResponse
     },
     getTransaction: async (hash: string) => ({
       status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 123,
@@ -380,5 +487,21 @@ describe('signed refund envelopes', () => {
     expect(submitted[0].sequence).toBe('101')
     expect(submitted[1].sequence).toBe('102')
     expect(ledger.markConfirmed).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not burn a sequence on backpressure, which would gap every later refund', async () => {
+    const signer = Keypair.random()
+    // TRY_AGAIN_LATER means the network never took the transaction. If the
+    // guard advanced here, refund #2 would be signed at 102 over an unused
+    // 101 and be rejected until the skipped envelope somehow landed.
+    const { env, server, ledger, submitted } = signerHarness(
+      signer, ['10000', '20000'], (index) => (index === 0 ? 'TRY_AGAIN_LATER' : 'PENDING'),
+    )
+
+    await runRefundSigner(env, ledger, server)
+
+    expect(submitted).toHaveLength(2)
+    expect(submitted[0].sequence).toBe('101')
+    expect(submitted[1].sequence).toBe('101')
   })
 })

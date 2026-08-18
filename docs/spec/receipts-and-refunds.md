@@ -99,12 +99,17 @@ to `manual_review`. `confirmed` is only reached after Stellar reports the
 transaction successful; the router does not treat submission as completion.
 
 `manual_review` is a diversion, **not** a dead end. `POST /admin/refunds/unpark`
-(operator token; addressable by `refundId` or by the `paymentTx` printed on the
-public ledger row) returns a parked refund to `pending`, discarding its stale
+returns a parked refund to `pending`, discarding its stale
 envelope so the executor signs a fresh one. It is idempotent, records an
 `admin_unpark` audit event on the refund, and permits no other transition —
 `confirmed`, `submitted` and `leased` refunds are refused, so it can never
 re-send money that already went back or steal a job from a live lease.
+
+It is addressable by `refundId` or by the `paymentTx` printed on the public
+ledger row, and it requires the operator's own `ADMIN_TOKEN` — unlike every
+other refund admin route, the signer's `REFUND_EXECUTOR_TOKEN` is refused.
+`manual_review` exists to take a decision away from the automated path, so the
+credential that path carries must not be able to reverse it.
 
 Two properties keep a transient network fault from becoming a stranded refund
 in the first place: signed envelopes are valid for **ten minutes**, comfortably

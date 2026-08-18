@@ -18,12 +18,31 @@ function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } })
 }
 
+function bearer(request: Request): string | undefined {
+  return request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
+}
+
 function authorized(request: Request, env: Env): boolean {
-  const supplied = request.headers.get('authorization')?.replace(/^Bearer\s+/i, '')
+  const supplied = bearer(request)
   return !!supplied && (
     (!!env.REFUND_EXECUTOR_TOKEN && supplied === env.REFUND_EXECUTOR_TOKEN) ||
     (!!env.ADMIN_TOKEN && supplied === env.ADMIN_TOKEN)
   )
+}
+
+/**
+ * Stricter than `authorized`: the executor token is NOT accepted.
+ *
+ * The refund signer holds `REFUND_EXECUTOR_TOKEN` alongside the router's
+ * Stellar signing key, and `manual_review` exists precisely to stop that
+ * automated path from retrying a refund on its own judgement. Letting the
+ * executor credential unpark would hand the machine the power to overturn the
+ * human review boundary it was diverted to, so unpark requires the operator's
+ * own `ADMIN_TOKEN`.
+ */
+function adminAuthorized(request: Request, env: Env): boolean {
+  const supplied = bearer(request)
+  return !!supplied && !!env.ADMIN_TOKEN && supplied === env.ADMIN_TOKEN
 }
 
 function signedReceipt(env: Env, record: NonNullable<Awaited<ReturnType<typeof readRefund>>>) {
@@ -83,6 +102,22 @@ export async function handleRefundStatus(env: Env, publicId: string): Promise<Re
  */
 export const STUCK_REFUND_THRESHOLD_MS = 10 * 60_000
 
+/**
+ * Floor on the `minutes` override. Without it `minutes=0` turns this into
+ * "return every unconfirmed refund ever recorded", an unbounded scan-and-
+ * serialize that both the executor and admin credentials could pull in a loop.
+ * The endpoint reports faults, so it never needs to look inside the window a
+ * healthy refund legitimately occupies.
+ */
+export const MIN_STUCK_REFUND_THRESHOLD_MS = 60_000
+
+/**
+ * Cap on rows returned. An alert sweep needs to know THAT refunds are stuck,
+ * not to enumerate them; a fleet-wide outage must not turn every cron tick
+ * into a megabyte response. Truncation is reported so it is never silent.
+ */
+export const MAX_STUCK_REFUNDS = 50
+
 export interface StuckRefund {
   refundId: string
   publicId: string
@@ -110,12 +145,14 @@ export function selectStuckRefunds(
   records: RefundRecord[],
   now: number,
   thresholdMs: number = STUCK_REFUND_THRESHOLD_MS,
+  limit: number = MAX_STUCK_REFUNDS,
 ): StuckRefund[] {
   return records
     .filter((record) => record.state !== 'confirmed')
     .map((record) => ({ record, ageMs: now - Date.parse(record.createdAt) }))
     .filter(({ ageMs }) => Number.isFinite(ageMs) && ageMs >= thresholdMs)
     .sort((a, b) => b.ageMs - a.ageMs)
+    .slice(0, limit)
     .map(({ record, ageMs }) => ({
       refundId: record.refundId,
       publicId: record.publicId,
@@ -141,16 +178,20 @@ export async function handleRefundAdmin(request: Request, env: Env, url: URL): P
     let thresholdMs = STUCK_REFUND_THRESHOLD_MS
     if (minutesRaw !== null) {
       const minutes = Number(minutesRaw)
-      if (!Number.isFinite(minutes) || minutes < 0) return json({ error: 'minutes must be a non-negative number' }, 400)
+      if (!Number.isFinite(minutes) || minutes * 60_000 < MIN_STUCK_REFUND_THRESHOLD_MS) {
+        return json({ error: 'minutes must be a number no smaller than 1' }, 400)
+      }
       thresholdMs = minutes * 60_000
     }
-    return json({ jobs: selectStuckRefunds(await listRefunds(env), Date.now(), thresholdMs) })
+    const jobs = selectStuckRefunds(await listRefunds(env), Date.now(), thresholdMs)
+    return json({ jobs, truncated: jobs.length === MAX_STUCK_REFUNDS })
   }
   // Unpark is addressable by the on-chain payment hash, because that is the
   // only identifier an operator can read off the public ledger row. Parsed
   // ahead of the shared body guard below, which requires a leaseId that an
   // out-of-band recovery has no way to hold.
   if (url.pathname === '/admin/refunds/unpark' && request.method === 'POST') {
+    if (!adminAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401)
     const payload = await request.json().catch(() => null) as any
     const paymentTx = typeof payload?.paymentTx === 'string' ? payload.paymentTx.toLowerCase() : null
     if (paymentTx !== null && !/^[0-9a-f]{64}$/.test(paymentTx)) {

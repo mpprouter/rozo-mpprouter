@@ -111,11 +111,26 @@ export class RefundSequenceGuard {
     return account
   }
 
-  /** Records a sequence consumed by a transaction the network did NOT reject. */
+  /** Records a sequence the network actually consumed. See `consumesSequence`. */
   recordAccepted(sequence: string | bigint): void {
     const value = BigInt(sequence)
     if (this.lastAccepted === undefined || value > this.lastAccepted) this.lastAccepted = value
   }
+}
+
+/**
+ * Whether a `sendTransaction` status means the network took the sequence
+ * number, which is a narrower question than "did this fail".
+ *
+ * `PENDING` and `DUPLICATE` consumed it. `ERROR` did not, and neither does
+ * `TRY_AGAIN_LATER` — that is backpressure, the transaction was never
+ * accepted, and advancing on it would leave a GAP: the next refund would be
+ * signed one sequence too high and be rejected until the skipped envelope
+ * finally lands. Defaulting to false keeps any future status the SDK adds on
+ * the safe side, since a stale sequence is retried while a gap wedges the run.
+ */
+export function consumesSequence(status: string): boolean {
+  return status === 'PENDING' || status === 'DUPLICATE'
 }
 
 export interface RefundLedger {
@@ -353,7 +368,7 @@ async function confirmSubmitted(
       await onRejected(refundTx, String(send.errorResult ?? send.status))
       throw new Error(`submitted refund rejected and parked: ${refundTx}`)
     }
-    sequence.recordAccepted(tx.sequence)
+    if (consumesSequence(send.status)) sequence.recordAccepted(tx.sequence)
     await waitForTransaction(server, refundTx)
   }
   await beforeRouterConfirm(refundTx)
@@ -398,7 +413,7 @@ async function executePending(
     await onRejected(refundTx, String(send.errorResult ?? send.status))
     throw new Error(`refund transaction rejected and parked: ${refundTx}`)
   }
-  sequence.recordAccepted(prepared.sequence)
+  if (consumesSequence(send.status)) sequence.recordAccepted(prepared.sequence)
   await waitForTransaction(server, refundTx)
   await beforeRouterConfirm(refundTx)
   await routerApi(env, '/admin/refunds/confirm', {
