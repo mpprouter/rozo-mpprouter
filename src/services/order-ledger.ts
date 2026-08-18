@@ -46,8 +46,18 @@ export interface OrderLedgerEntry {
   refund_status: RefundStatus
 }
 
-function orderKey(orderId: string): string {
+export function orderKey(orderId: string): string {
   return `mercury_order:${orderId}`
+}
+
+/**
+ * Secondary index: settlement tx hash -> order id. Exists so the public
+ * `GET /v1/ledger?tx=<hash>` lookup is one KV read instead of a scan over
+ * the entire order keyspace. Lowercased so a caller's casing never decides
+ * whether the row is found.
+ */
+export function txIndexKey(tx: string): string {
+  return `mercury_order_tx:${tx.toLowerCase()}`
 }
 
 /** Best-effort id — collision risk is irrelevant for an append-only audit log keyed by its own id. */
@@ -69,6 +79,15 @@ export async function recordOrder(env: Env, entry: OrderLedgerEntry): Promise<vo
       // W5) plus slack for provider weekly-report backfill runs.
       expirationTtl: 400 * 24 * 60 * 60,
     })
+    // Secondary index for GET /v1/ledger?tx=<hash>. Same TTL as the record it
+    // points at, so the index can never outlive its target and hand out a
+    // dangling id. Written second and in the same try: if it fails the record
+    // itself still exists and is reachable by paging.
+    if (entry.settlement_ref) {
+      await env.MPP_STORE.put(txIndexKey(entry.settlement_ref), entry.order_id, {
+        expirationTtl: 400 * 24 * 60 * 60,
+      })
+    }
   } catch (err: any) {
     console.error(`[order-ledger] write failed for ${entry.order_id}: ${err.message}`)
   }
