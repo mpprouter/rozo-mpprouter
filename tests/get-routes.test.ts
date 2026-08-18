@@ -128,17 +128,67 @@ describe('GET routes — build', () => {
     // an async job id that never resolves, so a 202 alone is not delivery.
     // 447 as of 2026-08-11: +3 mercury GET routes charge-verified with real
     // paid mainnet calls (tx hashes in docs/verified-services.md); the 4th
-    // (events/by-ledger) stays delisted — upstream 500/slow on the paid attempt.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(447)
-    expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(3)
+    // (events/by-ledger) stayed delisted — upstream 500/slow on the paid attempt.
+    //
+    // 448 as of 2026-08-18: events/by-ledger relisted after Mercury shipped the
+    // ledger-range query-plan fix on 2026-08-15, and charge-verified the same day
+    // with a real paid mainnet call (tx 5028a601...4f0d).
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(448)
+    // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
+    // events/by-ledger joined them at the beta launch (see the note above).
+    expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
+  })
+
+  it('keeps the SCF #44 Tranche 2 count of distinct verified services', () => {
+    // SCF #44 Tranche 2 commits to "top 20 services verified payable". The
+    // unit of that promise is the SERVICE, not the route — several services
+    // have many verified routes and most have exactly one — so this counts
+    // distinct `service` ids, not routes.
+    //
+    // A route counts as verified only when `verifiedMode` names a settlement
+    // dialect that a real paid call actually exercised. Both dialects count:
+    // `charge` settles per request, `session` settles through a Tempo
+    // channel. Deliberately NOT `chargeVerified === true`, which silently
+    // undercounts — openai is verified via a real paid call that returned a
+    // completion (2026-08-09) but settles as 'session' and so carries no
+    // `chargeVerified` flag.
+    //
+    // `verifiedMode: undefined` must never count. Undefined means "payable by
+    // default, never probed", which is the state the 45 dead Nansen routes
+    // were in when they shipped as available.
+    //
+    // 15 → 21 on 2026-08-18: six services charge-verified with real paid
+    // mainnet calls (~$0.081 total) — fal, alphavantage, openweather, deepl,
+    // mapbox, wolframalpha. Tx hashes in docs/verified-services.md.
+    //
+    // Moving this number UP requires a 200 from a real paid call per new
+    // service. Moving it DOWN is legitimate when a paid re-probe shows a
+    // service has broken; update this comment with which one and why.
+    const verifiedServices = new Set(
+      PUBLIC_SERVICE_ROUTES.filter(
+        r => r.verifiedMode === 'charge' || r.verifiedMode === 'session',
+      ).map(r => r.service),
+    )
+    expect(verifiedServices.size).toBe(21)
+    // The commitment itself, stated independently of the exact figure above,
+    // so a future delisting that drops us under 20 fails loudly.
+    expect(verifiedServices.size).toBeGreaterThanOrEqual(20)
   })
 
   it('explains in verifiedNote why each gated-off GET route is gated', () => {
     for (const r of getRoutes.filter(r => r.verifiedMode === false)) {
       expect(r.verifiedNote).toMatch(/not been real-money verified|DISABLED/i)
     }
-    // verified GET routes must carry the paid-run evidence instead
-    for (const r of getRoutes.filter(r => r.verifiedMode !== false)) {
+    // Listed GET routes must carry the paid-run evidence — or, for a route
+    // listed ahead of its probe, say so explicitly. The second branch is a
+    // deliberate, narrow exception (2026-08-18 beta launch of mercury
+    // events/by-ledger) and it is bounded: exactly one route may sit in it,
+    // so a second unverified listing fails this test rather than sliding in.
+    const listed = getRoutes.filter(r => r.verifiedMode !== false)
+    // Every listed GET route must carry its paid-run evidence. by-ledger briefly
+    // sat listed-but-unverified during the 2026-08-18 launch; that window closed
+    // the same day, so the exception is gone and the bar is uniform again.
+    for (const r of listed) {
       expect(r.verifiedNote).toMatch(/charge-verified/)
     }
   })

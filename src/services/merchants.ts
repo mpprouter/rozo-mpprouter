@@ -469,6 +469,93 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'Re-verify when QuickNode upstream is fixed.',
   },
   // ---------------------------------------------------------------
+  // SCF #44 Tranche 2 — "top 20 services verified payable"
+  //
+  // Six services charge-verified on 2026-08-18 with real mainnet USDC
+  // through the production Router (payer masked `GD5R4H...BB4U`). Each
+  // entry below is backed by a 200 + real response body from a single
+  // paid call; the settling Stellar tx hash is in the verifiedNote and
+  // is publicly auditable at
+  // `https://stellar.expert/explorer/public/tx/<hash>`. Full run log,
+  // including the routes that were probed and rejected, is in
+  // `docs/verified-services.md`.
+  //
+  // Chosen for reviewer recognisability and category spread — image
+  // generation, market data, weather, translation, maps, computational
+  // knowledge — rather than depth on any one provider. Only `id`/
+  // `publicPath` are deliberately omitted so the generated values from
+  // `buildRoutesFromMppSnapshot` continue to apply; these entries set
+  // verification state and nothing else.
+  // ---------------------------------------------------------------
+  'fal::/fal-ai/flux/schnell': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-18T03:22:45Z',
+    verifiedNote:
+      'charge-verified 2026-08-18T03:22:45Z, Stellar tx ' +
+      '7ee4ce8c359bebe4a4c94f94d9f815ff65b2faafe67a555a88d36f787ab6f9a1 ' +
+      '(see docs/verified-services.md). $0.003/request, returned a real ' +
+      'generated image URL. Cheapest deterministic fal.ai model — the ' +
+      'pricier flux-pro / video routes remain unprobed.',
+  },
+  'alphavantage::/alphavantage/company-overview': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-18T03:23:14Z',
+    verifiedNote:
+      'charge-verified 2026-08-18T03:23:14Z, Stellar tx ' +
+      'fc0296e6991beb22aee5923784df1de1e7971fb0c3f89d9db9a93ef6df1698f6 ' +
+      '(see docs/verified-services.md). $0.008/request, returned a full ' +
+      'IBM fundamentals record. The other 25 Alpha Vantage routes share ' +
+      'this price and upstream but are individually unprobed.',
+  },
+  'openweather::/openweather/current-weather': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-18T03:23:31Z',
+    verifiedNote:
+      'charge-verified 2026-08-18T03:23:31Z, Stellar tx ' +
+      'f5dfdc09cae3c3923769ada23bcc41f811f9e574157a8f90b3cabbeb11d761d9 ' +
+      '(see docs/verified-services.md). $0.006/request, returned live ' +
+      'San Francisco conditions.',
+  },
+  'deepl::/deepl/languages': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-18T03:24:29Z',
+    verifiedNote:
+      'charge-verified 2026-08-18T03:24:29Z, Stellar tx ' +
+      '1a47118ef2f625ef0571cbb1ce028aad867f0d278e34a51c0a949b0a93edafea ' +
+      '(see docs/verified-services.md). $0.005/request, returned the full ' +
+      'supported-language list. Picked over deepl/translate because ' +
+      'translate is dynamically priced ($0.025+, scales with text length) ' +
+      'and so is a poor fixed-cost verification target.',
+  },
+  'mapbox::/mapbox/geocode-forward': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-18T03:24:51Z',
+    verifiedNote:
+      'charge-verified 2026-08-18T03:24:51Z, Stellar tx ' +
+      '9592b917d7d2e7ea90fccede90e873191ce16ba6a846a4a74b2338ad1f817e51 ' +
+      '(see docs/verified-services.md). $0.00375/request, returned a real ' +
+      'GeoJSON FeatureCollection for "San Francisco". Fills the maps slot ' +
+      'because every googlemaps route 404s on the deployed Router (its ' +
+      'build predates this snapshot) — see docs/verified-services.md.',
+  },
+  'wolframalpha::/wolframalpha/short-answer': {
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-18T03:25:29Z',
+    verifiedNote:
+      'charge-verified 2026-08-18T03:25:29Z, Stellar tx ' +
+      'cffd0d499221037352a7db87aaf22e2f7449a6c09058ad4c80853e4dadc33722 ' +
+      '(see docs/verified-services.md). $0.055/request — the most ' +
+      'expensive of this round — returned "4" for input "2+2". Note the ' +
+      'body key is `i`, not `input`; the merchant pre-validates and 400s ' +
+      'before the 402 challenge is issued if it is missing.',
+  },
+  // ---------------------------------------------------------------
   // Mercury (Stellar indexer, xycloo Labs) — MVP router-held-credential
   // service (design: ainative todos/20260811-mercury-mpp-router-
   // integration-design.md). Mercury is NOT an mpp.dev merchant: the
@@ -519,11 +606,18 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
     fixedPricing: { amountUsd: '0.001' },
     rateLimit: { perDay: 1000 },
-    verifiedMode: false,
-    launchGate: 'MERCURY_LAUNCH_MODE',
+    verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-18T02:35:01Z',
     verifiedNote:
-      'DISABLED: Mercury mainnet /rest/events/by-ledger observed slow (40s+) and 500 on ' +
-      '2026-08-11 paid verify attempt; filed with provider. Other 3 mercury routes are charge-verified.',
+      'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-18T02:35:01Z, ' +
+      'Stellar tx 5028a601460bc30228b51d62072722b07df8c29b5bdb6100c92fa26d74064f0d ' +
+      '(see docs/verified-services.md). Previously delisted after the 2026-08-11 attempt saw ' +
+      'slow (40s+) / 500 responses; provider diagnosed a query-plan issue on ledger ranges away ' +
+      'from the chain tip and shipped a fix on 2026-08-15. Re-verified on a narrow range ' +
+      '(start_ledger=50000000, end_ledger=50000010) returning real Soroban events. ' +
+      'NOTE: very wide ledger ranges remain bounded by a server-side timeout by design. ' +
+      '$0.001/call, 1,000/day cap, router-held credential.',
   },
   'mercury::GET::/txs/by-contract/{contract_id}': {
     upstreamPath: '/rest/txs/by-contract/{contract_id}',
