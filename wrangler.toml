@@ -278,6 +278,21 @@ PLAYGROUND_CHANNEL_WASM_HASH = "d6717aa80e0a1e6f5e6e6b5a8a4c00219ecbd1d3c5be61a4
 #                                  challenges so returning credentials can be
 #                                  verified statelessly. Rotate to invalidate all
 #                                  outstanding challenges.
+# RECEIPT_SIGNING_SECRET         — S... Stellar seed whose Ed25519 key signs
+#                                  refund receipts (GET /v1/refunds/{id}).
+#                                  Dedicated key: holds no funds, grants no 402
+#                                  authority, so it is safe in the request path
+#                                  while STELLAR_ROUTER_SECRET stays offline.
+#                                  Its G... address is published on /health as
+#                                  stellar.receipt_signer so anyone can verify a
+#                                  receipt without a secret from us. Unset ⇒
+#                                  signed receipts fail CLOSED (503) rather than
+#                                  emitting an unverifiable receipt. Rotating it
+#                                  does not invalidate past receipts — append
+#                                  the retired G... address to the
+#                                  RECEIPT_SIGNER_RETIRED_ADDRESSES var below,
+#                                  or every receipt it signed silently stops
+#                                  verifying.
 # REFUND_EXECUTOR_TOKEN          — dedicated bearer token for the pull-only
 #                                  refund executor admin endpoints.
 # MERCURYDATA_MAINNET_JWT        — Mercury (Stellar indexer, xycloo Labs) scoped

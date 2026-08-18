@@ -118,12 +118,174 @@ While a refund is in flight:
 ```
 
 Once Stellar confirms the refund, the same URL returns a **signed** receipt: the
-same fields plus the refund transaction hash and confirmation time, with an
-`HS256` signature over the payload. The signature lets a payer — or a reviewer —
-verify the receipt came from the router without trusting the transport.
+same fields plus the refund transaction hash and confirmation ledger, wrapped in
+an **Ed25519** signature made with a Stellar keypair:
+
+```json
+{
+  "receipt": {
+    "version": 1,
+    "payment_id": "challenge-1",
+    "payment_tx": "c852353506...",
+    "merchant": "anthropic",
+    "amount": "10000",
+    "mode": "charge",
+    "outcome": "refunded_full",
+    "refund_tx": "dbc1695e0a...",
+    "refund_amount": "10000",
+    "reason": "non_fulfillment",
+    "confirmed_ledger": 58412290,
+    "iat": "2026-08-09T13:04:41.000Z",
+    "exp": "2026-08-10T13:04:41.000Z"
+  },
+  "signature": "8mQ...base64url...Ag",
+  "algorithm": "Ed25519",
+  "canonicalization": "rozo-receipt-json-v1",
+  "signer": {
+    "stellar_address": "G...",
+    "ed25519_public_key_hex": "a1b2..."
+  }
+}
+```
 
 Both transactions in a receipt are independently checkable on Stellar. Nothing
-in a receipt has to be taken on the router's word.
+in a receipt has to be taken on the router's word — including the receipt
+itself, per the next section.
+
+## 6.1 Verifying a receipt
+
+The signature is **asymmetric**. Anyone holding the signer's public Stellar
+address can verify a receipt; nobody but the router can produce one. That is the
+whole point: a receipt is evidence a third party can check, not an assertion we
+make about ourselves.
+
+### The signing key
+
+Receipts are signed by a **dedicated** Stellar keypair, not the router pool
+treasury key. A receipt signer holds no funds and carries no payment authority,
+so it can live in the request path while the treasury secret stays offline. Its
+public address is published in two places, which must agree:
+
+* `signer.stellar_address` on the receipt itself, and
+* `stellar.receipt_signer` on `GET /health`.
+
+Fetch the address from `/health` rather than trusting the copy embedded in the
+receipt you are checking — a forged receipt could carry a forged signer.
+
+```bash
+curl -s https://apiserver.mpprouter.dev/health \
+  | jq '{current: .stellar.receipt_signer, retired: .stellar.receipt_signer_retired}'
+```
+
+`/health` publishes the **current** signer plus `receipt_signer_retired`, the
+addresses of any previously-used signers. Rotating the key does not invalidate
+receipts the old key signed, so an older receipt is valid if its signature
+verifies against the current address **or** any retired one. A receipt whose
+signer matches nothing in either list should be rejected outright.
+
+A Stellar `G...` address *is* an Ed25519 public key in strkey encoding; the
+receipt also carries the same 32 bytes as `ed25519_public_key_hex` for
+verifiers that would rather not depend on a Stellar library.
+
+### Canonicalisation (`rozo-receipt-json-v1`)
+
+The signed bytes are UTF-8 `JSON.stringify` over the `receipt` object with keys
+emitted in exactly this order, omitting any key whose value is absent:
+
+```
+version, payment_id, payment_tx, merchant, amount, mode, outcome,
+refund_tx, refund_amount, reason, confirmed_ledger, iat, exp
+```
+
+Keys outside that list are not signed and must be ignored when verifying. Do
+not re-serialise the receipt with your own JSON encoder's key order — rebuild
+it in the order above. The contract is pinned in code as
+`RECEIPT_FIELD_ORDER` in `src/refund/receipt-signer.ts` and is covered by tests
+that assert the exact byte prefix.
+
+### Runnable verification (Node 20+)
+
+Needs only `@stellar/stellar-sdk`, which decodes the `G...` address and does the
+Ed25519 check. Save as `verify-receipt.mjs` and run
+`node verify-receipt.mjs <refund_id>`.
+
+```js
+import { Keypair, StrKey } from '@stellar/stellar-sdk'
+
+const ROUTER = 'https://apiserver.mpprouter.dev'
+const FIELDS = [
+  'version', 'payment_id', 'payment_tx', 'merchant', 'amount', 'mode',
+  'outcome', 'refund_tx', 'refund_amount', 'reason', 'confirmed_ledger',
+  'iat', 'exp',
+]
+
+const refundId = process.argv[2]
+const body = await (await fetch(`${ROUTER}/v1/refunds/${refundId}`)).json()
+if (body.algorithm !== 'Ed25519') throw new Error(`unexpected algorithm ${body.algorithm}`)
+
+// Trust the operator's published addresses, not the one inside the receipt.
+// Retired signers stay published so receipts predating a rotation still verify.
+const health = await (await fetch(`${ROUTER}/health`)).json()
+const trusted = [
+  health.stellar.receipt_signer,
+  ...(health.stellar.receipt_signer_retired ?? []),
+].filter(Boolean)
+const signer = body.signer.stellar_address
+if (!trusted.includes(signer)) throw new Error(`untrusted signer ${signer}`)
+
+// Rebuild the exact signed bytes.
+const canonical = {}
+for (const field of FIELDS) {
+  if (body.receipt[field] !== undefined) canonical[field] = body.receipt[field]
+}
+const message = Buffer.from(JSON.stringify(canonical), 'utf8')
+const signature = Buffer.from(
+  body.signature.replace(/-/g, '+').replace(/_/g, '/'), 'base64',
+)
+
+const ok = Keypair.fromPublicKey(signer).verify(message, signature)
+console.log(ok ? 'VALID' : 'INVALID', '·', signer)
+
+// Same check without any Stellar dependency, using the raw key:
+const raw = StrKey.decodeEd25519PublicKey(signer)          // 32 bytes
+console.log('ed25519 public key', Buffer.from(raw).toString('hex'))
+```
+
+Verify the two transaction hashes in the receipt against Stellar independently.
+The signature and the chain are separate evidence and should be checked
+separately.
+
+### What a valid signature proves — and what it does not
+
+**It proves** the router produced this exact receipt: these hashes, this amount,
+this outcome, this timestamp. Because only the holder of the secret half of the
+published address can produce that signature, we cannot later deny having issued
+it, and nobody else can fabricate one in our name. Change one character of one
+field and verification fails.
+
+**It does not prove** that the refund settled — the chain proves that. Check
+`payment_tx` and `refund_tx` on Stellar yourself. A signed receipt whose
+transactions do not check out is a signed statement we are on the hook for, not
+a settlement.
+
+When the router is operated by a third party, the mechanism is unchanged: that
+operator sets their own signing key, `/health` publishes their address, and
+receipts verify against it. Nothing in this scheme is specific to ROZO holding
+the key.
+
+### Predecessor: `HS256` receipts
+
+Before this change, receipts carried an HMAC-SHA256 signature
+(`"algorithm": "HS256"`) keyed on a shared secret. That is a **symmetric**
+construction: only the router could verify its own receipts, so an `HS256`
+receipt proved nothing to a payer or a reviewer. It has been removed.
+
+Verifiers should key off the `algorithm` field and **reject anything other than
+`Ed25519`**. Receipts issued before the cutover cannot be verified by a third
+party at all and should be treated as unverified claims; the transaction hashes
+they carry remain checkable on Stellar, which is the stronger evidence in any
+case. Cutover date: _to be filled in on deploy_ — the deploy that first sets
+`RECEIPT_SIGNING_SECRET`.
 
 ## 7. Worked example (mainnet, 2026-08-09)
 
@@ -165,5 +327,8 @@ own keystore and is never sent to the router.
    reports success — never on submission.
 5. **Large refunds are not automatic.** Above the configured ceiling, a human
    decides.
-6. **Settled value is never reversed.** A channel refund returns the remainder;
+6. **Receipts are verifiable without us.** Signatures are Ed25519 against a
+   published public address, never a shared secret. If a receipt can only be
+   verified by the party that issued it, it is not evidence.
+7. **Settled value is never reversed.** A channel refund returns the remainder;
    it does not claw back what a valid signed commitment already settled.
