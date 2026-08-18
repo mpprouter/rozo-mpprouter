@@ -170,10 +170,78 @@ weekly, per-round spend cap $1.
 
 ---
 
+### Run 2026-08-18 — SCF #44 Tranche 2 ("top 20 services verified payable")
+
+Goal: take the count of **distinct verified services** from 15 to 20. Payer
+masked `GD5R4H...BB4U`, all calls through production `apiserver.mpprouter.dev`.
+Selection criteria, in order: a reviewer should recognise the name; a cheap
+deterministic endpoint must exist; spread across categories rather than depth
+on one provider.
+
+> **Counting note.** The starting figure is **15 services**, not 14. A
+> `chargeVerified === true` filter undercounts: `openai` was verified by a real
+> paid call on 2026-08-09 but settles via the **session** dialect and so carries
+> `verifiedMode: 'session'` with no `chargeVerified` flag. The submission
+> promises verified *services* and describes both settlement dialects, so both
+> count. The guard in `tests/get-routes.test.ts` uses the two-dialect predicate.
+
+| Service | Category | Result | UTC | Amount | Stellar tx |
+|---|---|---|---|---|---|
+| `fal_flux_schnell` | image generation | ✅ PASS — real generated image URL returned | 2026-08-18T03:22:45Z | $0.003 | `7ee4ce8c359bebe4a4c94f94d9f815ff65b2faafe67a555a88d36f787ab6f9a1` |
+| `alphavantage_alphavantage_company-overview` | market data | ✅ PASS — full IBM fundamentals record | 2026-08-18T03:23:14Z | $0.008 | `fc0296e6991beb22aee5923784df1de1e7971fb0c3f89d9db9a93ef6df1698f6` |
+| `openweather_openweather_current-weather` | weather | ✅ PASS — live San Francisco conditions | 2026-08-18T03:23:31Z | $0.006 | `f5dfdc09cae3c3923769ada23bcc41f811f9e574157a8f90b3cabbeb11d761d9` |
+| `deepl_deepl_languages` | translation | ✅ PASS — full supported-language list | 2026-08-18T03:24:29Z | $0.005 | `1a47118ef2f625ef0571cbb1ce028aad867f0d278e34a51c0a949b0a93edafea` |
+| `mapbox_mapbox_geocode-forward` | maps / geocoding | ✅ PASS — real GeoJSON FeatureCollection | 2026-08-18T03:24:51Z | $0.00375 | `9592b917d7d2e7ea90fccede90e873191ce16ba6a846a4a74b2338ad1f817e51` |
+| `wolframalpha_wolframalpha_short-answer` | computational knowledge | ✅ PASS — returned `"4"` for `2+2` | 2026-08-18T03:25:29Z | $0.055 | `cffd0d499221037352a7db87aaf22e2f7449a6c09058ad4c80853e4dadc33722` |
+
+**6/6 passed. Total spend $0.08075**, confirmed by wallet balance delta
+(2.0731820 → 1.9924320 USDC), which matches the six quoted prices exactly and
+independently corroborates the tx-to-service mapping. Budget cap for the round
+was $2.
+
+**Result: 15 → 21 distinct verified services.** Tranche 2's commitment of 20 is
+met with one service of headroom.
+
+#### Probed and rejected — did not pay
+
+These were free-probed first (Step 1 of `docs/SOP-provider-e2e-test.md`, costs
+nothing) and excluded before any money moved. Recorded here because a rejected
+candidate is as much a result as a passing one.
+
+| Candidate | Free-probe result | Whose problem | Action |
+|---|---|---|---|
+| `googlemaps` (all routes) | **404** on the deployed Router for every route tried — `places:autocomplete`, `places:searchText`, `geolocate`, `computeRoutes`, `airquality`. The routes exist in this branch's `mpp-catalog-snapshot.json`, so the **deployed build predates the snapshot**. | **Ours** — a deploy-lag issue, not Google's | Deferred. Google Maps was the first-choice maps candidate; `mapbox` took the maps slot instead. Re-probe `googlemaps` after the next deploy — it is the strongest remaining name in this category. |
+| `gemini::/generate` | **403 "Route not enabled for payment"** — the router's own security gate, because the route is `verifiedMode: false`. Unreachable without a deploy. | **Merchant** (see below) | Not flipped, not paid. See the note below — this is *not* an un-reprobed route. |
+| `gemini::/version_files` | 404 on the deployed Router (with the required `?version=v1beta`) | Ours (deploy lag, as googlemaps) | Deferred to the same deploy |
+| `gemini::/version_operations` | 405 — POST not allowed, it is a GET route | n/a | GET routes are gated `verifiedMode: false` by design |
+| `wolframalpha` (first attempt, `{"input":...}`) | **400 "i is required"** — merchant pre-validates *before* the 402 is issued | n/a — our body was wrong | Retried with `{"i":"2+2"}` → clean 402 → paid → 200. Cost nothing. |
+
+**On gemini specifically.** It is tempting to read `verifiedMode: false` plus a
+note about an upstream 404 that was "fixed via `upstreamPath` override" as a
+route that was fixed and then never re-probed — the exact shape mercury's
+`events/by-ledger` was in. It is not. The overlay note in `merchants.ts` already
+records a **real paid re-test on 2026-08-09**: the path fix works and the
+request now reaches Google, but **the merchant's own Google API key is
+rejected — 400 "API key not valid"**. That evidence is newer than the path fix.
+Flipping the gate open would only buy a second 400 at our expense. Gemini is
+blocked **merchant-side** and stays `verifiedMode: false` until the merchant
+rotates its key; the correct next step is chasing the merchant, not a deploy.
+Note also that gemini settles `tempo.session`, not charge.
+
+#### Not attempted
+
+`openai/embeddings` and `openai/responses` are payable and unprobed, and both
+free-probe to a clean 402. They were left alone deliberately: `openai` already
+counts as a verified service, so paying for them adds route depth without moving
+the Tranche 2 number. Cheap follow-ups whenever route coverage is the goal.
+
+---
+
 ## Changelog
 
 | Date | Who | Change |
 |---|---|---|
+| 2026-08-18 | agent ($2 cap, spent $0.081) | SCF #44 Tranche 2: charge-verified fal, alphavantage, openweather, deepl, mapbox, wolframalpha with real paid mainnet calls. **15 → 21 distinct verified services.** googlemaps deferred (all routes 404 on the deployed build — deploy lag); gemini stays delisted (merchant's Google key invalid, already evidenced by the 2026-08-09 paid re-test). Added a `tests/get-routes.test.ts` guard on the distinct-verified-service count that counts both `charge` and `session` dialects |
 | 2026-08-10 | agent (founder-approved, $1 cap) | Paid verification run: deepseek+tavily PASS, DALL·E upstream-fail, Gemini blocked. Added `verified-runs.json` tx-hash audit trail |
 | 2026-04-12 | muggledev | Smoke test 6/6 passed (3 mppx charge + 3 x402 exact). Deployed `stellarIntentsFor` fix to production |
 | 2026-04-12 | muggledev | Created doc. Fixed `stellarIntentsFor` to respect upstream mode. Added `upstreamPaymentMethod: 'tempo.charge'` override for alchemy_rpc |

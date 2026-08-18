@@ -1,9 +1,28 @@
 {
  "$schema_note": "Machine-readable audit trail of real paid verification runs against apiserver.mpprouter.dev. Each run is a real Stellar mainnet USDC payment; tx is the Stellar transaction hash (view at https://stellar.expert/explorer/public/tx/<tx>).",
- "updated": "2026-08-10",
+ "updated": "2026-08-18",
  "cadence": "weekly",
- "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1.",
+ "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1 (raised to $2 for the 2026-08-18 SCF #44 Tranche 2 round, of which $0.081 was spent).",
  "services": [
+  {
+   "id": "alphavantage_alphavantage_company-overview",
+   "name": "Alpha Vantage – Company Overview",
+   "category": "data",
+   "price": "$0.008/request",
+   "public_path": "/v1/services/alphavantage/alphavantage_company-overview",
+   "charge_verified_at": "2026-08-18T03:23:14Z",
+   "session_verified_at": null,
+   "runs": [
+    {
+     "date": "2026-08-18",
+     "result": "pass",
+     "http": 200,
+     "amount_usd": "0.008",
+     "tx": "fc0296e6991beb22aee5923784df1de1e7971fb0c3f89d9db9a93ef6df1698f6",
+     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+    }
+   ]
+  },
   {
    "id": "anthropic_chat_completions",
    "name": "Anthropic",
@@ -26,7 +45,7 @@
   },
   {
    "id": "coingecko_simple_price",
-   "name": "CoinGecko \u2013 Simple Price",
+   "name": "CoinGecko – Simple Price",
    "category": "data",
    "price": "$0.060/request",
    "public_path": "/v1/services/coingecko/simple-price",
@@ -36,7 +55,7 @@
   },
   {
    "id": "deepgram_deepgram_list-models",
-   "name": "Deepgram \u2013 List Models",
+   "name": "Deepgram – List Models",
    "category": "data",
    "price": "$0.004/request",
    "public_path": "/v1/services/deepgram/deepgram_list-models",
@@ -45,10 +64,29 @@
    "runs": []
   },
   {
+   "id": "deepl_deepl_languages",
+   "name": "DeepL – Languages",
+   "category": "data",
+   "price": "$0.005/request",
+   "public_path": "/v1/services/deepl/deepl_languages",
+   "charge_verified_at": "2026-08-18T03:24:29Z",
+   "session_verified_at": null,
+   "runs": [
+    {
+     "date": "2026-08-18",
+     "result": "pass",
+     "http": 200,
+     "amount_usd": "0.005",
+     "tx": "1a47118ef2f625ef0571cbb1ce028aad867f0d278e34a51c0a949b0a93edafea",
+     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+    }
+   ]
+  },
+  {
    "id": "deepseek_chat",
-   "name": "DeepSeek \u2013 Chat",
+   "name": "DeepSeek – Chat",
    "category": "ai",
-   "price": "Model + token dependent (~$0.004\u2013$0.025) (dynamic)",
+   "price": "Model + token dependent (~$0.004–$0.025) (dynamic)",
    "public_path": "/v1/services/deepseek/chat",
    "charge_verified_at": "2026-06-22T00:00:00Z",
    "session_verified_at": null,
@@ -63,7 +101,7 @@
   },
   {
    "id": "exa_search",
-   "name": "Exa \u2013 Search the web",
+   "name": "Exa – Search the web",
    "category": "search",
    "price": "$0.005/request",
    "public_path": "/v1/services/exa/search",
@@ -72,8 +110,27 @@
    "runs": []
   },
   {
+   "id": "fal_flux_schnell",
+   "name": "fal.ai – FLUX.1 [schnell]",
+   "category": "ai",
+   "price": "$0.003/request",
+   "public_path": "/v1/services/fal/flux_schnell",
+   "charge_verified_at": "2026-08-18T03:22:45Z",
+   "session_verified_at": null,
+   "runs": [
+    {
+     "date": "2026-08-18",
+     "result": "pass",
+     "http": 200,
+     "amount_usd": "0.003",
+     "tx": "7ee4ce8c359bebe4a4c94f94d9f815ff65b2faafe67a555a88d36f787ab6f9a1",
+     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+    }
+   ]
+  },
+  {
    "id": "firecrawl_scrape",
-   "name": "Firecrawl \u2013 Scrape a URL",
+   "name": "Firecrawl – Scrape a URL",
    "category": "web",
    "price": "$0.002/request",
    "public_path": "/v1/services/firecrawl/scrape",
@@ -83,9 +140,9 @@
   },
   {
    "id": "grok_grok_chat",
-   "name": "Grok \u2013 Chat Completions",
+   "name": "Grok – Chat Completions",
    "category": "ai",
-   "price": "Model-dependent (~$0.001\u2013$0.02) (dynamic)",
+   "price": "Model-dependent (~$0.001–$0.02) (dynamic)",
    "public_path": "/v1/services/grok/grok_chat",
    "charge_verified_at": "2026-08-01T16:10:11Z",
    "session_verified_at": null,
@@ -93,19 +150,38 @@
   },
   {
    "id": "groq_chat",
-   "name": "Groq \u2013 Chat Completion",
+   "name": "Groq – Chat Completion",
    "category": "ai",
-   "price": "$0.005 \u2013 $0.10 (varies by model and tokens) (dynamic)",
+   "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
    "public_path": "/v1/services/groq/chat",
    "charge_verified_at": "2026-06-22T00:00:00Z",
    "session_verified_at": null,
    "runs": []
   },
   {
+   "id": "mapbox_mapbox_geocode-forward",
+   "name": "Mapbox – Forward Geocode",
+   "category": "data",
+   "price": "$0.00375/request",
+   "public_path": "/v1/services/mapbox/mapbox_geocode-forward",
+   "charge_verified_at": "2026-08-18T03:24:51Z",
+   "session_verified_at": null,
+   "runs": [
+    {
+     "date": "2026-08-18",
+     "result": "pass",
+     "http": 200,
+     "amount_usd": "0.00375",
+     "tx": "9592b917d7d2e7ea90fccede90e873191ce16ba6a846a4a74b2338ad1f817e51",
+     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+    }
+   ]
+  },
+  {
    "id": "mistral_mistral_chat",
-   "name": "Mistral AI \u2013 Chat Completion",
+   "name": "Mistral AI – Chat Completion",
    "category": "ai",
-   "price": "$0.005 \u2013 $0.10 (varies by model and tokens) (dynamic)",
+   "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
    "public_path": "/v1/services/mistral/mistral_chat",
    "charge_verified_at": "2026-08-01T16:10:27Z",
    "session_verified_at": null,
@@ -122,8 +198,27 @@
    "runs": []
   },
   {
+   "id": "openweather_openweather_current-weather",
+   "name": "OpenWeather – Current Weather",
+   "category": "data",
+   "price": "$0.006/request",
+   "public_path": "/v1/services/openweather/openweather_current-weather",
+   "charge_verified_at": "2026-08-18T03:23:31Z",
+   "session_verified_at": null,
+   "runs": [
+    {
+     "date": "2026-08-18",
+     "result": "pass",
+     "http": 200,
+     "amount_usd": "0.006",
+     "tx": "f5dfdc09cae3c3923769ada23bcc41f811f9e574157a8f90b3cabbeb11d761d9",
+     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+    }
+   ]
+  },
+  {
    "id": "parallel_search",
-   "name": "Parallel \u2013 Search the web",
+   "name": "Parallel – Search the web",
    "category": "search",
    "price": "$0.010/request",
    "public_path": "/v1/services/parallel/search",
@@ -133,9 +228,9 @@
   },
   {
    "id": "perplexity_perplexity_chat",
-   "name": "Perplexity \u2013 Sonar Chat",
+   "name": "Perplexity – Sonar Chat",
    "category": "ai",
-   "price": "Model-dependent (~$0.005\u2013$0.02) (dynamic)",
+   "price": "Model-dependent (~$0.005–$0.02) (dynamic)",
    "public_path": "/v1/services/perplexity/perplexity_chat",
    "charge_verified_at": "2026-08-01T16:26:16Z",
    "session_verified_at": null,
@@ -143,7 +238,7 @@
   },
   {
    "id": "storage_upload",
-   "name": "Object Storage \u2013 Initiate/complete multipart upload",
+   "name": "Object Storage – Initiate/complete multipart upload",
    "category": "storage",
    "price": "$0.0001/request",
    "public_path": "/v1/services/storage/upload",
@@ -165,6 +260,25 @@
      "utc": "2026-08-10T07:56:49Z",
      "tx": "38eaecde40d6430654212bf59b32eb0e1275a6b5f8e3d958be8a56ec71649952",
      "amount_usdc": "0.090"
+    }
+   ]
+  },
+  {
+   "id": "wolframalpha_wolframalpha_short-answer",
+   "name": "Wolfram|Alpha – Short Answer",
+   "category": "data",
+   "price": "$0.055/request",
+   "public_path": "/v1/services/wolframalpha/wolframalpha_short-answer",
+   "charge_verified_at": "2026-08-18T03:25:29Z",
+   "session_verified_at": null,
+   "runs": [
+    {
+     "date": "2026-08-18",
+     "result": "pass",
+     "http": 200,
+     "amount_usd": "0.055",
+     "tx": "cffd0d499221037352a7db87aaf22e2f7449a6c09058ad4c80853e4dadc33722",
+     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
     }
    ]
   }
