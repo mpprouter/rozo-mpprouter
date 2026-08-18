@@ -44,6 +44,18 @@ const DEFAULT_RPC_URL =
 const ALL_ZEROS_PUBKEY =
   "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
 
+/**
+ * The only assets we will ever sign a transfer for, per network. A 402
+ * challenge controls the `asset` field, so without this pin a hostile or
+ * compromised endpoint could name any token — a governance token, an NFT-ish
+ * SAC — and our USD ceiling, which assumes USDC's 7 decimals, would be
+ * meaningless. Signing is refused for anything not listed here.
+ */
+export const ALLOWED_ASSETS: Record<string, string> = {
+  // Circle USDC (issuer GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN)
+  "stellar:pubnet": "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+};
+
 /** Stellar closes a ledger in ~5.5s. Rounding UP shortens the validity
  * window we ask for, which is the safe direction: a verifier rejects an
  * auth entry that reaches further than its own limit. */
@@ -225,14 +237,20 @@ export interface PayAndCallOptions {
   /** Refuse to sign if the challenge names a different recipient. Set it from
    * the catalog or /health when you have it. */
   expectPayTo?: string;
+  /** Override the per-network asset pin. Defaults to `ALLOWED_ASSETS`. */
+  allowedAssets?: Record<string, string>;
 }
 
 export interface PayAndCallResult {
   status: number;
   /** Parsed JSON when the service returns JSON, raw text otherwise. */
   data: unknown;
-  /** What we actually paid, in USD. 0 when the endpoint was not gated. */
+  /** What we actually paid, in USD. 0 only when nothing settled. */
   paidUsd: number;
+  /** Whether the transfer settled, independent of the upstream HTTP status. */
+  settlement?: "settled" | "failed" | "not-settled";
+  /** Stellar transaction hash of the settled transfer, when the Router reports one. */
+  settlementTx?: string;
   payTo?: string;
   /** Router-issued receipt header, when present. */
   receipt?: string;
@@ -273,7 +291,17 @@ export async function payAndCall(
     throw new Error("Router advertised areFeesSponsored=false; unsupported");
   }
 
-  // --- guards. Without these, a hostile 402 can name any recipient and price.
+  // --- guards. Without these, a hostile 402 can name any asset, recipient
+  // and price. Check the ASSET FIRST: every downstream number, including the
+  // USD ceiling below, assumes USDC's 7 decimals.
+  const allowed = opts.allowedAssets ?? ALLOWED_ASSETS;
+  const pinnedAsset = allowed[requirement.network];
+  if (!pinnedAsset || requirement.asset !== pinnedAsset) {
+    throw new Error(
+      `Refusing to sign: challenge asset is not the pinned asset for ${requirement.network}`,
+    );
+  }
+
   const priceUsdValue = toUsd(requirement.amount);
   if (priceUsdValue > opts.maxPriceUsd) {
     throw new Error(
@@ -321,10 +349,27 @@ export async function payAndCall(
     },
   });
 
+  // Settlement is INDEPENDENT of the upstream HTTP status. A 5xx from the
+  // upstream API can still follow an accepted, settled transfer, so
+  // `paid.ok === false` does NOT mean the money stayed put. Read the Router's
+  // settlement headers and treat "unknown" as spent, never as free — the
+  // expensive mistake here is retrying a call you already paid for.
+  const settleStatus = paid.headers.get("x-payment-settle-status");
+  const settled =
+    settleStatus === "settled" ||
+    (settleStatus === null && paid.status !== 402);
+
   return {
     status: paid.status,
     data: await readBody(paid),
-    paidUsd: paid.ok ? priceUsdValue : 0,
+    paidUsd: settled ? priceUsdValue : 0,
+    settlement:
+      settleStatus === "failed"
+        ? "failed"
+        : settled
+          ? "settled"
+          : "not-settled",
+    settlementTx: paid.headers.get("x-payment-tx") ?? undefined,
     payTo: requirement.payTo,
     receipt: paid.headers.get("payment-receipt") ?? undefined,
   };

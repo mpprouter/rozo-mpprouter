@@ -136,7 +136,10 @@ Inside, five steps:
 
 1. plain request → expect `402`
 2. decode the challenge, pick the `exact` + `stellar:` requirement
-3. **guards**: refuse if the price is above your ceiling or `payTo` drifts
+3. **guards**: refuse if the `asset` is not the pinned USDC contract, if the
+   price is above your ceiling, or if `payTo` drifts. Check the asset *first* —
+   every number after it, the USD ceiling included, assumes USDC's 7 decimals,
+   so an unpinned asset makes the price check meaningless.
 4. sign a Soroban SAC `transfer(from, to, amount)` in sponsored mode — a
    zero-address source account and only the auth entries signed, so the
    Router's facilitator can fee-bump and submit it
@@ -158,6 +161,13 @@ Three details that will cost you an afternoon if you get them wrong:
 The credential is single-use and bound to this amount and recipient. If the
 retry fails, do not replay it — start over from a fresh 402.
 
+**A failed call is not a free call.** Settlement is independent of the upstream
+HTTP status: the transfer can settle and *then* the upstream API returns a 5xx.
+`payAndCall` reads the Router's `X-Payment-Settle-Status` header and counts
+anything that is not an outright non-settlement as spent, so a caller is never
+told a paid call was free. Inferring "no charge" from a non-2xx status is how
+you pay twice for the same request.
+
 ## 4. Wrap it as two AI SDK tools
 
 [`src/tools.ts`](../../examples/vercel-ai-sdk/src/tools.ts) in full is under 100
@@ -167,7 +177,13 @@ lines; the shape is:
 import { tool } from "ai";
 import { z } from "zod";
 
-export function createMppTools({ maxPriceUsd = 0.005, expectPayTo } = {}) {
+export function createMppTools({
+  maxPriceUsd = 0.005,
+  budgetUsd = 0.025,
+  expectPayTo,
+} = {}) {
+  let spentUsd = 0; // closure — no tool argument can reset it
+
   const mppDiscover = tool({
     description:
       "Search the MPP Router catalog of pay-per-call APIs. Free. Always call " +
@@ -194,14 +210,23 @@ export function createMppTools({ maxPriceUsd = 0.005, expectPayTo } = {}) {
       body: z.record(z.string(), z.unknown()).optional(),
     }),
     execute: async ({ url, method, body }) => {
-      if (!url.startsWith(ROUTER_BASE_URL)) {
+      // Same-ORIGIN, not startsWith — see the note below.
+      if (!isSameOrigin(url, ROUTER_BASE_URL)) {
         throw new Error(`Refusing to pay a non-Router URL: ${url}`);
       }
+      // Reserve before calling, so parallel tool calls can't each see an
+      // unspent budget.
+      if (spentUsd + maxPriceUsd > budgetUsd) {
+        throw new Error(`Budget exhausted: $${spentUsd} of $${budgetUsd}`);
+      }
+      spentUsd += maxPriceUsd;
+
       const r = await payAndCall({
         url, method, body,
         stellarSecret: requireSecret(),  // read from env, never a tool arg
         maxPriceUsd, expectPayTo,
       });
+      spentUsd += r.paidUsd - maxPriceUsd; // settle the reservation
       return { paidUsd: r.paidUsd, data: r.data };
     },
   });
@@ -210,9 +235,30 @@ export function createMppTools({ maxPriceUsd = 0.005, expectPayTo } = {}) {
 }
 ```
 
-Note what is **not** in `inputSchema`: no secret, no price, no recipient. Every
-spending limit lives in code the model cannot reach. A prompt can be talked
-around; a `throw` cannot.
+Note what is **not** in `inputSchema`: no secret, no price, no recipient, no
+budget. Every spending limit lives in code the model cannot reach. A prompt can
+be talked around; a `throw` cannot.
+
+Two of those guards are easy to get subtly wrong:
+
+- **`startsWith` is not an origin check.** The URL comes from the model, and
+  `https://apiserver.mpprouter.dev.attacker.example/v1/...` passes a prefix
+  test while pointing at an attacker's 402 server — which then receives a
+  wallet-signed transfer. Parse both URLs and compare protocol and host:
+
+  ```ts
+  function isSameOrigin(candidate: string, base: string): boolean {
+    try {
+      const a = new URL(candidate), b = new URL(base);
+      return a.protocol === b.protocol && a.host === b.host
+        && a.pathname.startsWith("/v1/");
+    } catch { return false; }
+  }
+  ```
+
+- **Reserve the budget before the call, not after.** A single model step can
+  emit several `mppCall`s in parallel; if each only debits on completion, they
+  all see an unspent budget and all go through.
 
 ## 5. Run the agent
 
@@ -222,7 +268,7 @@ import { generateText, stepCountIs } from "ai";
 
 const { text, steps } = await generateText({
   model: openai("gpt-4o-mini"),
-  tools: createMppTools({ maxPriceUsd: 0.005 }),
+  tools: createMppTools({ maxPriceUsd: 0.005, budgetUsd: 0.025 }),
   stopWhen: stepCountIs(6),
   system:
     "You buy data from paid APIs on behalf of the user. Always call " +
@@ -234,8 +280,11 @@ const { text, steps } = await generateText({
 });
 ```
 
-`stopWhen` matters: it is the ceiling on how many paid calls a single run can
-make. Combined with the per-call `maxPriceUsd`, your worst case is bounded.
+`stopWhen` caps model **steps**, and it is worth setting — but do not mistake
+it for a spending limit. One step can emit several tool calls in parallel, so
+step count does not bound paid calls. The real ceiling is `budgetUsd`, enforced
+inside `mppCall` itself: `maxPriceUsd` bounds any single call, `budgetUsd`
+bounds the run.
 
 ## 6. Verify it, cheaply
 
@@ -298,10 +347,12 @@ OPENAI_API_KEY=sk-... STELLAR_SECRET=S... npm run demo:agent
 
 ## Production checklist
 
-- [ ] `maxPriceUsd` set on the tool, not suggested in the prompt
+- [ ] `maxPriceUsd` **and** `budgetUsd` set on the tool, not suggested in the prompt
+- [ ] budget reserved before the call, so parallel calls cannot race past it
+- [ ] the challenge `asset` pinned to the USDC contract, checked before the price
 - [ ] `expectPayTo` pinned to the address from `GET /health`
-- [ ] `mppCall` refuses URLs outside your Router base URL
-- [ ] `stopWhen` caps the paid calls per run
+- [ ] `mppCall` compares URL **origin**, not a string prefix
+- [ ] a settled-but-failed call reported as paid, never as free
 - [ ] wallet holds only a working float — it is a hot key, treat it like petty cash
 - [ ] `STELLAR_SECRET` from the environment or a secret manager; `.env` git-ignored
 - [ ] failed retries start from a fresh 402, never a replayed credential
@@ -315,6 +366,8 @@ OPENAI_API_KEY=sk-... STELLAR_SECRET=S... npm run demo:agent
 | `expiration_too_far` | ledger window rounded down; use `ceil(timeout / 6)` |
 | `405` with `allowed_methods` | defaulted to GET; use the catalog's `method` |
 | `Simulation failed` | no USDC trustline, or balance below the charge |
+| `challenge asset is not the pinned asset` | the 402 named a token other than USDC — do not relax the pin, investigate |
+| `Budget exhausted` | `budgetUsd` reached; raise it deliberately in code |
 | empty/garbage result at a valid price | wrong request body — read the service's `docs.llms_txt` first |
 
 ## See also

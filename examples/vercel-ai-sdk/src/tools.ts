@@ -34,14 +34,40 @@ function requireSecret(): string {
 export interface MppToolOptions {
   /** Hard per-call ceiling in USD. The model cannot raise it. */
   maxPriceUsd?: number;
+  /** Cumulative ceiling in USD across every call these tools make. */
+  budgetUsd?: number;
   /** If set, refuse any 402 whose recipient is not this address. */
   expectPayTo?: string;
   baseUrl?: string;
 }
 
+/**
+ * Same-origin check. `startsWith` is NOT enough: the model supplies the URL,
+ * and `https://apiserver.mpprouter.dev.attacker.example/...` passes a prefix
+ * test while pointing at someone else's 402 server.
+ */
+function isSameOrigin(candidate: string, base: string): boolean {
+  try {
+    const a = new URL(candidate);
+    const b = new URL(base);
+    return (
+      a.protocol === b.protocol && a.host === b.host && a.pathname.startsWith("/v1/")
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function createMppTools(options: MppToolOptions = {}) {
   const maxPriceUsd = options.maxPriceUsd ?? 0.005;
   const baseUrl = options.baseUrl ?? ROUTER_BASE_URL;
+
+  // Cumulative budget for the lifetime of this tool set. Lives in a closure,
+  // so neither the model nor a tool argument can reset it. `stopWhen` caps
+  // model STEPS, not paid calls — one step can emit several parallel tool
+  // calls — so this is the only real aggregate bound.
+  const budgetUsd = options.budgetUsd ?? maxPriceUsd * 5;
+  let spentUsd = 0;
 
   const mppDiscover = tool({
     description:
@@ -76,8 +102,8 @@ export function createMppTools(options: MppToolOptions = {}) {
   const mppCall = tool({
     description:
       `Call a paid MPP Router endpoint. This SPENDS real USDC (max $${maxPriceUsd} ` +
-      "per call) and settles on Stellar automatically. Use the exact url and " +
-      "method returned by mppDiscover.",
+      `per call, $${budgetUsd} total for this session) and settles on Stellar ` +
+      "automatically. Use the exact url and method returned by mppDiscover.",
     inputSchema: z.object({
       url: z.string().url().describe("Full endpoint URL from mppDiscover"),
       method: z.enum(["GET", "POST"]).default("POST"),
@@ -87,9 +113,19 @@ export function createMppTools(options: MppToolOptions = {}) {
         .describe("JSON request body, forwarded to the upstream API as-is"),
     }),
     execute: async ({ url, method, body }) => {
-      if (!url.startsWith(baseUrl)) {
+      if (!isSameOrigin(url, baseUrl)) {
         throw new Error(`Refusing to pay a non-Router URL: ${url}`);
       }
+      // Reserve the worst case BEFORE calling. Reserving after would let
+      // concurrent tool calls in one step each see an unspent budget.
+      if (spentUsd + maxPriceUsd > budgetUsd) {
+        throw new Error(
+          `Budget exhausted: $${spentUsd.toFixed(4)} of $${budgetUsd} spent. ` +
+            "Refusing further paid calls.",
+        );
+      }
+      spentUsd += maxPriceUsd;
+
       const result = await payAndCall({
         url,
         method,
@@ -98,11 +134,26 @@ export function createMppTools(options: MppToolOptions = {}) {
         maxPriceUsd,
         expectPayTo: options.expectPayTo,
       });
+      // Settle the reservation against what was actually charged. Note that a
+      // failed upstream call can still have settled — never refund the
+      // reservation on an HTTP error alone.
+      spentUsd += result.paidUsd - maxPriceUsd;
+
       if (result.status >= 400) {
-        return { error: `HTTP ${result.status}`, detail: result.data };
+        return {
+          error: `HTTP ${result.status}`,
+          detail: result.data,
+          paidUsd: result.paidUsd,
+          settlement: result.settlement,
+          note:
+            result.paidUsd > 0
+              ? "This call was PAID despite the error. Do not retry it blindly."
+              : undefined,
+        };
       }
       return {
         paidUsd: result.paidUsd,
+        budgetRemainingUsd: Number((budgetUsd - spentUsd).toFixed(6)),
         data: result.data,
       };
     },
