@@ -191,6 +191,18 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
     expect(json.source).toEqual({ chainId: '8453', tokenSymbol: 'USDC' })
   })
 
+  it('echoes the Rozo intent as raw (parity with the Coinbase branch)', async () => {
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+    })
+    expect(status).toBe(200)
+    // The frontend renders payin instructions (e.g. raw.lnInvoice) from this.
+    expect(json.raw).toMatchObject({ id: 'rozo-pay-1' })
+    // Must never echo the Stripe URL through raw.
+    expect(JSON.stringify(json.raw)).not.toContain('crypto.stripe.com')
+  })
+
   it('uses exactOut with a pinned destination amount for a Lightning source', async () => {
     const { status } = await createInvoice({
       url: STRIPE_URL,

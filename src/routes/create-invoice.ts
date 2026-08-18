@@ -1025,6 +1025,10 @@ export async function handleStripeCreateInvoice(
   let paymentLink: string | null
   let expiresAt: string | null
   let reused: boolean
+  // The Rozo intent payload (deposit instructions incl. lnInvoice), echoed as
+  // `raw` exactly like the Coinbase branch so the checkout frontend can render
+  // the payin QR. Contains no Stripe URL/secrets — it is Rozo's own object.
+  let rawIntent: unknown = null
 
   // Source the reused order actually pays from, plus how we got there.
   let reusedSource: { chainId: string | null; tokenSymbol: string | null } = {
@@ -1086,6 +1090,7 @@ export async function handleStripeCreateInvoice(
     paymentLink = row?.paymentLink ?? row?.url ?? row?.payment_link ?? null
     expiresAt = row?.expiresAt ?? existing?.expiresAt ?? null
     reused = true
+    rawIntent = row ?? existing ?? null
   } else {
     // 7. Create the Rozo intent. The caller pays the discounted amount on the
     // source they chose; the settlement receiver is always the funder wallet on
@@ -1169,6 +1174,7 @@ export async function handleStripeCreateInvoice(
       intentsJson?.paymentLink ?? intentsJson?.url ?? intentsJson?.payment_link ?? intentsJson?.data?.url ?? null
     expiresAt = intentsJson?.expiresAt ?? null
     reused = false
+    rawIntent = intentsJson
   }
 
   // 8. Seed the locked fulfillment record so the webhook has the binding fields
@@ -1232,5 +1238,6 @@ export async function handleStripeCreateInvoice(
     rozoPaymentId,
     expiresAt,
     invoice,
+    raw: rawIntent,
   })
 }
