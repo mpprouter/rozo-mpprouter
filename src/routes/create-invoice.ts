@@ -987,6 +987,38 @@ export async function handleStripeCreateInvoice(
     // Non-fatal — fall through to create.
   }
 
+  // Rollout guard (codex P1 on the no-discount change): an unpaid intent
+  // created under the OLD discounted pricing must not be reused — we would
+  // report callerPays as the full amount while the payable link still collects
+  // the discounted one. The row's USD amount lives on destination.amount for
+  // Lightning (exactOut) and source.amount otherwise; anything unparsable is
+  // treated as a mismatch (fail toward honesty, never toward misreporting).
+  if (existing) {
+    const rowUsdRaw =
+      readRowSource(existing).chainId === 'lightning'
+        ? existing?.destination?.amount
+        : existing?.source?.amount
+    const rowUsd = Number(rowUsdRaw)
+    const fullUsd = Number(callerPays)
+    if (!Number.isFinite(rowUsd) || Math.abs(rowUsd - fullUsd) > 0.01) {
+      const legacy = existing
+      existing = null
+      return json(409, {
+        ok: false,
+        provider: 'stripe_crypto',
+        error: {
+          code: 'LEGACY_PRICING_ORDER_PENDING',
+          message:
+            `An unpaid order for this invoice exists under previous pricing and ` +
+            `cannot be reused. Wait for it to expire, then create a new order.`,
+        },
+        invoiceKey: invoice.invoiceKey,
+        rozoPaymentId: legacy?.id ?? null,
+        expiresAt: legacy?.expiresAt ?? null,
+      })
+    }
+  }
+
   // Creating again under the same orderId would just 409 orderIdConflict
   // upstream, so tell the caller the order is already active instead.
   if (activeConflict) {
