@@ -106,7 +106,9 @@ export const SERVICE_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
 // discovery UIs. Invariant: only paid-verified services may appear here —
 // audit trail in docs/verified-runs.json.
 const RECOMMENDED_SERVICE_IDS = new Set([
-  'anthropic_chat_completions',
+  // anthropic_chat_completions removed 2026-08-18 — delisted below after a
+  // paid re-probe showed the merchant leg failing on every call. The
+  // invariant above is that only paid-verified services appear here.
   'coingecko_simple_price',
   'deepseek_chat',
   'exa_search',
@@ -211,17 +213,38 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // If the merchant ever starts advertising `charge` at the service level, or
   // an operator opens a channel for this route, revisit — but the proxy will
   // keep auto-correcting either way.
+  // 2026-08-18: DELISTED. Same shape as openrouter and openai above — the
+  // agent's payment settles, then the merchant's own call upstream is
+  // refused, and the router auto-refunds ~25s later. Re-probed with real
+  // paid calls on 2026-08-18: every attempt returned
+  //   502 "Merchant payment failed" (merchant leg 403 forbidden)
+  // followed by a confirmed on-chain refund. The refund machinery worked,
+  // which is precisely why this stayed listed as charge-verified for days:
+  // callers got their money back and the route looked healthy from the
+  // catalog's point of view. Automatic refunds are not a substitute for a
+  // route that delivers, so it is marked unpayable until a paid re-probe
+  // returns a completion.
+  //
+  // Corroborating signal that predates this: wrangler.toml already carries
+  // PLAYGROUND_CHAT_MODELS_DISABLED = "anthropic,..." (2026-08-13) for the
+  // same post-payment 403. That killswitch only covered the playground; the
+  // public catalog kept advertising the route.
+  //
+  // The sibling anthropic_messages route settles through an installed Tempo
+  // channel (session dialect) and is a different upstream path, so it is not
+  // delisted here — but its last paid evidence is 2026-08-09 and it should
+  // be re-probed before it is relied on.
   'anthropic::/v1/chat/completions': {
     id: 'anthropic_chat_completions',
     publicPath: '/v1/services/anthropic/chat_completions',
     upstreamPaymentMethod: 'tempo.charge',
-    verifiedMode: 'charge',
-    chargeVerified: true,
-    chargeVerifiedAt: '2026-08-09T04:19:00Z',
+    verifiedMode: false,
     verifiedNote:
-      'Verified with real paid calls 2026-08-09 (202, completion returned) ' +
-      'on six current Claude models. Callers must pass a current model id — ' +
-      'retired 2024-era ids return 404 from the merchant.',
+      'DISABLED 2026-08-18: the payment settles and the merchant leg then ' +
+      'fails (403 forbidden) on every call, so the router refunds instead of ' +
+      'delivering. Confirmed with real paid re-probes on 2026-08-18; the ' +
+      'earlier 2026-08-09 charge verification no longer holds. Re-verify ' +
+      'with a real paid call that returns a completion before re-enabling.',
   },
   // Anthropic Messages — the native /v1/messages endpoint.
   // 2026-08-09: NOT yet re-tested with a current model id. The sibling

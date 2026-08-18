@@ -107,7 +107,7 @@ export interface PublicLedgerRow {
   amount_usd: string
   /** Stellar transaction hash of the settlement, or null if settlement did not produce one. */
   settlement_tx: string | null
-  /** delivered | failed | refund_pending | refund_unknown — see toPublicRow. */
+  /** delivered | failed | refund_pending | refunded | refund_unknown — see toPublicRow. */
   status: string
   /** HTTP status the upstream merchant returned. */
   upstream_status: number
@@ -125,6 +125,7 @@ export interface PublicLedgerRow {
 export function toPublicRow(entry: OrderLedgerEntry, internalPayers: Set<string>): PublicLedgerRow {
   let status: string
   if (entry.refund_status === 'pending') status = 'refund_pending'
+  else if (entry.refund_status === 'refunded') status = 'refunded'
   else if (entry.refund_status === 'unknown') status = 'refund_unknown'
   else if (entry.upstream_status >= 200 && entry.upstream_status < 300) status = 'delivered'
   else status = 'failed'

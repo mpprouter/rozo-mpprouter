@@ -133,7 +133,12 @@ describe('GET routes — build', () => {
     // 448 as of 2026-08-18: events/by-ledger relisted after Mercury shipped the
     // ledger-range query-plan fix on 2026-08-15, and charge-verified the same day
     // with a real paid mainnet call (tx 5028a601...4f0d).
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(448)
+    //
+    // 448 → 447 on 2026-08-18: anthropic chat_completions delisted. Paid
+    // re-probes showed the merchant leg failing 403 after the payment settled,
+    // so every call refunded instead of delivering. Moving this number DOWN is
+    // the mechanism working, not a regression.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(447)
     // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
     // events/by-ledger joined them at the beta launch (see the note above).
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
@@ -164,6 +169,14 @@ describe('GET routes — build', () => {
     // Moving this number UP requires a 200 from a real paid call per new
     // service. Moving it DOWN is legitimate when a paid re-probe shows a
     // service has broken; update this comment with which one and why.
+    //
+    // 2026-08-18: anthropic chat_completions was delisted (pay-then-403) and
+    // the count did NOT move. That is correct, not a loophole: the unit here
+    // is the SERVICE, and anthropic still has a verified route —
+    // anthropic_messages, a different upstream path that settles through an
+    // installed Tempo channel. Its last paid evidence is 2026-08-09; if a
+    // re-probe shows it broken too, anthropic leaves this set and the number
+    // becomes 20.
     const verifiedServices = new Set(
       PUBLIC_SERVICE_ROUTES.filter(
         r => r.verifiedMode === 'charge' || r.verifiedMode === 'session',

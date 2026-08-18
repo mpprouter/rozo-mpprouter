@@ -29,8 +29,10 @@
    "category": "ai",
    "price": "dynamic",
    "public_path": "/v1/services/anthropic/chat_completions",
-   "charge_verified_at": "2026-08-09T04:19:00Z",
+   "charge_verified_at": null,
    "session_verified_at": null,
+   "delisted_at": "2026-08-18",
+   "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), with the router auto-refunding on chain each time. The 2026-08-09 charge verification no longer holds, so verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Re-verify with a paid call returning a completion before relisting.",
    "runs": []
   },
   {

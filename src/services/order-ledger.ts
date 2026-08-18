@@ -24,7 +24,17 @@
 
 import type { Env } from '../index'
 
-export type RefundStatus = 'none' | 'pending' | 'unknown'
+/**
+ * `none`     — nothing to refund (the call was delivered).
+ * `pending`  — the merchant leg failed after the agent's payment settled and a
+ *              refund is queued; the on-chain return has not confirmed yet.
+ * `refunded` — the queued refund confirmed on chain.
+ * `unknown`  — the agent paid, the merchant leg failed, and no refund could be
+ *              queued (e.g. a channel voucher rollback that needs manual
+ *              review). Deliberately distinct from `pending`: it means nobody
+ *              has committed to returning the money.
+ */
+export type RefundStatus = 'none' | 'pending' | 'refunded' | 'unknown'
 
 export interface OrderLedgerEntry {
   order_id: string
@@ -90,5 +100,44 @@ export async function recordOrder(env: Env, entry: OrderLedgerEntry): Promise<vo
     }
   } catch (err: any) {
     console.error(`[order-ledger] write failed for ${entry.order_id}: ${err.message}`)
+  }
+}
+
+/**
+ * Move an existing order row to a new refund state (pending -> refunded).
+ *
+ * Called when the refund queue confirms the on-chain return, so the public
+ * ledger stops showing a settled-then-failed call as `refund_pending`
+ * forever. Read-modify-write on KV: the only writer of `refund_status` after
+ * the initial record is the refund executor, one write per refund, so there
+ * is no concurrent-update hazard worth a DO for.
+ *
+ * Best-effort like `recordOrder`: a missing row (write dropped, or TTL
+ * expired) or a KV failure logs and returns false rather than failing the
+ * refund itself — the refund record in ATOMIC_STORE remains the source of
+ * truth for whether the money went back.
+ */
+export async function updateOrderRefundStatus(
+  env: Env,
+  orderId: string,
+  refundStatus: RefundStatus,
+): Promise<boolean> {
+  try {
+    const raw = await env.MPP_STORE.get(orderKey(orderId))
+    if (!raw) {
+      console.error(`[order-ledger] refund status update: no order row ${orderId}`)
+      return false
+    }
+    const entry = JSON.parse(raw) as OrderLedgerEntry
+    if (entry.refund_status === refundStatus) return true
+    await env.MPP_STORE.put(
+      orderKey(orderId),
+      JSON.stringify({ ...entry, refund_status: refundStatus }),
+      { expirationTtl: 400 * 24 * 60 * 60 },
+    )
+    return true
+  } catch (err: any) {
+    console.error(`[order-ledger] refund status update failed for ${orderId}: ${err.message}`)
+    return false
   }
 }
