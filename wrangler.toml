@@ -206,6 +206,29 @@ PLAYGROUND_ENABLED = "true"
 # than to "unlimited" — see globalCapAtomic() in src/playground/ledger-client.ts.
 PLAYGROUND_GLOBAL_CAP_USD = "200"
 
+# ---- Public ledger payer attribution -----------------------------------
+# Source of truth for both lists: ainative
+# docs/reports/scf44-fullprice-repurchase-cohort-2026-08-18.md §3, where each
+# address is argued from on-chain provenance (which account created/funded it)
+# rather than asserted. These are public account IDs, not secrets — the list
+# being auditable is the point: SCF #44 promises the ledger "excludes our
+# published own/test keys", and a reviewer can only check that if they can see
+# which keys we excluded.
+#
+# INTERNAL = ours. Rozo E2E probe, leaked test wallet, mpp-showcase-payer,
+# and the founder's channel-playground wallet. All four trace to the Rozo V1
+# Stellar hub GC56BXCN... or are named as ours in our own docs.
+LEDGER_INTERNAL_PAYERS = "GAIK5OR2FY4MVXVL4AZDJLAJT3MIJ5I6PAYARB2CATRRVACWFI7C6NHW,GAN3YSPDH5VW7YFJJFUJH7LIYTJBWGH3GJMKOG6FP5RKHXGNMPX44UYY,GC2MW6GN67G74B6KXFLR3OTF35QB5KY75IKBY3QXSPLQNCQ7YH27JBSQ,GD5R4HTO5Y22ZNBD2ZZDJHFYN5JDYHDHG3VINLPM2ZU7HCIHUMI2BB4U"
+
+# UNRESOLVED = Rozo-ADJACENT, not clearable as external, not evidenced as ours.
+# GDOOBI5H... was funded by GDATMUNQ..., which appears as the worked example in
+# our own api-proxy-only README and itself paid the router pool 14x in May 2026;
+# it is also the hardcoded STELLAR_ADDR fixture in rozo-intents-api tests.
+# Reported as attribution:'unresolved' — excluded from the external count
+# without being claimed as ours. If it is ever cleared as a real customer,
+# move it out of this list rather than reclassifying rows after the fact.
+LEDGER_UNRESOLVED_PAYERS = "GDOOBI5HMUAXYF3QWGAPPY5MK3IPMHRA6LAXWAUZGA6H4FTZQUJNJU56"
+
 # Public Cloudflare Turnstile SITE key for the deposit-intent widget. Echoed by
 # GET /v1/playground/config so the frontend renders the widget; not a secret.
 PLAYGROUND_TURNSTILE_SITE_KEY = "0x4AAAAAAEOlP1MJ1iX6PnZl"

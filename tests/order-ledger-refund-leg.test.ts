@@ -30,6 +30,9 @@ import {
   type OrderLedgerEntry,
 } from '../src/services/order-ledger'
 import { toPublicRow } from '../src/routes/ledger'
+
+/** No payer classification configured — these tests only assert `status`. */
+const noLists = { internal: new Set<string>(), unresolved: new Set<string>() }
 import { completeRefund, enqueueRefund, leaseRefund } from '../src/refund/refund'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
@@ -98,16 +101,16 @@ describe('settled-but-undelivered calls are in the ledger', () => {
   })
 
   it('shows the failed leg publicly as refund_pending, not as a delivered call', () => {
-    const row = toPublicRow(failedLegEntry(), new Set())
+    const row = toPublicRow(failedLegEntry(), noLists)
     expect(row.status).toBe('refund_pending')
     expect(row.upstream_status).toBe(403)
     expect(row.settlement_tx).toBe(TX)
   })
 
   it('distinguishes a queued refund from one nobody committed to', () => {
-    expect(toPublicRow(failedLegEntry({ refund_status: 'unknown' }), new Set()).status)
+    expect(toPublicRow(failedLegEntry({ refund_status: 'unknown' }), noLists).status)
       .toBe('refund_unknown')
-    expect(toPublicRow(failedLegEntry({ refund_status: 'refunded' }), new Set()).status)
+    expect(toPublicRow(failedLegEntry({ refund_status: 'refunded' }), noLists).status)
       .toBe('refunded')
   })
 })
@@ -142,7 +145,7 @@ describe('refund confirmation writes back to the order row', () => {
     })
     const after = JSON.parse(kv.get(orderKey('ord_failedleg'))!) as OrderLedgerEntry
     expect(after.refund_status).toBe('refunded')
-    expect(toPublicRow(after, new Set()).status).toBe('refunded')
+    expect(toPublicRow(after, noLists).status).toBe('refunded')
     // Nothing else about the row is rewritten.
     expect(after.settlement_ref).toBe(TX)
     expect(after.upstream_status).toBe(403)
