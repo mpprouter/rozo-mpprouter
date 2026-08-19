@@ -145,7 +145,14 @@ describe('GET routes — build', () => {
     // condition was waiting on returned the identical merchant 403 on two
     // different current model ids (txs 832cd401...fc2152, ef7984cd...da09b69),
     // so the distinction did not hold. Anthropic now has no listed route.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(446)
+    //
+    // 446 → 447 on 2026-08-20: anthropic chat_completions relisted by founder
+    // decision as the LIVE REFUND DEMO route. The merchant leg still 403s on
+    // every call; each paid call settles and is auto-refunded in full within
+    // 1-2 minutes, which is exactly what payers use to exercise and verify
+    // the refund path. It does not deliver completions, and it is counted
+    // here because it is genuinely payable. anthropic_messages stays delisted.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(447)
     // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
     // events/by-ledger joined them at the beta launch (see the note above).
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
@@ -190,12 +197,19 @@ describe('GET routes — build', () => {
     // took the same merchant 403 as the charge route, so anthropic has no
     // verified route left and drops out of this set. The commitment is still
     // met, with zero headroom rather than one service of it.
+    //
+    // 20 → 21 on 2026-08-20: anthropic re-enters the set because
+    // chat_completions was relisted as the LIVE REFUND DEMO route (founder
+    // decision; see OPERATOR_OVERLAY). Its settlement dialect ('charge') is
+    // real and exercised by every demo call, but it does NOT deliver
+    // completions — so treat the SCF commitment as met by the OTHER 20
+    // services, and do not lean on anthropic if the number is ever argued.
     const verifiedServices = new Set(
       PUBLIC_SERVICE_ROUTES.filter(
         r => r.verifiedMode === 'charge' || r.verifiedMode === 'session',
       ).map(r => r.service),
     )
-    expect(verifiedServices.size).toBe(20)
+    expect(verifiedServices.size).toBe(21)
     // The commitment itself, stated independently of the exact figure above,
     // so a future delisting that drops us under 20 fails loudly.
     expect(verifiedServices.size).toBeGreaterThanOrEqual(20)
