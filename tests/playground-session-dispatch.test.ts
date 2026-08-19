@@ -201,18 +201,15 @@ describe('seam selection', () => {
     expect(merchantUrl).toContain(route.upstreamHost)
   })
 
-  it('refuses the anthropic chat_completions route outright — delisted, not re-seamed', async () => {
-    // Until 2026-08-18 this route was pinned to tempo.charge (production KV
-    // holds no channel for it) and was callable. It is now DELISTED in the
-    // overlay (`verifiedMode: false`): the merchant accepts the payment and
-    // then 403s the call, so every call ended in a router refund. The honest
-    // behaviour is to refuse before any seam is chosen — not to move it to the
-    // other seam, which would still pay for a call that cannot succeed.
-    expect(() => resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')).toThrow(
-      expect.objectContaining({ code: 'route_unverified', status: 503 }),
-    )
-    expect(payMerchant).not.toHaveBeenCalled()
-    expect(payMerchantSession).not.toHaveBeenCalled()
+  it('resolves anthropic chat_completions on the charge seam — relisted as the refund demo', async () => {
+    // Delisted 2026-08-18 (merchant charges then 403s, every call refunded).
+    // Relisted 2026-08-20 by founder decision as the LIVE REFUND DEMO route:
+    // the pay-then-403-then-auto-refund behaviour is intentional and is what
+    // payers use to exercise the refund path. It stays pinned to tempo.charge
+    // (production KV holds no channel for it) and must not move to the
+    // session seam.
+    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
   })
 
   it('routes the openai chat route through the session seam too', async () => {
@@ -544,14 +541,13 @@ describe('model catalog after the 2026-08-18 anthropic delisting', () => {
     }
   })
 
-  it('delists anthropic chat_completions instead of pinning it to a seam', () => {
-    // It was pinned to tempo.charge (production KV holds no channel for it).
-    // Delisted 2026-08-18: the merchant charges and then 403s. The overlay now
-    // sets verifiedMode:false, and resolvePlaygroundRoute — the same gate the
-    // proxy applies — refuses it with a 503 before any payment seam is picked.
-    expect(() => resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')).toThrow(
-      expect.objectContaining({ code: 'route_unverified', status: 503 }),
-    )
+  it('keeps the relisted anthropic chat_completions pinned to tempo.charge', () => {
+    // Delisted 2026-08-18 (charges then 403s), relisted 2026-08-20 as the
+    // refund demo (founder decision — see OPERATOR_OVERLAY). The gate must let
+    // it through again, and it must stay on the charge seam: production KV
+    // holds no channel for it, so the session seam would fail differently.
+    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
   })
 
   it('carries no unverified Claude model ids', () => {

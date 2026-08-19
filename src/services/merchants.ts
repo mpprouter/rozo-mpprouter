@@ -239,13 +239,22 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'anthropic_chat_completions',
     publicPath: '/v1/services/anthropic/chat_completions',
     upstreamPaymentMethod: 'tempo.charge',
-    verifiedMode: false,
+    // Founder decision 2026-08-20: keep this route payable as the LIVE
+    // REFUND DEMO. The merchant leg 403s on every call (confirmed with
+    // paid re-probes 2026-08-18 and 2026-08-19), so each paid call
+    // settles and is then automatically refunded in full within 1-2
+    // minutes — which is exactly the behaviour refund testing and the
+    // SCF44 tranche-2 video need to demonstrate. Do NOT delist it again
+    // for being undeliverable; that is the point. Delist only if the
+    // refund path itself stops working.
+    verifiedMode: 'charge',
     verifiedNote:
-      'DISABLED 2026-08-18: the payment settles and the merchant leg then ' +
-      'fails (403 forbidden) on every call, so the router refunds instead of ' +
-      'delivering. Confirmed with real paid re-probes on 2026-08-18; the ' +
-      'earlier 2026-08-09 charge verification no longer holds. Re-verify ' +
-      'with a real paid call that returns a completion before re-enabling.',
+      'REFUND DEMO route (founder decision 2026-08-20): payment settles, ' +
+      'the merchant leg then fails (403) on every call, and the router ' +
+      'automatically refunds in full within 1-2 minutes. Kept payable ' +
+      'intentionally so payers can exercise and verify the refund path ' +
+      'end-to-end (Refund-Id header -> /v1/refunds/{id} signed receipt). ' +
+      'It does NOT deliver completions.',
   },
   // Anthropic Messages — the native /v1/messages endpoint.
   //
