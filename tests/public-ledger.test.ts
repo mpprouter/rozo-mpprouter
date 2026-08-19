@@ -129,6 +129,7 @@ describe('GET /v1/ledger — response shape', () => {
       status: 'delivered',
       upstream_status: 200,
       internal: null,
+      attribution: 'unknown',
     })
     expect(row.settlement_tx).toMatch(/^a+1$/)
     expect(typeof row.ts).toBe('string')
@@ -146,7 +147,7 @@ describe('GET /v1/ledger — response shape', () => {
   })
 
   it('maps refund and failure states onto status', () => {
-    const none = new Set<string>()
+    const none = { internal: new Set<string>(), unresolved: new Set<string>() }
     expect(toPublicRow(entry(1, { refund_status: 'pending' }), none).status).toBe('refund_pending')
     expect(toPublicRow(entry(1, { refund_status: 'unknown' }), none).status).toBe('refund_unknown')
     expect(toPublicRow(entry(1, { upstream_status: 502 }), none).status).toBe('failed')
@@ -154,12 +155,34 @@ describe('GET /v1/ledger — response shape', () => {
   })
 
   it('marks internal payers only when an operator has configured the list', () => {
-    const configured = new Set(['GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB'])
+    const seeded = 'GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB'
+    const configured = { internal: new Set([seeded]), unresolved: new Set<string>() }
+    const empty = { internal: new Set<string>(), unresolved: new Set<string>() }
     expect(toPublicRow(entry(1), configured).internal).toBe(true)
     expect(toPublicRow(entry(1, { payer: 'GOTHER' }), configured).internal).toBe(false)
-    // Unknown, not "external": there is no marker in the stored records.
-    expect(toPublicRow(entry(1), new Set()).internal).toBeNull()
+    // Unknown, not "external": no list configured means no classification.
+    expect(toPublicRow(entry(1), empty).internal).toBeNull()
     expect(toPublicRow(entry(1, { payer: null }), configured).internal).toBeNull()
+  })
+
+  it('reports four-way attribution, keeping "unresolved" distinct from both buckets', () => {
+    const ours = 'GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB'
+    const adjacent = 'GDOOBI5HMUAXYF3QWGAPPY5MK3IPMHRA6LAXWAUZGA6H4FTZQUJNJU56'
+    const lists = { internal: new Set([ours]), unresolved: new Set([adjacent]) }
+
+    expect(toPublicRow(entry(1), lists).attribution).toBe('internal')
+    expect(toPublicRow(entry(1, { payer: adjacent }), lists).attribution).toBe('unresolved')
+    expect(toPublicRow(entry(1, { payer: 'GSTRANGER' }), lists).attribution).toBe('external')
+    expect(toPublicRow(entry(1, { payer: null }), lists).attribution).toBe('unknown')
+
+    // The whole reason the enum exists: an unresolved payer must not be
+    // counted as external (it would inflate the grant's unique-payer floor)
+    // and must not be claimed as internal (we cannot evidence ownership).
+    expect(toPublicRow(entry(1, { payer: adjacent }), lists).internal).toBeNull()
+
+    // With no lists at all, nothing is external — everything is unknown.
+    const empty = { internal: new Set<string>(), unresolved: new Set<string>() }
+    expect(toPublicRow(entry(1, { payer: 'GSTRANGER' }), empty).attribution).toBe('unknown')
   })
 })
 

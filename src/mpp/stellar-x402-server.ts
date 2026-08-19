@@ -85,6 +85,13 @@ import {
   getUsdcAddress,
 } from '@x402/stellar'
 import { ExactStellarScheme } from '@x402/stellar/exact/facilitator'
+import {
+  Networks,
+  StrKey,
+  TransactionBuilder,
+  scValToNative,
+  type Transaction,
+} from '@stellar/stellar-sdk'
 import type { Env } from '../index'
 
 // ---------------------------------------------------------------------
@@ -506,15 +513,72 @@ async function hashXdr(xdr: string): Promise<string> {
   return hex
 }
 
+/**
+ * Map our `STELLAR_NETWORK` tag onto the SDK's network passphrase.
+ * Returns null for anything we don't recognise so callers degrade to
+ * "payer unknown" instead of throwing inside a payment hot path.
+ */
+function passphraseFor(network: string): string | null {
+  if (network === 'stellar:pubnet') return Networks.PUBLIC
+  if (network === 'stellar:testnet') return Networks.TESTNET
+  return null
+}
+
+/**
+ * Decode the paying account out of the agent's signed x402 XDR.
+ *
+ * Why not just use the envelope source account: the envelope source is
+ * whoever pays the *network fee*, which is not necessarily whoever pays
+ * the *invoice*. This router already runs a separate gas sponsor
+ * (`GB5LCX...`, published in /health), and fee-bump / sponsored
+ * submission is a normal Soroban pattern. Attributing ledger rows to a
+ * sponsor would silently collapse many distinct agents onto one
+ * address — precisely the opposite of what the unique-payer count
+ * needs. So we read the SAC `transfer(from, to, amount)` invocation and
+ * take `from`, falling back to the envelope source only when no
+ * transfer op is present.
+ *
+ * NEVER throws. A malformed or unexpected XDR yields null and the
+ * caller records `payer: null`, exactly as before this function
+ * existed. Payment correctness must not depend on attribution.
+ */
+export function extractPayerFromXdr(xdrString: string, network: string): string | null {
+  const passphrase = passphraseFor(network)
+  if (!passphrase) return null
+  try {
+    const tx = TransactionBuilder.fromXDR(xdrString, passphrase) as Transaction
+    for (const op of tx.operations) {
+      if (op.type !== 'invokeHostFunction') continue
+      const fn = op.func
+      if (fn.switch().name !== 'hostFunctionTypeInvokeContract') continue
+      const invocation = fn.invokeContract()
+      if (invocation.functionName().toString() !== 'transfer') continue
+      const args = invocation.args()
+      if (args.length < 1) continue
+      const from = String(scValToNative(args[0]))
+      if (StrKey.isValidEd25519PublicKey(from)) return from
+      // Contract-address payers (smart wallets) are valid payers too and
+      // are stable identifiers, so keep them rather than dropping to the
+      // envelope source.
+      if (StrKey.isValidContract(from)) return from
+    }
+    const source = tx.source
+    return StrKey.isValidEd25519PublicKey(source) ? source : null
+  } catch {
+    return null
+  }
+}
+
 async function extractPayloadIdentity(
   payload: PaymentPayload,
-): Promise<{ payloadHash: string } | null> {
+  network: string,
+): Promise<{ payloadHash: string; payer: string | null } | null> {
   const raw = payload.payload as StellarExactPayload | undefined
   if (!raw || typeof raw.transaction !== 'string' || raw.transaction.length === 0) {
     return null
   }
   const payloadHash = await hashXdr(raw.transaction)
-  return { payloadHash }
+  return { payloadHash, payer: extractPayerFromXdr(raw.transaction, network) }
 }
 
 export type StellarX402VerifyFail = {
@@ -551,6 +615,12 @@ export type StellarX402PrepareOk = {
   requirements: PaymentRequirements
   signedAmount: bigint
   payloadHash: string
+  /**
+   * Paying Stellar account decoded from the signed XDR, or null when the
+   * payload shape prevented attribution. Used only for ledger
+   * attribution — never for authorization decisions.
+   */
+  payer: string | null
 }
 export type StellarX402PrepareFail = StellarX402VerifyFail
 
@@ -593,7 +663,7 @@ export async function prepareStellarX402Inbound(
   // `{ transaction: <XDR> }` in payload.payload — we hash the XDR
   // as our dedup key for the KV replay guard the proxy will run
   // next.
-  const identity = await extractPayloadIdentity(payload)
+  const identity = await extractPayloadIdentity(payload, env.STELLAR_NETWORK)
   if (!identity) {
     return {
       ok: false,
@@ -609,6 +679,7 @@ export async function prepareStellarX402Inbound(
     requirements,
     signedAmount,
     payloadHash: identity.payloadHash,
+    payer: identity.payer,
   }
 }
 

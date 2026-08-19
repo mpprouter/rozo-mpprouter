@@ -261,6 +261,23 @@ export interface Env {
   // put STELLAR_X402_FACILITATOR_SECRET`.
   STELLAR_X402_FACILITATOR_SECRET: string
   PAYINVOICE_ADMIN_SECRET: string
+
+  // ---- Public ledger attribution ----------------------------------------
+  // Comma-separated Stellar addresses that belong to US (probes, e2e wallets,
+  // dogfood accounts). GET /v1/ledger marks matching rows internal:true and
+  // everything else internal:false; when this is UNSET every row reports
+  // internal:null ("unknown"), which is what production returned before this
+  // var existed. Plain var, not a secret — these are public account IDs and
+  // the whole point is that reviewers can audit the exclusion list.
+  // Rows whose payer could not be decoded stay internal:null regardless.
+  LEDGER_INTERNAL_PAYERS?: string
+  // Comma-separated addresses that are Rozo-ADJACENT but cannot be evidenced
+  // as ours: /v1/ledger reports attribution:'unresolved' for these. They are
+  // excluded from the external count WITHOUT being claimed as internal.
+  // Keeping this separate from LEDGER_INTERNAL_PAYERS is the whole point —
+  // folding them into either bucket would misstate the external-payer number
+  // that the grant floors are measured against.
+  LEDGER_UNRESOLVED_PAYERS?: string
   ADMIN_ENDPOINT_ENABLED?: string
 
   // Coupon issuance secret (routes/coupon.ts). Deliberately separate from

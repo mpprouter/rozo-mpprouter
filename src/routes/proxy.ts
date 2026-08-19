@@ -1618,14 +1618,14 @@ export async function handleProxy(
       )
     }
 
-    // Payment log. No idempotency cache entry is written on this branch:
-    // the x402 payer account is not decoded here (it lives inside the
-    // signed Soroban XDR — see extractPayloadIdentity, which only hashes
-    // the XDR), and without a verified payer there is no safe key to
-    // scope a cached merchant response to. Writing one under the old
-    // payer-less key is exactly the cross-account disclosure this change
-    // removes. Restoring x402 idempotency requires decoding the source
-    // account from the XDR first; tracked as follow-up, not done here.
+    // Payment log. Still no idempotency cache entry on this branch.
+    // prepare() now decodes the payer for LEDGER ATTRIBUTION only, and that
+    // is deliberately a best-effort value that can be null — it is NOT the
+    // "verified payer" an idempotency key would need. Scoping a cached
+    // merchant response to a best-effort identity would reintroduce exactly
+    // the cross-account disclosure this branch removed. Restoring x402
+    // idempotency needs the payer to be verified (i.e. proven by the
+    // facilitator's simulate result), not merely parsed; still a follow-up.
     ctx.waitUntil((async () => {
       console.log(
         `[payment] route=${route.id} method=stellar.x402 merchant=${merchantHost} upstreamPath=${upstreamPath}`,
@@ -1635,15 +1635,20 @@ export async function handleProxy(
     // Per-call order ledger (design doc §2.9). Recorded for EVERY settled
     // call, not only router-held-credential (Mercury) routes: the records
     // now back the public GET /v1/ledger, and a ledger that silently omits
-    // most of the router's paid traffic misrepresents it. Payer isn't
-    // decoded from the x402 signed XDR in v1 (see order-ledger.ts note);
-    // settlement_ref is the on-chain settle tx when it succeeded.
+    // most of the router's paid traffic misrepresents it. settlement_ref is
+    // the on-chain settle tx when it succeeded.
+    //
+    // Payer IS now decoded from the signed XDR (extractPayerFromXdr, run
+    // during prepare). It stays null when the payload shape defeats
+    // decoding, so consumers must still treat null as "unknown", not as
+    // "no payer". Attribution never gates the payment: prepare already
+    // succeeded by this point regardless of what the decoder returned.
     {
       ctx.waitUntil(recordOrder(env, {
         order_id: newOrderId(),
         ts: new Date().toISOString(),
         route_id: route.id,
-        payer: null,
+        payer: prepared.payer,
         amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
         settlement_ref: settle.transaction ?? null,
         request_path: `${upstreamPath}${forwardedSearch}`,

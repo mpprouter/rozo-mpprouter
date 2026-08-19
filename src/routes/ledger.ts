@@ -113,16 +113,39 @@ export interface PublicLedgerRow {
   upstream_status: number
   /**
    * Whether this row is our own probe/test traffic rather than an external
-   * user. `null` means UNKNOWN, and today it is null for every row: the
-   * records carry no internal/test marker, and none was invented for this
-   * endpoint. Set LEDGER_INTERNAL_PAYERS (comma-separated G... addresses) to
-   * start classifying; rows with a payer then become true/false honestly.
+   * user. `null` means UNKNOWN — either the payer could not be decoded, or
+   * no classification list is configured. Derived from `attribution`:
+   * internal ⇒ true, external ⇒ false, unresolved/unknown ⇒ null.
+   * Kept for backwards compatibility; prefer `attribution`, which can say
+   * "we genuinely don't know" without pretending it's external.
    */
   internal: boolean | null
+  /**
+   * Four-way payer attribution:
+   *   'internal'   — ours (probe, e2e, dogfood). Listed in LEDGER_INTERNAL_PAYERS.
+   *   'unresolved' — Rozo-adjacent, cannot be cleared as external. Listed in
+   *                  LEDGER_UNRESOLVED_PAYERS. Deliberately NOT counted as
+   *                  external, and deliberately NOT claimed as ours either.
+   *   'external'   — a payer we did not create and cannot tie to ourselves.
+   *   'unknown'    — payer is null, or no lists are configured at all.
+   *
+   * The three-way split exists because a boolean forces a lie on the
+   * middle case: calling an unresolved wallet "external" inflates the
+   * external-payer count, and calling it "internal" asserts ownership we
+   * cannot evidence. Grant reviewers get to see the ambiguity instead of
+   * inheriting our guess.
+   */
+  attribution: 'internal' | 'external' | 'unresolved' | 'unknown'
+}
+
+/** The payer classification lists, resolved once per request from env. */
+export interface PayerLists {
+  internal: Set<string>
+  unresolved: Set<string>
 }
 
 /** Maps the stored entry onto the public shape, dropping the internal-only fields. */
-export function toPublicRow(entry: OrderLedgerEntry, internalPayers: Set<string>): PublicLedgerRow {
+export function toPublicRow(entry: OrderLedgerEntry, lists: PayerLists): PublicLedgerRow {
   let status: string
   if (entry.refund_status === 'pending') status = 'refund_pending'
   else if (entry.refund_status === 'refunded') status = 'refunded'
@@ -130,8 +153,21 @@ export function toPublicRow(entry: OrderLedgerEntry, internalPayers: Set<string>
   else if (entry.upstream_status >= 200 && entry.upstream_status < 300) status = 'delivered'
   else status = 'failed'
 
-  let internal: boolean | null = null
-  if (internalPayers.size > 0 && entry.payer) internal = internalPayers.has(entry.payer)
+  // Attribution. Note the ordering: a payer we cannot decode is 'unknown'
+  // no matter what the lists say, and with no lists configured at all we
+  // report 'unknown' rather than declaring every payer external.
+  let attribution: PublicLedgerRow['attribution']
+  if (!entry.payer || (lists.internal.size === 0 && lists.unresolved.size === 0)) {
+    attribution = 'unknown'
+  } else if (lists.internal.has(entry.payer)) {
+    attribution = 'internal'
+  } else if (lists.unresolved.has(entry.payer)) {
+    attribution = 'unresolved'
+  } else {
+    attribution = 'external'
+  }
+  const internal: boolean | null =
+    attribution === 'internal' ? true : attribution === 'external' ? false : null
 
   return {
     order_id: entry.order_id,
@@ -143,11 +179,11 @@ export function toPublicRow(entry: OrderLedgerEntry, internalPayers: Set<string>
     status,
     upstream_status: entry.upstream_status,
     internal,
+    attribution,
   }
 }
 
-function internalPayerSet(env: Env): Set<string> {
-  const raw = (env as unknown as { LEDGER_INTERNAL_PAYERS?: string }).LEDGER_INTERNAL_PAYERS
+function parseAddressList(raw: string | undefined): Set<string> {
   if (!raw) return new Set()
   return new Set(
     raw
@@ -155,6 +191,13 @@ function internalPayerSet(env: Env): Set<string> {
       .map((s) => s.trim())
       .filter(Boolean),
   )
+}
+
+function payerLists(env: Env): PayerLists {
+  return {
+    internal: parseAddressList(env.LEDGER_INTERNAL_PAYERS),
+    unresolved: parseAddressList(env.LEDGER_UNRESOLVED_PAYERS),
+  }
 }
 
 async function readEntry(env: Env, orderId: string): Promise<OrderLedgerEntry | null> {
@@ -180,7 +223,7 @@ async function handleByTx(env: Env, tx: string): Promise<Response> {
   if (!orderId) return json(404, { ok: false, error: 'No ledger entry for that transaction hash.' })
   const entry = await readEntry(env, orderId)
   if (!entry) return json(404, { ok: false, error: 'No ledger entry for that transaction hash.' })
-  return json(200, { ok: true, entry: toPublicRow(entry, internalPayerSet(env)) })
+  return json(200, { ok: true, entry: toPublicRow(entry, payerLists(env)) })
 }
 
 export async function handleLedger(request: Request, env: Env): Promise<Response> {
@@ -224,13 +267,13 @@ export async function handleLedger(request: Request, env: Env): Promise<Response
     return json(503, { ok: false, error: 'Ledger storage temporarily unavailable.' })
   }
 
-  const internalPayers = internalPayerSet(env)
+  const lists = payerLists(env)
   const raws = await Promise.all(listed.keys.map((k) => env.MPP_STORE.get(k.name)))
   const entries: PublicLedgerRow[] = []
   for (const raw of raws) {
     if (!raw) continue
     try {
-      entries.push(toPublicRow(JSON.parse(raw) as OrderLedgerEntry, internalPayers))
+      entries.push(toPublicRow(JSON.parse(raw) as OrderLedgerEntry, lists))
     } catch {
       // A single unparseable record must not 500 the whole page.
     }
