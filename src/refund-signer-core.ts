@@ -265,6 +265,51 @@ export async function sendAlert(env: Env, content: RedactedAlert): Promise<void>
   }
 }
 
+/**
+ * Pull the transaction-level result code ("txBadSeq", "txTooLate", ...) out of
+ * a SendTransactionResponse ERROR. The SDK hands back an xdr.TransactionResult
+ * whose shape has shifted across versions, so every accessor is guarded — an
+ * unreadable result returns undefined, which callers must treat as fatal
+ * (unknown errors park, they do not retry).
+ */
+export function sendErrorCode(send: { errorResult?: unknown }): string | undefined {
+  try {
+    const res = (send.errorResult as { result?: () => { switch?: () => { name?: string } } })?.result?.()
+    const name = res?.switch?.()?.name
+    return typeof name === 'string' ? name : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Submission rejections that resolve themselves if the job simply stays in
+ * `submitted` and waits: the dead-envelope recovery in `confirmSubmitted`
+ * requeues any envelope that is past maxTime and absent on chain, and a fresh
+ * envelope is then signed with a fresh sequence.
+ *
+ *   - txBadSeq: our sequence view lost a race (RPC lag after a refund landed
+ *     moments earlier — the exact "first refund fine, second refund dead"
+ *     asymmetry RefundSequenceGuard exists for, which only protects within a
+ *     single run). The envelope can never be included, so waiting out its
+ *     maxTime double-pays nothing.
+ *   - txTooLate: the envelope is already past maxTime — the recovery path's
+ *     own trigger condition.
+ *
+ * Everything else (txBadAuth, txInsufficientBalance, txMalformed, or a result
+ * we cannot even decode) parks into manual_review as before: retrying those
+ * blind would either never succeed or would need a human to look first.
+ *
+ * WHY THIS EXISTS: on 2026-08-21 two customer refunds (13:15Z and 14:42Z, both
+ * 0.001 USDC on codex_graphql) were parked into manual_review — a terminal
+ * state only an operator can leave — on their FIRST submission error, while
+ * the refunds two minutes on either side sailed through. Parking must be
+ * reserved for rejections that cannot heal themselves.
+ */
+export function isRetryableSendError(code: string | undefined): boolean {
+  return code === 'txBadSeq' || code === 'txTooLate'
+}
+
 async function buildSignedRefund(
   server: RefundSignerRpc,
   signer: Keypair,
@@ -364,8 +409,15 @@ async function confirmSubmitted(
     }
     const send = await server.sendTransaction(tx)
     if (send.status === 'ERROR') {
+      const code = sendErrorCode(send)
+      if (isRetryableSendError(code)) {
+        // Leave the job in `submitted`: this same function's dead-envelope
+        // recovery requeues it once the envelope is provably expired and
+        // absent from chain, and a fresh envelope gets a fresh sequence.
+        throw new Error(`submitted refund re-send rejected (${code}), left for dead-envelope recovery: ${refundTx}`)
+      }
       await parkRejected(env, job, refundTx)
-      await onRejected(refundTx, String(send.errorResult ?? send.status))
+      await onRejected(refundTx, String(code ?? send.errorResult ?? send.status))
       throw new Error(`submitted refund rejected and parked: ${refundTx}`)
     }
     if (consumesSequence(send.status)) sequence.recordAccepted(tx.sequence)
@@ -409,8 +461,17 @@ async function executePending(
   })
   const send = await server.sendTransaction(prepared)
   if (send.status === 'ERROR') {
+    const code = sendErrorCode(send)
+    if (isRetryableSendError(code)) {
+      // The job was completed to `submitted` just above, so the next cron
+      // run's confirmSubmitted path owns it: once the envelope is provably
+      // expired and absent from chain it is requeued and re-signed with a
+      // fresh sequence. Parking here — the old behaviour — turned a lost
+      // sequence race into a permanently stranded customer refund.
+      throw new Error(`refund submission rejected (${code}), left for dead-envelope recovery: ${refundTx}`)
+    }
     await parkRejected(env, leased.job, refundTx)
-    await onRejected(refundTx, String(send.errorResult ?? send.status))
+    await onRejected(refundTx, String(code ?? send.errorResult ?? send.status))
     throw new Error(`refund transaction rejected and parked: ${refundTx}`)
   }
   if (consumesSequence(send.status)) sequence.recordAccepted(prepared.sequence)
