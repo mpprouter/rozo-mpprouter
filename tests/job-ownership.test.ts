@@ -93,11 +93,24 @@ describe('handleJobChallenge', () => {
       'J1',
     )
     expect(res.status).toBe(200)
-    const body = (await res.json()) as { nonce: string; owner: string; jobId: string }
+    const body = (await res.json()) as {
+      nonce: string
+      owner: string
+      jobId: string
+      signedMessage: string
+    }
     expect(body.jobId).toBe('J1')
     expect(body.owner).toBe(owner)
     expect(body.nonce).toMatch(/^[0-9a-f]{64}$/)
     expect(kv.get(`challenge:J1:${owner}`)).toBe(body.nonce)
+
+    // signedMessage must be the exact string the verifier accepts, not a
+    // template — a client that signs it verbatim has to pass.
+    const advertised = (body as unknown as { signedMessage: string })
+      .signedMessage
+    expect(advertised).toBe(
+      new TextDecoder().decode(ownershipMessage('J1', body.nonce)),
+    )
   })
 })
 

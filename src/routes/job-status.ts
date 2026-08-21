@@ -302,7 +302,7 @@ export async function handleJobChallenge(
       owner,
       nonce,
       expiresAt,
-      signedMessage: `${OWNERSHIP_DOMAIN}:${jobId}:<nonce>`,
+      signedMessage: `${OWNERSHIP_DOMAIN}:${jobId}:${nonce}`,
       instructions:
         `Sign the UTF-8 bytes of "${OWNERSHIP_DOMAIN}:${jobId}:${nonce}" ` +
         'with your Stellar secret key, then GET /v1/services/<svc>/jobs/<id> ' +
