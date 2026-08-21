@@ -16,6 +16,7 @@ import { Keypair } from '@stellar/stellar-base'
 import {
   handleJobChallenge,
   handleJobStatus,
+  ownershipMessage,
   type JobAuthRecord,
 } from '../src/routes/job-status'
 import type { Env } from '../src/index'
@@ -178,7 +179,7 @@ describe('handleJobStatus ownership verification', () => {
     const { nonce } = (await challenge.json()) as { nonce: string }
 
     // Attacker signs with their own key but presents owner's G.
-    const sig = attacker.sign(Buffer.from(hexToBytes(nonce)))
+    const sig = attacker.sign(Buffer.from(ownershipMessage('J4', nonce)))
 
     const res = await handleJobStatus(
       new Request('https://r/v1/services/stablestudio/jobs/J4', {
@@ -212,7 +213,7 @@ describe('handleJobStatus ownership verification', () => {
       'J5',
     )
     const { nonce } = (await challenge.json()) as { nonce: string }
-    const sig = otherAgent.sign(Buffer.from(hexToBytes(nonce)))
+    const sig = otherAgent.sign(Buffer.from(ownershipMessage('J5', nonce)))
 
     const res = await handleJobStatus(
       new Request('https://r/v1/services/stablestudio/jobs/J5', {
@@ -243,7 +244,7 @@ describe('handleJobStatus ownership verification', () => {
       'J6',
     )
     const { nonce } = (await challenge.json()) as { nonce: string }
-    const sig = owner.sign(Buffer.from(hexToBytes(nonce)))
+    const sig = owner.sign(Buffer.from(ownershipMessage('J6', nonce)))
 
     const res = await handleJobStatus(
       new Request('https://r/v1/services/stablestudio/jobs/J6', {
@@ -274,5 +275,84 @@ describe('handleJobStatus ownership verification', () => {
       'J6',
     )
     expect(replay.status).toBe(401)
+  })
+
+  // The payer proves ownership with the same key it pays with, so the signed
+  // bytes must never double as a signature over a Stellar transaction. Every
+  // Stellar signing payload (transaction, Soroban auth entry) is a bare
+  // 32-byte hash, so a service that could get the payer to sign a raw 32-byte
+  // nonce of its choosing could harvest a valid transaction signature.
+  it('rejects a signature over the bare nonce bytes', async () => {
+    const { env, kv } = makeEnv()
+    const owner = Keypair.random()
+    seedJob(kv, 'J7', owner.publicKey())
+
+    const challenge = await handleJobChallenge(
+      new Request('https://r/v1/services/stablestudio/jobs/J7/challenge', {
+        headers: { 'x-stellar-owner': owner.publicKey() },
+      }),
+      env,
+      'stablestudio',
+      'J7',
+    )
+    const { nonce } = (await challenge.json()) as { nonce: string }
+
+    // The old (vulnerable) scheme: sign the 32 raw nonce bytes.
+    const sig = owner.sign(Buffer.from(hexToBytes(nonce)))
+
+    const res = await handleJobStatus(
+      new Request('https://r/v1/services/stablestudio/jobs/J7', {
+        headers: {
+          'x-stellar-owner': owner.publicKey(),
+          'x-stellar-nonce': nonce,
+          'x-stellar-signature': sig.toString('base64'),
+        },
+      }),
+      env,
+      'stablestudio',
+      'J7',
+    )
+    expect(res.status).toBe(401)
+  })
+
+  it('signs a message that can never be a 32-byte Stellar hash', () => {
+    const msg = ownershipMessage('J8', 'ab'.repeat(32))
+    expect(msg.length).not.toBe(32)
+    expect(new TextDecoder().decode(msg)).toMatch(
+      /^mpprouter-job-ownership-v1:J8:[0-9a-f]{64}$/,
+    )
+  })
+
+  it('binds the proof to one job — a proof for J9 does not open J10', async () => {
+    const { env, kv } = makeEnv()
+    const owner = Keypair.random()
+    seedJob(kv, 'J9', owner.publicKey())
+    seedJob(kv, 'J10', owner.publicKey())
+
+    const challenge = await handleJobChallenge(
+      new Request('https://r/v1/services/stablestudio/jobs/J9/challenge', {
+        headers: { 'x-stellar-owner': owner.publicKey() },
+      }),
+      env,
+      'stablestudio',
+      'J9',
+    )
+    const { nonce } = (await challenge.json()) as { nonce: string }
+    const sig = owner.sign(Buffer.from(ownershipMessage('J9', nonce)))
+
+    // Same owner, same signature, pointed at a different job they also own.
+    const res = await handleJobStatus(
+      new Request('https://r/v1/services/stablestudio/jobs/J10', {
+        headers: {
+          'x-stellar-owner': owner.publicKey(),
+          'x-stellar-nonce': nonce,
+          'x-stellar-signature': sig.toString('base64'),
+        },
+      }),
+      env,
+      'stablestudio',
+      'J10',
+    )
+    expect(res.status).toBe(401)
   })
 })
