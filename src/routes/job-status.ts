@@ -100,6 +100,23 @@ export interface JobAuthRecord {
 const CHALLENGE_TTL_SECONDS = 120
 const NONCE_BYTES = 32
 
+/**
+ * Payers prove job ownership by signing with the same Stellar key they pay
+ * with, so the bytes they sign must never be usable as a signature over
+ * something else. Everything Stellar signs — transactions, Soroban auth
+ * entries — is a bare 32-byte hash, which is exactly the size of a raw nonce.
+ * Signing the nonce directly would let any service that hands back a chosen
+ * "nonce" harvest a valid transaction signature from the payer's wallet.
+ *
+ * So the signed message is this printable, job-bound preimage instead. It can
+ * never equal a 32-byte hash, and it binds the proof to one specific job.
+ */
+const OWNERSHIP_DOMAIN = 'mpprouter-job-ownership-v1'
+
+export function ownershipMessage(jobId: string, nonceHex: string): Uint8Array {
+  return new TextEncoder().encode(`${OWNERSHIP_DOMAIN}:${jobId}:${nonceHex}`)
+}
+
 function classifyAsyncFailure(statusCode: number, body: string): RefundReason | undefined {
   if (statusCode >= 400 && statusCode < 500) return 'non_fulfillment'
   if (statusCode >= 500) return 'upstream_5xx'
@@ -285,10 +302,13 @@ export async function handleJobChallenge(
       owner,
       nonce,
       expiresAt,
+      signedMessage: `${OWNERSHIP_DOMAIN}:${jobId}:${nonce}`,
       instructions:
-        'Sign the hex-decoded nonce bytes with your Stellar secret key, ' +
-        'then GET /v1/services/<svc>/jobs/<id> with headers ' +
-        'X-Stellar-Owner, X-Stellar-Nonce, X-Stellar-Signature (base64).',
+        `Sign the UTF-8 bytes of "${OWNERSHIP_DOMAIN}:${jobId}:${nonce}" ` +
+        'with your Stellar secret key, then GET /v1/services/<svc>/jobs/<id> ' +
+        'with headers X-Stellar-Owner, X-Stellar-Nonce, X-Stellar-Signature ' +
+        '(base64 ed25519). Never sign the bare nonce bytes: a 32-byte ' +
+        'payload is indistinguishable from a Stellar transaction hash.',
     }),
     { status: 200, headers: { 'Content-Type': 'application/json' } },
   )
@@ -330,8 +350,9 @@ export async function handleJobStatus(
         error: 'Ownership proof required',
         hint:
           'GET /v1/services/<svc>/jobs/<id>/challenge with X-Stellar-Owner to ' +
-          'receive a nonce, sign the hex-decoded bytes with your Stellar ' +
-          'secret key, then retry this call with headers X-Stellar-Owner, ' +
+          'receive a nonce, sign the UTF-8 bytes of ' +
+          `"${OWNERSHIP_DOMAIN}:<jobId>:<nonce>" with your Stellar secret ` +
+          'key, then retry this call with headers X-Stellar-Owner, ' +
           'X-Stellar-Nonce, X-Stellar-Signature (base64 ed25519).',
       }),
       { status: 401, headers: { 'Content-Type': 'application/json' } },
@@ -370,7 +391,7 @@ export async function handleJobStatus(
   let sigOk = false
   try {
     sigOk = Keypair.fromPublicKey(owner).verify(
-      Buffer.from(nonceBytes),
+      Buffer.from(ownershipMessage(jobId, nonceHex)),
       Buffer.from(signatureBytes),
     )
   } catch {
