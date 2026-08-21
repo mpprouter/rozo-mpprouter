@@ -832,6 +832,46 @@ async function payMerchantAndGetBodyInner(
  *
  * Returns null if the response does not look like an async job.
  */
+/**
+ * Does a merchant response represent work that is still in flight?
+ *
+ * A 202 always does. A 200 only does when the merchant SAYS the work is
+ * pending — some merchants (StableStudio Nano-Banana-Pro, etc.) accept the
+ * payment and return 200 with `{ jobId, status: "queued" }` instead of the
+ * canonical 202.
+ *
+ * A 200 carrying an id but NO status is a delivered sync response, not a job.
+ * Anthropic's OpenAI-compatible completion is exactly that shape —
+ * `{"id":"msg_...","object":"chat.completion",...}` — and treating it as async
+ * threw the answer away, minted a job bound to a path the merchant does not
+ * serve, and handed the payer a poll URL that 404s forever. The payment also
+ * counted as dispatched, so no refund fired and the payer got nothing.
+ * (Observed 2026-08-21 on anthropic_chat_completions: 0.0021760 USDC settled
+ * and never returned.)
+ */
+export function isAsyncJobResponse(
+  merchantStatus: number,
+  body: string,
+): { isAsync: boolean; jobId?: string } {
+  let jobId: string | undefined
+  let bodyStatus: string | undefined
+  try {
+    const parsed = JSON.parse(body)
+    jobId = parsed.jobId ?? parsed.job_id ?? parsed.id
+    bodyStatus = typeof parsed.status === 'string' ? parsed.status.toLowerCase() : undefined
+  } catch {
+    // Not JSON — cannot be an async job
+  }
+
+  if (merchantStatus === 202) return { isAsync: true, jobId }
+  const pending = bodyStatus !== undefined && PENDING_JOB_STATUSES.has(bodyStatus)
+  return { isAsync: merchantStatus === 200 && !!jobId && pending, jobId }
+}
+
+const PENDING_JOB_STATUSES = new Set([
+  'queued', 'pending', 'running', 'processing', 'in_progress', 'in-progress',
+])
+
 async function handleAsyncJob(
   env: Env,
   payResult: MerchantPayResult & { kind: 'ok' },
@@ -841,23 +881,7 @@ async function handleAsyncJob(
   paymentProof?: PaymentProof,
   channelDelivery?: JobAuthRecord['channelDelivery'],
 ): Promise<Response | null> {
-  // Try to extract a job ID from the response body (both 202 and 200 paths).
-  let jobId: string | undefined
-  let bodyStatus: string | undefined
-  try {
-    const parsed = JSON.parse(payResult.body)
-    jobId = parsed.jobId ?? parsed.job_id ?? parsed.id
-    bodyStatus = typeof parsed.status === 'string' ? parsed.status.toLowerCase() : undefined
-  } catch {
-    // Not JSON — cannot be an async job
-  }
-
-  const PENDING_STATUSES = new Set([
-    'queued', 'pending', 'running', 'processing', 'in_progress', 'in-progress',
-  ])
-  const isAsync =
-    payResult.merchantStatus === 202 ||
-    (payResult.merchantStatus === 200 && !!jobId && (bodyStatus === undefined || PENDING_STATUSES.has(bodyStatus)))
+  const { isAsync, jobId } = isAsyncJobResponse(payResult.merchantStatus, payResult.body)
 
   if (!isAsync) return null
 
