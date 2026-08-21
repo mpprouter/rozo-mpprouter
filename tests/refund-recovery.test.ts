@@ -25,6 +25,8 @@ import {
   REFUND_TX_VALIDITY_SECONDS,
   RefundSequenceGuard,
   consumesSequence,
+  isRetryableSendError,
+  sendErrorCode,
   reportStuckRefunds,
   runRefundSigner,
   type Env as SignerEnv,
@@ -503,5 +505,79 @@ describe('signed refund envelopes', () => {
     expect(submitted).toHaveLength(2)
     expect(submitted[0].sequence).toBe('101')
     expect(submitted[1].sequence).toBe('101')
+  })
+})
+
+/**
+ * Regression for the 2026-08-21 stuck refunds (13:15Z and 14:42Z, both
+ * codex_graphql): a first-attempt submission ERROR parked the job straight
+ * into manual_review — a terminal state — even when the rejection was a lost
+ * sequence race that the dead-envelope recovery would have healed by itself.
+ */
+describe('park only fatal submission errors', () => {
+  // xdr.TransactionResult with code txBadSeq (-5), captured from the SDK.
+  const TX_BAD_SEQ_XDR = 'AAAAAAAAAAD////7AAAAAA=='
+
+  function txBadSeqResult() {
+    const { xdr } = require('@stellar/stellar-sdk') as typeof import('@stellar/stellar-sdk')
+    return xdr.TransactionResult.fromXDR(Buffer.from(TX_BAD_SEQ_XDR, 'base64'))
+  }
+
+  it('decodes the SDK error result shape', () => {
+    expect(sendErrorCode({ errorResult: txBadSeqResult() })).toBe('txBadSeq')
+    expect(sendErrorCode({ errorResult: undefined })).toBeUndefined()
+    expect(sendErrorCode({ errorResult: 'garbage' })).toBeUndefined()
+  })
+
+  it('classifies only self-healing rejections as retryable', () => {
+    expect(isRetryableSendError('txBadSeq')).toBe(true)
+    expect(isRetryableSendError('txTooLate')).toBe(true)
+    expect(isRetryableSendError('txBadAuth')).toBe(false)
+    expect(isRetryableSendError('txInsufficientBalance')).toBe(false)
+    expect(isRetryableSendError(undefined)).toBe(false) // undecodable = fatal = park
+  })
+
+  it('a txBadSeq rejection does NOT park the job into manual_review', async () => {
+    const signer = Keypair.random()
+    const { env, server, ledger, submitted } = signerHarness(signer, ['10000'], () => 'ERROR')
+    const erroringServer: RefundSignerRpc = {
+      ...server,
+      sendTransaction: async (tx) => {
+        const base = await server.sendTransaction(tx)
+        return { ...base, status: 'ERROR', errorResult: txBadSeqResult() } as unknown as rpc.Api.SendTransactionResponse
+      },
+    }
+
+    await runRefundSigner(env, ledger, erroringServer)
+
+    expect(submitted).toHaveLength(1)
+    // No park: /admin/refunds/complete must never be called with manual_review.
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    const parkCalls = fetchMock.mock.calls.filter(([input, init]: [string | URL | Request, RequestInit?]) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (!url.endsWith('/admin/refunds/complete')) return false
+      const body = init?.body ? JSON.parse(String(init.body)) as { state?: string } : {}
+      return body.state === 'manual_review'
+    })
+    expect(parkCalls).toHaveLength(0)
+    // And no manual-review alert either — the job is meant to heal silently.
+    expect(ledger.enqueueAlert).not.toHaveBeenCalled()
+  })
+
+  it('a fatal rejection still parks exactly as before', async () => {
+    const signer = Keypair.random()
+    const { env, server, ledger } = signerHarness(signer, ['10000'], () => 'ERROR')
+    // errorResult left undefined: an undecodable rejection must park.
+    await runRefundSigner(env, ledger, server)
+
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    const parkCalls = fetchMock.mock.calls.filter(([input, init]: [string | URL | Request, RequestInit?]) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (!url.endsWith('/admin/refunds/complete')) return false
+      const body = init?.body ? JSON.parse(String(init.body)) as { state?: string } : {}
+      return body.state === 'manual_review'
+    })
+    expect(parkCalls).toHaveLength(1)
+    expect(ledger.enqueueAlert).toHaveBeenCalledTimes(1)
   })
 })
