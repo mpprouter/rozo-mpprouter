@@ -42,8 +42,12 @@ export async function handleUsageLogs(request: Request, env: Env): Promise<Respo
       provider, fallback_reason, input_tokens, output_tokens, cached_tokens,
       input_price_per_million_usd, output_price_per_million_usd,
       cache_price_per_million_usd, quoted_amount_usd, upstream_cost_usd,
-      CASE WHEN quoted_amount_usd IS NULL OR upstream_cost_usd IS NULL THEN NULL
-        ELSE CAST(quoted_amount_usd AS REAL) - CAST(upstream_cost_usd AS REAL) END AS margin_usd,
+      CASE WHEN status IN ('settled','fallback_used') THEN CAST(quoted_amount_usd AS REAL)
+        WHEN status IN ('passthrough','delivered_unsettled') THEN 0 ELSE NULL END AS customer_spend_usd,
+      CASE WHEN upstream_cost_usd IS NULL THEN NULL
+        WHEN status IN ('settled','fallback_used') THEN CAST(quoted_amount_usd AS REAL) - CAST(upstream_cost_usd AS REAL)
+        WHEN status='delivered_unsettled' THEN 0 - CAST(upstream_cost_usd AS REAL)
+        ELSE NULL END AS margin_usd,
       settlement_ref, channel_cursor_before, channel_cursor_after, status,
       reconciliation_status
     FROM llm_facade_requests WHERE created_at BETWEEN ? AND ?
@@ -65,23 +69,28 @@ export async function handleUsageActivity(request: Request, env: Env): Promise<R
       SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END) AS usage_unknown_requests,
       SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens,
       SUM(cached_tokens) AS cached_tokens,
-      SUM(CAST(quoted_amount_usd AS REAL)) AS total_spend_usd,
-      SUM(CASE WHEN quoted_amount_usd IS NULL OR upstream_cost_usd IS NULL THEN NULL
-        ELSE CAST(quoted_amount_usd AS REAL) - CAST(upstream_cost_usd AS REAL) END) AS total_margin_usd
+      SUM(CASE WHEN status IN ('settled','fallback_used') THEN CAST(quoted_amount_usd AS REAL) ELSE 0 END) AS total_spend_usd,
+      SUM(CASE WHEN upstream_cost_usd IS NULL THEN NULL
+        WHEN status IN ('settled','fallback_used') THEN CAST(quoted_amount_usd AS REAL) - CAST(upstream_cost_usd AS REAL)
+        WHEN status='delivered_unsettled' THEN 0 - CAST(upstream_cost_usd AS REAL)
+        ELSE NULL END) AS total_margin_usd
     FROM llm_facade_requests WHERE created_at BETWEEN ? AND ?
   `).bind(from, to).first<Record<string, number | null>>()
   const byModel = await env.COUPON_SECURITY_DB.prepare(`
     SELECT actual_model, COUNT(*) AS requests, SUM(input_tokens) AS input_tokens,
-      SUM(output_tokens) AS output_tokens, SUM(CAST(quoted_amount_usd AS REAL)) AS spend_usd
+      SUM(output_tokens) AS output_tokens,
+      SUM(CASE WHEN status IN ('settled','fallback_used') THEN CAST(quoted_amount_usd AS REAL) ELSE 0 END) AS spend_usd
     FROM llm_facade_requests WHERE created_at BETWEEN ? AND ? GROUP BY actual_model ORDER BY spend_usd DESC
   `).bind(from, to).all()
   const byProvider = await env.COUPON_SECURITY_DB.prepare(`
     SELECT provider, COUNT(*) AS requests, SUM(input_tokens) AS input_tokens,
-      SUM(output_tokens) AS output_tokens, SUM(CAST(quoted_amount_usd AS REAL)) AS spend_usd
+      SUM(output_tokens) AS output_tokens,
+      SUM(CASE WHEN status IN ('settled','fallback_used') THEN CAST(quoted_amount_usd AS REAL) ELSE 0 END) AS spend_usd
     FROM llm_facade_requests WHERE created_at BETWEEN ? AND ? GROUP BY provider ORDER BY spend_usd DESC
   `).bind(from, to).all()
   const byWallet = await env.COUPON_SECURITY_DB.prepare(`
-    SELECT wallet_address, COUNT(*) AS requests, SUM(CAST(quoted_amount_usd AS REAL)) AS spend_usd
+    SELECT wallet_address, COUNT(*) AS requests,
+      SUM(CASE WHEN status IN ('settled','fallback_used') THEN CAST(quoted_amount_usd AS REAL) ELSE 0 END) AS spend_usd
     FROM llm_facade_requests WHERE created_at BETWEEN ? AND ? AND wallet_address IS NOT NULL
     GROUP BY wallet_address ORDER BY spend_usd DESC LIMIT 100
   `).bind(from, to).all<Record<string, unknown>>()

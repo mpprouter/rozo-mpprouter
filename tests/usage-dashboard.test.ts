@@ -27,7 +27,8 @@ describe('usage dashboard API', () => {
       output_tokens: 20, cached_tokens: 40, total_spend_usd: 0.01, total_margin_usd: 0.002,
     })
     const all = vi.fn().mockResolvedValue({ results: [] })
-    const db = { prepare: vi.fn(() => ({ bind: vi.fn(() => ({ first, all })) })) }
+    const prepare = vi.fn(() => ({ bind: vi.fn(() => ({ first, all })) }))
+    const db = { prepare }
     const response = await handleUsageActivity(request('/v1/usage/activity'), { USAGE_READ_TOKEN: 'secret', COUPON_SECURITY_DB: db } as unknown as Env)
     const body = await response.json() as { totals: Record<string, number> }
     expect(body.totals.token_volume).toBe(100)
@@ -35,5 +36,8 @@ describe('usage dashboard API', () => {
     expect(body.totals.blended_usd_per_million).toBe(100)
     expect(body.totals.fallback_rate).toBe(0.5)
     expect(body.totals.usage_unknown_requests).toBe(1)
+    const totalsSql = String(prepare.mock.calls[0][0])
+    expect(totalsSql).toContain("status IN ('settled','fallback_used')")
+    expect(totalsSql).toContain("status='delivered_unsettled' THEN 0 - CAST(upstream_cost_usd AS REAL)")
   })
 })
