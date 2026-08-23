@@ -63,6 +63,9 @@ export function classifyFacadeStatus(
   quote: string | null,
   fallbackReason: string | null,
 ): FacadeRequestStatus {
+  const refundStatus = response.headers.get('Refund-Status')
+  if (refundStatus === 'manual-review') return 'failed'
+  if (refundStatus === 'pending') return 'failed'
   if (!response.ok) return 'failed'
   if (response.headers.get('X-Payment-Settle-Status') === 'failed') return 'delivered_unsettled'
   if (quote === null) return 'passthrough'
@@ -89,8 +92,11 @@ async function recordUsage(
   const payer = response.headers.get('X-MPPRouter-Payer')
   const eventId = crypto.randomUUID()
   const status = classifyFacadeStatus(response, quote, fallbackReason)
-  const reconciliationStatus = status === 'delivered_unsettled'
+  const refundStatus = response.headers.get('Refund-Status')
+  const refundId = response.headers.get('Refund-Id')
+  const reconciliationStatus = status === 'delivered_unsettled' || refundStatus === 'manual-review'
     ? 'manual_review'
+    : refundStatus === 'pending' ? 'refund_pending'
     : settlementRef ? 'authoritative' : 'pending'
   try {
     await env.COUPON_SECURITY_DB.prepare(`
@@ -107,7 +113,7 @@ async function recordUsage(
       fallbackReason, usage.input, usage.output, usage.cached,
       quote, upstreamCost, settlementRef,
       status,
-      JSON.stringify({ quoted_amount_usd: quote }),
+      JSON.stringify({ quoted_amount_usd: quote, refund_id: refundId, refund_status: refundStatus }),
       settlementRef ? JSON.stringify({ settlement_ref: settlementRef }) : null,
       reconciliationStatus,
     ).run()

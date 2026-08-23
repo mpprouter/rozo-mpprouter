@@ -2088,14 +2088,28 @@ export async function handleProxy(
     }
   }
 
+  // Every response after inbound settlement must carry the same immutable
+  // charge evidence, including cache hits, async 202s and refund/error paths.
+  // The OpenAI facade ledger consumes these headers; omitting them would turn
+  // a real customer charge into a misleading passthrough/$0 row.
+  const withFacadeChargeEvidence = (response: Response): Response => {
+    const wrapped = new Response(response.body, response)
+    const amount = baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS)
+    wrapped.headers.set('X-MPPRouter-Quoted-Amount', amount)
+    wrapped.headers.set('X-MPPRouter-Upstream-Cost', amount)
+    const payer = settledPayment?.payer ?? verifiedChannelPayer
+    if (payer) wrapped.headers.set('X-MPPRouter-Payer', payer)
+    return wrapped
+  }
+
   if (authKind === 'stellar.channel' && !channelVoucher) {
-    return verifyResult.withReceipt(new Response(JSON.stringify({
+    return verifyResult.withReceipt(withFacadeChargeEvidence(new Response(JSON.stringify({
       error: 'Channel payment verified but delivery stopped for refund safety',
       detail: 'Operator reconciliation required; no upstream call was attempted.',
     }), {
       status: 503,
       headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
-    }))
+    })))
   }
 
   // Defensive recovery path: observer callbacks are intentionally isolated by
@@ -2121,13 +2135,13 @@ export async function handleProxy(
 
   if (authKind !== 'stellar.channel' && !settledPayment) {
     console.error('[refund] CRITICAL: Stellar charge settled but payment proof capture was unavailable')
-    return verifyResult.withReceipt(new Response(JSON.stringify({
+    return verifyResult.withReceipt(withFacadeChargeEvidence(new Response(JSON.stringify({
       error: 'Payment settled but delivery was stopped for refund safety',
       detail: 'Operator reconciliation required; no upstream charge was attempted.',
     }), {
       status: 503,
       headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
-    }))
+    })))
   }
 
   // 4. Pay the merchant from the Tempo pool.
@@ -2198,10 +2212,10 @@ export async function handleProxy(
         await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
         channelDeliveryLockId = undefined
       }
-      return verifyResult.withReceipt(new Response(cached, {
+      return verifyResult.withReceipt(withFacadeChargeEvidence(new Response(cached, {
         status: 200,
         headers: { 'Content-Type': 'application/json', 'X-Idempotent': 'true' },
-      }))
+      })))
     }
   }
 
@@ -2309,7 +2323,7 @@ export async function handleProxy(
       response.headers.set('Refund-Mode', 'channel-remainder')
       response.headers.set('Refund-Status', rolledBack ? 'voucher-not-consumed' : 'manual-review')
       response.headers.set('Refund-Channel', channelContractForVerify)
-      return verifyResult.withReceipt(response)
+      return verifyResult.withReceipt(withFacadeChargeEvidence(response))
     }
     if (settledPayment && payResult.refundReason) {
       // Before the enqueue, not after: see the note on recordFailedLeg.
@@ -2329,7 +2343,7 @@ export async function handleProxy(
       response.headers.set('Refund-Id', refund.publicId)
       response.headers.set('Refund-Status', 'pending')
       response.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
-      return verifyResult.withReceipt(response)
+      return verifyResult.withReceipt(withFacadeChargeEvidence(response))
     }
     // Settled, undelivered, and no refund could be queued (no refundReason,
     // e.g. a route-level rejection after settlement). `unknown` says so
@@ -2340,7 +2354,7 @@ export async function handleProxy(
       await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
       channelDeliveryLockId = undefined
     }
-    return payResult.response
+    return verifyResult.withReceipt(withFacadeChargeEvidence(payResult.response))
   }
 
   // Check for async 202 — store job auth and return early with poll URL
@@ -2357,7 +2371,7 @@ export async function handleProxy(
         }
       : undefined,
   )
-  if (asyncResponse) return asyncResponse
+  if (asyncResponse) return verifyResult.withReceipt(withFacadeChargeEvidence(asyncResponse))
 
   if (channelContractForVerify && channelDeliveryLockId) {
     await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
