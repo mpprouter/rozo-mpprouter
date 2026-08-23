@@ -834,6 +834,22 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
 
   const intentsText = await intentsResp.text()
   if (!intentsResp.ok) {
+    // A 409 orderIdConflict means this orderId (derived from the payment link)
+    // was already used to create an intent. The link is spent, not our outage —
+    // classify it as such so the FE can tell the user to get a fresh link
+    // instead of showing a generic "try again shortly".
+    if (
+      intentsResp.status === 409 ||
+      /orderIdConflict/i.test(intentsText)
+    ) {
+      return errorResponse(409, {
+        code: 'LINK_USED_OR_EXPIRED',
+        message: 'Payment link has already been used or has expired.',
+        hint: 'Request a new payment link from the merchant.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
     return errorResponse(502, {
       code: 'INTENTS_API_FAILED',
       message: `Rozo intents API returned ${intentsResp.status}.`,
