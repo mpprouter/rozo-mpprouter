@@ -1975,7 +1975,11 @@ export async function handleProxy(
     }
   } catch (err: any) {
     if (channelContractForVerify && channelDeliveryLockId) {
-      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      try {
+        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      } catch (error: any) {
+        console.error(`[channel] rate-limit lock release failed: ${error.message}`)
+      }
       channelDeliveryLockId = undefined
     }
     console.error(`[proxy] Stellar verify threw: ${err.message}`)
@@ -2386,16 +2390,36 @@ export async function handleProxy(
     }
     if (settledPayment && payResult.refundReason) {
       // Before the enqueue, not after: see the note on recordFailedLeg.
-      await recordFailedLeg('pending')
-      const refund = await enqueueRefund(env, {
-        proof: settledPayment,
-        reason: payResult.refundReason,
-        merchant: merchantHost,
-        routeId: route.id,
-        orderId: failedLegOrderId,
-      })
+      const orderRecorded = await recordFailedLeg('pending')
+      let refund
+      try {
+        refund = await enqueueRefund(env, {
+          proof: settledPayment,
+          reason: payResult.refundReason,
+          merchant: merchantHost,
+          routeId: route.id,
+          ...(orderRecorded && failedLegOrderId ? { orderId: failedLegOrderId } : {}),
+        })
+      } catch (error: any) {
+        console.error(`[refund] CRITICAL: merchant-failure refund persistence failed: ${error.message}`)
+        const response = new Response(payResult.response.body, payResult.response)
+        response.headers.set('Refund-Status', 'manual-review')
+        if (channelContractForVerify && channelDeliveryLockId) {
+          try {
+            await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+          } catch (releaseError: any) {
+            console.error(`[channel] refund-failure lock release failed: ${releaseError.message}`)
+          }
+          channelDeliveryLockId = undefined
+        }
+        return verifyResult.withReceipt(withFacadeChargeEvidence(response))
+      }
       if (channelContractForVerify && channelDeliveryLockId) {
-        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+        try {
+          await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+        } catch (error: any) {
+          console.error(`[channel] refund-pending lock release failed: ${error.message}`)
+        }
         channelDeliveryLockId = undefined
       }
       const response = new Response(payResult.response.body, payResult.response)
