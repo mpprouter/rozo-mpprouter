@@ -2441,11 +2441,17 @@ export async function handleProxy(
     // plainly rather than leaving the call invisible. No refund job exists to
     // race this write, so it stays off the response path.
     ctx.waitUntil(recordFailedLeg('unknown'))
+    const response = new Response(payResult.response.body, payResult.response)
+    response.headers.set('Refund-Status', 'manual-review')
     if (channelContractForVerify && channelDeliveryLockId) {
-      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      try {
+        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      } catch (error: any) {
+        console.error(`[channel] manual-review lock release failed: ${error.message}`)
+      }
       channelDeliveryLockId = undefined
     }
-    return verifyResult.withReceipt(withFacadeChargeEvidence(payResult.response))
+    return verifyResult.withReceipt(withFacadeChargeEvidence(response))
   }
 
   // Check for async 202 — store job auth and return early with poll URL
