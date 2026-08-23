@@ -2388,7 +2388,16 @@ export async function handleProxy(
 
   const merchantContent = new Response(body, {
     status: 200,
-    headers: { 'Content-Type': contentType },
+    headers: {
+      'Content-Type': contentType,
+      // Facade metering consumes these values after handleProxy returns. They
+      // are also useful reconciliation evidence for direct API clients.
+      'X-MPPRouter-Quoted-Amount': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      'X-MPPRouter-Upstream-Cost': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      ...(settledPayment?.payer ?? verifiedChannelPayer
+        ? { 'X-MPPRouter-Payer': (settledPayment?.payer ?? verifiedChannelPayer)! }
+        : {}),
+    },
   })
   return verifyResult.withReceipt(merchantContent)
 }

@@ -82,6 +82,8 @@ import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
 import { sendDingTalkAlert } from './utils/dingtalk'
 import { redactForAlert } from './utils/alert-redaction'
+import { handleChatCompletions, handleModels } from './routes/chat-completions'
+import { handleUsageActivity, handleUsageLogs } from './routes/usage-dashboard'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -529,6 +531,19 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
       if (url.pathname === '/v1/services/search') {
         return handleSearch(url, env)
+      }
+
+      if (url.pathname === '/v1/models' && request.method === 'GET') {
+        return handleModels()
+      }
+      if (url.pathname === '/v1/chat/completions') {
+        return handleChatCompletions(request, env, ctx)
+      }
+      if (url.pathname === '/v1/usage/logs' && request.method === 'GET') {
+        return handleUsageLogs(request, env)
+      }
+      if (url.pathname === '/v1/usage/activity' && request.method === 'GET') {
+        return handleUsageActivity(request, env)
       }
 
       // Public settlement ledger. Unauthenticated and read-only by design —
