@@ -2231,13 +2231,18 @@ export async function handleProxy(
       authKind === 'stellar.channel' && channelContractForVerify &&
       channelVoucher?.action === 'voucher'
     ) {
-      const rolledBack = await rollbackFailedChannelVoucher(
-        env,
-        channelContractForVerify,
-        channelVoucher.acceptedAmount,
-        channelVoucher.previousAmount,
-        channelVoucher.challengeId,
-      )
+      let rolledBack = false
+      try {
+        rolledBack = await rollbackFailedChannelVoucher(
+          env,
+          channelContractForVerify,
+          channelVoucher.acceptedAmount,
+          channelVoucher.previousAmount,
+          channelVoucher.challengeId,
+        )
+      } catch (error: any) {
+        console.error(`[refund] rate-limit channel rollback failed: ${error.message}`)
+      }
       rateLimitRejectMppx.headers.set(
         'Refund-Status',
         rolledBack ? 'voucher-not-consumed' : 'manual-review',
@@ -2245,7 +2250,7 @@ export async function handleProxy(
       rateLimitRejectMppx.headers.set('Refund-Mode', 'channel-remainder')
     } else if (settledPayment) {
       const orderId = newOrderId()
-      await recordOrder(env, {
+      const orderRecorded = await recordOrder(env, {
         order_id: orderId,
         ts: new Date().toISOString(),
         route_id: route.id,
@@ -2257,16 +2262,21 @@ export async function handleProxy(
         latency_ms: 0,
         refund_status: 'pending',
       })
-      const refund = await enqueueRefund(env, {
-        proof: settledPayment,
-        reason: 'non_fulfillment',
-        merchant: merchantHost,
-        routeId: route.id,
-        orderId,
-      })
-      rateLimitRejectMppx.headers.set('Refund-Id', refund.publicId)
-      rateLimitRejectMppx.headers.set('Refund-Status', 'pending')
-      rateLimitRejectMppx.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
+      try {
+        const refund = await enqueueRefund(env, {
+          proof: settledPayment,
+          reason: 'non_fulfillment',
+          merchant: merchantHost,
+          routeId: route.id,
+          ...(orderRecorded ? { orderId } : {}),
+        })
+        rateLimitRejectMppx.headers.set('Refund-Id', refund.publicId)
+        rateLimitRejectMppx.headers.set('Refund-Status', 'pending')
+        rateLimitRejectMppx.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
+      } catch (error: any) {
+        console.error(`[refund] CRITICAL: rate-limit refund persistence failed: ${error.message}`)
+        rateLimitRejectMppx.headers.set('Refund-Status', 'manual-review')
+      }
     } else {
       rateLimitRejectMppx.headers.set('Refund-Status', 'manual-review')
     }
@@ -2321,9 +2331,9 @@ export async function handleProxy(
      * `refund_pending` forever (codex review, 2026-08-18). One KV put on a
      * path that already awaits the enqueue is a cheap price for that.
      */
-    const recordFailedLeg = (refundStatus: RefundStatus): Promise<void> => {
+    const recordFailedLeg = (refundStatus: RefundStatus): Promise<boolean> => {
       if (!settledPayment || !failedLegOrderId || payResult.kind !== 'error') {
-        return Promise.resolve()
+        return Promise.resolve(false)
       }
       return recordOrder(env, {
         order_id: failedLegOrderId,
