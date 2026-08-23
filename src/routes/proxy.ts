@@ -2227,11 +2227,54 @@ export async function handleProxy(
 
   const rateLimitRejectMppx = await consumeRateLimitSlotOrReject()
   if (rateLimitRejectMppx) {
+    if (
+      authKind === 'stellar.channel' && channelContractForVerify &&
+      channelVoucher?.action === 'voucher'
+    ) {
+      const rolledBack = await rollbackFailedChannelVoucher(
+        env,
+        channelContractForVerify,
+        channelVoucher.acceptedAmount,
+        channelVoucher.previousAmount,
+        channelVoucher.challengeId,
+      )
+      rateLimitRejectMppx.headers.set(
+        'Refund-Status',
+        rolledBack ? 'voucher-not-consumed' : 'manual-review',
+      )
+      rateLimitRejectMppx.headers.set('Refund-Mode', 'channel-remainder')
+    } else if (settledPayment) {
+      const orderId = newOrderId()
+      await recordOrder(env, {
+        order_id: orderId,
+        ts: new Date().toISOString(),
+        route_id: route.id,
+        payer: settledPayment.payer ?? null,
+        amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+        settlement_ref: settledPayment.paymentTx ?? null,
+        request_path: `${upstreamPath}${forwardedSearch}`,
+        upstream_status: 429,
+        latency_ms: 0,
+        refund_status: 'pending',
+      })
+      const refund = await enqueueRefund(env, {
+        proof: settledPayment,
+        reason: 'non_fulfillment',
+        merchant: merchantHost,
+        routeId: route.id,
+        orderId,
+      })
+      rateLimitRejectMppx.headers.set('Refund-Id', refund.publicId)
+      rateLimitRejectMppx.headers.set('Refund-Status', 'pending')
+      rateLimitRejectMppx.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
+    } else {
+      rateLimitRejectMppx.headers.set('Refund-Status', 'manual-review')
+    }
     if (channelContractForVerify && channelDeliveryLockId) {
       await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
       channelDeliveryLockId = undefined
     }
-    return verifyResult.withReceipt(rateLimitRejectMppx)
+    return verifyResult.withReceipt(withFacadeChargeEvidence(rateLimitRejectMppx, '0'))
   }
 
   let payResult: MerchantPayResult
@@ -2329,7 +2372,7 @@ export async function handleProxy(
       response.headers.set('Refund-Mode', 'channel-remainder')
       response.headers.set('Refund-Status', rolledBack ? 'voucher-not-consumed' : 'manual-review')
       response.headers.set('Refund-Channel', channelContractForVerify)
-      return verifyResult.withReceipt(withFacadeChargeEvidence(response))
+      return verifyResult.withReceipt(withFacadeChargeEvidence(response, rolledBack ? '0' : undefined))
     }
     if (settledPayment && payResult.refundReason) {
       // Before the enqueue, not after: see the note on recordFailedLeg.

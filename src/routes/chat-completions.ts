@@ -97,6 +97,7 @@ async function recordUsage(
   const reconciliationStatus = status === 'delivered_unsettled' || refundStatus === 'manual-review'
     ? 'manual_review'
     : refundStatus === 'pending' ? 'refund_pending'
+    : refundStatus === 'voucher-not-consumed' ? 'not_charged'
     : settlementRef ? 'authoritative' : 'pending'
   try {
     await env.COUPON_SECURITY_DB.prepare(`
