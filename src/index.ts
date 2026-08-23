@@ -84,6 +84,7 @@ import { sendDingTalkAlert } from './utils/dingtalk'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
 import { handleUsageActivity, handleUsageLogs } from './routes/usage-dashboard'
+import { handleUsageDashboard } from './routes/usage-dashboard-ui'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -544,6 +545,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
       if (url.pathname === '/v1/usage/activity' && request.method === 'GET') {
         return handleUsageActivity(request, env)
+      }
+      if (url.pathname === '/usage' && request.method === 'GET') {
+        return handleUsageDashboard()
       }
 
       // Public settlement ledger. Unauthenticated and read-only by design —
