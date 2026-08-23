@@ -56,7 +56,7 @@ import { sendDingTalkAlert } from '../utils/dingtalk'
 import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
 import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
-import { newOrderId, recordOrder, type RefundStatus } from '../services/order-ledger'
+import { newOrderId, recordOrder, updateOrderRefundStatus, type RefundStatus } from '../services/order-ledger'
 import type { Env } from '../index'
 import { redactForAlert } from '../utils/alert-redaction'
 
@@ -2279,13 +2279,18 @@ export async function handleProxy(
         rateLimitRejectMppx.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
       } catch (error: any) {
         console.error(`[refund] CRITICAL: rate-limit refund persistence failed: ${error.message}`)
+        if (orderRecorded) await updateOrderRefundStatus(env, orderId, 'unknown')
         rateLimitRejectMppx.headers.set('Refund-Status', 'manual-review')
       }
     } else {
       rateLimitRejectMppx.headers.set('Refund-Status', 'manual-review')
     }
     if (channelContractForVerify && channelDeliveryLockId) {
-      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      try {
+        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      } catch (error: any) {
+        console.error(`[channel] rate-limit lock release failed: ${error.message}`)
+      }
       channelDeliveryLockId = undefined
     }
     return verifyResult.withReceipt(withFacadeChargeEvidence(rateLimitRejectMppx, '0'))
@@ -2402,6 +2407,9 @@ export async function handleProxy(
         })
       } catch (error: any) {
         console.error(`[refund] CRITICAL: merchant-failure refund persistence failed: ${error.message}`)
+        if (orderRecorded && failedLegOrderId) {
+          await updateOrderRefundStatus(env, failedLegOrderId, 'unknown')
+        }
         const response = new Response(payResult.response.body, payResult.response)
         response.headers.set('Refund-Status', 'manual-review')
         if (channelContractForVerify && channelDeliveryLockId) {
