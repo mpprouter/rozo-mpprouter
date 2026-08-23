@@ -2092,24 +2092,28 @@ export async function handleProxy(
   // charge evidence, including cache hits, async 202s and refund/error paths.
   // The OpenAI facade ledger consumes these headers; omitting them would turn
   // a real customer charge into a misleading passthrough/$0 row.
-  const withFacadeChargeEvidence = (response: Response): Response => {
+  const withFacadeChargeEvidence = (
+    response: Response,
+    upstreamCost = baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+  ): Response => {
     const wrapped = new Response(response.body, response)
     const amount = baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS)
     wrapped.headers.set('X-MPPRouter-Quoted-Amount', amount)
-    wrapped.headers.set('X-MPPRouter-Upstream-Cost', amount)
+    wrapped.headers.set('X-MPPRouter-Upstream-Cost', upstreamCost)
     const payer = settledPayment?.payer ?? verifiedChannelPayer
     if (payer) wrapped.headers.set('X-MPPRouter-Payer', payer)
     return wrapped
   }
 
   if (authKind === 'stellar.channel' && !channelVoucher) {
-    return verifyResult.withReceipt(withFacadeChargeEvidence(new Response(JSON.stringify({
+    const response = new Response(JSON.stringify({
       error: 'Channel payment verified but delivery stopped for refund safety',
       detail: 'Operator reconciliation required; no upstream call was attempted.',
     }), {
       status: 503,
       headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
-    })))
+    })
+    return verifyResult.withReceipt(withFacadeChargeEvidence(response, '0'))
   }
 
   // Defensive recovery path: observer callbacks are intentionally isolated by
@@ -2135,13 +2139,14 @@ export async function handleProxy(
 
   if (authKind !== 'stellar.channel' && !settledPayment) {
     console.error('[refund] CRITICAL: Stellar charge settled but payment proof capture was unavailable')
-    return verifyResult.withReceipt(withFacadeChargeEvidence(new Response(JSON.stringify({
+    const response = new Response(JSON.stringify({
       error: 'Payment settled but delivery was stopped for refund safety',
       detail: 'Operator reconciliation required; no upstream charge was attempted.',
     }), {
       status: 503,
       headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
-    })))
+    })
+    return verifyResult.withReceipt(withFacadeChargeEvidence(response, '0'))
   }
 
   // 4. Pay the merchant from the Tempo pool.
@@ -2212,10 +2217,11 @@ export async function handleProxy(
         await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
         channelDeliveryLockId = undefined
       }
-      return verifyResult.withReceipt(withFacadeChargeEvidence(new Response(cached, {
+      const response = new Response(cached, {
         status: 200,
         headers: { 'Content-Type': 'application/json', 'X-Idempotent': 'true' },
-      })))
+      })
+      return verifyResult.withReceipt(withFacadeChargeEvidence(response, '0'))
     }
   }
 

@@ -159,22 +159,13 @@ export async function handleChatCompletions(
   const requestedModel = MODEL_BY_ID.get(body.model)!
   const requestId = request.headers.get('X-Request-Id') || crypto.randomUUID()
   let response = await handleProxy(proxiedRequest(request, body, requestedModel.route, requestId), env, ctx)
-  let actualModel = requestedModel
-  let fallbackReason: string | null = null
+  const actualModel = requestedModel
+  const fallbackReason: string | null = null
 
-  // A 402 is the normal payment handshake, never a provider failure. Only a
-  // terminal upstream failure is eligible for fallback; handleProxy has
-  // already queued/marked the refund when the first payment settled.
-  const fallback = AVAILABLE_MODELS.find(model => model.id !== requestedModel.id)
-  if (response.status >= 500 && fallback) {
-    actualModel = fallback
-    fallbackReason = `primary_${requestedModel.provider}_http_${response.status}`
-    response = await handleProxy(
-      proxiedRequest(request, { ...body, model: actualModel.id }, actualModel.route, requestId),
-      env,
-      ctx,
-    )
-  }
+  // Never replay a payment credential to another paid route. Once the first
+  // leg settles, its refund/receipt must reach the caller intact. A future
+  // fallback design needs a separate payment handshake and one ledger row per
+  // leg; until then the safe behavior is to return the primary result.
 
   // Locus merchants wrap successful OpenAI responses as
   // { success: true, data: <OpenAI response> }. The facade contract is the
