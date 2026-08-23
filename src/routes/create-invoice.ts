@@ -839,7 +839,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     // classify it as such so the FE can tell the user to get a fresh link
     // instead of showing a generic "try again shortly".
     if (
-      intentsResp.status === 409 ||
+      intentsResp.status === 409 &&
       /orderIdConflict/i.test(intentsText)
     ) {
       return errorResponse(409, {
