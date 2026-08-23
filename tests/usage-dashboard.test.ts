@@ -8,14 +8,14 @@ function request(path: string, token = 'secret'): Request {
 
 describe('usage dashboard API', () => {
   it('fails closed without the admin credential', async () => {
-    const response = await handleUsageLogs(request('/v1/usage/logs', 'wrong'), { ADMIN_TOKEN: 'secret' } as Env)
+    const response = await handleUsageLogs(request('/v1/usage/logs', 'wrong'), { USAGE_READ_TOKEN: 'secret' } as Env)
     expect(response.status).toBe(401)
   })
 
   it('masks wallet addresses in logs', async () => {
     const all = vi.fn().mockResolvedValue({ results: [{ wallet_address: '0x1234567890abcdef1234', request_id: 'r1' }] })
     const db = { prepare: vi.fn(() => ({ bind: vi.fn(() => ({ all })) })) }
-    const response = await handleUsageLogs(request('/v1/usage/logs'), { ADMIN_TOKEN: 'secret', COUPON_SECURITY_DB: db } as unknown as Env)
+    const response = await handleUsageLogs(request('/v1/usage/logs'), { USAGE_READ_TOKEN: 'secret', COUPON_SECURITY_DB: db } as unknown as Env)
     const body = await response.json() as { data: Array<{ wallet_address: string }> }
     expect(body.data[0].wallet_address).toBe('0x1234...1234')
   })
@@ -28,7 +28,7 @@ describe('usage dashboard API', () => {
     })
     const all = vi.fn().mockResolvedValue({ results: [] })
     const db = { prepare: vi.fn(() => ({ bind: vi.fn(() => ({ first, all })) })) }
-    const response = await handleUsageActivity(request('/v1/usage/activity'), { ADMIN_TOKEN: 'secret', COUPON_SECURITY_DB: db } as unknown as Env)
+    const response = await handleUsageActivity(request('/v1/usage/activity'), { USAGE_READ_TOKEN: 'secret', COUPON_SECURITY_DB: db } as unknown as Env)
     const body = await response.json() as { totals: Record<string, number> }
     expect(body.totals.token_volume).toBe(100)
     expect(body.totals.cache_hit_rate).toBe(0.5)

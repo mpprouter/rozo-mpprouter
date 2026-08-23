@@ -17,7 +17,7 @@ function timingSafeEqualString(a: string, b: string): boolean {
 
 function authorized(request: Request, env: Env): boolean {
   const value = request.headers.get('Authorization')?.replace(/^Bearer\s+/i, '') ?? ''
-  return !!env.ADMIN_TOKEN && !!value && timingSafeEqualString(value, env.ADMIN_TOKEN)
+  return !!env.USAGE_READ_TOKEN && !!value && timingSafeEqualString(value, env.USAGE_READ_TOKEN)
 }
 
 function maskWallet(value: unknown): string | null {
@@ -38,7 +38,7 @@ export async function handleUsageLogs(request: Request, env: Env): Promise<Respo
   const { from, to } = period(url)
   const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 100, 1), 500)
   const result = await env.COUPON_SECURITY_DB.prepare(`
-    SELECT request_id, created_at, wallet_address, requested_model, actual_model,
+    SELECT event_id, request_id, created_at, wallet_address, requested_model, actual_model,
       provider, fallback_reason, input_tokens, output_tokens, cached_tokens,
       input_price_per_million_usd, output_price_per_million_usd,
       cache_price_per_million_usd, quoted_amount_usd, upstream_cost_usd,

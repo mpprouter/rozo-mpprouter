@@ -288,6 +288,10 @@ export interface Env {
   // direct pay-invoice access, and vice versa.
   // Set via: wrangler secret put ADMIN_TOKEN
   ADMIN_TOKEN: string
+  // Read-only credential for /v1/usage/* and the /usage operator dashboard.
+  // It deliberately grants none of ADMIN_TOKEN's mutation authority.
+  // Set via: wrangler secret put USAGE_READ_TOKEN
+  USAGE_READ_TOKEN?: string
   // Dedicated least-authority token for the pull-only refund executor.
   REFUND_EXECUTOR_TOKEN?: string
   // Kill switch for the coupon admin endpoints (issue/resolve/get). Separate

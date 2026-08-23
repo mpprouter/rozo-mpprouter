@@ -56,6 +56,20 @@ function extractUsage(payload: unknown): { input: number | null; output: number 
   }
 }
 
+export type FacadeRequestStatus = 'settled' | 'passthrough' | 'failed' | 'fallback_used' | 'delivered_unsettled'
+
+export function classifyFacadeStatus(
+  response: Response,
+  quote: string | null,
+  fallbackReason: string | null,
+): FacadeRequestStatus {
+  if (!response.ok) return 'failed'
+  if (response.headers.get('X-Payment-Settle-Status') === 'failed') return 'delivered_unsettled'
+  if (quote === null) return 'passthrough'
+  if (fallbackReason) return 'fallback_used'
+  return 'settled'
+}
+
 async function recordUsage(
   env: Env,
   requestId: string,
@@ -73,33 +87,29 @@ async function recordUsage(
   const settlementRef = response.headers.get('X-Payment-Tx')
     ?? response.headers.get('Payment-Receipt')
   const payer = response.headers.get('X-MPPRouter-Payer')
+  const eventId = crypto.randomUUID()
+  const status = classifyFacadeStatus(response, quote, fallbackReason)
+  const reconciliationStatus = status === 'delivered_unsettled'
+    ? 'manual_review'
+    : settlementRef ? 'authoritative' : 'pending'
   try {
     await env.COUPON_SECURITY_DB.prepare(`
       INSERT INTO llm_facade_requests (
-        request_id, created_at, wallet_address, requested_model, actual_model, provider,
+        event_id, request_id, created_at, wallet_address, requested_model, actual_model, provider,
         fallback_reason, input_tokens, output_tokens, cached_tokens,
         quoted_amount_usd, upstream_cost_usd, settlement_ref, status,
         charge_evidence_json, authoritative_receipt_json,
         reconciliation_status, reconciliation_attempts, reconciliation_last_error
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
-      ON CONFLICT(request_id) DO UPDATE SET
-        actual_model=excluded.actual_model, provider=excluded.provider,
-        fallback_reason=excluded.fallback_reason, input_tokens=excluded.input_tokens,
-        output_tokens=excluded.output_tokens, cached_tokens=excluded.cached_tokens,
-        quoted_amount_usd=excluded.quoted_amount_usd,
-        upstream_cost_usd=excluded.upstream_cost_usd,
-        settlement_ref=excluded.settlement_ref, status=excluded.status,
-        charge_evidence_json=excluded.charge_evidence_json,
-        authoritative_receipt_json=excluded.authoritative_receipt_json,
-        reconciliation_status=excluded.reconciliation_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+      ON CONFLICT(event_id) DO NOTHING
     `).bind(
-      requestId, Date.now(), payer, requestedModel, actualModel.id, actualModel.provider,
+      eventId, requestId, Date.now(), payer, requestedModel, actualModel.id, actualModel.provider,
       fallbackReason, usage.input, usage.output, usage.cached,
       quote, upstreamCost, settlementRef,
-      fallbackReason ? 'fallback_used' : (response.ok ? 'settled' : 'failed'),
+      status,
       JSON.stringify({ quoted_amount_usd: quote }),
       settlementRef ? JSON.stringify({ settlement_ref: settlementRef }) : null,
-      settlementRef ? 'authoritative' : 'pending',
+      reconciliationStatus,
     ).run()
   } catch (error) {
     console.error(JSON.stringify({ event: 'llm_facade_usage_write_failed', request_id: requestId, error: String(error) }))

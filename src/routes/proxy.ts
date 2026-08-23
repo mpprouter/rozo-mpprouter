@@ -1684,7 +1684,14 @@ export async function handleProxy(
 
     const headers: Record<string, string> = {
       'Content-Type': payResult.contentType,
+      // The merchant's accepted Tempo challenge amount is both the upstream
+      // quote and the exact amount payMerchant/payMerchantSession authorizes.
+      // It is therefore the realized upstream cash cost for this zero-markup
+      // route, not a token-derived estimate.
+      'X-MPPRouter-Quoted-Amount': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      'X-MPPRouter-Upstream-Cost': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
     }
+    if (prepared.payer) headers['X-MPPRouter-Payer'] = prepared.payer
     if (settle.transaction) headers['X-Payment-Tx'] = settle.transaction
     headers['X-Payment-Method'] = 'stellar.x402'
     if (!settle.success) {
@@ -2391,7 +2398,10 @@ export async function handleProxy(
     headers: {
       'Content-Type': contentType,
       // Facade metering consumes these values after handleProxy returns. They
-      // are also useful reconciliation evidence for direct API clients.
+      // are also useful reconciliation evidence for direct API clients. The
+      // upstream cash cost equals the accepted merchant challenge amount:
+      // payMerchant authorizes that exact charge, while session mode advances
+      // its cumulative channel by that exact amount.
       'X-MPPRouter-Quoted-Amount': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
       'X-MPPRouter-Upstream-Cost': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
       ...(settledPayment?.payer ?? verifiedChannelPayer

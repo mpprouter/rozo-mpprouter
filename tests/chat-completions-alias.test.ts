@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const { handleProxySpy } = vi.hoisted(() => ({ handleProxySpy: vi.fn() }))
 vi.mock('../src/routes/proxy', () => ({ handleProxy: handleProxySpy }))
 
-import { handleChatCompletions, handleModels } from '../src/routes/chat-completions'
+import { classifyFacadeStatus, handleChatCompletions, handleModels } from '../src/routes/chat-completions'
 import type { Env } from '../src/index'
 
 function context(): ExecutionContext {
@@ -110,6 +110,35 @@ describe('OpenAI chat completions facade', () => {
     const task = (ctx.waitUntil as ReturnType<typeof vi.fn>).mock.calls[0][0] as Promise<void>
     await task
     const values = bind.mock.calls[0]
-    expect(values.slice(7, 10)).toEqual([null, null, null])
+    expect(values.slice(8, 11)).toEqual([null, null, null])
+  })
+
+  it('never uses the caller-controlled request id as the ledger primary key', async () => {
+    const run = vi.fn().mockResolvedValue({ success: true })
+    const bind = vi.fn(() => ({ run }))
+    const prepare = vi.fn(() => ({ bind }))
+    const env = { COUPON_SECURITY_DB: { prepare } } as unknown as Env
+    const ctx1 = context()
+    const ctx2 = context()
+    handleProxySpy.mockImplementation(async () => new Response('{"choices":[]}', { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await handleChatCompletions(request({ model: 'deepseek-v4-flash', messages: [] }, { 'X-Request-Id': 'reused' }), env, ctx1)
+    await handleChatCompletions(request({ model: 'deepseek-v4-flash', messages: [] }, { 'X-Request-Id': 'reused' }), env, ctx2)
+    await Promise.all([
+      (ctx1.waitUntil as ReturnType<typeof vi.fn>).mock.calls[0][0],
+      (ctx2.waitUntil as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ])
+    expect(bind.mock.calls[0][0]).not.toBe(bind.mock.calls[1][0])
+    expect(bind.mock.calls[0][1]).toBe('reused')
+    expect(bind.mock.calls[1][1]).toBe('reused')
+  })
+
+  it('classifies final delivery and settlement independently from fallback', () => {
+    expect(classifyFacadeStatus(new Response('{}', { status: 502 }), null, 'primary_failed')).toBe('failed')
+    expect(classifyFacadeStatus(new Response('{}', {
+      status: 200,
+      headers: { 'X-MPPRouter-Quoted-Amount': '0.004', 'X-Payment-Settle-Status': 'failed' },
+    }), '0.004', 'primary_failed')).toBe('delivered_unsettled')
+    expect(classifyFacadeStatus(new Response('{}', { status: 200 }), null, null)).toBe('passthrough')
+    expect(classifyFacadeStatus(new Response('{}', { status: 200 }), '0.004', 'primary_failed')).toBe('fallback_used')
   })
 })
