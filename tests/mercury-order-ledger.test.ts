@@ -96,6 +96,6 @@ describe('recordOrder', () => {
       upstream_status: 200,
       latency_ms: 5,
       refund_status: 'none',
-    })).resolves.toBeUndefined()
+    })).resolves.toBe(false)
   })
 })

@@ -140,5 +140,9 @@ describe('OpenAI chat completions facade', () => {
     }), '0.004', 'primary_failed')).toBe('delivered_unsettled')
     expect(classifyFacadeStatus(new Response('{}', { status: 200 }), null, null)).toBe('passthrough')
     expect(classifyFacadeStatus(new Response('{}', { status: 200 }), '0.004', 'primary_failed')).toBe('fallback_used')
+    expect(classifyFacadeStatus(new Response('{}', {
+      status: 502,
+      headers: { 'X-MPPRouter-Quoted-Amount': '0.008', 'Refund-Status': 'pending' },
+    }), '0.008', null)).toBe('failed')
   })
 })

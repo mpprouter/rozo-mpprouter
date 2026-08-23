@@ -63,6 +63,9 @@ export function classifyFacadeStatus(
   quote: string | null,
   fallbackReason: string | null,
 ): FacadeRequestStatus {
+  const refundStatus = response.headers.get('Refund-Status')
+  if (refundStatus === 'manual-review') return 'failed'
+  if (refundStatus === 'pending') return 'failed'
   if (!response.ok) return 'failed'
   if (response.headers.get('X-Payment-Settle-Status') === 'failed') return 'delivered_unsettled'
   if (quote === null) return 'passthrough'
@@ -89,8 +92,12 @@ async function recordUsage(
   const payer = response.headers.get('X-MPPRouter-Payer')
   const eventId = crypto.randomUUID()
   const status = classifyFacadeStatus(response, quote, fallbackReason)
-  const reconciliationStatus = status === 'delivered_unsettled'
+  const refundStatus = response.headers.get('Refund-Status')
+  const refundId = response.headers.get('Refund-Id')
+  const reconciliationStatus = status === 'delivered_unsettled' || refundStatus === 'manual-review'
     ? 'manual_review'
+    : refundStatus === 'pending' ? 'refund_pending'
+    : refundStatus === 'voucher-not-consumed' ? 'not_charged'
     : settlementRef ? 'authoritative' : 'pending'
   try {
     await env.COUPON_SECURITY_DB.prepare(`
@@ -107,7 +114,7 @@ async function recordUsage(
       fallbackReason, usage.input, usage.output, usage.cached,
       quote, upstreamCost, settlementRef,
       status,
-      JSON.stringify({ quoted_amount_usd: quote }),
+      JSON.stringify({ quoted_amount_usd: quote, refund_id: refundId, refund_status: refundStatus }),
       settlementRef ? JSON.stringify({ settlement_ref: settlementRef }) : null,
       reconciliationStatus,
     ).run()
@@ -153,22 +160,13 @@ export async function handleChatCompletions(
   const requestedModel = MODEL_BY_ID.get(body.model)!
   const requestId = request.headers.get('X-Request-Id') || crypto.randomUUID()
   let response = await handleProxy(proxiedRequest(request, body, requestedModel.route, requestId), env, ctx)
-  let actualModel = requestedModel
-  let fallbackReason: string | null = null
+  const actualModel = requestedModel
+  const fallbackReason: string | null = null
 
-  // A 402 is the normal payment handshake, never a provider failure. Only a
-  // terminal upstream failure is eligible for fallback; handleProxy has
-  // already queued/marked the refund when the first payment settled.
-  const fallback = AVAILABLE_MODELS.find(model => model.id !== requestedModel.id)
-  if (response.status >= 500 && fallback) {
-    actualModel = fallback
-    fallbackReason = `primary_${requestedModel.provider}_http_${response.status}`
-    response = await handleProxy(
-      proxiedRequest(request, { ...body, model: actualModel.id }, actualModel.route, requestId),
-      env,
-      ctx,
-    )
-  }
+  // Never replay a payment credential to another paid route. Once the first
+  // leg settles, its refund/receipt must reach the caller intact. A future
+  // fallback design needs a separate payment handshake and one ledger row per
+  // leg; until then the safe behavior is to return the primary result.
 
   // Locus merchants wrap successful OpenAI responses as
   // { success: true, data: <OpenAI response> }. The facade contract is the
