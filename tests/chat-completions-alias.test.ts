@@ -25,7 +25,10 @@ describe('OpenAI chat completions facade', () => {
   it('lists only currently paid-verified models', async () => {
     const response = handleModels()
     const body = await response.json() as { data: Array<{ id: string }> }
-    expect(body.data.map(model => model.id).sort()).toEqual(['deepseek-v4-flash', 'grok-3-mini'])
+    expect(body.data.map(model => model.id).sort()).toEqual([
+      'claude-haiku-4-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5',
+      'deepseek-v4-flash', 'grok-3-mini', 'mistral-medium-2505', 'sonar',
+    ])
   })
 
   // The model list is derived from the catalog (2026-08-24), so these three
@@ -39,10 +42,16 @@ describe('OpenAI chat completions facade', () => {
     }
   })
 
-  it('never exposes the anthropic refund-demo route as a model', () => {
-    // anthropic_chat_completions is OpenAI-shaped and charge-verified, but is
-    // kept payable on purpose to demo refunds and never returns a completion.
-    expect(FACADE_MODELS.some(model => model.provider === 'anthropic')).toBe(false)
+  it('exposes the anthropic refund-demo route, per the 2026-08-24 founder decision', () => {
+    // These ids pay and then refund rather than returning a completion (the
+    // merchant leg 403s on every call). That is deliberate: the founder wants
+    // the refund path exercisable with a stock OpenAI SDK. This test exists so
+    // that removing them is a conscious decision rather than a tidy-up.
+    const anthropic = FACADE_MODELS.filter(model => model.provider === 'anthropic')
+    expect(anthropic.map(model => model.id).sort()).toEqual([
+      'claude-haiku-4-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5',
+    ])
+    expect(anthropic.every(model => model.route === '/v1/services/anthropic/chat_completions')).toBe(true)
   })
 
   it('keeps a known-broken model id listed as unavailable rather than deleted', () => {
