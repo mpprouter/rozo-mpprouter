@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const { handleProxySpy } = vi.hoisted(() => ({ handleProxySpy: vi.fn() }))
 vi.mock('../src/routes/proxy', () => ({ handleProxy: handleProxySpy }))
 
-import { classifyFacadeStatus, FACADE_MODELS, handleChatCompletions, handleModels } from '../src/routes/chat-completions'
+import { classifyFacadeStatus, FACADE_MODELS, handleChatCompletions, handleModels, isModelSubstitution } from '../src/routes/chat-completions'
 import { PUBLIC_SERVICE_ROUTES } from '../src/services/merchants'
 import type { Env } from '../src/index'
 
@@ -169,6 +169,28 @@ describe('OpenAI chat completions facade', () => {
     await task
     const values = bind.mock.calls[0]
     expect(values.slice(8, 11)).toEqual([null, null, null])
+  })
+
+  describe('isModelSubstitution', () => {
+    it('treats a pinned build of the same model as not a substitution', () => {
+      // Observed on a paid call 2026-08-24: anthropic answers the rolling
+      // alias with the dated build behind it.
+      expect(isModelSubstitution('claude-haiku-4-5', 'claude-haiku-4-5-20251001')).toBe(false)
+      expect(isModelSubstitution('gpt-4o', 'gpt-4o.2024-08-06')).toBe(false)
+      expect(isModelSubstitution('sonar', 'sonar')).toBe(false)
+    })
+
+    it('flags a genuinely different model', () => {
+      // The case this exists for: grok answers grok-3-mini with grok-4.3.
+      expect(isModelSubstitution('grok-3-mini', 'grok-4.3')).toBe(true)
+      // A shared prefix that is not a separator-delimited pin is still a
+      // different model, not a build of the requested one.
+      expect(isModelSubstitution('claude-haiku-4', 'claude-haiku-45')).toBe(true)
+    })
+
+    it('reports unknown rather than false when the merchant names no model', () => {
+      expect(isModelSubstitution('sonar', null)).toBe(null)
+    })
   })
 
   it('records the model the merchant says it served, and flags a substitution', async () => {

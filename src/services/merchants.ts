@@ -248,32 +248,35 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     // for being undeliverable; that is the point. Delist only if the
     // refund path itself stops working.
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-24T02:44:14Z',
     verifiedNote:
-      'REFUND DEMO route (founder decision 2026-08-20): payment settles, ' +
-      'the merchant leg then fails (403) on every call, and the router ' +
-      'automatically refunds in full within 1-2 minutes. Kept payable ' +
-      'intentionally so payers can exercise and verify the refund path ' +
-      'end-to-end (Refund-Id header -> /v1/refunds/{id} signed receipt). ' +
-      'It does NOT deliver completions.',
-    // Facade: registered per founder decision 2026-08-24. Treated as a
-    // normal service registration, not a special case.
+      'Delivers completions. Re-verified 2026-08-24 with a real paid call ' +
+      'through the router (claude-haiku-4-5, settled 0.001 USDC, 200 with a ' +
+      'completion, no refund). The 403-after-payment recorded from ' +
+      '2026-08-18 no longer reproduces.',
+    // Facade: registered per founder decision 2026-08-24. A normal service
+    // registration.
     //
-    // Current upstream state, from a paid probe run 2026-08-24 (NOT a
-    // historical note — this is the state at the time of writing): the
-    // merchant still answers 403 {"type":"forbidden","message":"Request not
-    // allowed"} after the payment settles, on BOTH /v1/chat/completions and
-    // /v1/messages. The router's auto-refund engages, so a caller is made
-    // whole within 1-2 minutes, but the call does not deliver a completion.
-    // The refusal is on the merchant side; nothing in this router restricts
-    // the route.
+    // Correcting the record, because two rounds of notes here were wrong and
+    // the reasoning matters more than the conclusion:
     //
-    // The ids are evidenced rather than guessed: all four returned real
-    // completions through this route on 2026-08-09, before the merchant began
-    // refusing. Same set as src/playground/models.ts.
+    // The 'REFUND DEMO' framing said this route never delivers a completion.
+    // A paid call through the router on 2026-08-24 returned 200 with a real
+    // completion and no refund, so that is simply not true any more --
+    // whatever the merchant was refusing on 2026-08-18 has been fixed.
     //
-    // If the refund path itself ever stops working, flip these to
-    // available:false rather than deleting them — a caller being refunded is
-    // the only thing that makes the current upstream state tolerable.
+    // Earlier the same day, two DIRECT paid probes (bypassing the router)
+    // still returned 403 and were briefly read as the merchant blocking us.
+    // They were run from a machine egressing in Hong Kong, which Anthropic
+    // does not serve; bypassing the router means the probe carries the
+    // operator's own IP rather than Cloudflare's. Direct-probe results are
+    // therefore NOT evidence about the production path. Verify this provider
+    // through the router.
+    //
+    // Model ids: the merchant answers the rolling alias with a pinned build
+    // (claude-haiku-4-5 -> claude-haiku-4-5-20251001). Same model; the ledger
+    // treats a version-pin suffix as not a substitution.
     facade: {
       models: [
         { id: 'claude-opus-5', available: true },
