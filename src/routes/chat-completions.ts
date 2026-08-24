@@ -101,15 +101,19 @@ function extractUsage(payload: unknown): { input: number | null; output: number 
  * is the same model, and flagging it would bury the case this exists for:
  * grok answering `grok-3-mini` with `grok-4.3`, a different model entirely.
  *
- * So a served id that merely extends the requested one at a separator is a
- * version pin, not a substitution. Anything else is.
+ * So a served id that extends the requested one with something that LOOKS
+ * LIKE A VERSION -- a separator followed by a number or a `v` and a number --
+ * is a pin. "Any separator-delimited suffix" is too generous: `sonar` ->
+ * `sonar-pro` would pass, and that is a different and dearer model, exactly
+ * the case worth catching.
  */
+const VERSION_PIN_SUFFIX = /^[-_.@:]v?\d[\w.-]*$/
+
 export function isModelSubstitution(dispatched: string, served: string | null): boolean | null {
   if (served === null) return null
   if (served === dispatched) return false
-  const suffix = served.startsWith(dispatched) ? served.slice(dispatched.length) : null
-  if (suffix && /^[-_.@:]/.test(suffix)) return false
-  return true
+  if (!served.startsWith(dispatched)) return true
+  return !VERSION_PIN_SUFFIX.test(served.slice(dispatched.length))
 }
 
 export type FacadeRequestStatus = 'settled' | 'passthrough' | 'failed' | 'fallback_used' | 'delivered_unsettled'

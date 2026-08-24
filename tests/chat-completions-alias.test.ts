@@ -188,6 +188,15 @@ describe('OpenAI chat completions facade', () => {
       expect(isModelSubstitution('claude-haiku-4', 'claude-haiku-45')).toBe(true)
     })
 
+    it('flags a named tier that merely looks like a suffix', () => {
+      // sonar-pro is a different, dearer model than sonar. Treating every
+      // separator-delimited suffix as a pin would hide exactly the upsell
+      // this flag is meant to catch.
+      expect(isModelSubstitution('sonar', 'sonar-pro')).toBe(true)
+      expect(isModelSubstitution('sonar', 'sonar-reasoning')).toBe(true)
+      expect(isModelSubstitution('gpt-4o', 'gpt-4o-mini')).toBe(true)
+    })
+
     it('reports unknown rather than false when the merchant names no model', () => {
       expect(isModelSubstitution('sonar', null)).toBe(null)
     })
