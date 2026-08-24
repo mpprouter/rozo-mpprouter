@@ -330,9 +330,6 @@ export interface Env {
   // See `PublicServiceRoute.launchGate` / proxy.ts SECURITY GATE. Unset
   // (default) → still 403 for everyone. Not a secret; plain var is fine.
   MERCURY_LAUNCH_MODE?: string
-  /** See `PublicServiceRoute.launchGate`. Set to 'verify' only for the
-   *  duration of a first-paid-call re-verification, never left on. */
-  ANTHROPIC_MESSAGES_LAUNCH_MODE?: string
 
   // Optional paid Base RPC (Alchemy / QuickNode / Infura) used as the
   // primary endpoint for funder balance checks. Falls back to public
