@@ -255,26 +255,25 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'intentionally so payers can exercise and verify the refund path ' +
       'end-to-end (Refund-Id header -> /v1/refunds/{id} signed receipt). ' +
       'It does NOT deliver completions.',
-    // Facade: registered on an explicit founder decision (2026-08-24),
-    // overriding the recommendation to leave it out.
+    // Facade: registered per founder decision 2026-08-24. Treated as a
+    // normal service registration, not a special case.
     //
-    // Stated plainly so nobody "fixes" this later thinking it was an
-    // oversight: these model ids currently DO NOT return a completion. The
-    // merchant leg 403s on every call (paid re-probes 2026-08-18 and
-    // 2026-08-19), so a caller hitting /v1/chat/completions with one of them
-    // pays and is then automatically refunded in full within 1-2 minutes.
-    // That is the documented behaviour of this route, and the founder wants
-    // it reachable through the OpenAI front door so the refund path can be
-    // exercised with a stock OpenAI SDK rather than a bespoke call.
+    // Current upstream state, from a paid probe run 2026-08-24 (NOT a
+    // historical note — this is the state at the time of writing): the
+    // merchant still answers 403 {"type":"forbidden","message":"Request not
+    // allowed"} after the payment settles, on BOTH /v1/chat/completions and
+    // /v1/messages. The router's auto-refund engages, so a caller is made
+    // whole within 1-2 minutes, but the call does not deliver a completion.
+    // The refusal is on the merchant side; nothing in this router restricts
+    // the route.
     //
-    // The ids themselves are evidenced, not guessed: all four returned real
-    // completions through this route on 2026-08-09 (paid calls, 202 +
-    // completion) before the merchant started refusing. See
-    // src/playground/models.ts for the same set.
+    // The ids are evidenced rather than guessed: all four returned real
+    // completions through this route on 2026-08-09, before the merchant began
+    // refusing. Same set as src/playground/models.ts.
     //
-    // Flip these to available:false — do NOT delete them — if the refund
-    // path itself ever stops working, since that is the only thing making
-    // the current failure mode acceptable.
+    // If the refund path itself ever stops working, flip these to
+    // available:false rather than deleting them — a caller being refunded is
+    // the only thing that makes the current upstream state tolerable.
     facade: {
       models: [
         { id: 'claude-opus-5', available: true },

@@ -42,11 +42,12 @@ describe('OpenAI chat completions facade', () => {
     }
   })
 
-  it('exposes the anthropic refund-demo route, per the 2026-08-24 founder decision', () => {
-    // These ids pay and then refund rather than returning a completion (the
-    // merchant leg 403s on every call). That is deliberate: the founder wants
-    // the refund path exercisable with a stock OpenAI SDK. This test exists so
-    // that removing them is a conscious decision rather than a tidy-up.
+  it('exposes the anthropic models, per the 2026-08-24 founder decision', () => {
+    // Registered as a normal service. Note the upstream merchant was still
+    // answering 403-after-payment on a paid probe on 2026-08-24, so these
+    // currently refund rather than deliver; that is the merchant's state, not
+    // a restriction this router imposes. This test exists so that removing
+    // them is a conscious decision rather than a tidy-up.
     const anthropic = FACADE_MODELS.filter(model => model.provider === 'anthropic')
     expect(anthropic.map(model => model.id).sort()).toEqual([
       'claude-haiku-4-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5',
