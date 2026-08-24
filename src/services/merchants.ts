@@ -459,10 +459,28 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-01T16:10:11Z',
-    // Facade: `grok-3-mini` is the model id the 2026-08-01 paid call above
-    // actually completed with (tx bd4ff356...121b96), so it is evidenced
-    // rather than assumed.
-    facade: { models: [{ id: 'grok-3-mini', available: true }] },
+    // Facade: the advertised id is the one the merchant actually runs.
+    //
+    // 2026-08-24: a paid call through the facade asking for `grok-3-mini`
+    // returned 200 with `"model":"grok-4.3"` in the body — the merchant
+    // accepts the older id but silently substitutes a different model. A
+    // direct paid probe confirmed `grok-4.3` is served under its own name.
+    // Advertising `grok-3-mini` therefore told callers they were getting a
+    // model they were not.
+    //
+    // `grok-3-mini` is kept listed-but-unavailable rather than deleted, so a
+    // caller still using it gets a 400 BEFORE paying, naming the id to switch
+    // to — deleting it would produce the same 400 with no hint of why.
+    facade: {
+      models: [
+        { id: 'grok-4.3', available: true },
+        {
+          id: 'grok-3-mini',
+          available: false,
+          unavailableReason: 'The upstream silently serves grok-4.3 for this id (paid probes 2026-08-24). Use grok-4.3 so the model you request is the model you get.',
+        },
+      ],
+    },
   },
   // Mistral chat — paid 0.0080000 USDC, live completion.
   // tx acd8d604c6af05ee47e91e88fcd59ba421fd3be3a2fad72fcadd698ea6868973

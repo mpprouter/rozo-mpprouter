@@ -27,7 +27,7 @@ describe('OpenAI chat completions facade', () => {
     const body = await response.json() as { data: Array<{ id: string }> }
     expect(body.data.map(model => model.id).sort()).toEqual([
       'claude-haiku-4-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5',
-      'deepseek-v4-flash', 'grok-3-mini', 'mistral-medium-2505', 'sonar',
+      'deepseek-v4-flash', 'grok-4.3', 'mistral-medium-2505', 'sonar',
     ])
   })
 
@@ -53,6 +53,16 @@ describe('OpenAI chat completions facade', () => {
       'claude-haiku-4-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5',
     ])
     expect(anthropic.every(model => model.route === '/v1/services/anthropic/chat_completions')).toBe(true)
+  })
+
+  it('rejects grok-3-mini before payment, since the upstream substitutes grok-4.3', () => {
+    // Advertising an id the merchant silently swaps means the caller pays for
+    // a model they did not ask for. Unavailable (400 before payment, naming
+    // the replacement) rather than deleted.
+    const stale = FACADE_MODELS.find(model => model.id === 'grok-3-mini')
+    expect(stale?.available).toBe(false)
+    expect(stale?.unavailableReason).toContain('grok-4.3')
+    expect(FACADE_MODELS.find(model => model.id === 'grok-4.3')?.available).toBe(true)
   })
 
   it('keeps a known-broken model id listed as unavailable rather than deleted', () => {
