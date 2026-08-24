@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 const { handleProxySpy } = vi.hoisted(() => ({ handleProxySpy: vi.fn() }))
 vi.mock('../src/routes/proxy', () => ({ handleProxy: handleProxySpy }))
 
-import { classifyFacadeStatus, handleChatCompletions, handleModels } from '../src/routes/chat-completions'
+import { classifyFacadeStatus, FACADE_MODELS, handleChatCompletions, handleModels } from '../src/routes/chat-completions'
+import { PUBLIC_SERVICE_ROUTES } from '../src/services/merchants'
 import type { Env } from '../src/index'
 
 function context(): ExecutionContext {
@@ -24,7 +25,33 @@ describe('OpenAI chat completions facade', () => {
   it('lists only currently paid-verified models', async () => {
     const response = handleModels()
     const body = await response.json() as { data: Array<{ id: string }> }
-    expect(body.data.map(model => model.id)).toEqual(['deepseek-v4-flash'])
+    expect(body.data.map(model => model.id).sort()).toEqual(['deepseek-v4-flash', 'grok-3-mini'])
+  })
+
+  // The model list is derived from the catalog (2026-08-24), so these three
+  // properties are what stop it drifting away from what we actually sell.
+  it('derives every facade model from a live catalog route', () => {
+    for (const model of FACADE_MODELS) {
+      const route = PUBLIC_SERVICE_ROUTES.find(entry => entry.publicPath === model.route)
+      expect(route, `no catalog route for ${model.id}`).toBeDefined()
+      expect(route!.service).toBe(model.provider)
+      expect(route!.verifiedMode).not.toBe(false)
+    }
+  })
+
+  it('never exposes the anthropic refund-demo route as a model', () => {
+    // anthropic_chat_completions is OpenAI-shaped and charge-verified, but is
+    // kept payable on purpose to demo refunds and never returns a completion.
+    expect(FACADE_MODELS.some(model => model.provider === 'anthropic')).toBe(false)
+  })
+
+  it('keeps a known-broken model id listed as unavailable rather than deleted', () => {
+    // Deleting it would turn a 400-before-payment into a paid call against an
+    // id the merchant no longer serves.
+    const groq = FACADE_MODELS.find(model => model.id === 'llama-3.1-8b-instant')
+    expect(groq).toBeDefined()
+    expect(groq!.available).toBe(false)
+    expect(groq!.unavailableReason).toBeTruthy()
   })
 
   it('rejects unknown models before the payment proxy', async () => {

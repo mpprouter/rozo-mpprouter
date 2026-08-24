@@ -1,21 +1,54 @@
 import type { Env } from '../index'
 import { handleProxy } from './proxy'
+import { PUBLIC_SERVICE_ROUTES } from '../services/merchants'
 
 export interface FacadeModel {
   id: string
-  provider: 'groq' | 'deepseek'
+  /** Catalog `service` of the route serving this model (e.g. 'groq'). */
+  provider: string
+  /** Public router path the facade re-dispatches to. */
   route: string
   available: boolean
   unavailableReason?: string
 }
 
-export const FACADE_MODELS: readonly FacadeModel[] = [
-  {
-    id: 'llama-3.1-8b-instant', provider: 'groq', route: '/v1/services/groq/chat', available: false,
-    unavailableReason: 'Paid re-probe on 2026-08-24 returned model_not_found after payment.',
-  },
-  { id: 'deepseek-v4-flash', provider: 'deepseek', route: '/v1/services/deepseek/chat', available: true },
-]
+/**
+ * The facade's model list is DERIVED from the public route table rather than
+ * hardcoded here (2026-08-24). A route opts in by carrying a `facade.models`
+ * entry in the operator overlay (`merchants.ts → OPERATOR_OVERLAY`), which is
+ * the same per-route-capability pattern already used by `upstreamAuth`,
+ * `fixedPricing`, `rateLimit` and `launchGate`.
+ *
+ * Two consequences worth stating, since both are load-bearing:
+ *
+ *  - A delisted route (`verifiedMode: false`) drops out of the facade
+ *    automatically. Before this, delisting a route in the catalog would have
+ *    left the facade happily selling it, because the model list was a literal
+ *    that nothing kept in sync with the catalog.
+ *  - Registration is opt-in, not "every OpenAI-shaped route". The anthropic
+ *    chat_completions route is OpenAI-shaped AND charge-verified, but it is
+ *    deliberately kept payable as the live refund demo and never returns a
+ *    completion, so it must not appear behind the front door we tell people
+ *    to point an OpenAI SDK at.
+ */
+function buildFacadeModels(): FacadeModel[] {
+  const models: FacadeModel[] = []
+  for (const route of PUBLIC_SERVICE_ROUTES) {
+    if (!route.facade || route.verifiedMode === false) continue
+    for (const model of route.facade.models) {
+      models.push({
+        id: model.id,
+        provider: route.service,
+        route: route.publicPath,
+        available: model.available,
+        unavailableReason: model.unavailableReason,
+      })
+    }
+  }
+  return models
+}
+
+export const FACADE_MODELS: readonly FacadeModel[] = buildFacadeModels()
 
 const AVAILABLE_MODELS = FACADE_MODELS.filter(model => model.available)
 const MODEL_BY_ID = new Map(AVAILABLE_MODELS.map(model => [model.id, model]))
