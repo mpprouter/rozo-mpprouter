@@ -121,6 +121,17 @@ async function recordUsage(
   let payload: unknown = null
   try { payload = await response.clone().json() } catch { /* usage remains unknown */ }
   const usage = extractUsage(payload)
+  // What the MERCHANT says it ran, which is not always what we asked for:
+  // grok's merchant accepts `grok-3-mini` and serves grok-4.3 (paid probes
+  // 2026-08-24). `actual_model` cannot carry this — it is the model this
+  // router dispatched to, paired with `fallback_reason`. Recording the
+  // merchant's own answer means a substitution is findable with a query
+  // instead of by reading a response body by hand, which is how the grok one
+  // was caught.
+  const servedModel = payload && typeof payload === 'object'
+    && typeof (payload as Record<string, unknown>).model === 'string'
+    ? (payload as Record<string, unknown>).model as string
+    : null
   const quote = response.headers.get('X-MPPRouter-Quoted-Amount')
   const upstreamCost = response.headers.get('X-MPPRouter-Upstream-Cost')
   const settlementRef = response.headers.get('X-Payment-Tx')
@@ -150,7 +161,16 @@ async function recordUsage(
       fallbackReason, usage.input, usage.output, usage.cached,
       quote, upstreamCost, settlementRef,
       status,
-      JSON.stringify({ quoted_amount_usd: quote, refund_id: refundId, refund_status: refundStatus }),
+      JSON.stringify({
+        quoted_amount_usd: quote,
+        refund_id: refundId,
+        refund_status: refundStatus,
+        served_model: servedModel,
+        // Precomputed rather than derived at query time so a substitution is
+        // one `json_extract(charge_evidence_json, '$.model_substituted')`
+        // away. Null when the merchant reported no model at all.
+        model_substituted: servedModel === null ? null : servedModel !== actualModel.id,
+      }),
       settlementRef ? JSON.stringify({ settlement_ref: settlementRef }) : null,
       reconciliationStatus,
     ).run()

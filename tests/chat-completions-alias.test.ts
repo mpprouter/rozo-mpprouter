@@ -171,6 +171,46 @@ describe('OpenAI chat completions facade', () => {
     expect(values.slice(8, 11)).toEqual([null, null, null])
   })
 
+  it('records the model the merchant says it served, and flags a substitution', async () => {
+    // How the grok substitution was caught: we asked for one model and the
+    // merchant answered with another. Reading that off the response body by
+    // hand does not scale, so the ledger records it.
+    const run = vi.fn().mockResolvedValue({ success: true })
+    const bind = vi.fn(() => ({ run }))
+    const prepare = vi.fn(() => ({ bind }))
+    const env = { COUPON_SECURITY_DB: { prepare } } as unknown as Env
+    const ctx = context()
+    handleProxySpy.mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      data: { id: 'c1', object: 'chat.completion', model: 'grok-4.3', choices: [] },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await handleChatCompletions(
+      request({ model: 'deepseek-v4-flash', messages: [] }), env, ctx,
+    )
+    await ((ctx.waitUntil as ReturnType<typeof vi.fn>).mock.calls[0][0] as Promise<void>)
+    const evidence = JSON.parse(bind.mock.calls[0][15] as string)
+    expect(evidence.served_model).toBe('grok-4.3')
+    expect(evidence.model_substituted).toBe(true)
+  })
+
+  it('does not flag a substitution when the merchant echoes the model back', async () => {
+    const run = vi.fn().mockResolvedValue({ success: true })
+    const bind = vi.fn(() => ({ run }))
+    const prepare = vi.fn(() => ({ bind }))
+    const env = { COUPON_SECURITY_DB: { prepare } } as unknown as Env
+    const ctx = context()
+    handleProxySpy.mockResolvedValue(new Response(JSON.stringify({
+      id: 'c1', object: 'chat.completion', model: 'deepseek-v4-flash', choices: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await handleChatCompletions(
+      request({ model: 'deepseek-v4-flash', messages: [] }), env, ctx,
+    )
+    await ((ctx.waitUntil as ReturnType<typeof vi.fn>).mock.calls[0][0] as Promise<void>)
+    const evidence = JSON.parse(bind.mock.calls[0][15] as string)
+    expect(evidence.served_model).toBe('deepseek-v4-flash')
+    expect(evidence.model_substituted).toBe(false)
+  })
+
   it('never uses the caller-controlled request id as the ledger primary key', async () => {
     const run = vi.fn().mockResolvedValue({ success: true })
     const bind = vi.fn(() => ({ run }))
