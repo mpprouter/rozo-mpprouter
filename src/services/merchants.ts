@@ -317,6 +317,10 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // never delivers, so it is not advertised as payable. Re-verify with a paid
   // call that returns an actual completion before relisting.
   //
+  // (That re-verification happened on 2026-08-24 and passed — see the entry
+  // below. The history above is kept because it is the reasoning that made
+  // the delisting right at the time, not a description of today.)
+  //
   // (Refund timing on this session-dialect route ran slower than the ~25s
   // observed on the charge-dialect sibling; noted in docs/verified-services.md
   // as a separate question, and immaterial to this delisting either way.)
@@ -324,16 +328,31 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'anthropic_messages',
     publicPath: '/v1/services/anthropic/messages',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: false,
-    sessionVerified: false,
+    // RELISTED 2026-08-24 on a real paid call through the router, which is
+    // the only evidence that ever settles this route's status.
+    //
+    //   POST /v1/services/anthropic/messages  model=claude-haiku-4-5
+    //   -> 200, Anthropic-native completion, no refund, signed receipt
+    //   (served claude-haiku-4-5-20251001, the pinned build of that alias)
+    //
+    // The 2026-08-18 delisting was correct when written; the merchant has
+    // since been fixed, and the sibling chat_completions route was
+    // re-verified the same day. The launchGate added earlier today did its
+    // job — a delisted route is 403'd before it can be paid, so it could
+    // never earn the verification that relists it — and is removed again now
+    // that the route is listed on its own merits.
+    //
+    // Note for the next re-probe: verify through the ROUTER. A direct probe
+    // that bypasses it carries the operator's own IP, and Anthropic does not
+    // serve every region; that is what produced a false 403 on 2026-08-24.
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-08-24T03:18:26Z',
     verifiedNote:
-      'DISABLED 2026-08-18: the payment settles and the merchant leg then ' +
-      'fails (403 forbidden) on every call, so the router refunds instead of ' +
-      'delivering. Confirmed with two real paid re-probes on 2026-08-18 using ' +
-      'two different current model ids (claude-haiku-4-5, claude-sonnet-4-5), ' +
-      'identical to the failure on the chat_completions sibling; the earlier ' +
-      '2026-08-09 session verification no longer holds. Re-verify with a real ' +
-      'paid call that returns a completion before re-enabling.',
+      'Delivers completions. Re-verified 2026-08-24 with a real paid call ' +
+      'through the router (claude-haiku-4-5, 200 + native completion, no ' +
+      'refund). The 403-after-payment recorded on 2026-08-18 no longer ' +
+      'reproduces. Verify through the router, not a direct merchant probe.',
   },
   // 2026-08-01: disabled. Same shape as openrouter above — the payment
   // settles, then the merchant's own call to OpenAI is refused:

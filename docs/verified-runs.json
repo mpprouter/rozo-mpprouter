@@ -29,13 +29,21 @@
    "category": "ai",
    "price": "dynamic",
    "public_path": "/v1/services/anthropic/chat_completions",
-   "charge_verified_at": null,
+   "charge_verified_at": "2026-08-24T02:44:14Z",
    "session_verified_at": null,
-   "delisted_at": "2026-08-18",
    "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), with the router auto-refunding on chain each time. The 2026-08-09 charge verification no longer holds, so verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Re-verify with a paid call returning a completion before relisting.",
-   "runs": [],
+   "runs": [
+    {
+     "date": "2026-08-24",
+     "result": "pass",
+     "http": 200,
+     "amount_usd": "0.001",
+     "note": "model claude-haiku-4-5 via /v1/chat/completions facade, served claude-haiku-4-5-20251001. 200 + completion, refund-status null. Run THROUGH THE ROUTER from the SG e2e box; two direct merchant probes the same day still returned 403 because they carry the operator IP (Hong Kong), which Anthropic does not serve — direct probes are not evidence about the production path."
+    }
+   ],
    "relisted": "2026-08-20",
-   "relisted_reason": "Founder decision 2026-08-20: relisted intentionally as the live REFUND DEMO route. The merchant leg still 403s on every call; each paid call settles and is auto-refunded in full within 1-2 minutes, which is the behaviour payers use to exercise and verify the refund path. It does not deliver completions."
+   "relisted_reason": "Paid call through the router on 2026-08-24 returned 200 with a real completion and no refund (claude-haiku-4-5, 0.001 USDC). The merchant has been fixed since the 2026-08-18 delisting.",
+   "relisted_at": "2026-08-24"
   },
   {
    "id": "anthropic_messages",
@@ -44,7 +52,7 @@
    "price": "dynamic",
    "public_path": "/v1/services/anthropic/messages",
    "charge_verified_at": null,
-   "session_verified_at": null,
+   "session_verified_at": "2026-08-24T03:18:26Z",
    "runs": [
     {
      "date": "2026-08-18",
@@ -61,10 +69,18 @@
      "amount_usd": "0.001",
      "tx": "ef7984cdbb35162331db6d32920beb9dcd96cec60a0513419eba6a9fbda09b69",
      "note": "model claude-sonnet-4-5, run to rule out a model-specific rejection. Payment settled 09:48:03Z, byte-identical merchant 403, router 502. Ledger order ord_msyhc4td_mh24qvsr, upstream_status 403, refund_status refund_pending as of 09:54Z."
+    },
+    {
+     "date": "2026-08-24",
+     "result": "pass",
+     "http": 200,
+     "amount_usd": "0.001",
+     "note": "model claude-haiku-4-5 via /v1/services/anthropic/messages, served claude-haiku-4-5-20251001. 200 + native completion, refund-status null, signed receipt. Run THROUGH THE ROUTER from the SG e2e box."
     }
    ],
-   "delisted_at": "2026-08-18",
-   "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), identical to the chat_completions sibling delisted earlier the same day. Two current model ids were tried (claude-haiku-4-5, claude-sonnet-4-5) to rule out a stale id; both failed the same way, so the session dialect and separate upstream path did not make this route immune. verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Anthropic now has no listed route, taking the distinct-verified-service count from 21 to 20. Re-verify with a paid call returning a completion before relisting."
+   "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), identical to the chat_completions sibling delisted earlier the same day. Two current model ids were tried (claude-haiku-4-5, claude-sonnet-4-5) to rule out a stale id; both failed the same way, so the session dialect and separate upstream path did not make this route immune. verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Anthropic now has no listed route, taking the distinct-verified-service count from 21 to 20. Re-verify with a paid call returning a completion before relisting.",
+   "relisted_at": "2026-08-24",
+   "relisted_reason": "Paid call through the router on 2026-08-24 returned 200 with a native Anthropic completion and no refund. Verified behind launchGate (ANTHROPIC_MESSAGES_LAUNCH_MODE=verify) since a delisted route is 403d before it can be paid; the gate was removed on relisting."
   },
   {
    "id": "coingecko_simple_price",
