@@ -181,6 +181,38 @@ export interface PublicServiceRoute {
    * catalog.
    */
   launchGate?: string
+  /**
+   * OpenAI-compatible facade registration (2026-08-24).
+   *
+   * When present, this route is reachable through `POST
+   * /v1/chat/completions` under the listed model ids, and those ids are
+   * advertised by `GET /v1/models`. Opt-in per route: a route that speaks
+   * the OpenAI chat shape is NOT automatically exposed, because "speaks the
+   * shape" and "delivers a completion for money" are different claims. The
+   * facade is the front door we tell developers to point an OpenAI SDK at,
+   * so only routes we have paid-verified belong behind it.
+   *
+   * Deliberately excluded even though it is `verifiedMode: 'charge'` and
+   * OpenAI-shaped: `anthropic_chat_completions`, which is kept payable on
+   * purpose as the live REFUND DEMO and never returns a completion.
+   *
+   * Every `id` here MUST have been echoed back by a real paid call. An id we
+   * merely believe the upstream serves would 404 at the merchant AFTER the
+   * router has already paid, which is the exact failure the playground model
+   * registry documents at `src/playground/models.ts`. Record the evidence in
+   * the overlay comment next to the entry.
+   *
+   * `available: false` keeps an id documented and rejected at validation
+   * time (400 before any payment) rather than silently deleted — same
+   * contract the hardcoded FACADE_MODELS list used for groq.
+   */
+  facade?: {
+    models: readonly {
+      id: string
+      available: boolean
+      unavailableReason?: string
+    }[]
+  }
 }
 
 /**
@@ -252,6 +284,14 @@ export interface PublicServiceRouteOverlay {
    * catalog.
    */
   launchGate?: string
+  /** See `PublicServiceRoute.facade`. */
+  facade?: {
+    models: readonly {
+      id: string
+      available: boolean
+      unavailableReason?: string
+    }[]
+  }
 }
 
 /**

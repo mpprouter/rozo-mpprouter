@@ -432,9 +432,18 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-01T16:10:11Z',
+    // Facade: `grok-3-mini` is the model id the 2026-08-01 paid call above
+    // actually completed with (tx bd4ff356...121b96), so it is evidenced
+    // rather than assumed.
+    facade: { models: [{ id: 'grok-3-mini', available: true }] },
   },
   // Mistral chat — paid 0.0080000 USDC, live completion.
   // tx acd8d604c6af05ee47e91e88fcd59ba421fd3be3a2fad72fcadd698ea6868973
+  // NOT facade-registered (2026-08-24): this route is OpenAI-shaped and
+  // charge-verified, but no concrete model id has ever been echoed back by a
+  // paid call through this router — the verification record names only the
+  // service. Pinning a guessed id would 404 at the merchant AFTER the router
+  // paid. Register it here once a paid call records a real id.
   'mistral::/mistral/chat': {
     verifiedMode: 'charge',
     chargeVerified: true,
@@ -445,6 +454,11 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // First attempt that round returned a transient upstream 502 with no
   // payment taken; the retry settled. Flagged charge-verified on the
   // successful paid call, not the probe.
+  // NOT facade-registered (2026-08-24): this route is OpenAI-shaped and
+  // charge-verified, but no concrete model id has ever been echoed back by a
+  // paid call through this router — the verification record names only the
+  // service. Pinning a guessed id would 404 at the merchant AFTER the router
+  // paid. Register it here once a paid call records a real id.
   'perplexity::/perplexity/chat': {
     verifiedMode: 'charge',
     chargeVerified: true,
@@ -487,6 +501,10 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-06-22T00:00:00Z',
+    // Facade: `deepseek-v4-flash` was echoed back verbatim by a real paid
+    // call (2026-06-22 through the router; re-verified 2026-08-13 direct to
+    // the merchant, see src/playground/models.ts).
+    facade: { models: [{ id: 'deepseek-v4-flash', available: true }] },
   },
   // Groq Chat — OpenAI-compatible, very fast inference, tempo.charge.
   // Price dynamic ($0.005–$0.10 by model/tokens).
@@ -499,6 +517,15 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-06-22T00:00:00Z',
+    // Facade: kept listed-but-unavailable so the id is rejected at
+    // validation time (400, before any payment) instead of vanishing.
+    facade: {
+      models: [{
+        id: 'llama-3.1-8b-instant',
+        available: false,
+        unavailableReason: 'Paid re-probe on 2026-08-24 returned model_not_found after payment.',
+      }],
+    },
   },
   // CoinGecko Simple Price — flat $0.06/request, tempo.charge. Cheapest
   // representative data endpoint; the other 15 coingecko routes keep
