@@ -52,6 +52,9 @@ export const FACADE_MODELS: readonly FacadeModel[] = buildFacadeModels()
 
 const AVAILABLE_MODELS = FACADE_MODELS.filter(model => model.available)
 const MODEL_BY_ID = new Map(AVAILABLE_MODELS.map(model => [model.id, model]))
+const UNAVAILABLE_BY_ID = new Map(
+  FACADE_MODELS.filter(model => !model.available).map(model => [model.id, model]),
+)
 
 function jsonError(status: number, message: string, code: string): Response {
   return new Response(JSON.stringify({
@@ -187,7 +190,15 @@ export async function handleChatCompletions(
     return jsonError(400, 'Streaming is not supported yet; set stream to false.', 'stream_not_supported')
   }
   if (typeof body.model !== 'string' || !MODEL_BY_ID.has(body.model)) {
-    return jsonError(400, `Unknown model. Supported models: ${AVAILABLE_MODELS.map(model => model.id).join(', ')}`, 'model_not_found')
+    // A model that is registered but unavailable carries an operator note
+    // saying WHY, and often which id to use instead. Surfacing it turns an
+    // opaque "unknown model" into an actionable one — the caller is being
+    // rejected before paying, which is the moment that note is worth most.
+    const known = typeof body.model === 'string' ? UNAVAILABLE_BY_ID.get(body.model) : undefined
+    const reason = known?.unavailableReason
+      ? `Model ${known.id} is currently unavailable. ${known.unavailableReason} `
+      : 'Unknown model. '
+    return jsonError(400, `${reason}Supported models: ${AVAILABLE_MODELS.map(model => model.id).join(', ')}`, 'model_not_found')
   }
 
   const requestedModel = MODEL_BY_ID.get(body.model)!
