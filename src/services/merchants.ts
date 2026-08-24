@@ -255,6 +255,33 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'intentionally so payers can exercise and verify the refund path ' +
       'end-to-end (Refund-Id header -> /v1/refunds/{id} signed receipt). ' +
       'It does NOT deliver completions.',
+    // Facade: registered per founder decision 2026-08-24. Treated as a
+    // normal service registration, not a special case.
+    //
+    // Current upstream state, from a paid probe run 2026-08-24 (NOT a
+    // historical note — this is the state at the time of writing): the
+    // merchant still answers 403 {"type":"forbidden","message":"Request not
+    // allowed"} after the payment settles, on BOTH /v1/chat/completions and
+    // /v1/messages. The router's auto-refund engages, so a caller is made
+    // whole within 1-2 minutes, but the call does not deliver a completion.
+    // The refusal is on the merchant side; nothing in this router restricts
+    // the route.
+    //
+    // The ids are evidenced rather than guessed: all four returned real
+    // completions through this route on 2026-08-09, before the merchant began
+    // refusing. Same set as src/playground/models.ts.
+    //
+    // If the refund path itself ever stops working, flip these to
+    // available:false rather than deleting them — a caller being refunded is
+    // the only thing that makes the current upstream state tolerable.
+    facade: {
+      models: [
+        { id: 'claude-opus-5', available: true },
+        { id: 'claude-sonnet-5', available: true },
+        { id: 'claude-opus-4-8', available: true },
+        { id: 'claude-haiku-4-5', available: true },
+      ],
+    },
   },
   // Anthropic Messages — the native /v1/messages endpoint.
   //
@@ -439,30 +466,30 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   },
   // Mistral chat — paid 0.0080000 USDC, live completion.
   // tx acd8d604c6af05ee47e91e88fcd59ba421fd3be3a2fad72fcadd698ea6868973
-  // NOT facade-registered (2026-08-24): this route is OpenAI-shaped and
-  // charge-verified, but no concrete model id has ever been echoed back by a
-  // paid call through this router — the verification record names only the
-  // service. Pinning a guessed id would 404 at the merchant AFTER the router
-  // paid. Register it here once a paid call records a real id.
   'mistral::/mistral/chat': {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-01T16:10:27Z',
+    // Facade: id resolved 2026-08-24 rather than guessed. The paid
+    // /mistral/models call (0.005 USDC) listed `mistral-medium-2505`
+    // (capabilities.completion_chat true), and a follow-up paid /mistral/chat
+    // (0.008 USDC) returned a real completion echoing that same id back.
+    facade: { models: [{ id: 'mistral-medium-2505', available: true }] },
   },
   // Perplexity chat — paid 0.0092200 USDC, live sonar completion.
   // tx e17f10439d37aafd9594d6f1ef8173a7bdd9657632138bd83c39dad23c93359d
   // First attempt that round returned a transient upstream 502 with no
   // payment taken; the retry settled. Flagged charge-verified on the
   // successful paid call, not the probe.
-  // NOT facade-registered (2026-08-24): this route is OpenAI-shaped and
-  // charge-verified, but no concrete model id has ever been echoed back by a
-  // paid call through this router — the verification record names only the
-  // service. Pinning a guessed id would 404 at the merchant AFTER the router
-  // paid. Register it here once a paid call records a real id.
   'perplexity::/perplexity/chat': {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-01T16:26:16Z',
+    // Facade: `sonar` confirmed 2026-08-24 by a paid /perplexity/chat call
+    // (0.00922 USDC) that returned a real completion with citations. The
+    // upstream publishes no list-models endpoint, so this id comes from the
+    // paid call itself rather than a catalog listing.
+    facade: { models: [{ id: 'sonar', available: true }] },
   },
   // Deepgram list-models — paid 0.0040000 USDC, model list returned.
   // tx 035adb0f16b269d59503b4eadbafc8cfb5a4c3deab187af914f1aeb44ec057d5
