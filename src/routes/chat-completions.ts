@@ -92,6 +92,30 @@ function extractUsage(payload: unknown): { input: number | null; output: number 
   }
 }
 
+/**
+ * Did the merchant run a DIFFERENT model than the one we dispatched?
+ *
+ * A bare string comparison is too eager. Providers routinely answer a rolling
+ * alias with the pinned build behind it — anthropic answers `claude-haiku-4-5`
+ * with `claude-haiku-4-5-20251001` (observed on a paid call 2026-08-24). That
+ * is the same model, and flagging it would bury the case this exists for:
+ * grok answering `grok-3-mini` with `grok-4.3`, a different model entirely.
+ *
+ * So a served id that extends the requested one with something that LOOKS
+ * LIKE A VERSION -- a separator followed by a number or a `v` and a number --
+ * is a pin. "Any separator-delimited suffix" is too generous: `sonar` ->
+ * `sonar-pro` would pass, and that is a different and dearer model, exactly
+ * the case worth catching.
+ */
+const VERSION_PIN_SUFFIX = /^[-_.@:]v?\d[\w.-]*$/
+
+export function isModelSubstitution(dispatched: string, served: string | null): boolean | null {
+  if (served === null) return null
+  if (served === dispatched) return false
+  if (!served.startsWith(dispatched)) return true
+  return !VERSION_PIN_SUFFIX.test(served.slice(dispatched.length))
+}
+
 export type FacadeRequestStatus = 'settled' | 'passthrough' | 'failed' | 'fallback_used' | 'delivered_unsettled'
 
 export function classifyFacadeStatus(
@@ -169,7 +193,7 @@ async function recordUsage(
         // Precomputed rather than derived at query time so a substitution is
         // one `json_extract(charge_evidence_json, '$.model_substituted')`
         // away. Null when the merchant reported no model at all.
-        model_substituted: servedModel === null ? null : servedModel !== actualModel.id,
+        model_substituted: isModelSubstitution(actualModel.id, servedModel),
       }),
       settlementRef ? JSON.stringify({ settlement_ref: settlementRef }) : null,
       reconciliationStatus,
