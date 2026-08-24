@@ -74,6 +74,17 @@ describe('OpenAI chat completions facade', () => {
     expect(groq!.unavailableReason).toBeTruthy()
   })
 
+  it('explains why a registered-but-unavailable model was rejected', async () => {
+    const response = await handleChatCompletions(
+      request({ model: 'grok-3-mini', messages: [] }), {} as Env, context(),
+    )
+    expect(response.status).toBe(400)
+    const body = await response.json() as { error: { message: string } }
+    expect(body.error.message).toContain('grok-3-mini is currently unavailable')
+    expect(body.error.message).toContain('grok-4.3')
+    expect(handleProxySpy).not.toHaveBeenCalled()
+  })
+
   it('rejects unknown models before the payment proxy', async () => {
     const response = await handleChatCompletions(
       request({ model: 'made-up-model', messages: [] }), {} as Env, context(),
