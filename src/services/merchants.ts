@@ -326,6 +326,19 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     upstreamPaymentMethod: 'tempo.session',
     verifiedMode: false,
     sessionVerified: false,
+    // 2026-08-24: the chat_completions sibling was re-verified with a paid
+    // call through the router and DELIVERS again, so the shared 2026-08-18
+    // evidence that delisted this route no longer describes the merchant.
+    // It is still delisted, because "the sibling works" is an argument and
+    // not a paid call — the same kind of argument that kept this route listed
+    // in the first place, and did not survive its own re-probe.
+    //
+    // launchGate is the way out of the deadlock: a delisted route is 403'd by
+    // the security gate before it can be paid, so it can never earn the
+    // verification that would relist it. With ANTHROPIC_MESSAGES_LAUNCH_MODE
+    // set to 'verify' the operator can make exactly one paid test call
+    // without advertising the route in the catalog.
+    launchGate: 'ANTHROPIC_MESSAGES_LAUNCH_MODE',
     verifiedNote:
       'DISABLED 2026-08-18: the payment settles and the merchant leg then ' +
       'fails (403 forbidden) on every call, so the router refunds instead of ' +
