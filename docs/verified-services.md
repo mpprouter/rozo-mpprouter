@@ -63,6 +63,8 @@ for the upstream.
 | `openai_chat` | `/v1/services/openai/chat` | free | muggledev | 2026-04-11 | — | Chat completions |
 | `gemini_generate` | `/v1/services/gemini/generate` | $0.000 | muggledev | 2026-04-11 | — | Uses `{model}` placeholder, default `gemini-2.0-flash` |
 | `tempo_rpc` | `/v1/services/tempo/rpc` | $0.001 | muggledev | 2026-04-11 | — | Tempo L2 RPC endpoint |
+| `anthropic_chat_completions` | `/v1/services/anthropic/chat_completions` | dynamic | claude-opus-5 | 2026-08-24 | — | Relisted. Paid call through the router returned 200 + completion, no refund (claude-haiku-4-5, $0.001). Retires the 2026-08-18 delisting and the 2026-08-20 "refund demo" description |
+| `anthropic_messages` | `/v1/services/anthropic/messages` | dynamic | claude-opus-5 | 2026-08-24 | — | Relisted. Paid call through the router returned 200 + native completion, no refund. Verified behind `launchGate` (a delisted route is 403'd before it can be paid); gate removed on relisting |
 
 ### Broken (verified failing)
 
@@ -72,7 +74,6 @@ money on them.
 
 | Service ID | Public Path | Verified By | Verified Date | Failure Reason |
 |---|---|---|---|---|
-| `anthropic_messages` | `/v1/services/anthropic/messages` | muggledev | 2026-04-11 | Merchant returns 500 on direct mppx call. Both `/v1/messages` and `/v1/chat/completions` fail upstream. Channel is open but unusable until Anthropic merchant is fixed |
 | `dune_execute` | `/v1/services/dune/execute` | muggledev | 2026-04-11 | Channel underfunded — Dune charged $4 initial probe but channel deposit was only $1. Needs topup or higher initial deposit |
 | `modal_exec` | `/v1/services/modal/exec` | muggledev | 2026-04-11 | Merchant returns `tempo.charge` despite mpp.dev catalog listing session. Router charge fallback fires, but modal rejects empty `{}` body with 500. Need correct body shape |
 
@@ -84,7 +85,6 @@ they correctly advertise `stellar.intents: ["channel"]` only.
 
 | Service ID | Public Path | Price | Status |
 |---|---|---|---|
-| `anthropic_chat_completions` | `/v1/services/anthropic/chat` | free | Untested — likely same issue as `anthropic_messages` |
 | `gemini_version_files` | `/v1/services/gemini/version_files` | $0.001 | Untested |
 | `modal_sandbox_create` | `/v1/services/modal/sandbox_create` | free | Untested |
 | `modal_sandbox_status` | `/v1/services/modal/sandbox_status` | $0.000 | Untested |
@@ -118,6 +118,18 @@ for results when available.
 3. **Update this doc**: Add a row to the appropriate table with your name,
    date, and any notes. Then update `OPERATOR_OVERLAY` in
    `src/services/merchants.ts` to set `verifiedMode`.
+
+   Update `verified-runs.json` in the same change — it is what audit and
+   reporting read, and a catalog that says verified while the registry still
+   says broken is worse than either alone.
+
+   **Verify through the ROUTER, not a direct merchant probe.** A direct probe
+   bypasses the router and therefore carries the operator's own IP. Some
+   providers geo-restrict: on 2026-08-24 two direct probes of the Anthropic
+   merchant returned 403 from a Hong Kong egress and were briefly read as the
+   merchant blocking us, while the same wallet through the router returned a
+   completion. A direct probe is useful only for telling a merchant fault
+   apart from a router fault, and never as evidence about production.
 
 4. **Deploy**: The fix only takes effect on the live catalog after deploy.
 
@@ -352,6 +364,7 @@ code switch would block the calls even if the env switch were cleared.
 
 | Date | Who | Change |
 |---|---|---|
+| 2026-08-24 | agent (founder-approved paid verification, spent $0.0504 total this session) | **Both anthropic routes relisted on paid calls through the router.** `anthropic_chat_completions` returned 200 + completion with no refund, retiring both the 2026-08-18 delisting and the 2026-08-20 "live refund demo" description — it delivers. `anthropic_messages` was re-verified behind `launchGate` (`ANTHROPIC_MESSAGES_LAUNCH_MODE=verify`, passed via `wrangler deploy --var` so it could not be left on), returned 200 + native completion, and was relisted with the gate removed. Payable routes 447 → 448; distinct verified services unchanged at 21. **Method note:** two DIRECT merchant probes the same day still returned 403 and were briefly misread as the merchant blocking our wallet — they were run from a Hong Kong egress, which Anthropic does not serve. Verify through the router. Separately, the OpenAI facade grew to 8 models and a paid call exposed the grok merchant serving grok-4.3 for `grok-3-mini` |
 | 2026-08-18 | agent ($0.02 cap, spent $0.002) | Paid re-probe of `anthropic_messages` (the route held back from that morning's delisting pending exactly this test): two calls on two current model ids, both settled then took the merchant's 403, so it is **delisted** and anthropic leaves the verified set. **21 → 20 distinct verified services** (Tranche 2's commitment of 20 still met, now with zero headroom); payable routes 447 → 446. Playground Claude tier evaluated for repointing to this route — not possible, no change made. Noted, not acted on: the refunds engaged correctly (the first confirmed `refunded` on chain, wallet credited) but ran minutes rather than the 25 s measured on the charge-dialect sibling that morning |
 | 2026-08-18 | agent ($2 cap, spent $0.081) | SCF #44 Tranche 2: charge-verified fal, alphavantage, openweather, deepl, mapbox, wolframalpha with real paid mainnet calls. **15 → 21 distinct verified services.** googlemaps deferred (all routes 404 on the deployed build — deploy lag); gemini stays delisted (merchant's Google key invalid, already evidenced by the 2026-08-09 paid re-test). Added a `tests/get-routes.test.ts` guard on the distinct-verified-service count that counts both `charge` and `session` dialects |
 | 2026-08-10 | agent (founder-approved, $1 cap) | Paid verification run: deepseek+tavily PASS, DALL·E upstream-fail, Gemini blocked. Added `verified-runs.json` tx-hash audit trail |
