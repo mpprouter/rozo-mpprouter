@@ -1057,7 +1057,11 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   const balance = balanceResult.balance
   let reservedFunds = false
   if (balance !== null) {
-    const webhookReserved = await reservedAtomic(env)
+    // Founder decision 2026-08-27: do not count webhook reservations against
+    // coupon redemptions — the best-effort counter drifts (leaked $75.22 and
+    // blocked a valid $525 redeem). Coupon-vs-coupon CAS still applies below;
+    // agentapi re-checks the real funder balance as the final gate.
+    const webhookReserved = 0n
     reservedFunds = await tryReserveFunds(env, attemptId, invoiceAtomic, balance, webhookReserved)
     if (!reservedFunds) {
       await rollbackToIssued(
