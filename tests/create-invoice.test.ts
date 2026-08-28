@@ -7,6 +7,7 @@ import {
   buildTitle,
   buildFullAmountTitle,
   resolveSource,
+  resolveClient,
 } from '../src/routes/create-invoice'
 import {
   createQuoteReceipt,
@@ -918,5 +919,37 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     expect(json.rozoPaymentId).toBe('rozo-existing')
     expect(json.linkId).toBe('pl_test123')
     expect(createBody).toBeNull()
+  })
+})
+
+
+describe('caller provenance', () => {
+  it('keeps a well-formed client label', () => {
+    expect(resolveClient('rozo-checkout-cli/1.2.3')).toBe('rozo-checkout-cli/1.2.3')
+    expect(resolveClient('  checkout-web  ')).toBe('checkout-web')
+  })
+
+  it('drops non-strings and empty labels instead of failing the payment', () => {
+    // Provenance is telemetry on a money path: malformed input is discarded,
+    // never turned into a 400 that would stop the order.
+    for (const bad of [undefined, null, 42, {}, [], true, '', '   ']) {
+      expect(resolveClient(bad)).toBeNull()
+    }
+  })
+
+  it('strips anything that could survive into stored JSONB as markup or SQL', () => {
+    expect(resolveClient('cli<script>"' + String.fromCharCode(10) + ' x')).toBe('cliscript x')
+    expect(resolveClient("a'; DROP TABLE t; --")).toBe('a DROP TABLE t --')
+    // Same charset the canonical attribution whitelist enforces, plus `/`.
+    expect(resolveClient('a:b@c+d%e&f=g')).toBe('abcdefg')
+  })
+
+  it('caps the label and bounds the input before scanning it', () => {
+    expect(resolveClient('a'.repeat(200))).toHaveLength(64)
+    // A multi-megabyte value must not cost a full-length regex pass to discard.
+    const huge = 'a'.repeat(5_000_000)
+    const started = Date.now()
+    expect(resolveClient(huge)).toHaveLength(64)
+    expect(Date.now() - started).toBeLessThan(1_000)
   })
 })

@@ -91,6 +91,49 @@ export interface SourceError {
   supported?: Record<string, SourceToken[]>
 }
 
+/**
+ * Caller provenance: which surface created this order.
+ *
+ * The web checkout and the CLI both post to this endpoint with the same body
+ * shape, so without a label every order is stored looking identical and a
+ * scripted payment can only be inferred from its absence in frontend
+ * analytics — negative evidence that is simply wrong for a browser user who
+ * blocks analytics.
+ *
+ * Deliberately NOT a home for channel attribution. `attribution` is a separate
+ * top-level intent field with a canonical normalizer in payment-api
+ * (utm-attribution.ts), which owns the whitelist and writes it to
+ * metadata.internal.attribution. Sanitizing it a second time here would be a
+ * second parser for one format, and a weaker one: the canonical whitelist
+ * rejects `/ : @ +` precisely because these values are persisted to JSONB and
+ * read back by dashboards. We pass attribution through untouched and let the
+ * one parser that owns it decide.
+ *
+ * `client` is ours because there is no canonical field for it. It uses the
+ * same conservative charset as the attribution whitelist so it cannot
+ * terminate a SQL string, open a tag or look like a URL, and it is capped
+ * before it is scanned so an oversized value cannot burn Worker CPU on a
+ * regex pass it was always going to discard. Malformed input is dropped, never
+ * rejected: provenance is telemetry hanging off a money path and must never be
+ * able to fail a payment.
+ */
+const CLIENT_MAX_LEN = 64
+// Mirrors ATTRIBUTION_VALUE_RE in payment-api/utm-attribution.ts, plus `/` so a
+// label can read "rozo-checkout-cli/1.2.3".
+const CLIENT_UNSAFE = /[^A-Za-z0-9_.\- /]/g
+
+export interface CallerProvenance {
+  client?: string
+}
+
+export function resolveClient(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  // Bound BEFORE scanning: slice first so replace() never walks a multi-megabyte
+  // string only to throw all but 64 characters of it away.
+  const cleaned = raw.slice(0, CLIENT_MAX_LEN * 4).trim().replace(CLIENT_UNSAFE, '').slice(0, CLIENT_MAX_LEN)
+  return cleaned.length ? cleaned : null
+}
+
 export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?: never } | { resolved?: never; error: SourceError } {
   const warnings: string[] = []
 
@@ -462,6 +505,20 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // providers now share one source-resolution path and one error contract.
   const sourceRaw = (parsed as Record<string, unknown> | null)?.source
   const sourceResult = resolveSource(sourceRaw)
+
+  // Caller provenance. Never fails the request — bad input is dropped, not rejected.
+  const provenance: CallerProvenance = {}
+  const clientLabel = resolveClient((parsed as Record<string, unknown> | null)?.client)
+  if (clientLabel) provenance.client = clientLabel
+
+  // Channel attribution rides as a top-level intent field, untouched. The web
+  // checkout has been sending it since launch and this route dropped it, so
+  // every order was stored unattributed. payment-api owns the whitelist.
+  const attributionRaw = (parsed as Record<string, unknown> | null)?.attribution
+  const attributionField =
+    attributionRaw && typeof attributionRaw === 'object' && !Array.isArray(attributionRaw)
+      ? { attribution: attributionRaw }
+      : {}
   if (sourceResult.error) {
     return errorResponse(400, {
       code: sourceResult.error.code,
@@ -487,7 +544,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         message: 'Stripe invoice requires a url.',
       })
     }
-    return handleStripeCreateInvoice(stripeUrl, env, source)
+    return handleStripeCreateInvoice(stripeUrl, env, source, provenance)
   }
 
   let quote: any
@@ -782,9 +839,11 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
           amount: callerPays,
         },
+        ...attributionField,
         metadata: {
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
+          ...provenance,
         },
       }
     : {
@@ -807,9 +866,11 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           tokenSymbol: 'USDC',
           tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
         },
+        ...attributionField,
         metadata: {
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
+          ...provenance,
         },
   }
 
@@ -929,6 +990,7 @@ export async function handleStripeCreateInvoice(
   stripeUrl: string,
   env: Env,
   source: ResolvedSource,
+  provenance: CallerProvenance = {},
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -1059,6 +1121,7 @@ export async function handleStripeCreateInvoice(
   // 6. Locked metadata (design §6). NO url / session hash / secrets.
   const lockedMetadata = {
     source: 'mpprouter-create-invoice',
+    ...provenance,
     invoiceProvider: 'stripe_crypto',
     invoiceKey: invoice.invoiceKey,
     invoiceLockFingerprint: invoice.lockFingerprint,
