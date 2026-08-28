@@ -248,13 +248,43 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     // for being undeliverable; that is the point. Delist only if the
     // refund path itself stops working.
     verifiedMode: 'charge',
+    chargeVerified: true,
+    chargeVerifiedAt: '2026-08-24T02:44:14Z',
     verifiedNote:
-      'REFUND DEMO route (founder decision 2026-08-20): payment settles, ' +
-      'the merchant leg then fails (403) on every call, and the router ' +
-      'automatically refunds in full within 1-2 minutes. Kept payable ' +
-      'intentionally so payers can exercise and verify the refund path ' +
-      'end-to-end (Refund-Id header -> /v1/refunds/{id} signed receipt). ' +
-      'It does NOT deliver completions.',
+      'Delivers completions. Re-verified 2026-08-24 with a real paid call ' +
+      'through the router (claude-haiku-4-5, settled 0.001 USDC, 200 with a ' +
+      'completion, no refund). The 403-after-payment recorded from ' +
+      '2026-08-18 no longer reproduces.',
+    // Facade: registered per founder decision 2026-08-24. A normal service
+    // registration.
+    //
+    // Correcting the record, because two rounds of notes here were wrong and
+    // the reasoning matters more than the conclusion:
+    //
+    // The 'REFUND DEMO' framing said this route never delivers a completion.
+    // A paid call through the router on 2026-08-24 returned 200 with a real
+    // completion and no refund, so that is simply not true any more --
+    // whatever the merchant was refusing on 2026-08-18 has been fixed.
+    //
+    // Earlier the same day, two DIRECT paid probes (bypassing the router)
+    // still returned 403 and were briefly read as the merchant blocking us.
+    // They were run from a machine egressing in Hong Kong, which Anthropic
+    // does not serve; bypassing the router means the probe carries the
+    // operator's own IP rather than Cloudflare's. Direct-probe results are
+    // therefore NOT evidence about the production path. Verify this provider
+    // through the router.
+    //
+    // Model ids: the merchant answers the rolling alias with a pinned build
+    // (claude-haiku-4-5 -> claude-haiku-4-5-20251001). Same model; the ledger
+    // treats a version-pin suffix as not a substitution.
+    facade: {
+      models: [
+        { id: 'claude-opus-5', available: true },
+        { id: 'claude-sonnet-5', available: true },
+        { id: 'claude-opus-4-8', available: true },
+        { id: 'claude-haiku-4-5', available: true },
+      ],
+    },
   },
   // Anthropic Messages — the native /v1/messages endpoint.
   //
@@ -287,6 +317,10 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // never delivers, so it is not advertised as payable. Re-verify with a paid
   // call that returns an actual completion before relisting.
   //
+  // (That re-verification happened on 2026-08-24 and passed — see the entry
+  // below. The history above is kept because it is the reasoning that made
+  // the delisting right at the time, not a description of today.)
+  //
   // (Refund timing on this session-dialect route ran slower than the ~25s
   // observed on the charge-dialect sibling; noted in docs/verified-services.md
   // as a separate question, and immaterial to this delisting either way.)
@@ -294,16 +328,31 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'anthropic_messages',
     publicPath: '/v1/services/anthropic/messages',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: false,
-    sessionVerified: false,
+    // RELISTED 2026-08-24 on a real paid call through the router, which is
+    // the only evidence that ever settles this route's status.
+    //
+    //   POST /v1/services/anthropic/messages  model=claude-haiku-4-5
+    //   -> 200, Anthropic-native completion, no refund, signed receipt
+    //   (served claude-haiku-4-5-20251001, the pinned build of that alias)
+    //
+    // The 2026-08-18 delisting was correct when written; the merchant has
+    // since been fixed, and the sibling chat_completions route was
+    // re-verified the same day. The launchGate added earlier today did its
+    // job — a delisted route is 403'd before it can be paid, so it could
+    // never earn the verification that relists it — and is removed again now
+    // that the route is listed on its own merits.
+    //
+    // Note for the next re-probe: verify through the ROUTER. A direct probe
+    // that bypasses it carries the operator's own IP, and Anthropic does not
+    // serve every region; that is what produced a false 403 on 2026-08-24.
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-08-24T03:18:26Z',
     verifiedNote:
-      'DISABLED 2026-08-18: the payment settles and the merchant leg then ' +
-      'fails (403 forbidden) on every call, so the router refunds instead of ' +
-      'delivering. Confirmed with two real paid re-probes on 2026-08-18 using ' +
-      'two different current model ids (claude-haiku-4-5, claude-sonnet-4-5), ' +
-      'identical to the failure on the chat_completions sibling; the earlier ' +
-      '2026-08-09 session verification no longer holds. Re-verify with a real ' +
-      'paid call that returns a completion before re-enabling.',
+      'Delivers completions. Re-verified 2026-08-24 with a real paid call ' +
+      'through the router (claude-haiku-4-5, 200 + native completion, no ' +
+      'refund). The 403-after-payment recorded on 2026-08-18 no longer ' +
+      'reproduces. Verify through the router, not a direct merchant probe.',
   },
   // 2026-08-01: disabled. Same shape as openrouter above — the payment
   // settles, then the merchant's own call to OpenAI is refused:
@@ -432,6 +481,28 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-01T16:10:11Z',
+    // Facade: the advertised id is the one the merchant actually runs.
+    //
+    // 2026-08-24: a paid call through the facade asking for `grok-3-mini`
+    // returned 200 with `"model":"grok-4.3"` in the body — the merchant
+    // accepts the older id but silently substitutes a different model. A
+    // direct paid probe confirmed `grok-4.3` is served under its own name.
+    // Advertising `grok-3-mini` therefore told callers they were getting a
+    // model they were not.
+    //
+    // `grok-3-mini` is kept listed-but-unavailable rather than deleted, so a
+    // caller still using it gets a 400 BEFORE paying, naming the id to switch
+    // to — deleting it would produce the same 400 with no hint of why.
+    facade: {
+      models: [
+        { id: 'grok-4.3', available: true },
+        {
+          id: 'grok-3-mini',
+          available: false,
+          unavailableReason: 'The upstream silently serves grok-4.3 for this id (paid probes 2026-08-24). Use grok-4.3 so the model you request is the model you get.',
+        },
+      ],
+    },
   },
   // Mistral chat — paid 0.0080000 USDC, live completion.
   // tx acd8d604c6af05ee47e91e88fcd59ba421fd3be3a2fad72fcadd698ea6868973
@@ -439,6 +510,11 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-01T16:10:27Z',
+    // Facade: id resolved 2026-08-24 rather than guessed. The paid
+    // /mistral/models call (0.005 USDC) listed `mistral-medium-2505`
+    // (capabilities.completion_chat true), and a follow-up paid /mistral/chat
+    // (0.008 USDC) returned a real completion echoing that same id back.
+    facade: { models: [{ id: 'mistral-medium-2505', available: true }] },
   },
   // Perplexity chat — paid 0.0092200 USDC, live sonar completion.
   // tx e17f10439d37aafd9594d6f1ef8173a7bdd9657632138bd83c39dad23c93359d
@@ -449,6 +525,11 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-01T16:26:16Z',
+    // Facade: `sonar` confirmed 2026-08-24 by a paid /perplexity/chat call
+    // (0.00922 USDC) that returned a real completion with citations. The
+    // upstream publishes no list-models endpoint, so this id comes from the
+    // paid call itself rather than a catalog listing.
+    facade: { models: [{ id: 'sonar', available: true }] },
   },
   // Deepgram list-models — paid 0.0040000 USDC, model list returned.
   // tx 035adb0f16b269d59503b4eadbafc8cfb5a4c3deab187af914f1aeb44ec057d5
@@ -487,6 +568,10 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-06-22T00:00:00Z',
+    // Facade: `deepseek-v4-flash` was echoed back verbatim by a real paid
+    // call (2026-06-22 through the router; re-verified 2026-08-13 direct to
+    // the merchant, see src/playground/models.ts).
+    facade: { models: [{ id: 'deepseek-v4-flash', available: true }] },
   },
   // Groq Chat — OpenAI-compatible, very fast inference, tempo.charge.
   // Price dynamic ($0.005–$0.10 by model/tokens).
@@ -499,6 +584,15 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-06-22T00:00:00Z',
+    // Facade: kept listed-but-unavailable so the id is rejected at
+    // validation time (400, before any payment) instead of vanishing.
+    facade: {
+      models: [{
+        id: 'llama-3.1-8b-instant',
+        available: false,
+        unavailableReason: 'Paid re-probe on 2026-08-24 returned model_not_found after payment.',
+      }],
+    },
   },
   // CoinGecko Simple Price — flat $0.06/request, tempo.charge. Cheapest
   // representative data endpoint; the other 15 coingecko routes keep

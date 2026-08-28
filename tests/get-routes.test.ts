@@ -152,7 +152,14 @@ describe('GET routes — build', () => {
     // 1-2 minutes, which is exactly what payers use to exercise and verify
     // the refund path. It does not deliver completions, and it is counted
     // here because it is genuinely payable. anthropic_messages stays delisted.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(447)
+    //
+    // 447 → 448 on 2026-08-24: anthropic_messages relisted. The merchant was
+    // fixed at some point after 2026-08-18 — a paid call through the router
+    // returned 200 with a native completion and no refund, and the
+    // chat_completions sibling was re-verified the same day and DELIVERS,
+    // which retires the 'refund demo' description above. Both anthropic
+    // routes are listed and both deliver.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(448)
     // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
     // events/by-ledger joined them at the beta launch (see the note above).
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
@@ -204,6 +211,12 @@ describe('GET routes — build', () => {
     // real and exercised by every demo call, but it does NOT deliver
     // completions — so treat the SCF commitment as met by the OTHER 20
     // services, and do not lean on anthropic if the number is ever argued.
+    //
+    // 2026-08-24: that caveat is withdrawn. Paid calls through the router on
+    // both anthropic routes returned real completions with no refund, so
+    // anthropic now counts here the same way every other service does. The
+    // service total is unchanged at 21 — relisting anthropic_messages adds a
+    // route, not a service.
     const verifiedServices = new Set(
       PUBLIC_SERVICE_ROUTES.filter(
         r => r.verifiedMode === 'charge' || r.verifiedMode === 'session',

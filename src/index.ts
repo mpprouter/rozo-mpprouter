@@ -82,6 +82,9 @@ import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
 import { sendDingTalkAlert } from './utils/dingtalk'
 import { redactForAlert } from './utils/alert-redaction'
+import { handleChatCompletions, handleModels } from './routes/chat-completions'
+import { handleUsageActivity, handleUsageLogs } from './routes/usage-dashboard'
+import { handleUsageDashboard } from './routes/usage-dashboard-ui'
 
 export interface Env {
   MPP_STORE: KVNamespace
@@ -285,6 +288,10 @@ export interface Env {
   // direct pay-invoice access, and vice versa.
   // Set via: wrangler secret put ADMIN_TOKEN
   ADMIN_TOKEN: string
+  // Read-only credential for /v1/usage/* and the /usage operator dashboard.
+  // It deliberately grants none of ADMIN_TOKEN's mutation authority.
+  // Set via: wrangler secret put USAGE_READ_TOKEN
+  USAGE_READ_TOKEN?: string
   // Dedicated least-authority token for the pull-only refund executor.
   REFUND_EXECUTOR_TOKEN?: string
   // Kill switch for the coupon admin endpoints (issue/resolve/get). Separate
@@ -529,6 +536,22 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
       if (url.pathname === '/v1/services/search') {
         return handleSearch(url, env)
+      }
+
+      if (url.pathname === '/v1/models' && request.method === 'GET') {
+        return handleModels()
+      }
+      if (url.pathname === '/v1/chat/completions') {
+        return handleChatCompletions(request, env, ctx)
+      }
+      if (url.pathname === '/v1/usage/logs' && request.method === 'GET') {
+        return handleUsageLogs(request, env)
+      }
+      if (url.pathname === '/v1/usage/activity' && request.method === 'GET') {
+        return handleUsageActivity(request, env)
+      }
+      if (url.pathname === '/usage' && request.method === 'GET') {
+        return handleUsageDashboard()
       }
 
       // Public settlement ledger. Unauthenticated and read-only by design —

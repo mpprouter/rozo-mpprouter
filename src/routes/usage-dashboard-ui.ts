@@ -1,0 +1,39 @@
+export function handleUsageDashboard(): Response {
+  return new Response(`<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MPPRouter Usage</title>
+  <meta name="description" content="MPPRouter LLM request logs, token activity, routing and reconciliation.">
+  <style>
+    :root{color-scheme:dark;--bg:#090b10;--panel:#11151d;--line:#263041;--text:#f4f7fb;--muted:#91a0b5;--mint:#56e6b1;--amber:#ffc66d;--red:#ff7b85}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 70% -20%,#193548 0,transparent 36%),var(--bg);color:var(--text);font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+    main{max-width:1280px;margin:auto;padding:32px 22px 64px}header{display:flex;justify-content:space-between;gap:20px;align-items:end;margin-bottom:26px}h1{font:700 clamp(28px,5vw,54px)/.95 system-ui,sans-serif;letter-spacing:-.055em;margin:0}.eyebrow{color:var(--mint);text-transform:uppercase;letter-spacing:.14em;font-size:12px}.sub{color:var(--muted);margin:10px 0 0}.actions{display:flex;gap:8px;flex-wrap:wrap}button{background:var(--mint);color:#06120e;border:0;border-radius:8px;padding:10px 14px;font:700 13px inherit;cursor:pointer}button.secondary{background:var(--panel);color:var(--text);border:1px solid var(--line)}
+    #notice{border:1px solid var(--line);background:#0c1118;padding:12px 14px;border-radius:8px;color:var(--muted);margin-bottom:18px}.cards{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:22px}.card{background:linear-gradient(145deg,#141a24,#0d1118);border:1px solid var(--line);border-radius:12px;padding:16px;min-height:110px}.label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em}.value{font:700 26px/1.15 system-ui,sans-serif;margin-top:12px}.hint{color:var(--muted);font-size:11px;margin-top:8px}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:22px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}.panel h2{font:650 16px system-ui,sans-serif;margin:0;padding:15px 16px;border-bottom:1px solid var(--line)}.table-wrap{overflow:auto;max-height:520px}table{border-collapse:collapse;width:100%;min-width:560px}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #1d2633;white-space:nowrap}th{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em;position:sticky;top:0;background:var(--panel)}td{font-size:12px}.status-settled{color:var(--mint)}.status-failed{color:var(--red)}.status-fallback_used{color:var(--amber)}.unknown{color:var(--muted)}
+    @media(max-width:900px){header{align-items:start;flex-direction:column}.cards{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}}@media(max-width:520px){.cards{grid-template-columns:1fr}}
+  </style>
+</head>
+<body><main>
+  <header><div><div class="eyebrow">Machine payments protocol</div><h1>Usage truth,<br>request by request.</h1><p class="sub">Quoted spend, actual routing, token usage, fallback and reconciliation.</p></div><div class="actions"><button id="connect">Authenticate</button><button class="secondary" id="refresh">Refresh</button></div></header>
+  <div id="notice">Authenticate with the operator token to load private usage data. The token stays in memory and is never stored.</div>
+  <section class="cards" id="cards"></section>
+  <section class="grid"><div class="panel"><h2>Usage by model</h2><div class="table-wrap"><table><thead><tr><th>Model</th><th>Requests</th><th>Tokens</th><th>Spend</th></tr></thead><tbody id="models"></tbody></table></div></div><div class="panel"><h2>Usage by provider</h2><div class="table-wrap"><table><thead><tr><th>Provider</th><th>Requests</th><th>Tokens</th><th>Spend</th></tr></thead><tbody id="providers"></tbody></table></div></div></section>
+  <section class="panel"><h2>Logs</h2><div class="table-wrap"><table><thead><tr><th>Time</th><th>Wallet</th><th>Requested</th><th>Actual / provider</th><th>Input</th><th>Output</th><th>Cached</th><th>Quote</th><th>Cost</th><th>Margin</th><th>Status</th></tr></thead><tbody id="logs"></tbody></table></div></section>
+</main><script>
+(()=>{let token='';const q=s=>document.querySelector(s),fmtMoney=v=>v==null?'unknown':'$'+Number(v).toFixed(6),fmtNum=v=>v==null?'<span class="unknown">unknown</span>':Number(v).toLocaleString(),esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const card=(label,value,hint='')=>'<div class="card"><div class="label">'+label+'</div><div class="value">'+value+'</div><div class="hint">'+hint+'</div></div>';
+const rows=(data,key)=>data.map(r=>'<tr><td>'+esc(r[key])+'</td><td>'+fmtNum(r.requests)+'</td><td>'+fmtNum(Number(r.input_tokens||0)+Number(r.output_tokens||0))+'</td><td>'+fmtMoney(r.spend_usd)+'</td></tr>').join('')||'<tr><td colspan="4" class="unknown">No data</td></tr>';
+async function api(path){const r=await fetch(path,{headers:{Authorization:'Bearer '+token}});if(!r.ok)throw new Error(r.status===401?'Authentication failed':'Request failed: '+r.status);return r.json()}
+async function load(){if(!token){q('#notice').textContent='Authenticate first. The token stays in memory and is never stored.';return}q('#notice').textContent='Loading current 30-day window…';try{const[a,l]=await Promise.all([api('/v1/usage/activity'),api('/v1/usage/logs?limit=200')]),t=a.totals||{};q('#cards').innerHTML=card('Total spend',fmtMoney(t.total_spend_usd),'settled customer charges')+card('Requests',fmtNum(t.requests),fmtNum(t.settled_requests)+' settled · '+fmtNum(t.failed_requests)+' failed')+card('Token volume',fmtNum(t.token_volume),fmtNum(t.usage_unknown_requests)+' requests unknown')+card('Blended $ / 1M',fmtMoney(t.blended_usd_per_million),'input + output')+card('Cache hit rate',t.cache_hit_rate==null?'unknown':(t.cache_hit_rate*100).toFixed(1)+'%','cached ÷ input')+card('Fallback rate',t.fallback_rate==null?'unknown':(t.fallback_rate*100).toFixed(1)+'%','automatic provider switches')+card('Quote − cost',fmtMoney(t.total_margin_usd),'reconciled margin')+card('Window',new Date(a.from).toLocaleDateString()+' → '+new Date(a.to).toLocaleDateString(),'rolling 30 days');q('#models').innerHTML=rows(a.usage_by_model||[],'actual_model');q('#providers').innerHTML=rows(a.usage_by_provider||[],'provider');q('#logs').innerHTML=(l.data||[]).map(r=>'<tr><td>'+new Date(r.created_at).toLocaleString()+'</td><td>'+esc(r.wallet_address||'unknown')+'</td><td>'+esc(r.requested_model)+'</td><td>'+esc(r.actual_model)+' / '+esc(r.provider)+'</td><td>'+fmtNum(r.input_tokens)+'</td><td>'+fmtNum(r.output_tokens)+'</td><td>'+fmtNum(r.cached_tokens)+'</td><td>'+fmtMoney(r.quoted_amount_usd)+'</td><td>'+fmtMoney(r.upstream_cost_usd)+'</td><td>'+fmtMoney(r.margin_usd)+'</td><td class="status-'+esc(r.status)+'">'+esc(r.status)+'</td></tr>').join('')||'<tr><td colspan="11" class="unknown">No requests in this window</td></tr>';q('#notice').textContent='Private operator view · refreshed '+new Date().toLocaleTimeString()}catch(e){q('#notice').textContent=e.message}}
+q('#connect').onclick=()=>{const value=prompt('Operator token');if(value){token=value;load()}};q('#refresh').onclick=load;
+})();
+  </script></body></html>`, { headers: {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  } })
+}

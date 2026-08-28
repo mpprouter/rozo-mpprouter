@@ -21,7 +21,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
 
 function loadDevVars(): Record<string, string> {
-  const path = resolve(REPO_ROOT, '.dev.vars')
+  const path = process.env.DEV_VARS_PATH || resolve(REPO_ROOT, '.dev.vars')
   if (!existsSync(path)) throw new Error(`No .dev.vars at ${path}`)
   const raw = readFileSync(path, 'utf8')
   const out: Record<string, string> = {}
@@ -54,9 +54,25 @@ async function main() {
   if (!pk) throw new Error('No TEMPO_ROUTER_PRIVATE_KEY in .dev.vars')
   const account = privateKeyToAccount(pk as `0x${string}`)
 
-  console.log(`Bypassing router, calling ${merchantUrl} directly with router wallet ${account.address}`)
-  console.log(`Body: ${requestBody}`)
-  console.log('')
+  const maskedAddress = `${account.address.slice(0, 6)}...${account.address.slice(-4)}`
+
+  // Record the exact unpaid quote independently. Never print the full auth
+  // challenge: it can contain merchant-specific opaque values.
+  const quoteResponse = await fetch(merchantUrl, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: requestBody,
+  })
+  const challenge = quoteResponse.headers.get('www-authenticate') || ''
+  const encodedRequest = challenge.match(/request="([^"]+)"/i)?.[1]
+  let amount: string | null = null
+  if (encodedRequest) {
+    try {
+      const decoded = JSON.parse(Buffer.from(encodedRequest, 'base64url').toString('utf8'))
+      amount = typeof decoded.amount === 'string' ? decoded.amount : String(decoded.amount ?? '') || null
+    } catch { /* malformed merchant challenge */ }
+  }
+  console.log(JSON.stringify({ event: 'merchant_probe_quote', merchant: new URL(merchantUrl).hostname, payer: maskedAddress, status: quoteResponse.status, amount_atomic_6dp: amount }))
 
   // Use auto-mode session manager to handle the 402 dance — this
   // mirrors what open-tempo-channel.ts does. maxDeposit caps it at
@@ -69,7 +85,6 @@ async function main() {
     polyfill: false,
   }) as any
 
-  console.log('→ Sending request via mppx tempo.charge...')
   let response: Response
   try {
     response = await sm.fetch(merchantUrl, {
@@ -83,11 +98,25 @@ async function main() {
     process.exit(1)
   }
 
-  console.log(`← HTTP ${response.status}`)
-  console.log('')
   const text = await response.text()
-  console.log(`  body (first 1000 chars):`)
-  console.log(text.slice(0, 1000))
+  let parsed: Record<string, any> = {}
+  try { parsed = JSON.parse(text) } catch { /* non-JSON response */ }
+  const usage = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage : null
+  const responseKeys = Object.keys(parsed).slice(0, 20)
+  const nested = parsed.result && typeof parsed.result === 'object' ? parsed.result as Record<string, any> : null
+  console.log(JSON.stringify({
+    event: 'merchant_probe_result',
+    merchant: new URL(merchantUrl).hostname,
+    status: response.status,
+    model: typeof parsed.model === 'string' ? parsed.model : null,
+    usage: usage ?? nested?.usage ?? null,
+    has_choices: (Array.isArray(parsed.choices) && parsed.choices.length > 0) ||
+      (Array.isArray(nested?.choices) && nested.choices.length > 0),
+    response_keys: responseKeys,
+    nested_result_keys: nested ? Object.keys(nested).slice(0, 20) : null,
+    error: parsed.error ?? null,
+    response_preview: text.slice(0, 500),
+  }))
 }
 
 main().catch((err) => {

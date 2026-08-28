@@ -56,7 +56,7 @@ import { sendDingTalkAlert } from '../utils/dingtalk'
 import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
 import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
-import { newOrderId, recordOrder, type RefundStatus } from '../services/order-ledger'
+import { newOrderId, recordOrder, updateOrderRefundStatus, type RefundStatus } from '../services/order-ledger'
 import type { Env } from '../index'
 import { redactForAlert } from '../utils/alert-redaction'
 
@@ -1684,7 +1684,14 @@ export async function handleProxy(
 
     const headers: Record<string, string> = {
       'Content-Type': payResult.contentType,
+      // The merchant's accepted Tempo challenge amount is both the upstream
+      // quote and the exact amount payMerchant/payMerchantSession authorizes.
+      // It is therefore the realized upstream cash cost for this zero-markup
+      // route, not a token-derived estimate.
+      'X-MPPRouter-Quoted-Amount': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      'X-MPPRouter-Upstream-Cost': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
     }
+    if (prepared.payer) headers['X-MPPRouter-Payer'] = prepared.payer
     if (settle.transaction) headers['X-Payment-Tx'] = settle.transaction
     headers['X-Payment-Method'] = 'stellar.x402'
     if (!settle.success) {
@@ -1968,7 +1975,11 @@ export async function handleProxy(
     }
   } catch (err: any) {
     if (channelContractForVerify && channelDeliveryLockId) {
-      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      try {
+        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      } catch (error: any) {
+        console.error(`[channel] rate-limit lock release failed: ${error.message}`)
+      }
       channelDeliveryLockId = undefined
     }
     console.error(`[proxy] Stellar verify threw: ${err.message}`)
@@ -2081,14 +2092,32 @@ export async function handleProxy(
     }
   }
 
+  // Every response after inbound settlement must carry the same immutable
+  // charge evidence, including cache hits, async 202s and refund/error paths.
+  // The OpenAI facade ledger consumes these headers; omitting them would turn
+  // a real customer charge into a misleading passthrough/$0 row.
+  const withFacadeChargeEvidence = (
+    response: Response,
+    upstreamCost = baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+  ): Response => {
+    const wrapped = new Response(response.body, response)
+    const amount = baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS)
+    wrapped.headers.set('X-MPPRouter-Quoted-Amount', amount)
+    wrapped.headers.set('X-MPPRouter-Upstream-Cost', upstreamCost)
+    const payer = settledPayment?.payer ?? verifiedChannelPayer
+    if (payer) wrapped.headers.set('X-MPPRouter-Payer', payer)
+    return wrapped
+  }
+
   if (authKind === 'stellar.channel' && !channelVoucher) {
-    return verifyResult.withReceipt(new Response(JSON.stringify({
+    const response = new Response(JSON.stringify({
       error: 'Channel payment verified but delivery stopped for refund safety',
       detail: 'Operator reconciliation required; no upstream call was attempted.',
     }), {
       status: 503,
       headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
-    }))
+    })
+    return verifyResult.withReceipt(withFacadeChargeEvidence(response, '0'))
   }
 
   // Defensive recovery path: observer callbacks are intentionally isolated by
@@ -2114,13 +2143,14 @@ export async function handleProxy(
 
   if (authKind !== 'stellar.channel' && !settledPayment) {
     console.error('[refund] CRITICAL: Stellar charge settled but payment proof capture was unavailable')
-    return verifyResult.withReceipt(new Response(JSON.stringify({
+    const response = new Response(JSON.stringify({
       error: 'Payment settled but delivery was stopped for refund safety',
       detail: 'Operator reconciliation required; no upstream charge was attempted.',
     }), {
       status: 503,
       headers: { 'Content-Type': 'application/json', 'Refund-Status': 'manual-review' },
-    }))
+    })
+    return verifyResult.withReceipt(withFacadeChargeEvidence(response, '0'))
   }
 
   // 4. Pay the merchant from the Tempo pool.
@@ -2191,20 +2221,79 @@ export async function handleProxy(
         await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
         channelDeliveryLockId = undefined
       }
-      return verifyResult.withReceipt(new Response(cached, {
+      const response = new Response(cached, {
         status: 200,
         headers: { 'Content-Type': 'application/json', 'X-Idempotent': 'true' },
-      }))
+      })
+      return verifyResult.withReceipt(withFacadeChargeEvidence(response, '0'))
     }
   }
 
   const rateLimitRejectMppx = await consumeRateLimitSlotOrReject()
   if (rateLimitRejectMppx) {
+    if (
+      authKind === 'stellar.channel' && channelContractForVerify &&
+      channelVoucher?.action === 'voucher'
+    ) {
+      let rolledBack = false
+      try {
+        rolledBack = await rollbackFailedChannelVoucher(
+          env,
+          channelContractForVerify,
+          channelVoucher.acceptedAmount,
+          channelVoucher.previousAmount,
+          channelVoucher.challengeId,
+        )
+      } catch (error: any) {
+        console.error(`[refund] rate-limit channel rollback failed: ${error.message}`)
+      }
+      rateLimitRejectMppx.headers.set(
+        'Refund-Status',
+        rolledBack ? 'voucher-not-consumed' : 'manual-review',
+      )
+      rateLimitRejectMppx.headers.set('Refund-Mode', 'channel-remainder')
+    } else if (settledPayment) {
+      const orderId = newOrderId()
+      const orderRecorded = await recordOrder(env, {
+        order_id: orderId,
+        ts: new Date().toISOString(),
+        route_id: route.id,
+        payer: settledPayment.payer ?? null,
+        amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+        settlement_ref: settledPayment.paymentTx ?? null,
+        request_path: `${upstreamPath}${forwardedSearch}`,
+        upstream_status: 429,
+        latency_ms: 0,
+        refund_status: 'pending',
+      })
+      try {
+        const refund = await enqueueRefund(env, {
+          proof: settledPayment,
+          reason: 'non_fulfillment',
+          merchant: merchantHost,
+          routeId: route.id,
+          ...(orderRecorded ? { orderId } : {}),
+        })
+        rateLimitRejectMppx.headers.set('Refund-Id', refund.publicId)
+        rateLimitRejectMppx.headers.set('Refund-Status', 'pending')
+        rateLimitRejectMppx.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
+      } catch (error: any) {
+        console.error(`[refund] CRITICAL: rate-limit refund persistence failed: ${error.message}`)
+        if (orderRecorded) await updateOrderRefundStatus(env, orderId, 'unknown')
+        rateLimitRejectMppx.headers.set('Refund-Status', 'manual-review')
+      }
+    } else {
+      rateLimitRejectMppx.headers.set('Refund-Status', 'manual-review')
+    }
     if (channelContractForVerify && channelDeliveryLockId) {
-      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      try {
+        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      } catch (error: any) {
+        console.error(`[channel] rate-limit lock release failed: ${error.message}`)
+      }
       channelDeliveryLockId = undefined
     }
-    return verifyResult.withReceipt(rateLimitRejectMppx)
+    return verifyResult.withReceipt(withFacadeChargeEvidence(rateLimitRejectMppx, '0'))
   }
 
   let payResult: MerchantPayResult
@@ -2251,9 +2340,9 @@ export async function handleProxy(
      * `refund_pending` forever (codex review, 2026-08-18). One KV put on a
      * path that already awaits the enqueue is a cheap price for that.
      */
-    const recordFailedLeg = (refundStatus: RefundStatus): Promise<void> => {
+    const recordFailedLeg = (refundStatus: RefundStatus): Promise<boolean> => {
       if (!settledPayment || !failedLegOrderId || payResult.kind !== 'error') {
-        return Promise.resolve()
+        return Promise.resolve(false)
       }
       return recordOrder(env, {
         order_id: failedLegOrderId,
@@ -2302,38 +2391,67 @@ export async function handleProxy(
       response.headers.set('Refund-Mode', 'channel-remainder')
       response.headers.set('Refund-Status', rolledBack ? 'voucher-not-consumed' : 'manual-review')
       response.headers.set('Refund-Channel', channelContractForVerify)
-      return verifyResult.withReceipt(response)
+      return verifyResult.withReceipt(withFacadeChargeEvidence(response, rolledBack ? '0' : undefined))
     }
     if (settledPayment && payResult.refundReason) {
       // Before the enqueue, not after: see the note on recordFailedLeg.
-      await recordFailedLeg('pending')
-      const refund = await enqueueRefund(env, {
-        proof: settledPayment,
-        reason: payResult.refundReason,
-        merchant: merchantHost,
-        routeId: route.id,
-        orderId: failedLegOrderId,
-      })
+      const orderRecorded = await recordFailedLeg('pending')
+      let refund
+      try {
+        refund = await enqueueRefund(env, {
+          proof: settledPayment,
+          reason: payResult.refundReason,
+          merchant: merchantHost,
+          routeId: route.id,
+          ...(orderRecorded && failedLegOrderId ? { orderId: failedLegOrderId } : {}),
+        })
+      } catch (error: any) {
+        console.error(`[refund] CRITICAL: merchant-failure refund persistence failed: ${error.message}`)
+        if (orderRecorded && failedLegOrderId) {
+          await updateOrderRefundStatus(env, failedLegOrderId, 'unknown')
+        }
+        const response = new Response(payResult.response.body, payResult.response)
+        response.headers.set('Refund-Status', 'manual-review')
+        if (channelContractForVerify && channelDeliveryLockId) {
+          try {
+            await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+          } catch (releaseError: any) {
+            console.error(`[channel] refund-failure lock release failed: ${releaseError.message}`)
+          }
+          channelDeliveryLockId = undefined
+        }
+        return verifyResult.withReceipt(withFacadeChargeEvidence(response))
+      }
       if (channelContractForVerify && channelDeliveryLockId) {
-        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+        try {
+          await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+        } catch (error: any) {
+          console.error(`[channel] refund-pending lock release failed: ${error.message}`)
+        }
         channelDeliveryLockId = undefined
       }
       const response = new Response(payResult.response.body, payResult.response)
       response.headers.set('Refund-Id', refund.publicId)
       response.headers.set('Refund-Status', 'pending')
       response.headers.set('Refund-Status-Url', `${url.origin}/v1/refunds/${refund.publicId}`)
-      return verifyResult.withReceipt(response)
+      return verifyResult.withReceipt(withFacadeChargeEvidence(response))
     }
     // Settled, undelivered, and no refund could be queued (no refundReason,
     // e.g. a route-level rejection after settlement). `unknown` says so
     // plainly rather than leaving the call invisible. No refund job exists to
     // race this write, so it stays off the response path.
     ctx.waitUntil(recordFailedLeg('unknown'))
+    const response = new Response(payResult.response.body, payResult.response)
+    response.headers.set('Refund-Status', 'manual-review')
     if (channelContractForVerify && channelDeliveryLockId) {
-      await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      try {
+        await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
+      } catch (error: any) {
+        console.error(`[channel] manual-review lock release failed: ${error.message}`)
+      }
       channelDeliveryLockId = undefined
     }
-    return payResult.response
+    return verifyResult.withReceipt(withFacadeChargeEvidence(response))
   }
 
   // Check for async 202 — store job auth and return early with poll URL
@@ -2350,7 +2468,7 @@ export async function handleProxy(
         }
       : undefined,
   )
-  if (asyncResponse) return asyncResponse
+  if (asyncResponse) return verifyResult.withReceipt(withFacadeChargeEvidence(asyncResponse))
 
   if (channelContractForVerify && channelDeliveryLockId) {
     await releaseChannelDeliveryLock(env, channelContractForVerify, channelDeliveryLockId)
@@ -2388,7 +2506,19 @@ export async function handleProxy(
 
   const merchantContent = new Response(body, {
     status: 200,
-    headers: { 'Content-Type': contentType },
+    headers: {
+      'Content-Type': contentType,
+      // Facade metering consumes these values after handleProxy returns. They
+      // are also useful reconciliation evidence for direct API clients. The
+      // upstream cash cost equals the accepted merchant challenge amount:
+      // payMerchant authorizes that exact charge, while session mode advances
+      // its cumulative channel by that exact amount.
+      'X-MPPRouter-Quoted-Amount': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      'X-MPPRouter-Upstream-Cost': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      ...(settledPayment?.payer ?? verifiedChannelPayer
+        ? { 'X-MPPRouter-Payer': (settledPayment?.payer ?? verifiedChannelPayer)! }
+        : {}),
+    },
   })
   return verifyResult.withReceipt(merchantContent)
 }

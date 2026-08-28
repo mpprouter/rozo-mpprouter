@@ -82,7 +82,7 @@ export function newOrderId(): string {
  * must never turn into a 500 for a call the agent already paid for and
  * received.
  */
-export async function recordOrder(env: Env, entry: OrderLedgerEntry): Promise<void> {
+export async function recordOrder(env: Env, entry: OrderLedgerEntry): Promise<boolean> {
   try {
     await env.MPP_STORE.put(orderKey(entry.order_id), JSON.stringify(entry), {
       // 400 days — comfortably covers the "past 30 days" user view (§2.9
@@ -98,8 +98,10 @@ export async function recordOrder(env: Env, entry: OrderLedgerEntry): Promise<vo
         expirationTtl: 400 * 24 * 60 * 60,
       })
     }
+    return true
   } catch (err: any) {
     console.error(`[order-ledger] write failed for ${entry.order_id}: ${err.message}`)
+    return false
   }
 }
 
