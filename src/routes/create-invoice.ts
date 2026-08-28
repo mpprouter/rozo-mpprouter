@@ -91,6 +91,54 @@ export interface SourceError {
   supported?: Record<string, SourceToken[]>
 }
 
+/**
+ * Caller provenance, written into intent metadata so orders can be sliced by
+ * where they came from. Two independent fields, both optional and both
+ * untrusted — they are labels for reporting, never authorization input:
+ *
+ *   client      — which surface created the order ("rozo-checkout-cli/1.2.3",
+ *                 "checkout-web"). Absent on callers that predate this field.
+ *   attribution — the UTM/referrer object the web checkout has been sending
+ *                 since launch. It was accepted by the API and then silently
+ *                 dropped here, so every order landed unattributed; it is now
+ *                 persisted.
+ *
+ * Sanitization: values are strings only, trimmed, length-capped, and stripped
+ * of anything outside a conservative charset. Non-conforming input is dropped
+ * rather than rejected — provenance must never fail a payment.
+ */
+const CLIENT_MAX_LEN = 64
+const ATTRIBUTION_MAX_KEYS = 8
+const ATTRIBUTION_MAX_LEN = 128
+const PROVENANCE_SAFE = /[^A-Za-z0-9._:/@+-]/g
+
+function sanitizeLabel(raw: unknown, maxLen: number): string | null {
+  if (typeof raw !== 'string') return null
+  const cleaned = raw.trim().replace(PROVENANCE_SAFE, '').slice(0, maxLen)
+  return cleaned.length ? cleaned : null
+}
+
+export interface CallerProvenance {
+  client?: string
+  attribution?: Record<string, string>
+}
+
+export function resolveClient(raw: unknown): string | null {
+  return sanitizeLabel(raw, CLIENT_MAX_LEN)
+}
+
+export function resolveAttribution(raw: unknown): Record<string, string> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (Object.keys(out).length >= ATTRIBUTION_MAX_KEYS) break
+    const safeKey = sanitizeLabel(key, 32)
+    const safeValue = sanitizeLabel(value, ATTRIBUTION_MAX_LEN)
+    if (safeKey && safeValue) out[safeKey] = safeValue
+  }
+  return Object.keys(out).length ? out : null
+}
+
 export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?: never } | { resolved?: never; error: SourceError } {
   const warnings: string[] = []
 
@@ -462,6 +510,15 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // providers now share one source-resolution path and one error contract.
   const sourceRaw = (parsed as Record<string, unknown> | null)?.source
   const sourceResult = resolveSource(sourceRaw)
+
+  // Caller provenance. Never fails the request — bad input is dropped, not rejected.
+  const provenance: CallerProvenance = {}
+  const clientLabel = resolveClient((parsed as Record<string, unknown> | null)?.client)
+  if (clientLabel) provenance.client = clientLabel
+  const attributionLabels = resolveAttribution(
+    (parsed as Record<string, unknown> | null)?.attribution,
+  )
+  if (attributionLabels) provenance.attribution = attributionLabels
   if (sourceResult.error) {
     return errorResponse(400, {
       code: sourceResult.error.code,
@@ -487,7 +544,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         message: 'Stripe invoice requires a url.',
       })
     }
-    return handleStripeCreateInvoice(stripeUrl, env, source)
+    return handleStripeCreateInvoice(stripeUrl, env, source, provenance)
   }
 
   let quote: any
@@ -785,6 +842,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         metadata: {
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
+          ...provenance,
         },
       }
     : {
@@ -810,6 +868,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         metadata: {
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
+          ...provenance,
         },
   }
 
@@ -913,6 +972,7 @@ export async function handleStripeCreateInvoice(
   stripeUrl: string,
   env: Env,
   source: ResolvedSource,
+  provenance: CallerProvenance = {},
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -1043,6 +1103,7 @@ export async function handleStripeCreateInvoice(
   // 6. Locked metadata (design §6). NO url / session hash / secrets.
   const lockedMetadata = {
     source: 'mpprouter-create-invoice',
+    ...provenance,
     invoiceProvider: 'stripe_crypto',
     invoiceKey: invoice.invoiceKey,
     invoiceLockFingerprint: invoice.lockFingerprint,

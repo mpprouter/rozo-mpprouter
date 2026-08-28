@@ -7,6 +7,8 @@ import {
   buildTitle,
   buildFullAmountTitle,
   resolveSource,
+  resolveClient,
+  resolveAttribution,
 } from '../src/routes/create-invoice'
 import {
   createQuoteReceipt,
@@ -918,5 +920,52 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     expect(json.rozoPaymentId).toBe('rozo-existing')
     expect(json.linkId).toBe('pl_test123')
     expect(createBody).toBeNull()
+  })
+})
+
+
+describe('caller provenance', () => {
+  it('keeps a well-formed client label', () => {
+    expect(resolveClient('rozo-checkout-cli/1.2.3')).toBe('rozo-checkout-cli/1.2.3')
+    expect(resolveClient('  checkout-web  ')).toBe('checkout-web')
+  })
+
+  it('drops non-strings and empty labels instead of failing the payment', () => {
+    for (const bad of [undefined, null, 42, {}, [], true, '', '   ']) {
+      expect(resolveClient(bad)).toBeNull()
+    }
+  })
+
+  it('strips characters outside the safe charset and caps the length', () => {
+    // A label is a reporting tag that lands in stored metadata - never let it
+    // carry quotes, angle brackets or newlines.
+    expect(resolveClient('cli<script>"' + String.fromCharCode(10) + ' x')).toBe('cliscriptx')
+    expect(resolveClient('a'.repeat(200))).toHaveLength(64)
+  })
+
+  it('keeps only string-valued attribution entries', () => {
+    expect(resolveAttribution({ utm_source: 'blog', ref: 'checkout.rozo.ai' })).toEqual({
+      utm_source: 'blog',
+      ref: 'checkout.rozo.ai',
+    })
+    expect(resolveAttribution({ good: 'x', bad: { nested: 1 }, alsoBad: 7 })).toEqual({
+      good: 'x',
+    })
+  })
+
+  it('rejects non-objects and empty results', () => {
+    for (const bad of [undefined, null, 'blog', 42, [], {}, { k: '' }]) {
+      expect(resolveAttribution(bad)).toBeNull()
+    }
+  })
+
+  it('caps the number of attribution keys so metadata cannot be inflated', () => {
+    const wide: Record<string, string> = {}
+    for (let i = 0; i < 50; i += 1) wide[`k${i}`] = 'v'
+    expect(Object.keys(resolveAttribution(wide) ?? {})).toHaveLength(8)
+  })
+
+  it('caps attribution value length', () => {
+    expect(resolveAttribution({ utm_campaign: 'c'.repeat(500) })?.utm_campaign).toHaveLength(128)
   })
 })
