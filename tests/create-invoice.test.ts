@@ -8,7 +8,6 @@ import {
   buildFullAmountTitle,
   resolveSource,
   resolveClient,
-  resolveAttribution,
 } from '../src/routes/create-invoice'
 import {
   createQuoteReceipt,
@@ -931,41 +930,26 @@ describe('caller provenance', () => {
   })
 
   it('drops non-strings and empty labels instead of failing the payment', () => {
+    // Provenance is telemetry on a money path: malformed input is discarded,
+    // never turned into a 400 that would stop the order.
     for (const bad of [undefined, null, 42, {}, [], true, '', '   ']) {
       expect(resolveClient(bad)).toBeNull()
     }
   })
 
-  it('strips characters outside the safe charset and caps the length', () => {
-    // A label is a reporting tag that lands in stored metadata - never let it
-    // carry quotes, angle brackets or newlines.
-    expect(resolveClient('cli<script>"' + String.fromCharCode(10) + ' x')).toBe('cliscriptx')
+  it('strips anything that could survive into stored JSONB as markup or SQL', () => {
+    expect(resolveClient('cli<script>"' + String.fromCharCode(10) + ' x')).toBe('cliscript x')
+    expect(resolveClient("a'; DROP TABLE t; --")).toBe('a DROP TABLE t --')
+    // Same charset the canonical attribution whitelist enforces, plus `/`.
+    expect(resolveClient('a:b@c+d%e&f=g')).toBe('abcdefg')
+  })
+
+  it('caps the label and bounds the input before scanning it', () => {
     expect(resolveClient('a'.repeat(200))).toHaveLength(64)
-  })
-
-  it('keeps only string-valued attribution entries', () => {
-    expect(resolveAttribution({ utm_source: 'blog', ref: 'checkout.rozo.ai' })).toEqual({
-      utm_source: 'blog',
-      ref: 'checkout.rozo.ai',
-    })
-    expect(resolveAttribution({ good: 'x', bad: { nested: 1 }, alsoBad: 7 })).toEqual({
-      good: 'x',
-    })
-  })
-
-  it('rejects non-objects and empty results', () => {
-    for (const bad of [undefined, null, 'blog', 42, [], {}, { k: '' }]) {
-      expect(resolveAttribution(bad)).toBeNull()
-    }
-  })
-
-  it('caps the number of attribution keys so metadata cannot be inflated', () => {
-    const wide: Record<string, string> = {}
-    for (let i = 0; i < 50; i += 1) wide[`k${i}`] = 'v'
-    expect(Object.keys(resolveAttribution(wide) ?? {})).toHaveLength(8)
-  })
-
-  it('caps attribution value length', () => {
-    expect(resolveAttribution({ utm_campaign: 'c'.repeat(500) })?.utm_campaign).toHaveLength(128)
+    // A multi-megabyte value must not cost a full-length regex pass to discard.
+    const huge = 'a'.repeat(5_000_000)
+    const started = Date.now()
+    expect(resolveClient(huge)).toHaveLength(64)
+    expect(Date.now() - started).toBeLessThan(1_000)
   })
 })
