@@ -200,7 +200,16 @@ async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; trun
   while (scanned < MAX_LEDGER_KEYS) {
     let listed: KVNamespaceListResult<unknown, string>
     try {
-      listed = await env.MPP_STORE.list({ prefix: 'mercury_order:', limit: 1000, cursor })
+      // Page size is bounded by what is left of the budget, not a flat
+      // 1000: the very first page would otherwise issue 1000 KV reads and
+      // blow the Worker subrequest cap before MAX_LEDGER_KEYS was ever
+      // consulted.
+      const remaining = MAX_LEDGER_KEYS - scanned
+      listed = await env.MPP_STORE.list({
+        prefix: 'mercury_order:',
+        limit: Math.min(remaining, 1000),
+        cursor,
+      })
     } catch {
       // A stats page must degrade, not 500.
       return { entries, truncated: true }
@@ -343,8 +352,13 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   for (const id of allQualityRows) acc(id)
 
   const services: ServiceStats[] = []
+  let anyQualityReadFailed = false
   for (const [serviceId, a] of byService) {
-    const q = await getRouteQuality(env, serviceId)
+    const { stats: q, availability } = await getRouteQualityWithAvailability(env, serviceId)
+    // One service's failed read would otherwise publish that provider as
+    // having zero faults and a null rate, indistinguishable from a clean
+    // record.
+    if (availability !== 'ok') anyQualityReadFailed = true
     const w = q[window]
     services.push({
       service_id: serviceId,
@@ -387,7 +401,10 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
         'Per-call order ledger (KV). Volume, buyers and calls are settled orders only.',
       quality_source:
         'route_metric_calls (D1), written at the proxy chokepoint every paid call passes through.',
-      quality_availability: qualityAvailability,
+      quality_availability:
+        anyQualityReadFailed && qualityAvailability === 'ok'
+          ? 'read_failed'
+          : qualityAvailability,
       known_gaps: [
         'Successful asynchronous (202) purchases return before the order ledger is written, so they are absent from volume, buyer and call counts. Their quality outcome IS recorded.',
         'Quality figures include ROZO test traffic; the payer is unknown where those rows are written. Volume and buyer counts exclude it.',

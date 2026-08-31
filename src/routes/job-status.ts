@@ -186,9 +186,8 @@ export async function finishAsyncDelivery(
   // calls from polling and from the cron are harmless.
   const jobId = terminalKey.slice(record.serviceId.length + 1)
   if (jobId) {
-    resolveRouteCall(
+    await resolveRouteCall(
       env,
-      { waitUntil: (p) => void p.catch(() => {}) },
       asyncCallId(record.serviceId, jobId),
       outcome === 'delivered' ? 'ok' : 'provider_fault',
       outcome === 'delivered' ? undefined : (reason ?? 'async_delivery_failed'),

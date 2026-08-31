@@ -221,28 +221,32 @@ export function asyncCallId(routeId: string, jobId: string): string {
  * Without the finalisation an accepted async call stayed 'pending' forever
  * and the provider's success rate could never reflect it.
  */
-export function resolveRouteCall(
+export async function resolveRouteCall(
   env: Env,
-  ctx: { waitUntil: (p: Promise<any>) => void },
   callId: string,
   outcome: CallOutcome,
   reason?: string,
-): void {
+): Promise<void> {
   const db = env.ROUTE_METRICS_DB
   if (!db) return
 
-  ctx.waitUntil(
-    (async () => {
-      await db
-        .prepare(
-          `UPDATE route_metric_calls
-              SET outcome = ?, reason = COALESCE(?, reason)
-            WHERE call_id = ? AND outcome = 'pending'`,
-        )
-        .bind(outcome, reason ?? null, callId)
-        .run()
-    })().catch(() => {}),
-  )
+  // Awaited by its caller rather than handed to a synthetic waitUntil. A
+  // fake `{waitUntil: p => void p.catch()}` does not extend the request
+  // lifetime, so the Worker could be torn down before the UPDATE landed and
+  // the row would stay 'pending' forever — the exact bug this resolution
+  // exists to fix. Errors are still swallowed: metrics never fail delivery.
+  try {
+    await db
+      .prepare(
+        `UPDATE route_metric_calls
+            SET outcome = ?, reason = COALESCE(?, reason)
+          WHERE call_id = ? AND outcome = 'pending'`,
+      )
+      .bind(outcome, reason ?? null, callId)
+      .run()
+  } catch {
+    // Intentionally ignored.
+  }
 }
 
 export type MetricsWindow = '24h' | '7d' | '30d' | '90d' | 'all'

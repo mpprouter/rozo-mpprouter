@@ -150,10 +150,17 @@ function main() {
     // `deliveryFailed` signal, and it is what catches an upstream that
     // answered 200 with an empty body.
     const deliveryFailed = entry.refund_status !== 'none'
-    const outcome = classifyOutcome(entry.upstream_status, {
+    let outcome = classifyOutcome(entry.upstream_status, {
       routerHoldsCredential: routerHeld,
       deliveryFailed,
     })
+    // OUR OWN rate limiter also answers 429, and a stored 429 cannot be told
+    // apart from an upstream one after the fact. classifyOutcome calls it a
+    // provider fault, which would understate a provider's published success
+    // rate for our throttling, so historical 429s are attributed to the
+    // router instead. Live traffic does not need this: the router's own
+    // rejections never reach the upstream chokepoint at all.
+    if (entry.upstream_status === 429) outcome = 'router_fault'
     // 0 in the ledger means "this branch never measured it", not "instant".
     const latency = entry.latency_ms > 0 ? entry.latency_ms : null
     const refunded = entry.refund_status === 'refunded' ? 1 : 0
@@ -172,7 +179,7 @@ function main() {
     const callId = `backfill:${entry.order_id}`
     const esc = (v: string) => `'${v.replace(/'/g, "''")}'`
     statements.push(
-      `INSERT INTO route_metric_calls (call_id, created_at, service_id, route_id, method, outcome, reason, upstream_status, latency_ms, refunded) VALUES (${esc(callId)}, ${createdAt}, ${esc(serviceIdFromRouteId(entry.route_id))}, ${esc(entry.route_id)}, ${esc('UNKNOWN')}, ${esc(outcome)}, ${outcome === 'ok' ? 'NULL' : esc('backfilled_from_order_ledger')}, ${entry.upstream_status}, ${latency ?? 'NULL'}, ${refunded}) ON CONFLICT(call_id) DO NOTHING;`,
+      `INSERT INTO route_metric_calls (call_id, created_at, service_id, route_id, method, outcome, reason, upstream_status, latency_ms, refunded) VALUES (${esc(callId)}, ${createdAt}, ${esc(serviceIdFromRouteId(entry.route_id))}, ${esc(entry.route_id)}, ${esc('UNKNOWN')}, ${esc(outcome)}, ${outcome === 'ok' ? 'NULL' : esc(entry.upstream_status === 429 ? 'rate_limited_ambiguous_backfill' : 'backfilled_from_order_ledger')}, ${entry.upstream_status}, ${latency ?? 'NULL'}, ${refunded}) ON CONFLICT(call_id) DO NOTHING;`,
     )
   }
 
