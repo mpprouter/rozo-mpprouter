@@ -87,6 +87,14 @@ export function classifyOutcome(
      * be recorded as a success.
      */
     deliveryFailed?: boolean
+    /**
+     * The upstream accepted the work for asynchronous processing. Passed in
+     * rather than inferred from the status, because a 202 is only the
+     * canonical shape: merchants also signal it with 200 plus a body of
+     * `{status: "queued", jobId: ...}`, and treating that as a completed
+     * success is how an async provider's failures disappear.
+     */
+    asyncAccepted?: boolean
   } = {},
 ): CallOutcome {
   // A failure we already know is ours — a missing router-owned session
@@ -101,9 +109,10 @@ export function classifyOutcome(
     // A 2xx we could not deliver is the provider's failure, not a success:
     // the caller got an error and their money back.
     if (opts.deliveryFailed) return 'provider_fault'
-    // 202 means "accepted, ask again later". The delivery verdict does not
-    // exist yet, so neither does a success.
-    if (upstreamStatus === 202) return 'pending'
+    // "Accepted, ask again later" — whether signalled as 202 or as 200 with
+    // a queued job body. The delivery verdict does not exist yet, so neither
+    // does a success.
+    if (opts.asyncAccepted || upstreamStatus === 202) return 'pending'
     return 'ok'
   }
 
@@ -300,15 +309,32 @@ function summarize(window: MetricsWindow, rows: RawRow[]): RouteQualityStats {
  * recorded — and quality is the figure least distorted by our own traffic
  * anyway, since a test call fails or succeeds for the same reasons.
  */
+/**
+ * Whether the quality figures could be read at all.
+ *
+ * `unavailable` and "no traffic" produce identical numbers, and publishing
+ * an outage or a half-finished rollout as a fresh, valid, zero-call result
+ * is the most damaging thing these endpoints could do. Callers must be able
+ * to tell the two apart and say so.
+ */
+export type QualityAvailability = 'ok' | 'not_provisioned' | 'read_failed'
+
 export async function getRouteQuality(
   env: Env,
   serviceId?: string,
 ): Promise<Record<MetricsWindow, RouteQualityStats>> {
+  return (await getRouteQualityWithAvailability(env, serviceId)).stats
+}
+
+export async function getRouteQualityWithAvailability(
+  env: Env,
+  serviceId?: string,
+): Promise<{ stats: Record<MetricsWindow, RouteQualityStats>; availability: QualityAvailability }> {
   const db = env.ROUTE_METRICS_DB
   const empty = Object.fromEntries(
     ALL_WINDOWS.map((w) => [w, summarize(w, [])]),
   ) as Record<MetricsWindow, RouteQualityStats>
-  if (!db) return empty
+  if (!db) return { stats: empty, availability: 'not_provisioned' }
 
   const sql = serviceId
     ? `SELECT outcome, refunded, latency_ms, created_at FROM route_metric_calls
@@ -321,17 +347,21 @@ export async function getRouteQuality(
     const res = await stmt.all<RawRow>()
     rows = res.results ?? []
   } catch {
-    // A metrics read must not take down the catalog it is attached to.
-    return empty
+    // A metrics read must not take down the catalog it is attached to — but
+    // it must not masquerade as a zero-traffic answer either.
+    return { stats: empty, availability: 'read_failed' }
   }
 
   const now = Date.now()
-  return Object.fromEntries(
-    ALL_WINDOWS.map((w) => [
-      w,
-      summarize(w, w === 'all' ? rows : rows.filter((r) => r.created_at >= now - WINDOW_MS[w])),
-    ]),
-  ) as Record<MetricsWindow, RouteQualityStats>
+  return {
+    stats: Object.fromEntries(
+      ALL_WINDOWS.map((w) => [
+        w,
+        summarize(w, w === 'all' ? rows : rows.filter((r) => r.created_at >= now - WINDOW_MS[w])),
+      ]),
+    ) as Record<MetricsWindow, RouteQualityStats>,
+    availability: 'ok',
+  }
 }
 
 /**

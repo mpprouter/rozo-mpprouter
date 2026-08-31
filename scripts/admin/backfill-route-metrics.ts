@@ -22,6 +22,10 @@
  * Idempotent ACROSS RUNS: `call_id` is `backfill:<order_id>`, so a second run
  * inserts nothing.
  *
+ * Intended order: run this BEFORE the ROUTE_METRICS_DB binding is enabled,
+ * so there is no live writer at all. The cutoff below is the belt to that
+ * braces.
+ *
  * NOT idempotent against LIVE recording, which is why the cutoff below
  * exists. A live row is keyed by a random UUID, so it can never collide with
  * a backfill row for the same call — run this after live recording has
@@ -89,7 +93,13 @@ function main() {
   // The cutoff: the oldest call the Worker recorded live. Anything at or
   // after it is already in the table under a different (random) id, and
   // inserting it again would double-count it forever.
-  let liveCutoffMs = Number.POSITIVE_INFINITY
+  // Never Infinity. The live D1 metric and the KV order row are independent
+  // background writes, so a call can take its UUID metric row after the
+  // cutoff query and still have its ledger row listed below — counted twice,
+  // permanently. When no live row exists yet, fall back to the moment this
+  // run started, less a margin covering that write skew.
+  const WRITE_SKEW_MS = 5 * 60 * 1000
+  let liveCutoffMs = Date.now() - WRITE_SKEW_MS
   try {
     const res = JSON.parse(
       wrangler([
@@ -100,12 +110,13 @@ function main() {
     )
     const oldest = res?.[0]?.results?.[0]?.oldest
     if (typeof oldest === 'number') {
-      liveCutoffMs = oldest
+      liveCutoffMs = Math.min(oldest, liveCutoffMs)
       console.log(
         `Live recording starts at ${new Date(oldest).toISOString()}; ` +
           `ledger entries at or after that are already recorded and will be skipped.`,
       )
     }
+    console.log(`Effective cutoff: ${new Date(liveCutoffMs).toISOString()}`)
   } catch (err) {
     // Fail closed. Guessing "no live rows" is exactly the assumption that
     // produces silent double counting.

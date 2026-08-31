@@ -18,7 +18,12 @@
  *     without their definition.
  */
 
-import { getRouteQuality, type MetricsWindow, type RouteQualityStats } from '../services/route-metrics'
+import {
+  getRouteQualityWithAvailability,
+  type MetricsWindow,
+  type QualityAvailability,
+  type RouteQualityStats,
+} from '../services/route-metrics'
 import { listPublicCatalog } from '../services/merchants'
 import type { Env } from '../index'
 
@@ -76,14 +81,38 @@ function json(body: unknown, status = 200): Response {
   })
 }
 
+/**
+ * 503 when the store could not be read.
+ *
+ * An unreadable store and a service with no traffic produce identical
+ * numbers, so returning 200 with zeros would publish an outage — or a
+ * half-finished rollout, which is exactly the staged state this repo ships
+ * in — as valid provider data carrying a fresh timestamp. Better to say the
+ * figures are unavailable than to state a confident zero we cannot support.
+ */
+function unavailable(availability: QualityAvailability): Response {
+  return json(
+    {
+      error: 'metrics_unavailable',
+      reason: availability,
+      detail:
+        availability === 'not_provisioned'
+          ? 'Metrics storage is not provisioned in this environment. This is not a report of zero traffic.'
+          : 'Metrics storage could not be read. This is not a report of zero traffic.',
+    },
+    503,
+  )
+}
+
 export async function handleAllServiceMetrics(env: Env): Promise<Response> {
-  const q = await getRouteQuality(env)
+  const { stats, availability } = await getRouteQualityWithAvailability(env)
+  if (availability !== 'ok') return unavailable(availability)
   return json({
     version: 1,
     generated_at: new Date().toISOString(),
     scope: 'all_services',
     methodology: METHODOLOGY,
-    windows: windowsPayload(q),
+    windows: windowsPayload(stats),
   })
 }
 
@@ -96,13 +125,14 @@ export async function handleServiceMetrics(env: Env, serviceId: string): Promise
     return json({ error: 'unknown_service', service_id: serviceId }, 404)
   }
 
-  const q = await getRouteQuality(env, serviceId)
+  const { stats, availability } = await getRouteQualityWithAvailability(env, serviceId)
+  if (availability !== 'ok') return unavailable(availability)
   return json({
     version: 1,
     generated_at: new Date().toISOString(),
     scope: 'service',
     service_id: serviceId,
     methodology: METHODOLOGY,
-    windows: windowsPayload(q),
+    windows: windowsPayload(stats),
   })
 }

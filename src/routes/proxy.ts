@@ -665,6 +665,13 @@ async function payMerchantAndGetBody(
         (isRozoPayInvoiceRoute(route) && Boolean(env.PAYINVOICE_ADMIN_SECRET)),
       routerSideFailure: result.kind === 'error' && result.routerSideFailure === true,
       deliveryFailed: result.kind === 'error',
+      // Reuse the SAME detector handleAsyncJob uses, rather than checking
+      // for 202 here: merchants also queue work with 200 plus a
+      // {status:"queued", jobId} body, and a second detector would drift
+      // from this one the way the backfill classifier already did.
+      asyncAccepted:
+        result.kind === 'ok' &&
+        isAsyncJobResponse(result.merchantStatus, result.body).isAsync,
     }),
     reason: result.kind === 'error' ? (result.refundReason ?? 'upstream_error') : undefined,
     upstreamStatus: result.merchantStatus,

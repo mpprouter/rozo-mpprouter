@@ -26,6 +26,7 @@ import type { OrderLedgerEntry } from './order-ledger'
 import {
   getQualityServiceIds,
   getRouteQuality,
+  getRouteQualityWithAvailability,
   serviceIdFromRouteId,
   type MetricsWindow,
 } from './route-metrics'
@@ -111,6 +112,12 @@ export interface StatsPayload {
   coverage: {
     commerce_source: string
     quality_source: string
+    /**
+     * 'ok', 'not_provisioned' or 'read_failed'. When it is not 'ok' the
+     * quality columns are absent data, NOT zero — a consumer must not
+     * render them as a 0% success rate.
+     */
+    quality_availability: string
     known_gaps: string[]
   }
   totals: {
@@ -338,7 +345,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   // Busiest first — the table's default sort in the reference layout.
   services.sort((x, y) => y.calls - x.calls)
 
-  const allQuality = await getRouteQuality(env)
+  const { stats: allQuality, availability: qualityAvailability } =
+    await getRouteQualityWithAvailability(env)
   const totalBuyers = new Set<string>()
   for (const e of entries) {
     const ts = Date.parse(e.ts)
@@ -356,6 +364,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
         'Per-call order ledger (KV). Volume, buyers and calls are settled orders only.',
       quality_source:
         'route_metric_calls (D1), written at the proxy chokepoint every paid call passes through.',
+      quality_availability: qualityAvailability,
       known_gaps: [
         'Successful asynchronous (202) purchases return before the order ledger is written, so they are absent from volume, buyer and call counts. Their quality outcome IS recorded.',
         'Quality figures include ROZO test traffic; the payer is unknown where those rows are written. Volume and buyer counts exclude it.',
