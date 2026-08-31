@@ -190,6 +190,41 @@ describe('create-invoice — stellar_payin_contracts intent', () => {
     expect(json.intentMismatch).toBeUndefined()
   })
 
+  it('flags intentMismatch when reusing a contract-mode order WITHOUT the intent', async () => {
+    existingIntent = {
+      id: 'rozo-pay-existing',
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      source: {
+        chainId: '1500',
+        tokenSymbol: 'USDC',
+        amount: '10.5',
+        receiverAddress: 'GHUBADDRESS',
+        receiverAddressContract: 'CCONTRACTADDRESS',
+        receiverMemoContract: 'memo_123',
+      },
+    }
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: STELLAR_SOURCE,
+    })
+    expect(status).toBe(200)
+    expect(json.reused).toBe(true)
+    expect(json.intentMismatch).toBe(true)
+    expect(String(json.warnings?.join(' '))).toContain('receiverAddressContract')
+  })
+
+  it('returns 400 (not a crash) for an object intent with poisoned coercion hooks', async () => {
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: STELLAR_SOURCE,
+      intent: { toString: null, valueOf: null },
+    })
+    expect(status).toBe(400)
+    expect(json.code).toBe('INVALID_INTENT')
+  })
+
   it('rejects the intent on Stripe invoices instead of silently dropping it', async () => {
     const { status, json } = await createInvoice({
       url: 'https://crypto.stripe.com/pay/CDMTestBlob_ABC123xyz',

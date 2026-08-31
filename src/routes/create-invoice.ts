@@ -736,7 +736,11 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     if (intentRaw !== 'stellar_payin_contracts') {
       return errorResponse(400, {
         code: 'INVALID_INTENT',
-        message: `intent must be "stellar_payin_contracts" when provided. Sent: ${String(intentRaw).substring(0, 60)}`,
+        message:
+          'intent must be "stellar_payin_contracts" when provided. Sent: ' +
+          (typeof intentRaw === 'string'
+            ? intentRaw.substring(0, 60)
+            : `(${typeof intentRaw})`),
         normalized_input: normalized,
         link_id_detected,
       })
@@ -1050,19 +1054,29 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         }
 
         // Contract pay-in mode is frozen upstream at create time; /checkout
-        // rotation preserves the stored intent but can never add it. If this
-        // caller asked for stellar_payin_contracts and the existing order is
-        // not contract-mode (no receiverAddressContract on the row), say so
-        // instead of letting them wait for a C-address that will never come.
-        const intentMismatch =
-          payinIntent !== null && !row?.source?.receiverAddressContract
+        // rotation preserves the stored intent but can never add or remove it.
+        // Flag a mismatch in BOTH directions: contract requested but the row is
+        // classic (a C-address will never come), and intent omitted but the row
+        // is contract-mode (a classic G-wallet cannot pay the contract rail).
+        const rowIsContractMode = Boolean(row?.source?.receiverAddressContract)
+        const intentMismatch = (payinIntent !== null) !== rowIsContractMode
         if (intentMismatch) {
+          const rowIsClassicStellar = rowSource.chainId === '1500'
           warnings.push(
-            'Requested intent "stellar_payin_contracts", but the existing unpaid ' +
-            'order for this invoice was created without it and the pay-in mode ' +
-            'cannot be changed after creation. Pay the classic G-address + memo ' +
-            'in raw.source (receiverAddress + receiverMemo), or wait for the ' +
-            'order to expire and re-create with the intent.',
+            payinIntent !== null
+              ? 'Requested intent "stellar_payin_contracts", but the existing unpaid ' +
+                'order for this invoice was created without it and the pay-in mode ' +
+                'cannot be changed after creation. ' +
+                (rowIsClassicStellar
+                  ? 'Pay the classic G-address + memo in raw.source ' +
+                    '(receiverAddress + receiverMemo), or wait'
+                  : 'Pay the source shown in raw.source, or wait') +
+                ' for the order to expire and re-create with the intent.'
+              : 'The existing unpaid order for this invoice was created with intent ' +
+                '"stellar_payin_contracts" (contract pay-in): pay via the contract ' +
+                'rail in raw.source (receiverAddressContract + receiverMemoContract), ' +
+                'NOT a classic G-address payment, or wait for the order to expire ' +
+                'and re-create without the intent.',
           )
         }
 
