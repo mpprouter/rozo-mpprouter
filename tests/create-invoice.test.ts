@@ -553,6 +553,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     body: Record<string, unknown>,
     feeBps?: string,
     merchant = 'OpenRouter, Inc.',
+    quoteResponses: Response[] = [],
   ) {
     const { handleCreateInvoice } = await import('../src/routes/create-invoice')
     let createBody: any = null
@@ -562,6 +563,8 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
       const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
       if (u.includes('/quote-invoice')) {
         quoteFetches += 1
+        const injected = quoteResponses.shift()
+        if (injected) return injected
         return new Response(
           JSON.stringify({
             invoice: { amount: '105' },
@@ -611,6 +614,33 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(json.callerPays).toBe('105')
     expect(json.discount).toBe('0')
     expect(json.title).toBe('Pay OpenRouter, Inc. $105')
+  })
+
+  it('retries a transient Coinbase session-readiness conflict before declaring the link expired', async () => {
+    const transient = new Response(
+      JSON.stringify({
+        code: 'LINK_USED_OR_EXPIRED',
+        message: 'Payment link has already been used or has expired.',
+      }),
+      { status: 409 },
+    )
+    const ready = new Response(
+      JSON.stringify({
+        invoice: { amount: '105' },
+        merchant: 'OpenRouter, Inc.',
+        linkId: 'paymentSession_test123',
+      }),
+      { status: 200 },
+    )
+    const { status, json, quoteFetches } = await run(
+      { payment_id: 'paymentSession_test123' },
+      undefined,
+      'OpenRouter, Inc.',
+      [transient, ready],
+    )
+    expect(status).toBe(200)
+    expect(json.linkId).toBe('paymentSession_test123')
+    expect(quoteFetches).toBe(2)
   })
 
   it('Lightning source → exactOut, destination.amount full, source BTC no amount, appId=merchant_openrouter', async () => {

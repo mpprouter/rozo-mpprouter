@@ -815,6 +815,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     // the policy check below rejects invalid receipts instead of silently
     // changing a price the customer may already have seen.
     let quoteResp: Response
+    let quoteErrorDetail: string | null = null
     try {
       quoteResp = await fetch(QUOTE_INVOICE_URL, {
         method: 'POST',
@@ -824,6 +825,34 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         },
         body: JSON.stringify(normalized),
       })
+
+      // A freshly-created Coinbase v3 session can briefly read as not payable
+      // before its CREATED state is visible on the next provider read. Retry one
+      // ambiguous conflict after a short bounded delay. Definitive paid/used
+      // states are never retried or softened.
+      if (
+        !quoteResp.ok &&
+        quoteResp.status === 409 &&
+        normalizedPaymentId?.startsWith('paymentSession_')
+      ) {
+        const firstDetail = await quoteResp.text()
+        quoteErrorDetail = firstDetail
+        const definitive =
+          /PAYMENT_SESSION_STATUS_[A-Z_]+/.test(firstDetail) ||
+          /already fully used/i.test(firstDetail)
+        if (!definitive) {
+          await new Promise((resolve) => setTimeout(resolve, 250))
+          quoteResp = await fetch(QUOTE_INVOICE_URL, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
+            },
+            body: JSON.stringify(normalized),
+          })
+          quoteErrorDetail = null
+        }
+      }
     } catch (err: any) {
       return errorResponse(502, {
         code: 'QUOTE_FETCH_FAILED',
@@ -834,7 +863,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     }
 
     if (!quoteResp.ok) {
-      const detail = await quoteResp.text()
+      const detail = quoteErrorDetail ?? await quoteResp.text()
       if (quoteResp.status === 409 || quoteResp.status === 410) {
         // Upstream 409 detail carries the real Coinbase state, e.g.
         // "payment session is not payable: PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED"
