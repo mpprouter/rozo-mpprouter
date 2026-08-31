@@ -235,6 +235,7 @@ export type CreateInvoiceErrorCode =
   | 'SERVER_MISCONFIGURED'
   | 'INVALID_SOURCE'
   | 'UNSUPPORTED_SOURCE'
+  | 'INVALID_INTENT'
   | 'RATE_LIMITED'
   | 'SERVICE_UNAVAILABLE'
   | 'PAYMENT_ALREADY_PAID'
@@ -721,6 +722,41 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   }
   const source = sourceResult.resolved
 
+  // Pay-in intent override (optional). Only 'stellar_payin_contracts' is
+  // recognized: the upstream payment-api then freezes the order in contract
+  // pay-in mode (per-payment Stellar C-address, no memo needed) instead of the
+  // classic hub G-address + memo, and its response exposes
+  // receiverAddressContract + receiverMemoContract (emitted together, contract
+  // orders only — database.ts gates the fields on the frozen mode). The mode is
+  // frozen at create time upstream, so a reused unpaid order created without it
+  // cannot be upgraded by rotation — that case is reported, not silently kept.
+  const intentRaw = (parsed as Record<string, unknown> | null)?.intent
+  let payinIntent: 'stellar_payin_contracts' | null = null
+  if (intentRaw !== undefined && intentRaw !== null && intentRaw !== '') {
+    if (intentRaw !== 'stellar_payin_contracts') {
+      return errorResponse(400, {
+        code: 'INVALID_INTENT',
+        message:
+          'intent must be "stellar_payin_contracts" when provided. Sent: ' +
+          (typeof intentRaw === 'string'
+            ? intentRaw.substring(0, 60)
+            : `(${typeof intentRaw})`),
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    if (source.chainId !== '1500') {
+      return errorResponse(400, {
+        code: 'INVALID_INTENT',
+        message:
+          'intent "stellar_payin_contracts" requires source {"chainId":"1500","tokenSymbol":"USDC"} (Stellar).',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    payinIntent = 'stellar_payin_contracts'
+  }
+
   // Stripe crypto create-invoice: resolve the session, create/reuse a Rozo
   // intent, and seed the locked fulfillment record. Fulfillment itself is
   // money movement done by the (disabled-by-default) Supabase pay-invoice
@@ -732,6 +768,17 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       return errorResponse(400, {
         code: 'INVALID_INPUT',
         message: 'Stripe invoice requires a url.',
+      })
+    }
+    if (payinIntent) {
+      // The Stripe branch builds its own intents body and does not carry the
+      // intent through; dropping it silently would hand the caller a classic
+      // G-address order they did not ask for (same rationale as source above).
+      return errorResponse(400, {
+        code: 'INVALID_INTENT',
+        message: 'intent "stellar_payin_contracts" is not supported for Stripe invoices yet.',
+        normalized_input: normalized,
+        link_id_detected,
       })
     }
     return handleStripeCreateInvoice(
@@ -1006,6 +1053,33 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           warnings.push(sourceMismatchWarning(rowSource, source, rotationFailure))
         }
 
+        // Contract pay-in mode is frozen upstream at create time; /checkout
+        // rotation preserves the stored intent but can never add or remove it.
+        // Flag a mismatch in BOTH directions: contract requested but the row is
+        // classic (a C-address will never come), and intent omitted but the row
+        // is contract-mode (a classic G-wallet cannot pay the contract rail).
+        const rowIsContractMode = Boolean(row?.source?.receiverAddressContract)
+        const intentMismatch = (payinIntent !== null) !== rowIsContractMode
+        if (intentMismatch) {
+          const rowIsClassicStellar = rowSource.chainId === '1500'
+          warnings.push(
+            payinIntent !== null
+              ? 'Requested intent "stellar_payin_contracts", but the existing unpaid ' +
+                'order for this invoice was created without it and the pay-in mode ' +
+                'cannot be changed after creation. ' +
+                (rowIsClassicStellar
+                  ? 'Pay the classic G-address + memo in raw.source ' +
+                    '(receiverAddress + receiverMemo), or wait'
+                  : 'Pay the source shown in raw.source, or wait') +
+                ' for the order to expire and re-create with the intent.'
+              : 'The existing unpaid order for this invoice was created with intent ' +
+                '"stellar_payin_contracts" (contract pay-in): pay via the contract ' +
+                'rail in raw.source (receiverAddressContract + receiverMemoContract), ' +
+                'NOT a classic G-address payment, or wait for the order to expire ' +
+                'and re-create without the intent.',
+          )
+        }
+
         return json(200, {
           ok: true,
           reused: true,
@@ -1030,6 +1104,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           },
           ...(sourceRotated ? { sourceRotated: true } : {}),
           ...(rotationFailure ? { sourceMismatch: true } : {}),
+          ...(intentMismatch ? { intentMismatch: true } : {}),
           ...(warnings.length ? { warnings } : {}),
           raw: row,
         })
@@ -1079,6 +1154,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         appId: OPENROUTER_APP_ID,
         orderId: orderId ?? `mpprouter-${Date.now()}`,
         type: 'exactIn',
+        // Optional Stellar contract pay-in — validated above (Stellar source
+        // only); upstream payment-api freezes the C-address mode from this.
+        ...(payinIntent ? { intent: payinIntent } : {}),
         display: {
           title,
           currency: 'USD',
