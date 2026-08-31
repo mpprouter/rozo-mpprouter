@@ -837,10 +837,19 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       ) {
         const firstDetail = await quoteResp.text()
         quoteErrorDetail = firstDetail
+        let hasGenericLinkConflict = false
+        try {
+          const parsed = JSON.parse(firstDetail) as { code?: unknown; error?: { code?: unknown } }
+          hasGenericLinkConflict =
+            parsed?.code === 'LINK_USED_OR_EXPIRED' ||
+            parsed?.error?.code === 'LINK_USED_OR_EXPIRED'
+        } catch {
+          // Non-JSON conflicts are not the known Coinbase readiness race.
+        }
         const definitive =
           /PAYMENT_SESSION_STATUS_[A-Z_]+/.test(firstDetail) ||
           /already fully used/i.test(firstDetail)
-        if (!definitive) {
+        if (hasGenericLinkConflict && !definitive) {
           await new Promise((resolve) => setTimeout(resolve, 250))
           quoteResp = await fetch(QUOTE_INVOICE_URL, {
             method: 'POST',

@@ -643,6 +643,93 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(quoteFetches).toBe(2)
   })
 
+  it('retries when LINK_USED_OR_EXPIRED is nested even if a different top-level code exists', async () => {
+    const nestedConflict = new Response(
+      JSON.stringify({
+        code: 'UPSTREAM_ERROR',
+        error: { code: 'LINK_USED_OR_EXPIRED' },
+      }),
+      { status: 409 },
+    )
+    const ready = new Response(
+      JSON.stringify({
+        invoice: { amount: '105' },
+        merchant: 'OpenRouter, Inc.',
+        linkId: 'paymentSession_test123',
+      }),
+      { status: 200 },
+    )
+    const { status, quoteFetches } = await run(
+      { payment_id: 'paymentSession_test123' },
+      undefined,
+      'OpenRouter, Inc.',
+      [nestedConflict, ready],
+    )
+    expect(status).toBe(200)
+    expect(quoteFetches).toBe(2)
+  })
+
+  it('does not retry unrelated or malformed Coinbase 409 responses', async () => {
+    for (const first of [
+      new Response(JSON.stringify({ code: 'ORDER_ID_CONFLICT' }), { status: 409 }),
+      new Response('not json', { status: 409 }),
+      new Response('', { status: 409 }),
+    ]) {
+      const ready = new Response(
+        JSON.stringify({ invoice: { amount: '105' }, merchant: 'OpenRouter, Inc.' }),
+        { status: 200 },
+      )
+      const { status, quoteFetches } = await run(
+        { payment_id: 'paymentSession_test123' },
+        undefined,
+        'OpenRouter, Inc.',
+        [first, ready],
+      )
+      expect(status).toBe(409)
+      expect(quoteFetches).toBe(1)
+    }
+  })
+
+  it('does not retry generic-code conflicts that carry a definitive Coinbase state', async () => {
+    for (const detail of [
+      'payment session is not payable: PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED',
+      'payment link is already fully used',
+    ]) {
+      const definitive = new Response(
+        JSON.stringify({ code: 'LINK_USED_OR_EXPIRED', detail }),
+        { status: 409 },
+      )
+      const ready = new Response(
+        JSON.stringify({ invoice: { amount: '105' }, merchant: 'OpenRouter, Inc.' }),
+        { status: 200 },
+      )
+      const { status, quoteFetches } = await run(
+        { payment_id: 'paymentSession_test123' },
+        undefined,
+        'OpenRouter, Inc.',
+        [definitive, ready],
+      )
+      expect(status).toBe(409)
+      expect(quoteFetches).toBe(1)
+    }
+  })
+
+  it('returns the second generic Coinbase conflict after exactly one retry', async () => {
+    const conflict = () => new Response(
+      JSON.stringify({ code: 'LINK_USED_OR_EXPIRED' }),
+      { status: 409 },
+    )
+    const { status, json, quoteFetches } = await run(
+      { payment_id: 'paymentSession_test123' },
+      undefined,
+      'OpenRouter, Inc.',
+      [conflict(), conflict()],
+    )
+    expect(status).toBe(409)
+    expect(json.code).toBe('LINK_USED_OR_EXPIRED')
+    expect(quoteFetches).toBe(2)
+  })
+
   it('Lightning source → exactOut, destination.amount full, source BTC no amount, appId=merchant_openrouter', async () => {
     const { status, createBody } = await run({
       payment_id: 'pl_test123',
