@@ -657,7 +657,12 @@ async function payMerchantAndGetBody(
     // alone would raise that provider's success rate for a call we had to
     // give the money back on.
     outcome: classifyOutcome(result.merchantStatus, {
-      routerHoldsCredential: Boolean(route.upstreamAuth),
+      // The pay-invoice bridge injects PAYINVOICE_ADMIN_SECRET without
+      // setting route.upstreamAuth, so an expired admin secret of OURS would
+      // otherwise be published as the provider refusing to serve.
+      routerHoldsCredential:
+        Boolean(route.upstreamAuth) ||
+        (isRozoPayInvoiceRoute(route) && Boolean(env.PAYINVOICE_ADMIN_SECRET)),
       routerSideFailure: result.kind === 'error' && result.routerSideFailure === true,
       deliveryFailed: result.kind === 'error',
     }),

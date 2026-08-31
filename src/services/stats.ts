@@ -355,6 +355,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       known_gaps: [
         'Successful asynchronous (202) purchases return before the order ledger is written, so they are absent from volume, buyer and call counts. Their quality outcome IS recorded.',
         'Quality figures include ROZO test traffic; the payer is unknown where those rows are written. Volume and buyer counts exclude it.',
+        'Order-ledger records expire after 400 days, so the "all" window is a trailing 400 days for volume, buyers and refunds rather than true all-time. Quality history in D1 does not expire.',
       ],
     },
     totals: {

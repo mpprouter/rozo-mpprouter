@@ -205,6 +205,13 @@ export interface RouteQualityStats {
   latency_p95_ms: number | null
   /** Epoch ms of the newest call in the window; null when there are none. */
   last_call_at: number | null
+  /**
+   * Epoch ms of the OLDEST call in the window. The published methodology
+   * points at this to say how far back coverage actually reaches, which is
+   * how a reader tells a complete history from a partial backfill — so it
+   * has to exist, not just be promised.
+   */
+  first_call_at: number | null
 }
 
 interface RawRow {
@@ -249,6 +256,7 @@ function summarize(window: MetricsWindow, rows: RawRow[]): RouteQualityStats {
     latency_p50_ms: percentile(latencies, 50),
     latency_p95_ms: percentile(latencies, 95),
     last_call_at: rows.length === 0 ? null : Math.max(...rows.map((r) => r.created_at)),
+    first_call_at: rows.length === 0 ? null : Math.min(...rows.map((r) => r.created_at)),
   }
 }
 
