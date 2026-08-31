@@ -48,8 +48,10 @@ CREATE TABLE IF NOT EXISTS route_metric_calls (
   --   'router_fault'  — our credentials/config were wrong (401/403 on a
   --                     router-held-credential route), or we failed to
   --                     deliver a response we had already been paid for.
+  --   'pending'       — accepted for async processing (202); the delivery
+  --                     verdict does not exist yet. Never a success.
   -- Only 'provider_fault' counts against a provider's published success rate.
-  outcome        TEXT NOT NULL CHECK (outcome IN ('ok','provider_fault','caller_error','router_fault')),
+  outcome        TEXT NOT NULL CHECK (outcome IN ('ok','provider_fault','caller_error','router_fault','pending')),
   -- Coarse machine reason (RefundReason or 'timeout'/'upstream_error').
   -- Never an upstream error body: those quote URLs, payloads and sometimes
   -- credentials, and this table is published.

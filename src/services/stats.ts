@@ -77,6 +77,8 @@ export interface ServiceStats {
    */
   caller_error: number
   router_fault: number
+  /** Async calls accepted but not yet resolved. Never counted as success. */
+  pending: number
   latency_p50_ms: number | null
   /**
    * Refunded external calls over external calls, from the ORDER LEDGER, not
@@ -120,6 +122,7 @@ export interface StatsPayload {
     provider_success_rate: number | null
     caller_error: number
     router_fault: number
+    pending: number
     refunded: number
     refund_rate: number | null
   }
@@ -325,6 +328,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       provider_success_rate: w.provider_success_rate,
       caller_error: w.caller_error,
       router_fault: w.router_fault,
+      pending: w.pending,
       latency_p50_ms: w.latency_p50_ms,
       refunded: a.refunded,
       refund_rate: a.calls === 0 ? null : Math.round((a.refunded / a.calls) * 10000) / 10000,
@@ -355,6 +359,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       known_gaps: [
         'Successful asynchronous (202) purchases return before the order ledger is written, so they are absent from volume, buyer and call counts. Their quality outcome IS recorded.',
         'Quality figures include ROZO test traffic; the payer is unknown where those rows are written. Volume and buyer counts exclude it.',
+        'An x402 payment whose settlement fails after the merchant already answered 2xx still writes an order row, so volume can overstate settled commerce during facilitator or chain incidents. The settlement outcome is not yet persisted per order.',
         'Order-ledger records expire after 400 days, so the "all" window is a trailing 400 days for volume, buyers and refunds rather than true all-time. Quality history in D1 does not expire.',
       ],
     },
@@ -367,6 +372,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       provider_success_rate: allQuality[window].provider_success_rate,
       caller_error: allQuality[window].caller_error,
       router_fault: allQuality[window].router_fault,
+      pending: allQuality[window].pending,
       refunded: services.reduce((n, x) => n + x.refunded, 0),
       refund_rate: (() => {
         const calls = services.reduce((n, x) => n + x.calls, 0)

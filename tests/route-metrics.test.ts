@@ -89,6 +89,16 @@ describe('classifyOutcome', () => {
     expect(classifyOutcome(401)).toBe('provider_fault')
   })
 
+  it('does not call an accepted-but-unresolved async call a success', () => {
+    // 202 means "ask again later". job-status can still fail, reject or time
+    // the job out and refund it, and this row is written before that verdict
+    // exists — so recording ok here would let every failed async job inflate
+    // the provider's success rate permanently.
+    expect(classifyOutcome(202)).toBe('pending')
+    // ...unless we already know delivery failed, which outranks it.
+    expect(classifyOutcome(202, { deliveryFailed: true })).toBe('provider_fault')
+  })
+
   it('attributes a known router-side failure to us, not the provider', () => {
     // A session channel we never installed says nothing about the provider.
     expect(classifyOutcome(undefined, { routerSideFailure: true })).toBe('router_fault')
@@ -182,6 +192,20 @@ describe('getRouteQuality', () => {
     expect(q['30d'].calls).toBe(5)
     expect(q['90d'].calls).toBe(6)
     expect(q.all.calls).toBe(6)
+  })
+
+  it('excludes pending async calls from the provider success rate', async () => {
+    const rowsWithPending = [
+      { outcome: 'ok', refunded: 0, latency_ms: 100, created_at: Date.now() - 1000 },
+      { outcome: 'pending', refunded: 0, latency_ms: null, created_at: Date.now() - 2000 },
+    ]
+    const env = { ROUTE_METRICS_DB: fakeDb(rowsWithPending) } as unknown as Env
+    const q = await getRouteQuality(env, 'mercury')
+    // 1 ok, 0 provider_fault → 100%, and the pending call is reported
+    // separately rather than counted as either.
+    expect(q['24h'].provider_success_rate).toBe(1)
+    expect(q['24h'].pending).toBe(1)
+    expect(q['24h'].calls).toBe(2)
   })
 
   it('excludes caller errors and router faults from the provider success rate', async () => {

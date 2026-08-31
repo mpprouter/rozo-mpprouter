@@ -29,7 +29,22 @@ import type { Env } from '../index'
  * against a provider — but see classifyOutcome for which statuses actually
  * qualify, because guessing that wrong hides real outages instead.
  */
-export type CallOutcome = 'ok' | 'provider_fault' | 'caller_error' | 'router_fault'
+export type CallOutcome =
+  | 'ok'
+  | 'provider_fault'
+  | 'caller_error'
+  | 'router_fault'
+  /**
+   * Accepted for asynchronous processing (HTTP 202) and not yet resolved.
+   *
+   * The job can still fail, be rejected or time out later and be refunded,
+   * and this row is written at the chokepoint where that verdict is not yet
+   * known. Recording it as `ok` would let every failed async job
+   * permanently inflate the provider's success rate. `pending` is counted
+   * and published, and excluded from the success-rate denominator until
+   * something can resolve it — an unresolved call is not a successful one.
+   */
+  | 'pending'
 
 export interface RouteCallMetric {
   routeId: string
@@ -85,7 +100,11 @@ export function classifyOutcome(
   if (upstreamStatus >= 200 && upstreamStatus < 300) {
     // A 2xx we could not deliver is the provider's failure, not a success:
     // the caller got an error and their money back.
-    return opts.deliveryFailed ? 'provider_fault' : 'ok'
+    if (opts.deliveryFailed) return 'provider_fault'
+    // 202 means "accepted, ask again later". The delivery verdict does not
+    // exist yet, so neither does a success.
+    if (upstreamStatus === 202) return 'pending'
+    return 'ok'
   }
 
   // 401/403 is NEVER the caller's fault on this rail. The agent's own
@@ -189,6 +208,8 @@ export interface RouteQualityStats {
   provider_fault: number
   caller_error: number
   router_fault: number
+  /** Async calls accepted but not yet resolved. Never counted as success. */
+  pending: number
   /**
    * ok / (ok + provider_fault), rounded to 4 decimals. Caller errors and
    * router faults are excluded from the denominator: neither says anything
@@ -249,6 +270,7 @@ function summarize(window: MetricsWindow, rows: RawRow[]): RouteQualityStats {
     provider_fault: providerFault,
     caller_error: count('caller_error'),
     router_fault: count('router_fault'),
+    pending: count('pending'),
     provider_success_rate: served === 0 ? null : Math.round((ok / served) * 10000) / 10000,
     refunded,
     refund_rate: rows.length === 0 ? null : Math.round((refunded / rows.length) * 10000) / 10000,
