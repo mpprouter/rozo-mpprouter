@@ -99,6 +99,16 @@ describe('classifyOutcome', () => {
     expect(classifyOutcome(202, { deliveryFailed: true })).toBe('provider_fault')
   })
 
+  it('does not strand an async response that carries no job id', () => {
+    // finishAsyncDelivery resolves rows by job id, so a 202 without one can
+    // never be resolved and would sit as 'pending' forever. The caller is
+    // refunded, and an async response with no job id is the provider
+    // breaking the protocol it chose.
+    expect(classifyOutcome(202, { deliveryFailed: true })).toBe('provider_fault')
+    // With a job id the call is resolvable, so pending is honest.
+    expect(classifyOutcome(202, { asyncAccepted: true })).toBe('pending')
+  })
+
   it('attributes a known router-side failure to us, not the provider', () => {
     // A session channel we never installed says nothing about the provider.
     expect(classifyOutcome(undefined, { routerSideFailure: true })).toBe('router_fault')

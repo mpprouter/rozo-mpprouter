@@ -235,17 +235,24 @@ export async function resolveRouteCall(
   // lifetime, so the Worker could be torn down before the UPDATE landed and
   // the row would stay 'pending' forever — the exact bug this resolution
   // exists to fix. Errors are still swallowed: metrics never fail delivery.
-  try {
-    await db
-      .prepare(
-        `UPDATE route_metric_calls
-            SET outcome = ?, reason = COALESCE(?, reason)
-          WHERE call_id = ? AND outcome = 'pending'`,
-      )
-      .bind(outcome, reason ?? null, callId)
-      .run()
-  } catch {
-    // Intentionally ignored.
+  // Retried, because this is the ONLY moment the verdict is known: the
+  // caller has already claimed the terminal state atomically, so a swallowed
+  // failure here leaves the row 'pending' forever with nothing scheduled to
+  // come back for it. Two extra attempts cost nothing on the success path.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await db
+        .prepare(
+          `UPDATE route_metric_calls
+              SET outcome = ?, reason = COALESCE(?, reason)
+            WHERE call_id = ? AND outcome = 'pending'`,
+        )
+        .bind(outcome, reason ?? null, callId)
+        .run()
+      return
+    } catch {
+      // Metrics never fail delivery; the last failure is simply dropped.
+    }
   }
 }
 

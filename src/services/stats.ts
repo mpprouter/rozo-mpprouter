@@ -79,6 +79,11 @@ export interface ServiceStats {
   /** Epoch ms of the most recent external call, or null. */
   last_call_at: number | null
   /** ok / (ok + provider_fault), or null when nothing was served. */
+  /**
+   * Null — not 0 — whenever quality storage could not be read. Zeroes here
+   * would state that a provider had no faults, which is a claim, while the
+   * truth is that we could not look.
+   */
   provider_success_rate: number | null
   /**
    * Calls excluded from `provider_success_rate` and why. Published, not
@@ -88,10 +93,10 @@ export interface ServiceStats {
    * indistinguishable from cherry-picking, and a reviewer is right to
    * treat it that way.
    */
-  caller_error: number
-  router_fault: number
+  caller_error: number | null
+  router_fault: number | null
   /** Async calls accepted but not yet resolved. Never counted as success. */
-  pending: number
+  pending: number | null
   latency_p50_ms: number | null
   /**
    * Refunded external calls over external calls, from the ORDER LEDGER, not
@@ -140,9 +145,9 @@ export interface StatsPayload {
     volume_usd: string
     buyers: number
     provider_success_rate: number | null
-    caller_error: number
-    router_fault: number
-    pending: number
+    caller_error: number | null
+    router_fault: number | null
+    pending: number | null
     refunded: number
     refund_rate: number | null
   }
@@ -359,6 +364,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     // having zero faults and a null rate, indistinguishable from a clean
     // record.
     if (availability !== 'ok') anyQualityReadFailed = true
+    const qualityReadable = availability === 'ok'
     const w = q[window]
     services.push({
       service_id: serviceId,
@@ -369,11 +375,12 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       volume_usd: a.volume,
       buyers: a.buyers.size,
       last_call_at: a.last,
-      provider_success_rate: w.provider_success_rate,
-      caller_error: w.caller_error,
-      router_fault: w.router_fault,
-      pending: w.pending,
-      latency_p50_ms: w.latency_p50_ms,
+      // Absent data, not zero, when the store could not be read.
+      provider_success_rate: qualityReadable ? w.provider_success_rate : null,
+      caller_error: qualityReadable ? w.caller_error : null,
+      router_fault: qualityReadable ? w.router_fault : null,
+      pending: qualityReadable ? w.pending : null,
+      latency_p50_ms: qualityReadable ? w.latency_p50_ms : null,
       refunded: a.refunded,
       refund_rate: a.calls === 0 ? null : Math.round((a.refunded / a.calls) * 10000) / 10000,
       activity: activitySeries(a.tss, window, now),
@@ -419,10 +426,11 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       unknown_calls: services.reduce((n, s) => n + s.unknown_calls, 0),
       volume_usd: services.reduce((v, s) => addUsd(v, s.volume_usd), '0'),
       buyers: totalBuyers.size,
-      provider_success_rate: allQuality[window].provider_success_rate,
-      caller_error: allQuality[window].caller_error,
-      router_fault: allQuality[window].router_fault,
-      pending: allQuality[window].pending,
+      provider_success_rate:
+        qualityAvailability === 'ok' ? allQuality[window].provider_success_rate : null,
+      caller_error: qualityAvailability === 'ok' ? allQuality[window].caller_error : null,
+      router_fault: qualityAvailability === 'ok' ? allQuality[window].router_fault : null,
+      pending: qualityAvailability === 'ok' ? allQuality[window].pending : null,
       refunded: services.reduce((n, x) => n + x.refunded, 0),
       refund_rate: (() => {
         const calls = services.reduce((n, x) => n + x.calls, 0)

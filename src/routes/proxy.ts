@@ -676,14 +676,26 @@ async function payMerchantAndGetBody(
         Boolean(route.upstreamAuth) ||
         (isRozoPayInvoiceRoute(route) && Boolean(env.PAYINVOICE_ADMIN_SECRET)),
       routerSideFailure: result.kind === 'error' && result.routerSideFailure === true,
-      deliveryFailed: result.kind === 'error',
       // Reuse the SAME detector handleAsyncJob uses, rather than checking
       // for 202 here: merchants also queue work with 200 plus a
       // {status:"queued", jobId} body, and a second detector would drift
       // from this one the way the backfill classifier already did.
-      asyncAccepted: asyncInfo.isAsync,
+      // Only claim "accepted, ask later" when the merchant gave us a job id
+      // to ask WITH. A 202 without one cannot be resolved by anything —
+      // finishAsyncDelivery is keyed on the job id — so marking it pending
+      // would strand the row permanently. The proxy refunds that caller, so
+      // it is a failed delivery, and an async response with no job id is the
+      // provider breaking the protocol it chose.
+      asyncAccepted: asyncInfo.isAsync && Boolean(asyncInfo.jobId),
+      deliveryFailed:
+        result.kind === 'error' || (asyncInfo.isAsync && !asyncInfo.jobId),
     }),
-    reason: result.kind === 'error' ? (result.refundReason ?? 'upstream_error') : undefined,
+    reason:
+      result.kind === 'error'
+        ? (result.refundReason ?? 'upstream_error')
+        : asyncInfo.isAsync && !asyncInfo.jobId
+          ? 'async_response_without_job_id'
+          : undefined,
     upstreamStatus: result.merchantStatus,
     latencyMs: result.latencyMs ?? elapsedMs,
   })
