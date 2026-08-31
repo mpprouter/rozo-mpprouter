@@ -128,11 +128,11 @@ migrations_dir = "migrations"
 #   (paste the returned database_id below, then uncomment this block)
 #   wrangler d1 migrations apply mpprouter-route-metrics --remote
 #
-# [[d1_databases]]
-# binding = "ROUTE_METRICS_DB"
-# database_name = "mpprouter-route-metrics"
-# database_id = "<paste-from-wrangler-d1-create>"
-# migrations_dir = "migrations-metrics"
+[[d1_databases]]
+binding = "ROUTE_METRICS_DB"
+database_name = "mpprouter-route-metrics"
+database_id = "5169f99e-916b-4dd1-a246-072a585a5abf"
+migrations_dir = "migrations-metrics"
 
 # Public keys (not secrets, safe to commit)
 [vars]

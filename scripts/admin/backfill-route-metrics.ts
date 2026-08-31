@@ -36,12 +36,7 @@
  * Usage (read-only against KV, writes only to the metrics D1):
  *   npx tsx scripts/admin/backfill-route-metrics.ts --dry-run
  *   npx tsx scripts/admin/backfill-route-metrics.ts --execute
- *
- * Add --no-live-writer when running BEFORE the ROUTE_METRICS_DB binding is
- * enabled (the intended order). It skips the write-skew margin, which would
- * otherwise discard the newest ledger rows to guard against a writer that
- * does not exist yet. If any live row is found, the margin is reapplied
- * regardless of the flag.
+
  */
 
 import { execFileSync } from 'node:child_process'
@@ -104,17 +99,8 @@ function main() {
   // cutoff query and still have its ledger row listed below — counted twice,
   // permanently. When no live row exists yet, fall back to the moment this
   // run started, less a margin covering that write skew.
-  //
-  // The margin applies ONLY when live recording may be running. In the
-  // intended order — backfill before the binding is enabled — there is no
-  // live writer at all, and subtracting five minutes would silently discard
-  // the newest ledger rows for no reason. `--no-live-writer` asserts that
-  // state explicitly rather than assuming it.
   const WRITE_SKEW_MS = 5 * 60 * 1000
-  const noLiveWriter = process.argv.includes('--no-live-writer')
-  let liveCutoffMs = noLiveWriter
-    ? Number.POSITIVE_INFINITY
-    : Date.now() - WRITE_SKEW_MS
+  let liveCutoffMs = Date.now() - WRITE_SKEW_MS
   try {
     const res = JSON.parse(
       wrangler([
@@ -125,23 +111,13 @@ function main() {
     )
     const oldest = res?.[0]?.results?.[0]?.oldest
     if (typeof oldest === 'number') {
-      // A live row exists, so the assertion was wrong whatever the flag says.
-      liveCutoffMs = Math.min(oldest, Date.now() - WRITE_SKEW_MS)
+      liveCutoffMs = Math.min(oldest, liveCutoffMs)
       console.log(
         `Live recording starts at ${new Date(oldest).toISOString()}; ` +
           `ledger entries at or after that are already recorded and will be skipped.`,
       )
     }
-    // Infinity is a legitimate cutoff (--no-live-writer: take everything),
-    // but new Date(Infinity).toISOString() throws a RangeError and would
-    // abort the run before it inserted anything.
-    console.log(
-      `Effective cutoff: ${
-        Number.isFinite(liveCutoffMs)
-          ? new Date(liveCutoffMs).toISOString()
-          : 'none (no live writer asserted; all ledger rows eligible)'
-      }`,
-    )
+    console.log(`Effective cutoff: ${new Date(liveCutoffMs).toISOString()}`)
   } catch (err) {
     // Fail closed. Guessing "no live rows" is exactly the assumption that
     // produces silent double counting.
