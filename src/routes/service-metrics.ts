@@ -34,17 +34,32 @@ const METHODOLOGY = {
   caller_error: 'Upstream returned a 4xx describing a bad request (not 401/403 on a route where the router holds the credential).',
   router_fault: 'Upstream rejected our own credentials (401/403) on a route where the router, not the caller, presents them.',
   latency: 'Wall-clock milliseconds for the paid upstream leg, over SUCCESSFUL calls only, so a fast error cannot flatter the percentiles. Percentiles are exact (nearest-rank over stored per-call values), not histogram estimates. Calls whose duration was not measured are excluded rather than counted as 0ms.',
+  refunds: 'Not reported here: a metric row is written once at call time and a refund confirms later, so any refund figure on this endpoint could only ever be zero. See /v1/stats, whose refund rate comes from the order ledger.',
   null_values: 'null means "no data in this window", never zero. A service with no traffic is not a service with a 0% success rate.',
   coverage: 'Recording began when this endpoint shipped; earlier calls appear only where they were backfilled from the per-call order ledger. `first_call_at` shows how far back the data actually reaches.',
 } as const
 
+/**
+ * Refund fields are stripped from this endpoint on purpose.
+ *
+ * A metric row is written once, at call time, and never revisited; a refund
+ * confirms later and updates only the KV order ledger. So `refunded` here
+ * would read 0 forever no matter how many refunds were actually paid, and a
+ * published 0.0% refund rate that can never move is worse than no number.
+ * The refund rate on /v1/stats is derived from the ledger and is real.
+ */
+function stripUnmaintainedFields(s: RouteQualityStats) {
+  const { refunded: _refunded, refund_rate: _refundRate, ...rest } = s
+  return rest
+}
+
 function windowsPayload(q: Record<MetricsWindow, RouteQualityStats>) {
   return {
-    '24h': q['24h'],
-    '7d': q['7d'],
-    '30d': q['30d'],
-    '90d': q['90d'],
-    all: q.all,
+    '24h': stripUnmaintainedFields(q['24h']),
+    '7d': stripUnmaintainedFields(q['7d']),
+    '30d': stripUnmaintainedFields(q['30d']),
+    '90d': stripUnmaintainedFields(q['90d']),
+    all: stripUnmaintainedFields(q.all),
   }
 }
 

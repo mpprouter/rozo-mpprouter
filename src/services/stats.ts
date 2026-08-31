@@ -89,6 +89,23 @@ export interface ServiceStats {
 export interface StatsPayload {
   window: MetricsWindow
   generated_at: string
+  /**
+   * Stated limits of these figures, published with them.
+   *
+   * The commerce columns (volume, buyers, calls) come from the order ledger,
+   * and a successful ASYNC purchase returns via handleAsyncJob before the
+   * success-path recordOrder runs — so those orders are missing from the
+   * ledger and therefore from volume and buyer counts. Quality figures are
+   * unaffected: they are written at the proxy chokepoint, which every async
+   * call still passes through. Saying so is the honest option while the
+   * async leg is fixed separately; a footnote is better than a total that
+   * quietly understates itself.
+   */
+  coverage: {
+    commerce_source: string
+    quality_source: string
+    known_gaps: string[]
+  }
   totals: {
     calls: number
     internal_calls: number
@@ -162,13 +179,24 @@ async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; trun
     // whole endpoint into a 500, when the contract here is to degrade and
     // say so via `truncated`.
     let raws: (string | null)[]
+    let lostReads = 0
     try {
       raws = await Promise.all(
-        listed.keys.map((k) => env.MPP_STORE.get(k.name).catch(() => null)),
+        listed.keys.map((k) =>
+          env.MPP_STORE.get(k.name).catch(() => {
+            // Count it. Swallowing the failure into a null would let the
+            // endpoint undercount while still claiming a complete result —
+            // the same "confident zero from a broken read" this page exists
+            // to avoid.
+            lostReads += 1
+            return null
+          }),
+        ),
       )
     } catch {
       return { entries, truncated: true }
     }
+    if (lostReads > 0) return { entries, truncated: true }
     for (const raw of raws) {
       if (!raw) continue
       try {
@@ -301,6 +329,16 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   return {
     window,
     generated_at: new Date(now).toISOString(),
+    coverage: {
+      commerce_source:
+        'Per-call order ledger (KV). Volume, buyers and calls are settled orders only.',
+      quality_source:
+        'route_metric_calls (D1), written at the proxy chokepoint every paid call passes through.',
+      known_gaps: [
+        'Successful asynchronous (202) purchases return before the order ledger is written, so they are absent from volume, buyer and call counts. Their quality outcome IS recorded.',
+        'Quality figures include ROZO test traffic; the payer is unknown where those rows are written. Volume and buyer counts exclude it.',
+      ],
+    },
     totals: {
       calls: services.reduce((n, s) => n + s.calls, 0),
       internal_calls: services.reduce((n, s) => n + s.internal_calls, 0),

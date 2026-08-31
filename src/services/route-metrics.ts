@@ -63,7 +63,16 @@ export function serviceIdFromRouteId(routeId: string): string {
  */
 export function classifyOutcome(
   upstreamStatus: number | undefined,
-  opts: { routerHoldsCredential?: boolean; routerSideFailure?: boolean } = {},
+  opts: {
+    routerHoldsCredential?: boolean
+    routerSideFailure?: boolean
+    /**
+     * The delivery failed even though a status may look fine. An upstream
+     * that returns 200 with an empty body refunds the payer, and must not
+     * be recorded as a success.
+     */
+    deliveryFailed?: boolean
+  } = {},
 ): CallOutcome {
   // A failure we already know is ours — a missing router-owned session
   // channel, for example — must not be charged to the provider just because
@@ -73,7 +82,11 @@ export function classifyOutcome(
   // No status at all: transport failure, timeout or throw. Nothing reached
   // us from the provider, so it is the provider leg that failed.
   if (upstreamStatus === undefined) return 'provider_fault'
-  if (upstreamStatus >= 200 && upstreamStatus < 300) return 'ok'
+  if (upstreamStatus >= 200 && upstreamStatus < 300) {
+    // A 2xx we could not deliver is the provider's failure, not a success:
+    // the caller got an error and their money back.
+    return opts.deliveryFailed ? 'provider_fault' : 'ok'
+  }
 
   // 401/403 is NEVER the caller's fault on this rail. The agent's own
   // Authorization header is stripped before we call upstream (see

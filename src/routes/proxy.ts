@@ -549,6 +549,15 @@ type MerchantPayResult =
       merchantStatus?: number
       /** Wall-clock ms for the upstream call. Order-ledger use only. */
       latencyMs?: number
+      /**
+       * True when the failure is OURS (or the agent's setup), not the
+       * provider's — a session channel that was never installed, say. It
+       * cannot be inferred from `refundReason`, which reuses `upstream_5xx`
+       * for this case and is therefore indistinguishable from a real
+       * provider 5xx. Without this flag the provider is penalised in its
+       * published success rate for a fault it had no part in.
+       */
+      routerSideFailure?: boolean
     }
 
 /**
@@ -641,8 +650,16 @@ async function payMerchantAndGetBody(
     // A 401/403 on a route where WE hold the upstream credential is our
     // misconfiguration, not the caller sending a bad request — publishing it
     // as a provider outage (or as the caller's fault) would both be wrong.
+    //
+    // `deliveryFailed` matters independently of the status: an upstream that
+    // answers 200 with an empty body produces kind:'error' with
+    // merchantStatus 200, and the payer is refunded. Classifying on status
+    // alone would raise that provider's success rate for a call we had to
+    // give the money back on.
     outcome: classifyOutcome(result.merchantStatus, {
       routerHoldsCredential: Boolean(route.upstreamAuth),
+      routerSideFailure: result.kind === 'error' && result.routerSideFailure === true,
+      deliveryFailed: result.kind === 'error',
     }),
     reason: result.kind === 'error' ? (result.refundReason ?? 'upstream_error') : undefined,
     upstreamStatus: result.merchantStatus,
@@ -811,6 +828,7 @@ async function payMerchantAndGetBodyInner(
       return {
         kind: 'error',
         refundReason: 'upstream_5xx',
+        routerSideFailure: true,
         response: new Response(
           JSON.stringify({
             error: 'Router session channel not installed',

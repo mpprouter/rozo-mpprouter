@@ -16,8 +16,15 @@
  *     history is therefore a floor on failures, not a complete census, and
  *     the endpoint's `methodology.coverage` says so.
  *
- * Idempotent: `call_id` is derived from the ledger's `order_id`, so a second
- * run inserts nothing. Safe to re-run after a partial failure.
+ * Idempotent ACROSS RUNS: `call_id` is `backfill:<order_id>`, so a second run
+ * inserts nothing.
+ *
+ * NOT idempotent against LIVE recording, which is why the cutoff below
+ * exists. A live row is keyed by a random UUID, so it can never collide with
+ * a backfill row for the same call — run this after live recording has
+ * started and every overlapping call is counted TWICE, permanently, in every
+ * window. The script therefore refuses to insert anything at or after the
+ * oldest live row it can find.
  *
  * Usage (read-only against KV, writes only to the metrics D1):
  *   npx tsx scripts/admin/backfill-route-metrics.ts --dry-run
@@ -89,6 +96,36 @@ function main() {
     process.exit(2)
   }
 
+  // The cutoff: the oldest call the Worker recorded live. Anything at or
+  // after it is already in the table under a different (random) id, and
+  // inserting it again would double-count it forever.
+  let liveCutoffMs = Number.POSITIVE_INFINITY
+  try {
+    const res = JSON.parse(
+      wrangler([
+        'd1', 'execute', D1_NAME, '--remote', '--json',
+        '--command',
+        "SELECT MIN(created_at) AS oldest FROM route_metric_calls WHERE call_id NOT LIKE 'backfill:%'",
+      ]),
+    )
+    const oldest = res?.[0]?.results?.[0]?.oldest
+    if (typeof oldest === 'number') {
+      liveCutoffMs = oldest
+      console.log(
+        `Live recording starts at ${new Date(oldest).toISOString()}; ` +
+          `ledger entries at or after that are already recorded and will be skipped.`,
+      )
+    }
+  } catch (err) {
+    // Fail closed. Guessing "no live rows" is exactly the assumption that
+    // produces silent double counting.
+    console.error(
+      `Could not determine the live-recording cutoff: ${(err as Error).message}\n` +
+        `Refusing to run rather than risk double-counting. Verify the table exists and retry.`,
+    )
+    process.exit(1)
+  }
+
   const keys: Array<{ name: string }> = JSON.parse(
     wrangler(['kv', 'key', 'list', '--namespace-id', KV_NAMESPACE_ID, '--prefix', LEDGER_PREFIX, '--remote']),
   )
@@ -114,6 +151,10 @@ function main() {
     const createdAt = Date.parse(entry.ts)
     if (Number.isNaN(createdAt)) {
       skipped.push(`${name}: unparseable ts ${entry.ts}`)
+      continue
+    }
+    if (createdAt >= liveCutoffMs) {
+      skipped.push(`${name}: at/after live cutoff, already recorded live`)
       continue
     }
 
