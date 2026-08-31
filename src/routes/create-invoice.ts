@@ -986,12 +986,31 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // the pl_* id as the orderId so the same Coinbase link always maps to
   // the same Rozo intent. An expired hit is treated as a miss (so callers
   // never get a dead payment link back).
+  //
+  // Contract pay-in supersede: upstream freezes the pay-in mode at create
+  // time, and an orderId stays taken forever (getPaymentByOrderId has no
+  // status/expiry filter — even an expired order blocks it), so a classic
+  // order can never be upgraded in place NOR re-created under the same
+  // orderId. When the caller explicitly asks for `stellar_payin_contracts`
+  // and the stored order for the base orderId is classic (the common FE
+  // sequence: a default-source create on page load, then the user picks the
+  // contract rail), we create a SEPARATE contract-mode order under the
+  // deterministic variant orderId `<linkId>__contract` instead of reusing
+  // the classic one. Intent callers look the variant up first, so the
+  // supersede happens at most once per link. The classic order stays live
+  // until it expires — the response warns callers not to pay it.
   const orderId = linkId
-  if (orderId) {
+  const contractOrderId = orderId ? `${orderId}__contract` : null
+  // The orderId step 3b creates under; switched to the contract variant when
+  // superseding an existing classic order.
+  let createOrderId: string | null = orderId
+  let supersededClassic: any = null
+
+  const lookupOrder = async (id: string): Promise<any | null> => {
     let lookup: Response | null = null
     try {
       lookup = await fetch(
-        `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(OPENROUTER_APP_ID)}/${encodeURIComponent(orderId)}`,
+        `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(OPENROUTER_APP_ID)}/${encodeURIComponent(id)}`,
         {
           method: 'GET',
           headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY },
@@ -999,11 +1018,18 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       )
     } catch {
       // Network blip on lookup is non-fatal — fall through to create.
-      lookup = null
+      return null
     }
+    if (!lookup.ok) return null
+    return await lookup.json().catch(() => null)
+  }
 
-    if (lookup && lookup.ok) {
-      const existing: any = await lookup.json().catch(() => null)
+  if (orderId) {
+    // Intent callers prefer the contract-mode variant when one exists.
+    const candidates =
+      payinIntent && contractOrderId ? [contractOrderId, orderId] : [orderId]
+    for (const candidateOrderId of candidates) {
+      const existing: any = await lookupOrder(candidateOrderId)
       const existingExpiresAt: string | null = existing?.expiresAt ?? null
       const stillValid =
         existingExpiresAt && Date.parse(existingExpiresAt) > Date.now()
@@ -1013,6 +1039,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           // Unexpired but already funded / settled / in flight. Falling through
           // to create would only earn a 409 orderIdConflict upstream, so answer
           // the caller directly instead of letting them pay a second time.
+          // This also blocks a contract supersede of a funded classic order —
+          // the invoice is already being settled on the classic rail.
           return json(409, {
             ok: false,
             error: {
@@ -1027,6 +1055,25 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
             status: existingStatus,
             expiresAt: existingExpiresAt,
           })
+        }
+
+        // Contract supersede: explicit intent + stored classic order → create
+        // a fresh contract-mode order under the variant orderId instead of
+        // reusing (upstream can never add the mode to an existing order).
+        // Skips the pricing check on the classic row — it is not returned;
+        // the new order is priced fresh below.
+        const existingIsContractMode = Boolean(
+          existing?.source?.receiverAddressContract,
+        )
+        if (
+          payinIntent &&
+          !existingIsContractMode &&
+          candidateOrderId === orderId &&
+          contractOrderId
+        ) {
+          supersededClassic = existing
+          createOrderId = contractOrderId
+          break
         }
 
         if (!pendingPricingMatches(existing, pricing)) {
@@ -1093,28 +1140,28 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
 
         // Contract pay-in mode is frozen upstream at create time; /checkout
         // rotation preserves the stored intent but can never add or remove it.
-        // Flag a mismatch in BOTH directions: contract requested but the row is
-        // classic (a C-address will never come), and intent omitted but the row
-        // is contract-mode (a classic G-wallet cannot pay the contract rail).
+        // The contract-requested-but-classic direction is superseded above
+        // (a fresh contract-mode order is created), so the only reachable
+        // mismatch here is intent omitted while the row is contract-mode — a
+        // classic G-wallet cannot pay the contract rail. The check stays
+        // two-sided as a defensive invariant.
         const rowIsContractMode = Boolean(row?.source?.receiverAddressContract)
         const intentMismatch = (payinIntent !== null) !== rowIsContractMode
         if (intentMismatch) {
           const rowIsClassicStellar = rowSource.chainId === '1500'
           warnings.push(
             payinIntent !== null
-              ? 'Requested intent "stellar_payin_contracts", but the existing unpaid ' +
-                'order for this invoice was created without it and the pay-in mode ' +
-                'cannot be changed after creation. ' +
+              ? 'Requested intent "stellar_payin_contracts", but this unpaid ' +
+                'order was created without it and the pay-in mode cannot be ' +
+                'changed after creation. ' +
                 (rowIsClassicStellar
                   ? 'Pay the classic G-address + memo in raw.source ' +
-                    '(receiverAddress + receiverMemo), or wait'
-                  : 'Pay the source shown in raw.source, or wait') +
-                ' for the order to expire and re-create with the intent.'
+                    '(receiverAddress + receiverMemo).'
+                  : 'Pay the source shown in raw.source.')
               : 'The existing unpaid order for this invoice was created with intent ' +
                 '"stellar_payin_contracts" (contract pay-in): pay via the contract ' +
                 'rail in raw.source (receiverAddressContract + receiverMemoContract), ' +
-                'NOT a classic G-address payment, or wait for the order to expire ' +
-                'and re-create without the intent.',
+                'NOT a classic G-address payment.',
           )
         }
 
@@ -1163,7 +1210,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const intentsBody = isLightning
     ? {
         appId: OPENROUTER_APP_ID,
-        orderId: orderId ?? `mpprouter-${Date.now()}`,
+        orderId: createOrderId ?? `mpprouter-${Date.now()}`,
         type: 'exactOut',
         display: {
           title,
@@ -1190,7 +1237,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       }
     : {
         appId: OPENROUTER_APP_ID,
-        orderId: orderId ?? `mpprouter-${Date.now()}`,
+        orderId: createOrderId ?? `mpprouter-${Date.now()}`,
         type: 'exactIn',
         // Optional Stellar contract pay-in — validated above (Stellar source
         // only); upstream payment-api freezes the C-address mode from this.
@@ -1249,6 +1296,48 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       intentsResp.status === 409 &&
       /orderIdConflict/i.test(intentsText)
     ) {
+      // Supersede race: a concurrent intent caller created the contract-mode
+      // variant between our lookup and this create. Re-read it — if it is
+      // reusable, hand it back instead of declaring the link dead.
+      if (supersededClassic && createOrderId === contractOrderId && contractOrderId) {
+        const winner: any = await lookupOrder(contractOrderId)
+        const winnerExpiresAt: string | null = winner?.expiresAt ?? null
+        const winnerValid =
+          winnerExpiresAt && Date.parse(winnerExpiresAt) > Date.now()
+        if (
+          winner &&
+          winnerValid &&
+          readPaymentStatus(winner) === REUSABLE_PAYMENT_STATUS
+        ) {
+          if (!pendingPricingMatches(winner, pricing)) {
+            return pricingMismatchResponse({ linkId }, winner)
+          }
+          const winnerSource = readRowSource(winner)
+          return json(200, {
+            ok: true,
+            reused: true,
+            linkId,
+            merchant: merchantName,
+            original: originalStr,
+            serviceFee: priced.serviceFee,
+            callerPays,
+            feeBps: priced.feeBps,
+            pricingVersion: priced.pricingVersion,
+            discount: discountStr,
+            title,
+            paymentLink:
+              winner?.paymentLink ?? winner?.url ?? winner?.payment_link ?? null,
+            rozoPaymentId: winner?.id ?? null,
+            expiresAt: winnerExpiresAt,
+            source: {
+              chainId: winnerSource.chainId,
+              tokenSymbol: winnerSource.tokenSymbol,
+            },
+            ...(source.warnings.length ? { warnings: source.warnings } : {}),
+            raw: winner,
+          })
+        }
+      }
       return errorResponse(409, {
         code: 'LINK_USED_OR_EXPIRED',
         message: 'Payment link has already been used or has expired.',
@@ -1289,6 +1378,17 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     intentsJson?.id ?? intentsJson?.paymentId ?? intentsJson?.data?.id ?? null
   const expiresAt = intentsJson?.expiresAt ?? null
 
+  const createWarnings = [...source.warnings]
+  if (supersededClassic) {
+    createWarnings.push(
+      'A previous order for this invoice was created without intent ' +
+        '"stellar_payin_contracts" (classic pay-in), which cannot be upgraded. ' +
+        'This response is a NEW contract-mode order — pay only this one. Do ' +
+        'NOT also pay the old classic G-address + memo: both orders settle ' +
+        'the same invoice, and a second payment is not refunded automatically.',
+    )
+  }
+
   return json(200, {
     ok: true,
     reused: false,
@@ -1309,7 +1409,13 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       tokenSymbol: source.tokenSymbol,
       tokenAddress: source.tokenAddress,
     },
-    ...(source.warnings.length ? { warnings: source.warnings } : {}),
+    ...(supersededClassic
+      ? {
+          superseded: true,
+          supersededPaymentId: supersededClassic?.id ?? null,
+        }
+      : {}),
+    ...(createWarnings.length ? { warnings: createWarnings } : {}),
     raw: intentsJson,
   })
 }
