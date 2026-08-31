@@ -37,6 +37,8 @@ let createdIntent: any = null
 let existingByOrderId: Record<string, any> = {}
 /** When set, the create POST answers with this (e.g. a 409 orderIdConflict). */
 let createResponseOverride: (() => Response) | null = null
+/** Status returned by GET /payments/:id (the post-create supersede re-check). */
+let refetchStatus = 'payment_unpaid'
 
 /** Back-compat setter used by the older tests: seeds the BASE orderId. */
 function setExistingIntent(row: any) {
@@ -47,6 +49,7 @@ function installFetchMock() {
   createdIntent = null
   existingByOrderId = {}
   createResponseOverride = null
+  refetchStatus = 'payment_unpaid'
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u =
       typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -67,7 +70,7 @@ function installFetchMock() {
         ? new Response(JSON.stringify(row), { status: 200 })
         : new Response('not found', { status: 404 })
     }
-    if (u.includes('/payment-api')) {
+    if (u.includes('/payment-api') && init?.method === 'POST') {
       createdIntent = JSON.parse(String(init?.body ?? '{}'))
       if (createResponseOverride) return createResponseOverride()
       return new Response(
@@ -78,6 +81,10 @@ function installFetchMock() {
         }),
         { status: 200 },
       )
+    }
+    if (u.includes('/payment-api')) {
+      // GET /payments/:id — the post-create supersede race re-check.
+      return new Response(JSON.stringify({ status: refetchStatus }), { status: 200 })
     }
     return new Response('{}', { status: 200 })
   }) as typeof fetch)
@@ -349,6 +356,103 @@ describe('create-invoice — stellar_payin_contracts intent', () => {
     })
     expect(status).toBe(400)
     expect(json.code).toBe('INVALID_INTENT')
+  })
+
+  it('aborts the supersede when the classic order starts paying mid-create', async () => {
+    setExistingIntent({
+      id: 'rozo-pay-classic',
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      paymentLink: 'https://pay.rozo.ai/classic',
+      source: {
+        chainId: '1500',
+        tokenSymbol: 'USDC',
+        amount: '10.5',
+        receiverAddress: 'GHUBADDRESS',
+        receiverMemo: 'memo123',
+      },
+    })
+    // By the time the variant create returns, the classic payer's funds are
+    // in flight: the post-create re-check must refuse to hand out the rail.
+    refetchStatus = 'payment_started'
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: STELLAR_SOURCE,
+      intent: 'stellar_payin_contracts',
+    })
+    expect(status).toBe(409)
+    expect(json.error?.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.rozoPaymentId).toBe('rozo-pay-classic')
+  })
+
+  it('blocks a classic caller while the contract sibling is in flight', async () => {
+    setExistingIntent({
+      id: 'rozo-pay-classic',
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      paymentLink: 'https://pay.rozo.ai/classic',
+      source: {
+        chainId: '1500',
+        tokenSymbol: 'USDC',
+        amount: '10.5',
+        receiverAddress: 'GHUBADDRESS',
+        receiverMemo: 'memo123',
+      },
+    })
+    existingByOrderId[`${PAYMENT_ID}__contract`] = {
+      id: 'rozo-pay-contract',
+      status: 'payment_started',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      paymentLink: 'https://pay.rozo.ai/contract',
+      source: {
+        chainId: '1500',
+        tokenSymbol: 'USDC',
+        amount: '10.5',
+        receiverAddressContract: 'CCONTRACTADDRESS',
+        receiverMemoContract: 'memo_c',
+      },
+    }
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: STELLAR_SOURCE,
+    })
+    expect(status).toBe(409)
+    expect(json.error?.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.rozoPaymentId).toBe('rozo-pay-contract')
+  })
+
+  it('allocates the next variant slot when the first contract variant expired', async () => {
+    setExistingIntent({
+      id: 'rozo-pay-classic',
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      paymentLink: 'https://pay.rozo.ai/classic',
+      source: {
+        chainId: '1500',
+        tokenSymbol: 'USDC',
+        amount: '10.5',
+        receiverAddress: 'GHUBADDRESS',
+        receiverMemo: 'memo123',
+      },
+    })
+    existingByOrderId[`${PAYMENT_ID}__contract`] = {
+      id: 'rozo-pay-expired-contract',
+      status: 'payment_unpaid',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      source: {
+        chainId: '1500',
+        tokenSymbol: 'USDC',
+        receiverAddressContract: 'CCONTRACTADDRESS',
+      },
+    }
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: STELLAR_SOURCE,
+      intent: 'stellar_payin_contracts',
+    })
+    expect(status).toBe(200)
+    expect(json.superseded).toBe(true)
+    expect(createdIntent.orderId).toBe(`${PAYMENT_ID}__contract2`)
   })
 
   it('rejects the intent on Stripe invoices instead of silently dropping it', async () => {
