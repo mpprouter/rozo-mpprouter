@@ -308,6 +308,11 @@ export interface Env {
   // Set via: wrangler secret put ROZO_INTENTS_API_KEY
   ROZO_INTENTS_API_KEY: string
 
+  // Browser-only OpenRouter fee canary. Plain integer basis points, default
+  // OFF (0). Invalid/missing values also resolve to 0. This never applies to
+  // CLI/unknown clients or non-OpenRouter merchants.
+  CHECKOUT_WEB_FEE_BPS?: string
+
   // Rozo webhook signing secret. Used to verify HMAC-SHA256 on
   // POST /v1/services/rozo-agent-api/webhook.
   // Set via: wrangler secret put ROZO_WEBHOOK_SECRET

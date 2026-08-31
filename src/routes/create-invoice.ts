@@ -11,7 +11,19 @@ import {
 } from './invoice-provider'
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
-import { verifyQuoteReceipt } from './quote-receipt'
+import { verifyQuoteReceipt, type QuoteReceiptPayload } from './quote-receipt'
+import {
+  CHECKOUT_PRICING_VERSION,
+  CHECKOUT_WEB_CLIENT,
+  computeServiceFeeAtomic,
+  formatUsdcAtomic,
+  isExactCheckoutWebClient,
+  isStrictOpenRouterMerchant,
+  normalizeCheckoutClient,
+  parseUsdcAtomic,
+  resolveCheckoutPricing,
+  type CheckoutPricing,
+} from './checkout-web-pricing'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
@@ -117,21 +129,12 @@ export interface SourceError {
  * rejected: provenance is telemetry hanging off a money path and must never be
  * able to fail a payment.
  */
-const CLIENT_MAX_LEN = 64
-// Mirrors ATTRIBUTION_VALUE_RE in payment-api/utm-attribution.ts, plus `/` so a
-// label can read "rozo-checkout-cli/1.2.3".
-const CLIENT_UNSAFE = /[^A-Za-z0-9_.\- /]/g
-
 export interface CallerProvenance {
   client?: string
 }
 
 export function resolveClient(raw: unknown): string | null {
-  if (typeof raw !== 'string') return null
-  // Bound BEFORE scanning: slice first so replace() never walks a multi-megabyte
-  // string only to throw all but 64 characters of it away.
-  const cleaned = raw.slice(0, CLIENT_MAX_LEN * 4).trim().replace(CLIENT_UNSAFE, '').slice(0, CLIENT_MAX_LEN)
-  return cleaned.length ? cleaned : null
+  return normalizeCheckoutClient(raw)
 }
 
 export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?: never } | { resolved?: never; error: SourceError } {
@@ -235,6 +238,9 @@ export type CreateInvoiceErrorCode =
   | 'RATE_LIMITED'
   | 'SERVICE_UNAVAILABLE'
   | 'PAYMENT_ALREADY_PAID'
+  | 'LEGACY_PRICING_ORDER_PENDING'
+  | 'QUOTE_RECEIPT_INVALID_OR_EXPIRED'
+  | 'QUOTE_RECEIPT_REQUIRED'
 
 export interface CreateInvoiceError extends Omit<PayInvoiceError, 'code'> {
   code: CreateInvoiceErrorCode
@@ -394,19 +400,11 @@ export function computeCallerPaysAtomic(invoiceAtomic: bigint): bigint {
 // USDC has 6 decimals. Parse "10.00" → 10_000_000n; "9.523809" → 9_523_809n.
 // Truncates extra precision (no rounding). Throws on invalid input.
 export function parseUsdc(amountDecimal: string): bigint {
-  const m = amountDecimal.match(/^(\d+)(?:\.(\d+))?$/)
-  if (!m) throw new Error(`invalid decimal amount: ${amountDecimal}`)
-  const whole = BigInt(m[1])
-  const fracRaw = (m[2] ?? '').padEnd(6, '0').slice(0, 6)
-  return whole * 1_000_000n + BigInt(fracRaw)
+  return parseUsdcAtomic(amountDecimal)
 }
 
 export function formatUsdc(atomic: bigint): string {
-  const whole = atomic / 1_000_000n
-  const frac = atomic % 1_000_000n
-  if (frac === 0n) return whole.toString()
-  const fracStr = frac.toString().padStart(6, '0').replace(/0+$/, '')
-  return `${whole}.${fracStr}`
+  return formatUsdcAtomic(atomic)
 }
 
 // Renders an amount for display in the title. Integers come back as "$105"
@@ -438,6 +436,195 @@ export function buildTitle(
 // "originally.../Discount" clause.
 export function buildFullAmountTitle(merchant: string, invoiceAtomic: bigint): string {
   return `Pay ${merchant} ${formatTitleAmount(invoiceAtomic)}`
+}
+
+function formatExactCheckoutTitleAmount(atomic: bigint): string {
+  const [whole, fraction = ''] = formatUsdc(atomic).split('.')
+  return `$${whole}.${fraction.padEnd(2, '0')}`
+}
+
+export function buildCheckoutTitle(merchant: string, pricing: CheckoutPricing): string {
+  if (pricing.serviceFeeAtomic === 0n) {
+    return buildFullAmountTitle(merchant, pricing.originalAtomic)
+  }
+  return (
+    `Pay ${merchant} ${formatExactCheckoutTitleAmount(pricing.callerPaysAtomic)}` +
+    ` (includes ${formatExactCheckoutTitleAmount(pricing.serviceFeeAtomic)} service fee)`
+  )
+}
+
+function pricingFields(pricing: CheckoutPricing) {
+  return {
+    original: formatUsdc(pricing.originalAtomic),
+    serviceFee: formatUsdc(pricing.serviceFeeAtomic),
+    callerPays: formatUsdc(pricing.callerPaysAtomic),
+    feeBps: pricing.feeBps,
+    pricingVersion: pricing.pricingVersion,
+  }
+}
+
+/**
+ * Recover the exact signed pricing snapshot from a v2 quote receipt.
+ * The raw fee-eligibility client identity is bound too, so a zero-fee CLI or
+ * sanitized lookalike quote cannot be replayed by the browser when its canary
+ * is enabled. v1 receipts simply return null and are repriced using the current
+ * policy (safe backwards compatibility).
+ */
+function pricingFromReceipt(
+  receipt: QuoteReceiptPayload | null,
+  originalAtomic: bigint,
+  merchant: string,
+  pricingClient: string | null,
+): CheckoutPricing | null {
+  // Bind the raw eligibility identity, not the lossy provenance label. For
+  // example `rozo-checkout-web!!!` normalizes to the browser label for
+  // telemetry but is deliberately NOT fee-eligible and must not mint a zero-
+  // fee receipt that can later be replayed by the exact browser client.
+  if (receipt?.v !== 2 || receipt.client !== pricingClient) return null
+  if (
+    receipt.pricingVersion !== CHECKOUT_PRICING_VERSION ||
+    receipt.original === undefined ||
+    receipt.serviceFee === undefined ||
+    receipt.callerPays === undefined ||
+    receipt.feeBps === undefined
+  ) {
+    return null
+  }
+  try {
+    const signedOriginal = parseUsdc(receipt.original)
+    const signedFee = parseUsdc(receipt.serviceFee)
+    const signedCallerPays = parseUsdc(receipt.callerPays)
+    if (
+      signedOriginal !== originalAtomic ||
+      signedOriginal + signedFee !== signedCallerPays ||
+      computeServiceFeeAtomic(signedOriginal, receipt.feeBps) !== signedFee
+    ) {
+      return null
+    }
+    const eligible =
+      pricingClient === CHECKOUT_WEB_CLIENT && isStrictOpenRouterMerchant(merchant)
+    if (!eligible && (receipt.feeBps !== 0 || signedFee !== 0n)) return null
+    return {
+      originalAtomic: signedOriginal,
+      serviceFeeAtomic: signedFee,
+      callerPaysAtomic: signedCallerPays,
+      feeBps: receipt.feeBps,
+      pricingVersion: CHECKOUT_PRICING_VERSION,
+    }
+  } catch {
+    return null
+  }
+}
+
+function readMetadataObject(row: any): Record<string, unknown> | null {
+  let metadata = row?.metadata
+  if (typeof metadata === 'string') {
+    try {
+      metadata = JSON.parse(metadata)
+    } catch {
+      return null
+    }
+  }
+  return metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+    ? metadata as Record<string, unknown>
+    : null
+}
+
+/**
+ * Reuse is safe only when the payable intent still represents this exact
+ * price. Legacy zero-fee rows are accepted when their amount matches; once a
+ * fee is enabled, missing/partial pricing metadata fails closed.
+ */
+function pendingPricingMatches(row: any, pricing: CheckoutPricing): boolean {
+  const source = readRowSource(row)
+  const rowAmountRaw =
+    source.chainId === 'lightning'
+      ? row?.destination?.amount ?? row?.destination_amount
+      : row?.source?.amount ?? row?.source_amount
+
+  let amountMatches: boolean | null = null
+  if (typeof rowAmountRaw === 'string') {
+    try {
+      amountMatches = parseUsdc(rowAmountRaw) === pricing.callerPaysAtomic
+    } catch {
+      amountMatches = null
+    }
+  }
+
+  const metadata = readMetadataObject(row)
+  const candidates = [metadata, metadata?.internal]
+  const expected = pricingFields(pricing)
+  const stored = candidates.find((candidate) =>
+    candidate &&
+    typeof candidate === 'object' &&
+    ['original', 'serviceFee', 'callerPays', 'feeBps', 'pricingVersion'].some(
+      (key) => key in candidate,
+    ),
+  ) as Record<string, unknown> | undefined
+
+  const metadataMatches = !!stored && (
+    stored.original === expected.original &&
+    stored.serviceFee === expected.serviceFee &&
+    stored.callerPays === expected.callerPays &&
+    stored.feeBps === expected.feeBps &&
+    stored.pricingVersion === expected.pricingVersion
+  )
+
+  // Reuse requires positive pricing evidence. A readable exact amount is
+  // sufficient when upstream omits metadata. If amount is unavailable, an
+  // exact persisted pricing tuple is required; otherwise rollback could report
+  // the original price while returning a link that still collects a fee.
+  if (amountMatches === false) return false
+  if (amountMatches === true) return !stored || metadataMatches
+  return metadataMatches
+}
+
+function pricingMismatchResponse(
+  providerFields: Record<string, unknown>,
+  row: any,
+): Response {
+  return json(409, {
+    ok: false,
+    ...providerFields,
+    error: {
+      code: 'LEGACY_PRICING_ORDER_PENDING',
+      message:
+        'An unpaid order for this invoice exists under different pricing and ' +
+        'cannot be reused. Wait for it to expire, then create a new order.',
+    },
+    rozoPaymentId: row?.id ?? null,
+    expiresAt: row?.expiresAt ?? null,
+  })
+}
+
+function quoteReceiptErrorResponse(
+  providerFields: Record<string, unknown> = {},
+): Response {
+  return json(409, {
+    ok: false,
+    ...providerFields,
+    error: {
+      code: 'QUOTE_RECEIPT_INVALID_OR_EXPIRED',
+      message:
+        'The signed quote is invalid, expired, or does not match this request. ' +
+        'Request a fresh quote before creating the invoice.',
+    },
+  })
+}
+
+function quoteReceiptRequiredResponse(
+  providerFields: Record<string, unknown> = {},
+): Response {
+  return json(409, {
+    ok: false,
+    ...providerFields,
+    error: {
+      code: 'QUOTE_RECEIPT_REQUIRED',
+      message:
+        'This priced checkout requires a signed quote from invoice-details. ' +
+        'Refresh the invoice details before creating it.',
+    },
+  })
 }
 
 export async function handleCreateInvoice(request: Request, env: Env): Promise<Response> {
@@ -508,7 +695,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
 
   // Caller provenance. Never fails the request — bad input is dropped, not rejected.
   const provenance: CallerProvenance = {}
-  const clientLabel = resolveClient((parsed as Record<string, unknown> | null)?.client)
+  const clientRaw = (parsed as Record<string, unknown> | null)?.client
+  const clientLabel = resolveClient(clientRaw)
+  const pricingClient = isExactCheckoutWebClient(clientRaw) ? CHECKOUT_WEB_CLIENT : null
   if (clientLabel) provenance.client = clientLabel
 
   // Channel attribution rides as a top-level intent field, untouched. The web
@@ -519,6 +708,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     attributionRaw && typeof attributionRaw === 'object' && !Array.isArray(attributionRaw)
       ? { attribution: attributionRaw }
       : {}
+  const receiptRaw = (parsed as Record<string, unknown> | null)?.quoteReceipt
   if (sourceResult.error) {
     return errorResponse(400, {
       code: sourceResult.error.code,
@@ -544,11 +734,17 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         message: 'Stripe invoice requires a url.',
       })
     }
-    return handleStripeCreateInvoice(stripeUrl, env, source, provenance)
+    return handleStripeCreateInvoice(
+      stripeUrl,
+      env,
+      source,
+      provenance,
+      pricingClient,
+      typeof receiptRaw === 'string' ? receiptRaw : null,
+    )
   }
 
   let quote: any
-  const receiptRaw = (parsed as Record<string, unknown> | null)?.quoteReceipt
   const normalizedPaymentId =
     'payment_id' in normalized ? normalized.payment_id : link_id_detected
   const receipt =
@@ -567,8 +763,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       linkId: receipt.paymentId,
     }
   } else {
-    // Backward compatibility and safe fallback: callers without a receipt, or
-    // with an expired/tampered receipt, get a fresh server-side quote.
+    // Backward compatibility: a missing or invalid receipt gets a fresh
+    // server-side quote while pricing is disabled. Once a browser fee is active,
+    // the policy check below rejects invalid receipts instead of silently
+    // changing a price the customer may already have seen.
     let quoteResp: Response
     try {
       quoteResp = await fetch(QUOTE_INVOICE_URL, {
@@ -654,7 +852,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     })
   }
 
-  // Step 2: compute discounted price.
+  // Step 2: compute the browser-only fee (default off), or honor the exact
+  // signed v2 quote snapshot when the same client submits it within its TTL.
   let invoiceAtomic: bigint
   try {
     invoiceAtomic = parseUsdc(invoiceAmount)
@@ -666,13 +865,35 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       link_id_detected,
     })
   }
-  // OpenRouter / Coinbase line: no discount (founder decision). Caller pays the
-  // full invoice amount; discount fields are kept in the response for shape
-  // stability but are always the full amount / "0".
-  const callerPays = formatUsdc(invoiceAtomic)
-  const originalStr = formatUsdc(invoiceAtomic)
+  const currentPricing = resolveCheckoutPricing(
+    invoiceAtomic,
+    merchantName,
+    pricingClient,
+    env.CHECKOUT_WEB_FEE_BPS,
+  )
+  if (!receipt && currentPricing.feeBps > 0) {
+    return typeof receiptRaw === 'string'
+      ? quoteReceiptErrorResponse({ linkId })
+      : quoteReceiptRequiredResponse({ linkId })
+  }
+  const receiptPricing = pricingFromReceipt(
+    receipt,
+    invoiceAtomic,
+    merchantName,
+    pricingClient,
+  )
+  if (
+    (currentPricing.feeBps > 0 && receipt?.v === 2 && !receiptPricing) ||
+    (receipt?.v === 1 && currentPricing.feeBps !== 0)
+  ) {
+    return quoteReceiptErrorResponse({ linkId })
+  }
+  const pricing = receiptPricing ?? currentPricing
+  const priced = pricingFields(pricing)
+  const callerPays = priced.callerPays
+  const originalStr = priced.original
   const discountStr = '0'
-  const title = buildFullAmountTitle(merchantName, invoiceAtomic)
+  const title = buildCheckoutTitle(merchantName, pricing)
 
   // Step 3a: idempotency — if an intent already exists for this Coinbase
   // link, reuse it instead of creating a new one. The Rozo payment-api
@@ -721,6 +942,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
             status: existingStatus,
             expiresAt: existingExpiresAt,
           })
+        }
+
+        if (!pendingPricingMatches(existing, pricing)) {
+          return pricingMismatchResponse({ linkId }, existing)
         }
 
         // Unpaid and unexpired → reusable. If this caller asked for a different
@@ -787,7 +1012,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           linkId,
           merchant: merchantName,
           original: originalStr,
+          serviceFee: priced.serviceFee,
           callerPays,
+          feeBps: priced.feeBps,
+          pricingVersion: priced.pricingVersion,
           discount: discountStr,
           title,
           paymentLink:
@@ -844,6 +1072,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
           ...provenance,
+          ...priced,
         },
       }
     : {
@@ -871,6 +1100,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
           ...provenance,
+          ...priced,
         },
   }
 
@@ -949,7 +1179,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     linkId,
     merchant: merchantName,
     original: originalStr,
+    serviceFee: priced.serviceFee,
     callerPays,
+    feeBps: priced.feeBps,
+    pricingVersion: priced.pricingVersion,
     discount: discountStr,
     title,
     paymentLink,
@@ -991,6 +1224,8 @@ export async function handleStripeCreateInvoice(
   env: Env,
   source: ResolvedSource,
   provenance: CallerProvenance = {},
+  pricingClient: string | null = null,
+  quoteReceiptRaw: string | null = null,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -1023,9 +1258,9 @@ export async function handleStripeCreateInvoice(
     })
   }
 
-  // 3. No discount (founder decision 2026-08-18: Stripe line matches the
-  // Coinbase line — caller pays the full invoice amount; discount fields kept
-  // in the response for shape stability but always full amount / "0").
+  // 3. Apply the same narrow browser-only pricing policy as Coinbase. A
+  // fee-bearing browser create must present the signed snapshot issued by
+  // invoice-details, so the confirm card and payable intent cannot diverge.
   let invoiceAtomic: bigint
   try {
     invoiceAtomic = BigInt(invoice.stablecoinAmountAtomic)
@@ -1035,10 +1270,51 @@ export async function handleStripeCreateInvoice(
   if (invoiceAtomic <= 0n) {
     return json(422, { ok: false, provider: 'stripe_crypto', error: 'Invoice amount must be positive.' })
   }
-  const callerPays = formatUsdc(invoiceAtomic)
-  const originalStr = formatUsdc(invoiceAtomic)
+  const receipt = quoteReceiptRaw !== null
+    ? await verifyQuoteReceipt(
+        quoteReceiptRaw,
+        invoice.invoiceKey,
+        env.PAYINVOICE_ADMIN_SECRET,
+      )
+    : null
+  const currentPricing = resolveCheckoutPricing(
+    invoiceAtomic,
+    invoice.merchantTitle,
+    pricingClient,
+    env.CHECKOUT_WEB_FEE_BPS,
+  )
+  if (!receipt && currentPricing.feeBps > 0) {
+    return quoteReceiptRaw !== null
+      ? quoteReceiptErrorResponse({
+          provider: 'stripe_crypto',
+          invoiceKey: invoice.invoiceKey,
+        })
+      : quoteReceiptRequiredResponse({
+          provider: 'stripe_crypto',
+          invoiceKey: invoice.invoiceKey,
+        })
+  }
+  const receiptPricing = pricingFromReceipt(
+    receipt,
+    invoiceAtomic,
+    invoice.merchantTitle,
+    pricingClient,
+  )
+  if (
+    (currentPricing.feeBps > 0 && receipt?.v === 2 && !receiptPricing) ||
+    (receipt?.v === 1 && currentPricing.feeBps !== 0)
+  ) {
+    return quoteReceiptErrorResponse({
+      provider: 'stripe_crypto',
+      invoiceKey: invoice.invoiceKey,
+    })
+  }
+  const pricing = receiptPricing ?? currentPricing
+  const priced = pricingFields(pricing)
+  const callerPays = priced.callerPays
+  const originalStr = priced.original
   const discountStr = '0'
-  const title = buildFullAmountTitle(invoice.merchantTitle, invoiceAtomic)
+  const title = buildCheckoutTitle(invoice.merchantTitle, pricing)
 
   // 4. Provider-qualified orderId (design §6): stripe_crypto_<cpis_*>.
   const orderId = stripeOrderId(invoice.invoiceKey)
@@ -1065,36 +1341,11 @@ export async function handleStripeCreateInvoice(
     // Non-fatal — fall through to create.
   }
 
-  // Rollout guard (codex P1 on the no-discount change): an unpaid intent
-  // created under the OLD discounted pricing must not be reused — we would
-  // report callerPays as the full amount while the payable link still collects
-  // the discounted one. The row's USD amount lives on destination.amount for
-  // Lightning (exactOut) and source.amount otherwise; anything unparsable is
-  // treated as a mismatch (fail toward honesty, never toward misreporting).
-  if (existing) {
-    const rowUsdRaw =
-      readRowSource(existing).chainId === 'lightning'
-        ? existing?.destination?.amount
-        : existing?.source?.amount
-    const rowUsd = Number(rowUsdRaw)
-    const fullUsd = Number(callerPays)
-    if (!Number.isFinite(rowUsd) || Math.abs(rowUsd - fullUsd) > 0.01) {
-      const legacy = existing
-      existing = null
-      return json(409, {
-        ok: false,
-        provider: 'stripe_crypto',
-        error: {
-          code: 'LEGACY_PRICING_ORDER_PENDING',
-          message:
-            `An unpaid order for this invoice exists under previous pricing and ` +
-            `cannot be reused. Wait for it to expire, then create a new order.`,
-        },
-        invoiceKey: invoice.invoiceKey,
-        rozoPaymentId: legacy?.id ?? null,
-        expiresAt: legacy?.expiresAt ?? null,
-      })
-    }
+  if (existing && !pendingPricingMatches(existing, pricing)) {
+    return pricingMismatchResponse(
+      { provider: 'stripe_crypto', invoiceKey: invoice.invoiceKey },
+      existing,
+    )
   }
 
   // Creating again under the same orderId would just 409 orderIdConflict
@@ -1130,6 +1381,7 @@ export async function handleStripeCreateInvoice(
     invoiceCurrency: invoice.fiatCurrency,
     settlementChainId: SETTLEMENT_CHAIN_ID,
     settlementToken: 'USDC',
+    ...priced,
   }
 
   let rozoPaymentId: string | null
@@ -1342,7 +1594,10 @@ export async function handleStripeCreateInvoice(
     merchant: invoice.merchantTitle,
     merchantAccount: invoice.merchantAccount,
     original: originalStr,
+    serviceFee: priced.serviceFee,
     callerPays,
+    feeBps: priced.feeBps,
+    pricingVersion: priced.pricingVersion,
     discount: discountStr,
     title,
     paymentLink,

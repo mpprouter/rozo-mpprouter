@@ -1,13 +1,31 @@
+import { MAX_CHECKOUT_WEB_FEE_BPS } from './checkout-web-pricing'
+
 const RECEIPT_TTL_SECONDS = 60
 const encoder = new TextEncoder()
 
 export interface QuoteReceiptPayload {
-  v: 1
+  v: 1 | 2
   paymentId: string
   amount: string
   merchant: string
+  /** Present on v2 receipts. Binds the browser/CLI pricing decision. */
+  original?: string
+  serviceFee?: string
+  callerPays?: string
+  feeBps?: number
+  pricingVersion?: string
+  client?: string | null
   iat: number
   exp: number
+}
+
+export interface QuoteReceiptPricing {
+  original: string
+  serviceFee: string
+  callerPays: string
+  feeBps: number
+  pricingVersion: string
+  client: string | null
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -38,12 +56,14 @@ export async function createQuoteReceipt(
   merchant: string,
   secret: string,
   nowSeconds = Math.floor(Date.now() / 1000),
+  pricing?: QuoteReceiptPricing,
 ): Promise<string> {
   const payload: QuoteReceiptPayload = {
-    v: 1,
+    v: pricing ? 2 : 1,
     paymentId,
     amount,
     merchant,
+    ...(pricing ?? {}),
     iat: nowSeconds,
     exp: nowSeconds + RECEIPT_TTL_SECONDS,
   }
@@ -78,7 +98,7 @@ export async function verifyQuoteReceipt(
       new TextDecoder().decode(base64UrlDecode(encodedPayload)),
     ) as Partial<QuoteReceiptPayload>
     if (
-      payload.v !== 1 ||
+      (payload.v !== 1 && payload.v !== 2) ||
       payload.paymentId !== expectedPaymentId ||
       typeof payload.amount !== 'string' ||
       typeof payload.merchant !== 'string' ||
@@ -87,6 +107,21 @@ export async function verifyQuoteReceipt(
       typeof payload.exp !== 'number' ||
       payload.iat > nowSeconds + 30 ||
       payload.exp <= nowSeconds
+    ) {
+      return null
+    }
+    if (
+      payload.v === 2 &&
+      (typeof payload.original !== 'string' ||
+        typeof payload.serviceFee !== 'string' ||
+        typeof payload.callerPays !== 'string' ||
+        typeof payload.feeBps !== 'number' ||
+        !Number.isSafeInteger(payload.feeBps) ||
+        payload.feeBps < 0 ||
+        payload.feeBps > MAX_CHECKOUT_WEB_FEE_BPS ||
+        typeof payload.pricingVersion !== 'string' ||
+        !payload.pricingVersion ||
+        (payload.client !== null && typeof payload.client !== 'string'))
     ) {
       return null
     }

@@ -8,11 +8,18 @@ import {
   buildFullAmountTitle,
   resolveSource,
   resolveClient,
+  buildCheckoutTitle,
 } from '../src/routes/create-invoice'
 import {
   createQuoteReceipt,
   verifyQuoteReceipt,
 } from '../src/routes/quote-receipt'
+import {
+  computeServiceFeeAtomic,
+  isExactCheckoutWebClient,
+  parseCheckoutWebFeeBps,
+  resolveCheckoutPricing,
+} from '../src/routes/checkout-web-pricing'
 
 describe('quote receipt', () => {
   it('round-trips a signed quote and binds it to the payment id', async () => {
@@ -51,6 +58,27 @@ describe('quote receipt', () => {
     ).resolves.toBeNull()
   })
 
+  it('rejects a signed v2 receipt above the code-level 100 bps ceiling', async () => {
+    const receipt = await createQuoteReceipt(
+      'pl_test123',
+      '10',
+      'OpenRouter, Inc.',
+      'test-secret',
+      1_000,
+      {
+        original: '10',
+        serviceFee: '0.101',
+        callerPays: '10.101',
+        feeBps: 101,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-web',
+      },
+    )
+    await expect(
+      verifyQuoteReceipt(receipt, 'pl_test123', 'test-secret', 1_001),
+    ).resolves.toBeNull()
+  })
+
   it('is issued by quote-invoice and can be verified against its link id', async () => {
     const { handleQuoteInvoice } = await import('../src/routes/pay-invoice-admin')
     const originalFetch = globalThis.fetch
@@ -86,6 +114,163 @@ describe('quote receipt', () => {
     } finally {
       globalThis.fetch = originalFetch
     }
+  })
+
+  it('binds the browser fee snapshot and returns the same priced quote', async () => {
+    const { handleQuoteInvoice } = await import('../src/routes/pay-invoice-admin')
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () =>
+      Response.json({
+        linkId: 'pl_fee_quote',
+        merchant: 'OpenRouter, Inc.',
+        invoice: { amount: '10.01' },
+      })) as typeof fetch
+    try {
+      const response = await handleQuoteInvoice(
+        new Request('https://mpp.test/quote-invoice', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            payment_id: 'pl_fee_quote',
+            client: 'rozo-checkout-web',
+          }),
+        }),
+        {
+          PAYINVOICE_ADMIN_SECRET: 'test-secret',
+          CHECKOUT_WEB_FEE_BPS: '100',
+        } as import('../src/index').Env,
+      )
+      const body = await response.json() as any
+      expect(body).toMatchObject({
+        original: '10.01',
+        serviceFee: '0.1001',
+        callerPays: '10.1101',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+      })
+      expect(body.quote.callerPaysAtomicUsdc).toBe('10110100')
+      await expect(
+        verifyQuoteReceipt(body.quoteReceipt, 'pl_fee_quote', 'test-secret'),
+      ).resolves.toMatchObject({
+        v: 2,
+        client: 'rozo-checkout-web',
+        original: '10.01',
+        serviceFee: '0.1001',
+        callerPays: '10.1101',
+        feeBps: 100,
+      })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  it('binds quote receipts to raw fee eligibility, not sanitized provenance', async () => {
+    const { handleQuoteInvoice } = await import('../src/routes/pay-invoice-admin')
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => Response.json({
+      linkId: 'pl_fee_quote',
+      merchant: 'OpenRouter, Inc.',
+      invoice: { amount: '10' },
+    })) as typeof fetch
+    try {
+      const response = await handleQuoteInvoice(
+        new Request('https://mpp.test/quote-invoice', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            payment_id: 'pl_fee_quote',
+            client: 'rozo-checkout-web!!!',
+          }),
+        }),
+        {
+          PAYINVOICE_ADMIN_SECRET: 'test-secret',
+          CHECKOUT_WEB_FEE_BPS: '100',
+        } as import('../src/index').Env,
+      )
+      const body = await response.json() as any
+      expect(body.feeBps).toBe(0)
+      await expect(
+        verifyQuoteReceipt(body.quoteReceipt, 'pl_fee_quote', 'test-secret'),
+      ).resolves.toMatchObject({ client: null, feeBps: 0 })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+})
+
+describe('browser checkout fee policy', () => {
+  it('requires byte-for-byte exact browser client provenance', () => {
+    expect(isExactCheckoutWebClient('rozo-checkout-web')).toBe(true)
+    for (const raw of [
+      ' rozo-checkout-web',
+      'rozo-checkout-web ',
+      'ROZO-CHECKOUT-WEB',
+      'rozo-checkout-Web',
+      'rozo-checkout-web!!!',
+      'rozo-checkout-web/1.0',
+      null,
+      undefined,
+    ]) {
+      expect(isExactCheckoutWebClient(raw)).toBe(false)
+    }
+  })
+
+  it('uses atomic ceil for a non-divisible 1% fee', () => {
+    expect(computeServiceFeeAtomic(10_000_001n, 100)).toBe(100_001n)
+    expect(computeServiceFeeAtomic(1n, 100)).toBe(1n)
+  })
+
+  it('defaults malformed, fractional, negative, and above-canary config to 0', () => {
+    for (const raw of [undefined, '', '1.5', '-1', '101', '10000', 'abc']) {
+      expect(parseCheckoutWebFeeBps(raw)).toBe(0)
+    }
+    expect(parseCheckoutWebFeeBps('100')).toBe(100)
+  })
+
+  it('hard-caps fee math at the approved 1% canary boundary', () => {
+    expect(() => computeServiceFeeAtomic(10_000_000n, 101)).toThrow()
+  })
+
+  it('only prices the exact web client and strict OpenRouter allowlist', () => {
+    const eligible = resolveCheckoutPricing(
+      10_000_000n,
+      'OpenRouter, Inc.',
+      'rozo-checkout-web',
+      '100',
+    )
+    expect(eligible.serviceFeeAtomic).toBe(100_000n)
+    expect(eligible.callerPaysAtomic).toBe(10_100_000n)
+    for (const [merchant, client] of [
+      ['OpenRouter, Inc.', null],
+      ['OpenRouter, Inc.', 'rozo-checkout-cli/1.0'],
+      ['OpenRouter, Inc.', 'rozo-checkout-web!!!'],
+      ['OpenRouter Support', 'rozo-checkout-web'],
+      ['openrouter', 'rozo-checkout-web'],
+    ] as const) {
+      expect(resolveCheckoutPricing(10_000_000n, merchant, client, '100').feeBps).toBe(0)
+    }
+  })
+
+  it('makes the charged total explicit in the display title', () => {
+    const pricing = resolveCheckoutPricing(
+      10_000_000n,
+      'OpenRouter',
+      'rozo-checkout-web',
+      '100',
+    )
+    expect(buildCheckoutTitle('OpenRouter', pricing)).toBe(
+      'Pay OpenRouter $10.10 (includes $0.10 service fee)',
+    )
+
+    const subCent = resolveCheckoutPricing(
+      10_010_000n,
+      'OpenRouter',
+      'rozo-checkout-web',
+      '100',
+    )
+    expect(buildCheckoutTitle('OpenRouter', subCent)).toBe(
+      'Pay OpenRouter $10.1101 (includes $0.1001 service fee)',
+    )
   })
 })
 
@@ -353,17 +538,22 @@ describe('resolveSource', () => {
 // mocked quote-invoice upstream and a mocked Rozo intents API, then assert the
 // intent-create body Rozo receives.
 describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
-  function makeEnv() {
+  function makeEnv(feeBps?: string) {
     return {
       PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
       ROZO_INTENTS_API_KEY: 'test-key',
+      CHECKOUT_WEB_FEE_BPS: feeBps,
     } as unknown as import('../src/index').Env
   }
 
   // Runs the handler with a body, capturing the JSON body POSTed to the Rozo
   // intents create endpoint. Quote upstream returns a fixed $105 OpenRouter
   // invoice; the order-lookup returns 404 (idempotency miss).
-  async function run(body: Record<string, unknown>) {
+  async function run(
+    body: Record<string, unknown>,
+    feeBps?: string,
+    merchant = 'OpenRouter, Inc.',
+  ) {
     const { handleCreateInvoice } = await import('../src/routes/create-invoice')
     let createBody: any = null
     let quoteFetches = 0
@@ -375,7 +565,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         return new Response(
           JSON.stringify({
             invoice: { amount: '105' },
-            merchant: 'OpenRouter, Inc.',
+            merchant,
             linkId: 'pl_test123',
           }),
           { status: 200 },
@@ -400,7 +590,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       })
-      const res = await handleCreateInvoice(req, makeEnv())
+      const res = await handleCreateInvoice(req, makeEnv(feeBps))
       const json = JSON.parse(await res.text())
       return { status: res.status, json, createBody, quoteFetches }
     } finally {
@@ -441,6 +631,106 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(createBody.destination.tokenSymbol).toBe('USDC')
   })
 
+  it('charges the same 1% browser fee on stablecoin and Lightning and persists its breakdown', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '105',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '105',
+        serviceFee: '1.05',
+        callerPays: '106.05',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-web',
+      },
+    )
+    for (const source of [
+      undefined,
+      { chainId: 'lightning', tokenSymbol: 'BTC' },
+    ]) {
+      const { status, json, createBody } = await run(
+        {
+          payment_id: 'pl_test123',
+          client: 'rozo-checkout-web',
+          quoteReceipt,
+          ...(source ? { source } : {}),
+        },
+        '100',
+      )
+      expect(status).toBe(200)
+      expect(json).toMatchObject({
+        original: '105',
+        serviceFee: '1.05',
+        callerPays: '106.05',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+      })
+      expect(createBody.type === 'exactOut'
+        ? createBody.destination.amount
+        : createBody.source.amount).toBe('106.05')
+      expect(createBody.metadata).toMatchObject({
+        client: 'rozo-checkout-web',
+        original: '105',
+        serviceFee: '1.05',
+        callerPays: '106.05',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+      })
+    }
+  })
+
+  it('refuses fee-bearing browser create without a v2 quote receipt', async () => {
+    for (const source of [
+      undefined,
+      { chainId: 'lightning', tokenSymbol: 'BTC' },
+    ]) {
+      const { status, json, createBody } = await run(
+        {
+          payment_id: 'pl_test123',
+          client: 'rozo-checkout-web',
+          ...(source ? { source } : {}),
+        },
+        '100',
+      )
+      expect(status).toBe(409)
+      expect(json.error.code).toBe('QUOTE_RECEIPT_REQUIRED')
+      expect(createBody).toBeNull()
+    }
+  })
+
+  it('keeps CLI/unknown clients and lookalike merchants at zero fee', async () => {
+    const cli = await run(
+      { payment_id: 'pl_test123', client: 'rozo-checkout-cli/1.0' },
+      '100',
+    )
+    expect(cli.json.serviceFee).toBe('0')
+    expect(cli.json.feeBps).toBe(0)
+
+    const spoof = await run(
+      { payment_id: 'pl_test123', client: 'rozo-checkout-web' },
+      '100',
+      'OpenRouter Support',
+    )
+    expect(spoof.json.serviceFee).toBe('0')
+    expect(spoof.json.feeBps).toBe(0)
+
+    const spoofClient = await run(
+      { payment_id: 'pl_test123', client: 'rozo-checkout-web!!!' },
+      '100',
+    )
+    expect(spoofClient.json.serviceFee).toBe('0')
+    expect(spoofClient.json.feeBps).toBe(0)
+
+    for (const client of [' rozo-checkout-web ', 'ROZO-CHECKOUT-WEB']) {
+      const nonExact = await run({ payment_id: 'pl_test123', client }, '100')
+      expect(nonExact.json.serviceFee).toBe('0')
+      expect(nonExact.json.feeBps).toBe(0)
+    }
+  })
+
   it('uses a valid signed quote receipt without fetching the quote upstream again', async () => {
     const quoteReceipt = await createQuoteReceipt(
       'pl_test123',
@@ -457,20 +747,174 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(createBody.source.amount).toBe('77')
   })
 
-  it('falls back to a fresh upstream quote when the receipt is tampered', async () => {
+  it('honors the exact signed v2 browser price across quote → create', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '77',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '77',
+        serviceFee: '0.77',
+        callerPays: '77.77',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-web',
+      },
+    )
+    // Even if the env changes during the receipt's 60-second TTL, the signed
+    // snapshot is the price the browser was shown.
+    const { status, json, createBody, quoteFetches } = await run({
+      payment_id: 'pl_test123',
+      client: 'rozo-checkout-web',
+      quoteReceipt,
+    }, '0')
+    expect(status).toBe(200)
+    expect(quoteFetches).toBe(0)
+    expect(json.callerPays).toBe('77.77')
+    expect(createBody.source.amount).toBe('77.77')
+  })
+
+  it('rejects a CLI receipt on the browser instead of silently repricing it', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '77',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '77',
+        serviceFee: '0',
+        callerPays: '77',
+        feeBps: 0,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-cli/1.0',
+      },
+    )
+    const { status, json, createBody } = await run({
+      payment_id: 'pl_test123',
+      client: 'rozo-checkout-web',
+      quoteReceipt,
+    }, '100')
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('QUOTE_RECEIPT_INVALID_OR_EXPIRED')
+    expect(createBody).toBeNull()
+  })
+
+  it('keeps zero-fee legacy fallback for a tampered receipt', async () => {
     const quoteReceipt = await createQuoteReceipt(
       'pl_test123',
       '77',
       'OpenRouter, Inc.',
       'test-admin-secret',
     )
-    const { status, createBody, quoteFetches } = await run({
+    const { status, json, createBody, quoteFetches } = await run({
       payment_id: 'pl_test123',
       quoteReceipt: `${quoteReceipt}x`,
     })
     expect(status).toBe(200)
+    expect(json.serviceFee).toBe('0')
     expect(quoteFetches).toBe(1)
     expect(createBody.source.amount).toBe('105')
+  })
+
+  it('keeps zero-fee legacy fallback for an expired receipt', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '77',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      1_000,
+    )
+    const { status, json, createBody, quoteFetches } = await run({
+      payment_id: 'pl_test123',
+      quoteReceipt,
+    })
+    expect(status).toBe(200)
+    expect(json.serviceFee).toBe('0')
+    expect(quoteFetches).toBe(1)
+    expect(createBody.source.amount).toBe('105')
+  })
+
+  it('rejects an invalid receipt once the browser fee is active', async () => {
+    const { status, json, createBody } = await run({
+      payment_id: 'pl_test123',
+      client: 'rozo-checkout-web',
+      quoteReceipt: 'tampered.receipt',
+    }, '100')
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('QUOTE_RECEIPT_INVALID_OR_EXPIRED')
+    expect(createBody).toBeNull()
+  })
+
+  it('cannot replay a zero-fee sanitized-lookalike receipt as the exact browser client', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '105',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '105',
+        serviceFee: '0',
+        callerPays: '105',
+        feeBps: 0,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: null,
+      },
+    )
+    const { status, json, createBody } = await run({
+      payment_id: 'pl_test123',
+      client: 'rozo-checkout-web',
+      quoteReceipt,
+    }, '100')
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('QUOTE_RECEIPT_INVALID_OR_EXPIRED')
+    expect(createBody).toBeNull()
+  })
+
+  it('ignores a client-mismatched receipt while pricing is disabled', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '77',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '77',
+        serviceFee: '0',
+        callerPays: '77',
+        feeBps: 0,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: null,
+      },
+    )
+    const { status, json, createBody } = await run({
+      payment_id: 'pl_test123',
+      client: 'rozo-checkout-cli/1.0',
+      quoteReceipt,
+    })
+    expect(status).toBe(200)
+    expect(json.serviceFee).toBe('0')
+    expect(createBody.source.amount).toBe('77')
+  })
+
+  it('rejects legacy v1 pricing when an enabled fee would change the shown total', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '77',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+    )
+    const { status, json, createBody } = await run({
+      payment_id: 'pl_test123',
+      client: 'rozo-checkout-web',
+      quoteReceipt,
+    }, '100')
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('QUOTE_RECEIPT_INVALID_OR_EXPIRED')
+    expect(createBody).toBeNull()
   })
 })
 
@@ -778,10 +1222,11 @@ describe('handleCreateInvoice — already-paid vs expired', () => {
 // regardless of its status and regardless of the source the caller asked for.
 // A caller wanting Solana USDT got a Stellar USDC link with reused:true / 200.
 describe('handleCreateInvoice — Coinbase reuse gate', () => {
-  function makeEnv() {
+  function makeEnv(feeBps?: string) {
     return {
       PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
       ROZO_INTENTS_API_KEY: 'test-key',
+      CHECKOUT_WEB_FEE_BPS: feeBps,
     } as unknown as import('../src/index').Env
   }
 
@@ -790,6 +1235,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     existing: any,
     body: Record<string, unknown>,
     checkout: () => Response = () => new Response('{}', { status: 200 }),
+    feeBps?: string,
   ) {
     const { handleCreateInvoice } = await import('../src/routes/create-invoice')
     let createBody: any = null
@@ -829,7 +1275,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       })
-      const res = await handleCreateInvoice(req, makeEnv())
+      const res = await handleCreateInvoice(req, makeEnv(feeBps))
       return { status: res.status, json: JSON.parse(await res.text()), createBody, checkoutBody }
     } finally {
       globalThis.fetch = originalFetch
@@ -841,7 +1287,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     status: 'payment_unpaid',
     paymentLink: 'https://pay.rozo.ai/existing',
     expiresAt: '2999-01-01T00:00:00.000Z',
-    source: { chainId: '1500', tokenSymbol: 'USDC' },
+    source: { chainId: '1500', tokenSymbol: 'USDC', amount: '105' },
   }
 
   it('rotates an unpaid order onto the requested source (the lost-sale incident)', async () => {
@@ -897,14 +1343,130 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     expect(json.warnings).toBeUndefined()
   })
 
+  it('fails closed when a legacy lookup omits both source amount and pricing metadata', async () => {
+    const { status, json, createBody } = await runReuse(
+      {
+        ...unpaidStellar,
+        source: { chainId: '1500', tokenSymbol: 'USDC' },
+      },
+      { payment_id: 'pl_test123', source: { chainId: '1500', tokenSymbol: 'USDC' } },
+    )
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('LEGACY_PRICING_ORDER_PENDING')
+    expect(createBody).toBeNull()
+  })
+
+  it('fails closed when a lightning lookup omits both destination amount and pricing metadata', async () => {
+    const { status, json, createBody } = await runReuse(
+      {
+        ...unpaidStellar,
+        source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+      },
+      { payment_id: 'pl_test123' },
+    )
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('LEGACY_PRICING_ORDER_PENDING')
+    expect(createBody).toBeNull()
+  })
+
   it('never rotates a lightning order — warns instead', async () => {
     const { json, checkoutBody } = await runReuse(
-      { ...unpaidStellar, source: { chainId: 'lightning', tokenSymbol: 'BTC' } },
+      {
+        ...unpaidStellar,
+        source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+        destination: { amount: '105' },
+      },
       { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
     )
     expect(checkoutBody).toBeNull()
     expect(json.sourceMismatch).toBe(true)
     expect(json.source).toEqual({ chainId: 'lightning', tokenSymbol: 'BTC' })
+  })
+
+  it('rejects a zero-fee pending order when the browser canary price is now 1%', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '105',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '105',
+        serviceFee: '1.05',
+        callerPays: '106.05',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-web',
+      },
+    )
+    const { status, json, checkoutBody } = await runReuse(
+      unpaidStellar,
+      {
+        payment_id: 'pl_test123',
+        client: 'rozo-checkout-web',
+        quoteReceipt,
+        source: { chainId: '1500', tokenSymbol: 'USDC' },
+      },
+      () => new Response('{}', { status: 200 }),
+      '100',
+    )
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('LEGACY_PRICING_ORDER_PENDING')
+    expect(checkoutBody).toBeNull()
+  })
+
+  it('rejects a fee-bearing row with unreadable amount after rollback to zero', async () => {
+    const { status, json } = await runReuse(
+      {
+        ...unpaidStellar,
+        source: { chainId: '1500', tokenSymbol: 'USDC' },
+        metadata: {
+          original: '105',
+          serviceFee: '1.05',
+          callerPays: '106.05',
+          feeBps: 100,
+          pricingVersion: 'checkout-web-fee-v1',
+        },
+      },
+      { payment_id: 'pl_test123', source: { chainId: '1500', tokenSymbol: 'USDC' } },
+    )
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('LEGACY_PRICING_ORDER_PENDING')
+  })
+
+  it('reuses a fee-priced pending order when lookup omits metadata but amount matches', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '105',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '105',
+        serviceFee: '1.05',
+        callerPays: '106.05',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-web',
+      },
+    )
+    const { status, json, createBody } = await runReuse(
+      {
+        ...unpaidStellar,
+        source: { ...unpaidStellar.source, amount: '106.05' },
+      },
+      {
+        payment_id: 'pl_test123',
+        client: 'rozo-checkout-web',
+        quoteReceipt,
+      },
+      () => new Response('{}', { status: 200 }),
+      '100',
+    )
+    expect(status).toBe(200)
+    expect(json.reused).toBe(true)
+    expect(json.callerPays).toBe('106.05')
+    expect(createBody).toBeNull()
   })
 
   it('409s an unexpired order that is no longer unpaid instead of reusing it', async () => {

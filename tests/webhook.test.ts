@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest'
+import { callAgentApiPayInvoice } from '../src/routes/webhook'
 
 // We can't easily unit-test the full webhook handler without mocking
 // Cloudflare bindings; instead verify the HMAC primitive matches Rozo's
@@ -47,5 +48,30 @@ describe('webhook HMAC contract', () => {
     const s1 = await hmacSha256Hex(secret, `${ts}.a`)
     const s2 = await hmacSha256Hex(secret, `${ts}.b`)
     expect(s1).not.toBe(s2)
+  })
+})
+
+describe('Coinbase fulfillment amount boundary', () => {
+  it('forwards only the provider invoice id, never callerPays/serviceFee', async () => {
+    const originalFetch = globalThis.fetch
+    let sent: any = null
+    globalThis.fetch = (async (_input: any, init?: RequestInit) => {
+      sent = JSON.parse(String(init?.body ?? '{}'))
+      return Response.json({ ok: true })
+    }) as typeof fetch
+    try {
+      await callAgentApiPayInvoice(
+        { PAYINVOICE_ADMIN_SECRET: 'test-secret' } as any,
+        'pl_original_invoice',
+      )
+      // agentapi resolves the merchant amount from the immutable Coinbase
+      // invoice itself. The fee-bearing Rozo intent amount is not an input.
+      expect(sent).toEqual({ payment_id: 'pl_original_invoice' })
+      expect(sent).not.toHaveProperty('amount')
+      expect(sent).not.toHaveProperty('callerPays')
+      expect(sent).not.toHaveProperty('serviceFee')
+    } finally {
+      globalThis.fetch = originalFetch
+    }
   })
 })

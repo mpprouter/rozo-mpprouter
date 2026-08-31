@@ -136,6 +136,9 @@ migrations_dir = "migrations-metrics"
 
 # Public keys (not secrets, safe to commit)
 [vars]
+# Browser-only OpenRouter fee canary. Keep at 0 until the approved activation
+# gates pass; invalid/missing values also resolve to 0 in code.
+CHECKOUT_WEB_FEE_BPS = "0"
 STELLAR_NETWORK = "stellar:pubnet"
 STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
 # Comma-separated POOL, round-robined per request (src/mpp/tempo-rpc.ts).
@@ -244,6 +247,8 @@ PLAYGROUND_GLOBAL_CAP_USD = "200"
 # INTERNAL = ours. Rozo E2E probe, leaked test wallet, mpp-showcase-payer,
 # and the founder's channel-playground wallet. All four trace to the Rozo V1
 # Stellar hub GC56BXCN... or are named as ours in our own docs.
+# Classification history only: listed leaked/retired accounts must never be
+# funded or reused as a payment destination.
 LEDGER_INTERNAL_PAYERS = "GAIK5OR2FY4MVXVL4AZDJLAJT3MIJ5I6PAYARB2CATRRVACWFI7C6NHW,GAN3YSPDH5VW7YFJJFUJH7LIYTJBWGH3GJMKOG6FP5RKHXGNMPX44UYY,GC2MW6GN67G74B6KXFLR3OTF35QB5KY75IKBY3QXSPLQNCQ7YH27JBSQ,GD5R4HTO5Y22ZNBD2ZZDJHFYN5JDYHDHG3VINLPM2ZU7HCIHUMI2BB4U"
 
 # UNRESOLVED = Rozo-ADJACENT, not clearable as external, not evidenced as ours.

@@ -1,5 +1,12 @@
 import type { Env } from '../index'
 import { createQuoteReceipt } from './quote-receipt'
+import {
+  formatUsdcAtomic,
+  isExactCheckoutWebClient,
+  normalizeCheckoutClient,
+  parseUsdcAtomic,
+  resolveCheckoutPricing,
+} from './checkout-web-pricing'
 
 // ── Error code constants ─────────────────────────────────────────────────────
 
@@ -442,11 +449,53 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     })
   }
 
+  let originalAtomic: bigint
+  try {
+    originalAtomic = parseUsdcAtomic(amount)
+  } catch {
+    return errorResponse(502, {
+      code: 'QUOTE_UNAVAILABLE',
+      message: 'Quote upstream returned an unparseable invoice amount.',
+      normalized_input: normalized,
+      link_id_detected,
+    })
+  }
+  const clientRaw = (parsed as Record<string, unknown> | null)?.client
+  const client = normalizeCheckoutClient(clientRaw)
+  const pricingClient = isExactCheckoutWebClient(clientRaw) ? client : null
+  const pricing = resolveCheckoutPricing(
+    originalAtomic,
+    merchant,
+    pricingClient,
+    env.CHECKOUT_WEB_FEE_BPS,
+  )
+  const pricingFields = {
+    original: formatUsdcAtomic(pricing.originalAtomic),
+    serviceFee: formatUsdcAtomic(pricing.serviceFeeAtomic),
+    callerPays: formatUsdcAtomic(pricing.callerPaysAtomic),
+    feeBps: pricing.feeBps,
+    pricingVersion: pricing.pricingVersion,
+  }
+
   const quoteReceipt = await createQuoteReceipt(
     paymentId,
     amount,
     merchant,
     env.PAYINVOICE_ADMIN_SECRET,
+    Math.floor(Date.now() / 1000),
+    { ...pricingFields, client: pricingClient },
   )
-  return json(200, { ...quote, quoteReceipt })
+  return json(200, {
+    ...quote,
+    ...pricingFields,
+    quote: {
+      ...(quote?.quote && typeof quote.quote === 'object' ? quote.quote : {}),
+      originalAtomicUsdc: pricing.originalAtomic.toString(),
+      serviceFeeAtomicUsdc: pricing.serviceFeeAtomic.toString(),
+      callerPaysAtomicUsdc: pricing.callerPaysAtomic.toString(),
+      feeBps: pricing.feeBps,
+      pricingVersion: pricing.pricingVersion,
+    },
+    quoteReceipt,
+  })
 }
