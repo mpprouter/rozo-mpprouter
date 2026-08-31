@@ -23,6 +23,7 @@ import {
 } from '../services/merchants'
 import { normalizePayInvoiceBody } from './pay-invoice-admin'
 import { recordRouteFailure, recordRouteSuccess } from '../services/route-health'
+import { classifyOutcome, recordRouteCall } from '../services/route-metrics'
 import {
   ChannelNotInstalledError,
   payMerchant,
@@ -572,6 +573,16 @@ async function payMerchantAndGetBody(
   request: Request,
   requestBody: string | undefined,
 ): Promise<MerchantPayResult> {
+  // Timed HERE rather than in the inner function so every payment branch is
+  // covered. The inner timer at the router-held-credential branch is the only
+  // one that ever set `latencyMs`; the pay-invoice and Tempo branches returned
+  // none, and consumers papered over it with `?? 0`. That is how the order
+  // ledger came to report a p50 of 0ms across 47 calls. This outer measurement
+  // includes our own settlement overhead, so it is the number a buyer actually
+  // waits for, and `result.latencyMs` (upstream leg only) still wins when the
+  // inner branch measured it.
+  const startedAt = Date.now()
+
   let result: MerchantPayResult
   try {
     result = await payMerchantAndGetBodyInner(
@@ -583,14 +594,39 @@ async function payMerchantAndGetBody(
     // could fail every call through that path while still advertising
     // live_status "ok" — the exact blind spot this field exists to close.
     recordRouteFailure(env, ctx, route.id, 'timeout')
+    // No upstream status exists on a throw, so classifyOutcome attributes it
+    // to the provider leg. Latency is deliberately omitted: a call that threw
+    // has no delivery time worth publishing.
+    recordRouteCall(env, ctx, {
+      routeId: route.id,
+      method: request.method,
+      outcome: classifyOutcome(undefined),
+      reason: 'timeout',
+    })
     throw err
   }
+
+  const elapsedMs = Date.now() - startedAt
 
   if (result.kind === 'error') {
     recordRouteFailure(env, ctx, route.id, result.refundReason ?? 'upstream_error')
   } else {
     recordRouteSuccess(env, ctx, route.id)
   }
+
+  recordRouteCall(env, ctx, {
+    routeId: route.id,
+    method: request.method,
+    // A 401/403 on a route where WE hold the upstream credential is our
+    // misconfiguration, not the caller sending a bad request — publishing it
+    // as a provider outage (or as the caller's fault) would both be wrong.
+    outcome: classifyOutcome(result.merchantStatus, {
+      routerHoldsCredential: Boolean(route.upstreamAuth),
+    }),
+    reason: result.kind === 'error' ? (result.refundReason ?? 'upstream_error') : undefined,
+    upstreamStatus: result.merchantStatus,
+    latencyMs: result.latencyMs ?? elapsedMs,
+  })
 
   return result
 }

@@ -108,6 +108,21 @@ database_name = "mpprouter-coupon-security"
 database_id = "4bcb90b4-57c6-4a7d-848e-30e043cbc8ca"
 migrations_dir = "migrations"
 
+# Per-provider service-quality metrics (SCF #44 reviewer feedback 2026-08-31).
+# One row per paid upstream call; published on the public service pages.
+# Deliberately a SEPARATE database from the coupon security audit above: that
+# one is redacted forensic data, this one is public. Provision before deploy:
+#   wrangler d1 create mpprouter-route-metrics
+#   (paste the returned database_id below)
+#   wrangler d1 migrations apply mpprouter-route-metrics --remote
+# Migrations live in migrations-metrics/ (a per-database directory; wrangler
+# tracks applied migrations per database, so they must not share one).
+[[d1_databases]]
+binding = "ROUTE_METRICS_DB"
+database_name = "mpprouter-route-metrics"
+database_id = "PROVISION_ME"
+migrations_dir = "migrations-metrics"
+
 # Public keys (not secrets, safe to commit)
 [vars]
 STELLAR_NETWORK = "stellar:pubnet"
