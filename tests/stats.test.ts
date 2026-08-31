@@ -37,12 +37,19 @@ function kv(records: string[]) {
   } as any
 }
 
-/** Metrics D1 stub: quality rows are irrelevant to the commerce assertions. */
-function metricsDb(rows: any[] = []) {
+/**
+ * Metrics D1 stub. `serviceIds` answers the DISTINCT service_id query used to
+ * seed services that have quality rows but no ledger rows.
+ */
+function metricsDb(rows: any[] = [], serviceIds: string[] = []) {
+  const answer = (sql: string) =>
+    sql.includes('DISTINCT service_id')
+      ? { results: serviceIds.map((service_id) => ({ service_id })) }
+      : { results: rows }
   return {
-    prepare: () => ({
-      bind: () => ({ all: async () => ({ results: rows }) }),
-      all: async () => ({ results: rows }),
+    prepare: (sql: string) => ({
+      bind: () => ({ all: async () => answer(sql), run: async () => {} }),
+      all: async () => answer(sql),
     }),
   } as any
 }
@@ -221,5 +228,48 @@ describe('getStats attribution and refunds', () => {
     // Must not become a 500; the endpoint promises degradation.
     const s = await getStats(broken, '30d')
     expect(s.totals.calls).toBe(0)
+  })
+})
+
+describe('getStats coverage', () => {
+  it('keeps a service that has quality rows but no ledger rows', async () => {
+    // Every call failed before an order was written, or all succeeded
+    // asynchronously. Dropping the provider from a provider-quality page is
+    // the worst available failure mode.
+    const e = {
+      MPP_STORE: kv([]),
+      ROUTE_METRICS_DB: metricsDb([], ['firecrawl']),
+    } as unknown as Env
+    const s = await getStats(e, '30d')
+    expect(s.services.map((x) => x.service_id)).toContain('firecrawl')
+    expect(s.services[0].calls).toBe(0)
+  })
+
+  it('reports unresolved calls in the totals, not only per service', async () => {
+    const UNRESOLVED = 'GUNRESOLVEDTOTALSAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    const s = await getStats(
+      env(
+        [order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: UNRESOLVED })],
+        { unresolved: UNRESOLVED },
+      ),
+      '30d',
+    )
+    // The page reads this from totals; without it the expression is NaN and
+    // the exclusion hint disappears entirely.
+    expect(s.totals.unresolved_calls).toBe(1)
+  })
+
+  it('marks a malformed ledger row as truncated rather than claiming completeness', async () => {
+    const s = await getStats(
+      env(['{not json', order({ route_id: 'mercury_a', ts: iso(now - 1000) })]),
+      '30d',
+    )
+    expect(s.totals.calls).toBe(1)
+    expect(s.truncated).toBe(true)
+  })
+
+  it('publishes its known coverage gaps', async () => {
+    const s = await getStats(env([]), '30d')
+    expect(s.coverage.known_gaps.length).toBeGreaterThan(0)
   })
 })

@@ -107,6 +107,15 @@ export function classifyOutcome(
   // 408 and 429 are 4xx but describe the upstream refusing to serve, not a
   // malformed request.
   if (upstreamStatus === 408 || upstreamStatus === 429) return 'provider_fault'
+
+  // A FINAL 402 means the merchant rejected the payment we presented after
+  // retrying its challenge. That is a payment-protocol failure between the
+  // router and the merchant; the caller's own request may be perfectly
+  // valid, so booking it as caller_error would quietly drop a real failure
+  // out of the published denominator.
+  if (upstreamStatus === 402) {
+    return opts.routerHoldsCredential ? 'router_fault' : 'provider_fault'
+  }
   if (upstreamStatus >= 400 && upstreamStatus < 500) return 'caller_error'
   return 'provider_fault'
 }
@@ -293,4 +302,30 @@ export async function getRouteQuality(
       summarize(w, w === 'all' ? rows : rows.filter((r) => r.created_at >= now - WINDOW_MS[w])),
     ]),
   ) as Record<MetricsWindow, RouteQualityStats>
+}
+
+/**
+ * Service ids with at least one quality row in the window.
+ *
+ * Used by services/stats.ts to seed its service list: a provider whose calls
+ * never reached the order ledger (all failed, or all succeeded
+ * asynchronously) would otherwise be absent from a page about provider
+ * quality, which is precisely when its numbers matter most.
+ */
+export async function getQualityServiceIds(env: Env, sinceMs: number): Promise<string[]> {
+  const db = env.ROUTE_METRICS_DB
+  if (!db) return []
+  try {
+    const res = await db
+      .prepare(
+        `SELECT DISTINCT service_id FROM route_metric_calls WHERE created_at >= ?`,
+      )
+      .bind(sinceMs)
+      .all<{ service_id: string }>()
+    return (res.results ?? []).map((r) => r.service_id)
+  } catch {
+    // Never let this degrade the page into an error; the ledger-derived
+    // services still render.
+    return []
+  }
 }

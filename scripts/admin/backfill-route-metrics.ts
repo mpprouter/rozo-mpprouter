@@ -9,6 +9,9 @@
  * that measured it — a duration. That is exactly the shape this table wants.
  *
  * WHAT IT CANNOT RECOVER, and must not fake:
+ *   - The HTTP method. The order ledger does not store it, and most catalog
+ *     routes are POST, so hard-coding 'GET' would permanently record a
+ *     method that disagrees with live rows. Backfilled rows use 'UNKNOWN'.
  *   - Latency for routes whose branch never measured it. The ledger stores
  *     0 for those; 0 is written back as NULL (unmeasured), never as a
  *     0ms sample, or the published p50 would be a lie in our own favour.
@@ -163,7 +166,7 @@ function main() {
     const callId = `backfill:${entry.order_id}`
     const esc = (v: string) => `'${v.replace(/'/g, "''")}'`
     statements.push(
-      `INSERT INTO route_metric_calls (call_id, created_at, service_id, route_id, method, outcome, reason, upstream_status, latency_ms, refunded) VALUES (${esc(callId)}, ${createdAt}, ${esc(serviceIdFromRouteId(entry.route_id))}, ${esc(entry.route_id)}, 'GET', ${esc(outcome)}, ${outcome === 'ok' ? 'NULL' : esc('backfilled_from_order_ledger')}, ${entry.upstream_status}, ${latency ?? 'NULL'}, ${refunded}) ON CONFLICT(call_id) DO NOTHING;`,
+      `INSERT INTO route_metric_calls (call_id, created_at, service_id, route_id, method, outcome, reason, upstream_status, latency_ms, refunded) VALUES (${esc(callId)}, ${createdAt}, ${esc(serviceIdFromRouteId(entry.route_id))}, ${esc(entry.route_id)}, ${esc('UNKNOWN')}, ${esc(outcome)}, ${outcome === 'ok' ? 'NULL' : esc('backfilled_from_order_ledger')}, ${entry.upstream_status}, ${latency ?? 'NULL'}, ${refunded}) ON CONFLICT(call_id) DO NOTHING;`,
     )
   }
 

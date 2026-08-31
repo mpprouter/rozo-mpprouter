@@ -23,7 +23,12 @@
  */
 
 import type { OrderLedgerEntry } from './order-ledger'
-import { getRouteQuality, serviceIdFromRouteId, type MetricsWindow } from './route-metrics'
+import {
+  getQualityServiceIds,
+  getRouteQuality,
+  serviceIdFromRouteId,
+  type MetricsWindow,
+} from './route-metrics'
 import type { Env } from '../index'
 
 /**
@@ -109,6 +114,7 @@ export interface StatsPayload {
   totals: {
     calls: number
     internal_calls: number
+    unresolved_calls: number
     volume_usd: string
     buyers: number
     provider_success_rate: number | null
@@ -164,6 +170,9 @@ async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; trun
   const entries: OrderLedgerEntry[] = []
   let cursor: string | undefined
   let scanned = 0
+  // Reads that failed or would not parse. Any of them makes the result a
+  // floor rather than a total.
+  let lostReads = 0
 
   while (scanned < MAX_LEDGER_KEYS) {
     let listed: KVNamespaceListResult<unknown, string>
@@ -179,7 +188,6 @@ async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; trun
     // whole endpoint into a 500, when the contract here is to degrade and
     // say so via `truncated`.
     let raws: (string | null)[]
-    let lostReads = 0
     try {
       raws = await Promise.all(
         listed.keys.map((k) =>
@@ -196,18 +204,20 @@ async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; trun
     } catch {
       return { entries, truncated: true }
     }
-    if (lostReads > 0) return { entries, truncated: true }
     for (const raw of raws) {
       if (!raw) continue
       try {
         entries.push(JSON.parse(raw) as OrderLedgerEntry)
       } catch {
-        // One unparseable record must not empty the whole page.
+        // One unparseable record must not empty the whole page — but it is
+        // still data we failed to read, so the result is a floor, not a
+        // total, and must say so.
+        lostReads += 1
       }
     }
-    if (listed.list_complete) return { entries, truncated: false }
+    if (listed.list_complete) return { entries, truncated: lostReads > 0 }
     cursor = (listed as { cursor?: string }).cursor
-    if (!cursor) return { entries, truncated: false }
+    if (!cursor) return { entries, truncated: lostReads > 0 }
   }
   return { entries, truncated: true }
 }
@@ -292,6 +302,14 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     a.last = a.last === null ? ts : Math.max(a.last, ts)
   }
 
+  // Seed from the quality table as well as the ledger. A service whose calls
+  // all failed before an order was written — or all succeeded asynchronously —
+  // has quality rows and no ledger rows, and would otherwise disappear from
+  // the page. Dropping a provider's failures from a page about provider
+  // quality is the worst available failure mode.
+  const allQualityRows = await getQualityServiceIds(env, cutoff)
+  for (const id of allQualityRows) acc(id)
+
   const services: ServiceStats[] = []
   for (const [serviceId, a] of byService) {
     const q = await getRouteQuality(env, serviceId)
@@ -342,6 +360,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     totals: {
       calls: services.reduce((n, s) => n + s.calls, 0),
       internal_calls: services.reduce((n, s) => n + s.internal_calls, 0),
+      unresolved_calls: services.reduce((n, s) => n + s.unresolved_calls, 0),
       volume_usd: services.reduce((v, s) => addUsd(v, s.volume_usd), '0'),
       buyers: totalBuyers.size,
       provider_success_rate: allQuality[window].provider_success_rate,
