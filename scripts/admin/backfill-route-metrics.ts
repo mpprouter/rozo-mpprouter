@@ -39,6 +39,12 @@ import { execFileSync } from 'node:child_process'
 // "type": "module", so require is undefined here. The dry-run path never
 // reaches the write, which is exactly how this stayed hidden.
 import { writeFileSync } from 'node:fs'
+// The LIVE classifier, imported rather than copied. A second implementation
+// drifted from this one within a day: it kept sending a final 402 to
+// caller_error and an empty-body-but-refunded 2xx to ok, which would have
+// baked wrong attribution into permanent history. Backfilled and live rows
+// must be classified by the same code, not by two that agree today.
+import { classifyOutcome, serviceIdFromRouteId } from '../../src/services/route-metrics'
 
 const KV_NAMESPACE_ID = 'b0fa51efc09e4e708c6bd5061b0663e0'
 const D1_NAME = 'mpprouter-route-metrics'
@@ -62,35 +68,16 @@ function wrangler(args: string[]): string {
   })
 }
 
-function serviceIdFromRouteId(routeId: string): string {
-  const i = routeId.indexOf('_')
-  return i === -1 ? routeId : routeId.slice(0, i)
-}
-
 /**
- * Mirrors classifyOutcome in src/services/route-metrics.ts. Kept as a copy
- * rather than imported because this script runs in Node against the wrangler
- * CLI, not in the Worker runtime — but the two MUST stay in step, or
- * backfilled history and live recording will disagree about whose fault a
- * 403 was. Change both together.
+ * Routes where the ROUTER presents the upstream credential, so a 401/403 is
+ * our misconfiguration rather than the provider refusing to serve.
+ *
+ * `mercury_` uses upstreamAuth; `rozo-agent-api` reaches agentapi.rozo.ai
+ * through the pay-invoice admin bridge, which injects our own
+ * PAYINVOICE_ADMIN_SECRET without setting upstreamAuth. Omitting the second
+ * one blames the provider for our expired secret.
  */
-function classify(status: number, routerHoldsCredential: boolean): string {
-  if (status >= 200 && status < 300) return 'ok'
-  // Not 'caller_error': the agent's Authorization never reaches the upstream
-  // (forwardHeaders strips it), so an auth rejection is ours or the
-  // provider's. Must match classifyOutcome exactly.
-  if (status === 401 || status === 403) return routerHoldsCredential ? 'router_fault' : 'provider_fault'
-  if (status === 408 || status === 429) return 'provider_fault'
-  if (status >= 400 && status < 500) return 'caller_error'
-  return 'provider_fault'
-}
-
-/**
- * Routes where the router presents the upstream credential. Sourced from
- * `upstreamAuth` in src/services/merchants.ts; a 401/403 on these is our
- * misconfiguration, not the caller's bad request.
- */
-const ROUTER_CREDENTIAL_PREFIXES = ['mercury_']
+const ROUTER_CREDENTIAL_PREFIXES = ['mercury_', 'rozo-agent-api']
 
 function main() {
   const execute = process.argv.includes('--execute')
@@ -147,7 +134,15 @@ function main() {
     }
 
     const routerHeld = ROUTER_CREDENTIAL_PREFIXES.some((p) => entry.route_id.startsWith(p))
-    const outcome = classify(entry.upstream_status, routerHeld)
+    // A refund means the caller did NOT get what they paid for, whatever the
+    // status said. This is the historical stand-in for the live
+    // `deliveryFailed` signal, and it is what catches an upstream that
+    // answered 200 with an empty body.
+    const deliveryFailed = entry.refund_status !== 'none'
+    const outcome = classifyOutcome(entry.upstream_status, {
+      routerHoldsCredential: routerHeld,
+      deliveryFailed,
+    })
     // 0 in the ledger means "this branch never measured it", not "instant".
     const latency = entry.latency_ms > 0 ? entry.latency_ms : null
     const refunded = entry.refund_status === 'refunded' ? 1 : 0
