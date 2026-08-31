@@ -1,5 +1,6 @@
 import type { Env } from '../index'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
+import { baseLinkIdOf } from '../mpp/contract-variant'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import {
   isStripeOrderId,
@@ -354,7 +355,11 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
 
   const eventId = evt.event_id ?? null
   const eventType = evt.type ?? null
-  const plId = evt.data?.orderId ?? null
+  // A contract-supersede order carries a `__contract*`-suffixed orderId; the
+  // real Coinbase link id (and the KV fulfillment record both sibling orders
+  // share) is the base id. Normalize BEFORE any provider or KV use.
+  const rawOrderId = evt.data?.orderId ?? null
+  const plId = typeof rawOrderId === 'string' ? baseLinkIdOf(rawOrderId) : null
   const rozoPaymentId = evt.data?.id ?? null
 
   if (!eventId || !eventType || !plId) {
@@ -783,7 +788,8 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
     rozo = await fetchRozoPaymentById(env, rozoId)
     // If Rozo lookup returned a Coinbase orderId, surface
     // the corresponding Coinbase state too (caller may want both).
-    const inferredPl = rozo?.orderId
+    const inferredPl =
+      typeof rozo?.orderId === 'string' ? baseLinkIdOf(rozo.orderId) : rozo?.orderId
     if (typeof inferredPl === 'string' && isCoinbasePaymentId(inferredPl) && !coinbase) {
       plId = inferredPl
       coinbase = await fetchCoinbasePayment(plId)
