@@ -23,6 +23,7 @@ import {
 } from '../services/merchants'
 import { normalizePayInvoiceBody } from './pay-invoice-admin'
 import { recordRouteFailure, recordRouteSuccess } from '../services/route-health'
+import { asyncCallId, classifyOutcome, recordRouteCall } from '../services/route-metrics'
 import {
   ChannelNotInstalledError,
   payMerchant,
@@ -548,7 +549,31 @@ type MerchantPayResult =
       merchantStatus?: number
       /** Wall-clock ms for the upstream call. Order-ledger use only. */
       latencyMs?: number
+      /**
+       * True when the failure is OURS (or the agent's setup), not the
+       * provider's — a session channel that was never installed, say. It
+       * cannot be inferred from `refundReason`, which reuses `upstream_5xx`
+       * for this case and is therefore indistinguishable from a real
+       * provider 5xx. Without this flag the provider is penalised in its
+       * published success rate for a fault it had no part in.
+       */
+      routerSideFailure?: boolean
     }
+
+/**
+ * Errors we raise ourselves before the upstream is reached. Matched by
+ * `name` rather than `instanceof` so the set stays a plain data list and
+ * does not drag channel/session modules into this file's import graph.
+ *
+ * These must not count against a provider's published success rate: nothing
+ * about them says the provider failed to serve.
+ */
+const ROUTER_SIDE_ERROR_NAMES = new Set([
+  // src/mpp/tempo-client.ts — merchant has no payment channel installed.
+  'ChannelNotInstalledError',
+  // src/mpp/tempo-client.ts — our own configured budget ceiling rejected it.
+  'BudgetExceededError',
+])
 
 /**
  * Thin wrapper that feeds the catalog's live health signal.
@@ -572,6 +597,16 @@ async function payMerchantAndGetBody(
   request: Request,
   requestBody: string | undefined,
 ): Promise<MerchantPayResult> {
+  // Timed HERE rather than in the inner function so every payment branch is
+  // covered. The inner timer at the router-held-credential branch is the only
+  // one that ever set `latencyMs`; the pay-invoice and Tempo branches returned
+  // none, and consumers papered over it with `?? 0`. That is how the order
+  // ledger came to report a p50 of 0ms across 47 calls. This outer measurement
+  // includes our own settlement overhead, so it is the number a buyer actually
+  // waits for, and `result.latencyMs` (upstream leg only) still wins when the
+  // inner branch measured it.
+  const startedAt = Date.now()
+
   let result: MerchantPayResult
   try {
     result = await payMerchantAndGetBodyInner(
@@ -583,14 +618,87 @@ async function payMerchantAndGetBody(
     // could fail every call through that path while still advertising
     // live_status "ok" — the exact blind spot this field exists to close.
     recordRouteFailure(env, ctx, route.id, 'timeout')
+    // A throw carries no upstream status, and classifyOutcome therefore
+    // blames the provider leg — correct for a timeout or a dropped
+    // connection, wrong for the setup errors we raise ourselves before the
+    // provider is ever reached. A session channel that was never installed
+    // is our (or the agent's) missing configuration; booking it as a
+    // provider outage would deflate a provider's published success rate for
+    // something it had no part in. Latency is deliberately omitted: a call
+    // that threw has no delivery time worth publishing.
+    const routerSideFailure = ROUTER_SIDE_ERROR_NAMES.has((err as Error)?.name)
+    recordRouteCall(env, ctx, {
+      routeId: route.id,
+      method: request.method,
+      outcome: classifyOutcome(undefined, { routerSideFailure }),
+      reason: routerSideFailure ? (err as Error).name : 'timeout',
+    })
     throw err
   }
+
+  const elapsedMs = Date.now() - startedAt
+  // Computed once: the outcome classification needs to know this is async,
+  // and the row needs a stable id so finishAsyncDelivery can resolve it.
+  const asyncInfo =
+    result.kind === 'ok'
+      ? isAsyncJobResponse(result.merchantStatus, result.body)
+      : { isAsync: false, jobId: undefined as string | undefined }
 
   if (result.kind === 'error') {
     recordRouteFailure(env, ctx, route.id, result.refundReason ?? 'upstream_error')
   } else {
     recordRouteSuccess(env, ctx, route.id)
   }
+
+  recordRouteCall(env, ctx, {
+    // Only async rows get a deterministic id; a synchronous call is already
+    // terminal and nothing will ever need to find it again.
+    callId:
+      asyncInfo.isAsync && asyncInfo.jobId
+        ? asyncCallId(route.id, asyncInfo.jobId)
+        : undefined,
+    routeId: route.id,
+    method: request.method,
+    // A 401/403 on a route where WE hold the upstream credential is our
+    // misconfiguration, not the caller sending a bad request — publishing it
+    // as a provider outage (or as the caller's fault) would both be wrong.
+    //
+    // `deliveryFailed` matters independently of the status: an upstream that
+    // answers 200 with an empty body produces kind:'error' with
+    // merchantStatus 200, and the payer is refunded. Classifying on status
+    // alone would raise that provider's success rate for a call we had to
+    // give the money back on.
+    outcome: classifyOutcome(result.merchantStatus, {
+      // The pay-invoice bridge injects PAYINVOICE_ADMIN_SECRET without
+      // setting route.upstreamAuth, so an expired admin secret of OURS would
+      // otherwise be published as the provider refusing to serve.
+      routerHoldsCredential:
+        Boolean(route.upstreamAuth) ||
+        (isRozoPayInvoiceRoute(route) && Boolean(env.PAYINVOICE_ADMIN_SECRET)),
+      routerSideFailure: result.kind === 'error' && result.routerSideFailure === true,
+      // Reuse the SAME detector handleAsyncJob uses, rather than checking
+      // for 202 here: merchants also queue work with 200 plus a
+      // {status:"queued", jobId} body, and a second detector would drift
+      // from this one the way the backfill classifier already did.
+      // Only claim "accepted, ask later" when the merchant gave us a job id
+      // to ask WITH. A 202 without one cannot be resolved by anything —
+      // finishAsyncDelivery is keyed on the job id — so marking it pending
+      // would strand the row permanently. The proxy refunds that caller, so
+      // it is a failed delivery, and an async response with no job id is the
+      // provider breaking the protocol it chose.
+      asyncAccepted: asyncInfo.isAsync && Boolean(asyncInfo.jobId),
+      deliveryFailed:
+        result.kind === 'error' || (asyncInfo.isAsync && !asyncInfo.jobId),
+    }),
+    reason:
+      result.kind === 'error'
+        ? (result.refundReason ?? 'upstream_error')
+        : asyncInfo.isAsync && !asyncInfo.jobId
+          ? 'async_response_without_job_id'
+          : undefined,
+    upstreamStatus: result.merchantStatus,
+    latencyMs: result.latencyMs ?? elapsedMs,
+  })
 
   return result
 }
@@ -754,6 +862,7 @@ async function payMerchantAndGetBodyInner(
       return {
         kind: 'error',
         refundReason: 'upstream_5xx',
+        routerSideFailure: true,
         response: new Response(
           JSON.stringify({
             error: 'Router session channel not installed',

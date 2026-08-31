@@ -21,6 +21,8 @@ import { handleProxy } from './routes/proxy'
 import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './routes/job-status'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
+import { handleAllServiceMetrics, handleServiceMetrics } from './routes/service-metrics'
+import { handleStats } from './routes/stats'
 import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
 import { handleX402Supported } from './routes/x402-supported'
@@ -378,6 +380,15 @@ export interface Env {
   // wrangler.toml. NOT the Rozo Intents Supabase. Optional so a staged rollout
   // can deploy the code before provisioning the DB (audit becomes a no-op).
   COUPON_SECURITY_DB?: D1Database
+
+  // Per-provider service-quality metrics: one row per paid upstream call
+  // (src/services/route-metrics.ts). Separate database from
+  // COUPON_SECURITY_DB because that one carries a strict redaction
+  // invariant for payment forensics, while this one is published as-is on
+  // the public service pages — mixing them would put a public reader one
+  // JOIN away from the audit trail. Optional so a staged rollout can ship
+  // the code before the database exists (metrics become a no-op).
+  ROUTE_METRICS_DB?: D1Database
 
   // HMAC-SHA-256 key for the coupon audit digests (code_hash / payment_id_hash
   // / pair_hash / ip_prefix_hash). The 8-digit code space is enumerable, so a
@@ -792,6 +803,24 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Moves no money; rate-limited per-IP and per-session.
       if (url.pathname === '/v1/services/rozo-agent-api/invoice-details') {
         return handleInvoiceDetails(request, env)
+      }
+
+      // Public per-service statistics feed for the /stats page.
+      if (url.pathname === '/v1/stats' && request.method === 'GET') {
+        return handleStats(request, env)
+      }
+
+      // Public per-provider service-quality metrics. Must match BEFORE the
+      // catch-all `/v1/services/*` proxy route below, or `metrics` would be
+      // treated as an endpoint path on a service named `metrics`. GET-only
+      // and unauthenticated by design: these numbers exist to be checked by
+      // people who are not our customers.
+      if (url.pathname === '/v1/services/metrics' && request.method === 'GET') {
+        return handleAllServiceMetrics(env)
+      }
+      const serviceMetricsMatch = url.pathname.match(/^\/v1\/services\/([^/]+)\/metrics$/)
+      if (serviceMetricsMatch && request.method === 'GET') {
+        return handleServiceMetrics(env, serviceMetricsMatch[1])
       }
 
       // Async job polling — must match before the catch-all proxy route.
