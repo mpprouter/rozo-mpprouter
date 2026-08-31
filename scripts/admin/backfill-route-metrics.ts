@@ -132,7 +132,16 @@ function main() {
           `ledger entries at or after that are already recorded and will be skipped.`,
       )
     }
-    console.log(`Effective cutoff: ${new Date(liveCutoffMs).toISOString()}`)
+    // Infinity is a legitimate cutoff (--no-live-writer: take everything),
+    // but new Date(Infinity).toISOString() throws a RangeError and would
+    // abort the run before it inserted anything.
+    console.log(
+      `Effective cutoff: ${
+        Number.isFinite(liveCutoffMs)
+          ? new Date(liveCutoffMs).toISOString()
+          : 'none (no live writer asserted; all ledger rows eligible)'
+      }`,
+    )
   } catch (err) {
     // Fail closed. Guessing "no live rows" is exactly the assumption that
     // produces silent double counting.
