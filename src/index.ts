@@ -22,6 +22,7 @@ import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './ro
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleAllServiceMetrics, handleServiceMetrics } from './routes/service-metrics'
+import { handleStats } from './routes/stats'
 import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
 import { handleX402Supported } from './routes/x402-supported'
@@ -802,6 +803,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Moves no money; rate-limited per-IP and per-session.
       if (url.pathname === '/v1/services/rozo-agent-api/invoice-details') {
         return handleInvoiceDetails(request, env)
+      }
+
+      // Public per-service statistics feed for the /stats page.
+      if (url.pathname === '/v1/stats' && request.method === 'GET') {
+        return handleStats(request, env)
       }
 
       // Public per-provider service-quality metrics. Must match BEFORE the
