@@ -1008,8 +1008,16 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   let createOrderId: string | null = orderId
   let supersededClassic: any = null
 
-  const lookupOrder = async (id: string): Promise<any | null> => {
-    let lookup: Response | null = null
+  // Tri-state: only an explicit 404 means the orderId slot is free. Any other
+  // failure (network, 5xx, malformed body) is 'error' — treating it as a free
+  // slot could hand out a payable sibling while the order that failed to read
+  // is already settling the same invoice (codex round-2 P1).
+  type OrderLookup =
+    | { state: 'found'; row: any }
+    | { state: 'missing' }
+    | { state: 'error' }
+  const lookupOrder = async (id: string): Promise<OrderLookup> => {
+    let lookup: Response
     try {
       lookup = await fetch(
         `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(OPENROUTER_APP_ID)}/${encodeURIComponent(id)}`,
@@ -1019,19 +1027,33 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         },
       )
     } catch {
-      // Network blip on lookup is non-fatal — fall through to create.
-      return null
+      return { state: 'error' }
     }
-    if (!lookup.ok) return null
-    return await lookup.json().catch(() => null)
+    if (lookup.status === 404) return { state: 'missing' }
+    if (!lookup.ok) return { state: 'error' }
+    const row = await lookup.json().catch(() => undefined)
+    if (row === undefined) return { state: 'error' }
+    return { state: 'found', row }
   }
 
   if (orderId) {
     // Scan the base orderId and every contract-variant slot in parallel.
     const allIds = [orderId, ...contractVariantIds(orderId)]
     const scanned = await Promise.all(allIds.map((id) => lookupOrder(id)))
+    if (scanned.some((r) => r.state === 'error')) {
+      return errorResponse(502, {
+        code: 'INTENTS_API_FAILED',
+        message:
+          'Could not verify the existing orders for this payment link. ' +
+          'Retry shortly — creating a new order without that check could ' +
+          'invite a double payment.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
     const entries = allIds.map((id, i) => {
-      const row = scanned[i]
+      const r = scanned[i]
+      const row = r.state === 'found' ? r.row : null
       const expiresAt: string | null = row?.expiresAt ?? null
       const live = Boolean(expiresAt && Date.parse(expiresAt) > Date.now())
       return { id, row, live, status: row ? readPaymentStatus(row) : null }
@@ -1041,9 +1063,15 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     // webhook fulfillment record is keyed by the base link id), so a funded /
     // in-flight / settled sibling blocks EVERY caller in both pay-in modes:
     // handing back an unpaid sibling as payable would invite a second payment
-    // that can never be fulfilled twice.
+    // that can never be fulfilled twice. Expiry does NOT clear the block — a
+    // payment can still be settling after expiresAt (codex round-2 P1); only
+    // upstream's own terminal 'payment_expired' status frees the link.
     const inFlight = entries.find(
-      (e) => e.row && e.live && e.status !== REUSABLE_PAYMENT_STATUS,
+      (e) =>
+        e.row &&
+        e.status !== null &&
+        e.status !== REUSABLE_PAYMENT_STATUS &&
+        e.status !== 'payment_expired',
     )
     if (inFlight) {
       return json(409, {
@@ -1331,7 +1359,34 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       // between the scan and this create. Re-read that slot — if the winner
       // is reusable, hand it back instead of declaring the link dead.
       if (createOrderId && orderId && createOrderId !== orderId) {
-        const winner: any = await lookupOrder(createOrderId)
+        // Same guard as the main supersede path (codex round-2 P1): the
+        // classic payer may have raced funds in — never hand out a second
+        // payable rail while the classic order is no longer awaiting payment.
+        if (supersededClassic?.id) {
+          const classicNow = await refetchPaymentStatus(
+            env,
+            String(supersededClassic.id),
+          )
+          if (classicNow !== null && classicNow !== REUSABLE_PAYMENT_STATUS) {
+            return json(409, {
+              ok: false,
+              error: {
+                code: 'ORDER_ALREADY_ACTIVE',
+                message:
+                  `An order already exists for this invoice and is no longer awaiting ` +
+                  `payment (status: ${classicNow}). Do not pay again — ` +
+                  `poll the payment status instead.`,
+              },
+              linkId,
+              rozoPaymentId: supersededClassic.id,
+              status: classicNow,
+              expiresAt: supersededClassic?.expiresAt ?? null,
+            })
+          }
+        }
+        const winnerLookup = await lookupOrder(createOrderId)
+        const winner: any =
+          winnerLookup.state === 'found' ? winnerLookup.row : null
         const winnerExpiresAt: string | null = winner?.expiresAt ?? null
         const winnerValid =
           winnerExpiresAt && Date.parse(winnerExpiresAt) > Date.now()

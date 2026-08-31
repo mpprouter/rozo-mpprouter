@@ -66,6 +66,7 @@ function installFetchMock() {
     if (u.includes('/payments/order/')) {
       const lookedUp = decodeURIComponent(u.split('/').pop() ?? '')
       const row = existingByOrderId[lookedUp]
+      if (row === 'LOOKUP_500') return new Response('upstream down', { status: 500 })
       return row
         ? new Response(JSON.stringify(row), { status: 200 })
         : new Response('not found', { status: 404 })
@@ -444,6 +445,70 @@ describe('create-invoice — stellar_payin_contracts intent', () => {
         tokenSymbol: 'USDC',
         receiverAddressContract: 'CCONTRACTADDRESS',
       },
+    }
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: STELLAR_SOURCE,
+      intent: 'stellar_payin_contracts',
+    })
+    expect(status).toBe(200)
+    expect(json.superseded).toBe(true)
+    expect(createdIntent.orderId).toBe(`${PAYMENT_ID}__contract2`)
+  })
+
+  it('fails closed when a sibling lookup errors instead of treating it as free', async () => {
+    setExistingIntent({
+      id: 'rozo-pay-classic',
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '1500', tokenSymbol: 'USDC', amount: '10.5', receiverAddress: 'G' },
+    })
+    existingByOrderId[`${PAYMENT_ID}__contract`] = 'LOOKUP_500'
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: STELLAR_SOURCE,
+      intent: 'stellar_payin_contracts',
+    })
+    expect(status).toBe(502)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(createdIntent).toBeNull()
+  })
+
+  it('blocks on an in-flight sibling even after its expiresAt has passed', async () => {
+    setExistingIntent({
+      id: 'rozo-pay-classic',
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '1500', tokenSymbol: 'USDC', amount: '10.5', receiverAddress: 'G' },
+    })
+    existingByOrderId[`${PAYMENT_ID}__contract`] = {
+      id: 'rozo-pay-settling',
+      status: 'payment_started',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      source: { chainId: '1500', tokenSymbol: 'USDC', receiverAddressContract: 'C' },
+    }
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: STELLAR_SOURCE,
+      intent: 'stellar_payin_contracts',
+    })
+    expect(status).toBe(409)
+    expect(json.error?.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.rozoPaymentId).toBe('rozo-pay-settling')
+  })
+
+  it('lets an upstream-expired sibling free the slot (payment_expired does not block)', async () => {
+    setExistingIntent({
+      id: 'rozo-pay-classic',
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '1500', tokenSymbol: 'USDC', amount: '10.5', receiverAddress: 'G' },
+    })
+    existingByOrderId[`${PAYMENT_ID}__contract`] = {
+      id: 'rozo-pay-dead',
+      status: 'payment_expired',
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      source: { chainId: '1500', tokenSymbol: 'USDC', receiverAddressContract: 'C' },
     }
     const { status, json } = await createInvoice({
       payment_id: PAYMENT_ID,
