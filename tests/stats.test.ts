@@ -91,26 +91,26 @@ describe('getStats', () => {
     expect(s.totals.volume_usd).toBe('0.3')
   })
 
-  it('excludes internal ROZO traffic from volume and buyers, but reports it', async () => {
+
+  it('counts every recorded call, whoever paid', async () => {
+    // The payer-classification split was removed deliberately: this is an
+    // internal operating view, so "internal vs external" was a distinction
+    // nobody read and three counters to keep true.
     const s = await getStats(
       env(
         [
           order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: BUYER_A, amount_usd: '1' }),
-          order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: INTERNAL, amount_usd: '99' }),
+          order({ route_id: 'mercury_a', ts: iso(now - 2000), payer: INTERNAL, amount_usd: '2' }),
+          order({ route_id: 'mercury_a', ts: iso(now - 3000), payer: null, amount_usd: '4' }),
         ],
         { internal: INTERNAL },
       ),
       '30d',
     )
-
-    const m = s.services[0]
-    expect(m.calls).toBe(1)
-    expect(m.buyers).toBe(1)
-    // Our own dogfood spend must not appear as external demand.
-    expect(m.volume_usd).toBe('1')
-    // ...but it is disclosed rather than silently dropped.
-    expect(m.internal_calls).toBe(1)
-    expect(s.totals.internal_calls).toBe(1)
+    expect(s.totals.calls).toBe(3)
+    expect(s.totals.volume_usd).toBe('7')
+    // An undecodable payer is still a call, just not a distinct buyer.
+    expect(s.totals.buyers).toBe(2)
   })
 
   it('counts distinct buyers, not calls', async () => {
@@ -126,21 +126,6 @@ describe('getStats', () => {
     expect(s.services[0].buyers).toBe(2)
   })
 
-  it('keeps a call with an undecodable payer out of external totals', async () => {
-    const s = await getStats(
-      env([order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: null, amount_usd: '5' })]),
-      '30d',
-    )
-    // 'unknown' is not 'external' — the ledger's attribution contract is
-    // explicit about that. Counting it toward calls and volume while
-    // refusing to count a buyer asserted demand we cannot evidence.
-    expect(s.services[0].calls).toBe(0)
-    expect(s.services[0].volume_usd).toBe('0')
-    expect(s.services[0].buyers).toBe(0)
-    // Disclosed in its own bucket rather than dropped silently.
-    expect(s.services[0].unknown_calls).toBe(1)
-    expect(s.totals.unknown_calls).toBe(1)
-  })
 
   it('honours the window boundary', async () => {
     const records = [
@@ -186,26 +171,6 @@ describe('getStats', () => {
 describe('getStats attribution and refunds', () => {
   const UNRESOLVED = 'GUNRESOLVEDPAYERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
 
-  it('does not count unresolved payers as external demand', async () => {
-    const s = await getStats(
-      env(
-        [
-          order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: BUYER_A, amount_usd: '1' }),
-          order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: UNRESOLVED, amount_usd: '5' }),
-        ],
-        { unresolved: UNRESOLVED },
-      ),
-      '30d',
-    )
-
-    const m = s.services[0]
-    // The ledger contract refuses to call these external; so must we.
-    expect(m.calls).toBe(1)
-    expect(m.buyers).toBe(1)
-    expect(m.volume_usd).toBe('1')
-    expect(m.unresolved_calls).toBe(1)
-    expect(s.totals.buyers).toBe(1)
-  })
 
   it('takes refunds from the ledger, which is actually updated', async () => {
     const s = await getStats(
@@ -252,19 +217,6 @@ describe('getStats coverage', () => {
     expect(s.services[0].calls).toBe(0)
   })
 
-  it('reports unresolved calls in the totals, not only per service', async () => {
-    const UNRESOLVED = 'GUNRESOLVEDTOTALSAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
-    const s = await getStats(
-      env(
-        [order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: UNRESOLVED })],
-        { unresolved: UNRESOLVED },
-      ),
-      '30d',
-    )
-    // The page reads this from totals; without it the expression is NaN and
-    // the exclusion hint disappears entirely.
-    expect(s.totals.unresolved_calls).toBe(1)
-  })
 
   it('marks a malformed ledger row as truncated rather than claiming completeness', async () => {
     const s = await getStats(

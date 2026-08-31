@@ -16,10 +16,9 @@
  * one buyer's calls across every service they bought from. Aggregating on
  * the server and publishing only counts leaks nothing.
  *
- * Internal ROZO traffic (probes, e2e, dogfood — LEDGER_INTERNAL_PAYERS) is
- * excluded from volume and buyer counts, because those are the figures a
- * grant reviewer is being asked to trust. It is reported separately as
- * `internal_calls` rather than silently dropped.
+ * Every recorded call is counted, whoever paid. The page is an internal
+ * operating view for now, so splitting traffic by payer classification
+ * added a distinction nobody was reading and three counters to keep true.
  */
 
 import type { OrderLedgerEntry } from './order-ledger'
@@ -59,19 +58,6 @@ export interface ServiceStats {
   service_id: string
   /** Paid calls from external payers in the window. */
   calls: number
-  /** Calls from ROZO's own test/dogfood wallets, reported, never hidden. */
-  internal_calls: number
-  /**
-   * Calls from Rozo-adjacent payers we cannot clear as external. Neither
-   * claimed as ours nor counted as demand — the ambiguity is published
-   * rather than resolved in our favour.
-   */
-  unresolved_calls: number
-  /**
-   * Calls whose payer could not be decoded. Not external, not ours — the
-   * ledger's attribution contract refuses to guess, and so does this.
-   */
-  unknown_calls: number
   /** Summed USDC, external payers only. String to avoid float drift. */
   volume_usd: string
   /** Distinct external payers. Computed server-side; no payer id is published. */
@@ -139,9 +125,6 @@ export interface StatsPayload {
   }
   totals: {
     calls: number
-    internal_calls: number
-    unresolved_calls: number
-    unknown_calls: number
     volume_usd: string
     buyers: number
     provider_success_rate: number | null
@@ -166,32 +149,6 @@ function addUsd(a: string, b: string): string {
   const whole = total / 1000000n
   const frac = (total % 1000000n).toString().padStart(6, '0').replace(/0+$/, '')
   return frac ? `${whole}.${frac}` : whole.toString()
-}
-
-function parseAddressList(raw: string | undefined): Set<string> {
-  return new Set(
-    (raw ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean),
-  )
-}
-
-/**
- * Payers that must not be counted as external demand.
- *
- * Two lists, not one, mirroring the contract in routes/ledger.ts:
- * LEDGER_INTERNAL_PAYERS is ours (probes, e2e, dogfood), while
- * LEDGER_UNRESOLVED_PAYERS is Rozo-adjacent and cannot be cleared as
- * external. Counting the second group as external would inflate the exact
- * buyer and volume figures a reviewer is checking, and the ledger endpoint
- * already refuses to make that claim.
- */
-function parseExcludedPayers(env: Env): { internal: Set<string>; unresolved: Set<string> } {
-  return {
-    internal: parseAddressList(env.LEDGER_INTERNAL_PAYERS),
-    unresolved: parseAddressList(env.LEDGER_UNRESOLVED_PAYERS),
-  }
 }
 
 async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; truncated: boolean }> {
@@ -281,15 +238,11 @@ function activitySeries(timestamps: number[], window: MetricsWindow, now: number
 export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPayload> {
   const now = Date.now()
   const cutoff = window === 'all' ? 0 : now - WINDOW_MS[window]
-  const excluded = parseExcludedPayers(env)
 
   const { entries, truncated } = await readLedger(env)
 
   interface Acc {
     calls: number
-    internal: number
-    unresolved: number
-    unknown: number
     refunded: number
     volume: string
     buyers: Set<string>
@@ -302,9 +255,6 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     if (!a) {
       a = {
         calls: 0,
-        internal: 0,
-        unresolved: 0,
-        unknown: 0,
         refunded: 0,
         volume: '0',
         buyers: new Set(),
@@ -321,30 +271,13 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     if (Number.isNaN(ts) || ts < cutoff) continue
     const a = acc(serviceIdFromRouteId(e.route_id))
 
-    if (e.payer && excluded.internal.has(e.payer)) {
-      a.internal += 1
-      continue
-    }
-    if (e.payer && excluded.unresolved.has(e.payer)) {
-      a.unresolved += 1
-      continue
-    }
-
-    // A call whose payer we could not decode is 'unknown', and the ledger's
-    // own four-way attribution is explicit that unknown is NOT external.
-    // Counting it toward external calls and volume while refusing to count
-    // it as a buyer asserted demand we cannot evidence — in the direction
-    // that flatters us — so it is reported in its own bucket instead.
-    if (!e.payer) {
-      a.unknown += 1
-      continue
-    }
-
     a.calls += 1
     if (e.refund_status === 'refunded') a.refunded += 1
     a.tss.push(ts)
     a.volume = addUsd(a.volume, e.amount_usd || '0')
-    a.buyers.add(e.payer)
+    // Undecodable payers still count as calls; they simply cannot contribute
+    // a distinct buyer.
+    if (e.payer) a.buyers.add(e.payer)
     a.last = a.last === null ? ts : Math.max(a.last, ts)
   }
 
@@ -369,9 +302,6 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     services.push({
       service_id: serviceId,
       calls: a.calls,
-      internal_calls: a.internal,
-      unresolved_calls: a.unresolved,
-      unknown_calls: a.unknown,
       volume_usd: a.volume,
       buyers: a.buyers.size,
       last_call_at: a.last,
@@ -395,9 +325,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   for (const e of entries) {
     const ts = Date.parse(e.ts)
     if (Number.isNaN(ts) || ts < cutoff) continue
-    if (!e.payer) continue
-    if (excluded.internal.has(e.payer) || excluded.unresolved.has(e.payer)) continue
-    totalBuyers.add(e.payer)
+    if (e.payer) totalBuyers.add(e.payer)
   }
 
   return {
@@ -414,16 +342,12 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
           : qualityAvailability,
       known_gaps: [
         'Successful asynchronous (202) purchases return before the order ledger is written, so they are absent from volume, buyer and call counts. Their quality outcome IS recorded.',
-        'Quality figures include ROZO test traffic; the payer is unknown where those rows are written. Volume and buyer counts exclude it.',
         'An x402 payment whose settlement fails after the merchant already answered 2xx still writes an order row, so volume can overstate settled commerce during facilitator or chain incidents. The settlement outcome is not yet persisted per order.',
         'Order-ledger records expire after 400 days, so the "all" window is a trailing 400 days for volume, buyers and refunds rather than true all-time. Quality history in D1 does not expire.',
       ],
     },
     totals: {
       calls: services.reduce((n, s) => n + s.calls, 0),
-      internal_calls: services.reduce((n, s) => n + s.internal_calls, 0),
-      unresolved_calls: services.reduce((n, s) => n + s.unresolved_calls, 0),
-      unknown_calls: services.reduce((n, s) => n + s.unknown_calls, 0),
       volume_usd: services.reduce((v, s) => addUsd(v, s.volume_usd), '0'),
       buyers: totalBuyers.size,
       provider_success_rate:
