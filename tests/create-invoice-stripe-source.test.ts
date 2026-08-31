@@ -10,6 +10,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { handleCreateInvoice } from '../src/routes/create-invoice'
+import { handleInvoiceDetails } from '../src/routes/invoice-details'
+import { createQuoteReceipt, verifyQuoteReceipt } from '../src/routes/quote-receipt'
 import type { Env } from '../src/index'
 
 const STRIPE_URL = 'https://crypto.stripe.com/pay/CDMTestBlob_ABC123xyz'
@@ -50,13 +52,14 @@ function makeDoStub() {
   return { idFromName: (n: string) => ({ name: n }), get: () => stub }
 }
 
-function makeEnv(): Env {
+function makeEnv(feeBps?: string): Env {
   return {
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     ROZO_INTENTS_API_KEY: 'test-key',
     MPP_STORE: makeKvStub(),
     ATOMIC_STORE: makeDoStub(),
     INVOICE_CAPABILITY_ENCRYPTION_KEY: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
+    CHECKOUT_WEB_FEE_BPS: feeBps,
   } as unknown as Env
 }
 
@@ -70,12 +73,14 @@ let checkoutBody: any = null
 let checkoutResponse: () => Response = () => new Response('{}', { status: 200 })
 /** When set, the post-rotation status refetch returns this instead of existingIntent. */
 let refetchedIntent: any = null
+let stripeMerchantTitle = 'Test Merchant'
 
 function installFetchMock() {
   createdIntent = null
   existingIntent = null
   checkoutBody = null
   refetchedIntent = null
+  stripeMerchantTitle = 'Test Merchant'
   checkoutResponse = () => new Response('{}', { status: 200 })
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u =
@@ -96,7 +101,7 @@ function installFetchMock() {
         JSON.stringify({
           id: 'cpis_test123',
           state: 'checkout',
-          business_name: 'Test Merchant',
+          business_name: stripeMerchantTitle,
           merchant: 'acct_test',
           payment_details: { amount: 1000, currency: 'usd' },
           supported_currencies: [
@@ -147,16 +152,34 @@ function installFetchMock() {
   }) as typeof fetch)
 }
 
-async function createInvoice(body: Record<string, unknown>) {
+async function createInvoice(body: Record<string, unknown>, feeBps?: string) {
   const res = await handleCreateInvoice(
     new Request('https://mpp.test/create-invoice', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     }),
-    makeEnv(),
+    makeEnv(feeBps),
   )
   return { status: res.status, json: (await res.json()) as any }
+}
+
+async function openRouterFeeReceipt(nowSeconds = Math.floor(Date.now() / 1000)) {
+  return createQuoteReceipt(
+    'cpis_test123',
+    '10',
+    'OpenRouter',
+    'test-admin-secret',
+    nowSeconds,
+    {
+      original: '10',
+      serviceFee: '0.1',
+      callerPays: '10.1',
+      feeBps: 100,
+      pricingVersion: 'checkout-web-fee-v1',
+      client: 'rozo-checkout-web',
+    },
+  )
 }
 
 beforeEach(() => {
@@ -216,6 +239,163 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
     expect(createdIntent.destination.amount).toBe('10')
   })
 
+  it('charges and persists the same 1% browser fee on stablecoin and Lightning', async () => {
+    stripeMerchantTitle = 'OpenRouter'
+    const quoteReceipt = await openRouterFeeReceipt()
+    for (const source of [
+      undefined,
+      { chainId: 'lightning', tokenSymbol: 'BTC' },
+    ]) {
+      const { status, json } = await createInvoice(
+        {
+          url: STRIPE_URL,
+          client: 'rozo-checkout-web',
+          quoteReceipt,
+          ...(source ? { source } : {}),
+        },
+        '100',
+      )
+      expect(status).toBe(200)
+      expect(json).toMatchObject({
+        original: '10',
+        serviceFee: '0.1',
+        callerPays: '10.1',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+      })
+      expect(createdIntent.type === 'exactOut'
+        ? createdIntent.destination.amount
+        : createdIntent.source.amount).toBe('10.1')
+      expect(createdIntent.metadata).toMatchObject({
+        client: 'rozo-checkout-web',
+        invoiceAmountAtomic: '10000000',
+        original: '10',
+        serviceFee: '0.1',
+        callerPays: '10.1',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+      })
+    }
+  })
+
+  it('invoice-details returns the signed Stripe pricing snapshot the confirm card must show', async () => {
+    stripeMerchantTitle = 'OpenRouter'
+    const response = await handleInvoiceDetails(
+      new Request('https://mpp.test/invoice-details', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'CF-Connecting-IP': '1.2.3.4' },
+        body: JSON.stringify({ url: STRIPE_URL, client: 'rozo-checkout-web' }),
+      }),
+      makeEnv('100'),
+    )
+    const body = await response.json() as any
+    expect(response.status).toBe(200)
+    expect(body).toMatchObject({
+      original: '10',
+      serviceFee: '0.1',
+      callerPays: '10.1',
+      feeBps: 100,
+      pricingVersion: 'checkout-web-fee-v1',
+    })
+    await expect(
+      verifyQuoteReceipt(body.quoteReceipt, 'cpis_test123', 'test-admin-secret'),
+    ).resolves.toMatchObject({
+      original: '10',
+      serviceFee: '0.1',
+      callerPays: '10.1',
+      client: 'rozo-checkout-web',
+    })
+  })
+
+  it('refuses fee-enabled Stripe create without the invoice-details receipt', async () => {
+    stripeMerchantTitle = 'OpenRouter'
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      client: 'rozo-checkout-web',
+    }, '100')
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('QUOTE_RECEIPT_REQUIRED')
+    expect(createdIntent).toBeNull()
+  })
+
+  it('rejects mismatched and expired Stripe receipts without creating', async () => {
+    stripeMerchantTitle = 'OpenRouter'
+    const mismatched = await createQuoteReceipt(
+      'cpis_other',
+      '10',
+      'OpenRouter',
+      'test-admin-secret',
+    )
+    for (const quoteReceipt of [mismatched, await openRouterFeeReceipt(1_000)]) {
+      const { status, json } = await createInvoice({
+        url: STRIPE_URL,
+        client: 'rozo-checkout-web',
+        quoteReceipt,
+      }, '100')
+      expect(status).toBe(409)
+      expect(json.error.code).toBe('QUOTE_RECEIPT_INVALID_OR_EXPIRED')
+      expect(createdIntent).toBeNull()
+    }
+  })
+
+  it('keeps zero-fee Stripe compatibility for an invalid or client-mismatched receipt', async () => {
+    stripeMerchantTitle = 'OpenRouter'
+    const clientMismatched = await createQuoteReceipt(
+      'cpis_test123',
+      '10',
+      'OpenRouter',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '10',
+        serviceFee: '0',
+        callerPays: '10',
+        feeBps: 0,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: null,
+      },
+    )
+    for (const quoteReceipt of ['tampered.receipt', clientMismatched]) {
+      const { status, json } = await createInvoice({
+        url: STRIPE_URL,
+        client: 'rozo-checkout-web',
+        quoteReceipt,
+      }, '0')
+      expect(status).toBe(200)
+      expect(json.serviceFee).toBe('0')
+      expect(createdIntent.source.amount).toBe('10')
+    }
+  })
+
+  it('honors the signed Stripe quote price when the env changes before create', async () => {
+    stripeMerchantTitle = 'OpenRouter'
+    const quoteReceipt = await createQuoteReceipt(
+      'cpis_test123',
+      '10',
+      'OpenRouter',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '10',
+        serviceFee: '0.1',
+        callerPays: '10.1',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-web',
+      },
+    )
+
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      client: 'rozo-checkout-web',
+      quoteReceipt,
+    }, '0')
+
+    expect(status).toBe(200)
+    expect(json.callerPays).toBe('10.1')
+    expect(createdIntent.source.amount).toBe('10.1')
+  })
+
   it('rejects an unsupported source explicitly instead of silently ignoring it', async () => {
     // Base has no USDT. Previously this was swallowed and billed as Base USDC.
     const { status, json } = await createInvoice({
@@ -270,6 +450,102 @@ describe('Stripe create-invoice — what source must NOT change', () => {
 })
 
 describe('Stripe create-invoice — reuse with a conflicting source', () => {
+  it('rejects a zero-fee pending order when the browser canary price is now 1%', async () => {
+    stripeMerchantTitle = 'OpenRouter, Inc.'
+    const quoteReceipt = await createQuoteReceipt(
+      'cpis_test123',
+      '10',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '10',
+        serviceFee: '0.1',
+        callerPays: '10.1',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-web',
+      },
+    )
+    existingIntent = {
+      id: 'rozo-existing-price',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
+    }
+
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      client: 'rozo-checkout-web',
+      quoteReceipt,
+    }, '100')
+
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('LEGACY_PRICING_ORDER_PENDING')
+    expect(createdIntent).toBeNull()
+  })
+
+  it('reuses a fee-priced pending order when lookup omits metadata but amount matches', async () => {
+    stripeMerchantTitle = 'OpenRouter, Inc.'
+    const quoteReceipt = await createQuoteReceipt(
+      'cpis_test123',
+      '10',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '10',
+        serviceFee: '0.1',
+        callerPays: '10.1',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: 'rozo-checkout-web',
+      },
+    )
+    existingIntent = {
+      id: 'rozo-existing-price',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10.1' },
+    }
+
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      client: 'rozo-checkout-web',
+      quoteReceipt,
+    }, '100')
+
+    expect(status).toBe(200)
+    expect(json.reused).toBe(true)
+    expect(json.callerPays).toBe('10.1')
+    expect(createdIntent).toBeNull()
+  })
+
+  it('rejects a fee-bearing row with unreadable amount after rollback to zero', async () => {
+    stripeMerchantTitle = 'OpenRouter, Inc.'
+    existingIntent = {
+      id: 'rozo-existing-price',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC' },
+      metadata: {
+        original: '10',
+        serviceFee: '0.1',
+        callerPays: '10.1',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v1',
+      },
+    }
+
+    const { status, json } = await createInvoice({ url: STRIPE_URL })
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('LEGACY_PRICING_ORDER_PENDING')
+    expect(createdIntent).toBeNull()
+  })
+
   it('rotates the unpaid order onto the requested source instead of echoing the old one', async () => {
     existingIntent = {
       id: 'rozo-existing-1',

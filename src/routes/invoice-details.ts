@@ -1,11 +1,13 @@
 // Public read-only invoice detail endpoint.
 //
-// POST /v1/services/rozo-agent-api/invoice-details  { "url": "<invoice url>" }
+// POST /v1/services/rozo-agent-api/invoice-details
+//   { "url": "<invoice url>", "client": "rozo-checkout-web" }
 //
 // Resolves a Coinbase or Stripe checkout URL to normalized, NON-SECRET detail:
 // merchant, amount, currency, state, expiry, supported payment options, and
 // masked transaction details — the same data a customer already sees on the
-// checkout page.
+// checkout page. Stripe responses also include the priced checkout total and
+// a signed receipt that create-invoice requires when the fee canary is active.
 //
 // This endpoint moves NO money and NEVER exposes: client_secret, publishable
 // key, the raw session URL/hash, unmasked wallet addresses, private keys, or
@@ -21,6 +23,13 @@ import {
   StripeResolveError,
   type NormalizedInvoice,
 } from './invoice-provider'
+import { createQuoteReceipt } from './quote-receipt'
+import {
+  formatUsdcAtomic,
+  isExactCheckoutWebClient,
+  normalizeCheckoutClient,
+  resolveCheckoutPricing,
+} from './checkout-web-pricing'
 
 // Rate limits (design doc §5.1). Per-IP protects the endpoint; per-session
 // protects an individual live Stripe session from being pounded.
@@ -197,5 +206,50 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
       return json(502, { ok: false, provider, error: 'Failed to resolve Coinbase invoice' })
     }
   }
+  if (provider === 'stripe_crypto') {
+    const clientRaw = body.client
+    const client = normalizeCheckoutClient(clientRaw)
+    const pricingClient = isExactCheckoutWebClient(clientRaw) ? client : null
+    const pricing = resolveCheckoutPricing(
+      BigInt(invoice.stablecoinAmountAtomic),
+      invoice.merchantTitle,
+      pricingClient,
+      env.CHECKOUT_WEB_FEE_BPS,
+    )
+    const pricingFields = {
+      original: formatUsdcAtomic(pricing.originalAtomic),
+      serviceFee: formatUsdcAtomic(pricing.serviceFeeAtomic),
+      callerPays: formatUsdcAtomic(pricing.callerPaysAtomic),
+      feeBps: pricing.feeBps,
+      pricingVersion: pricing.pricingVersion,
+    }
+
+    // A non-zero canary must never become display-X/create-X+fee. Fail closed
+    // if we cannot issue the signed snapshot create-invoice requires.
+    if (pricing.feeBps > 0 && !env.PAYINVOICE_ADMIN_SECRET) {
+      return json(503, {
+        ok: false,
+        provider,
+        error: 'Signed checkout pricing is temporarily unavailable.',
+      })
+    }
+    const quoteReceipt = env.PAYINVOICE_ADMIN_SECRET
+      ? await createQuoteReceipt(
+          invoice.invoiceKey,
+          invoice.stablecoinAmount,
+          invoice.merchantTitle,
+          env.PAYINVOICE_ADMIN_SECRET,
+          Math.floor(Date.now() / 1000),
+          { ...pricingFields, client: pricingClient },
+        )
+      : null
+    return json(200, {
+      ok: true,
+      invoice,
+      ...pricingFields,
+      ...(quoteReceipt ? { quoteReceipt } : {}),
+    })
+  }
+
   return json(200, { ok: true, invoice })
 }
