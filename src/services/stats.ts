@@ -56,6 +56,16 @@ export interface ServiceStats {
   last_call_at: number | null
   /** ok / (ok + provider_fault), or null when nothing was served. */
   provider_success_rate: number | null
+  /**
+   * Calls excluded from `provider_success_rate` and why. Published, not
+   * merely documented: the first backfill produced 28 ok and 19 caller
+   * errors, so the rate reads 100% while 40% of calls sit outside the
+   * denominator. A bare 100% with no visible exclusion count is
+   * indistinguishable from cherry-picking, and a reviewer is right to
+   * treat it that way.
+   */
+  caller_error: number
+  router_fault: number
   latency_p50_ms: number | null
   refund_rate: number | null
   /** Per-day external call counts, oldest first, for the activity sparkline. */
@@ -71,6 +81,8 @@ export interface StatsPayload {
     volume_usd: string
     buyers: number
     provider_success_rate: number | null
+    caller_error: number
+    router_fault: number
   }
   services: ServiceStats[]
   /** True when the ledger scan hit MAX_LEDGER_KEYS; figures are then a floor. */
@@ -204,6 +216,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       buyers: a.buyers.size,
       last_call_at: a.last,
       provider_success_rate: w.provider_success_rate,
+      caller_error: w.caller_error,
+      router_fault: w.router_fault,
       latency_p50_ms: w.latency_p50_ms,
       refund_rate: w.refund_rate,
       activity: activitySeries(a.tss, window, now),
@@ -229,6 +243,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       volume_usd: services.reduce((v, s) => addUsd(v, s.volume_usd), '0'),
       buyers: totalBuyers.size,
       provider_success_rate: allQuality[window].provider_success_rate,
+      caller_error: allQuality[window].caller_error,
+      router_fault: allQuality[window].router_fault,
     },
     services,
     truncated,
