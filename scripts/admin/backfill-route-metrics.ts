@@ -25,6 +25,10 @@
  */
 
 import { execFileSync } from 'node:child_process'
+// Imported at module scope, not via require(): package.json sets
+// "type": "module", so require is undefined here. The dry-run path never
+// reaches the write, which is exactly how this stayed hidden.
+import { writeFileSync } from 'node:fs'
 
 const KV_NAMESPACE_ID = 'b0fa51efc09e4e708c6bd5061b0663e0'
 const D1_NAME = 'mpprouter-route-metrics'
@@ -62,7 +66,10 @@ function serviceIdFromRouteId(routeId: string): string {
  */
 function classify(status: number, routerHoldsCredential: boolean): string {
   if (status >= 200 && status < 300) return 'ok'
-  if (status === 401 || status === 403) return routerHoldsCredential ? 'router_fault' : 'caller_error'
+  // Not 'caller_error': the agent's Authorization never reaches the upstream
+  // (forwardHeaders strips it), so an auth rejection is ours or the
+  // provider's. Must match classifyOutcome exactly.
+  if (status === 401 || status === 403) return routerHoldsCredential ? 'router_fault' : 'provider_fault'
   if (status === 408 || status === 429) return 'provider_fault'
   if (status >= 400 && status < 500) return 'caller_error'
   return 'provider_fault'
@@ -115,7 +122,7 @@ function main() {
     const callId = `backfill:${entry.order_id}`
     const esc = (v: string) => `'${v.replace(/'/g, "''")}'`
     statements.push(
-      `INSERT INTO route_metric_calls (call_id, created_at, service_id, route_id, method, outcome, reason, upstream_status, latency_ms, refunded, is_internal) VALUES (${esc(callId)}, ${createdAt}, ${esc(serviceIdFromRouteId(entry.route_id))}, ${esc(entry.route_id)}, 'GET', ${esc(outcome)}, ${outcome === 'ok' ? 'NULL' : esc('backfilled_from_order_ledger')}, ${entry.upstream_status}, ${latency ?? 'NULL'}, ${refunded}, 0) ON CONFLICT(call_id) DO NOTHING;`,
+      `INSERT INTO route_metric_calls (call_id, created_at, service_id, route_id, method, outcome, reason, upstream_status, latency_ms, refunded) VALUES (${esc(callId)}, ${createdAt}, ${esc(serviceIdFromRouteId(entry.route_id))}, ${esc(entry.route_id)}, 'GET', ${esc(outcome)}, ${outcome === 'ok' ? 'NULL' : esc('backfilled_from_order_ledger')}, ${entry.upstream_status}, ${latency ?? 'NULL'}, ${refunded}) ON CONFLICT(call_id) DO NOTHING;`,
     )
   }
 
@@ -134,7 +141,7 @@ function main() {
   }
 
   const sqlFile = `/tmp/backfill-route-metrics-${Date.now()}.sql`
-  require('node:fs').writeFileSync(sqlFile, statements.join('\n'))
+  writeFileSync(sqlFile, statements.join('\n'))
   wrangler(['d1', 'execute', D1_NAME, '--remote', '--file', sqlFile])
   console.log(`Wrote ${statements.length} rows to ${D1_NAME}.`)
 }

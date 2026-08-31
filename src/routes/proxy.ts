@@ -552,6 +552,21 @@ type MerchantPayResult =
     }
 
 /**
+ * Errors we raise ourselves before the upstream is reached. Matched by
+ * `name` rather than `instanceof` so the set stays a plain data list and
+ * does not drag channel/session modules into this file's import graph.
+ *
+ * These must not count against a provider's published success rate: nothing
+ * about them says the provider failed to serve.
+ */
+const ROUTER_SIDE_ERROR_NAMES = new Set([
+  // src/mpp/tempo-client.ts — merchant has no payment channel installed.
+  'ChannelNotInstalledError',
+  // src/mpp/tempo-client.ts — our own configured budget ceiling rejected it.
+  'BudgetExceededError',
+])
+
+/**
  * Thin wrapper that feeds the catalog's live health signal.
  *
  * Wrapped rather than inlined at each `return` because this function has
@@ -594,14 +609,20 @@ async function payMerchantAndGetBody(
     // could fail every call through that path while still advertising
     // live_status "ok" — the exact blind spot this field exists to close.
     recordRouteFailure(env, ctx, route.id, 'timeout')
-    // No upstream status exists on a throw, so classifyOutcome attributes it
-    // to the provider leg. Latency is deliberately omitted: a call that threw
-    // has no delivery time worth publishing.
+    // A throw carries no upstream status, and classifyOutcome therefore
+    // blames the provider leg — correct for a timeout or a dropped
+    // connection, wrong for the setup errors we raise ourselves before the
+    // provider is ever reached. A session channel that was never installed
+    // is our (or the agent's) missing configuration; booking it as a
+    // provider outage would deflate a provider's published success rate for
+    // something it had no part in. Latency is deliberately omitted: a call
+    // that threw has no delivery time worth publishing.
+    const routerSideFailure = ROUTER_SIDE_ERROR_NAMES.has((err as Error)?.name)
     recordRouteCall(env, ctx, {
       routeId: route.id,
       method: request.method,
-      outcome: classifyOutcome(undefined),
-      reason: 'timeout',
+      outcome: classifyOutcome(undefined, { routerSideFailure }),
+      reason: routerSideFailure ? (err as Error).name : 'timeout',
     })
     throw err
   }

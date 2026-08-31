@@ -47,11 +47,12 @@ function metricsDb(rows: any[] = []) {
   } as any
 }
 
-function env(records: string[], opts: { internal?: string } = {}): Env {
+function env(records: string[], opts: { internal?: string; unresolved?: string } = {}): Env {
   return {
     MPP_STORE: kv(records),
     ROUTE_METRICS_DB: metricsDb(),
     LEDGER_INTERNAL_PAYERS: opts.internal,
+    LEDGER_UNRESOLVED_PAYERS: opts.unresolved,
   } as unknown as Env
 }
 
@@ -165,5 +166,60 @@ describe('getStats', () => {
     expect(s.totals.calls).toBe(0)
     // The caller must be able to tell "no data" from "we could not read it".
     expect(s.truncated).toBe(true)
+  })
+})
+
+describe('getStats attribution and refunds', () => {
+  const UNRESOLVED = 'GUNRESOLVEDPAYERAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+
+  it('does not count unresolved payers as external demand', async () => {
+    const s = await getStats(
+      env(
+        [
+          order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: BUYER_A, amount_usd: '1' }),
+          order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: UNRESOLVED, amount_usd: '5' }),
+        ],
+        { unresolved: UNRESOLVED },
+      ),
+      '30d',
+    )
+
+    const m = s.services[0]
+    // The ledger contract refuses to call these external; so must we.
+    expect(m.calls).toBe(1)
+    expect(m.buyers).toBe(1)
+    expect(m.volume_usd).toBe('1')
+    expect(m.unresolved_calls).toBe(1)
+    expect(s.totals.buyers).toBe(1)
+  })
+
+  it('takes refunds from the ledger, which is actually updated', async () => {
+    const s = await getStats(
+      env([
+        order({ route_id: 'mercury_a', ts: iso(now - 1000), refund_status: 'refunded' }),
+        order({ route_id: 'mercury_a', ts: iso(now - 2000), refund_status: 'none' }),
+        // 'pending' is not yet money returned, so it is not counted.
+        order({ route_id: 'mercury_a', ts: iso(now - 3000), refund_status: 'pending' }),
+      ]),
+      '30d',
+    )
+    expect(s.services[0].refunded).toBe(1)
+    expect(s.services[0].refund_rate).toBeCloseTo(0.3333, 4)
+    expect(s.totals.refunded).toBe(1)
+  })
+
+  it('degrades to truncated when an individual KV read fails', async () => {
+    const broken = {
+      MPP_STORE: {
+        async list() {
+          return { keys: [{ name: 'mercury_order:0' }], list_complete: true }
+        },
+        get: () => Promise.reject(new Error('kv read failed')),
+      },
+      ROUTE_METRICS_DB: metricsDb(),
+    } as unknown as Env
+    // Must not become a 500; the endpoint promises degradation.
+    const s = await getStats(broken, '30d')
+    expect(s.totals.calls).toBe(0)
   })
 })

@@ -117,11 +117,22 @@ migrations_dir = "migrations"
 #   wrangler d1 migrations apply mpprouter-route-metrics --remote
 # Migrations live in migrations-metrics/ (a per-database directory; wrangler
 # tracks applied migrations per database, so they must not share one).
-[[d1_databases]]
-binding = "ROUTE_METRICS_DB"
-database_name = "mpprouter-route-metrics"
-database_id = "PROVISION_ME"
-migrations_dir = "migrations-metrics"
+# COMMENTED OUT UNTIL PROVISIONED. Cloudflare rejects a placeholder database
+# id, so leaving one here would break every deploy of this Worker, including
+# deploys that have nothing to do with metrics. The binding is optional in
+# code (ROUTE_METRICS_DB?), so with this block absent the Worker runs and
+# metric recording is simply a no-op.
+#
+# To enable:
+#   wrangler d1 create mpprouter-route-metrics
+#   (paste the returned database_id below, then uncomment this block)
+#   wrangler d1 migrations apply mpprouter-route-metrics --remote
+#
+# [[d1_databases]]
+# binding = "ROUTE_METRICS_DB"
+# database_name = "mpprouter-route-metrics"
+# database_id = "<paste-from-wrangler-d1-create>"
+# migrations_dir = "migrations-metrics"
 
 # Public keys (not secrets, safe to commit)
 [vars]

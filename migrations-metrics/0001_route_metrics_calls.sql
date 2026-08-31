@@ -66,12 +66,13 @@ CREATE TABLE IF NOT EXISTS route_metric_calls (
   -- 1 when the payer was refunded for this call. A provider that fails and
   -- refunds and one that fails and keeps the money are different promises,
   -- so the page reports refund rate next to success rate.
-  refunded       INTEGER NOT NULL DEFAULT 0,
+  refunded       INTEGER NOT NULL DEFAULT 0
 
-  -- 1 when the call came from ROZO's own test/dogfood traffic. Published
-  -- figures exclude these; without the flag our own smoke tests would
-  -- inflate exactly the numbers reviewers are asked to trust.
-  is_internal    INTEGER NOT NULL DEFAULT 0
+  -- NOTE: there is deliberately no is_internal column. The payer is not
+  -- known at the proxy chokepoint where these rows are written, so the flag
+  -- could only ever be written as 0 — a promise of exclusion that never
+  -- happens. Internal traffic is excluded in services/stats.ts, which reads
+  -- the order ledger where the payer IS recorded.
 );
 
 -- Every public query is "one service over a time window" or "all services

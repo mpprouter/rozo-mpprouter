@@ -23,11 +23,11 @@ import type { Env } from '../index'
 /**
  * Whose fault a call was — deliberately not "did it work".
  *
- * A raw success rate charges providers for our own bad requests. In the
- * order ledger on 2026-08-31, 19 of 47 lifetime calls were non-2xx and most
- * were 4xx from malformed parameters we sent; publishing that as a 60%
- * provider success rate would have been false. Only `provider_fault` counts
- * against a provider.
+ * A raw success rate charges providers for our own bad requests: in the
+ * order ledger on 2026-08-31, 19 of 47 lifetime calls were non-2xx, many of
+ * them 4xx from malformed parameters we sent. Only `provider_fault` counts
+ * against a provider — but see classifyOutcome for which statuses actually
+ * qualify, because guessing that wrong hides real outages instead.
  */
 export type CallOutcome = 'ok' | 'provider_fault' | 'caller_error' | 'router_fault'
 
@@ -40,7 +40,6 @@ export interface RouteCallMetric {
   /** Omit when unmeasured. Never pass 0 as a stand-in — see classify note. */
   latencyMs?: number
   refunded?: boolean
-  isInternal?: boolean
 }
 
 /**
@@ -56,24 +55,42 @@ export function serviceIdFromRouteId(routeId: string): string {
 /**
  * Attribute an upstream result to a party.
  *
- * `routerHoldsCredential` matters for 401/403: on a route where WE present
- * the credential, an auth rejection is our misconfiguration, not the
- * caller's bad request and not the provider being down. On a route where
- * the caller's own payment authorises the call, the same status is a caller
- * problem. Getting this backwards would publish our own expired key as a
- * provider outage.
+ * `routerHoldsCredential` splits 401/403 between us and the provider. It is
+ * never the caller: their Authorization header does not reach the upstream.
+ * Getting this wrong in either direction corrupts the published rate —
+ * blaming the provider for our expired key, or (as the first version did)
+ * excluding a provider's refusals from its own success rate.
  */
 export function classifyOutcome(
   upstreamStatus: number | undefined,
-  opts: { routerHoldsCredential?: boolean } = {},
+  opts: { routerHoldsCredential?: boolean; routerSideFailure?: boolean } = {},
 ): CallOutcome {
+  // A failure we already know is ours — a missing router-owned session
+  // channel, for example — must not be charged to the provider just because
+  // no upstream status came back.
+  if (opts.routerSideFailure) return 'router_fault'
+
   // No status at all: transport failure, timeout or throw. Nothing reached
   // us from the provider, so it is the provider leg that failed.
   if (upstreamStatus === undefined) return 'provider_fault'
   if (upstreamStatus >= 200 && upstreamStatus < 300) return 'ok'
+
+  // 401/403 is NEVER the caller's fault on this rail. The agent's own
+  // Authorization header is stripped before we call upstream (see
+  // forwardHeaders in routes/proxy.ts) — the caller authenticates to US by
+  // paying, and whatever credential the upstream sees is either ours or the
+  // merchant's. So an auth rejection is our misconfiguration on routes where
+  // we hold the credential, and the provider's problem everywhere else.
+  //
+  // The earlier version of this function called it `caller_error`, which
+  // would have removed real provider failures (the historical Anthropic 403s
+  // among them) from the denominator and published 100% for a provider that
+  // was refusing to serve. That is precisely the number this table exists to
+  // make trustworthy.
   if (upstreamStatus === 401 || upstreamStatus === 403) {
-    return opts.routerHoldsCredential ? 'router_fault' : 'caller_error'
+    return opts.routerHoldsCredential ? 'router_fault' : 'provider_fault'
   }
+
   // 408 and 429 are 4xx but describe the upstream refusing to serve, not a
   // malformed request.
   if (upstreamStatus === 408 || upstreamStatus === 429) return 'provider_fault'
@@ -103,8 +120,8 @@ export function recordRouteCall(
         .prepare(
           `INSERT INTO route_metric_calls
              (call_id, created_at, service_id, route_id, method,
-              outcome, reason, upstream_status, latency_ms, refunded, is_internal)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              outcome, reason, upstream_status, latency_ms, refunded)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(call_id) DO NOTHING`,
         )
         .bind(
@@ -121,7 +138,6 @@ export function recordRouteCall(
           // ledger came to report a p50 of 0ms.
           metric.latencyMs ?? null,
           metric.refunded ? 1 : 0,
-          metric.isInternal ? 1 : 0,
         )
         .run()
     })().catch(() => {}),
@@ -224,7 +240,13 @@ function summarize(window: MetricsWindow, rows: RawRow[]): RouteQualityStats {
  * queries can straddle an inbound call and report a 24h count larger than
  * the 7d count.
  *
- * Internal ROZO test traffic is excluded from every published figure.
+ * NOTE ON INTERNAL TRAFFIC: these quality figures include ROZO's own test
+ * calls. The payer is not known at the proxy chokepoint where rows are
+ * written, so this table cannot attribute them, and a column that is always
+ * zero would be a promise we do not keep. Internal exclusion is applied in
+ * services/stats.ts, which reads the order ledger where the payer IS
+ * recorded — and quality is the figure least distorted by our own traffic
+ * anyway, since a test call fails or succeeds for the same reasons.
  */
 export async function getRouteQuality(
   env: Env,
@@ -238,9 +260,8 @@ export async function getRouteQuality(
 
   const sql = serviceId
     ? `SELECT outcome, refunded, latency_ms, created_at FROM route_metric_calls
-         WHERE is_internal = 0 AND service_id = ?`
-    : `SELECT outcome, refunded, latency_ms, created_at FROM route_metric_calls
-         WHERE is_internal = 0`
+         WHERE service_id = ?`
+    : `SELECT outcome, refunded, latency_ms, created_at FROM route_metric_calls`
   const stmt = serviceId ? db.prepare(sql).bind(serviceId) : db.prepare(sql)
 
   let rows: RawRow[]

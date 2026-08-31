@@ -78,16 +78,33 @@ describe('classifyOutcome', () => {
     expect(classifyOutcome(404)).toBe('caller_error')
   })
 
+  it('never blames the caller for an auth rejection', () => {
+    // The agent's Authorization header is stripped before the upstream call
+    // (forwardHeaders in routes/proxy.ts), so a 401/403 cannot be the
+    // caller's credential. Calling it caller_error would drop a provider's
+    // own refusals out of its published success rate — the first version of
+    // this function did exactly that and would have shown 100% for a
+    // provider that was refusing every call.
+    expect(classifyOutcome(403)).toBe('provider_fault')
+    expect(classifyOutcome(401)).toBe('provider_fault')
+  })
+
+  it('attributes a known router-side failure to us, not the provider', () => {
+    // A session channel we never installed says nothing about the provider.
+    expect(classifyOutcome(undefined, { routerSideFailure: true })).toBe('router_fault')
+    expect(classifyOutcome(500, { routerSideFailure: true })).toBe('router_fault')
+  })
+
   it('treats 408 and 429 as the provider refusing to serve', () => {
     expect(classifyOutcome(408)).toBe('provider_fault')
     expect(classifyOutcome(429)).toBe('provider_fault')
   })
 
-  it('blames the router for auth rejections only when the router holds the credential', () => {
+  it('splits auth rejections between us and the provider, never the caller', () => {
     expect(classifyOutcome(403, { routerHoldsCredential: true })).toBe('router_fault')
     expect(classifyOutcome(401, { routerHoldsCredential: true })).toBe('router_fault')
-    expect(classifyOutcome(403, { routerHoldsCredential: false })).toBe('caller_error')
-    expect(classifyOutcome(401)).toBe('caller_error')
+    expect(classifyOutcome(403, { routerHoldsCredential: false })).toBe('provider_fault')
+    expect(classifyOutcome(401)).toBe('provider_fault')
   })
 })
 

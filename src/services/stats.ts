@@ -48,6 +48,12 @@ export interface ServiceStats {
   calls: number
   /** Calls from ROZO's own test/dogfood wallets, reported, never hidden. */
   internal_calls: number
+  /**
+   * Calls from Rozo-adjacent payers we cannot clear as external. Neither
+   * claimed as ours nor counted as demand — the ambiguity is published
+   * rather than resolved in our favour.
+   */
+  unresolved_calls: number
   /** Summed USDC, external payers only. String to avoid float drift. */
   volume_usd: string
   /** Distinct external payers. Computed server-side; no payer id is published. */
@@ -67,6 +73,14 @@ export interface ServiceStats {
   caller_error: number
   router_fault: number
   latency_p50_ms: number | null
+  /**
+   * Refunded external calls over external calls, from the ORDER LEDGER, not
+   * from the quality table. The ledger's refund_status is updated when a
+   * refund actually confirms; the metrics row is written once at call time
+   * and never revisited, so a rate derived from it would read 0.0% forever
+   * no matter how many refunds were paid.
+   */
+  refunded: number
   refund_rate: number | null
   /** Per-day external call counts, oldest first, for the activity sparkline. */
   activity: number[]
@@ -83,6 +97,8 @@ export interface StatsPayload {
     provider_success_rate: number | null
     caller_error: number
     router_fault: number
+    refunded: number
+    refund_rate: number | null
   }
   services: ServiceStats[]
   /** True when the ledger scan hit MAX_LEDGER_KEYS; figures are then a floor. */
@@ -101,13 +117,30 @@ function addUsd(a: string, b: string): string {
   return frac ? `${whole}.${frac}` : whole.toString()
 }
 
-function parseInternalPayers(env: Env): Set<string> {
+function parseAddressList(raw: string | undefined): Set<string> {
   return new Set(
-    (env.LEDGER_INTERNAL_PAYERS ?? '')
+    (raw ?? '')
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean),
   )
+}
+
+/**
+ * Payers that must not be counted as external demand.
+ *
+ * Two lists, not one, mirroring the contract in routes/ledger.ts:
+ * LEDGER_INTERNAL_PAYERS is ours (probes, e2e, dogfood), while
+ * LEDGER_UNRESOLVED_PAYERS is Rozo-adjacent and cannot be cleared as
+ * external. Counting the second group as external would inflate the exact
+ * buyer and volume figures a reviewer is checking, and the ledger endpoint
+ * already refuses to make that claim.
+ */
+function parseExcludedPayers(env: Env): { internal: Set<string>; unresolved: Set<string> } {
+  return {
+    internal: parseAddressList(env.LEDGER_INTERNAL_PAYERS),
+    unresolved: parseAddressList(env.LEDGER_UNRESOLVED_PAYERS),
+  }
 }
 
 async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; truncated: boolean }> {
@@ -124,7 +157,18 @@ async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; trun
       return { entries, truncated: true }
     }
     scanned += listed.keys.length
-    const raws = await Promise.all(listed.keys.map((k) => env.MPP_STORE.get(k.name)))
+    // Each get() is caught individually: a bare Promise.all would reject
+    // outside the try above on a single transient KV failure and turn the
+    // whole endpoint into a 500, when the contract here is to degrade and
+    // say so via `truncated`.
+    let raws: (string | null)[]
+    try {
+      raws = await Promise.all(
+        listed.keys.map((k) => env.MPP_STORE.get(k.name).catch(() => null)),
+      )
+    } catch {
+      return { entries, truncated: true }
+    }
     for (const raw of raws) {
       if (!raw) continue
       try {
@@ -162,13 +206,15 @@ function activitySeries(timestamps: number[], window: MetricsWindow, now: number
 export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPayload> {
   const now = Date.now()
   const cutoff = window === 'all' ? 0 : now - WINDOW_MS[window]
-  const internalPayers = parseInternalPayers(env)
+  const excluded = parseExcludedPayers(env)
 
   const { entries, truncated } = await readLedger(env)
 
   interface Acc {
     calls: number
     internal: number
+    unresolved: number
+    refunded: number
     volume: string
     buyers: Set<string>
     last: number | null
@@ -178,7 +224,16 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   const acc = (id: string): Acc => {
     let a = byService.get(id)
     if (!a) {
-      a = { calls: 0, internal: 0, volume: '0', buyers: new Set(), last: null, tss: [] }
+      a = {
+        calls: 0,
+        internal: 0,
+        unresolved: 0,
+        refunded: 0,
+        volume: '0',
+        buyers: new Set(),
+        last: null,
+        tss: [],
+      }
       byService.set(id, a)
     }
     return a
@@ -189,12 +244,17 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     if (Number.isNaN(ts) || ts < cutoff) continue
     const a = acc(serviceIdFromRouteId(e.route_id))
 
-    if (e.payer && internalPayers.has(e.payer)) {
+    if (e.payer && excluded.internal.has(e.payer)) {
       a.internal += 1
+      continue
+    }
+    if (e.payer && excluded.unresolved.has(e.payer)) {
+      a.unresolved += 1
       continue
     }
 
     a.calls += 1
+    if (e.refund_status === 'refunded') a.refunded += 1
     a.tss.push(ts)
     a.volume = addUsd(a.volume, e.amount_usd || '0')
     // A null payer is a real call whose payer we could not decode. It counts
@@ -212,6 +272,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       service_id: serviceId,
       calls: a.calls,
       internal_calls: a.internal,
+      unresolved_calls: a.unresolved,
       volume_usd: a.volume,
       buyers: a.buyers.size,
       last_call_at: a.last,
@@ -219,7 +280,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       caller_error: w.caller_error,
       router_fault: w.router_fault,
       latency_p50_ms: w.latency_p50_ms,
-      refund_rate: w.refund_rate,
+      refunded: a.refunded,
+      refund_rate: a.calls === 0 ? null : Math.round((a.refunded / a.calls) * 10000) / 10000,
       activity: activitySeries(a.tss, window, now),
     })
   }
@@ -231,7 +293,9 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   for (const e of entries) {
     const ts = Date.parse(e.ts)
     if (Number.isNaN(ts) || ts < cutoff) continue
-    if (e.payer && !internalPayers.has(e.payer)) totalBuyers.add(e.payer)
+    if (!e.payer) continue
+    if (excluded.internal.has(e.payer) || excluded.unresolved.has(e.payer)) continue
+    totalBuyers.add(e.payer)
   }
 
   return {
@@ -245,6 +309,12 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       provider_success_rate: allQuality[window].provider_success_rate,
       caller_error: allQuality[window].caller_error,
       router_fault: allQuality[window].router_fault,
+      refunded: services.reduce((n, x) => n + x.refunded, 0),
+      refund_rate: (() => {
+        const calls = services.reduce((n, x) => n + x.calls, 0)
+        const refunded = services.reduce((n, x) => n + x.refunded, 0)
+        return calls === 0 ? null : Math.round((refunded / calls) * 10000) / 10000
+      })(),
     },
     services,
     truncated,
