@@ -23,7 +23,7 @@ import {
 } from '../services/merchants'
 import { normalizePayInvoiceBody } from './pay-invoice-admin'
 import { recordRouteFailure, recordRouteSuccess } from '../services/route-health'
-import { classifyOutcome, recordRouteCall } from '../services/route-metrics'
+import { asyncCallId, classifyOutcome, recordRouteCall } from '../services/route-metrics'
 import {
   ChannelNotInstalledError,
   payMerchant,
@@ -637,6 +637,12 @@ async function payMerchantAndGetBody(
   }
 
   const elapsedMs = Date.now() - startedAt
+  // Computed once: the outcome classification needs to know this is async,
+  // and the row needs a stable id so finishAsyncDelivery can resolve it.
+  const asyncInfo =
+    result.kind === 'ok'
+      ? isAsyncJobResponse(result.merchantStatus, result.body)
+      : { isAsync: false, jobId: undefined as string | undefined }
 
   if (result.kind === 'error') {
     recordRouteFailure(env, ctx, route.id, result.refundReason ?? 'upstream_error')
@@ -645,6 +651,12 @@ async function payMerchantAndGetBody(
   }
 
   recordRouteCall(env, ctx, {
+    // Only async rows get a deterministic id; a synchronous call is already
+    // terminal and nothing will ever need to find it again.
+    callId:
+      asyncInfo.isAsync && asyncInfo.jobId
+        ? asyncCallId(route.id, asyncInfo.jobId)
+        : undefined,
     routeId: route.id,
     method: request.method,
     // A 401/403 on a route where WE hold the upstream credential is our
@@ -669,9 +681,7 @@ async function payMerchantAndGetBody(
       // for 202 here: merchants also queue work with 200 plus a
       // {status:"queued", jobId} body, and a second detector would drift
       // from this one the way the backfill classifier already did.
-      asyncAccepted:
-        result.kind === 'ok' &&
-        isAsyncJobResponse(result.merchantStatus, result.body).isAsync,
+      asyncAccepted: asyncInfo.isAsync,
     }),
     reason: result.kind === 'error' ? (result.refundReason ?? 'upstream_error') : undefined,
     upstreamStatus: result.merchantStatus,

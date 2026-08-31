@@ -41,6 +41,7 @@ import { Credential } from 'mppx'
 import { fetchWithSiwx } from '../mpp/siwx-signer'
 import type { Env } from '../index'
 import { enqueueRefund, type PaymentProof, type RefundReason } from '../refund/refund'
+import { asyncCallId, resolveRouteCall } from '../services/route-metrics'
 import { releaseChannelDeliveryLock, rollbackFailedChannelVoucher } from '../mpp/stellar-channel-dispatch'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
 
@@ -175,6 +176,25 @@ export async function finishAsyncDelivery(
   await store.put(`refund:async-terminal:${terminalKey}`, JSON.stringify({
     outcome, state: 'done', completedAt: new Date().toISOString(),
   }))
+
+  // Close out the quality metric this job opened. The proxy recorded it as
+  // 'pending' when the merchant accepted the work, because whether the
+  // provider actually delivered was not knowable then — this is the only
+  // place it becomes knowable. Without it, an async provider's failures
+  // would sit as 'pending' forever and never reach its published success
+  // rate. Fire-and-forget and UPDATE-guarded on pending, so the repeated
+  // calls from polling and from the cron are harmless.
+  const jobId = terminalKey.slice(record.serviceId.length + 1)
+  if (jobId) {
+    resolveRouteCall(
+      env,
+      { waitUntil: (p) => void p.catch(() => {}) },
+      asyncCallId(record.serviceId, jobId),
+      outcome === 'delivered' ? 'ok' : 'provider_fault',
+      outcome === 'delivered' ? undefined : (reason ?? 'async_delivery_failed'),
+    )
+  }
+
   return 'done'
 }
 

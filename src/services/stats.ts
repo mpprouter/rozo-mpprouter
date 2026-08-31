@@ -33,13 +33,20 @@ import {
 import type { Env } from '../index'
 
 /**
- * Hard ceiling on ledger keys scanned per request. Lifetime volume is in the
- * tens, so this is headroom, not a limit we expect to hit — but an unbounded
- * KV walk behind a public URL is a denial-of-service primitive, so the scan
- * must terminate whatever the data does. `truncated` tells the caller the
- * page is showing a floor rather than a total.
+ * Hard ceiling on ledger keys scanned per request.
+ *
+ * Every key costs one KV read, and a Worker invocation has a hard subrequest
+ * budget (1000 on the paid plan). The previous 5000 would not merely be slow
+ * — it would throw partway through and take the endpoint down. 400 leaves
+ * room for the list calls, the D1 queries and the rate limiter, and still
+ * clears lifetime volume by an order of magnitude.
+ *
+ * An unbounded walk behind a public URL is also a denial-of-service
+ * primitive, so the scan must terminate whatever the data does. `truncated`
+ * tells the caller the page is a floor rather than a total. When volume
+ * genuinely approaches this, the answer is a rollup table, not a bigger cap.
  */
-const MAX_LEDGER_KEYS = 5000
+const MAX_LEDGER_KEYS = 400
 
 const WINDOW_MS: Record<Exclude<MetricsWindow, 'all'>, number> = {
   '24h': 24 * 60 * 60 * 1000,
@@ -60,6 +67,11 @@ export interface ServiceStats {
    * rather than resolved in our favour.
    */
   unresolved_calls: number
+  /**
+   * Calls whose payer could not be decoded. Not external, not ours — the
+   * ledger's attribution contract refuses to guess, and so does this.
+   */
+  unknown_calls: number
   /** Summed USDC, external payers only. String to avoid float drift. */
   volume_usd: string
   /** Distinct external payers. Computed server-side; no payer id is published. */
@@ -124,6 +136,7 @@ export interface StatsPayload {
     calls: number
     internal_calls: number
     unresolved_calls: number
+    unknown_calls: number
     volume_usd: string
     buyers: number
     provider_success_rate: number | null
@@ -262,6 +275,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     calls: number
     internal: number
     unresolved: number
+    unknown: number
     refunded: number
     volume: string
     buyers: Set<string>
@@ -276,6 +290,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
         calls: 0,
         internal: 0,
         unresolved: 0,
+        unknown: 0,
         refunded: 0,
         volume: '0',
         buyers: new Set(),
@@ -301,14 +316,21 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       continue
     }
 
+    // A call whose payer we could not decode is 'unknown', and the ledger's
+    // own four-way attribution is explicit that unknown is NOT external.
+    // Counting it toward external calls and volume while refusing to count
+    // it as a buyer asserted demand we cannot evidence — in the direction
+    // that flatters us — so it is reported in its own bucket instead.
+    if (!e.payer) {
+      a.unknown += 1
+      continue
+    }
+
     a.calls += 1
     if (e.refund_status === 'refunded') a.refunded += 1
     a.tss.push(ts)
     a.volume = addUsd(a.volume, e.amount_usd || '0')
-    // A null payer is a real call whose payer we could not decode. It counts
-    // as a call but not as a buyer: inventing a buyer for it would inflate
-    // the exact number a reviewer is checking.
-    if (e.payer) a.buyers.add(e.payer)
+    a.buyers.add(e.payer)
     a.last = a.last === null ? ts : Math.max(a.last, ts)
   }
 
@@ -329,6 +351,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       calls: a.calls,
       internal_calls: a.internal,
       unresolved_calls: a.unresolved,
+      unknown_calls: a.unknown,
       volume_usd: a.volume,
       buyers: a.buyers.size,
       last_call_at: a.last,
@@ -376,6 +399,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       calls: services.reduce((n, s) => n + s.calls, 0),
       internal_calls: services.reduce((n, s) => n + s.internal_calls, 0),
       unresolved_calls: services.reduce((n, s) => n + s.unresolved_calls, 0),
+      unknown_calls: services.reduce((n, s) => n + s.unknown_calls, 0),
       volume_usd: services.reduce((v, s) => addUsd(v, s.volume_usd), '0'),
       buyers: totalBuyers.size,
       provider_success_rate: allQuality[window].provider_success_rate,

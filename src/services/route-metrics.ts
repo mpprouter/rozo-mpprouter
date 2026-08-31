@@ -47,6 +47,15 @@ export type CallOutcome =
   | 'pending'
 
 export interface RouteCallMetric {
+  /**
+   * Deterministic id for a call that can be resolved later.
+   *
+   * Async calls pass `asyncCallId(routeId, jobId)` so finishAsyncDelivery
+   * can find this exact row when the job reaches a terminal state, without
+   * the job record having to carry a random UUID around. Omitted for
+   * synchronous calls, which are terminal the moment they are written.
+   */
+  callId?: string
   routeId: string
   method: string
   outcome: CallOutcome
@@ -175,7 +184,7 @@ export function recordRouteCall(
            ON CONFLICT(call_id) DO NOTHING`,
         )
         .bind(
-          crypto.randomUUID(),
+          metric.callId ?? crypto.randomUUID(),
           Date.now(),
           serviceIdFromRouteId(metric.routeId),
           metric.routeId,
@@ -189,6 +198,48 @@ export function recordRouteCall(
           metric.latencyMs ?? null,
           metric.refunded ? 1 : 0,
         )
+        .run()
+    })().catch(() => {}),
+  )
+}
+
+/**
+ * Stable id for an async call, shared by the chokepoint that opens it and
+ * the delivery path that closes it. `routeId` is included because job ids
+ * are only unique within a merchant.
+ */
+export function asyncCallId(routeId: string, jobId: string): string {
+  return `job:${routeId}:${jobId}`
+}
+
+/**
+ * Replace a pending async row with its real outcome.
+ *
+ * Guarded on `outcome = 'pending'` so a terminal verdict can never be
+ * rewritten — job-status can be polled repeatedly, and reconcileAsyncRefunds
+ * runs on a cron, so this will be called more than once for the same job.
+ * Without the finalisation an accepted async call stayed 'pending' forever
+ * and the provider's success rate could never reflect it.
+ */
+export function resolveRouteCall(
+  env: Env,
+  ctx: { waitUntil: (p: Promise<any>) => void },
+  callId: string,
+  outcome: CallOutcome,
+  reason?: string,
+): void {
+  const db = env.ROUTE_METRICS_DB
+  if (!db) return
+
+  ctx.waitUntil(
+    (async () => {
+      await db
+        .prepare(
+          `UPDATE route_metric_calls
+              SET outcome = ?, reason = COALESCE(?, reason)
+            WHERE call_id = ? AND outcome = 'pending'`,
+        )
+        .bind(outcome, reason ?? null, callId)
         .run()
     })().catch(() => {}),
   )

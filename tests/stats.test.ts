@@ -126,13 +126,20 @@ describe('getStats', () => {
     expect(s.services[0].buyers).toBe(2)
   })
 
-  it('counts a call with an undecodable payer without inventing a buyer', async () => {
+  it('keeps a call with an undecodable payer out of external totals', async () => {
     const s = await getStats(
-      env([order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: null })]),
+      env([order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: null, amount_usd: '5' })]),
       '30d',
     )
-    expect(s.services[0].calls).toBe(1)
+    // 'unknown' is not 'external' — the ledger's attribution contract is
+    // explicit about that. Counting it toward calls and volume while
+    // refusing to count a buyer asserted demand we cannot evidence.
+    expect(s.services[0].calls).toBe(0)
+    expect(s.services[0].volume_usd).toBe('0')
     expect(s.services[0].buyers).toBe(0)
+    // Disclosed in its own bucket rather than dropped silently.
+    expect(s.services[0].unknown_calls).toBe(1)
+    expect(s.totals.unknown_calls).toBe(1)
   })
 
   it('honours the window boundary', async () => {
