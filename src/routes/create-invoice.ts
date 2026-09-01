@@ -23,8 +23,16 @@ import {
   normalizeCheckoutClient,
   parseUsdcAtomic,
   resolveCheckoutPricing,
+  buildCheckoutTitle,
+  buildFullAmountTitle,
+  buildTitle,
+  formatTitleAmount,
   type CheckoutPricing,
 } from './checkout-web-pricing'
+
+// Re-exported so existing importers of these title helpers keep working now
+// that they live in checkout-web-pricing.
+export { buildCheckoutTitle, buildFullAmountTitle, buildTitle, formatTitleAmount }
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
@@ -407,52 +415,6 @@ export function parseUsdc(amountDecimal: string): bigint {
 
 export function formatUsdc(atomic: bigint): string {
   return formatUsdcAtomic(atomic)
-}
-
-// Renders an amount for display in the title. Integers come back as "$105"
-// (no trailing .00), non-integers as "$9.52" (truncated to 2 decimals).
-export function formatTitleAmount(atomic: bigint): string {
-  if (atomic % 1_000_000n === 0n) {
-    return `$${atomic / 1_000_000n}`
-  }
-  const whole = atomic / 1_000_000n
-  const cents = (atomic % 1_000_000n) / 10_000n // 6 decimals → 2 decimals (truncate)
-  return `$${whole}.${cents.toString().padStart(2, '0')}`
-}
-
-export function buildTitle(
-  merchant: string,
-  invoiceAtomic: bigint,
-  callerPaysAtomic: bigint,
-): string {
-  const discountAtomic = invoiceAtomic - callerPaysAtomic
-  return (
-    `Pay ${merchant} ${formatTitleAmount(callerPaysAtomic)}` +
-    ` (originally ${formatTitleAmount(invoiceAtomic)},` +
-    ` ${formatTitleAmount(discountAtomic)} Discount)`
-  )
-}
-
-// OpenRouter / Coinbase line has no discount — the caller pays the full invoice
-// amount, so the title is a plain "Pay <merchant> $<amount>" with no
-// "originally.../Discount" clause.
-export function buildFullAmountTitle(merchant: string, invoiceAtomic: bigint): string {
-  return `Pay ${merchant} ${formatTitleAmount(invoiceAtomic)}`
-}
-
-function formatExactCheckoutTitleAmount(atomic: bigint): string {
-  const [whole, fraction = ''] = formatUsdc(atomic).split('.')
-  return `$${whole}.${fraction.padEnd(2, '0')}`
-}
-
-export function buildCheckoutTitle(merchant: string, pricing: CheckoutPricing): string {
-  if (pricing.serviceFeeAtomic === 0n) {
-    return buildFullAmountTitle(merchant, pricing.originalAtomic)
-  }
-  return (
-    `Pay ${merchant} ${formatExactCheckoutTitleAmount(pricing.callerPaysAtomic)}` +
-    ` (includes ${formatExactCheckoutTitleAmount(pricing.serviceFeeAtomic)} service fee)`
-  )
 }
 
 function pricingFields(pricing: CheckoutPricing) {

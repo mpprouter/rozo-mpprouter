@@ -107,3 +107,55 @@ export function resolveCheckoutPricing(
     pricingVersion: CHECKOUT_PRICING_VERSION,
   }
 }
+
+// ── Display titles ───────────────────────────────────────────────────────────
+// Title rendering lives here rather than in create-invoice so the read-only
+// quote path (pay-invoice-admin.handleQuoteInvoice) can render the same title
+// the create path will use, without importing create-invoice and forming a
+// cycle (create-invoice already imports pay-invoice-admin).
+
+// Renders an amount for display in the title. Integers come back as "$105"
+// (no trailing .00), non-integers as "$9.52" (truncated to 2 decimals).
+export function formatTitleAmount(atomic: bigint): string {
+  if (atomic % 1_000_000n === 0n) {
+    return `$${atomic / 1_000_000n}`
+  }
+  const whole = atomic / 1_000_000n
+  const cents = (atomic % 1_000_000n) / 10_000n // 6 decimals → 2 decimals (truncate)
+  return `$${whole}.${cents.toString().padStart(2, '0')}`
+}
+
+export function buildTitle(
+  merchant: string,
+  invoiceAtomic: bigint,
+  callerPaysAtomic: bigint,
+): string {
+  const discountAtomic = invoiceAtomic - callerPaysAtomic
+  return (
+    `Pay ${merchant} ${formatTitleAmount(callerPaysAtomic)}` +
+    ` (originally ${formatTitleAmount(invoiceAtomic)},` +
+    ` ${formatTitleAmount(discountAtomic)} Discount)`
+  )
+}
+
+// OpenRouter / Coinbase line has no discount — the caller pays the full invoice
+// amount, so the title is a plain "Pay <merchant> $<amount>" with no
+// "originally.../Discount" clause.
+export function buildFullAmountTitle(merchant: string, invoiceAtomic: bigint): string {
+  return `Pay ${merchant} ${formatTitleAmount(invoiceAtomic)}`
+}
+
+function formatExactCheckoutTitleAmount(atomic: bigint): string {
+  const [whole, fraction = ''] = formatUsdcAtomic(atomic).split('.')
+  return `$${whole}.${fraction.padEnd(2, '0')}`
+}
+
+export function buildCheckoutTitle(merchant: string, pricing: CheckoutPricing): string {
+  if (pricing.serviceFeeAtomic === 0n) {
+    return buildFullAmountTitle(merchant, pricing.originalAtomic)
+  }
+  return (
+    `Pay ${merchant} ${formatExactCheckoutTitleAmount(pricing.callerPaysAtomic)}` +
+    ` (includes ${formatExactCheckoutTitleAmount(pricing.serviceFeeAtomic)} service fee)`
+  )
+}
