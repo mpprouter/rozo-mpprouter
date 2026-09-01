@@ -6,8 +6,10 @@
  *   - only exact, known OpenRouter merchant labels are eligible;
  *   - an absent, malformed, non-integer, or out-of-range env value is 0 bps.
  *
- * Keep the arithmetic in atomic USDC. Fees round UP so a non-zero configured
- * fee can never disappear because of integer truncation on a small invoice.
+ * Keep the arithmetic in atomic USDC. Fees round UP to the next whole cent
+ * (founder decision 2026-09-02: "$1.05 -> $1.06, not $1.0605") so the total a
+ * user sees is a plain two-decimal price and a non-zero configured fee can
+ * never disappear because of integer truncation on a small invoice.
  */
 
 export const CHECKOUT_WEB_CLIENT = 'rozo-checkout-web'
@@ -78,14 +80,22 @@ export function parseCheckoutWebFeeBps(raw: unknown): number {
   return parsed
 }
 
-/** ceil(originalAtomic * feeBps / 10_000), entirely in integer arithmetic. */
+const ATOMIC_PER_CENT = 10_000n
+// bps -> cents: divide by 10_000 (bps) and again by 10_000 (atomic per cent).
+const CENT_DIVISOR = 10_000n * ATOMIC_PER_CENT
+
+/**
+ * ceil(originalAtomic * feeBps / 10_000) rounded UP to a whole cent, entirely in
+ * integer arithmetic. The result is always a multiple of 10_000 atomic units.
+ */
 export function computeServiceFeeAtomic(originalAtomic: bigint, feeBps: number): bigint {
   if (originalAtomic < 0n) throw new Error('originalAtomic must be non-negative')
   if (!Number.isSafeInteger(feeBps) || feeBps < 0 || feeBps > MAX_CHECKOUT_WEB_FEE_BPS) {
     throw new Error(`feeBps must be an integer between 0 and ${MAX_CHECKOUT_WEB_FEE_BPS}`)
   }
   if (feeBps === 0 || originalAtomic === 0n) return 0n
-  return (originalAtomic * BigInt(feeBps) + 9_999n) / 10_000n
+  const cents = (originalAtomic * BigInt(feeBps) + CENT_DIVISOR - 1n) / CENT_DIVISOR
+  return cents * ATOMIC_PER_CENT
 }
 
 export function resolveCheckoutPricing(

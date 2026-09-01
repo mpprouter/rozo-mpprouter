@@ -143,20 +143,20 @@ describe('quote receipt', () => {
       const body = await response.json() as any
       expect(body).toMatchObject({
         original: '10.01',
-        serviceFee: '0.1001',
-        callerPays: '10.1101',
+        serviceFee: '0.11',
+        callerPays: '10.12',
         feeBps: 100,
         pricingVersion: 'checkout-web-fee-v1',
       })
-      expect(body.quote.callerPaysAtomicUsdc).toBe('10110100')
+      expect(body.quote.callerPaysAtomicUsdc).toBe('10120000')
       await expect(
         verifyQuoteReceipt(body.quoteReceipt, 'pl_fee_quote', 'test-secret'),
       ).resolves.toMatchObject({
         v: 2,
         client: 'rozo-checkout-web',
         original: '10.01',
-        serviceFee: '0.1001',
-        callerPays: '10.1101',
+        serviceFee: '0.11',
+        callerPays: '10.12',
         feeBps: 100,
       })
     } finally {
@@ -215,9 +215,15 @@ describe('browser checkout fee policy', () => {
     }
   })
 
-  it('uses atomic ceil for a non-divisible 1% fee', () => {
-    expect(computeServiceFeeAtomic(10_000_001n, 100)).toBe(100_001n)
-    expect(computeServiceFeeAtomic(1n, 100)).toBe(1n)
+  it('rounds a non-divisible 1% fee up to the next whole cent', () => {
+    // $10.000001 -> 10.000001 cents -> 11 cents
+    expect(computeServiceFeeAtomic(10_000_001n, 100)).toBe(110_000n)
+    // dust still pays the 1-cent floor
+    expect(computeServiceFeeAtomic(1n, 100)).toBe(10_000n)
+    // $1.05 -> $0.0105 -> $0.02, so the user sees $1.07, never $1.0605
+    expect(computeServiceFeeAtomic(1_050_000n, 100)).toBe(20_000n)
+    // exact cents stay exact: $10 -> $0.10
+    expect(computeServiceFeeAtomic(10_000_000n, 100)).toBe(100_000n)
   })
 
   it('defaults malformed, fractional, negative, and above-canary config to 0', () => {
@@ -269,7 +275,7 @@ describe('browser checkout fee policy', () => {
       '100',
     )
     expect(buildCheckoutTitle('OpenRouter', subCent)).toBe(
-      'Pay OpenRouter $10.1101 (includes $0.1001 service fee)',
+      'Pay OpenRouter $10.12 (includes $0.11 service fee)',
     )
   })
 })
