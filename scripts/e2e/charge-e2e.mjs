@@ -215,8 +215,9 @@ async function main() {
   // scheduled run does not page anyone for it (403 would otherwise).
   const catalog = await fetch(`${BASE}/v1/services/catalog`).then((r) => r.json()).catch(() => null)
   const payable = new Map()
+  const skipNote = new Map()
   const list = Array.isArray(catalog) ? catalog : (catalog?.services ?? catalog?.items ?? catalog?.routes ?? [])
-  for (const x of list) if (x?.public_path && typeof x.payment_enabled === 'boolean') payable.set(x.public_path, x.payment_enabled)
+  for (const x of list) if (x?.public_path && typeof x.payment_enabled === 'boolean') { payable.set(x.public_path, x.payment_enabled); if (x.payment_status_note) skipNote.set(x.public_path, String(x.payment_status_note)) }
 
   const payDir = resolvePayPerCallDir()
   const { file: secretFile, dir: secretDir } = extractSecretFile()
@@ -225,7 +226,7 @@ async function main() {
     for (const p of targets) {
       process.stderr.write(`→ ${p.id} (${p.family}/${p.mode}) ${p.publicPath} ... `)
       if (payable.size && payable.get(p.publicPath) === false) {
-        const c = { verdict: 'SKIP', blame: 'none', detail: 'catalog: payment_enabled=false (route not payable today)' }
+        const c = { verdict: 'SKIP', blame: 'none', detail: `catalog: payment_enabled=false — ${(skipNote.get(p.publicPath) || 'no reason recorded').slice(0, 160)}` }
         results.push({ id: p.id, family: p.family, mode: p.mode, path: p.publicPath, ...c })
         process.stderr.write(`${c.verdict} ${c.detail}\n`)
         continue
