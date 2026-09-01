@@ -25,8 +25,11 @@
  *   MAX_AUTO_USD=0.10 node scripts/e2e/charge-e2e.mjs
  *
  * Env:
- *   STELLAR_ENV_FILE  path to .env holding STELLAR_PRIVATE_KEY
- *                     (default: rozoskilltest/.env)
+ *   E2E_STELLAR_SECRET  Stellar S-key of the dedicated test wallet
+ *                       (preferred; used by the Railway cron service)
+ *   STELLAR_ENV_FILE    fallback: .env holding E2E_STELLAR_SECRET
+ *                       (default: ~/workspace/rozoai/rozoskilltest/.env.e2e-20260703)
+ *   JSON_OUT            also write the machine-readable report to this path
  *   PAY_PER_CALL_DIR  path to the pay-per-call skill dir
  *                     (default: latest mpprouter plugin cache)
  *   MAX_AUTO_USD      per-call auto-pay ceiling (default 0.10)
@@ -43,9 +46,13 @@ import { ROUTER_BASE, PROVIDERS } from './providers.mjs'
 
 const BASE = process.env.ROUTER_BASE_OVERRIDE || ROUTER_BASE
 const MAX_AUTO_USD = process.env.MAX_AUTO_USD || '0.10'
+// The pre-2026-07-03 default (rozocontracts/rozoskilltest/.env, key
+// STELLAR_PRIVATE_KEY) pointed at a wallet the founder declared leaked.
+// Never resurrect it: only E2E_STELLAR_SECRET is accepted.
 const ENV_FILE =
   process.env.STELLAR_ENV_FILE ||
-  `${process.env.HOME}/workspace/rozo/rozocontracts/rozoskilltest/.env`
+  `${process.env.HOME}/workspace/rozoai/rozoskilltest/.env.e2e-20260703`
+const SECRET_VAR = 'E2E_STELLAR_SECRET'
 
 function resolvePayPerCallDir() {
   if (process.env.PAY_PER_CALL_DIR) return process.env.PAY_PER_CALL_DIR
@@ -68,16 +75,17 @@ function resolvePayPerCallDir() {
  * We NEVER print the key. The file is deleted by the caller's finally.
  */
 function extractSecretFile() {
-  if (!existsSync(ENV_FILE)) throw new Error(`STELLAR_ENV_FILE not found: ${ENV_FILE}`)
-  const lines = readFileSync(ENV_FILE, 'utf8').split('\n')
-  let secret = null
-  for (const l of lines) {
-    if (l.startsWith('STELLAR_PRIVATE_KEY=')) {
-      secret = l.slice('STELLAR_PRIVATE_KEY='.length).trim().replace(/^["']|["']$/g, '')
-      break
+  let secret = (process.env[SECRET_VAR] || '').trim()
+  if (!secret) {
+    if (!existsSync(ENV_FILE)) throw new Error(`${SECRET_VAR} unset and STELLAR_ENV_FILE not found: ${ENV_FILE}`)
+    for (const l of readFileSync(ENV_FILE, 'utf8').split('\n')) {
+      if (l.startsWith(`${SECRET_VAR}=`)) {
+        secret = l.slice(SECRET_VAR.length + 1).trim().replace(/^["']|["']$/g, '')
+        break
+      }
     }
   }
-  if (!secret) throw new Error('STELLAR_PRIVATE_KEY not found in env file')
+  if (!secret) throw new Error(`${SECRET_VAR} not found in env or env file`)
   if (!secret.startsWith('S')) throw new Error('extracted value is not a Stellar secret key')
   const dir = mkdtempSync(join(tmpdir(), 'mpp-e2e-'))
   // Self-clean: if ANY step after the dir exists throws (writeFile, chmod),
@@ -119,7 +127,11 @@ function classify(p, { ok, stdout, stderr, json }) {
   if (ok && json) {
     return { verdict: 'PASS_WEAK', blame: 'none', detail: 'HTTP 200 but body shape unexpected (manual check)' }
   }
-  const err = (stderr || '') + (stdout || '')
+  // Drop the wallet tool's plaintext-key advisory so it cannot mask the real error.
+  const err = ((stderr || '') + (stdout || '')).split('\n').filter((l) => !/Signing key loaded|--identity <name>/.test(l)).join('\n')
+  if (/Route not enabled for payment/i.test(err)) {
+    return { verdict: 'FAIL', blame: 'us', detail: 'router catalog has payment disabled for this route (403)' }
+  }
   if (/descriptor required for TIP-1034/i.test(err)) {
     return { verdict: 'FAIL', blame: 'us', detail: 'voucher missing TIP-1034 descriptor (mppx too old)' }
   }
@@ -198,12 +210,26 @@ async function main() {
   // Resolve everything that can throw BEFORE extracting the secret, so the
   // 0600 temp key file is created only inside the try/finally that deletes
   // it. (If resolvePayPerCallDir threw after extraction, the key would leak.)
+  // Catalog gate: a route the router itself lists as not payable is a
+  // catalog decision, not a payment-chain failure. Report it as SKIP so the
+  // scheduled run does not page anyone for it (403 would otherwise).
+  const catalog = await fetch(`${BASE}/v1/services/catalog`).then((r) => r.json()).catch(() => null)
+  const payable = new Map()
+  const list = Array.isArray(catalog) ? catalog : (catalog?.services ?? catalog?.items ?? catalog?.routes ?? [])
+  for (const x of list) if (x?.public_path) payable.set(x.public_path, x.payment_enabled === true)
+
   const payDir = resolvePayPerCallDir()
   const { file: secretFile, dir: secretDir } = extractSecretFile()
   const results = []
   try {
     for (const p of targets) {
       process.stderr.write(`→ ${p.id} (${p.family}/${p.mode}) ${p.publicPath} ... `)
+      if (payable.size && payable.get(p.publicPath) === false) {
+        const c = { verdict: 'SKIP', blame: 'none', detail: 'catalog: payment_enabled=false (route not payable today)' }
+        results.push({ id: p.id, family: p.family, mode: p.mode, path: p.publicPath, ...c })
+        process.stderr.write(`${c.verdict} ${c.detail}\n`)
+        continue
+      }
       const raw = payOne(p, secretFile, payDir)
       const c = classify(p, raw)
       results.push({ id: p.id, family: p.family, mode: p.mode, path: p.publicPath, ...c })
@@ -217,18 +243,22 @@ async function main() {
   // Only a strict PASS (200 + okCheck passed) is green. PASS_WEAK (200 but
   // body shape unexpected — unwrap/okCheck failed) is NOT success: it needs
   // a human look and must not let the suite exit 0.
+  const skipped = results.filter((r) => r.verdict === 'SKIP')
   const pass = results.filter((r) => r.verdict === 'PASS')
   const weak = results.filter((r) => r.verdict === 'PASS_WEAK')
   const ourFault = results.filter((r) => r.blame === 'us')
   const merchantFault = results.filter((r) => r.blame === 'merchant')
-  console.error(`PASS: ${pass.length}/${results.length}  (${pass.map((r) => r.id).join(', ') || 'none'})`)
+  if (skipped.length) console.error(`SKIP (not payable per catalog): ${skipped.map((r) => r.id).join(', ')}`)
+  console.error(`PASS: ${pass.length}/${results.length - skipped.length}  (${pass.map((r) => r.id).join(', ') || 'none'})`)
   if (weak.length) console.error(`PASS_WEAK (200, body unexpected — verify): ${weak.map((r) => r.id).join(', ')}`)
   if (ourFault.length) console.error(`OUR BUG: ${ourFault.map((r) => `${r.id}(${r.detail})`).join('; ')}`)
   if (merchantFault.length) console.error(`MERCHANT: ${merchantFault.map((r) => r.id).join(', ')}`)
 
   // Machine-readable report to stdout.
-  console.log(JSON.stringify({ base: BASE, ts: new Date().toISOString(), results }, null, 2))
-  process.exit(pass.length === results.length ? 0 : 1)
+  const report = JSON.stringify({ base: BASE, ts: new Date().toISOString(), results }, null, 2)
+  console.log(report)
+  if (process.env.JSON_OUT) writeFileSync(process.env.JSON_OUT, report)
+  process.exit(pass.length === results.length - skipped.length ? 0 : 1)
 }
 
 main().catch((e) => {
