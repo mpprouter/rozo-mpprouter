@@ -11,7 +11,8 @@
  *   4. Feishu: one compact summary every run, failures listed first
  *
  * Env: E2E_STELLAR_SECRET (required), E2E_STELLAR_ADDRESS (required, for
- * the read-only balance check), FEISHU_WEBHOOK, SUPABASE_URL, SUPABASE_KEY,
+ * the read-only balance check), FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_CHAT_ID
+ * (or FEISHU_WEBHOOK), SUPABASE_URL, SUPABASE_KEY,
  * MIN_USDC, PAY_PER_CALL_DIR, MAX_AUTO_USD.
  * Never prints secrets; charge-e2e already redacts child output.
  */
@@ -29,14 +30,35 @@ for (const k of ['E2E_STELLAR_SECRET', 'E2E_STELLAR_ADDRESS']) {
   if (!process.env[k]) { console.error(`${k} is required`); process.exit(2) }
 }
 
+// Feishu: bot identity (FEISHU_APP_ID + FEISHU_APP_SECRET + FEISHU_CHAT_ID,
+// same bot as ainative notify_feishu.py) or a plain FEISHU_WEBHOOK. Neither
+// set → print to stderr only.
 async function feishu(text) {
-  const url = process.env.FEISHU_WEBHOOK
-  if (!url) { console.error('[feishu skipped]\n' + text); return }
-  const r = await fetch(url, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ msg_type: 'text', content: { text } }),
-  }).catch((e) => ({ ok: false, statusText: String(e) }))
-  if (!r.ok) console.error('feishu post failed:', r.status ?? '', r.statusText)
+  const { FEISHU_WEBHOOK: url, FEISHU_APP_ID: appId, FEISHU_APP_SECRET: appSecret, FEISHU_CHAT_ID: chatId } = process.env
+  const base = (process.env.FEISHU_API_BASE || 'https://open.feishu.cn').replace(/\/$/, '')
+  try {
+    if (appId && appSecret && chatId) {
+      const tok = await fetch(`${base}/open-apis/auth/v3/tenant_access_token/internal`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      }).then((r) => r.json())
+      if (!tok.tenant_access_token) throw new Error(`tenant token code=${tok.code}`)
+      const r = await fetch(`${base}/open-apis/im/v1/messages?receive_id_type=chat_id`, {
+        method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${tok.tenant_access_token}` },
+        body: JSON.stringify({ receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) }),
+      }).then((r) => r.json())
+      if (r.code !== 0) throw new Error(`im send code=${r.code} ${r.msg}`)
+      return
+    }
+    if (url) {
+      const r = await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ msg_type: 'text', content: { text } }) })
+      if (!r.ok) throw new Error(`webhook ${r.status}`)
+      return
+    }
+    console.error('[feishu skipped]\n' + text)
+  } catch (e) {
+    console.error('feishu send failed:', e.message, '\n' + text)
+  }
 }
 
 async function usdcBalance() {
