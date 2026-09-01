@@ -216,7 +216,7 @@ async function main() {
   const catalog = await fetch(`${BASE}/v1/services/catalog`).then((r) => r.json()).catch(() => null)
   const payable = new Map()
   const list = Array.isArray(catalog) ? catalog : (catalog?.services ?? catalog?.items ?? catalog?.routes ?? [])
-  for (const x of list) if (x?.public_path) payable.set(x.public_path, x.payment_enabled === true)
+  for (const x of list) if (x?.public_path && typeof x.payment_enabled === 'boolean') payable.set(x.public_path, x.payment_enabled)
 
   const payDir = resolvePayPerCallDir()
   const { file: secretFile, dir: secretDir } = extractSecretFile()

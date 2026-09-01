@@ -112,15 +112,18 @@ async function main() {
   const fails = report.results.filter((r) => r.verdict !== 'PASS' && r.verdict !== 'SKIP')
   const tested = report.results.length - skipped.length
   const pass = tested - fails.length
+  const nothingTested = tested === 0
   const lines = [`【MPP Router 付费巡检 · ${stamp()}】`,
-    `${fails.length ? '🔴' : '🟢'} ${pass}/${tested} provider 全链路付款成功，用时 ${secs}s`]
+    nothingTested
+      ? `🟡 0 个 provider 被测试（全部被目录标为不可付款），本轮没有真实付款，不算通过`
+      : `${fails.length ? '🔴' : '🟢'} ${pass}/${tested} provider 全链路付款成功，用时 ${secs}s`]
   if (skipped.length) lines.push(`⚪ 目录标为不可付款、未测: ${skipped.map((r) => r.id).join(', ')}`)
   for (const f of fails) lines.push(`· ${f.id} ${f.verdict} [${f.blame === 'us' ? '我们的问题' : f.blame === 'merchant' ? '商家问题' : '待判'}] ${f.detail}`)
   if (fails.length) lines.push(`→ 责任在「我们的问题」的项先修；排查 SOP: docs/SOP-provider-e2e-test.md`)
   if (bal !== null && after !== null) lines.push(`💰 钱包 USDC ${bal.toFixed(3)} → ${after.toFixed(3)}（本轮花 $${(bal - after).toFixed(3)}）`)
   lines.push(`📎 落库: ${persisted}`)
   await feishu(lines.join('\n'))
-  process.exit(fails.length ? 1 : 0)
+  process.exit(nothingTested ? 4 : fails.length ? 1 : 0)
 }
 
 main().catch(async (e) => { console.error(e); await feishu(`【MPP Router 付费巡检】🔴 wrapper crashed: ${String(e.message || e).slice(0, 200)}`); process.exit(1) })
