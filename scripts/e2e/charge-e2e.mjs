@@ -129,6 +129,9 @@ function classify(p, { ok, stdout, stderr, json }) {
   }
   // Drop the wallet tool's plaintext-key advisory so it cannot mask the real error.
   const err = ((stderr || '') + (stdout || '')).split('\n').filter((l) => !/Signing key loaded|--identity <name>/.test(l)).join('\n')
+  if (/model_not_found|does not exist or you do not have access|invalid model|unknown model/i.test(err)) {
+    return { verdict: 'FAIL', blame: 'merchant', detail: `merchant no longer serves model ${p.body?.model ?? '?'} (model_not_found; router auto-refunds)` }
+  }
   if (/Route not enabled for payment/i.test(err)) {
     return { verdict: 'FAIL', blame: 'us', detail: 'router catalog has payment disabled for this route (403)' }
   }
@@ -231,9 +234,26 @@ async function main() {
         process.stderr.write(`${c.verdict} ${c.detail}\n`)
         continue
       }
-      const raw = payOne(p, secretFile, payDir)
-      const c = classify(p, raw)
-      results.push({ id: p.id, family: p.family, mode: p.mode, path: p.publicPath, ...c })
+      let raw = payOne(p, secretFile, payDir)
+      let c = classify(p, raw)
+      // Self-heal: a retired model is a config drift, not a broken payment
+      // chain. Walk the provider's fallbackModels; the first one that
+      // completes counts as PASS and the switch is reported so the default
+      // (and the public catalog facade) can be updated.
+      let switched = null
+      if (c.verdict === 'FAIL' && /model_not_found/.test(c.detail) && Array.isArray(p.fallbackModels)) {
+        const original = p.body?.model
+        for (const m of p.fallbackModels.filter((x) => x !== original)) {
+          process.stderr.write(`\n   ↻ ${p.id}: ${original} retired, retrying with ${m} ... `)
+          const q = { ...p, body: { ...p.body, model: m } }
+          raw = payOne(q, secretFile, payDir)
+          c = classify(q, raw)
+          if (c.verdict === 'PASS') { switched = { from: original, to: m }; break }
+          if (!/model_not_found/.test(c.detail)) break
+        }
+      }
+      if (switched) c = { ...c, detail: `PASS after model switch ${switched.from} → ${switched.to} (${switched.from} retired by merchant; update default + catalog facade)` }
+      results.push({ id: p.id, family: p.family, mode: p.mode, path: p.publicPath, ...c, ...(switched ? { modelSwitched: switched } : {}) })
       process.stderr.write(`${c.verdict} [${c.blame}] ${c.detail}\n`)
     }
   } finally {

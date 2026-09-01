@@ -27,6 +27,7 @@ export const PROVIDERS = [
     method: 'POST',
     mode: 'session',
     body: { model: 'gpt-4o-mini', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    fallbackModels: ['gpt-4.1-nano', 'gpt-4o-mini', 'gpt-4.1-mini'],
     okCheck: (j) => Boolean(j?.choices?.[0]?.message ?? j?.choices?.[0]?.text),
   },
   {
@@ -36,6 +37,7 @@ export const PROVIDERS = [
     method: 'POST',
     mode: 'session',
     body: { model: 'claude-haiku-4-5', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    fallbackModels: ['claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-3-5-haiku-latest'],
     okCheck: (j) => Boolean(j?.content?.[0]?.text ?? j?.choices),
   },
   {
@@ -63,6 +65,7 @@ export const PROVIDERS = [
     method: 'POST',
     mode: 'charge',
     body: { model: 'deepseek-chat', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    fallbackModels: ['deepseek-chat', 'deepseek-reasoner'],
     okCheck: (j) => Boolean(j?.choices?.[0]?.message),
   },
   {
@@ -74,6 +77,8 @@ export const PROVIDERS = [
     // llama-3.1-8b-instant / llama-3.3-70b-versatile: merchant returns model_not_found
     // since 2026-08-24 (paid re-probe 2026-09-02, auto-refunded). gpt-oss-20b works.
     body: { model: 'openai/gpt-oss-20b', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    // Tried in order when the merchant answers model_not_found (self-heal).
+    fallbackModels: ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'llama-3.1-8b-instant'],
     okCheck: (j) => Boolean(j?.choices?.[0]?.message),
   },
 
