@@ -12,7 +12,7 @@
  *
  * Env: E2E_STELLAR_SECRET (required), E2E_STELLAR_ADDRESS (required, for
  * the read-only balance check), FEISHU_APP_ID/FEISHU_APP_SECRET/FEISHU_CHAT_ID
- * (or FEISHU_WEBHOOK), SUPABASE_URL, SUPABASE_KEY,
+ * (or FEISHU_WEBHOOK), SUPABASE_URL + SUPABASE_ANON_KEY + CHARGE_EVAL_RPC_SECRET,
  * MIN_USDC, PAY_PER_CALL_DIR, MAX_AUTO_USD.
  * Never prints secrets; charge-e2e already redacts child output.
  */
@@ -69,19 +69,23 @@ async function usdcBalance() {
   return b ? Number(b.balance) : 0
 }
 
-async function persist(report) {
-  const url = process.env.SUPABASE_URL, key = process.env.SUPABASE_KEY
-  if (!url || !key) return 'not configured'
+// Persist via the restricted RPC (anon key + Vault-checked secret); the job
+// never holds a service-role key. Table: analytics_app_mpprouter_charge_evals.
+async function persist(report, usdSpent) {
+  const { SUPABASE_URL: url, SUPABASE_ANON_KEY: key, CHARGE_EVAL_RPC_SECRET: secret } = process.env
+  if (!url || !key || !secret) return 'not configured'
   const rows = report.results.map((r) => ({
     run_ts: report.ts, router_base: report.base, provider: r.id, family: r.family,
     mode: r.mode, verdict: r.verdict, blame: r.blame, detail: r.detail,
+    usd_spent: usdSpent == null ? null : usdSpent.toFixed(6),
   }))
-  const res = await fetch(`${url}/rest/v1/analytics_app_mpprouter_charge_evals`, {
+  const res = await fetch(`${url}/rest/v1/rpc/mpprouter_charge_eval_insert`, {
     method: 'POST',
-    headers: { apikey: key, authorization: `Bearer ${key}`, 'content-type': 'application/json', prefer: 'return=minimal' },
-    body: JSON.stringify(rows),
+    headers: { apikey: key, authorization: `Bearer ${key}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ p_secret: secret, p_rows: rows }),
   })
-  return res.ok ? `${rows.length} rows` : `HTTP ${res.status}`
+  if (!res.ok) return `HTTP ${res.status} ${(await res.text()).slice(0, 120)}`
+  return `${await res.text()} rows`
 }
 
 const stamp = () => new Date().toISOString().slice(0, 16).replace('T', ' ') + 'Z'
@@ -105,8 +109,9 @@ async function main() {
   }
   const report = JSON.parse(readFileSync(OUT, 'utf8'))
   unlinkSync(OUT)
-  const persisted = await persist(report).catch((e) => `error ${e.message}`)
   const after = await usdcBalance().catch(() => null)
+  const usdSpent = bal !== null && after !== null ? bal - after : null
+  const persisted = await persist(report, usdSpent).catch((e) => `error ${e.message}`)
 
   const skipped = report.results.filter((r) => r.verdict === 'SKIP')
   const fails = report.results.filter((r) => r.verdict !== 'PASS' && r.verdict !== 'SKIP')
