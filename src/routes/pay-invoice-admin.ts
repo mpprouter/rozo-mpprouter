@@ -1,6 +1,7 @@
 import type { Env } from '../index'
 import { createQuoteReceipt } from './quote-receipt'
 import {
+  buildCheckoutTitle,
   formatUsdcAtomic,
   isExactCheckoutWebClient,
   normalizeCheckoutClient,
@@ -485,9 +486,20 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     Math.floor(Date.now() / 1000),
     { ...pricingFields, client: pricingClient },
   )
+  // Display fields, so a client can render the full invoice card from the quote
+  // alone — before any order exists. `merchant` and `linkId` already reach the
+  // caller via the `...quote` spread; `title` and `currency` are added here so
+  // the quote shows exactly what create-invoice will show, instead of the
+  // client rebuilding the string and drifting from the server.
+  //
+  // Deliberately NOT included: merchantLogoUrl / merchantDescription. Those come
+  // from the Rozo intents response and genuinely do not exist until an intent is
+  // created, so a quote-time card must render without them.
   return json(200, {
     ...quote,
     ...pricingFields,
+    title: buildCheckoutTitle(merchant, pricing),
+    currency: 'USD',
     quote: {
       ...(quote?.quote && typeof quote.quote === 'object' ? quote.quote : {}),
       originalAtomicUsdc: pricing.originalAtomic.toString(),
