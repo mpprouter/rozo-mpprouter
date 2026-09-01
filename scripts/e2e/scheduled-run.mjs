@@ -90,7 +90,7 @@ async function main() {
   const bal = await usdcBalance().catch((e) => { console.error('balance check failed:', e.message); return null })
   if (bal !== null && bal < MIN_USDC) {
     await feishu(`【MPP Router 付费巡检 · ${stamp()}】\n⏸ 本轮跳过：测试钱包 USDC 仅 ${bal.toFixed(3)}，低于 ${MIN_USDC}。\n🟡 请老板补 Stellar USDC 到 ${ADDR.slice(0, 6)}...${ADDR.slice(-4)}（约 $10 够一个月）。`)
-    process.exit(3)
+    process.exit(0) // see note at end of main: never non-zero on Railway
   }
 
   const t0 = Date.now()
@@ -101,7 +101,7 @@ async function main() {
 
   if (!existsSync(OUT)) {
     await feishu(`【MPP Router 付费巡检 · ${stamp()}】\n🔴 巡检脚本本身没跑完（exit ${run.status}, ${secs}s），没有结果。看 Railway 服务 mpprouter-charge-eval 的日志。`)
-    process.exit(1)
+    process.exit(0)
   }
   const report = JSON.parse(readFileSync(OUT, 'utf8'))
   unlinkSync(OUT)
@@ -123,7 +123,11 @@ async function main() {
   if (bal !== null && after !== null) lines.push(`💰 钱包 USDC ${bal.toFixed(3)} → ${after.toFixed(3)}（本轮花 $${(bal - after).toFixed(3)}）`)
   lines.push(`📎 落库: ${persisted}`)
   await feishu(lines.join('\n'))
-  process.exit(nothingTested ? 4 : fails.length ? 1 : 0)
+  // Always exit 0: Railway restarts a cron container on non-zero exit (the
+  // restart policy is not reliably applied from railway.json), which would
+  // re-run the paid suite in a loop. Outcome is carried by the Feishu message.
+  console.error(`outcome: ${nothingTested ? 'NOTHING_TESTED' : fails.length ? 'FAIL' : 'PASS'}`)
+  process.exit(0)
 }
 
-main().catch(async (e) => { console.error(e); await feishu(`【MPP Router 付费巡检】🔴 wrapper crashed: ${String(e.message || e).slice(0, 200)}`); process.exit(1) })
+main().catch(async (e) => { console.error(e); await feishu(`【MPP Router 付费巡检】🔴 wrapper crashed: ${String(e.message || e).slice(0, 200)}`); process.exit(0) })
