@@ -129,6 +129,9 @@ function classify(p, { ok, stdout, stderr, json }) {
   }
   // Drop the wallet tool's plaintext-key advisory so it cannot mask the real error.
   const err = ((stderr || '') + (stdout || '')).split('\n').filter((l) => !/Signing key loaded|--identity <name>/.test(l)).join('\n')
+  if (/Pay \$[\d.]+ USDC on mainnet\? \(yes\/no\)/.test(err)) {
+    return { verdict: 'FAIL', blame: 'us', detail: `quote exceeds MAX_AUTO_USD=$${MAX_AUTO_USD}; not paid (raise the cap deliberately or drop the route)` }
+  }
   if (/model_not_found|does not exist or you do not have access|invalid model|unknown model/i.test(err)) {
     return { verdict: 'FAIL', blame: 'merchant', detail: `merchant no longer serves model ${p.body?.model ?? '?'} (model_not_found; router auto-refunds)` }
   }
@@ -172,7 +175,10 @@ function payOne(p, secretFile, payDir) {
     'pubnet',
     '--max-auto',
     MAX_AUTO_USD,
-    '--yes',
+    // No --yes: the wallet's mainnet gate returns early on --yes and never
+    // checks --max-auto, so an over-cap quote would be auto-signed. Without
+    // it, amount <= MAX_AUTO_USD pays unattended and anything above hits the
+    // confirm prompt, which reads EOF (stdin ignored) and aborts unpaid.
     '--json',
   ]
   try {
