@@ -416,16 +416,20 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'fixes its key.',
     placeholderDefaults: { version: 'v1beta', model: 'gemini-2.0-flash' },
   },
-  // Dune SQL Execute — channel underfunded
+  // Dune SQL Execute — delisted by founder decision 2026-09-02 (reason text
+  // approved verbatim). Background, not shown publicly: the session channel
+  // was underfunded ($4 probe charge vs $1 deposit) and the founder chose not
+  // to top it up. Re-listing needs a real paid verification first.
   'dune::/api/v1/sql/execute': {
     id: 'dune_execute',
     publicPath: '/v1/services/dune/execute',
     upstreamPaymentMethod: 'tempo.session',
     verifiedMode: false,
     verifiedNote:
-      'Channel underfunded — Dune SQL execute charged $4 USDC initial probe ' +
-      'charge but channel deposit was only $1. Cumulative > deposit, so the ' +
-      'next voucher will be rejected. Needs a topup or a higher initial deposit.',
+      'Not listed for now: this route is comparatively expensive ' +
+      '($0.05–$4 per request) and has not been verified end-to-end by Rozo. ' +
+      'If you need Dune SQL through the router, contact us and we will ' +
+      'enable it on request.',
   },
   // Modal Sandbox — body shape issue
   'modal::/sandbox/exec': {

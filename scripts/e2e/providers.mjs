@@ -71,7 +71,9 @@ export const PROVIDERS = [
     publicPath: '/v1/services/groq/chat',
     method: 'POST',
     mode: 'charge',
-    body: { model: 'llama-3.1-8b-instant', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
+    // llama-3.1-8b-instant / llama-3.3-70b-versatile: merchant returns model_not_found
+    // since 2026-08-24 (paid re-probe 2026-09-02, auto-refunded). gpt-oss-20b works.
+    body: { model: 'openai/gpt-oss-20b', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] },
     okCheck: (j) => Boolean(j?.choices?.[0]?.message),
   },
 
