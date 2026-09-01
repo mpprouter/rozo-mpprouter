@@ -123,6 +123,7 @@ async function main() {
       ? `🟡 0 个 provider 被测试（全部被目录标为不可付款），本轮没有真实付款，不算通过`
       : `${fails.length ? '🔴' : '🟢'} ${pass}/${tested} provider 全链路付款成功，用时 ${secs}s`]
   for (const s of skipped) lines.push(`⚪ ${s.id} 已下架未测: ${s.detail.replace(/^catalog: payment_enabled=false — /, '')}`)
+  for (const r of report.results.filter((x) => x.modelSwitched)) lines.push(`🔁 ${r.id}: 默认模型 ${r.modelSwitched.from} 已被商家下线，自动切到 ${r.modelSwitched.to} 通过 → 需更新巡检默认模型 + 目录 facade`)
   for (const f of fails) lines.push(`· ${f.id} ${f.verdict} [${f.blame === 'us' ? '我们的问题' : f.blame === 'merchant' ? '商家问题' : '待判'}] ${f.detail}`)
   if (fails.length) lines.push(`→ 责任在「我们的问题」的项先修；排查 SOP: docs/SOP-provider-e2e-test.md`)
   if (bal !== null && after !== null) lines.push(`💰 钱包 USDC ${bal.toFixed(3)} → ${after.toFixed(3)}（本轮花 $${(bal - after).toFixed(3)}）`)
