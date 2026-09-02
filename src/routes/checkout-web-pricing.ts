@@ -17,7 +17,13 @@
  */
 
 export const CHECKOUT_WEB_CLIENT = 'rozo-checkout-web'
-export const CHECKOUT_PRICING_VERSION = 'checkout-web-fee-v1'
+// Bump this whenever the meaning of a signed quote-receipt field changes —
+// even "this field is no longer written". A receipt lives 60 s, so a deploy
+// that changes payload semantics without a version bump opens a 60 s window
+// in which receipts signed under the old rule are accepted under the new one.
+// v2 (2026-09-02): pricing no longer depends on the client label; receipts
+// signed by the v1 build (client-bound) are rejected and the client re-quotes.
+export const CHECKOUT_PRICING_VERSION = 'checkout-web-fee-v2'
 // This surface is approved only for the 1% canary. Keep a code-level ceiling
 // so a configuration typo cannot turn the narrow experiment into a 10%/100%
 // surcharge. A future increase requires a reviewed code change, not just a var.

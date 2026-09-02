@@ -70,7 +70,7 @@ describe('quote receipt', () => {
         serviceFee: '0.101',
         callerPays: '10.101',
         feeBps: 101,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -146,7 +146,7 @@ describe('quote receipt', () => {
         serviceFee: '0.11',
         callerPays: '10.12',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
       })
       expect(body.quote.callerPaysAtomicUsdc).toBe('10120000')
       await expect(
@@ -748,7 +748,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -771,7 +771,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
       })
       expect(createBody.type === 'exactOut'
         ? createBody.destination.amount
@@ -782,7 +782,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
       })
     }
   })
@@ -851,7 +851,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '0.77',
         callerPays: '77.77',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -866,6 +866,35 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(quoteFetches).toBe(0)
     expect(json.callerPays).toBe('77.77')
     expect(createBody.source.amount).toBe('77.77')
+  })
+
+  it('rejects a receipt signed under the previous pricing version once the fee is on', async () => {
+    // Regression for the cross-deploy window: a receipt minted by the earlier
+    // build carried pricingVersion v1 and could be zero-fee. It must not be
+    // honoured under v2 even though its signature and amounts still verify.
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '105',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '105',
+        serviceFee: '0',
+        callerPays: '105',
+        feeBps: 0,
+        pricingVersion: 'checkout-web-fee-v1',
+        client: null,
+      },
+    )
+    const { status, json, createBody } = await run({
+      payment_id: 'pl_test123',
+      client: 'rozo-checkout-web',
+      quoteReceipt,
+    }, '100')
+    expect(status).toBe(409)
+    expect(json.error.code).toBe('QUOTE_RECEIPT_INVALID_OR_EXPIRED')
+    expect(createBody).toBeNull()
   })
 
   it('keeps zero-fee legacy fallback for a tampered receipt', async () => {
@@ -926,7 +955,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '0',
         callerPays: '77',
         feeBps: 0,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -1435,7 +1464,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -1465,7 +1494,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
           serviceFee: '1.05',
           callerPays: '106.05',
           feeBps: 100,
-          pricingVersion: 'checkout-web-fee-v1',
+          pricingVersion: 'checkout-web-fee-v2',
         },
       },
       { payment_id: 'pl_test123', source: { chainId: '1500', tokenSymbol: 'USDC' } },
@@ -1486,7 +1515,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )

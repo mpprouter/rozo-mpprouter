@@ -176,7 +176,7 @@ async function openRouterFeeReceipt(nowSeconds = Math.floor(Date.now() / 1000)) 
       serviceFee: '0.1',
       callerPays: '10.1',
       feeBps: 100,
-      pricingVersion: 'checkout-web-fee-v1',
+      pricingVersion: 'checkout-web-fee-v2',
       client: null,
     },
   )
@@ -261,7 +261,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
       })
       expect(createdIntent.type === 'exactOut'
         ? createdIntent.destination.amount
@@ -273,7 +273,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
       })
     }
   })
@@ -295,7 +295,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
       serviceFee: '0.1',
       callerPays: '10.1',
       feeBps: 100,
-      pricingVersion: 'checkout-web-fee-v1',
+      pricingVersion: 'checkout-web-fee-v2',
     })
     await expect(
       verifyQuoteReceipt(body.quoteReceipt, 'cpis_test123', 'test-admin-secret'),
@@ -351,7 +351,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         serviceFee: '0',
         callerPays: '10',
         feeBps: 0,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -380,7 +380,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -463,7 +463,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -499,7 +499,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
         client: null,
       },
     )
@@ -536,7 +536,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v1',
+        pricingVersion: 'checkout-web-fee-v2',
       },
     }
 
