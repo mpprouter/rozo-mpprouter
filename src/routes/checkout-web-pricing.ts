@@ -171,12 +171,18 @@ function formatExactCheckoutTitleAmount(atomic: bigint): string {
   return `$${whole}.${fraction.padEnd(2, '0')}`
 }
 
+// "via Rozo" names who the service fee goes to: the title is what a payer
+// sees in their wallet, and without it the fee reads as the merchant's. It is
+// on the zero-fee branch as well so the checkout line carries one consistent
+// attribution whether or not a fee applies (exempt merchants, gate at 0).
+export const CHECKOUT_TITLE_VIA = 'via Rozo'
+
 export function buildCheckoutTitle(merchant: string, pricing: CheckoutPricing): string {
   if (pricing.serviceFeeAtomic === 0n) {
-    return buildFullAmountTitle(merchant, pricing.originalAtomic)
+    return `${buildFullAmountTitle(merchant, pricing.originalAtomic)} ${CHECKOUT_TITLE_VIA}`
   }
   return (
-    `Pay ${merchant} ${formatExactCheckoutTitleAmount(pricing.callerPaysAtomic)}` +
+    `Pay ${merchant} ${formatExactCheckoutTitleAmount(pricing.callerPaysAtomic)} ${CHECKOUT_TITLE_VIA}` +
     ` (includes ${formatExactCheckoutTitleAmount(pricing.serviceFeeAtomic)} service fee)`
   )
 }

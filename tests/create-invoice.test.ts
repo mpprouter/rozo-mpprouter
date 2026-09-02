@@ -252,13 +252,18 @@ describe('browser checkout fee policy', () => {
   it('makes the charged total explicit in the display title', () => {
     const pricing = resolveCheckoutPricing(10_000_000n, 'OpenRouter', '100')
     expect(buildCheckoutTitle('OpenRouter', pricing)).toBe(
-      'Pay OpenRouter $10.10 (includes $0.10 service fee)',
+      'Pay OpenRouter $10.10 via Rozo (includes $0.10 service fee)',
     )
 
     const subCent = resolveCheckoutPricing(10_010_000n, 'OpenRouter', '100')
     expect(buildCheckoutTitle('OpenRouter', subCent)).toBe(
-      'Pay OpenRouter $10.12 (includes $0.11 service fee)',
+      'Pay OpenRouter $10.12 via Rozo (includes $0.11 service fee)',
     )
+
+    // Zero fee keeps the attribution so the checkout line reads the same
+    // whether or not a fee applies.
+    const free = resolveCheckoutPricing(10_000_000n, 'OpenRouter', '0')
+    expect(buildCheckoutTitle('OpenRouter', free)).toBe('Pay OpenRouter $10 via Rozo')
   })
 })
 
