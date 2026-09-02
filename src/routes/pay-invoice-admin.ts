@@ -385,7 +385,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     return json(400, { code: 'INVALID_INPUT', error: 'Invalid JSON body' })
   }
 
-  const { normalized, error, link_id_detected } = normalizePayInvoiceBody(parsed)
+  const { normalized, error, link_id_detected, raw_url } = normalizePayInvoiceBody(parsed)
   if (!normalized || error) {
     const errPayload = error ?? {
       code: 'INVALID_INPUT' as PayInvoiceErrorCode,
@@ -492,6 +492,12 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
   return json(200, {
     ...quote,
     ...pricingFields,
+    // Verbatim echo of the invoice URL this caller supplied in this same
+    // request, so a client that keeps only the quote can still link back to the
+    // merchant's invoice page. Discloses nothing new — they already hold it.
+    // Omitted when the invoice was identified by payment_id instead of a URL.
+    // Never sourced from a lookup: no endpoint keyed by id may return this.
+    ...(raw_url ? { invoiceUrl: raw_url } : {}),
     title: buildCheckoutTitle(merchant, pricing),
     currency: 'USD',
     quote: {
