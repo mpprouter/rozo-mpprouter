@@ -579,23 +579,42 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   },
   // Groq Chat — OpenAI-compatible, very fast inference, tempo.charge.
   // Price dynamic ($0.005–$0.10 by model/tokens).
-  // verifiedMode 'charge' — real-money E2E 2026-06-22 returned a live
-  // llama-3.1-8b-instant completion through the full chain.
+  // verifiedMode 'charge' — real-money E2E 2026-06-22 (llama-3.1-8b-instant)
+  // and again 2026-09-02 (openai/gpt-oss-20b, openai/gpt-oss-120b) returned
+  // live completions through the full chain. Founder approved the public
+  // wording 2026-09-02 ("改").
   'groq::/groq/chat': {
     id: 'groq_chat',
     publicPath: '/v1/services/groq/chat',
     upstreamPaymentMethod: 'tempo.charge',
     verifiedMode: 'charge',
     chargeVerified: true,
-    chargeVerifiedAt: '2026-06-22T00:00:00Z',
-    // Facade: kept listed-but-unavailable so the id is rejected at
-    // validation time (400, before any payment) instead of vanishing.
+    chargeVerifiedAt: '2026-09-02T00:00:00Z',
+    verifiedNote:
+      'Verified end-to-end with real payments on 2026-09-02: ' +
+      'openai/gpt-oss-20b and openai/gpt-oss-120b return live Groq ' +
+      'completions through the router. llama-3.1-8b-instant and ' +
+      'llama-3.3-70b-versatile are no longer served by this merchant ' +
+      '(model_not_found after payment; the router refunds automatically) ' +
+      'and are rejected before payment. Re-checked twice weekly by the ' +
+      'scheduled charge eval.',
+    // Facade: retired ids stay documented-but-rejected (400 before any
+    // payment) instead of vanishing; evidence in the comment above.
     facade: {
-      models: [{
-        id: 'llama-3.1-8b-instant',
-        available: false,
-        unavailableReason: 'Paid re-probe on 2026-08-24 returned model_not_found after payment.',
-      }],
+      models: [
+        { id: 'openai/gpt-oss-20b', available: true },
+        { id: 'openai/gpt-oss-120b', available: true },
+        {
+          id: 'llama-3.1-8b-instant',
+          available: false,
+          unavailableReason: 'Merchant no longer serves this model: paid probes on 2026-08-24 and 2026-09-02 returned model_not_found. Use openai/gpt-oss-20b.',
+        },
+        {
+          id: 'llama-3.3-70b-versatile',
+          available: false,
+          unavailableReason: 'Merchant no longer serves this model: paid probe on 2026-09-02 returned model_not_found. Use openai/gpt-oss-20b.',
+        },
+      ],
     },
   },
   // CoinGecko Simple Price — flat $0.06/request, tempo.charge. Cheapest
