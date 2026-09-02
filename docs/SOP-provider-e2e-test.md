@@ -56,7 +56,7 @@ curl -s -X POST "$BASE/v1/services/<svc>/<path>" \
 | provider | publicPath | 最轻 body |
 |---|---|---|
 | alchemy | `/v1/services/alchemy/rpc` | `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}` |
-| anthropic | `/v1/services/anthropic/messages` | `{"model":"claude-3-5-haiku-20241022","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}` |
+| anthropic | `/v1/services/anthropic/messages` | `{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}` |
 | openai | `/v1/services/openai/chat` | `{"model":"gpt-4o-mini","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}` |
 | gemini | `/v1/services/gemini/generate` | `{"contents":[{"parts":[{"text":"hi"}]}]}` |
 | exa | `/v1/services/exa/search` | `{"query":"test"}` |
