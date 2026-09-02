@@ -250,6 +250,16 @@ export type CreateInvoiceErrorCode =
   | 'QUOTE_RECEIPT_INVALID_OR_EXPIRED'
   | 'QUOTE_RECEIPT_REQUIRED'
 
+// Resolver failure kind -> the error code a checkout UI keys its friendly copy
+// off. Without a code the UI renders the raw upstream string, so an expired
+// Stripe session showed the customer "resume_payin_session failed (410)"
+// instead of "This invoice has expired. Please generate a new payment link."
+const STRIPE_RESOLVE_ERROR_CODES: Record<string, CreateInvoiceErrorCode> = {
+  invalid_url: 'INVALID_INPUT',
+  expired: 'LINK_USED_OR_EXPIRED',
+  unsupported: 'UNSUPPORTED_SOURCE',
+}
+
 export interface CreateInvoiceError extends Omit<PayInvoiceError, 'code'> {
   code: CreateInvoiceErrorCode
   payment_status?: string
@@ -1534,10 +1544,25 @@ export async function handleStripeCreateInvoice(
             : err.kind === 'unsupported'
               ? 422
               : 502
-      // err.message is authored to be address/secret-free by construction.
-      return json(status, { ok: false, provider: 'stripe_crypto', error: err.message, reason: err.kind })
+      // Checkout UIs map upstream failures to friendly copy by `code` and fall
+      // back to rendering `error` verbatim when there is none — which is how a
+      // customer ended up reading "resume_payin_session failed (410)" on a
+      // checkout page. `err.message` stays in the payload for operators and is
+      // address/secret-free by construction.
+      return json(status, {
+        ok: false,
+        provider: 'stripe_crypto',
+        code: STRIPE_RESOLVE_ERROR_CODES[err.kind] ?? 'UPSTREAM_ERROR',
+        error: err.message,
+        reason: err.kind,
+      })
     }
-    return json(502, { ok: false, provider: 'stripe_crypto', error: 'Failed to resolve Stripe invoice' })
+    return json(502, {
+      ok: false,
+      provider: 'stripe_crypto',
+      code: 'UPSTREAM_ERROR',
+      error: 'Failed to resolve Stripe invoice',
+    })
   }
 
   // 2. Refuse to create an unfulfillable order (design §12: 422 no wallet_connect).

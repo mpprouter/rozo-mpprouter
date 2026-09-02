@@ -16,6 +16,7 @@
  *     - www-authenticate     (mppx 402 challenge)
  *     - payment-required     (x402 402 challenge)
  *     - x-request-id
+ *     - retry-after          (429 backoff, read by browser checkout UIs)
  *
  * Echoing the Origin (rather than `*`) keeps the door open for
  * credentialed requests later without a code change.
@@ -39,6 +40,10 @@ const EXPOSED_RESPONSE_HEADERS = [
   // 402 challenge headers the browser mppx client must read
   'accept-payment',
   'payment',
+  // 429 backoff. Without this a browser checkout UI cannot read Retry-After
+  // cross-origin — the header is present on the wire but hidden from JS — so
+  // the client has no way to back off correctly.
+  'retry-after',
 ].join(', ')
 
 const ALLOWED_METHODS = 'GET, POST, OPTIONS'

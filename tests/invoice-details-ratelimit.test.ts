@@ -9,6 +9,7 @@
 
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { handleInvoiceDetails } from '../src/routes/invoice-details'
+import { withCors } from '../src/utils/cors'
 
 // Coinbase resolution performs live network I/O too, so stub the upstream with
 // a payable v1 link. These tests are about the guard rails, not normalization
@@ -218,5 +219,42 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
     )
     // Not a 429 — the request proceeds (fails open) and resolves normally.
     expect(r.status).toBe(200)
+  })
+})
+
+describe('429 reaches a cross-origin browser client intact', () => {
+  // The checkout UI runs on a different origin from the router, so a response
+  // header the worker sets is invisible to JS unless it is listed in
+  // Access-Control-Expose-Headers. Assert through the CORS wrapper, which is
+  // what actually leaves the worker — asserting on the raw handler response
+  // would pass while the browser still saw null.
+  it('exposes Retry-After through the CORS wrapper', async () => {
+    const env = makeEnv()
+    const url = 'https://payments.coinbase.com/payment-links/pl_cors'
+    const request = () =>
+      new Request('https://router.test/v1/services/rozo-agent-api/invoice-details', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'CF-Connecting-IP': '3.3.3.3',
+          origin: 'https://agent.rozo.ai',
+        },
+        body: JSON.stringify({ url }),
+      })
+    for (let i = 0; i < 30; i++) {
+      await handleInvoiceDetails(request(), env)
+    }
+    const raw = await handleInvoiceDetails(request(), env)
+    expect(raw.status).toBe(429)
+
+    const wrapped = withCors(request(), raw)
+    const exposed = (wrapped.headers.get('access-control-expose-headers') ?? '').toLowerCase()
+    expect(exposed.split(/,\s*/)).toContain('retry-after')
+    expect(wrapped.headers.get('Retry-After')).toBeTruthy()
+    // The body carries the same value, so a client that cannot read headers
+    // at all still has a correct backoff.
+    const j = (await wrapped.json()) as any
+    expect(j.scope).toBe('invoice')
+    expect(j.retry_after_s).toBeGreaterThan(0)
   })
 })
