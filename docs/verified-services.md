@@ -255,7 +255,35 @@ the Tranche 2 number. Cheap follow-ups whenever route coverage is the goal.
 
 ---
 
+> ## ⚠️ Authority note (added 2026-09-02)
+>
+> **`src/services/merchants.ts` is the source of truth for whether a route is
+> payable, not this file.** Both Anthropic routes were RELISTED in that file on
+> 2026-08-24 after paid re-probes, but the delisting round recorded below was
+> never marked superseded here. That gap made this file assert the opposite of
+> production for nine days, and it misled a downstream reader into publishing
+> that Anthropic was unpayable.
+>
+> Re-confirmed 2026-09-02 with two fresh paid calls through the router
+> (payer `GD5R4H...BB4U`, $0.001 each):
+>
+> | Route | Model | Stellar tx | Ledger |
+> |---|---|---|---|
+> | `anthropic_messages` | `claude-haiku-4-5` | `4a22b9468875556a58121951a22aff9fd6296a9d3371a6a8afeb2d082a585feb` | `delivered`, upstream 200 |
+> | `anthropic_chat_completions` | `claude-haiku-4-5` | `cd1ab46e6f89fb6842556e520bc15686533e2879e485d7c286ae21ece3a9c03c` | `delivered`, upstream 200 |
+>
+> A third call the same minute is the useful negative control: the retired id
+> `claude-3-5-haiku-20241022` (still the body in `docs/SOP-provider-e2e-test.md`)
+> returned upstream **404 `not_found_error`**, settled, and auto-refunded
+> (tx `a844bbeb3c564ee8897423109e2e678397092190c62f1d4695a311d91fadd4ba`,
+> ledger `refunded`). A stale model id in the SOP therefore looks like a broken
+> provider. **Update the SOP body before probing.**
+
 ### Run 2026-08-18 (later) — `anthropic_messages` re-probe → delisted
+
+> **SUPERSEDED 2026-08-24, re-confirmed 2026-09-02.** The delisting below was
+> correct when written. The merchant was fixed; both routes deliver again. Kept
+> in full because the reasoning stands, but do not read it as current status.
 
 A verification round whose result is a **removal**. Recorded in the same detail
 as a passing round, because a delisting carries the same burden of proof.
