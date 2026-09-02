@@ -166,23 +166,15 @@ export function buildFullAmountTitle(merchant: string, invoiceAtomic: bigint): s
   return `Pay ${merchant} ${formatTitleAmount(invoiceAtomic)}`
 }
 
-function formatExactCheckoutTitleAmount(atomic: bigint): string {
-  const [whole, fraction = ''] = formatUsdcAtomic(atomic).split('.')
-  return `$${whole}.${fraction.padEnd(2, '0')}`
-}
-
-// "via Rozo" names who the service fee goes to: the title is what a payer
-// sees in their wallet, and without it the fee reads as the merchant's. It is
-// on the zero-fee branch as well so the checkout line carries one consistent
-// attribution whether or not a fee applies (exempt merchants, gate at 0).
+// "via Rozo" names who the service fee goes to. The title follows the intent
+// into wallets and order records, where the checkout's own fee breakdown
+// (invoice-pricing-breakdown.tsx) is not shown; without it a $31.76 title
+// reads as the merchant's price when the merchant receives $31.44. The fee
+// itself is not repeated here — the breakdown already shows it — so the title
+// keeps the original `Pay <merchant> $<amount>` shape plus the attribution.
 export const CHECKOUT_TITLE_VIA = 'via Rozo'
 
 export function buildCheckoutTitle(merchant: string, pricing: CheckoutPricing): string {
-  if (pricing.serviceFeeAtomic === 0n) {
-    return `${buildFullAmountTitle(merchant, pricing.originalAtomic)} ${CHECKOUT_TITLE_VIA}`
-  }
-  return (
-    `Pay ${merchant} ${formatExactCheckoutTitleAmount(pricing.callerPaysAtomic)} ${CHECKOUT_TITLE_VIA}` +
-    ` (includes ${formatExactCheckoutTitleAmount(pricing.serviceFeeAtomic)} service fee)`
-  )
+  // Zero fee: callerPays === original, so one shape covers both branches.
+  return `${buildFullAmountTitle(merchant, pricing.callerPaysAtomic)} ${CHECKOUT_TITLE_VIA}`
 }
