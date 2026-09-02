@@ -119,9 +119,9 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
   // (stricter) per-invoice limit.
   const linkN = (n: number) => `https://payments.coinbase.com/payment-links/pl_ratelimit${n}`
 
-  it('throttles the 11th request from the same IP within the window', async () => {
+  it('throttles the 61st request from the same IP within the window', async () => {
     const env = makeEnv()
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 60; i++) {
       const r = await handleInvoiceDetails(req({ url: linkN(i) }, '9.9.9.9'), env)
       expect(r.status).toBe(200) // allowed, not throttled
     }
@@ -137,7 +137,7 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
 
   it('does not throttle a different IP', async () => {
     const env = makeEnv()
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 60; i++) {
       await handleInvoiceDetails(req({ url: linkN(i) }, '8.8.8.8'), env)
     }
     // Different IP starts fresh
@@ -161,22 +161,23 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
     expect(stillOk.status).toBe(200)
   })
 
-  it('throttles the 31st hit on one invoice from the same IP', async () => {
+  it('throttles the 31st hit on one invoice from the same IP, before the per-IP ceiling', async () => {
     const env = makeEnv()
     const url = 'https://payments.coinbase.com/payment-links/pl_hammered2'
-    // Per-IP is the tighter limit for a single IP, so raise it out of the way
-    // by spreading the first 30 across the invoice bucket only: we drive the
-    // invoice bucket directly through repeated calls and assert the 429 shape
-    // once both budgets are exhausted.
-    let last = await handleInvoiceDetails(req({ url }, '6.6.6.6'), env)
-    for (let i = 1; i < 31; i++) {
-      last = await handleInvoiceDetails(req({ url }, '6.6.6.6'), env)
+    for (let i = 0; i < 30; i++) {
+      const r = await handleInvoiceDetails(req({ url }, '6.6.6.6'), env)
+      expect(r.status).toBe(200)
     }
-    expect(last.status).toBe(429)
-    const j = (await last.json()) as any
+    const throttled = await handleInvoiceDetails(req({ url }, '6.6.6.6'), env)
+    expect(throttled.status).toBe(429)
+    const j = (await throttled.json()) as any
+    // `scope` is the assertion that matters: it proves the INVOICE bucket
+    // tripped and not the per-IP ceiling, which is what makes this bucket
+    // reachable rather than dead code.
+    expect(j.scope).toBe('invoice')
     expect(j.code).toBe('RATE_LIMITED')
     expect(j.error).not.toContain('per-session')
-    expect(last.headers.get('Retry-After')).toBeTruthy()
+    expect(throttled.headers.get('Retry-After')).toBeTruthy()
   })
 
   it('resets on a fixed window boundary, not on inactivity', async () => {
@@ -185,8 +186,8 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
     const start = Date.now()
     const clock = vi.spyOn(Date, 'now')
     clock.mockReturnValue(start)
-    // Exhaust the per-IP budget (10/min) inside one window.
-    for (let i = 0; i < 10; i++) {
+    // Exhaust the per-IP budget (60/min) inside one window.
+    for (let i = 0; i < 60; i++) {
       await handleInvoiceDetails(req({ url: `${url}${i}` }, '4.4.4.4'), env)
     }
     // 59s later, still inside the window even though traffic never stopped.

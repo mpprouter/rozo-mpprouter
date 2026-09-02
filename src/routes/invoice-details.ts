@@ -42,7 +42,12 @@ import {
 // The per-invoice bucket is keyed by invoice AND client IP. Keying it by
 // invoice alone made the budget global to a payment link, so two people (or one
 // person on two tabs) opening the same link locked each other out.
-const PER_IP_LIMIT = 10 // requests
+// The per-IP limit must stay ABOVE the per-invoice limit, or the per-invoice
+// bucket is unreachable: the IP check runs first over the same window, so a
+// lower IP ceiling would answer every request that could ever have tripped the
+// invoice bucket. Per-IP is the endpoint-wide abuse ceiling across all
+// invoices; per-invoice is what stops one live session being pounded.
+const PER_IP_LIMIT = 60 // requests, across all invoices
 const PER_IP_WINDOW_S = 60
 const PER_SESSION_LIMIT = 30 // requests, per invoice per IP
 const PER_SESSION_WINDOW_S = 60
