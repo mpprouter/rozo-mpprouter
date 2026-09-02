@@ -249,16 +249,21 @@ describe('browser checkout fee policy', () => {
     expect(resolveCheckoutPricing(10_000_000n, 'Venice.ai', undefined).feeBps).toBe(0)
   })
 
-  it('makes the charged total explicit in the display title', () => {
+  it('shows the charged total and the Rozo attribution in the display title', () => {
     const pricing = resolveCheckoutPricing(10_000_000n, 'OpenRouter', '100')
     expect(buildCheckoutTitle('OpenRouter', pricing)).toBe(
-      'Pay OpenRouter $10.10 (includes $0.10 service fee)',
+      'Pay OpenRouter $10.10 via Rozo',
     )
 
     const subCent = resolveCheckoutPricing(10_010_000n, 'OpenRouter', '100')
     expect(buildCheckoutTitle('OpenRouter', subCent)).toBe(
-      'Pay OpenRouter $10.12 (includes $0.11 service fee)',
+      'Pay OpenRouter $10.12 via Rozo',
     )
+
+    // Zero fee keeps the attribution so the checkout line reads the same
+    // whether or not a fee applies.
+    const free = resolveCheckoutPricing(10_000_000n, 'OpenRouter', '0')
+    expect(buildCheckoutTitle('OpenRouter', free)).toBe('Pay OpenRouter $10 via Rozo')
   })
 })
 
@@ -601,7 +606,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     // Response reflects no discount.
     expect(json.callerPays).toBe('105')
     expect(json.discount).toBe('0')
-    expect(json.title).toBe('Pay OpenRouter, Inc. $105')
+    expect(json.title).toBe('Pay OpenRouter, Inc. $105 via Rozo')
   })
 
   it('retries a transient Coinbase session-readiness conflict before declaring the link expired', async () => {
