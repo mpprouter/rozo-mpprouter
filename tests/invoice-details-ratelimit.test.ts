@@ -1,6 +1,6 @@
 /**
  * invoice-details endpoint: input validation, provider routing, and the
- * per-IP / per-session fixed-window rate limiter.
+ * per-IP / per-invoice fixed-window rate limiter.
  *
  * Stripe resolution itself performs live network I/O, so these tests exercise
  * the guard rails BEFORE resolution (bad body, unsupported host, rate limits)
@@ -9,6 +9,7 @@
 
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest'
 import { handleInvoiceDetails } from '../src/routes/invoice-details'
+import { withCors } from '../src/utils/cors'
 
 // Coinbase resolution performs live network I/O too, so stub the upstream with
 // a payable v1 link. These tests are about the guard rails, not normalization
@@ -119,21 +120,25 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
   // (stricter) per-invoice limit.
   const linkN = (n: number) => `https://payments.coinbase.com/payment-links/pl_ratelimit${n}`
 
-  it('throttles the 11th request from the same IP within the window', async () => {
+  it('throttles the 61st request from the same IP within the window', async () => {
     const env = makeEnv()
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 60; i++) {
       const r = await handleInvoiceDetails(req({ url: linkN(i) }, '9.9.9.9'), env)
       expect(r.status).toBe(200) // allowed, not throttled
     }
     const throttled = await handleInvoiceDetails(req({ url: linkN(99) }, '9.9.9.9'), env)
     expect(throttled.status).toBe(429)
     const j = (await throttled.json()) as any
-    expect(j.error).toContain('per-IP')
+    expect(j.code).toBe('RATE_LIMITED')
+    expect(j.scope).toBe('ip')
+    // The user-facing string must not leak internal bucket names.
+    expect(j.error).not.toContain('per-IP')
+    expect(throttled.headers.get('Retry-After')).toBeTruthy()
   })
 
   it('does not throttle a different IP', async () => {
     const env = makeEnv()
-    for (let i = 0; i < 10; i++) {
+    for (let i = 0; i < 60; i++) {
       await handleInvoiceDetails(req({ url: linkN(i) }, '8.8.8.8'), env)
     }
     // Different IP starts fresh
@@ -141,17 +146,61 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
     expect(other.status).toBe(200)
   })
 
-  it('applies the per-invoice limit to Coinbase too (4th hit on one link)', async () => {
+  it('applies the per-invoice limit to Coinbase too, but only past 30 hits', async () => {
     const env = makeEnv()
     const url = 'https://payments.coinbase.com/payment-links/pl_hammered'
-    for (let i = 0; i < 3; i++) {
-      const r = await handleInvoiceDetails(req({ url }, '5.5.5.5'), env)
+    // Per-IP (10/min) would trip first, so give each request its own IP: the
+    // per-invoice bucket is now keyed by invoice AND IP, which means a single
+    // IP can never exhaust another visitor's budget for the same link.
+    for (let i = 0; i < 30; i++) {
+      const r = await handleInvoiceDetails(req({ url }, `5.5.5.${i}`), env)
       expect(r.status).toBe(200)
     }
-    const throttled = await handleInvoiceDetails(req({ url }, '5.5.5.5'), env)
+    // Same IP as the first request: its own per-invoice bucket still has 29
+    // left, so it is NOT throttled by the other 29 visitors' traffic.
+    const stillOk = await handleInvoiceDetails(req({ url }, '5.5.5.0'), env)
+    expect(stillOk.status).toBe(200)
+  })
+
+  it('throttles the 31st hit on one invoice from the same IP, before the per-IP ceiling', async () => {
+    const env = makeEnv()
+    const url = 'https://payments.coinbase.com/payment-links/pl_hammered2'
+    for (let i = 0; i < 30; i++) {
+      const r = await handleInvoiceDetails(req({ url }, '6.6.6.6'), env)
+      expect(r.status).toBe(200)
+    }
+    const throttled = await handleInvoiceDetails(req({ url }, '6.6.6.6'), env)
     expect(throttled.status).toBe(429)
     const j = (await throttled.json()) as any
-    expect(j.error).toContain('per-session')
+    // `scope` is the assertion that matters: it proves the INVOICE bucket
+    // tripped and not the per-IP ceiling, which is what makes this bucket
+    // reachable rather than dead code.
+    expect(j.scope).toBe('invoice')
+    expect(j.code).toBe('RATE_LIMITED')
+    expect(j.error).not.toContain('per-session')
+    expect(throttled.headers.get('Retry-After')).toBeTruthy()
+  })
+
+  it('resets on a fixed window boundary, not on inactivity', async () => {
+    const env = makeEnv()
+    const url = 'https://payments.coinbase.com/payment-links/pl_window'
+    const start = Date.now()
+    const clock = vi.spyOn(Date, 'now')
+    clock.mockReturnValue(start)
+    // Exhaust the per-IP budget (60/min) inside one window.
+    for (let i = 0; i < 60; i++) {
+      await handleInvoiceDetails(req({ url: `${url}${i}` }, '4.4.4.4'), env)
+    }
+    // 59s later, still inside the window even though traffic never stopped.
+    clock.mockReturnValue(start + 59_000)
+    const blocked = await handleInvoiceDetails(req({ url }, '4.4.4.4'), env)
+    expect(blocked.status).toBe(429)
+    // 61s after the FIRST request the window rolls over, regardless of the
+    // continuous traffic that kept resetting the KV TTL.
+    clock.mockReturnValue(start + 61_000)
+    const allowed = await handleInvoiceDetails(req({ url }, '4.4.4.4'), env)
+    expect(allowed.status).toBe(200)
+    clock.mockRestore()
   })
 
   it('fails open when KV throws (never takes down the endpoint)', async () => {
@@ -170,5 +219,42 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
     )
     // Not a 429 — the request proceeds (fails open) and resolves normally.
     expect(r.status).toBe(200)
+  })
+})
+
+describe('429 reaches a cross-origin browser client intact', () => {
+  // The checkout UI runs on a different origin from the router, so a response
+  // header the worker sets is invisible to JS unless it is listed in
+  // Access-Control-Expose-Headers. Assert through the CORS wrapper, which is
+  // what actually leaves the worker — asserting on the raw handler response
+  // would pass while the browser still saw null.
+  it('exposes Retry-After through the CORS wrapper', async () => {
+    const env = makeEnv()
+    const url = 'https://payments.coinbase.com/payment-links/pl_cors'
+    const request = () =>
+      new Request('https://router.test/v1/services/rozo-agent-api/invoice-details', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'CF-Connecting-IP': '3.3.3.3',
+          origin: 'https://agent.rozo.ai',
+        },
+        body: JSON.stringify({ url }),
+      })
+    for (let i = 0; i < 30; i++) {
+      await handleInvoiceDetails(request(), env)
+    }
+    const raw = await handleInvoiceDetails(request(), env)
+    expect(raw.status).toBe(429)
+
+    const wrapped = withCors(request(), raw)
+    const exposed = (wrapped.headers.get('access-control-expose-headers') ?? '').toLowerCase()
+    expect(exposed.split(/,\s*/)).toContain('retry-after')
+    expect(wrapped.headers.get('Retry-After')).toBeTruthy()
+    // The body carries the same value, so a client that cannot read headers
+    // at all still has a correct backoff.
+    const j = (await wrapped.json()) as any
+    expect(j.scope).toBe('invoice')
+    expect(j.retry_after_s).toBeGreaterThan(0)
   })
 })
