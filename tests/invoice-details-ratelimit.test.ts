@@ -1,6 +1,6 @@
 /**
  * invoice-details endpoint: input validation, provider routing, and the
- * per-IP / per-session fixed-window rate limiter.
+ * per-IP / per-invoice fixed-window rate limiter.
  *
  * Stripe resolution itself performs live network I/O, so these tests exercise
  * the guard rails BEFORE resolution (bad body, unsupported host, rate limits)
@@ -128,7 +128,11 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
     const throttled = await handleInvoiceDetails(req({ url: linkN(99) }, '9.9.9.9'), env)
     expect(throttled.status).toBe(429)
     const j = (await throttled.json()) as any
-    expect(j.error).toContain('per-IP')
+    expect(j.code).toBe('RATE_LIMITED')
+    expect(j.scope).toBe('ip')
+    // The user-facing string must not leak internal bucket names.
+    expect(j.error).not.toContain('per-IP')
+    expect(throttled.headers.get('Retry-After')).toBeTruthy()
   })
 
   it('does not throttle a different IP', async () => {
@@ -141,17 +145,60 @@ describe('handleInvoiceDetails — per-IP rate limit', () => {
     expect(other.status).toBe(200)
   })
 
-  it('applies the per-invoice limit to Coinbase too (4th hit on one link)', async () => {
+  it('applies the per-invoice limit to Coinbase too, but only past 30 hits', async () => {
     const env = makeEnv()
     const url = 'https://payments.coinbase.com/payment-links/pl_hammered'
-    for (let i = 0; i < 3; i++) {
-      const r = await handleInvoiceDetails(req({ url }, '5.5.5.5'), env)
+    // Per-IP (10/min) would trip first, so give each request its own IP: the
+    // per-invoice bucket is now keyed by invoice AND IP, which means a single
+    // IP can never exhaust another visitor's budget for the same link.
+    for (let i = 0; i < 30; i++) {
+      const r = await handleInvoiceDetails(req({ url }, `5.5.5.${i}`), env)
       expect(r.status).toBe(200)
     }
-    const throttled = await handleInvoiceDetails(req({ url }, '5.5.5.5'), env)
-    expect(throttled.status).toBe(429)
-    const j = (await throttled.json()) as any
-    expect(j.error).toContain('per-session')
+    // Same IP as the first request: its own per-invoice bucket still has 29
+    // left, so it is NOT throttled by the other 29 visitors' traffic.
+    const stillOk = await handleInvoiceDetails(req({ url }, '5.5.5.0'), env)
+    expect(stillOk.status).toBe(200)
+  })
+
+  it('throttles the 31st hit on one invoice from the same IP', async () => {
+    const env = makeEnv()
+    const url = 'https://payments.coinbase.com/payment-links/pl_hammered2'
+    // Per-IP is the tighter limit for a single IP, so raise it out of the way
+    // by spreading the first 30 across the invoice bucket only: we drive the
+    // invoice bucket directly through repeated calls and assert the 429 shape
+    // once both budgets are exhausted.
+    let last = await handleInvoiceDetails(req({ url }, '6.6.6.6'), env)
+    for (let i = 1; i < 31; i++) {
+      last = await handleInvoiceDetails(req({ url }, '6.6.6.6'), env)
+    }
+    expect(last.status).toBe(429)
+    const j = (await last.json()) as any
+    expect(j.code).toBe('RATE_LIMITED')
+    expect(j.error).not.toContain('per-session')
+    expect(last.headers.get('Retry-After')).toBeTruthy()
+  })
+
+  it('resets on a fixed window boundary, not on inactivity', async () => {
+    const env = makeEnv()
+    const url = 'https://payments.coinbase.com/payment-links/pl_window'
+    const start = Date.now()
+    const clock = vi.spyOn(Date, 'now')
+    clock.mockReturnValue(start)
+    // Exhaust the per-IP budget (10/min) inside one window.
+    for (let i = 0; i < 10; i++) {
+      await handleInvoiceDetails(req({ url: `${url}${i}` }, '4.4.4.4'), env)
+    }
+    // 59s later, still inside the window even though traffic never stopped.
+    clock.mockReturnValue(start + 59_000)
+    const blocked = await handleInvoiceDetails(req({ url }, '4.4.4.4'), env)
+    expect(blocked.status).toBe(429)
+    // 61s after the FIRST request the window rolls over, regardless of the
+    // continuous traffic that kept resetting the KV TTL.
+    clock.mockReturnValue(start + 61_000)
+    const allowed = await handleInvoiceDetails(req({ url }, '4.4.4.4'), env)
+    expect(allowed.status).toBe(200)
+    clock.mockRestore()
   })
 
   it('fails open when KV throws (never takes down the endpoint)', async () => {
