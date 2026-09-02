@@ -136,9 +136,10 @@ migrations_dir = "migrations-metrics"
 
 # Public keys (not secrets, safe to commit)
 [vars]
-# Browser-only OpenRouter fee canary. Keep at 0 until the approved activation
-# gates pass; invalid/missing values also resolve to 0 in code.
-CHECKOUT_WEB_FEE_BPS = "0"
+# Browser-only OpenRouter fee canary. Founder activated the 1% canary on
+# 2026-09-02 (Sep 6 gate: >=30 orders, $600 GMV, conversion drop <=20%).
+# Invalid/missing values resolve to 0 in code; set back to "0" to roll back.
+CHECKOUT_WEB_FEE_BPS = "100"
 STELLAR_NETWORK = "stellar:pubnet"
 STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
 # Comma-separated POOL, round-robined per request (src/mpp/tempo-rpc.ts).
