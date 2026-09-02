@@ -1,345 +1,362 @@
 {
- "$schema_note": "Machine-readable audit trail of real paid verification runs against apiserver.mpprouter.dev. Each run is a real Stellar mainnet USDC payment; tx is the Stellar transaction hash (view at https://stellar.expert/explorer/public/tx/<tx>).",
- "updated": "2026-08-18",
- "cadence": "weekly",
- "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1 (raised to $2 for the 2026-08-18 SCF #44 Tranche 2 round, of which $0.081 was spent).",
- "services": [
-  {
-   "id": "alphavantage_alphavantage_company-overview",
-   "name": "Alpha Vantage – Company Overview",
-   "category": "data",
-   "price": "$0.008/request",
-   "public_path": "/v1/services/alphavantage/alphavantage_company-overview",
-   "charge_verified_at": "2026-08-18T03:23:14Z",
-   "session_verified_at": null,
-   "runs": [
+  "$schema_note": "Machine-readable audit trail of real paid verification runs against apiserver.mpprouter.dev. Each run is a real Stellar mainnet USDC payment; tx is the Stellar transaction hash (view at https://stellar.expert/explorer/public/tx/<tx>).",
+  "updated": "2026-09-02",
+  "cadence": "weekly",
+  "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1 (raised to $2 for the 2026-08-18 SCF #44 Tranche 2 round, of which $0.081 was spent).",
+  "services": [
     {
-     "date": "2026-08-18",
-     "result": "pass",
-     "http": 200,
-     "amount_usd": "0.008",
-     "tx": "fc0296e6991beb22aee5923784df1de1e7971fb0c3f89d9db9a93ef6df1698f6",
-     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
-    }
-   ]
-  },
-  {
-   "id": "anthropic_chat_completions",
-   "name": "Anthropic",
-   "category": "ai",
-   "price": "dynamic",
-   "public_path": "/v1/services/anthropic/chat_completions",
-   "charge_verified_at": "2026-08-24T02:44:14Z",
-   "session_verified_at": null,
-   "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), with the router auto-refunding on chain each time. The 2026-08-09 charge verification no longer holds, so verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Re-verify with a paid call returning a completion before relisting.",
-   "runs": [
-    {
-     "date": "2026-08-24",
-     "result": "pass",
-     "http": 200,
-     "amount_usd": "0.001",
-     "note": "model claude-haiku-4-5 via /v1/chat/completions facade, served claude-haiku-4-5-20251001. 200 + completion, refund-status null. Run THROUGH THE ROUTER from the SG e2e box; two direct merchant probes the same day still returned 403 because they carry the operator IP (Hong Kong), which Anthropic does not serve — direct probes are not evidence about the production path."
-    }
-   ],
-   "relisted": "2026-08-20",
-   "relisted_reason": "Paid call through the router on 2026-08-24 returned 200 with a real completion and no refund (claude-haiku-4-5, 0.001 USDC). The merchant has been fixed since the 2026-08-18 delisting.",
-   "relisted_at": "2026-08-24"
-  },
-  {
-   "id": "anthropic_messages",
-   "name": "Anthropic",
-   "category": "ai",
-   "price": "dynamic",
-   "public_path": "/v1/services/anthropic/messages",
-   "charge_verified_at": null,
-   "session_verified_at": "2026-08-24T03:18:26Z",
-   "runs": [
-    {
-     "date": "2026-08-18",
-     "result": "fail",
-     "http": 502,
-     "amount_usd": "0.001",
-     "tx": "832cd4012991b9f4cca8a0d9ebfd18479d90c95697910e5d6b74d07961fc2152",
-     "note": "model claude-haiku-4-5. Payment settled 09:47:30Z, merchant leg returned 403 forbidden ('Request not allowed'), router replied 502. Ledger order ord_msyhbhlk_byuqlwpt, upstream_status 403, refund confirmed refunded on chain (wallet credited back $0.001)."
+      "id": "alphavantage_alphavantage_company-overview",
+      "name": "Alpha Vantage – Company Overview",
+      "category": "data",
+      "price": "$0.008/request",
+      "public_path": "/v1/services/alphavantage/alphavantage_company-overview",
+      "charge_verified_at": "2026-08-18T03:23:14Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-08-18",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.008",
+          "tx": "fc0296e6991beb22aee5923784df1de1e7971fb0c3f89d9db9a93ef6df1698f6",
+          "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        }
+      ]
     },
     {
-     "date": "2026-08-18",
-     "result": "fail",
-     "http": 502,
-     "amount_usd": "0.001",
-     "tx": "ef7984cdbb35162331db6d32920beb9dcd96cec60a0513419eba6a9fbda09b69",
-     "note": "model claude-sonnet-4-5, run to rule out a model-specific rejection. Payment settled 09:48:03Z, byte-identical merchant 403, router 502. Ledger order ord_msyhc4td_mh24qvsr, upstream_status 403, refund_status refund_pending as of 09:54Z."
+      "id": "anthropic_chat_completions",
+      "name": "Anthropic",
+      "category": "ai",
+      "price": "dynamic",
+      "public_path": "/v1/services/anthropic/chat_completions",
+      "charge_verified_at": "2026-08-24T02:44:14Z",
+      "session_verified_at": null,
+      "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), with the router auto-refunding on chain each time. The 2026-08-09 charge verification no longer holds, so verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Re-verify with a paid call returning a completion before relisting.",
+      "runs": [
+        {
+          "date": "2026-08-24",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "note": "model claude-haiku-4-5 via /v1/chat/completions facade, served claude-haiku-4-5-20251001. 200 + completion, refund-status null. Run THROUGH THE ROUTER from the SG e2e box; two direct merchant probes the same day still returned 403 because they carry the operator IP (Hong Kong), which Anthropic does not serve — direct probes are not evidence about the production path."
+        }
+      ],
+      "relisted": "2026-08-20",
+      "relisted_reason": "Paid call through the router on 2026-08-24 returned 200 with a real completion and no refund (claude-haiku-4-5, 0.001 USDC). The merchant has been fixed since the 2026-08-18 delisting.",
+      "relisted_at": "2026-08-24"
     },
     {
-     "date": "2026-08-24",
-     "result": "pass",
-     "http": 200,
-     "amount_usd": "0.001",
-     "note": "model claude-haiku-4-5 via /v1/services/anthropic/messages, served claude-haiku-4-5-20251001. 200 + native completion, refund-status null, signed receipt. Run THROUGH THE ROUTER from the SG e2e box."
-    }
-   ],
-   "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), identical to the chat_completions sibling delisted earlier the same day. Two current model ids were tried (claude-haiku-4-5, claude-sonnet-4-5) to rule out a stale id; both failed the same way, so the session dialect and separate upstream path did not make this route immune. verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Anthropic now has no listed route, taking the distinct-verified-service count from 21 to 20. Re-verify with a paid call returning a completion before relisting.",
-   "relisted_at": "2026-08-24",
-   "relisted_reason": "Paid call through the router on 2026-08-24 returned 200 with a native Anthropic completion and no refund. Verified behind launchGate (ANTHROPIC_MESSAGES_LAUNCH_MODE=verify) since a delisted route is 403d before it can be paid; the gate was removed on relisting."
-  },
-  {
-   "id": "coingecko_simple_price",
-   "name": "CoinGecko – Simple Price",
-   "category": "data",
-   "price": "$0.060/request",
-   "public_path": "/v1/services/coingecko/simple-price",
-   "charge_verified_at": "2026-06-22T00:00:00Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "deepgram_deepgram_list-models",
-   "name": "Deepgram – List Models",
-   "category": "data",
-   "price": "$0.004/request",
-   "public_path": "/v1/services/deepgram/deepgram_list-models",
-   "charge_verified_at": "2026-08-01T16:11:11Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "deepl_deepl_languages",
-   "name": "DeepL – Languages",
-   "category": "data",
-   "price": "$0.005/request",
-   "public_path": "/v1/services/deepl/deepl_languages",
-   "charge_verified_at": "2026-08-18T03:24:29Z",
-   "session_verified_at": null,
-   "runs": [
+      "id": "anthropic_messages",
+      "name": "Anthropic",
+      "category": "ai",
+      "price": "dynamic",
+      "public_path": "/v1/services/anthropic/messages",
+      "charge_verified_at": null,
+      "session_verified_at": "2026-08-24T03:18:26Z",
+      "runs": [
+        {
+          "date": "2026-08-18",
+          "result": "fail",
+          "http": 502,
+          "amount_usd": "0.001",
+          "tx": "832cd4012991b9f4cca8a0d9ebfd18479d90c95697910e5d6b74d07961fc2152",
+          "note": "model claude-haiku-4-5. Payment settled 09:47:30Z, merchant leg returned 403 forbidden ('Request not allowed'), router replied 502. Ledger order ord_msyhbhlk_byuqlwpt, upstream_status 403, refund confirmed refunded on chain (wallet credited back $0.001)."
+        },
+        {
+          "date": "2026-08-18",
+          "result": "fail",
+          "http": 502,
+          "amount_usd": "0.001",
+          "tx": "ef7984cdbb35162331db6d32920beb9dcd96cec60a0513419eba6a9fbda09b69",
+          "note": "model claude-sonnet-4-5, run to rule out a model-specific rejection. Payment settled 09:48:03Z, byte-identical merchant 403, router 502. Ledger order ord_msyhc4td_mh24qvsr, upstream_status 403, refund_status refund_pending as of 09:54Z."
+        },
+        {
+          "date": "2026-08-24",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "note": "model claude-haiku-4-5 via /v1/services/anthropic/messages, served claude-haiku-4-5-20251001. 200 + native completion, refund-status null, signed receipt. Run THROUGH THE ROUTER from the SG e2e box."
+        }
+      ],
+      "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), identical to the chat_completions sibling delisted earlier the same day. Two current model ids were tried (claude-haiku-4-5, claude-sonnet-4-5) to rule out a stale id; both failed the same way, so the session dialect and separate upstream path did not make this route immune. verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Anthropic now has no listed route, taking the distinct-verified-service count from 21 to 20. Re-verify with a paid call returning a completion before relisting.",
+      "relisted_at": "2026-08-24",
+      "relisted_reason": "Paid call through the router on 2026-08-24 returned 200 with a native Anthropic completion and no refund. Verified behind launchGate (ANTHROPIC_MESSAGES_LAUNCH_MODE=verify) since a delisted route is 403d before it can be paid; the gate was removed on relisting."
+    },
     {
-     "date": "2026-08-18",
-     "result": "pass",
-     "http": 200,
-     "amount_usd": "0.005",
-     "tx": "1a47118ef2f625ef0571cbb1ce028aad867f0d278e34a51c0a949b0a93edafea",
-     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
-    }
-   ]
-  },
-  {
-   "id": "deepseek_chat",
-   "name": "DeepSeek – Chat",
-   "category": "ai",
-   "price": "Model + token dependent (~$0.004–$0.025) (dynamic)",
-   "public_path": "/v1/services/deepseek/chat",
-   "charge_verified_at": "2026-06-22T00:00:00Z",
-   "session_verified_at": null,
-   "runs": [
+      "id": "coingecko_simple_price",
+      "name": "CoinGecko – Simple Price",
+      "category": "data",
+      "price": "$0.060/request",
+      "public_path": "/v1/services/coingecko/simple-price",
+      "charge_verified_at": "2026-06-22T00:00:00Z",
+      "session_verified_at": null,
+      "runs": []
+    },
     {
-     "result": "pass",
-     "utc": "2026-08-10T07:55:59Z",
-     "tx": "d3a0a8d42fc40415a0c36e6519fd5e121df4c9154405cc8f45399446ac7edf0b",
-     "amount_usdc": "0.004"
-    }
-   ]
-  },
-  {
-   "id": "exa_search",
-   "name": "Exa – Search the web",
-   "category": "search",
-   "price": "$0.005/request",
-   "public_path": "/v1/services/exa/search",
-   "charge_verified_at": "2026-04-11T00:00:00Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "fal_flux_schnell",
-   "name": "fal.ai – FLUX.1 [schnell]",
-   "category": "ai",
-   "price": "$0.003/request",
-   "public_path": "/v1/services/fal/flux_schnell",
-   "charge_verified_at": "2026-08-18T03:22:45Z",
-   "session_verified_at": null,
-   "runs": [
+      "id": "deepgram_deepgram_list-models",
+      "name": "Deepgram – List Models",
+      "category": "data",
+      "price": "$0.004/request",
+      "public_path": "/v1/services/deepgram/deepgram_list-models",
+      "charge_verified_at": "2026-08-01T16:11:11Z",
+      "session_verified_at": null,
+      "runs": []
+    },
     {
-     "date": "2026-08-18",
-     "result": "pass",
-     "http": 200,
-     "amount_usd": "0.003",
-     "tx": "7ee4ce8c359bebe4a4c94f94d9f815ff65b2faafe67a555a88d36f787ab6f9a1",
-     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
-    }
-   ]
-  },
-  {
-   "id": "firecrawl_scrape",
-   "name": "Firecrawl – Scrape a URL",
-   "category": "web",
-   "price": "$0.002/request",
-   "public_path": "/v1/services/firecrawl/scrape",
-   "charge_verified_at": "2026-04-11T00:00:00Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "grok_grok_chat",
-   "name": "Grok – Chat Completions",
-   "category": "ai",
-   "price": "Model-dependent (~$0.001–$0.02) (dynamic)",
-   "public_path": "/v1/services/grok/grok_chat",
-   "charge_verified_at": "2026-08-01T16:10:11Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "groq_chat",
-   "name": "Groq – Chat Completion",
-   "category": "ai",
-   "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
-   "public_path": "/v1/services/groq/chat",
-   "charge_verified_at": "2026-06-22T00:00:00Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "mapbox_mapbox_geocode-forward",
-   "name": "Mapbox – Forward Geocode",
-   "category": "data",
-   "price": "$0.00375/request",
-   "public_path": "/v1/services/mapbox/mapbox_geocode-forward",
-   "charge_verified_at": "2026-08-18T03:24:51Z",
-   "session_verified_at": null,
-   "runs": [
+      "id": "deepl_deepl_languages",
+      "name": "DeepL – Languages",
+      "category": "data",
+      "price": "$0.005/request",
+      "public_path": "/v1/services/deepl/deepl_languages",
+      "charge_verified_at": "2026-08-18T03:24:29Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-08-18",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.005",
+          "tx": "1a47118ef2f625ef0571cbb1ce028aad867f0d278e34a51c0a949b0a93edafea",
+          "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        }
+      ]
+    },
     {
-     "date": "2026-08-18",
-     "result": "pass",
-     "http": 200,
-     "amount_usd": "0.00375",
-     "tx": "9592b917d7d2e7ea90fccede90e873191ce16ba6a846a4a74b2338ad1f817e51",
-     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
-    }
-   ]
-  },
-  {
-   "id": "mistral_mistral_chat",
-   "name": "Mistral AI – Chat Completion",
-   "category": "ai",
-   "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
-   "public_path": "/v1/services/mistral/mistral_chat",
-   "charge_verified_at": "2026-08-01T16:10:27Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "openai_chat",
-   "name": "OpenAI",
-   "category": "ai",
-   "price": "dynamic",
-   "public_path": "/v1/services/openai/chat",
-   "charge_verified_at": null,
-   "session_verified_at": "2026-08-09T03:51:00Z",
-   "runs": []
-  },
-  {
-   "id": "openweather_openweather_current-weather",
-   "name": "OpenWeather – Current Weather",
-   "category": "data",
-   "price": "$0.006/request",
-   "public_path": "/v1/services/openweather/openweather_current-weather",
-   "charge_verified_at": "2026-08-18T03:23:31Z",
-   "session_verified_at": null,
-   "runs": [
+      "id": "deepseek_chat",
+      "name": "DeepSeek – Chat",
+      "category": "ai",
+      "price": "Model + token dependent (~$0.004–$0.025) (dynamic)",
+      "public_path": "/v1/services/deepseek/chat",
+      "charge_verified_at": "2026-06-22T00:00:00Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "result": "pass",
+          "utc": "2026-08-10T07:55:59Z",
+          "tx": "d3a0a8d42fc40415a0c36e6519fd5e121df4c9154405cc8f45399446ac7edf0b",
+          "amount_usdc": "0.004"
+        }
+      ]
+    },
     {
-     "date": "2026-08-18",
-     "result": "pass",
-     "http": 200,
-     "amount_usd": "0.006",
-     "tx": "f5dfdc09cae3c3923769ada23bcc41f811f9e574157a8f90b3cabbeb11d761d9",
-     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
-    }
-   ]
-  },
-  {
-   "id": "parallel_search",
-   "name": "Parallel – Search the web",
-   "category": "search",
-   "price": "$0.010/request",
-   "public_path": "/v1/services/parallel/search",
-   "charge_verified_at": "2026-04-11T00:00:00Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "perplexity_perplexity_chat",
-   "name": "Perplexity – Sonar Chat",
-   "category": "ai",
-   "price": "Model-dependent (~$0.005–$0.02) (dynamic)",
-   "public_path": "/v1/services/perplexity/perplexity_chat",
-   "charge_verified_at": "2026-08-01T16:26:16Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "storage_upload",
-   "name": "Object Storage – Initiate/complete multipart upload",
-   "category": "storage",
-   "price": "$0.0001/request",
-   "public_path": "/v1/services/storage/upload",
-   "charge_verified_at": "2026-04-11T00:00:00Z",
-   "session_verified_at": null,
-   "runs": []
-  },
-  {
-   "id": "tavily_tavily_search",
-   "name": "Tavily Search",
-   "category": "search",
-   "price": "$0.09 (basic) / $0.16 (advanced) (dynamic)",
-   "public_path": "/v1/services/tavily/tavily_search",
-   "charge_verified_at": "2026-08-10T07:56:49Z",
-   "session_verified_at": null,
-   "runs": [
+      "id": "exa_search",
+      "name": "Exa – Search the web",
+      "category": "search",
+      "price": "$0.005/request",
+      "public_path": "/v1/services/exa/search",
+      "charge_verified_at": "2026-04-11T00:00:00Z",
+      "session_verified_at": null,
+      "runs": []
+    },
     {
-     "result": "pass",
-     "utc": "2026-08-10T07:56:49Z",
-     "tx": "38eaecde40d6430654212bf59b32eb0e1275a6b5f8e3d958be8a56ec71649952",
-     "amount_usdc": "0.090"
-    }
-   ]
-  },
-  {
-   "id": "wolframalpha_wolframalpha_short-answer",
-   "name": "Wolfram|Alpha – Short Answer",
-   "category": "data",
-   "price": "$0.055/request",
-   "public_path": "/v1/services/wolframalpha/wolframalpha_short-answer",
-   "charge_verified_at": "2026-08-18T03:25:29Z",
-   "session_verified_at": null,
-   "runs": [
+      "id": "fal_flux_schnell",
+      "name": "fal.ai – FLUX.1 [schnell]",
+      "category": "ai",
+      "price": "$0.003/request",
+      "public_path": "/v1/services/fal/flux_schnell",
+      "charge_verified_at": "2026-08-18T03:22:45Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-08-18",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.003",
+          "tx": "7ee4ce8c359bebe4a4c94f94d9f815ff65b2faafe67a555a88d36f787ab6f9a1",
+          "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        }
+      ]
+    },
     {
-     "date": "2026-08-18",
-     "result": "pass",
-     "http": 200,
-     "amount_usd": "0.055",
-     "tx": "cffd0d499221037352a7db87aaf22e2f7449a6c09058ad4c80853e4dadc33722",
-     "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
-    }
-   ]
-  }
- ],
- "failed_candidates": [
-  {
-   "id": "openai_images_generations",
-   "status": "not_recommended",
-   "runs": [
+      "id": "firecrawl_scrape",
+      "name": "Firecrawl – Scrape a URL",
+      "category": "web",
+      "price": "$0.002/request",
+      "public_path": "/v1/services/firecrawl/scrape",
+      "charge_verified_at": "2026-04-11T00:00:00Z",
+      "session_verified_at": null,
+      "runs": []
+    },
     {
-     "result": "fail_upstream",
-     "utc": "2026-08-10T07:56:26Z",
-     "tx": "62ada49fe848ea313693f83f7e167ed3910a753a18af3e5afb116d0c91b5c934",
-     "amount_usdc": "0.050",
-     "note": "Payment settled; upstream OpenAI rejected the merchant key region (403 unsupported_country_region_territory). Router returned 502; automatic refund pending."
+      "id": "grok_grok_chat",
+      "name": "Grok – Chat Completions",
+      "category": "ai",
+      "price": "Model-dependent (~$0.001–$0.02) (dynamic)",
+      "public_path": "/v1/services/grok/grok_chat",
+      "charge_verified_at": "2026-08-01T16:10:11Z",
+      "session_verified_at": null,
+      "runs": []
+    },
+    {
+      "id": "groq_chat",
+      "name": "Groq – Chat Completion",
+      "category": "ai",
+      "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
+      "public_path": "/v1/services/groq/chat",
+      "charge_verified_at": "2026-09-02T00:00:00Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-09-02",
+          "result": "fail",
+          "http": 502,
+          "amount_usd": "0.008",
+          "tx": "ea690038c0d089cea999bdb29eaa2fd44e4e2a43f3eb26808b4ae61122631ee0",
+          "note": "llama-3.1-8b-instant: merchant returned model_not_found after payment; router refunded in full (refund 2d336d46). Model retired by merchant, id kept in facade as unavailable."
+        },
+        {
+          "date": "2026-09-02",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.008",
+          "tx": "feb1c3fa7bbe536c7bfa7baedb46d99258898b5410473644fc9a0518a0c55b42",
+          "note": "openai/gpt-oss-20b: 200 with a live completion through the router (charge). Also passes as the scheduled charge eval default; openai/gpt-oss-120b passed as fallback the same day."
+        }
+      ]
+    },
+    {
+      "id": "mapbox_mapbox_geocode-forward",
+      "name": "Mapbox – Forward Geocode",
+      "category": "data",
+      "price": "$0.00375/request",
+      "public_path": "/v1/services/mapbox/mapbox_geocode-forward",
+      "charge_verified_at": "2026-08-18T03:24:51Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-08-18",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.00375",
+          "tx": "9592b917d7d2e7ea90fccede90e873191ce16ba6a846a4a74b2338ad1f817e51",
+          "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        }
+      ]
+    },
+    {
+      "id": "mistral_mistral_chat",
+      "name": "Mistral AI – Chat Completion",
+      "category": "ai",
+      "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
+      "public_path": "/v1/services/mistral/mistral_chat",
+      "charge_verified_at": "2026-08-01T16:10:27Z",
+      "session_verified_at": null,
+      "runs": []
+    },
+    {
+      "id": "openai_chat",
+      "name": "OpenAI",
+      "category": "ai",
+      "price": "dynamic",
+      "public_path": "/v1/services/openai/chat",
+      "charge_verified_at": null,
+      "session_verified_at": "2026-08-09T03:51:00Z",
+      "runs": []
+    },
+    {
+      "id": "openweather_openweather_current-weather",
+      "name": "OpenWeather – Current Weather",
+      "category": "data",
+      "price": "$0.006/request",
+      "public_path": "/v1/services/openweather/openweather_current-weather",
+      "charge_verified_at": "2026-08-18T03:23:31Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-08-18",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.006",
+          "tx": "f5dfdc09cae3c3923769ada23bcc41f811f9e574157a8f90b3cabbeb11d761d9",
+          "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        }
+      ]
+    },
+    {
+      "id": "parallel_search",
+      "name": "Parallel – Search the web",
+      "category": "search",
+      "price": "$0.010/request",
+      "public_path": "/v1/services/parallel/search",
+      "charge_verified_at": "2026-04-11T00:00:00Z",
+      "session_verified_at": null,
+      "runs": []
+    },
+    {
+      "id": "perplexity_perplexity_chat",
+      "name": "Perplexity – Sonar Chat",
+      "category": "ai",
+      "price": "Model-dependent (~$0.005–$0.02) (dynamic)",
+      "public_path": "/v1/services/perplexity/perplexity_chat",
+      "charge_verified_at": "2026-08-01T16:26:16Z",
+      "session_verified_at": null,
+      "runs": []
+    },
+    {
+      "id": "storage_upload",
+      "name": "Object Storage – Initiate/complete multipart upload",
+      "category": "storage",
+      "price": "$0.0001/request",
+      "public_path": "/v1/services/storage/upload",
+      "charge_verified_at": "2026-04-11T00:00:00Z",
+      "session_verified_at": null,
+      "runs": []
+    },
+    {
+      "id": "tavily_tavily_search",
+      "name": "Tavily Search",
+      "category": "search",
+      "price": "$0.09 (basic) / $0.16 (advanced) (dynamic)",
+      "public_path": "/v1/services/tavily/tavily_search",
+      "charge_verified_at": "2026-08-10T07:56:49Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "result": "pass",
+          "utc": "2026-08-10T07:56:49Z",
+          "tx": "38eaecde40d6430654212bf59b32eb0e1275a6b5f8e3d958be8a56ec71649952",
+          "amount_usdc": "0.090"
+        }
+      ]
+    },
+    {
+      "id": "wolframalpha_wolframalpha_short-answer",
+      "name": "Wolfram|Alpha – Short Answer",
+      "category": "data",
+      "price": "$0.055/request",
+      "public_path": "/v1/services/wolframalpha/wolframalpha_short-answer",
+      "charge_verified_at": "2026-08-18T03:25:29Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-08-18",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.055",
+          "tx": "cffd0d499221037352a7db87aaf22e2f7449a6c09058ad4c80853e4dadc33722",
+          "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        }
+      ]
     }
-   ]
-  },
-  {
-   "id": "gemini_generate",
-   "status": "disabled_in_catalog",
-   "note": "Merchant's Google API key invalid (400 API key not valid, re-tested 2026-08-09 with a real paid call). Route set payment_status=unavailable until the merchant fixes its key."
-  }
- ]
+  ],
+  "failed_candidates": [
+    {
+      "id": "openai_images_generations",
+      "status": "not_recommended",
+      "runs": [
+        {
+          "result": "fail_upstream",
+          "utc": "2026-08-10T07:56:26Z",
+          "tx": "62ada49fe848ea313693f83f7e167ed3910a753a18af3e5afb116d0c91b5c934",
+          "amount_usdc": "0.050",
+          "note": "Payment settled; upstream OpenAI rejected the merchant key region (403 unsupported_country_region_territory). Router returned 502; automatic refund pending."
+        }
+      ]
+    },
+    {
+      "id": "gemini_generate",
+      "status": "disabled_in_catalog",
+      "note": "Merchant's Google API key invalid (400 API key not valid, re-tested 2026-08-09 with a real paid call). Route set payment_status=unavailable until the merchant fixes its key."
+    }
+  ]
 }
