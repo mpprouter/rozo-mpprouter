@@ -15,11 +15,9 @@ import { contractVariantIds } from '../mpp/contract-variant'
 import { verifyQuoteReceipt, type QuoteReceiptPayload } from './quote-receipt'
 import {
   CHECKOUT_PRICING_VERSION,
-  CHECKOUT_WEB_CLIENT,
   computeServiceFeeAtomic,
   formatUsdcAtomic,
-  isExactCheckoutWebClient,
-  isStrictOpenRouterMerchant,
+  isFeeEligibleMerchant,
   normalizeCheckoutClient,
   parseUsdcAtomic,
   resolveCheckoutPricing,
@@ -438,13 +436,10 @@ function pricingFromReceipt(
   receipt: QuoteReceiptPayload | null,
   originalAtomic: bigint,
   merchant: string,
-  pricingClient: string | null,
 ): CheckoutPricing | null {
-  // Bind the raw eligibility identity, not the lossy provenance label. For
-  // example `rozo-checkout-web!!!` normalizes to the browser label for
-  // telemetry but is deliberately NOT fee-eligible and must not mint a zero-
-  // fee receipt that can later be replayed by the exact browser client.
-  if (receipt?.v !== 2 || receipt.client !== pricingClient) return null
+  // Pricing no longer depends on who the caller says they are, so the receipt
+  // carries no client identity: a v2 receipt minted with one is stale.
+  if (receipt?.v !== 2 || receipt.client !== null) return null
   if (
     receipt.pricingVersion !== CHECKOUT_PRICING_VERSION ||
     receipt.original === undefined ||
@@ -465,9 +460,12 @@ function pricingFromReceipt(
     ) {
       return null
     }
-    const eligible =
-      pricingClient === CHECKOUT_WEB_CLIENT && isStrictOpenRouterMerchant(merchant)
-    if (!eligible && (receipt.feeBps !== 0 || signedFee !== 0n)) return null
+    // An exempt merchant can only ever carry a zero fee. For everyone else the
+    // signed rate is honoured for the receipt's 60s life even if the env gate
+    // moves meanwhile: the quote the user saw is the price they pay.
+    if (!isFeeEligibleMerchant(merchant) && (receipt.feeBps !== 0 || signedFee !== 0n)) {
+      return null
+    }
     return {
       originalAtomic: signedOriginal,
       serviceFeeAtomic: signedFee,
@@ -661,7 +659,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const provenance: CallerProvenance = {}
   const clientRaw = (parsed as Record<string, unknown> | null)?.client
   const clientLabel = resolveClient(clientRaw)
-  const pricingClient = isExactCheckoutWebClient(clientRaw) ? CHECKOUT_WEB_CLIENT : null
   if (clientLabel) provenance.client = clientLabel
 
   // Channel attribution rides as a top-level intent field, untouched. The web
@@ -749,7 +746,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       env,
       source,
       provenance,
-      pricingClient,
       typeof receiptRaw === 'string' ? receiptRaw : null,
     )
   }
@@ -916,7 +912,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const currentPricing = resolveCheckoutPricing(
     invoiceAtomic,
     merchantName,
-    pricingClient,
     env.CHECKOUT_WEB_FEE_BPS,
   )
   if (!receipt && currentPricing.feeBps > 0) {
@@ -928,7 +923,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     receipt,
     invoiceAtomic,
     merchantName,
-    pricingClient,
   )
   if (
     (currentPricing.feeBps > 0 && receipt?.v === 2 && !receiptPricing) ||
@@ -1524,7 +1518,6 @@ export async function handleStripeCreateInvoice(
   env: Env,
   source: ResolvedSource,
   provenance: CallerProvenance = {},
-  pricingClient: string | null = null,
   quoteReceiptRaw: string | null = null,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
@@ -1580,7 +1573,6 @@ export async function handleStripeCreateInvoice(
   const currentPricing = resolveCheckoutPricing(
     invoiceAtomic,
     invoice.merchantTitle,
-    pricingClient,
     env.CHECKOUT_WEB_FEE_BPS,
   )
   if (!receipt && currentPricing.feeBps > 0) {
@@ -1598,7 +1590,6 @@ export async function handleStripeCreateInvoice(
     receipt,
     invoiceAtomic,
     invoice.merchantTitle,
-    pricingClient,
   )
   if (
     (currentPricing.feeBps > 0 && receipt?.v === 2 && !receiptPricing) ||

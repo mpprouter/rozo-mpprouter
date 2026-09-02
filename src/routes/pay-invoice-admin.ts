@@ -3,8 +3,6 @@ import { createQuoteReceipt } from './quote-receipt'
 import {
   buildCheckoutTitle,
   formatUsdcAtomic,
-  isExactCheckoutWebClient,
-  normalizeCheckoutClient,
   parseUsdcAtomic,
   resolveCheckoutPricing,
 } from './checkout-web-pricing'
@@ -461,13 +459,9 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       link_id_detected,
     })
   }
-  const clientRaw = (parsed as Record<string, unknown> | null)?.client
-  const client = normalizeCheckoutClient(clientRaw)
-  const pricingClient = isExactCheckoutWebClient(clientRaw) ? client : null
   const pricing = resolveCheckoutPricing(
     originalAtomic,
     merchant,
-    pricingClient,
     env.CHECKOUT_WEB_FEE_BPS,
   )
   const pricingFields = {
@@ -484,7 +478,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     merchant,
     env.PAYINVOICE_ADMIN_SECRET,
     Math.floor(Date.now() / 1000),
-    { ...pricingFields, client: pricingClient },
+    { ...pricingFields, client: null },
   )
   // Display fields, so a client can render the full invoice card from the quote
   // alone — before any order exists. `merchant` and `linkId` already reach the

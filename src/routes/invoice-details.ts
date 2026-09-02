@@ -26,8 +26,6 @@ import {
 import { createQuoteReceipt } from './quote-receipt'
 import {
   formatUsdcAtomic,
-  isExactCheckoutWebClient,
-  normalizeCheckoutClient,
   resolveCheckoutPricing,
 } from './checkout-web-pricing'
 
@@ -207,13 +205,9 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
     }
   }
   if (provider === 'stripe_crypto') {
-    const clientRaw = body.client
-    const client = normalizeCheckoutClient(clientRaw)
-    const pricingClient = isExactCheckoutWebClient(clientRaw) ? client : null
     const pricing = resolveCheckoutPricing(
       BigInt(invoice.stablecoinAmountAtomic),
       invoice.merchantTitle,
-      pricingClient,
       env.CHECKOUT_WEB_FEE_BPS,
     )
     const pricingFields = {
@@ -240,7 +234,7 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
           invoice.merchantTitle,
           env.PAYINVOICE_ADMIN_SECRET,
           Math.floor(Date.now() / 1000),
-          { ...pricingFields, client: pricingClient },
+          { ...pricingFields, client: null },
         )
       : null
     return json(200, {
