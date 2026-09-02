@@ -1,9 +1,13 @@
 /**
  * Pricing policy for the browser-only checkout fee canary.
  *
- * The policy is deliberately narrow and defaults off:
- *   - only the exact browser client label `rozo-checkout-web` is eligible;
- *   - only exact, known OpenRouter merchant labels are eligible;
+ * The policy is cut by product line and defaults off:
+ *   - every invoice created through the mpprouter checkout endpoints pays the
+ *     fee (checkout.rozo.ai, agent.rozo.ai, and any API caller), whatever the
+ *     merchant on the pasted Coinbase/Stripe link. Rozo Intents integrators
+ *     never reach this code — they use rozo-intents-api under their own appId;
+ *   - the free-text `client` label is telemetry only. It is caller-supplied
+ *     and unverified, so it must never decide whether someone pays;
  *   - an absent, malformed, non-integer, or out-of-range env value is 0 bps.
  *
  * Keep the arithmetic in atomic USDC. Fees round UP to the next whole cent
@@ -24,7 +28,21 @@ const CLIENT_MAX_LEN = 64
 // versioned CLI labels remain valid provenance even though they are not fee
 // eligible.
 const CLIENT_UNSAFE = /[^A-Za-z0-9_.\- /]/g
-const OPENROUTER_MERCHANTS = new Set(['OpenRouter', 'OpenRouter, Inc.'])
+// Merchants that pay no service fee. Deliberately empty: the product is "pay
+// any Coinbase/Stripe link", so the merchant set is open and the fee applies
+// to all of them. Add an exact merchant label here only for a founder-approved
+// exemption — this is an exemption list, never an allowlist.
+const FEE_EXEMPT_MERCHANTS: ReadonlySet<string> = new Set<string>([])
+
+/**
+ * Whether an invoice for `merchant` pays the checkout service fee. The only
+ * input is the merchant label on the resolved invoice: the caller's `client`
+ * string is not consulted because it is self-declared. Single source of truth
+ * for the create path and the signed-receipt replay check alike.
+ */
+export function isFeeEligibleMerchant(merchant: string): boolean {
+  return !FEE_EXEMPT_MERCHANTS.has(merchant.trim())
+}
 
 export interface CheckoutPricing {
   originalAtomic: bigint
@@ -57,15 +75,6 @@ export function normalizeCheckoutClient(raw: unknown): string | null {
     .replace(CLIENT_UNSAFE, '')
     .slice(0, CLIENT_MAX_LEN)
   return cleaned.length ? cleaned : null
-}
-
-/** Fee eligibility uses the raw label, never the lossy telemetry sanitizer. */
-export function isExactCheckoutWebClient(raw: unknown): boolean {
-  return raw === CHECKOUT_WEB_CLIENT
-}
-
-export function isStrictOpenRouterMerchant(merchant: string): boolean {
-  return OPENROUTER_MERCHANTS.has(merchant.trim())
 }
 
 /** Invalid configuration fails safe to the disabled value (0 bps). */
@@ -101,13 +110,9 @@ export function computeServiceFeeAtomic(originalAtomic: bigint, feeBps: number):
 export function resolveCheckoutPricing(
   originalAtomic: bigint,
   merchant: string,
-  client: string | null,
   configuredFeeBps: unknown,
 ): CheckoutPricing {
-  const feeBps =
-    client === CHECKOUT_WEB_CLIENT && isStrictOpenRouterMerchant(merchant)
-      ? parseCheckoutWebFeeBps(configuredFeeBps)
-      : 0
+  const feeBps = isFeeEligibleMerchant(merchant) ? parseCheckoutWebFeeBps(configuredFeeBps) : 0
   const serviceFeeAtomic = computeServiceFeeAtomic(originalAtomic, feeBps)
   return {
     originalAtomic,

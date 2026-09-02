@@ -177,7 +177,7 @@ async function openRouterFeeReceipt(nowSeconds = Math.floor(Date.now() / 1000)) 
       callerPays: '10.1',
       feeBps: 100,
       pricingVersion: 'checkout-web-fee-v1',
-      client: 'rozo-checkout-web',
+      client: null,
     },
   )
 }
@@ -303,7 +303,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
       original: '10',
       serviceFee: '0.1',
       callerPays: '10.1',
-      client: 'rozo-checkout-web',
+      client: null,
     })
   })
 
@@ -381,7 +381,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         callerPays: '10.1',
         feeBps: 100,
         pricingVersion: 'checkout-web-fee-v1',
-        client: 'rozo-checkout-web',
+        client: null,
       },
     )
 
@@ -464,7 +464,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
         callerPays: '10.1',
         feeBps: 100,
         pricingVersion: 'checkout-web-fee-v1',
-        client: 'rozo-checkout-web',
+        client: null,
       },
     )
     existingIntent = {
@@ -500,7 +500,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
         callerPays: '10.1',
         feeBps: 100,
         pricingVersion: 'checkout-web-fee-v1',
-        client: 'rozo-checkout-web',
+        client: null,
       },
     )
     existingIntent = {
