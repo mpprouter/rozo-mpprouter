@@ -29,54 +29,97 @@ import {
   resolveCheckoutPricing,
 } from './checkout-web-pricing'
 
-// Rate limits (design doc §5.1). Per-IP protects the endpoint; per-session
-// protects an individual live Stripe session from being pounded.
+// Rate limits (design doc §5.1). Per-IP protects the endpoint; the per-invoice
+// bucket protects an individual live session from being pounded.
 //
-// NOTE ON WINDOW SEMANTICS: this is an activity-based (sliding) limiter, not a
-// strict fixed window. Each allowed request re-sets the KV TTL, so the counter
-// only resets after `*_WINDOW_S` seconds of INACTIVITY. In practice this is
-// stricter than a fixed window (sustained traffic never gets a mid-window
-// reset), which is the desired property for abuse control. See rateLimitOk.
-const PER_IP_LIMIT = 10 // requests
+// WINDOW SEMANTICS: a true FIXED window. The window start is stored inside the
+// value, so the counter resets `*_WINDOW_S` after the first request of a window
+// even though CF KV resets a key's TTL on every write. The previous version
+// derived the window from the TTL alone, which made it activity-based
+// (sliding): sustained traffic never got a reset, so a throttled invoice could
+// stay locked indefinitely.
+//
+// The per-invoice bucket is keyed by invoice AND client IP. Keying it by
+// invoice alone made the budget global to a payment link, so two people (or one
+// person on two tabs) opening the same link locked each other out.
+// The per-IP limit must stay ABOVE the per-invoice limit, or the per-invoice
+// bucket is unreachable: the IP check runs first over the same window, so a
+// lower IP ceiling would answer every request that could ever have tripped the
+// invoice bucket. Per-IP is the endpoint-wide abuse ceiling across all
+// invoices; per-invoice is what stops one live session being pounded.
+const PER_IP_LIMIT = 60 // requests, across all invoices
 const PER_IP_WINDOW_S = 60
-const PER_SESSION_LIMIT = 3 // requests
+const PER_SESSION_LIMIT = 30 // requests, per invoice per IP
 const PER_SESSION_WINDOW_S = 60
 
-function json(status: number, payload: unknown): Response {
+// User-facing 429 text. Callers branch on `code`, not on this string — it is
+// rendered verbatim by checkout UIs, so it must never leak internal bucket
+// names ("per-IP" / "per-session"); `scope` carries that for operators.
+const RATE_LIMIT_MESSAGE = 'Too many requests. Please wait a moment and try again.'
+
+function json(status: number, payload: unknown, headers?: Record<string, string>): Response {
   return new Response(JSON.stringify(payload), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(headers ?? {}) },
   })
 }
 
+type RateLimitResult = { ok: true } | { ok: false; retryAfterS: number }
+
 /**
- * Activity-based (sliding) counter in KV. Returns true if the request is
- * allowed (under the limit), false if it should be throttled. Each allowed
- * request re-sets the KV TTL, so the counter only resets after `windowSeconds`
- * of inactivity — sustained traffic never gets a mid-window reset. Best-effort:
- * a KV read/write race can let a small burst through, which is acceptable for
- * abuse control on a read-only endpoint. Fails OPEN if KV is unavailable so a
- * KV outage never takes down the endpoint.
+ * Fixed-window counter in KV. Returns `ok: true` if the request is allowed, or
+ * `ok: false` with the seconds left in the current window. The window start is
+ * carried in the value (`{ n, w }`) rather than inferred from the KV TTL, so a
+ * write's unavoidable TTL reset cannot extend the window. The TTL is only used
+ * to garbage-collect idle keys. Best-effort: a KV read/write race can let a
+ * small burst through, which is acceptable for abuse control on a read-only
+ * endpoint. Fails OPEN if KV is unavailable so a KV outage never takes down the
+ * endpoint.
  */
 async function rateLimitOk(
   env: Env,
   bucket: string,
   limit: number,
   windowSeconds: number,
-): Promise<boolean> {
+): Promise<RateLimitResult> {
   const key = `ratelimit:invoice-details:${bucket}`
+  const now = Date.now()
+  const windowMs = windowSeconds * 1000
   try {
     const raw = await env.MPP_STORE.get(key)
-    const count = raw ? parseInt(raw, 10) : 0
-    if (Number.isFinite(count) && count >= limit) return false
-    // Increment and (re)set the TTL. CF KV cannot update a value without
-    // resetting TTL, so this is an activity-based sliding window by design.
-    await env.MPP_STORE.put(key, String((Number.isFinite(count) ? count : 0) + 1), {
-      expirationTtl: windowSeconds,
+    let count = 0
+    let windowStart = now
+    if (raw) {
+      // Values written before the fixed-window change were bare integers; they
+      // do not parse and simply start a fresh window (one-time, self-healing).
+      try {
+        const parsed = JSON.parse(raw) as { n?: unknown; w?: unknown }
+        if (
+          typeof parsed?.n === 'number' &&
+          Number.isFinite(parsed.n) &&
+          typeof parsed?.w === 'number' &&
+          Number.isFinite(parsed.w) &&
+          now - parsed.w < windowMs
+        ) {
+          count = parsed.n
+          windowStart = parsed.w
+        }
+      } catch {
+        // fall through with a fresh window
+      }
+    }
+    if (count >= limit) {
+      const retryAfterS = Math.max(1, Math.ceil((windowStart + windowMs - now) / 1000))
+      return { ok: false, retryAfterS }
+    }
+    // CF KV has a 60s minimum TTL; 2x the window is ample garbage collection
+    // and no longer affects when the counter resets.
+    await env.MPP_STORE.put(key, JSON.stringify({ n: count + 1, w: windowStart }), {
+      expirationTtl: Math.max(60, windowSeconds * 2),
     })
-    return true
+    return { ok: true }
   } catch {
-    return true // fail open
+    return { ok: true } // fail open
   }
 }
 
@@ -148,20 +191,42 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
 
   // Rate limit: per-IP first (cheap), then per-session for Stripe.
   const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
-  if (!(await rateLimitOk(env, `ip:${ip}`, PER_IP_LIMIT, PER_IP_WINDOW_S))) {
-    return json(429, { ok: false, error: 'Rate limit exceeded (per-IP). Try again shortly.' })
+  const ipLimit = await rateLimitOk(env, `ip:${ip}`, PER_IP_LIMIT, PER_IP_WINDOW_S)
+  if (!ipLimit.ok) {
+    return json(
+      429,
+      {
+        ok: false,
+        code: 'RATE_LIMITED',
+        error: RATE_LIMIT_MESSAGE,
+        scope: 'ip',
+        retry_after_s: ipLimit.retryAfterS,
+      },
+      { 'Retry-After': String(ipLimit.retryAfterS) },
+    )
   }
   // Per-invoice limit applies to BOTH providers: each request touches a live
   // upstream (a Stripe session, or the Coinbase checkout API).
   const sessBucket = await sessionBucketId(rawUrl)
   if (sessBucket) {
-    if (
-      !(await rateLimitOk(env, `session:${sessBucket}`, PER_SESSION_LIMIT, PER_SESSION_WINDOW_S))
-    ) {
-      return json(429, {
-        ok: false,
-        error: 'Rate limit exceeded (per-session). Try again shortly.',
-      })
+    const sessLimit = await rateLimitOk(
+      env,
+      `session:${sessBucket}:ip:${ip}`,
+      PER_SESSION_LIMIT,
+      PER_SESSION_WINDOW_S,
+    )
+    if (!sessLimit.ok) {
+      return json(
+        429,
+        {
+          ok: false,
+          code: 'RATE_LIMITED',
+          error: RATE_LIMIT_MESSAGE,
+          scope: 'invoice',
+          retry_after_s: sessLimit.retryAfterS,
+        },
+        { 'Retry-After': String(sessLimit.retryAfterS) },
+      )
     }
   }
 
