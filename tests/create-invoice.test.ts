@@ -1066,6 +1066,21 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
     expect(body).not.toContain('normalized_input')
   }
 
+  // Success responses DO carry the caller's own URL back as `invoiceUrl` (the
+  // client needs it to link to the merchant's invoice page, and the caller
+  // supplied that exact string in this same request — see create-invoice.ts).
+  // What must still hold is that this is the ONLY place it appears: not in the
+  // Rozo metadata, not in an error field, and never alongside session secrets.
+  function assertUrlOnlyAsEcho(body: string) {
+    const json = JSON.parse(body)
+    expect(json.invoiceUrl).toBe(STRIPE_URL)
+    const rest = JSON.stringify({ ...json, invoiceUrl: undefined })
+    expect(rest).not.toContain('crypto.stripe.com')
+    expect(rest).not.toContain(BLOB)
+    expect(rest).not.toContain('/pay/')
+    expect(body).not.toContain('normalized_input')
+  }
+
   it('never leaks the URL/blob when Stripe resolution fails (fake blob)', async () => {
     // A fake blob makes resume_payin_session 404 -> StripeResolveError; the
     // response must still be blob-free and provider-tagged.
@@ -1143,7 +1158,7 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
     try {
       const { status, body } = await callWith(STRIPE_URL, env)
       expect(status).toBe(200)
-      assertNoLeak(body)
+      assertUrlOnlyAsEcho(body)
       // client_secret / publishable key must never leak either.
       expect(body).not.toContain('cs_secret_should_never_leak')
       expect(body).not.toContain('pk_live_should_never_leak')

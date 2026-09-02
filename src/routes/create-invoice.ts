@@ -641,7 +641,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid JSON body' })
   }
 
-  const { normalized, error, link_id_detected, provider_detected } =
+  const { normalized, error, link_id_detected, provider_detected, raw_url } =
     normalizePayInvoiceBody(parsed)
   if (!normalized || error) {
     return errorResponse(400, {
@@ -691,6 +691,19 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     } as CreateInvoiceError & { supported_sources?: Record<string, SourceToken[]> })
   }
   const source = sourceResult.resolved
+
+  // Echo of the invoice URL the CALLER supplied in THIS request, so a client
+  // that keeps only our response can still link back to the merchant's own
+  // invoice page. This discloses nothing new: the caller already holds this
+  // exact string, and we hand back only what they just sent us.
+  //
+  // The invariant this must NOT break: for Stripe the URL carries a replayable
+  // /pay/<blob> session hash, so it is still never stored in Rozo metadata,
+  // never logged, and never returned by any endpoint that looks an order up by
+  // id (invoice-status, invoice-details, the Rozo intent object) — only this
+  // same-request echo. Omitted when the caller identified the invoice by
+  // payment_id rather than a URL; we do not resolve one on their behalf.
+  const invoiceUrlEcho = raw_url ? { invoiceUrl: raw_url } : {}
 
   // Pay-in intent override (optional). Only 'stellar_payin_contracts' is
   // recognized: the upstream payment-api then freezes the order in contract
@@ -1195,6 +1208,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         ok: true,
         reused: true,
         linkId,
+        ...invoiceUrlEcho,
         merchant: merchantName,
         original: originalStr,
         serviceFee: priced.serviceFee,
@@ -1369,6 +1383,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
             ok: true,
             reused: true,
             linkId,
+            ...invoiceUrlEcho,
             merchant: merchantName,
             original: originalStr,
             serviceFee: priced.serviceFee,
@@ -1475,6 +1490,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     ok: true,
     reused: false,
     linkId,
+    ...invoiceUrlEcho,
     merchant: merchantName,
     original: originalStr,
     serviceFee: priced.serviceFee,
@@ -1510,10 +1526,16 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
 // webhook can settle later WITHOUT trusting the Rozo webhook payload to carry
 // metadata. Moves no money here.
 //
-// SECURITY: the Stripe URL carries a replayable /pay/<blob> session hash. It is
-// stored ONLY in the seeded KV record (never in Rozo metadata, never in any
-// response, never logged). The Rozo metadata carries only the non-secret locked
+// SECURITY: the Stripe URL carries a replayable /pay/<blob> session hash. At
+// rest it lives ONLY in the seeded KV record, encrypted (never in Rozo
+// metadata, never logged). The Rozo metadata carries only the non-secret locked
 // fields (design §6).
+//
+// The one place it leaves this Worker is `invoiceUrl` in the 200 below: a
+// verbatim echo of the URL this same caller just sent us, in the same request.
+// That is not a disclosure — they already have it. What stays forbidden is
+// handing it to anyone who did NOT supply it, i.e. any endpoint keyed by
+// paymentId/invoiceKey (invoice-status, invoice-details) must never return it.
 /**
  * Stripe crypto create-invoice.
  *
@@ -1900,6 +1922,10 @@ export async function handleStripeCreateInvoice(
     ok: true,
     reused,
     provider: 'stripe_crypto',
+    // Same-request echo of the caller's own URL — see invoiceUrlEcho in
+    // handleCreateInvoice. Still never persisted to Rozo metadata or exposed
+    // by any lookup-by-id endpoint.
+    invoiceUrl: stripeUrl,
     source: reused
       ? { chainId: reusedSource.chainId, tokenSymbol: reusedSource.tokenSymbol }
       : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
