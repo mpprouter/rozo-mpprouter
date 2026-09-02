@@ -595,8 +595,9 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'openai/gpt-oss-20b and openai/gpt-oss-120b return live Groq ' +
       'completions through the router. llama-3.1-8b-instant and ' +
       'llama-3.3-70b-versatile are no longer served by this merchant ' +
-      '(model_not_found after payment; the router refunds automatically) ' +
-      'and are rejected before payment. Re-checked twice weekly by the ' +
+      '(model_not_found after payment; the router refunds automatically). ' +
+      'The OpenAI-compatible facade rejects those ids before payment; the ' +
+      'raw route still forwards them. Re-checked twice weekly by the ' +
       'scheduled charge eval.',
     // Facade: retired ids stay documented-but-rejected (400 before any
     // payment) instead of vanishing; evidence in the comment above.
