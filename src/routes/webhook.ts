@@ -660,6 +660,61 @@ async function fetchRozoPaymentById(env: Env, rozoId: string): Promise<any | nul
   }
 }
 
+// Server-confirmed payin — the ONLY signal a checkout UI may use to tell a
+// customer their payment is complete.
+//
+// Everything here is derived from an upstream we control or trust (Rozo's
+// on-chain confirmation, the provider's own settlement, or our fulfillment
+// record). A wallet/SDK callback in the browser saying "completed" means the
+// client believes it submitted something; it is NOT proof that money arrived,
+// and it must never reach this field.
+//
+// Callers used to have only `coinbase.settled` to go on, which is always null
+// for Stripe orders (they take a different branch below) — so a Stripe checkout
+// had no server-truth signal at all and the UI fell back to the client
+// callback, showing "Payment Complete" for orders that were never paid.
+//
+// `confirmed` means the CUSTOMER's payin landed. It does not mean we have
+// settled the merchant invoice yet; `rozoPayment.status` /
+// `routerState.status` still carry that.
+
+// Router states that are only reachable after the payin was observed.
+const ROUTER_STATES_IMPLYING_PAYIN = new Set([
+  'payin_seen',
+  'payout_seen',
+  'provider_paying',
+  'provider_submitted',
+  'provider_submitted_ambiguous',
+  'provider_disabled',
+  'paid',
+])
+
+const ROZO_STATUSES_IMPLYING_PAYIN = new Set([
+  'payment_payin_completed',
+  'payment_payout_completed',
+])
+
+function derivePayinTruth(
+  rozoPayment: any,
+  coinbase: any,
+  routerState: any,
+): { confirmed: boolean; confirmedAt: string | null; via: string | null } {
+  const confirmedAt = rozoPayment?.source?.confirmedAt ?? null
+  if (confirmedAt) {
+    return { confirmed: true, confirmedAt, via: 'rozo_payin' }
+  }
+  if (typeof rozoPayment?.status === 'string' && ROZO_STATUSES_IMPLYING_PAYIN.has(rozoPayment.status)) {
+    return { confirmed: true, confirmedAt: null, via: 'rozo_payin' }
+  }
+  if (coinbase?.settled === true) {
+    return { confirmed: true, confirmedAt: null, via: 'coinbase_settlement' }
+  }
+  if (typeof routerState?.status === 'string' && ROUTER_STATES_IMPLYING_PAYIN.has(routerState.status)) {
+    return { confirmed: true, confirmedAt: routerState.paidAt ?? null, via: 'router_fulfillment' }
+  }
+  return { confirmed: false, confirmedAt: null, via: null }
+}
+
 function pickRozoCallerSafe(rp: any) {
   if (!rp) return null
   return {
@@ -753,12 +808,18 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
         provider: 'stripe_crypto',
       })
     }
+    const stripeRouterState = pickStripeRouterStateSafe(stripeRec)
+    const stripeRozo = pickRozoCallerSafe(rozoPayment)
     return json(200, {
       ok: true,
       provider: 'stripe_crypto',
       invoiceKey,
-      routerState: pickStripeRouterStateSafe(stripeRec),
-      rozoPayment: pickRozoCallerSafe(rozoPayment),
+      // Stripe orders never carry a Coinbase object; the key is present and
+      // null so a caller can tell "no Coinbase side" from "field missing".
+      coinbase: null,
+      payin: derivePayinTruth(stripeRozo, null, stripeRouterState),
+      routerState: stripeRouterState,
+      rozoPayment: stripeRozo,
     })
   }
 
@@ -808,20 +869,25 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
     })
   }
 
+  const callerCoinbase = pickCoinbaseCallerSafe(coinbase)
+  const callerRozo = pickRozoCallerSafe(rozo)
+  const callerRouterState = rec
+    ? {
+        status: rec.status,
+        paidAt: rec.paidAt,
+        invoiceAmountAtomic: rec.invoiceAmountAtomic,
+        funderBalanceAtomic: rec.funderBalanceAtomic,
+        failureReason: rec.failureReason,
+      }
+    : null
+
   return json(200, {
     ok: true,
     pl_id: plId,
     rozo_payment_id: rozoId ?? rozo?.id ?? null,
-    routerState: rec
-      ? {
-          status: rec.status,
-          paidAt: rec.paidAt,
-          invoiceAmountAtomic: rec.invoiceAmountAtomic,
-          funderBalanceAtomic: rec.funderBalanceAtomic,
-          failureReason: rec.failureReason,
-        }
-      : null,
-    coinbase: pickCoinbaseCallerSafe(coinbase),
-    rozoPayment: pickRozoCallerSafe(rozo),
+    payin: derivePayinTruth(callerRozo, callerCoinbase, callerRouterState),
+    routerState: callerRouterState,
+    coinbase: callerCoinbase,
+    rozoPayment: callerRozo,
   })
 }
