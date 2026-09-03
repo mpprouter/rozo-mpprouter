@@ -23,6 +23,14 @@ import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleAllServiceMetrics, handleServiceMetrics } from './routes/service-metrics'
 import { handleStats } from './routes/stats'
+import {
+  providersEnabled,
+  handleProviderChallenge,
+  handleProviderRegister,
+  handleProviderVerify,
+  handleProviderGet,
+  handleProviderSponsor,
+} from './routes/providers'
 import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
 import { handleX402Supported } from './routes/x402-supported'
@@ -426,6 +434,38 @@ export interface Env {
   // Optional expected hostname to pin verified tokens to (e.g. "open.rozo.ai").
   // Set via: wrangler secret put TURNSTILE_HOSTNAME
   TURNSTILE_HOSTNAME?: string
+
+  // ── Provider self-serve onboarding (routes/providers.ts) ─────────────────
+  //
+  // Kill switch for the whole /v1/providers/* surface, mirroring
+  // COUPON_ENDPOINT_ENABLED / PARTNER_ENDPOINT_ENABLED. Anything other than
+  // "true" makes every provider path 404. Default OFF: this is the one
+  // surface where an unauthenticated caller can cause the router to sign a
+  // payment, so it does not come up merely because the code shipped.
+  PROVIDERS_ENDPOINT_ENABLED?: string
+
+  // Stellar secret for the wallet that pays the real-money verification
+  // call (gate 2). A DEDICATED, low-balance wallet — never the router pool
+  // and never the gas sponsor: this key signs payments to addresses that
+  // strangers supplied minutes earlier, so its blast radius must be its own
+  // balance. Per-call and per-day caps live in
+  // services/provider-verification.ts. Unset ⇒ the gate reports
+  // `gate_unavailable` and registrations stay pending (fails closed).
+  // Set via: wrangler secret put PROVIDER_VERIFY_STELLAR_SECRET
+  PROVIDER_VERIFY_STELLAR_SECRET?: string
+
+  // Kill switch for POST /v1/providers/sponsor, which funds a new provider's
+  // Stellar account reserve out of STELLAR_GAS_SECRET. Separate from
+  // PROVIDERS_ENDPOINT_ENABLED because it spends XLM and the rest of the
+  // surface does not. Default OFF.
+  PROVIDER_SPONSOR_ENABLED?: string
+
+  // Post published providers to mppscan.com/register. Default OFF so a new
+  // environment does not announce itself to a third party on first run.
+  MPPSCAN_REGISTER_ENABLED?: string
+  // Optional bearer token for that registration, if MPPScan requires one.
+  // Set via: wrangler secret put MPPSCAN_API_KEY
+  MPPSCAN_API_KEY?: string
 }
 
 export default {
@@ -535,7 +575,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
 
       if (url.pathname === '/llms.txt') {
-        return handleLlmsTxt()
+        return handleLlmsTxt(env)
       }
 
       if (url.pathname === '/openapi.json') {
@@ -840,6 +880,28 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       const jobMatch = url.pathname.match(/^\/v1\/services\/([^/]+)\/jobs\/([^/]+)$/)
       if (jobMatch && request.method === 'GET') {
         return handleJobStatus(request, env, jobMatch[1], jobMatch[2])
+      }
+
+      // Provider self-serve onboarding. The whole surface 404s unless
+      // PROVIDERS_ENDPOINT_ENABLED === 'true' — a 404 rather than a 403, so
+      // probing cannot tell an off deployment from one without the feature.
+      if (url.pathname.startsWith('/v1/providers') && providersEnabled(env)) {
+        if (url.pathname === '/v1/providers/challenge' && request.method === 'GET') {
+          return handleProviderChallenge(request, env)
+        }
+        if (url.pathname === '/v1/providers/register' && request.method === 'POST') {
+          return handleProviderRegister(request, env)
+        }
+        if (url.pathname === '/v1/providers/verify' && request.method === 'POST') {
+          return handleProviderVerify(request, env, ctx)
+        }
+        if (url.pathname === '/v1/providers/sponsor' && request.method === 'POST') {
+          return handleProviderSponsor(request, env)
+        }
+        const providerMatch = url.pathname.match(/^\/v1\/providers\/([a-z0-9-]{3,32})$/)
+        if (providerMatch && request.method === 'GET') {
+          return handleProviderGet(env, providerMatch[1])
+        }
       }
 
       if (url.pathname.startsWith('/v1/services/')) {

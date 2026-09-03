@@ -13,6 +13,8 @@
  * of hand-typed numbers going stale).
  */
 import { listPublicCatalog, PUBLIC_SERVICE_ROUTES } from '../services/merchants'
+import { getAllRoutes } from '../services/catalog-overlay'
+import type { Env } from '../index'
 
 /**
  * `route.name` is `${service.name} – ${endpoint description}` for
@@ -25,10 +27,17 @@ function serviceDisplayName(route: { name: string }): string {
   return sep === -1 ? route.name : route.name.slice(0, sep)
 }
 
-export function handleLlmsTxt(): Response {
+export async function handleLlmsTxt(env?: Env): Promise<Response> {
   const catalog = listPublicCatalog()
   const payable = catalog.filter(entry => entry.payment_status !== 'unavailable')
   const routeById = new Map(PUBLIC_SERVICE_ROUTES.map(route => [route.id, route]))
+
+  // Third-party providers, listed separately rather than folded into the
+  // counts above. An agent reading this file is deciding who it is about
+  // to pay, and "settles to ROZO" and "settles to the provider" are
+  // different answers to that question — merging them into one total would
+  // hide the only distinction that changes where its money goes.
+  const operatorRoutes = (await getAllRoutes(env)).filter(r => r.operator)
 
   const serviceNameBySlug = new Map<string, string>()
   const payableServiceSlugs = new Set<string>()
@@ -179,6 +188,23 @@ https://github.com/mpprouter/rozo-mpprouter/blob/main/docs/verified-services.md)
 blue verified badge and dates on https://www.mpprouter.dev/services
 come from those runs, not from self-reporting. Ask us to verify your
 routes after listing.
+
+## Third-party providers (direct settlement)
+
+${operatorRoutes.length === 0
+  ? 'None listed yet.'
+  : `${operatorRoutes.length} route(s) are operated by third parties and settle
+DIRECTLY to the provider's own address — ROZO never holds the funds. Each
+one advertises its settlement addresses in the live 402 challenge
+(x402 v2 \`accepts[]\`, one entry per chain) and in
+\`operator.payouts\` in /v1/services/catalog.
+
+${operatorRoutes
+    .map(r => `- ${r.publicPath} — ${r.operator!.name} (${r.price}), settles on ${r.operator!.payouts.map(p => p.network).join(', ')}`)
+    .join('\n')}
+
+Providers onboard themselves at POST /v1/providers/register; listing is
+automatic after two verification gates and involves no ROZO human.`}
 
 ## Errors
 

@@ -49,6 +49,43 @@ export function getStellarUsdcSac(env: Env): string {
  * (credential verified).
  */
 export function createStellarPayment(env: Env, onSuccess?: (context: any) => void) {
+  return createStellarPaymentForRecipient(env, env.STELLAR_ROUTER_PUBLIC, onSuccess)
+}
+
+/**
+ * The same charge handler, but settling to an arbitrary recipient.
+ *
+ * This is the whole direct-settlement mechanism (provider self-serve
+ * onboarding, 2026-09-03). `stellar.charge` already takes the recipient as
+ * a parameter, so paying a third-party provider instead of our pool is a
+ * different argument, not a different code path: the buyer signs a SEP-41
+ * transfer straight to the provider's address and no ROZO account appears
+ * anywhere in the transaction.
+ *
+ * `createStellarPayment` above is now a call to this with our own address,
+ * which is what keeps the existing behaviour byte-identical rather than
+ * merely equivalent — there is one implementation, and the 674 snapshot
+ * routes pass the same value they always did.
+ *
+ * ## The one thing a caller must get right
+ *
+ * `recipient` MUST come from a signature-verified provider record
+ * (`route.operator.payouts`), never from anything a request carried. It is
+ * the destination of real money and there is no recovery: on this path the
+ * funds never pass through us, so a wrong address here is not a
+ * reconciliation problem, it is somebody else's money, permanently. The
+ * only caller is the `route.operator` branch in `proxy.ts`.
+ *
+ * Fee sponsorship stays on: the buyer should not need XLM to pay a
+ * provider any more than they need it to pay us, and the gas sponsor is
+ * not part of the money path — it pays the transaction fee, not the
+ * invoice.
+ */
+export function createStellarPaymentForRecipient(
+  env: Env,
+  recipient: string,
+  onSuccess?: (context: any) => void,
+) {
   // Store.cloudflare with AtomicParameters produces Store.AtomicStore,
   // which @stellar/mpp 0.7.0 requires for replay protection (update() CAS).
   // The DO-backed doAtomicParams provides TRUE linearizable CAS — see
@@ -57,7 +94,7 @@ export function createStellarPayment(env: Env, onSuccess?: (context: any) => voi
 
   const method = stellar({
     currency: getStellarUsdcSac(env),
-    recipient: env.STELLAR_ROUTER_PUBLIC,
+    recipient,
     network: env.STELLAR_NETWORK as any,
     rpcUrl: env.STELLAR_RPC_URL,
     store,

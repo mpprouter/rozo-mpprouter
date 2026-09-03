@@ -20,14 +20,51 @@
  * which is out of Phase 1 scope.
  */
 
+import { listPublishedProviders } from '../services/provider-registry'
 import type { Env } from '../index'
 
-export function handleX402Supported(env: Env): Response {
+export async function handleX402Supported(env: Env): Promise<Response> {
   if (env.X402_ENABLED !== 'true') {
     return new Response(
       JSON.stringify({ kinds: [], extensions: [], signers: {} }, null, 2),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
     )
+  }
+
+  // Third-party providers settle to their OWN addresses, on whichever
+  // chains they registered. Each becomes its own `kinds` entry rather than
+  // being folded into the router's: a client picking a kind is picking who
+  // it pays, and collapsing "pays ROZO" and "pays Acme on Base" into one
+  // row would make that choice invisible. `facilitator: 'none'` on the
+  // non-Stellar rows is the honest label — we do not run one there and
+  // cannot sponsor fees we do not pay.
+  const providers = await listPublishedProviders(env)
+  const providerKinds = providers.flatMap(provider =>
+    provider.payouts.map(payout => ({
+      x402Version: 2,
+      scheme: 'exact',
+      network: payout.network,
+      extra: {
+        pay_to: payout.payTo,
+        asset: payout.asset,
+        operator: provider.id,
+        operator_name: provider.name,
+        settlement: 'direct',
+        facilitator: payout.network.startsWith('stellar:') ? 'self' : 'none',
+        fees_sponsored: payout.network.startsWith('stellar:'),
+      },
+    })),
+  )
+
+  const signers: Record<string, string[]> = {
+    [env.STELLAR_NETWORK]: [env.STELLAR_X402_PAY_TO],
+  }
+  for (const provider of providers) {
+    for (const payout of provider.payouts) {
+      const existing = signers[payout.network] ?? []
+      if (!existing.includes(payout.payTo)) existing.push(payout.payTo)
+      signers[payout.network] = existing
+    }
   }
 
   const body = {
@@ -40,17 +77,17 @@ export function handleX402Supported(env: Env): Response {
           pay_to: env.STELLAR_X402_PAY_TO,
           asset: 'USDC',
           facilitator: 'self',
+          settlement: 'pooled',
           // @x402/stellar's `areFeesSponsored: true` means the
           // router facilitator pays tx fees on behalf of the agent.
           // Clients don't need to attach XLM for gas.
           fees_sponsored: true,
         },
       },
+      ...providerKinds,
     ],
     extensions: [],
-    signers: {
-      [env.STELLAR_NETWORK]: [env.STELLAR_X402_PAY_TO],
-    },
+    signers,
   }
 
   return new Response(JSON.stringify(body, null, 2), {

@@ -11,7 +11,7 @@
  * in src/services/merchants.ts for the exact shape.
  */
 
-import { listPublicCatalog } from '../services/merchants'
+import { listCatalogWithOverlay } from '../services/catalog-overlay'
 import { getDegradedRoutes } from '../services/route-health'
 import type { Env } from '../index'
 
@@ -38,7 +38,11 @@ export async function handleServices(env: Env): Promise<Response> {
   // field was added for — see services/route-health.ts.
   const degraded = await getDegradedRoutes(env)
 
-  const services = listPublicCatalog(env).map(s => ({
+  // Snapshot catalog plus any self-serve providers published at runtime.
+  // Provider entries carry `settlement: 'direct'` and an `operator` block
+  // naming the addresses the buyer pays; snapshot entries are byte-identical
+  // to what they have always been.
+  const services = (await listCatalogWithOverlay(env)).map(s => ({
     ...s,
     ...(degraded[s.id] ?? { live_status: 'ok' as const }),
   }))
@@ -54,6 +58,10 @@ export async function handleServices(env: Env): Promise<Response> {
     available_unverified: services.filter(s => s.payment_status === 'available').length,
     unavailable: services.filter(s => s.payment_status === 'unavailable').length,
     degraded_now: services.filter(s => s.live_status === 'degraded').length,
+    // How many routes settle straight to a third-party provider rather
+    // than to the ROZO pool. Published because it is the headline claim of
+    // the provider programme and a reader should not have to count.
+    direct_settlement: services.filter(s => s.settlement === 'direct').length,
   }
 
   return new Response(JSON.stringify({
