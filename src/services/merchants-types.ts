@@ -213,6 +213,64 @@ export interface PublicServiceRoute {
       unavailableReason?: string
     }[]
   }
+  /**
+   * Third-party provider that runs this service and is paid for it
+   * directly (provider self-serve onboarding, 2026-09-03).
+   *
+   * ⚠️ NAME COLLISION, read this before touching it. This repo already
+   * uses the word "operator" for *us*: `OPERATOR_OVERLAY` in
+   * `merchants.ts` and every "operator-maintained" comment in this file
+   * mean the ROZO operator overriding a snapshot route. This field means
+   * the opposite party — an outside provider whose own server answers
+   * the call and whose own key receives the money. The two never appear
+   * on the same route: `OPERATOR_OVERLAY` only keys snapshot routes, and
+   * a route carrying `operator` exists only in the runtime overlay
+   * (`services/provider-registry.ts`), never in the snapshot.
+   *
+   * Presence of this field is the ONLY gate on the direct-settlement
+   * side-path in `proxy.ts`. Every one of the 674 snapshot routes has it
+   * undefined and therefore keeps the existing pooled path, byte for
+   * byte. Do not set it on a snapshot route to "test" the branch —
+   * that would point a route we settle for at an address we do not
+   * control.
+   */
+  operator?: RouteOperator
+}
+
+/**
+ * The third-party provider behind an `operator`-bearing route.
+ *
+ * `payouts` is the load-bearing part: one entry per chain, each holding
+ * an address the provider proved control of with a wallet signature at
+ * registration time. A hand-typed address never reaches here — see
+ * `services/provider-registry.ts` for why (one wrong character sends
+ * money to a stranger, and we cannot claw it back precisely because the
+ * funds never pass through us).
+ */
+export interface RouteOperator {
+  /** Stable provider id, slug-shaped. Appears in public JSON. */
+  id: string
+  /** Display name, provider-supplied. */
+  name: string
+  /**
+   * Settlement addresses the buyer may pay directly, one per chain.
+   * Every entry was signature-verified at registration.
+   */
+  payouts: RouteOperatorPayout[]
+  /** ISO timestamp the provider passed both verification gates. */
+  verifiedAt?: string
+}
+
+export interface RouteOperatorPayout {
+  /**
+   * CAIP-2-style network id, matching what the x402 `accepts[]` entry
+   * advertises: `stellar:pubnet`, `eip155:8453` (Base), `solana:mainnet`.
+   */
+  network: string
+  /** The provider's own receiving address on that network. */
+  payTo: string
+  /** Settlement asset. USDC everywhere we currently support. */
+  asset: string
 }
 
 /**
@@ -439,4 +497,29 @@ export interface PublicCatalogEntry {
   }
   verified_mode?: 'session' | 'charge' | false
   verified_note?: string
+  /**
+   * Third-party provider running this service, and the addresses the
+   * buyer pays directly. Present only on runtime-overlay routes; the 674
+   * snapshot routes omit the key entirely, so a v1 client sees no change.
+   *
+   * A client can read `settlement: 'direct'` as "the money goes to
+   * `operator.payouts`, not to ROZO" — which is exactly the claim the
+   * SCF Tranche 3 payout gate asks us to be able to demonstrate.
+   */
+  operator?: {
+    id: string
+    name: string
+    verified_at?: string
+    payouts: Array<{ network: string; pay_to: string; asset: string }>
+  }
+  /**
+   * How the buyer's money reaches the party serving the call.
+   *
+   *   - `'pooled'` — buyer pays ROZO's address, ROZO pays the upstream
+   *     from its own pool. Every snapshot route. Omitted rather than
+   *     stated for those, so existing clients see no new key.
+   *   - `'direct'` — buyer signs a transfer straight to the provider's
+   *     address. No ROZO custody at any point.
+   */
+  settlement?: 'direct'
 }

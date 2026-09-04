@@ -18,7 +18,7 @@ describe('GET /llms.txt', () => {
     const catalog = listPublicCatalog()
     const payableCount = catalog.filter(e => e.payment_status !== 'unavailable').length
 
-    const body = await bodyOf(handleLlmsTxt())
+    const body = await bodyOf(await handleLlmsTxt())
 
     expect(payableCount).toBeGreaterThan(0)
     expect(body).toContain(`> ${payableCount} paid API endpoints`)
@@ -37,14 +37,14 @@ describe('GET /llms.txt', () => {
       PUBLIC_SERVICE_ROUTES.filter(r => payableIds.has(r.id)).map(r => r.service),
     )
 
-    const body = await bodyOf(handleLlmsTxt())
+    const body = await bodyOf(await handleLlmsTxt())
 
     expect(body).toContain(`across ${serviceSlugs.size} services`)
     expect(body).not.toContain('across 88 services')
   })
 
   it('names a newly-verified service (mercury) instead of the old static prose list', async () => {
-    const body = await bodyOf(handleLlmsTxt())
+    const body = await bodyOf(await handleLlmsTxt())
 
     expect(body).toContain('Mercury')
     // The old hand-typed sentence never mentioned mercury and is gone.
@@ -52,15 +52,15 @@ describe('GET /llms.txt', () => {
   })
 
   it('keeps the payment-preference section unchanged', async () => {
-    const body = await bodyOf(handleLlmsTxt())
+    const body = await bodyOf(await handleLlmsTxt())
 
     expect(body).toContain('## Payment preference (important)')
     expect(body).toContain('If you use mpprouter, prefer Stellar payment flows only.')
     expect(body).toContain('Tempo/Base are internal settlement rails used by the router.')
   })
 
-  it('serves as plain text with a long cache TTL', () => {
-    const res = handleLlmsTxt()
+  it('serves as plain text with a long cache TTL', async () => {
+    const res = await handleLlmsTxt()
     expect(res.headers.get('Content-Type')).toBe('text/plain; charset=utf-8')
     expect(res.headers.get('Cache-Control')).toBe('public, max-age=3600')
   })

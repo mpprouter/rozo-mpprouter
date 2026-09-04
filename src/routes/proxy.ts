@@ -34,6 +34,7 @@ import { buildIdempotencyKey } from '../mpp/idempotency'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
 import {
   createStellarPayment,
+  createStellarPaymentForRecipient,
   getRouterStellarAddress,
   getStellarUsdcSac,
 } from '../mpp/stellar-server'
@@ -58,14 +59,24 @@ import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balan
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
 import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
 import { newOrderId, recordOrder, updateOrderRefundStatus, type RefundStatus } from '../services/order-ledger'
+import {
+  getAllowedMethodsWithOverlay,
+  getRouteWithOverlay,
+} from '../services/catalog-overlay'
 import type { Env } from '../index'
 import { redactForAlert } from '../utils/alert-redaction'
 
 /**
  * Resolve a public Router URL to an internal upstream route.
+ *
+ * Snapshot routes still resolve synchronously inside
+ * `getRouteWithOverlay`, so the 674 existing paths never wait on KV; only
+ * a miss falls through to the runtime provider overlay. That ordering is
+ * the reason adding self-serve providers costs the existing traffic
+ * nothing.
  */
-function resolveRoute(url: URL, method: string) {
-  return getRouteByPublicPath(url.pathname, method)
+async function resolveRoute(env: Env, url: URL, method: string) {
+  return getRouteWithOverlay(env, url.pathname, method)
 }
 
 /**
@@ -214,7 +225,12 @@ type AuthKind =
   | 'passthrough'
   | 'none'
 
-function classifyAuth(authHeader: string | null, env: Env): AuthKind {
+function classifyAuth(
+  authHeader: string | null,
+  env: Env,
+  /** Provider's Stellar address for `operator` routes; see isStellarX402ForThisRouter. */
+  expectedX402PayTo?: string,
+): AuthKind {
   if (!authHeader) return 'none'
   const trimmed = authHeader.trim()
   // Payment scheme uses the MPP "Payment" prefix. Anything else is
@@ -248,7 +264,7 @@ function classifyAuth(authHeader: string | null, env: Env): AuthKind {
   // feature flag is on. This makes dispatch opt-in per request so
   // agents paying directly to some other Stellar recipient (not our
   // router) stay in passthrough.
-  if (isStellarX402ForThisRouter(trimmed, env)) return 'stellar.x402'
+  if (isStellarX402ForThisRouter(trimmed, env, expectedX402PayTo)) return 'stellar.x402'
   return 'passthrough'
 }
 
@@ -712,6 +728,85 @@ async function payMerchantAndGetBodyInner(
   request: Request,
   requestBody: string | undefined,
 ): Promise<MerchantPayResult> {
+  // DIRECT SETTLEMENT (provider self-serve onboarding, 2026-09-03).
+  //
+  // The buyer's payment has already settled to the PROVIDER's own address
+  // — the mppx charge above was issued with `recipient: <provider G…>`,
+  // not with ours (see `createStellarPaymentForRecipient`). So there is no
+  // upstream to pay here: the money never entered a ROZO pool and does not
+  // need to leave one. All that remains is to fetch the provider's own
+  // endpoint and hand back what it serves.
+  //
+  // This branch is gated on `route.operator`, which exists only on runtime
+  // overlay routes. Every one of the 674 snapshot routes has it undefined,
+  // so none of them can reach this code and the pooled path below is
+  // untouched. Placed FIRST because it is the cheapest test and because a
+  // provider route must never fall through into a branch that would pay an
+  // upstream out of our funds.
+  if (route.operator) {
+    const startedAt = Date.now()
+    let providerResponse: Response
+    try {
+      providerResponse = await fetch(merchantUrl, {
+        method: request.method,
+        headers: forwardHeaders(request),
+        body: requestBody,
+      })
+    } catch (err: any) {
+      return {
+        kind: 'error',
+        refundReason: 'timeout',
+        // `routerSideFailure: false` on purpose. The provider's server did
+        // not answer; publishing that as our fault would flatter our own
+        // availability numbers on /v1/stats using someone else's outage.
+        routerSideFailure: false,
+        response: new Response(
+          JSON.stringify({
+            error: 'Provider endpoint unreachable',
+            provider: route.operator.id,
+            detail: err.message,
+          }),
+          { status: 502, headers: { 'Content-Type': 'application/json' } },
+        ),
+      }
+    }
+    const latencyMs = Date.now() - startedAt
+    const contentType = providerResponse.headers.get('content-type') || 'application/json'
+    const body = await providerResponse.text()
+    if (!providerResponse.ok) {
+      return {
+        kind: 'error',
+        // Recorded for the metrics, but note what a refund CANNOT mean on
+        // this path: we hold none of the buyer's money, so there is nothing
+        // for us to return. Founder decision 2026-09-03 — no protocol-level
+        // refund for directly-settled third-party services. The reason is
+        // structural, not an omission: refunding would require custody,
+        // which is the exact thing this path exists to avoid.
+        refundReason: providerResponse.status >= 500 ? 'upstream_5xx' : 'non_fulfillment',
+        merchantStatus: providerResponse.status,
+        latencyMs,
+        routerSideFailure: false,
+        response: new Response(
+          JSON.stringify({
+            error: 'Provider request failed',
+            provider: route.operator.id,
+            status: providerResponse.status,
+            detail: sanitizeUpstreamErrorDetail(false, body),
+          }),
+          { status: 502, headers: { 'Content-Type': 'application/json' } },
+        ),
+      }
+    }
+    return {
+      kind: 'ok',
+      body,
+      contentType,
+      merchantResponse: providerResponse,
+      merchantStatus: providerResponse.status,
+      latencyMs,
+    }
+  }
+
   // Router-held-credential bridge (Mercury MVP, 2026-08-12): the agent
   // still pays Router via Stellar/x402 as normal, but instead of paying a
   // Tempo merchant, Router calls the upstream DIRECTLY with its own held
@@ -1142,9 +1237,9 @@ export async function handleProxy(
 ): Promise<Response> {
   const url = new URL(request.url)
 
-  const route = resolveRoute(url, request.method)
+  const route = await resolveRoute(env, url, request.method)
   if (!route) {
-    const allowedMethods = getAllowedMethodsForPath(url.pathname)
+    const allowedMethods = await getAllowedMethodsWithOverlay(env, url.pathname)
     if (allowedMethods.length > 0) {
       return new Response(JSON.stringify({
         error: 'Method not allowed for this service route',
@@ -1301,7 +1396,15 @@ export async function handleProxy(
       authHeader = `Payment ${x402V2Header.trim()}`
     }
   }
-  const rawAuthKind = classifyAuth(authHeader, env)
+  // For a direct-settlement route the credential pays the PROVIDER, so
+  // the dispatch predicate has to compare against their address rather
+  // than ours — otherwise a correctly-addressed payment falls through to
+  // passthrough and the buyer is served for free.
+  const rawAuthKind = classifyAuth(
+    authHeader,
+    env,
+    route.operator?.payouts.find(p => p.network.startsWith('stellar:'))?.payTo,
+  )
 
   // V2 §6-D2 query-param bootstrap: agents that want the stellar.channel
   // flow on their FIRST request (before any credential has been signed)
@@ -1828,6 +1931,32 @@ export async function handleProxy(
   //     Mppx instance bound to that specific channel + its
   //     commitmentKey. See src/mpp/stellar-channel-dispatch.ts and
   //     internaldocs/v2-stellar-channel-notes.md §N2.
+  // Who the buyer's USDC actually goes to.
+  //
+  // For every snapshot route this is the router pool, exactly as before.
+  // For an `operator` route it is the provider's own Stellar address, taken
+  // from the signature-verified registration record and from nowhere else —
+  // never from a header, a query param or the upstream's own challenge, any
+  // of which would let a caller redirect settlement.
+  //
+  // A direct route that reaches this point without a Stellar payout is a
+  // bug in the publish gate rather than a request we should improvise on,
+  // so it fails loudly instead of quietly falling back to our pool — a
+  // silent fallback would take custody of money on the one path whose whole
+  // purpose is not to.
+  let settlementRecipient = getRouterStellarAddress(env)
+  if (route.operator) {
+    const stellarPayout = route.operator.payouts.find(p => p.network.startsWith('stellar:'))
+    if (!stellarPayout) {
+      console.error(`[proxy] operator route ${route.id} has no stellar payout address`)
+      return new Response(JSON.stringify({
+        error: 'Provider route misconfigured',
+        detail: 'This third-party service has no Stellar settlement address.',
+      }), { status: 503, headers: { 'Content-Type': 'application/json' } })
+    }
+    settlementRecipient = stellarPayout.payTo
+  }
+
   let mppx: Awaited<ReturnType<typeof resolveStellarChannelMppx>>['mppx']
   let settledPayment: PaymentProof | undefined
   // Verified payer for the stellar.channel voucher path, which delivers
@@ -1859,7 +1988,7 @@ export async function handleProxy(
         `[proxy] Stellar channel dispatch for ${resolved.channelContract} (agent=${resolved.agentAccount}, currency=${resolved.channelCurrency})`,
       )
     } else {
-      mppx = createStellarPayment(env, (payment: any) => {
+      mppx = createStellarPaymentForRecipient(env, settlementRecipient, (payment: any) => {
         settledPayment = {
           paymentId: payment.challenge.id,
           paymentTx: payment.receipt.reference,
@@ -2064,7 +2193,12 @@ export async function handleProxy(
       verifyResult = await (mppx as any)['stellar/charge']({
         amount: stellarAmount,
         currency: getStellarUsdcSac(env),
-        recipient: getRouterStellarAddress(env),
+        // The pool for snapshot routes; the provider's own address for
+        // `operator` routes. Must be the SAME value the challenge was
+        // issued with above, or mppx rejects the credential — which is the
+        // property that makes a redirected recipient impossible rather
+        // than merely discouraged.
+        recipient: settlementRecipient,
         // `meta` is server-defined correlation data that mppx 0.7 binds into
         // the challenge `opaque` and re-checks at verify time (it MUST be
         // identical between issue and verify, or the credential is rejected
@@ -2145,6 +2279,11 @@ export async function handleProxy(
         env,
         merchantQuoteTempo,
         request.url,
+        // Direct-settlement routes advertise the PROVIDER's addresses,
+        // one accepts[] entry per chain they registered. Snapshot routes
+        // pass undefined and get exactly the single-entry header they
+        // have always emitted.
+        route.operator,
       )
       if (x402HeaderValue) {
         // Clone the mppx Response so we can add headers without
@@ -2501,6 +2640,30 @@ export async function handleProxy(
       response.headers.set('Refund-Status', rolledBack ? 'voucher-not-consumed' : 'manual-review')
       response.headers.set('Refund-Channel', channelContractForVerify)
       return verifyResult.withReceipt(withFacadeChargeEvidence(response, rolledBack ? '0' : undefined))
+    }
+    // DIRECT SETTLEMENT: never enqueue a refund for a provider route.
+    //
+    // This guard is load-bearing, not defensive. On a direct route the
+    // buyer's USDC went to the PROVIDER's address — it was never in a ROZO
+    // pool — but `settledPayment` is still populated (the payment really
+    // did settle) and `refundReason` is still set (the provider really did
+    // fail). Without this check the generic path below would enqueue a
+    // refund that `refund-executor` pays out of OUR treasury: we would be
+    // reimbursing a buyer for money we never received, once per failed
+    // third-party call. That is a direct, repeatable drain.
+    //
+    // Founder decision 2026-09-03: no protocol-level refund for directly
+    // settled third-party services. The reason is structural — refunding
+    // requires custody, and not taking custody is the entire point of this
+    // path. `refundReason` is still computed above, because the metrics
+    // pipeline uses it to classify the failure.
+    if (settledPayment && payResult.refundReason && route.operator) {
+      ctx.waitUntil(recordFailedLeg('none'))
+      const response = new Response(payResult.response.body, payResult.response)
+      response.headers.set('Refund-Status', 'not-applicable-direct-settlement')
+      response.headers.set('Refund-Mode', 'direct')
+      response.headers.set('Settled-To', settlementRecipient)
+      return verifyResult.withReceipt(withFacadeChargeEvidence(response))
     }
     if (settledPayment && payResult.refundReason) {
       // Before the enqueue, not after: see the note on recordFailedLeg.

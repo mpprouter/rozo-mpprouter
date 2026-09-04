@@ -29,6 +29,7 @@ import {
   serviceIdFromRouteId,
   type MetricsWindow,
 } from './route-metrics'
+import { listPublishedProviders } from './provider-registry'
 import type { Env } from '../index'
 
 /**
@@ -56,6 +57,16 @@ const WINDOW_MS: Record<Exclude<MetricsWindow, 'all'>, number> = {
 
 export interface ServiceStats {
   service_id: string
+  /**
+   * Third-party provider running this service, when there is one.
+   *
+   * Present only for directly-settled providers; absent for every pooled
+   * ROZO route, so an existing consumer sees no new key. `settlement`
+   * makes the money path explicit rather than leaving it inferred from
+   * the presence of `operator`.
+   */
+  operator?: { id: string; name: string }
+  settlement?: 'direct'
   /** Paid calls from external payers in the window. */
   calls: number
   /** Summed USDC, external payers only. String to avoid float drift. */
@@ -289,6 +300,14 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   const allQualityRows = await getQualityServiceIds(env, cutoff)
   for (const id of allQualityRows) acc(id)
 
+  // Which service ids belong to third-party providers. The registry keys
+  // on provider id and `serviceIdFromRouteId` yields exactly that for
+  // overlay routes (`<provider>_<operation>` → `<provider>`), so the two
+  // line up without a second lookup table to keep in sync.
+  const operatorById = new Map(
+    (await listPublishedProviders(env)).map(p => [p.id, { id: p.id, name: p.name }]),
+  )
+
   const services: ServiceStats[] = []
   let anyQualityReadFailed = false
   for (const [serviceId, a] of byService) {
@@ -299,8 +318,10 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     if (availability !== 'ok') anyQualityReadFailed = true
     const qualityReadable = availability === 'ok'
     const w = q[window]
+    const operator = operatorById.get(serviceId)
     services.push({
       service_id: serviceId,
+      ...(operator ? { operator, settlement: 'direct' as const } : {}),
       calls: a.calls,
       volume_usd: a.volume,
       buyers: a.buyers.size,

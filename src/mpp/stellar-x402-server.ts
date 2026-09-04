@@ -92,6 +92,7 @@ import {
   scValToNative,
   type Transaction,
 } from '@stellar/stellar-sdk'
+import type { RouteOperator } from '../services/merchants-types'
 import type { Env } from '../index'
 
 // ---------------------------------------------------------------------
@@ -225,14 +226,27 @@ export function parseStellarX402Header(
 export function isStellarX402ForThisRouter(
   authHeader: string,
   env: Env,
+  /**
+   * Direct-settlement override: the provider's own Stellar address, for a
+   * route carrying an `operator`. When present it REPLACES the router
+   * address in the comparison below rather than being added to it — a
+   * credential paying our pool on a provider's route is not a payment we
+   * should claim, because the provider would then serve a call nobody paid
+   * them for. Snapshot routes pass nothing and the check is unchanged.
+   *
+   * Must come from the signature-verified registration record, never from
+   * the request.
+   */
+  expectedPayTo?: string,
 ): boolean {
   if (env.X402_ENABLED !== 'true') return false
-  if (!env.STELLAR_X402_PAY_TO) return false
+  const payTo = expectedPayTo ?? env.STELLAR_X402_PAY_TO
+  if (!payTo) return false
   const payload = parseStellarX402Header(authHeader)
   if (!payload) return false
   if (payload.accepted.scheme !== 'exact') return false
   if (payload.accepted.network !== env.STELLAR_NETWORK) return false
-  if (payload.accepted.payTo !== env.STELLAR_X402_PAY_TO) return false
+  if (payload.accepted.payTo !== payTo) return false
   return true
 }
 
@@ -438,9 +452,9 @@ export function buildX402PaymentRequiredHeader(
   env: Env,
   merchantQuoteTempoBaseUnits: bigint,
   resourceUrl: string,
+  operator?: RouteOperator,
 ): string | null {
   if (env.X402_ENABLED !== 'true') return null
-  if (!env.STELLAR_X402_PAY_TO) return null
 
   // Convert Tempo 6dp → Stellar 7dp (×10). Same conversion the
   // dispatch branch does on the way in. Keep these two call sites
@@ -449,24 +463,101 @@ export function buildX402PaymentRequiredHeader(
   const stellarAmount = merchantQuoteTempoBaseUnits * 10n
   const network = env.STELLAR_NETWORK as Network
 
+  const accepts = operator
+    ? buildOperatorAccepts(operator, merchantQuoteTempoBaseUnits, stellarAmount, network)
+    : env.STELLAR_X402_PAY_TO
+      ? [
+          {
+            scheme: 'exact',
+            network,
+            amount: stellarAmount.toString(),
+            asset: getUsdcAddress(network),
+            payTo: env.STELLAR_X402_PAY_TO,
+            maxTimeoutSeconds: 300,
+            extra: { areFeesSponsored: true },
+          },
+        ]
+      : []
+
+  if (accepts.length === 0) return null
+
   const paymentRequired = {
     x402Version: 2,
     error: 'Payment required',
     resource: { url: resourceUrl },
-    accepts: [
-      {
-        scheme: 'exact',
-        network,
-        amount: stellarAmount.toString(),
-        asset: getUsdcAddress(network),
-        payTo: env.STELLAR_X402_PAY_TO,
-        maxTimeoutSeconds: 300,
-        extra: { areFeesSponsored: true },
-      },
-    ],
+    accepts,
   }
 
   return safeBase64Encode(JSON.stringify(paymentRequired))
+}
+
+/**
+ * One `accepts[]` entry per chain the provider settles on.
+ *
+ * This is the multi-chain half of provider onboarding, and it is a
+ * discovery requirement before it is a payment one. Measured across 800
+ * Bazaar records: Base carries 957 accepts, Solana 359, `stellar:pubnet`
+ * 8 — from two providers. A Stellar-only listing is close to invisible, so
+ * a provider who already has a Base address keeps it and adds a Stellar
+ * leg rather than migrating to one.
+ *
+ * Every `payTo` here is the PROVIDER's own address on that chain, each one
+ * signature-proven at registration. There is deliberately no ROZO entry in
+ * the list: a buyer who picks any option pays the provider directly, which
+ * is the property the Tranche 3 payout gate asks about, and an "or pay us
+ * instead" entry would quietly reintroduce the custody we removed.
+ *
+ * ## Decimals, and why they are not one constant
+ *
+ * Stellar USDC is 7dp; USDC on Base and Solana is 6dp. The router's
+ * internal quote is Tempo USDC at 6dp. Emitting the ×10 Stellar figure on
+ * an EVM entry would ask the buyer to sign for ten times the price — the
+ * same class of bug as the 1,000,000× overcharge this file's history
+ * records — so each entry is denominated from the source quote in its own
+ * chain's units rather than converted from its neighbour.
+ */
+function buildOperatorAccepts(
+  operator: RouteOperator,
+  quoteTempoBaseUnits6: bigint,
+  stellarAmount7: bigint,
+  routerNetwork: Network,
+): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = []
+  for (const payout of operator.payouts) {
+    if (payout.network.startsWith('stellar:')) {
+      out.push({
+        scheme: 'exact',
+        network: payout.network,
+        amount: stellarAmount7.toString(),
+        // The USDC SAC for the network the ROUTER runs on. A provider
+        // registering a testnet payout while we serve pubnet would produce
+        // an asset/network pair that cannot settle; registration already
+        // refuses that, and this keeps the two consistent if it ever
+        // changes.
+        asset: getUsdcAddress(payout.network === routerNetwork ? routerNetwork : (payout.network as Network)),
+        payTo: payout.payTo,
+        maxTimeoutSeconds: 300,
+        // Fee sponsorship is OURS to offer and it applies to the Stellar
+        // leg we facilitate. We claim it only here, never on a chain where
+        // we do not run the facilitator and therefore could not honour it.
+        extra: { areFeesSponsored: true },
+      })
+      continue
+    }
+    // Base / Solana and anything else the provider proved: 6dp USDC,
+    // settled by the buyer's own x402 client against the provider's
+    // address, with no ROZO facilitator in the path.
+    out.push({
+      scheme: 'exact',
+      network: payout.network,
+      amount: quoteTempoBaseUnits6.toString(),
+      asset: payout.asset || 'USDC',
+      payTo: payout.payTo,
+      maxTimeoutSeconds: 300,
+      extra: { areFeesSponsored: false },
+    })
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------
