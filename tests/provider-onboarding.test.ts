@@ -216,6 +216,10 @@ describe('registration validation', () => {
     expect(out.routes[0].priceUsd).toBe('0.01')
   })
 
+  it('refuses a registration with no payout address', () => {
+    expect(() => validateRegistration({ ...base, payouts: [] })).toThrow(/At least one payout address/)
+  })
+
   it.each([
     ['http://api.acme.example', 'plain http'],
     ['https://localhost/api', 'localhost'],
@@ -276,6 +280,12 @@ describe('registration validation', () => {
 
 describe('wallet-signature authentication', () => {
   const payouts = [{ network: 'stellar:pubnet', payTo: PROVIDER_ADDRESS, asset: 'USDC' }]
+
+  it('rejects an empty signatures array', async () => {
+    await expect(verifyRegistrationSignatures(makeEnv(), {
+      providerId: 'acme', digest: '0'.repeat(64), payouts, signatures: [],
+    })).rejects.toThrow(/signatures\[\] is required/)
+  })
 
   async function signedRegistration(over: { nonce?: string; issuedAt?: string } = {}) {
     const digest = await registrationDigest({

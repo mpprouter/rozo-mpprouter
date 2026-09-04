@@ -27,6 +27,7 @@ const ALLOWED_REQUEST_HEADERS = [
   'content-type',
   'payment-signature',
   'x-request-id',
+  'x-mpp-client-id',
   // mppx/x402 channel-voucher retry sends the credential in these headers
   'accept-payment',
   'x-payment',
