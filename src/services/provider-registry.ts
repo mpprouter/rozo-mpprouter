@@ -136,6 +136,30 @@ export interface ProviderVerification {
   /** Last failure reason, for a provider retrying `/verify`. */
   lastError?: string
   lastAttemptAt?: string
+  domainVerifiedAt?: string
+  lastReachableAt?: string
+  healthStatus?: 'pending' | 'healthy' | 'degraded' | 'offline'
+  consecutiveProbeFailures?: number
+  checks?: ProviderCheck[]
+}
+
+export interface ProviderCheck {
+  key: 'website_reachable' | 'service_discovered' | 'payment_configured' | 'ownership_confirmed' | 'paid_call_works'
+  label: 'Website reachable' | 'Service discovered' | 'Payment configured' | 'Ownership confirmed' | 'Paid call works'
+  status: 'passed' | 'failed' | 'pending'
+  detail: string
+  checkedAt?: string
+}
+
+export interface ProviderDiscovery {
+  submissionStatus: 'not_submitted' | 'submitted' | 'failed'
+  submittedAt?: string
+  submissionId?: string
+  resourceId?: string
+  discoveryUrl?: string
+  lastAttemptAt?: string
+  lastError?: string
+  nextAttemptAt?: string
 }
 
 export interface ProviderRecord {
@@ -171,6 +195,11 @@ export interface ProviderRecord {
    * key — email alone never authorises a payout-address change.
    */
   ownerKey: { network: string; address: string }
+  /** Canonical signed-registration digest. Changes only on signed re-register. */
+  registrationVersion?: string
+  /** SHA-256 only. The bearer token is returned once after signed registration. */
+  dashboardTokenHash?: string
+  discovery?: ProviderDiscovery
 }
 
 /** The derived index: published providers only. */
@@ -219,8 +248,9 @@ function fail(field: string, message: string): never {
  * registration naming `http://localhost` or a cloud metadata address would
  * have us make authenticated-looking requests into our own infrastructure
  * and hand the response back to the registrant. HTTPS-only plus a
- * literal-address ban is the cheap part; the DNS-rebinding residue is
- * handled at fetch time in `provider-verification.ts`.
+ * literal-address ban and strict same-origin secondary fetches reduce the
+ * reachable surface. Workers do not expose a general DNS-pinning primitive,
+ * so this must not be described as complete protection against DNS rebinding.
  */
 export function validateApiBaseUrl(raw: string): string {
   let url: URL

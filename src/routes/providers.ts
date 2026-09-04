@@ -31,6 +31,7 @@ import {
   publicPathFor,
   ProviderValidationError,
   type ProviderRecord,
+  type ProviderCheck,
 } from '../services/provider-registry'
 import {
   buildSignatureMessage,
@@ -46,7 +47,14 @@ import {
   gateRealMoneyCall,
 } from '../services/provider-verification'
 import { registerWithMppScan } from '../services/provider-listing'
+import { submitAndPersistPartnerDiscovery } from '../services/provider-discovery'
 import { sponsorStellarAccount } from '../services/provider-sponsor'
+import { consumeDomainProof, getDomainProofEvidence, issueDomainProof } from '../services/provider-domain-proof'
+import { inspectProviderUrl } from '../services/provider-check'
+import { readProviderRevenue } from '../services/provider-revenue'
+import { getStats } from '../services/stats'
+import { issueDashboardToken, verifyDashboardToken } from '../services/provider-dashboard-auth'
+import { runClaimedPaidGate } from '../services/provider-verify-claim'
 
 function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload, null, 2), {
@@ -71,19 +79,28 @@ export function providersEnabled(env: Env): boolean {
 const WRITE_WINDOW_MS = 60_000
 const WRITE_REQUESTS_PER_WINDOW = 5
 
-async function throttleWrite(request: Request, env: Env): Promise<Response | null> {
+async function throttleRequest(request: Request, env: Env, bucket: string, clientLimit = WRITE_REQUESTS_PER_WINDOW, ipLimit = 30): Promise<Response | null> {
   const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
+  const rawClientId = request.headers.get('X-MPP-Client-Id') ?? ''
+  const clientId = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(rawClientId)
+    ? rawClientId.toLowerCase() : 'anonymous'
   try {
-    const verdict = await checkAndBumpWindowLimit(
+    const ipVerdict = await checkAndBumpWindowLimit(
       env,
-      `ratelimit:providers:${ip}`,
-      WRITE_REQUESTS_PER_WINDOW,
+      `ratelimit:providers:${bucket}:ip:${ip}`,
+      ipLimit,
       WRITE_WINDOW_MS,
     )
-    if (!verdict.ok) {
+    const clientVerdict = ipVerdict.ok ? await checkAndBumpWindowLimit(
+      env,
+      `ratelimit:providers:${bucket}:client:${ip}:${clientId}`,
+      clientLimit,
+      WRITE_WINDOW_MS,
+    ) : ipVerdict
+    if (!ipVerdict.ok || !clientVerdict.ok) {
       return json(429, {
         error: 'rate_limited',
-        detail: `${WRITE_REQUESTS_PER_WINDOW} requests per minute.`,
+        detail: 'Too many requests for this onboarding step. Retry in one minute.',
       })
     }
     return null
@@ -129,7 +146,19 @@ function publicView(record: ProviderRecord) {
       paid_call_network: record.verification.paidCallNetwork ?? null,
       last_error: record.verification.lastError ?? null,
       last_attempt_at: record.verification.lastAttemptAt ?? null,
+      domain_verified_at: record.verification.domainVerifiedAt ?? null,
+      last_reachable_at: record.verification.lastReachableAt ?? null,
+      health_status: record.verification.healthStatus ?? 'pending',
+      checks: record.verification.checks ?? [],
     },
+    labels: {
+      endpoint_and_settlement: record.status === 'published' ? 'Endpoint and settlement checked' : null,
+      router_listing: record.status === 'published' ? 'Listed on MPP Router' : null,
+      partner_submission: record.discovery?.submissionStatus === 'submitted' ? 'Submitted to partner discovery' : null,
+      partner_discovery: record.discovery?.resourceId && record.discovery?.discoveryUrl ? 'Discoverable on partner' : null,
+      degraded: ['degraded', 'offline'].includes(record.verification.healthStatus ?? '') ? 'Service degraded' : null,
+    },
+    discovery: record.discovery ?? { submissionStatus: 'not_submitted' },
     created_at: record.createdAt,
     updated_at: record.updatedAt,
   }
@@ -204,7 +233,7 @@ export async function handleProviderChallenge(request: Request, env: Env): Promi
 // ---------------------------------------------------------------------
 
 export async function handleProviderRegister(request: Request, env: Env): Promise<Response> {
-  const throttled = await throttleWrite(request, env)
+  const throttled = await throttleRequest(request, env, 'register')
   if (throttled) return throttled
 
   let body: any
@@ -293,6 +322,8 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
   }
 
   const now = new Date().toISOString()
+  const dashboardCredential = await issueDashboardToken()
+  const domainVerifiedAt = await getDomainProofEvidence(env, validated.id, validated.apiBaseUrl, auth.ownerKey.address)
   const record: ProviderRecord = {
     id: validated.id,
     name: validated.name,
@@ -305,15 +336,21 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     // the old verification says nothing about either. Re-verifying is the
     // point — a published record must never describe an unverified claim.
     status: 'pending',
-    verification: {},
+    verification: {
+      domainVerifiedAt: domainVerifiedAt ?? undefined,
+      healthStatus: 'pending',
+    },
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
     ownerKey: existing?.ownerKey ?? auth.ownerKey,
+    registrationVersion: digest,
+    dashboardTokenHash: dashboardCredential.hash,
   }
   await putProviderRecord(env, record)
 
   return json(201, {
     ...publicView(record),
+    dashboard_token: dashboardCredential.token,
     next_step: {
       endpoint: 'POST /v1/providers/verify',
       body: { id: record.id },
@@ -334,7 +371,7 @@ export async function handleProviderVerify(
   env: Env,
   ctx: ExecutionContext,
 ): Promise<Response> {
-  const throttled = await throttleWrite(request, env)
+  const throttled = await throttleRequest(request, env, 'verify')
   if (throttled) return throttled
 
   let body: any
@@ -349,8 +386,29 @@ export async function handleProviderVerify(
 
   const record = await getProviderRecord(env, id)
   if (!record) return json(404, { error: 'not_found', detail: `No registration for "${id}".` })
+  if (record.status === 'published') {
+    return json(200, { ...publicView(record), published: true, idempotent: true, evidence: {
+      settlement_tx: record.verification.paidCallTxHash ?? null,
+      paid_call_at: record.verification.paidCallAt ?? null,
+    } })
+  }
   if (record.status === 'suspended') {
     return json(403, { error: 'suspended', detail: 'This provider is suspended.' })
+  }
+  const observedUpdatedAt = record.updatedAt
+  // Records created before registrationVersion shipped derive the exact same
+  // canonical signed-payload digest. No random initialization race is possible.
+  const verificationEpoch = record.registrationVersion ?? await registrationDigest({
+    id: record.id,
+    name: record.name,
+    email: record.email,
+    apiBaseUrl: record.apiBaseUrl,
+    payouts: record.payouts,
+    routes: record.routes,
+  })
+  if (!record.verification.domainVerifiedAt) {
+    record.verification.checks = buildChecks(record, undefined, undefined, 'Domain control has not been confirmed.')
+    return json(422, { error: 'verification_failed', gate: 'ownership', detail: 'Domain control and settlement-wallet control must both pass.', checks: record.verification.checks })
   }
 
   const spec = chooseVerificationRoute(record)
@@ -362,28 +420,48 @@ export async function handleProviderVerify(
       ...record.verification,
       lastError: `probe-402 (${probe.code}): ${probe.detail}`,
       lastAttemptAt: attemptAt,
+      checks: buildChecks(record, probe),
     }
-    record.updatedAt = attemptAt
-    await putProviderRecord(env, record)
+    const latest = await getProviderRecord(env, id)
+    if (!latest || latest.status !== record.status || latest.updatedAt !== observedUpdatedAt) {
+      return json(409, { error: 'registration_changed', detail: 'Registration changed during verification. Retry against the latest version.' })
+    }
+    latest.verification = record.verification
+    latest.updatedAt = attemptAt
+    await putProviderRecord(env, latest)
     return json(422, {
       error: 'verification_failed',
       gate: 'probe-402',
       code: probe.code,
       detail: probe.detail,
       probed: { operation: spec.operation, method: spec.method },
+      checks: buildChecks(record, probe),
     })
   }
 
-  const paid = await gateRealMoneyCall(env, record, spec)
+  const claimed = await runClaimedPaidGate(env, record.id, verificationEpoch, () => gateRealMoneyCall(env, record, spec))
+  if (claimed.status === 'in_progress') {
+    return json(202, { status: 'verification_in_progress', retry_after_seconds: claimed.retryAfterSeconds })
+  }
+  if (claimed.status === 'uncertain') {
+    return json(409, { error: 'payment_outcome_uncertain', detail: claimed.detail, retry: 'manual_status_check_required' })
+  }
+  const paid = claimed.result
   if (!paid.ok) {
     record.verification = {
       ...record.verification,
       probe402At: attemptAt,
       lastError: `real-money (${paid.code}): ${paid.detail}`,
       lastAttemptAt: attemptAt,
+      checks: buildChecks(record, probe, paid),
     }
-    record.updatedAt = attemptAt
-    await putProviderRecord(env, record)
+    const latest = await getProviderRecord(env, id)
+    if (!latest || latest.status !== record.status || latest.updatedAt !== observedUpdatedAt) {
+      return json(409, { error: 'registration_changed', detail: 'Registration changed during verification. Retry against the latest version.' })
+    }
+    latest.verification = record.verification
+    latest.updatedAt = attemptAt
+    await putProviderRecord(env, latest)
     // `gate_unavailable` is our missing configuration, not their failure,
     // so it reads as 503 rather than as a rejection of their endpoint.
     const status = paid.code === 'gate_unavailable' ? 503 : 422
@@ -393,6 +471,7 @@ export async function handleProviderVerify(
       code: paid.code,
       detail: paid.detail,
       probe_402: 'passed',
+      checks: buildChecks(record, probe, paid),
     })
   }
 
@@ -402,27 +481,122 @@ export async function handleProviderVerify(
     paidCallAt: publishedAt,
     paidCallTxHash: paid.txHash,
     paidCallNetwork: paid.network,
+    domainVerifiedAt: record.verification.domainVerifiedAt,
+    lastReachableAt: publishedAt,
+    healthStatus: 'healthy',
+    consecutiveProbeFailures: 0,
+    checks: buildChecks(record, probe, paid),
   }
-  record.status = 'published'
-  record.updatedAt = publishedAt
-  await putProviderRecord(env, record)
+  const latest = await getProviderRecord(env, id)
+  if (!latest || latest.status !== record.status || latest.updatedAt !== observedUpdatedAt) {
+    return json(409, { error: 'registration_changed', detail: 'Registration changed during verification. The paid probe was not used to publish stale configuration; retry.' })
+  }
+  latest.verification = record.verification
+  latest.status = 'published'
+  latest.updatedAt = publishedAt
+  await putProviderRecord(env, latest)
 
   // External listing is best-effort and deliberately off the critical
   // path: MPPScan being down must not un-publish a provider who has
   // already proven a paid call settled to their own key.
-  ctx.waitUntil(registerWithMppScan(env, record).catch(() => {}))
+  ctx.waitUntil(registerWithMppScan(env, latest).catch(() => {}))
+  ctx.waitUntil(submitAndPersistPartnerDiscovery(env, latest.id))
 
   return json(200, {
-    ...publicView(record),
+    ...publicView(latest),
     published: true,
     evidence: {
       probe_402: probe.detail,
       real_money: paid.detail,
       settlement_tx: paid.txHash,
-      settled_to: record.payouts.find(p => p.network.startsWith('stellar:'))?.payTo,
+      settled_to: latest.payouts.find(p => p.network.startsWith('stellar:'))?.payTo,
     },
-    catalog: record.routes.map(r => publicPathFor(record.id, r.operation)),
+    catalog: latest.routes.map(r => publicPathFor(latest.id, r.operation)),
   })
+}
+
+function buildChecks(record: ProviderRecord, probe?: { ok: boolean; detail: string; code?: string }, paid?: { ok: boolean; detail: string }, ownershipError?: string): ProviderCheck[] {
+  const checkedAt = new Date().toISOString()
+  const unreachable = probe?.ok === false && probe.code === 'unreachable'
+  const serviceFailure = probe?.ok === false && ['not_402', 'unparseable_challenge'].includes(probe.code ?? '')
+  const websitePassed = probe ? !unreachable : false
+  const servicePassed = probe?.ok === true || (probe?.ok === false && !unreachable && !serviceFailure)
+  return [
+    { key: 'website_reachable', label: 'Website reachable', status: probe ? websitePassed ? 'passed' : 'failed' : 'pending', detail: websitePassed ? 'The HTTPS endpoint responded.' : probe?.detail ?? 'Not checked.', checkedAt },
+    { key: 'service_discovered', label: 'Service discovered', status: probe ? servicePassed ? 'passed' : 'failed' : 'pending', detail: probe?.detail ?? 'Not checked.', checkedAt },
+    { key: 'payment_configured', label: 'Payment configured', status: probe?.ok ? 'passed' : probe ? 'failed' : 'pending', detail: probe?.detail ?? 'Not checked.', checkedAt },
+    { key: 'ownership_confirmed', label: 'Ownership confirmed', status: record.verification.domainVerifiedAt && !ownershipError ? 'passed' : 'failed', detail: ownershipError ?? 'Domain and settlement-wallet control confirmed.', checkedAt },
+    { key: 'paid_call_works', label: 'Paid call works', status: paid?.ok ? 'passed' : paid ? 'failed' : 'pending', detail: paid?.detail ?? 'Not checked.', checkedAt },
+  ]
+}
+
+export async function handleProviderCheck(request: Request, env: Env): Promise<Response> {
+  const throttled = await throttleRequest(request, env, 'check')
+  if (throttled) return throttled
+  try {
+    const body = await readJson(request) as Record<string, unknown>
+    const url = String(body.url ?? '').trim()
+    const inspected = await inspectProviderUrl(url)
+    const host = new URL(url).hostname.toLowerCase()
+    const providerId = host.replace(/^www\./, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32)
+    const payTo = inspected.draft?.payouts[0]?.pay_to
+    const domainProof = inspected.draft && payTo && providerId.length >= 3
+      ? await issueDomainProof(env, { providerId, url, payTo }) : null
+    const registration = inspected.draft ? {
+      id: providerId,
+      name: host.replace(/^www\./, ''),
+      email: '',
+      ...inspected.draft,
+    } : null
+    return json(200, { provider_id: providerId || null, registration, checks: inspected.checks, domain_proof: domainProof })
+  } catch (error) {
+    return json(422, { error: 'check_failed', detail: error instanceof Error ? error.message : 'Service check failed.' })
+  }
+}
+
+export async function handleProviderDomainVerify(request: Request, env: Env): Promise<Response> {
+  const throttled = await throttleRequest(request, env, 'domain-verify')
+  if (throttled) return throttled
+  try {
+    const body = await readJson(request) as Record<string, unknown>
+    const result = await consumeDomainProof(env, {
+      providerId: String(body.provider_id ?? '').trim().toLowerCase(), url: String(body.url ?? '').trim(), token: String(body.token ?? ''),
+    })
+    return json(result.ok ? 200 : 422, result)
+  } catch (error) {
+    return json(400, { error: 'invalid_domain_proof', detail: error instanceof Error ? error.message : 'Invalid domain proof.' })
+  }
+}
+
+export async function handleProviderDashboard(request: Request, env: Env, id: string): Promise<Response> {
+  const throttled = await throttleRequest(request, env, 'dashboard', 30, 120)
+  if (throttled) return throttled
+  const record = await getProviderRecord(env, id.trim().toLowerCase())
+  if (!record) return json(404, { error: 'not_found' })
+  if (!(await verifyDashboardToken(request.headers.get('authorization'), record.dashboardTokenHash))) {
+    return json(401, { error: 'unauthorized', detail: 'Valid dashboard credentials are required.' })
+  }
+  const cacheKey = `providerDashboardCache:${id}`
+  const cached = await env.MPP_STORE.get(cacheKey)
+  if (cached) return json(200, JSON.parse(cached))
+  const revenue = await readProviderRevenue(env, record)
+  let activity: unknown
+  try {
+    const stats = await getStats(env, '30d')
+    const service = stats.services.find(item => item.service_id === record.id)
+    activity = {
+      status: stats.coverage.quality_availability === 'ok' ? 'available' : 'unavailable',
+      window: stats.window,
+      coverage: stats.coverage,
+      truncated: stats.truncated,
+      service: service ?? null,
+    }
+  } catch {
+    activity = { status: 'unavailable', window: '30d', detail: 'Paid-call metrics could not be read; no zero values are substituted.' }
+  }
+  const payload = { provider: publicView(record), revenue, activity }
+  await env.MPP_STORE.put(cacheKey, JSON.stringify(payload), { expirationTtl: 60 })
+  return json(200, payload)
 }
 
 // ---------------------------------------------------------------------
@@ -451,7 +625,7 @@ export async function handleProviderGet(env: Env, id: string): Promise<Response>
  * "we'll hold it for you", because the second one would be false.
  */
 export async function handleProviderSponsor(request: Request, env: Env): Promise<Response> {
-  const throttled = await throttleWrite(request, env)
+  const throttled = await throttleRequest(request, env, 'sponsor')
   if (throttled) return throttled
 
   let body: any

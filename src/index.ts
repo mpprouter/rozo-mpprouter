@@ -30,10 +30,16 @@ import {
   handleProviderVerify,
   handleProviderGet,
   handleProviderSponsor,
+  handleProviderCheck,
+  handleProviderDomainVerify,
+  handleProviderDashboard,
 } from './routes/providers'
 import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
 import { handleX402Supported } from './routes/x402-supported'
+import { handleX402WellKnown } from './routes/x402-well-known'
+import { monitorPublishedProviders } from './services/provider-monitor'
+import { retryPartnerDiscoveries } from './services/provider-discovery'
 import { handleLlmsTxt } from './routes/llms-txt'
 import { handleOpenApi } from './routes/openapi'
 import { handleAiPlugin } from './routes/ai-plugin'
@@ -466,6 +472,11 @@ export interface Env {
   // Optional bearer token for that registration, if MPPScan requires one.
   // Set via: wrangler secret put MPPSCAN_API_KEY
   MPPSCAN_API_KEY?: string
+  // Optional generic partner-discovery adapter. A successful POST means only
+  // submitted; discoverable is shown only when the partner returns both a
+  // resource id and URL.
+  PROVIDER_DISCOVERY_SUBMIT_URL?: string
+  PROVIDER_DISCOVERY_API_KEY?: string
 }
 
 export default {
@@ -484,6 +495,12 @@ export default {
     // state TRANSITION only — this cron runs every 2 minutes, so a level-based
     // check would re-send the same warning 720 times a day.
     ctx.waitUntil(watchGasSponsor(env))
+    // Free 402 probes only. Scheduled health monitoring never spends money.
+    // Serialize these because both merge advisory fields into provider rows.
+    ctx.waitUntil((async () => {
+      await monitorPublishedProviders(env)
+      await retryPartnerDiscoveries(env)
+    })())
   },
 }
 
@@ -584,6 +601,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
       if (url.pathname === '/.well-known/ai-plugin.json') {
         return handleAiPlugin()
+      }
+      if (url.pathname === '/.well-known/x402') {
+        return handleX402WellKnown(env)
       }
 
       if (url.pathname === '/services' || url.pathname === '/v1/services/catalog') {
@@ -886,6 +906,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // PROVIDERS_ENDPOINT_ENABLED === 'true' — a 404 rather than a 403, so
       // probing cannot tell an off deployment from one without the feature.
       if (url.pathname.startsWith('/v1/providers') && providersEnabled(env)) {
+        if (url.pathname === '/v1/providers/check' && request.method === 'POST') {
+          return handleProviderCheck(request, env)
+        }
+        if (url.pathname === '/v1/providers/domain/verify' && request.method === 'POST') {
+          return handleProviderDomainVerify(request, env)
+        }
         if (url.pathname === '/v1/providers/challenge' && request.method === 'GET') {
           return handleProviderChallenge(request, env)
         }
@@ -901,6 +927,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         const providerMatch = url.pathname.match(/^\/v1\/providers\/([a-z0-9-]{3,32})$/)
         if (providerMatch && request.method === 'GET') {
           return handleProviderGet(env, providerMatch[1])
+        }
+        const dashboardMatch = url.pathname.match(/^\/v1\/providers\/([a-z0-9-]{3,32})\/dashboard$/)
+        if (dashboardMatch && request.method === 'GET') {
+          return handleProviderDashboard(request, env, dashboardMatch[1])
         }
       }
 
