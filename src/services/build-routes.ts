@@ -482,6 +482,9 @@ export function buildRoutesFromMppSnapshot(
         if (overlayEntry.placeholderDefaults !== undefined) {
           route.placeholderDefaults = overlayEntry.placeholderDefaults
         }
+        if (overlayEntry.exampleParams !== undefined) {
+          route.exampleParams = overlayEntry.exampleParams
+        }
         if (overlayEntry.upstreamPaymentMethod !== undefined) {
           // Operator override — e.g. the operator opened a session
           // channel for this merchant and wants the router to use

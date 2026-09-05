@@ -216,3 +216,41 @@ describe('directory data hygiene', () => {
     }
   })
 })
+
+describe('example_request — the field that stops a crawler filing us as dead', () => {
+  it('publishes a fetchable URL for every Mercury route that needs a parameter', async () => {
+    const manifest = await buildX402WellKnown(env())
+    const templated = manifest.resources.filter(
+      (r: any) => typeof r.resource === 'string'
+        && r.resource.includes('/v1/services/mercury/')
+        && Array.isArray(r.required_query_params),
+    )
+    expect(templated.length).toBeGreaterThan(0)
+    for (const route of templated) {
+      expect(route.example_request, `${route.resource} has no example`).toBeTypeOf('string')
+      const url = new URL(route.example_request)
+      // Every declared requirement must actually be present in the example,
+      // or the example reproduces the 400 it exists to prevent.
+      for (const param of route.required_query_params) {
+        expect(url.searchParams.get(param), `${route.resource} missing ${param}`).toBeTruthy()
+      }
+      expect(`${url.origin}${url.pathname}`).toBe(route.resource)
+    }
+  })
+
+  it('omits example_request rather than publishing a partial one', async () => {
+    const manifest = await buildX402WellKnown(env())
+    for (const route of manifest.resources) {
+      if (!route.example_request) continue
+      const url = new URL(route.example_request)
+      for (const param of route.required_query_params ?? []) {
+        expect(url.searchParams.get(param)).toBeTruthy()
+      }
+    }
+  })
+
+  it('tells a crawler that parameters go on the query string', async () => {
+    const manifest = await buildX402WellKnown(env())
+    expect(JSON.stringify(manifest.notes)).toContain('QUERY parameters')
+  })
+})
