@@ -93,6 +93,10 @@ interface WellKnownResource {
   payable_through_router: boolean
   operator?: { id: string; name: string; homepage?: string }
   accepts: WellKnownAccept[]
+  /** Directory entries only: when we last read the operator's own 402. */
+  accepts_read_at?: string
+  /** Directory entries only: the endpoint whose live 402 is authoritative. */
+  accepts_authority?: string
   evaluation_tx?: string
 }
 
@@ -117,10 +121,18 @@ export function toMinorUnits(amountDecimal: string, decimals: number): string | 
   return digits
 }
 
+/**
+ * The USDC contract id for a Stellar network, or undefined.
+ *
+ * Deliberately not defaulting to pubnet for an unrecognised `stellar:*`
+ * value: a provider may register any of them, and stamping the pubnet SAC
+ * on a network it does not exist on produces a canonical-looking accept
+ * that no client can pay.
+ */
 function stellarAssetId(network: string, hint?: string): string | undefined {
   if (hint) return hint
   if (!network.startsWith('stellar:')) return undefined
-  return STELLAR_USDC_SAC_BY_NETWORK[network] ?? STELLAR_USDC_SAC_BY_NETWORK['stellar:pubnet']
+  return STELLAR_USDC_SAC_BY_NETWORK[network]
 }
 
 /**
@@ -151,6 +163,9 @@ function acceptsForCatalogEntry(
       const amount = toMinorUnits(priceUsd, decimals)
       if (!amount) continue
       const assetId = stellarAssetId(payout.network)
+      // No known asset identifier on a Stellar network we do not recognise
+      // — emit nothing rather than an unpayable requirement.
+      if (payout.network.startsWith('stellar:') && !assetId) continue
       out.push({
         scheme: 'exact',
         network: payout.network,
@@ -241,6 +256,12 @@ function directoryResources(): WellKnownResource[] {
         payTo: payout.pay_to,
       }]
     }),
+    // These requirements mirror the operator's own 402 as read on this
+    // date. We do not control them, and the operator's live challenge is
+    // authoritative — a buyer pays them directly, so their probe settles
+    // any disagreement.
+    accepts_read_at: entry.listed_prices_read_at,
+    accepts_authority: entry.resource_url,
     ...(entry.evaluation_tx ? { evaluation_tx: entry.evaluation_tx } : {}),
   }))
 }
@@ -290,6 +311,7 @@ export async function buildX402WellKnown(env: Env): Promise<{
       'An empty accepts[] means the price is determined at request time; probe the resource for a live 402.',
       'price_indicative: true means price_usd is a catalog snapshot of an upstream price, not an amount this router fixes.',
       'accepts[].asset is the on-chain asset identifier (Stellar SAC); accepts[].asset_symbol is the ticker.',
+      'On a directory entry, accepts[] mirrors the operator\'s own 402 as read on accepts_read_at; their live challenge at accepts_authority is authoritative.',
       'payable_through_router: false means MPP Router does not sell this call — pay the operator at the resource URL.',
       'settlement: "direct" means the buyer pays the operator address, not a ROZO pool.',
     ],

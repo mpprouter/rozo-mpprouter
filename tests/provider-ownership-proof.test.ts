@@ -19,16 +19,22 @@ import {
   resolveOwnershipProof,
   verifyX402PayToMatch,
   assertNoProofDowngrade,
+  providerIdsForOrigin,
   OWNERSHIP_PROOF_GUIDE,
 } from '../src/services/provider-ownership'
 import { issueDomainProof } from '../src/services/provider-domain-proof'
 import { ProviderAuthError } from '../src/services/provider-auth'
 import { handleProviderRegister } from '../src/routes/providers'
+import { Keypair } from '@stellar/stellar-sdk'
+import { buildSignatureMessage, registrationDigest } from '../src/services/provider-auth'
 import { issueDashboardToken } from '../src/services/provider-dashboard-auth'
 import { resetProviderCache, type ProviderRecord } from '../src/services/provider-registry'
 
 const PROVIDER_ADDRESS = 'GDNJXCKW7ZM7GEEVP674TWPU26YJNBQ2FI4ZIPRKTPTNUEJMDHFJWWRL'
 const OTHER_ADDRESS = 'GBSNB5A7OS5ACS5NINYIVHS4BBGJNPNGARBSORNNZ2W6UCVYA32GU4LT'
+/** A real keypair: a mocked signature check only tests the mock. */
+const SIGNER = Keypair.random()
+const SIGNER_ADDRESS = SIGNER.publicKey()
 
 const ROUTES = [
   { operation: 'stablecoin-peg', method: 'GET' as const, upstreamPath: '/api/stablecoin-peg', priceUsd: '0.003' },
@@ -221,6 +227,25 @@ describe('well-known tokens are bound to the declared payouts', () => {
     })).rejects.toThrow(/does not declare/)
   })
 
+  it('refuses two payouts that share one address across networks', async () => {
+    // A token binds an address, not an address-plus-network, so it cannot
+    // tell these two apart — and resolving the ambiguity wrongly would
+    // publish an unadvertised network on the strength of a real proof.
+    const e = env()
+    const proof = await issueDomainProof(e, {
+      providerId: 'agent402', url: 'https://agent402.tools', payTo: PROVIDER_ADDRESS,
+    })
+    await expect(resolveOwnershipProof(e, {
+      providerId: 'agent402', digest: 'd', apiBaseUrl: 'https://agent402.tools',
+      payouts: [
+        { network: 'stellar:pubnet', payTo: PROVIDER_ADDRESS, asset: 'USDC' },
+        { network: 'stellar:testnet', payTo: PROVIDER_ADDRESS, asset: 'USDC' },
+      ],
+      routes: ROUTES,
+      body: { ownership_proof: { type: 'well_known', token: proof.token } },
+    })).rejects.toThrow(/share the same address/)
+  })
+
   it('refuses when a second payout address rides along unproven', async () => {
     // The token proves one address. Without this check it would also
     // publish every other address in the same registration.
@@ -238,6 +263,27 @@ describe('well-known tokens are bound to the declared payouts', () => {
       routes: ROUTES,
       body: { ownership_proof: { type: 'well_known', token: proof.token } },
     })).rejects.toThrow(/eip155:8453/)
+  })
+})
+
+describe('a public proof may only claim its own domain\'s name', () => {
+  it('derives the ids an origin is allowed to register', () => {
+    expect(providerIdsForOrigin('https://agent402.tools')).toEqual(['agent402-tools', 'agent402'])
+    expect(providerIdsForOrigin('https://www.example.co.uk')).toContain('example')
+    expect(providerIdsForOrigin('not a url')).toEqual([])
+  })
+
+  it('refuses a public proof that claims someone else\'s name', async () => {
+    // Both new proofs rest on public facts, so without this a stranger
+    // could file first under a desirable id and become its credential
+    // holder. Tying the id to the origin removes the prize.
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async () => challenge402([
+      { scheme: 'exact', network: 'stellar:pubnet', amount: '30000', asset: 'CCW6', payTo: PROVIDER_ADDRESS },
+    ])) as unknown as typeof fetch)
+    await expect(resolveOwnershipProof(env(), {
+      providerId: 'openai', digest: 'd', apiBaseUrl: 'https://agent402.tools',
+      payouts: PAYOUTS, routes: ROUTES, body: { ownership_proof: { type: 'x402_pay_to' } },
+    })).rejects.toThrow(/derived from its own domain/)
   })
 })
 
@@ -394,5 +440,67 @@ describe('POST /v1/providers/register with a non-signature proof', () => {
     )
     expect(response.status).toBe(401)
     expect(await response.json()).toMatchObject({ code: 'proof_downgrade' })
+  })
+})
+
+
+describe('concurrent creation and proof upgrades', () => {
+  beforeEach(() => { resetProviderCache() })
+
+  it('lets only one of two simultaneous first registrations win the id', async () => {
+    // Both requests read `existing === null`; without an atomic claim the
+    // loser would overwrite the winner's record without ever meeting the
+    // dashboard-token check that guards an update.
+    const e = withLimiter(env())
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async () => stellar402()) as unknown as typeof fetch)
+    const [a, b] = await Promise.all([
+      handleProviderRegister(registerRequest(registrationBody({ ownership_proof: { type: 'x402_pay_to' } })), e),
+      handleProviderRegister(registerRequest(registrationBody({ ownership_proof: { type: 'x402_pay_to' } })), e),
+    ])
+    const statuses = [a.status, b.status].sort()
+    expect(statuses).toEqual([201, 409])
+  })
+
+  it('upgrades the stored proof marker when a signature updates a weak record', async () => {
+    // Otherwise a record that was strengthened stays downgradeable, and
+    // the no-downgrade invariant quietly does not hold for it.
+    const e = withLimiter(env())
+    const credential = await issueDashboardToken()
+    const weak: ProviderRecord = {
+      id: 'agent402', name: 'Agent402', email: 'mike@agent402.tools',
+      apiBaseUrl: 'https://agent402.tools',
+      payouts: [{ network: 'stellar:pubnet', payTo: SIGNER_ADDRESS, asset: 'USDC' }],
+      routes: [{ operation: 'stablecoin-peg', method: 'GET', upstreamPath: '/api/stablecoin-peg', priceUsd: '0.003' }],
+      status: 'published', verification: { ownershipProof: 'x402_pay_to' },
+      createdAt: '2026-09-05T00:00:00.000Z', updatedAt: '2026-09-05T00:00:00.000Z',
+      ownerKey: { network: 'stellar:pubnet', address: SIGNER_ADDRESS, proof: 'x402_pay_to' },
+      dashboardTokenHash: credential.hash,
+    }
+    await e.MPP_STORE.put('provider:agent402', JSON.stringify(weak))
+
+    const body = registrationBody({
+      payouts: [{ network: 'stellar:pubnet', pay_to: SIGNER_ADDRESS, asset: 'USDC' }],
+    })
+    const digest = await registrationDigest({
+      id: 'agent402', name: 'Agent402', email: 'mike@agent402.tools',
+      apiBaseUrl: 'https://agent402.tools',
+      payouts: [{ network: 'stellar:pubnet', payTo: SIGNER_ADDRESS, asset: 'USDC' }],
+      routes: [{ operation: 'stablecoin-peg', method: 'GET', upstreamPath: '/api/stablecoin-peg', priceUsd: '0.003' }],
+    })
+    const issuedAt = new Date().toISOString()
+    const nonce = 'nonce-upgrade-1'
+    const message = buildSignatureMessage({
+      providerId: 'agent402', network: 'stellar:pubnet', address: SIGNER_ADDRESS,
+      digest, issuedAt, nonce,
+    })
+    const signature = SIGNER.sign(Buffer.from(message)).toString('base64')
+
+    const response = await handleProviderRegister(registerRequest({
+      ...body,
+      signatures: [{ network: 'stellar:pubnet', signature, issued_at: issuedAt, nonce }],
+    }), e)
+    expect(response.status).toBe(201)
+    const stored = JSON.parse((await e.MPP_STORE.get('provider:agent402'))!)
+    expect(stored.ownerKey.proof).toBe('wallet_signature')
   })
 })

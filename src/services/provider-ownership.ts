@@ -102,6 +102,39 @@ export const OWNERSHIP_PROOF_GUIDE = {
   },
 } as const
 
+/**
+ * Provider ids a non-signature proof may claim for a given origin.
+ *
+ * Both new proofs rest on public facts — anyone can fetch someone else's
+ * 402, and a published well-known token is readable by the world — so
+ * without this a stranger could file first under a desirable id and become
+ * its credential holder. Tying the id to the origin being proven removes
+ * the prize: you may only claim a name your own domain already spells.
+ *
+ * `agent402.tools` therefore yields `agent402-tools`, `agent402` and
+ * `agent402-tools` again for the label-minus-TLD form — the shapes a real
+ * operator would reach for — and nothing belonging to anyone else. A
+ * wallet signature is exempt: it proves key custody directly and has
+ * always been allowed to name its own record.
+ */
+export function providerIdsForOrigin(apiBaseUrl: string): string[] {
+  let host: string
+  try {
+    host = new URL(apiBaseUrl).hostname.toLowerCase().replace(/^www\./, '')
+  } catch {
+    return []
+  }
+  const labels = host.split('.')
+  const slug = (value: string) =>
+    value.replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32)
+  const candidates = [
+    slug(host),
+    slug(labels[0] ?? ''),
+    slug(labels.slice(0, -1).join('.')),
+  ]
+  return [...new Set(candidates.filter(Boolean))]
+}
+
 export interface OwnershipOutcome {
   proof: OwnershipProofType
   /** The key/address authorised to change this record later. */
@@ -270,6 +303,18 @@ export async function resolveOwnershipProof(
     }
   }
 
+  // From here on the proof is a public fact, so the id must belong to the
+  // origin the proof is about.
+  const allowedIds = providerIdsForOrigin(args.apiBaseUrl)
+  if (!allowedIds.includes(args.providerId)) {
+    throw new ProviderAuthError(
+      `A ${type} proof may only register an id derived from its own domain. ` +
+        `For ${args.apiBaseUrl} that is: ${allowedIds.join(', ') || '(none)'}. ` +
+        'Registering a different id requires a wallet signature.',
+      'id_not_derived_from_domain',
+    )
+  }
+
   const first = args.payouts[0]
 
   if (type === 'well_known') {
@@ -282,6 +327,20 @@ export async function resolveOwnershipProof(
       throw new ProviderAuthError(
         'ownership_proof.token is required. Issue one with POST /v1/providers/check and publish it.',
         'missing_token',
+      )
+    }
+
+    // A token binds an ADDRESS, not an address-plus-network. Two payout
+    // entries sharing the same address string on different networks would
+    // therefore both be covered by one token, letting an unadvertised
+    // network ride in on a real proof. Refuse the ambiguity rather than
+    // resolve it wrongly.
+    const addresses = args.payouts.map(p => p.payTo)
+    if (new Set(addresses).size !== addresses.length) {
+      throw new ProviderAuthError(
+        'Two payout entries share the same address. A domain proof token binds an address, ' +
+          'not a network, so it cannot tell them apart. Use distinct addresses, or sign with the wallet.',
+        'ambiguous_payout',
       )
     }
 

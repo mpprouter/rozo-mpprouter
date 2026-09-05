@@ -127,6 +127,38 @@ async function throttleRequest(request: Request, env: Env, bucket: string, clien
   }
 }
 
+/**
+ * Claim a provider id for a first registration, atomically.
+ *
+ * Two concurrent registrations for the same id can both read
+ * `existing === null`, and the second would then overwrite the first
+ * without ever facing the dashboard-token check that guards an update. The
+ * ATOMIC_STORE compare-and-set is the repo's existing answer to exactly
+ * this shape of race (see `provider-verify-claim.ts`); with no DO bound —
+ * unit tests, a stripped environment — it degrades to the re-read the
+ * caller already did, which is weaker but no worse than before.
+ *
+ * Returns false when someone else got there first; the caller answers 409.
+ */
+async function claimProviderIdForCreate(env: Env, id: string): Promise<boolean> {
+  if (!env.ATOMIC_STORE) return (await getProviderRecord(env, id)) === null
+  const key = `providerIdClaim:${id}`
+  const stub = env.ATOMIC_STORE.get(env.ATOMIC_STORE.idFromName('provider-id-claim'))
+  const read = await stub.fetch(new Request('https://provider-id-claim.internal/read', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }),
+  }))
+  const current = await read.json() as { value: string | null; version: number }
+  if (current.value) return false
+  const committed = await stub.fetch(new Request('https://provider-id-claim.internal/commit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      key, expectedVersion: current.version, op: 'set', value: new Date().toISOString(),
+    }),
+  }))
+  return ((await committed.json()) as { ok: boolean }).ok
+}
+
 async function readJson(request: Request): Promise<unknown> {
   const text = await request.text()
   // 64 KB. A registration is a few hundred bytes; anything approaching this
@@ -377,6 +409,16 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     }
   }
 
+  // First registration of this id: take the claim atomically, so a
+  // concurrent create cannot slip past the update check above by racing
+  // the read that found no record.
+  if (!existing && !(await claimProviderIdForCreate(env, validated.id))) {
+    return json(409, {
+      error: 'registration_in_flight',
+      detail: `Provider id "${validated.id}" was claimed by another registration. Retry to update it.`,
+    })
+  }
+
   const now = new Date().toISOString()
   const dashboardCredential = await issueDashboardToken()
   // A proof that already demonstrated control of the origin carries its own
@@ -404,7 +446,15 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     },
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
-    ownerKey: existing?.ownerKey ?? auth.ownerKey,
+    // Keep the original owner address, but let a STRONGER proof upgrade the
+    // marker: a weakly established record updated under a wallet signature
+    // must not stay downgradeable afterwards.
+    ownerKey: existing
+      ? {
+          ...existing.ownerKey,
+          ...(auth.proof === 'wallet_signature' ? { proof: 'wallet_signature' as const } : {}),
+        }
+      : auth.ownerKey,
     registrationVersion: digest,
     dashboardTokenHash: dashboardCredential.hash,
   }
