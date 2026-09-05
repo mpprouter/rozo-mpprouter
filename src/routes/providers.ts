@@ -9,6 +9,17 @@
  *   GET  /v1/providers/:id         — public status (no email, no signatures)
  *   POST /v1/providers/sponsor     — offer to open their Stellar account
  *
+ * ## Ownership proof: three accepted forms, none of them a ROZO decision
+ *
+ * Registration must prove the payout address belongs to the party serving
+ * the API. Since 2026-09-05 that can be a wallet signature, a challenge
+ * token served under the provider's `/.well-known/`, or a match between
+ * the registration and the provider's own live 402 `payTo`. The reasoning,
+ * and what each form does and does not establish, is in
+ * `services/provider-ownership.ts`. A wallet signature is no longer
+ * required — the first real provider refused to take their treasury key
+ * out for it, and a gate nobody passes protects nobody.
+ *
  * No ROZO human appears in any of them. That is SCF Tranche 3's second
  * criterion, and it is why registration cannot be "email us and we will add
  * you to the snapshot" however quickly we answer the email.
@@ -36,11 +47,15 @@ import {
 import {
   buildSignatureMessage,
   registrationDigest,
-  verifyRegistrationSignatures,
   isSupportedPayoutNetwork,
   ProviderAuthError,
   SIGNATURE_REALM,
 } from '../services/provider-auth'
+import {
+  resolveOwnershipProof,
+  assertNoProofDowngrade,
+  OWNERSHIP_PROOF_GUIDE,
+} from '../services/provider-ownership'
 import {
   chooseVerificationRoute,
   gateProbe402,
@@ -112,6 +127,38 @@ async function throttleRequest(request: Request, env: Env, bucket: string, clien
   }
 }
 
+/**
+ * Claim a provider id for a first registration, atomically.
+ *
+ * Two concurrent registrations for the same id can both read
+ * `existing === null`, and the second would then overwrite the first
+ * without ever facing the dashboard-token check that guards an update. The
+ * ATOMIC_STORE compare-and-set is the repo's existing answer to exactly
+ * this shape of race (see `provider-verify-claim.ts`); with no DO bound —
+ * unit tests, a stripped environment — it degrades to the re-read the
+ * caller already did, which is weaker but no worse than before.
+ *
+ * Returns false when someone else got there first; the caller answers 409.
+ */
+async function claimProviderIdForCreate(env: Env, id: string): Promise<boolean> {
+  if (!env.ATOMIC_STORE) return (await getProviderRecord(env, id)) === null
+  const key = `providerIdClaim:${id}`
+  const stub = env.ATOMIC_STORE.get(env.ATOMIC_STORE.idFromName('provider-id-claim'))
+  const read = await stub.fetch(new Request('https://provider-id-claim.internal/read', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }),
+  }))
+  const current = await read.json() as { value: string | null; version: number }
+  if (current.value) return false
+  const committed = await stub.fetch(new Request('https://provider-id-claim.internal/commit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      key, expectedVersion: current.version, op: 'set', value: new Date().toISOString(),
+    }),
+  }))
+  return ((await committed.json()) as { ok: boolean }).ok
+}
+
 async function readJson(request: Request): Promise<unknown> {
   const text = await request.text()
   // 64 KB. A registration is a few hundred bytes; anything approaching this
@@ -147,6 +194,7 @@ function publicView(record: ProviderRecord) {
       last_error: record.verification.lastError ?? null,
       last_attempt_at: record.verification.lastAttemptAt ?? null,
       domain_verified_at: record.verification.domainVerifiedAt ?? null,
+      ownership_proof: record.verification.ownershipProof ?? record.ownerKey.proof ?? null,
       last_reachable_at: record.verification.lastReachableAt ?? null,
       health_status: record.verification.healthStatus ?? 'pending',
       checks: record.verification.checks ?? [],
@@ -225,6 +273,10 @@ export async function handleProviderChallenge(request: Request, env: Env): Promi
     note:
       'Sign this exact string, newlines included. Submit it with the same nonce and issued_at. ' +
       'Get the registration digest first with POST /v1/providers/register {"dry_run": true, ...}.',
+    // A signature is one of three accepted proofs, not the only one. A
+    // provider whose payout address is a treasury key should not have to
+    // take it out to list a service.
+    alternatives: [OWNERSHIP_PROOF_GUIDE.well_known, OWNERSHIP_PROOF_GUIDE.x402_pay_to],
   })
 }
 
@@ -278,6 +330,7 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
         address: p.payTo,
         note: 'Fetch /v1/providers/challenge with this digest to get the exact string, or build it from the docs.',
       })),
+      ownership_proofs: Object.values(OWNERSHIP_PROOF_GUIDE),
     })
   }
 
@@ -308,22 +361,72 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
 
   let auth
   try {
-    auth = await verifyRegistrationSignatures(env, {
+    auth = await resolveOwnershipProof(env, {
       providerId: validated.id,
       digest,
+      apiBaseUrl: validated.apiBaseUrl,
       payouts: validated.payouts,
-      signatures: body?.signatures,
+      routes: validated.routes,
+      body: (body ?? {}) as Record<string, unknown>,
     })
+    // A record established by a signature cannot be re-pointed by a weaker
+    // proof. Checked after the proof runs so the caller learns their proof
+    // was valid AND insufficient, rather than guessing. An absent marker
+    // means the record predates pluralised proofs and was signed.
+    assertNoProofDowngrade(existing?.ownerKey.proof, auth.proof, Boolean(existing))
   } catch (err: any) {
     if (err instanceof ProviderAuthError) {
-      return json(401, { error: 'signature_rejected', code: err.code, detail: err.message })
+      return json(401, {
+        error: 'ownership_proof_rejected',
+        code: err.code,
+        detail: err.message,
+        accepted_proofs: Object.values(OWNERSHIP_PROOF_GUIDE),
+      })
     }
     throw err
   }
 
+  // Creation and update are different acts. Neither non-signature proof
+  // identifies the CALLER — anyone can fetch a public 402 or read a token
+  // off a domain they do not run — so they may file a new record (whose
+  // money goes to the provider either way) but may not silently change an
+  // existing one, which would swap its routes and origin and mint a fresh
+  // dashboard credential. Updating with a non-signature proof therefore
+  // additionally requires that record's dashboard bearer token.
+  if (existing && auth.proof !== 'wallet_signature') {
+    const authorized = await verifyDashboardToken(
+      request.headers.get('authorization'),
+      existing.dashboardTokenHash,
+    )
+    if (!authorized) {
+      return json(401, {
+        error: 'unauthorized',
+        detail:
+          `Provider id "${validated.id}" already exists. Updating it with a ${auth.proof} proof ` +
+          'requires the dashboard token issued at registration, sent as an Authorization: Bearer ' +
+          'header. A wallet signature over the new payload also authorises the change.',
+      })
+    }
+  }
+
+  // First registration of this id: take the claim atomically, so a
+  // concurrent create cannot slip past the update check above by racing
+  // the read that found no record.
+  if (!existing && !(await claimProviderIdForCreate(env, validated.id))) {
+    return json(409, {
+      error: 'registration_in_flight',
+      detail: `Provider id "${validated.id}" was claimed by another registration. Retry to update it.`,
+    })
+  }
+
   const now = new Date().toISOString()
   const dashboardCredential = await issueDashboardToken()
-  const domainVerifiedAt = await getDomainProofEvidence(env, validated.id, validated.apiBaseUrl, auth.ownerKey.address)
+  // A proof that already demonstrated control of the origin carries its own
+  // timestamp; a wallet signature does not, and still relies on a separately
+  // completed domain proof exactly as before.
+  const domainVerifiedAt =
+    auth.domainVerifiedAt ??
+    (await getDomainProofEvidence(env, validated.id, validated.apiBaseUrl, auth.ownerKey.address))
   const record: ProviderRecord = {
     id: validated.id,
     name: validated.name,
@@ -338,11 +441,20 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     status: 'pending',
     verification: {
       domainVerifiedAt: domainVerifiedAt ?? undefined,
+      ownershipProof: auth.proof,
       healthStatus: 'pending',
     },
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
-    ownerKey: existing?.ownerKey ?? auth.ownerKey,
+    // Keep the original owner address, but let a STRONGER proof upgrade the
+    // marker: a weakly established record updated under a wallet signature
+    // must not stay downgradeable afterwards.
+    ownerKey: existing
+      ? {
+          ...existing.ownerKey,
+          ...(auth.proof === 'wallet_signature' ? { proof: 'wallet_signature' as const } : {}),
+        }
+      : auth.ownerKey,
     registrationVersion: digest,
     dashboardTokenHash: dashboardCredential.hash,
   }
@@ -350,6 +462,7 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
 
   return json(201, {
     ...publicView(record),
+    ownership_proof: { type: auth.proof, detail: auth.detail },
     dashboard_token: dashboardCredential.token,
     next_step: {
       endpoint: 'POST /v1/providers/verify',
@@ -478,6 +591,7 @@ export async function handleProviderVerify(
   const publishedAt = new Date().toISOString()
   record.verification = {
     probe402At: attemptAt,
+    ownershipProof: record.verification.ownershipProof,
     paidCallAt: publishedAt,
     paidCallTxHash: paid.txHash,
     paidCallNetwork: paid.network,

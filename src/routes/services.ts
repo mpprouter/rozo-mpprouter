@@ -12,6 +12,7 @@
  */
 
 import { listCatalogWithOverlay } from '../services/catalog-overlay'
+import { listThirdPartyDirectory } from '../services/third-party-directory'
 import { getDegradedRoutes } from '../services/route-health'
 import type { Env } from '../index'
 
@@ -38,6 +39,13 @@ export async function handleServices(env: Env): Promise<Response> {
   // field was added for — see services/route-health.ts.
   const degraded = await getDegradedRoutes(env)
 
+  // Third-party providers who gave written permission to be listed and
+  // whom a buyer pays at their OWN endpoint. Deliberately a separate array
+  // rather than extra `services[]` rows: every existing client reads
+  // `services[]` as "things this router will sell me", and that reading
+  // must stay true.
+  const thirdParty = listThirdPartyDirectory()
+
   // Snapshot catalog plus any self-serve providers published at runtime.
   // Provider entries carry `settlement: 'direct'` and an `operator` block
   // naming the addresses the buyer pays; snapshot entries are byte-identical
@@ -62,6 +70,12 @@ export async function handleServices(env: Env): Promise<Response> {
     // than to the ROZO pool. Published because it is the headline claim of
     // the provider programme and a reader should not have to count.
     direct_settlement: services.filter(s => s.settlement === 'direct').length,
+    // Curated third-party services we list but do not sell. Counted apart
+    // from `total` on purpose: they are not in `services[]`, are not
+    // payable here, and folding them into the headline number would make
+    // the catalog look bigger than what the router will actually charge
+    // for. See src/services/third-party-directory.ts.
+    third_party_directory: thirdParty.length,
   }
 
   return new Response(JSON.stringify({
@@ -71,6 +85,13 @@ export async function handleServices(env: Env): Promise<Response> {
     supported_payment_methods: supportedPaymentMethods,
     summary,
     services,
+    third_party_providers: {
+      note:
+        'Provider-operated services listed with the operator\'s written permission. ' +
+        'Settlement is direct to the operator and MPP Router does not proxy or sell these calls — ' +
+        'pay the operator at resource_url.',
+      services: thirdParty,
+    },
   }, null, 2), {
     headers: { 'Content-Type': 'application/json' },
   })
