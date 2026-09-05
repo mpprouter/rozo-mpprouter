@@ -74,6 +74,19 @@ export interface PublicServiceRoute {
    * carry the corresponding query param.
    */
   placeholderDefaults?: Record<string, string>
+  /**
+   * A working value per required parameter, so the manifest can publish a URL
+   * a crawler may fetch as printed.
+   *
+   * A templated route answers a bare GET with 400, never 402 — the payment
+   * challenge only appears once the parameter is present. A crawler that
+   * probes the plain `resource` therefore reads a live, paid route as a dead
+   * link, which is how this router stayed absent from third-party seller
+   * indexes while every route worked. Only set values verified against
+   * production; an example that 400s is worse than none, so a route without
+   * one simply omits `example_request` and keeps `required_query_params`.
+   */
+  exampleParams?: Record<string, string>
   /** Upstream service docs URLs from mpp.dev catalog */
   docs?: {
     homepage?: string
@@ -291,6 +304,9 @@ export interface RouteOperatorPayout {
  *   session channel for a route the snapshot lists as charge.
  */
 export interface PublicServiceRouteOverlay {
+  /** Verified example values for templated params; see PublicServiceRoute.exampleParams. */
+  exampleParams?: Record<string, string>
+
   id?: string
   publicPath?: string
   /**
@@ -389,6 +405,8 @@ export interface PublicCatalogEntry {
    * an agent cannot construct the call without knowing the names.
    */
   path_params?: string[]
+  /** Verified values for `path_params`, when every one of them has one. */
+  example_params?: Record<string, string>
   price: string
   /**
    * Legacy flat field. V1 agents read this to know they should

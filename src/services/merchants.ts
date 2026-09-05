@@ -36,6 +36,11 @@ import type {
   PublicCatalogEntry,
 } from './merchants-types'
 
+// Stellar mainnet USDC Stellar Asset Contract. Used only as a public example
+// value in the discovery manifest: it is a real, permanently live contract, so
+// the published example URL keeps answering 402 rather than rotting.
+const USDC_SAC_CONTRACT_ID = 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75'
+
 // Re-export types from `merchants-types.ts` so existing imports
 // like `import type { PublicServiceRoute } from './services/merchants'`
 // continue to work.
@@ -766,6 +771,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // ---------------------------------------------------------------
   'mercury::GET::/events/by-contract/{contract_id}': {
     upstreamPath: '/rest/events/by-contract/{contract_id}',
+    exampleParams: { contract_id: USDC_SAC_CONTRACT_ID },
     id: 'mercury_events_by_contract',
     publicPath: '/v1/services/mercury/events/by-contract',
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
@@ -802,6 +808,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   },
   'mercury::GET::/txs/by-contract/{contract_id}': {
     upstreamPath: '/rest/txs/by-contract/{contract_id}',
+    exampleParams: { contract_id: USDC_SAC_CONTRACT_ID },
     id: 'mercury_txs_by_contract',
     publicPath: '/v1/services/mercury/txs/by-contract',
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
@@ -818,6 +825,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   },
   'mercury::GET::/txs/by-hash/{tx_hash}': {
     upstreamPath: '/rest/txs/by-hash/{tx_hash}',
+    exampleParams: { tx_hash: 'ed871f51567573904d04f9b211bbcd8d1c3afa2854092efd9021ed36cd1c1f4f' },
     id: 'mercury_txs_by_hash',
     publicPath: '/v1/services/mercury/txs/by-hash',
     upstreamAuth: { secretBinding: 'MERCURYDATA_MAINNET_JWT', header: 'Authorization', scheme: 'bearer' },
@@ -1008,6 +1016,7 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
       ...(requiredPathParams(route).length > 0
         ? { path_params: requiredPathParams(route) }
         : {}),
+      ...(exampleParamsFor(route) ? { example_params: exampleParamsFor(route)! } : {}),
       price: route.price,
       payment_method: route.paymentMethod,
       network: route.network,
@@ -1106,6 +1115,25 @@ export function requiredPathParams(
     if (!Object.prototype.hasOwnProperty.call(defaults, name)) names.add(name)
   }
   return [...names]
+}
+
+/**
+ * Example values for a route's required parameters, or undefined.
+ *
+ * Undefined unless EVERY required parameter has a value: a partially filled
+ * example still 400s, and publishing one would recreate the exact failure it
+ * exists to prevent.
+ */
+export function exampleParamsFor(
+  route: Pick<PublicServiceRoute, 'upstreamPath' | 'placeholderDefaults' | 'exampleParams'>,
+): Record<string, string> | undefined {
+  const required = requiredPathParams(route)
+  if (required.length === 0) return undefined
+  const examples = route.exampleParams ?? {}
+  if (!required.every(name => typeof examples[name] === 'string' && examples[name].length > 0)) {
+    return undefined
+  }
+  return Object.fromEntries(required.map(name => [name, examples[name]]))
 }
 
 export function getRouteByPublicPath(

@@ -79,6 +79,11 @@ interface WellKnownResource {
   categories?: string[]
   /** Query parameters the caller MUST supply, or the call 400s before payment. */
   required_query_params?: string[]
+  /**
+   * The same URL with verified values filled in, fetchable exactly as printed.
+   * Present only when every required parameter has a verified example.
+   */
+  example_request?: string
   price: string
   price_usd?: string
   /**
@@ -198,6 +203,12 @@ function acceptsForCatalogEntry(
   }]
 }
 
+/** `public_path` plus verified example values, as an absolute URL. */
+function exampleRequestUrl(publicPath: string, params: Record<string, string>): string {
+  const query = new URLSearchParams(params).toString()
+  return `${BASE_URL}${publicPath}${query ? `?${query}` : ''}`
+}
+
 function catalogResource(entry: PublicCatalogEntry, routerFixesPrice: boolean): WellKnownResource {
   const priceUsd = fixedUsdFromPriceLabel(entry.price)
   return {
@@ -210,6 +221,12 @@ function catalogResource(entry: PublicCatalogEntry, routerFixesPrice: boolean): 
     // before payment without it, and a manifest that omits the requirement
     // reads as "callable as printed".
     ...(entry.path_params?.length ? { required_query_params: entry.path_params } : {}),
+    // A crawler that fetches `resource` as printed gets 400 on a templated
+    // route and files it as a dead link. The example URL is the same call with
+    // verified values, so probing it returns the real 402.
+    ...(entry.example_params
+      ? { example_request: exampleRequestUrl(entry.public_path, entry.example_params) }
+      : {}),
     price: entry.price,
     ...(priceUsd ? { price_usd: priceUsd } : {}),
     ...(priceUsd && !routerFixesPrice ? { price_indicative: true as const } : {}),
@@ -309,6 +326,7 @@ export async function buildX402WellKnown(env: Env): Promise<{
     },
     notes: [
       'An empty accepts[] means the price is determined at request time; probe the resource for a live 402.',
+      'required_query_params must be supplied as QUERY parameters, not path segments; without them a route answers 400, not 402. Probe example_request when present.',
       'price_indicative: true means price_usd is a catalog snapshot of an upstream price, not an amount this router fixes.',
       'accepts[].asset is the on-chain asset identifier (Stellar SAC); accepts[].asset_symbol is the ticker.',
       'On a directory entry, accepts[] mirrors the operator\'s own 402 as read on accepts_read_at; their live challenge at accepts_authority is authoritative.',
