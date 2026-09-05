@@ -137,6 +137,13 @@ export interface ProviderVerification {
   lastError?: string
   lastAttemptAt?: string
   domainVerifiedAt?: string
+  /**
+   * Which ownership proof the registration passed. Surfaced publicly so a
+   * buyer can tell "the provider signed with the payout key" apart from
+   * "the provider's own endpoint advertises this address" — both are
+   * accepted, they are not the same claim.
+   */
+  ownershipProof?: 'wallet_signature' | 'well_known' | 'x402_pay_to'
   lastReachableAt?: string
   healthStatus?: 'pending' | 'healthy' | 'degraded' | 'offline'
   consecutiveProbeFailures?: number
@@ -194,7 +201,18 @@ export interface ProviderRecord {
    * network. Any later mutation of this record must be signed by the same
    * key — email alone never authorises a payout-address change.
    */
-  ownerKey: { network: string; address: string }
+  ownerKey: {
+    network: string
+    address: string
+    /**
+     * Which proof established this record (2026-09-05). Absent on records
+     * written before ownership proofs were pluralised; those were all
+     * wallet signatures, and `assertNoProofDowngrade` treats an absent
+     * value as "not a signature" deliberately — an old record can still be
+     * updated with a signature, and upgrading a proof is never the risk.
+     */
+    proof?: 'wallet_signature' | 'well_known' | 'x402_pay_to'
+  }
   /** Canonical signed-registration digest. Changes only on signed re-register. */
   registrationVersion?: string
   /** SHA-256 only. The bearer token is returned once after signed registration. */

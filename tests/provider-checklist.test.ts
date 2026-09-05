@@ -211,7 +211,14 @@ describe('health, discovery and public manifest', () => {
     resetProviderCache()
     const response = await handleX402WellKnown(e)
     const body = await response.json() as any
-    expect(body.resources[0].accepts[0]).toMatchObject({ payTo: address, settlement: 'direct' })
+    // `settlement` describes the ROUTE, not one payment option on it: an
+    // accepts[] entry is an x402 field and gains nothing from a key the
+    // spec does not define. The manifest now also carries our own 674
+    // routes, so the provider's entry is found by operator rather than by
+    // being the only thing in the list.
+    const direct = body.resources.find((r: any) => r.operator?.id === record.id)
+    expect(direct).toMatchObject({ settlement: 'direct', payable_through_router: true })
+    expect(direct.accepts[0]).toMatchObject({ payTo: address, network: 'stellar:pubnet' })
   })
 
   it('sums only canonical Circle USDC revenue with bigint base units', async () => {

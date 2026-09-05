@@ -15,6 +15,9 @@
  *   GET      /llms.txt                      — LLM-readable router description
  *   GET      /openapi.json                  — OpenAPI 3.1 spec
  *   GET      /.well-known/ai-plugin.json    — AI plugin manifest
+ *   GET      /.well-known/x402              — x402 discovery manifest (our
+ *                                             own catalog with inline prices
+ *                                             and payout addresses)
  */
 
 import { handleProxy } from './routes/proxy'
@@ -955,6 +958,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         '  GET /llms.txt                        - LLM-readable description\n' +
         '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +
         '  GET /.well-known/ai-plugin.json      - AI plugin manifest\n' +
+        '  GET /.well-known/x402                - x402 discovery manifest\n' +
         '  POST /v1/services/<service>/<op>     - Call a paid service\n' +
         '  GET  /v1/services/<svc>/jobs/<id>/challenge - Get ownership nonce\n' +
         '  GET  /v1/services/<svc>/jobs/<id>   - Poll async job (signed)\n' +

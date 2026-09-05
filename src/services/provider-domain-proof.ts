@@ -117,40 +117,105 @@ export async function consumeDomainProof(
   if (proof.providerId !== args.providerId || proof.domain !== domain || await sha256(args.token) !== proof.tokenHash) {
     return { ok: false, detail: 'Domain proof expired or no longer matches this registration.' }
   }
-  let response: Response
-  try {
-    response = await fetch(`https://${domain}/.well-known/mpp-provider.json`, {
-      headers: { Accept: 'application/json', 'User-Agent': 'mpprouter-domain-proof/1' },
-      redirect: 'error',
-      signal: AbortSignal.timeout(10_000),
-    })
-  } catch {
-    return { ok: false, detail: 'The well-known domain proof could not be fetched over HTTPS without redirects.' }
-  }
-  if (!response.ok) return { ok: false, detail: `The well-known domain proof returned HTTP ${response.status}.` }
-  const length = Number(response.headers.get('content-length') ?? '0')
-  if (length > MAX_MANIFEST_BYTES) return { ok: false, detail: 'The well-known domain proof is too large.' }
-  let manifest: Record<string, unknown>
-  try {
-    const text = await readBoundedText(response, MAX_MANIFEST_BYTES)
-    manifest = JSON.parse(text) as Record<string, unknown>
-  } catch { return { ok: false, detail: 'The well-known domain proof is not valid JSON.' } }
-  const token = String(manifest.token ?? '')
-  if (
-    token !== args.token ||
-    String(manifest.domain ?? '').toLowerCase() !== domain ||
-    String(manifest.provider_id ?? '') !== args.providerId ||
-    String(manifest.pay_to ?? '') !== proof.payTo
-  ) return { ok: false, detail: 'The manifest must bind the token, domain, provider ID and payout address.' }
+  // Two accepted locations, tried in order. The plain-text file exists
+  // because it is the smallest thing a provider can serve — the first real
+  // provider to reach this step asked for a challenge file rather than a
+  // wallet signature, and "echo one token into a static file" is a request
+  // an ops team says yes to. The JSON manifest stays supported and binds
+  // more fields; both are equivalent proofs, because the token itself is
+  // what we issued against this provider id, domain and payout address.
+  // JSON first because it is the documented default and binds every field;
+  // the plain-text file is the fallback for a provider who would rather
+  // publish one opaque token than a manifest.
+  const attempts: Array<{ url: string; kind: 'txt' | 'json' }> = [
+    { url: `https://${domain}/.well-known/mpp-provider.json`, kind: 'json' },
+    { url: `https://${domain}/.well-known/mpprouter-verify.txt`, kind: 'txt' },
+  ]
+  const failures: string[] = []
+  for (const attempt of attempts) {
+    let response: Response
+    try {
+      response = await fetch(attempt.url, {
+        headers: { Accept: attempt.kind === 'txt' ? 'text/plain' : 'application/json', 'User-Agent': 'mpprouter-domain-proof/1' },
+        redirect: 'error',
+        signal: AbortSignal.timeout(10_000),
+      })
+    } catch {
+      failures.push(`${attempt.url} could not be fetched over HTTPS without redirects`)
+      continue
+    }
+    if (!response.ok) {
+      failures.push(`${attempt.url} returned HTTP ${response.status}`)
+      continue
+    }
+    const length = Number(response.headers.get('content-length') ?? '0')
+    if (length > MAX_MANIFEST_BYTES) {
+      failures.push(`${attempt.url} is too large`)
+      continue
+    }
+    let text: string
+    try {
+      text = await readBoundedText(response, MAX_MANIFEST_BYTES)
+    } catch {
+      failures.push(`${attempt.url} could not be read`)
+      continue
+    }
 
+    if (attempt.kind === 'txt') {
+      // The token is the whole binding: it was issued for this provider
+      // id, this domain and this payout address, and is hashed in KV. A
+      // file containing it, served from the domain, is the assertion.
+      if (text.trim() !== args.token) {
+        failures.push(`${attempt.url} does not contain the issued token`)
+        continue
+      }
+    } else {
+      let manifest: Record<string, unknown>
+      try {
+        manifest = JSON.parse(text) as Record<string, unknown>
+      } catch {
+        failures.push(`${attempt.url} is not valid JSON`)
+        continue
+      }
+      if (
+        String(manifest.token ?? '') !== args.token ||
+        String(manifest.domain ?? '').toLowerCase() !== domain ||
+        String(manifest.provider_id ?? '') !== args.providerId ||
+        String(manifest.pay_to ?? '') !== proof.payTo
+      ) {
+        failures.push(`${attempt.url} must bind the token, domain, provider ID and payout address`)
+        continue
+      }
+    }
+
+    return await finishProof(env, key, loaded.version, args.providerId, domain, proof.payTo, attempt.url)
+  }
+  return { ok: false, detail: `No usable domain proof was found. Tried: ${failures.join('; ')}.` }
+}
+
+/**
+ * Consume the token and record the evidence.
+ *
+ * Split out so both accepted file formats share one single-use path: the
+ * token is deleted before publication, so a retry needs a fresh one.
+ */
+async function finishProof(
+  env: Env,
+  key: string,
+  version: number | undefined,
+  providerId: string,
+  domain: string,
+  payTo: string,
+  sourceUrl: string,
+): Promise<{ ok: true; detail: string } | { ok: false; detail: string }> {
   // Delete before publication. A retry needs a fresh token, making the proof single-use.
-  if (!(await deleteProof(env, key, loaded.version))) {
+  if (!(await deleteProof(env, key, version))) {
     return { ok: false, detail: 'This domain proof token was already consumed.' }
   }
-  await env.MPP_STORE.put(`providerDomainVerified:${args.providerId}`, JSON.stringify({
-    domain, payTo: proof.payTo, verifiedAt: new Date().toISOString(),
+  await env.MPP_STORE.put(`providerDomainVerified:${providerId}`, JSON.stringify({
+    domain, payTo, verifiedAt: new Date().toISOString(),
   }), { expirationTtl: 24 * 60 * 60 })
-  return { ok: true, detail: `Domain control confirmed at https://${domain}/.well-known/mpp-provider.json.` }
+  return { ok: true, detail: `Domain control confirmed at ${sourceUrl}.` }
 }
 
 export async function getDomainProofEvidence(env: Env, providerId: string, url: string, payTo: string): Promise<string | null> {
