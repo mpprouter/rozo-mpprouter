@@ -37,15 +37,34 @@
  * it reached us; an impostor would have to control the provider's origin,
  * at which point they can already redirect the money without us.
  *
- * What we do NOT do is let a weaker proof take over a record that a
- * signature established — see the no-downgrade rule below. Nor do these
- * forms weaken the paid gate: publication still requires a real minimal
- * payment that settles to the registered address and returns 200.
+ * ## The limit that matters, and how it is contained
+ *
+ * Neither new proof identifies the *caller*. Anyone can fetch a public 402,
+ * so `x402_pay_to` on its own says "this origin publishes this address",
+ * not "the person submitting this form runs that origin". That is fine for
+ * creating a record — the worst outcome is a stranger filing a listing
+ * whose money goes to the real provider anyway — and it is NOT fine for
+ * changing one, because an update can swap routes and origin and mints a
+ * fresh dashboard credential.
+ *
+ * So updates are separated from creation:
+ *
+ *   - a wallet signature over the new payload updates anything, as before;
+ *   - any other proof may update an existing record only when the caller
+ *     also presents that record's dashboard bearer token;
+ *   - a record established by a signature can never be re-pointed by a
+ *     weaker proof, and a record from before proofs were pluralised is
+ *     treated as signature-established.
+ *
+ * Nor do these forms weaken the paid gate: publication still requires a
+ * real minimal payment that settles to the registered address and returns
+ * 200.
  */
 
 import type { Env } from '../index'
 import { ProviderAuthError, isSupportedPayoutNetwork, verifyRegistrationSignatures } from './provider-auth'
-import { consumeDomainProof } from './provider-domain-proof'
+import { consumeDomainProof, payToFromProofToken } from './provider-domain-proof'
+import { readBoundedText } from './provider-check'
 import { parseProviderChallenge } from './provider-verification'
 import type { RouteOperatorPayout } from './merchants-types'
 import type { ProviderRouteSpec } from './provider-registry'
@@ -149,7 +168,18 @@ export async function verifyX402PayToMatch(args: {
     )
   }
 
-  const text = await response.text().catch(() => '')
+  // The registrant controls this response and is unauthenticated, so it is
+  // read through the same bounded reader the well-known proof uses rather
+  // than buffered whole.
+  let text = ''
+  try {
+    text = await readBoundedText(response, 65_536)
+  } catch {
+    throw new ProviderAuthError(
+      `${url} returned a payment challenge too large to read.`,
+      'oversized_challenge',
+    )
+  }
   const challenge = parseProviderChallenge(response.status, response.headers, text)
   if (!challenge) {
     throw new ProviderAuthError(
@@ -243,26 +273,59 @@ export async function resolveOwnershipProof(
   const first = args.payouts[0]
 
   if (type === 'well_known') {
-    const token = String(requested?.token ?? '')
-    if (!token) {
+    const rawTokens = Array.isArray(requested?.tokens)
+      ? (requested!.tokens as unknown[]).map(String)
+      : requested?.token
+        ? [String(requested.token)]
+        : []
+    if (rawTokens.length === 0) {
       throw new ProviderAuthError(
         'ownership_proof.token is required. Issue one with POST /v1/providers/check and publish it.',
         'missing_token',
       )
     }
-    const result = await consumeDomainProof(env, {
-      providerId: args.providerId,
-      url: args.apiBaseUrl,
-      token,
-    })
-    if (!result.ok) {
-      throw new ProviderAuthError(result.detail, 'domain_proof_failed')
+
+    // Each token was issued for ONE payout address. Consuming a token
+    // published for address A must not authorise a registration that
+    // settles to address B, nor smuggle extra unproven addresses in
+    // alongside it — so the proven set must cover every declared payout.
+    const proven = new Set<string>()
+    const details: string[] = []
+    for (const token of rawTokens) {
+      const tokenPayTo = payToFromProofToken(token)
+      if (!tokenPayTo) {
+        throw new ProviderAuthError('Domain proof token is malformed.', 'bad_token')
+      }
+      if (!args.payouts.some(p => p.payTo === tokenPayTo)) {
+        throw new ProviderAuthError(
+          'A domain proof token was issued for an address this registration does not declare.',
+          'token_payout_mismatch',
+        )
+      }
+      const result = await consumeDomainProof(env, {
+        providerId: args.providerId,
+        url: args.apiBaseUrl,
+        token,
+      })
+      if (!result.ok) {
+        throw new ProviderAuthError(result.detail, 'domain_proof_failed')
+      }
+      proven.add(tokenPayTo)
+      details.push(result.detail)
+    }
+    const unproven = args.payouts.filter(p => !proven.has(p.payTo))
+    if (unproven.length > 0) {
+      throw new ProviderAuthError(
+        `No domain proof was published for the ${unproven.map(p => p.network).join(', ')} ` +
+          'payout address. Publish one token per payout address, or sign with the wallet.',
+        'missing_token',
+      )
     }
     return {
       proof: 'well_known',
       ownerKey: { network: first.network, address: first.payTo, proof: 'well_known' },
       domainVerifiedAt: new Date().toISOString(),
-      detail: result.detail,
+      detail: details.join(' '),
     }
   }
 
@@ -295,8 +358,15 @@ export async function resolveOwnershipProof(
 export function assertNoProofDowngrade(
   existingProof: OwnershipProofType | undefined,
   offered: OwnershipProofType,
+  hasRecord = true,
 ): void {
-  if (existingProof === 'wallet_signature' && offered !== 'wallet_signature') {
+  // A record with no recorded proof predates this change, and every record
+  // written before it was signature-established. Reading `undefined` as
+  // "weak" would let exactly the takeover this function exists to stop
+  // through the one door nobody would think to check. `hasRecord: false`
+  // distinguishes "no existing record" from "record with no marker".
+  const effective = hasRecord ? existingProof ?? 'wallet_signature' : undefined
+  if (effective === 'wallet_signature' && offered !== 'wallet_signature') {
     throw new ProviderAuthError(
       'This provider id was registered with a wallet signature. Updating it requires a wallet ' +
         'signature too; a weaker proof cannot replace a stronger one.',

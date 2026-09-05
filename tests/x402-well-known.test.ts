@@ -92,6 +92,27 @@ describe('the manifest describes our own catalog, not a hand-written list', () =
     expect(pooledWithAccepts).toEqual([])
   })
 
+  it('marks a merchant-priced route indicative and gives it no exact amount', async () => {
+    // The proxy charges what the upstream merchant's live 402 demands, so a
+    // snapshot price label must not be published as an exact x402 amount:
+    // the day the merchant reprices, a client signing from this manifest
+    // has its payment rejected.
+    const doc = await buildX402WellKnown(env())
+    const indicative = doc.resources.filter(r => r.price_indicative)
+    expect(indicative.length).toBeGreaterThan(100)
+    expect(indicative.every(r => r.accepts.length === 0)).toBe(true)
+    // And the router-priced ones still carry an exact amount.
+    const exact = doc.resources.filter(r => r.accepts.length > 0)
+    expect(exact.length).toBeGreaterThan(0)
+    expect(exact.every(r => !r.price_indicative)).toBe(true)
+  })
+
+  it('carries the query parameters a templated route needs', async () => {
+    const doc = await buildX402WellKnown(env())
+    const templated = doc.resources.filter(r => (r.required_query_params?.length ?? 0) > 0)
+    expect(templated.length).toBeGreaterThan(0)
+  })
+
   it('never publishes a route the proxy would refuse', async () => {
     const e = env()
     const doc = await buildX402WellKnown(e)
@@ -140,6 +161,21 @@ describe('third-party directory entries are listed, never sold', () => {
     // 0.003 USDC at Stellar's 7 decimals is what their live 402 advertises.
     const peg = agent402.find(r => r.price_usd === '0.003')!
     expect(peg.accepts[0]).toMatchObject({ network: 'stellar:pubnet', amount: '30000', decimals: 7 })
+  })
+
+  it('advertises the on-chain asset id, not the ticker, in accepts[].asset', async () => {
+    // A canonical x402 client matches its payment requirements on
+    // accepts[].asset. Publishing "USDC" there makes every compliant wallet
+    // sign for the wrong asset and get rejected by our own facilitator.
+    const doc = await buildX402WellKnown(env())
+    for (const resource of doc.resources) {
+      for (const accept of resource.accepts) {
+        if (accept.network.startsWith('stellar:')) {
+          expect(accept.asset).toMatch(/^C[A-Z2-7]{55}$/)
+          expect(accept.asset_symbol).toBe('USDC')
+        }
+      }
+    }
   })
 
   it('serves the whole document over HTTP with a cache header', async () => {

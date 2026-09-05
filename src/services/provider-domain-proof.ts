@@ -92,17 +92,30 @@ export async function issueDomainProof(env: Env, args: { providerId: string; url
   }
 }
 
+/**
+ * The payout address a proof token was issued for.
+ *
+ * The token embeds it, so this needs no storage read. Exported because the
+ * caller must check it against the registration: a token published for
+ * address A must not authorise a registration that settles to address B.
+ */
+export function payToFromProofToken(token: string): string | null {
+  try {
+    const encoded = token.split('.')[1] ?? ''
+    const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/')
+    const decoded = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '='))
+    return decoded || null
+  } catch {
+    return null
+  }
+}
+
 export async function consumeDomainProof(
   env: Env,
   args: { providerId: string; url: string; token: string },
 ): Promise<{ ok: true; detail: string } | { ok: false; detail: string }> {
   const domain = new URL(args.url).hostname.toLowerCase()
-  let payTo = ''
-  try {
-    const encoded = args.token.split('.')[1] ?? ''
-    const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/')
-    payTo = atob(base64.padEnd(Math.ceil(base64.length / 4) * 4, '='))
-  } catch { /* Invalid token is handled as a missing binding below. */ }
+  const payTo = payToFromProofToken(args.token)
   if (!payTo) return { ok: false, detail: 'Domain proof token is malformed.' }
   const key = await proofKey(args.providerId, domain, payTo)
   const loaded = await readProof(env, key)

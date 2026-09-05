@@ -39,7 +39,7 @@
 
 import type { Env } from '../index'
 import type { PublicCatalogEntry } from '../services/merchants-types'
-import { listCatalogWithOverlay } from '../services/catalog-overlay'
+import { listCatalogWithOverlay, getAllRoutes } from '../services/catalog-overlay'
 import { listThirdPartyDirectory } from '../services/third-party-directory'
 
 const BASE_URL = 'https://apiserver.mpprouter.dev'
@@ -58,8 +58,16 @@ interface WellKnownAccept {
   /** Integer minor units, as x402 `accepts[].amount` is defined. */
   amount: string
   decimals: number
+  /**
+   * The on-chain asset identifier — the Stellar SAC, not the ticker.
+   * `accepts[].asset` is what a canonical x402 client matches its payment
+   * requirements against, so putting `"USDC"` here would have every
+   * standards-compliant wallet sign for the wrong asset and get rejected
+   * by the very facilitator this manifest is advertising.
+   */
   asset: string
-  asset_id?: string
+  /** Human ticker, alongside rather than instead of the identifier. */
+  asset_symbol?: string
   payTo: string
 }
 
@@ -69,8 +77,18 @@ interface WellKnownResource {
   name?: string
   description: string
   categories?: string[]
+  /** Query parameters the caller MUST supply, or the call 400s before payment. */
+  required_query_params?: string[]
   price: string
   price_usd?: string
+  /**
+   * True when `price_usd` is a catalog snapshot of an upstream merchant's
+   * price rather than a number this router fixes. Such a route gets no
+   * `accepts[]`: the live 402 is derived from the merchant's own current
+   * price, and a client signing an amount from here would have its payment
+   * rejected the day that merchant repriced.
+   */
+  price_indicative?: true
   settlement: 'pooled' | 'direct'
   payable_through_router: boolean
   operator?: { id: string; name: string; homepage?: string }
@@ -113,9 +131,17 @@ function stellarAssetId(network: string, hint?: string): string | undefined {
  * the live 402, which is the correct outcome for a dynamically priced
  * route; a fabricated accept would be worse than silence.
  */
-function acceptsForCatalogEntry(entry: PublicCatalogEntry): WellKnownAccept[] {
+function acceptsForCatalogEntry(
+  entry: PublicCatalogEntry,
+  routerFixesPrice: boolean,
+): WellKnownAccept[] {
   const priceUsd = fixedUsdFromPriceLabel(entry.price)
   if (!priceUsd) return []
+  // Only advertise an exact amount for a route whose price THIS router
+  // sets. For a snapshot route the amount comes from the upstream
+  // merchant's live 402 at request time, so an inline exact amount is a
+  // promise we do not control.
+  if (!routerFixesPrice) return []
 
   // Provider-direct routes: one accept per proven payout address.
   if (entry.operator?.payouts?.length) {
@@ -124,13 +150,14 @@ function acceptsForCatalogEntry(entry: PublicCatalogEntry): WellKnownAccept[] {
       const decimals = payout.network.startsWith('stellar:') ? STELLAR_DECIMALS : 6
       const amount = toMinorUnits(priceUsd, decimals)
       if (!amount) continue
+      const assetId = stellarAssetId(payout.network)
       out.push({
         scheme: 'exact',
         network: payout.network,
         amount,
         decimals,
-        asset: payout.asset,
-        ...(stellarAssetId(payout.network) ? { asset_id: stellarAssetId(payout.network) } : {}),
+        asset: assetId ?? payout.asset,
+        ...(assetId ? { asset_symbol: payout.asset } : {}),
         payTo: payout.pay_to,
       })
     }
@@ -144,20 +171,19 @@ function acceptsForCatalogEntry(entry: PublicCatalogEntry): WellKnownAccept[] {
   if (!x402) return []
   const amount = toMinorUnits(priceUsd, STELLAR_DECIMALS)
   if (!amount) return []
+  const assetId = stellarAssetId(x402.network, entry.payment_hints?.asset_sac)
   return [{
     scheme: 'exact',
     network: x402.network,
     amount,
     decimals: STELLAR_DECIMALS,
-    asset: x402.asset,
-    ...(stellarAssetId(x402.network, entry.payment_hints?.asset_sac)
-      ? { asset_id: stellarAssetId(x402.network, entry.payment_hints?.asset_sac) }
-      : {}),
+    asset: assetId ?? x402.asset,
+    ...(assetId ? { asset_symbol: x402.asset } : {}),
     payTo: x402.pay_to,
   }]
 }
 
-function catalogResource(entry: PublicCatalogEntry): WellKnownResource {
+function catalogResource(entry: PublicCatalogEntry, routerFixesPrice: boolean): WellKnownResource {
   const priceUsd = fixedUsdFromPriceLabel(entry.price)
   return {
     resource: `${BASE_URL}${entry.public_path}`,
@@ -165,14 +191,19 @@ function catalogResource(entry: PublicCatalogEntry): WellKnownResource {
     name: entry.name,
     description: entry.description,
     categories: entry.categories,
+    // Carried through because a route templated on a path parameter 400s
+    // before payment without it, and a manifest that omits the requirement
+    // reads as "callable as printed".
+    ...(entry.path_params?.length ? { required_query_params: entry.path_params } : {}),
     price: entry.price,
     ...(priceUsd ? { price_usd: priceUsd } : {}),
+    ...(priceUsd && !routerFixesPrice ? { price_indicative: true as const } : {}),
     settlement: entry.operator ? 'direct' : 'pooled',
     payable_through_router: true,
     ...(entry.operator
       ? { operator: { id: entry.operator.id, name: entry.operator.name } }
       : {}),
-    accepts: acceptsForCatalogEntry(entry),
+    accepts: acceptsForCatalogEntry(entry, routerFixesPrice),
   }
 }
 
@@ -203,8 +234,10 @@ function directoryResources(): WellKnownResource[] {
         network: payout.network,
         amount,
         decimals,
-        asset: payout.asset,
-        ...(payout.asset_id ? { asset_id: payout.asset_id } : {}),
+        // The operator's own 402 advertises the contract id here, and this
+        // entry is a mirror of that challenge.
+        asset: payout.asset_id ?? payout.asset,
+        ...(payout.asset_id ? { asset_symbol: payout.asset } : {}),
         payTo: payout.pay_to,
       }]
     }),
@@ -224,10 +257,18 @@ export async function buildX402WellKnown(env: Env): Promise<{
   resources: WellKnownResource[]
 }> {
   const catalog = await listCatalogWithOverlay(env)
+  // Which routes does the ROUTER price, rather than relay a merchant's
+  // price for? Only those can carry an exact inline amount — see
+  // `price_indicative`. `fixedPricing` is the router-set case and
+  // `operator` is the provider-direct case (priced from the registration).
+  const routes = await getAllRoutes(env)
+  const routerPriced = new Set(
+    routes.filter(route => route.fixedPricing || route.operator).map(route => route.id),
+  )
   // Routes we know are broken are excluded: publishing an endpoint the
   // proxy will refuse wastes a crawler's paid probe.
   const payable = catalog.filter(entry => entry.payment_enabled)
-  const routerResources = payable.map(catalogResource)
+  const routerResources = payable.map(entry => catalogResource(entry, routerPriced.has(entry.id)))
   const directory = directoryResources()
 
   return {
@@ -247,6 +288,8 @@ export async function buildX402WellKnown(env: Env): Promise<{
     },
     notes: [
       'An empty accepts[] means the price is determined at request time; probe the resource for a live 402.',
+      'price_indicative: true means price_usd is a catalog snapshot of an upstream price, not an amount this router fixes.',
+      'accepts[].asset is the on-chain asset identifier (Stellar SAC); accepts[].asset_symbol is the ticker.',
       'payable_through_router: false means MPP Router does not sell this call — pay the operator at the resource URL.',
       'settlement: "direct" means the buyer pays the operator address, not a ROZO pool.',
     ],

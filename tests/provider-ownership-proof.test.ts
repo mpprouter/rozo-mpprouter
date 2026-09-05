@@ -23,6 +23,9 @@ import {
 } from '../src/services/provider-ownership'
 import { issueDomainProof } from '../src/services/provider-domain-proof'
 import { ProviderAuthError } from '../src/services/provider-auth'
+import { handleProviderRegister } from '../src/routes/providers'
+import { issueDashboardToken } from '../src/services/provider-dashboard-auth'
+import { resetProviderCache, type ProviderRecord } from '../src/services/provider-registry'
 
 const PROVIDER_ADDRESS = 'GDNJXCKW7ZM7GEEVP674TWPU26YJNBQ2FI4ZIPRKTPTNUEJMDHFJWWRL'
 const OTHER_ADDRESS = 'GBSNB5A7OS5ACS5NINYIVHS4BBGJNPNGARBSORNNZ2W6UCVYA32GU4LT'
@@ -205,6 +208,39 @@ describe('resolveOwnershipProof', () => {
   })
 })
 
+describe('well-known tokens are bound to the declared payouts', () => {
+  it('refuses a token issued for an address the registration does not declare', async () => {
+    const e = env()
+    const proof = await issueDomainProof(e, {
+      providerId: 'agent402', url: 'https://agent402.tools', payTo: OTHER_ADDRESS,
+    })
+    await expect(resolveOwnershipProof(e, {
+      providerId: 'agent402', digest: 'd', apiBaseUrl: 'https://agent402.tools',
+      payouts: PAYOUTS, routes: ROUTES,
+      body: { ownership_proof: { type: 'well_known', token: proof.token } },
+    })).rejects.toThrow(/does not declare/)
+  })
+
+  it('refuses when a second payout address rides along unproven', async () => {
+    // The token proves one address. Without this check it would also
+    // publish every other address in the same registration.
+    const e = env()
+    const proof = await issueDomainProof(e, {
+      providerId: 'agent402', url: 'https://agent402.tools', payTo: PROVIDER_ADDRESS,
+    })
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any) =>
+      String(input).endsWith('.txt')
+        ? new Response(proof.token, { status: 200 })
+        : new Response('nope', { status: 404 })) as unknown as typeof fetch)
+    await expect(resolveOwnershipProof(e, {
+      providerId: 'agent402', digest: 'd', apiBaseUrl: 'https://agent402.tools',
+      payouts: [...PAYOUTS, { network: 'eip155:8453', payTo: '0xdead', asset: 'USDC' }],
+      routes: ROUTES,
+      body: { ownership_proof: { type: 'well_known', token: proof.token } },
+    })).rejects.toThrow(/eip155:8453/)
+  })
+})
+
 describe('no downgrade', () => {
   it('refuses a weaker proof over a record established by a signature', () => {
     expect(() => assertNoProofDowngrade('wallet_signature', 'well_known')).toThrow(/wallet signature/)
@@ -215,6 +251,148 @@ describe('no downgrade', () => {
     expect(() => assertNoProofDowngrade('wallet_signature', 'wallet_signature')).not.toThrow()
     expect(() => assertNoProofDowngrade('x402_pay_to', 'wallet_signature')).not.toThrow()
     expect(() => assertNoProofDowngrade('well_known', 'well_known')).not.toThrow()
-    expect(() => assertNoProofDowngrade(undefined, 'well_known')).not.toThrow()
+  })
+
+  it('treats a record with no recorded proof as signature-established', () => {
+    // Every record written before proofs were pluralised was signed.
+    // Reading the missing marker as "weak" would open the takeover this
+    // function exists to close, through the one door nobody would check.
+    expect(() => assertNoProofDowngrade(undefined, 'well_known', true)).toThrow(/wallet signature/)
+    expect(() => assertNoProofDowngrade(undefined, 'wallet_signature', true)).not.toThrow()
+    // No existing record at all: any proof may create one.
+    expect(() => assertNoProofDowngrade(undefined, 'well_known', false)).not.toThrow()
+    expect(() => assertNoProofDowngrade(undefined, 'x402_pay_to', false)).not.toThrow()
+  })
+})
+
+
+// ---------------------------------------------------------------------
+// Handler level: creating a record and changing one are different acts
+// ---------------------------------------------------------------------
+
+/** The ATOMIC_STORE CAS shim the rate limiter and proof store need. */
+function withLimiter<T extends Record<string, any>>(base: T): T {
+  const states = new Map<string, { value: string | null; version: number }>()
+  const stub = {
+    fetch: async (request: Request) => {
+      const body = await request.json() as any
+      const state = states.get(body.key) ?? { value: null, version: 0 }
+      if (new URL(request.url).pathname === '/read') return Response.json(state)
+      if (body.expectedVersion !== state.version) return Response.json({ ok: false, ...state })
+      state.value = body.op === 'delete' ? null : body.value
+      state.version += 1
+      states.set(body.key, state)
+      return Response.json({ ok: true })
+    },
+  }
+  return Object.assign(base, { ATOMIC_STORE: { idFromName: () => ({}), get: () => stub } })
+}
+
+function registrationBody(extra: Record<string, unknown> = {}) {
+  return {
+    id: 'agent402',
+    name: 'Agent402',
+    email: 'mike@agent402.tools',
+    api_base_url: 'https://agent402.tools',
+    payouts: [{ network: 'stellar:pubnet', pay_to: PROVIDER_ADDRESS, asset: 'USDC' }],
+    routes: [{ operation: 'stablecoin-peg', method: 'GET', upstream_path: '/api/stablecoin-peg', price_usd: '0.003' }],
+    ...extra,
+  }
+}
+
+function registerRequest(body: unknown, authorization?: string) {
+  return new Request('https://router.test/v1/providers/register', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'CF-Connecting-IP': '203.0.113.7',
+      ...(authorization ? { Authorization: authorization } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+}
+
+function stellar402() {
+  return challenge402([
+    { scheme: 'exact', network: 'stellar:pubnet', amount: '30000', asset: 'CCW6', payTo: PROVIDER_ADDRESS },
+  ])
+}
+
+describe('POST /v1/providers/register with a non-signature proof', () => {
+  beforeEach(() => { resetProviderCache() })
+
+  it('creates a new record from a live 402 match', async () => {
+    const e = withLimiter(env())
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async () => stellar402()) as unknown as typeof fetch)
+    const response = await handleProviderRegister(
+      registerRequest(registrationBody({ ownership_proof: { type: 'x402_pay_to' } })), e,
+    )
+    expect(response.status).toBe(201)
+    const body = await response.json() as any
+    expect(body.ownership_proof.type).toBe('x402_pay_to')
+    expect(body.status).toBe('pending')
+    expect(body.verification.ownership_proof).toBe('x402_pay_to')
+  })
+
+  it('refuses to CHANGE an existing record without that record\'s dashboard token', async () => {
+    // The takeover this closes: fetching a public 402 proves nothing about
+    // the caller, so without a credential anyone could re-point an existing
+    // provider's routes and origin and mint themselves a fresh dashboard
+    // token in the process.
+    const e = withLimiter(env())
+    const credential = await issueDashboardToken()
+    const existing: ProviderRecord = {
+      id: 'agent402', name: 'Agent402', email: 'mike@agent402.tools',
+      apiBaseUrl: 'https://agent402.tools',
+      payouts: [{ network: 'stellar:pubnet', payTo: PROVIDER_ADDRESS, asset: 'USDC' }],
+      routes: [{ operation: 'stablecoin-peg', method: 'GET', upstreamPath: '/api/stablecoin-peg', priceUsd: '0.003' }],
+      status: 'published',
+      verification: { ownershipProof: 'x402_pay_to' },
+      createdAt: '2026-09-05T00:00:00.000Z', updatedAt: '2026-09-05T00:00:00.000Z',
+      ownerKey: { network: 'stellar:pubnet', address: PROVIDER_ADDRESS, proof: 'x402_pay_to' },
+      dashboardTokenHash: credential.hash,
+    }
+    await e.MPP_STORE.put('provider:agent402', JSON.stringify(existing))
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async () => stellar402()) as unknown as typeof fetch)
+
+    const denied = await handleProviderRegister(
+      registerRequest(registrationBody({ ownership_proof: { type: 'x402_pay_to' } })), e,
+    )
+    expect(denied.status).toBe(401)
+    expect(await denied.json()).toMatchObject({ error: 'unauthorized' })
+    // The stored record is untouched.
+    expect(JSON.parse((await e.MPP_STORE.get('provider:agent402'))!).updatedAt)
+      .toBe('2026-09-05T00:00:00.000Z')
+
+    const authorised = await handleProviderRegister(
+      registerRequest(
+        registrationBody({ ownership_proof: { type: 'x402_pay_to' } }),
+        `Bearer ${credential.token}`,
+      ),
+      e,
+    )
+    expect(authorised.status).toBe(201)
+  })
+
+  it('refuses a weak proof over a record that predates the proof marker', async () => {
+    const e = withLimiter(env())
+    const legacy: ProviderRecord = {
+      id: 'agent402', name: 'Agent402', email: 'mike@agent402.tools',
+      apiBaseUrl: 'https://agent402.tools',
+      payouts: [{ network: 'stellar:pubnet', payTo: PROVIDER_ADDRESS, asset: 'USDC' }],
+      routes: [{ operation: 'stablecoin-peg', method: 'GET', upstreamPath: '/api/stablecoin-peg', priceUsd: '0.003' }],
+      status: 'published', verification: {},
+      createdAt: '2026-09-04T00:00:00.000Z', updatedAt: '2026-09-04T00:00:00.000Z',
+      // No `proof` marker: written before proofs were pluralised, so it was
+      // established by a wallet signature.
+      ownerKey: { network: 'stellar:pubnet', address: PROVIDER_ADDRESS },
+    }
+    await e.MPP_STORE.put('provider:agent402', JSON.stringify(legacy))
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async () => stellar402()) as unknown as typeof fetch)
+    const response = await handleProviderRegister(
+      registerRequest(registrationBody({ ownership_proof: { type: 'x402_pay_to' } })), e,
+    )
+    expect(response.status).toBe(401)
+    expect(await response.json()).toMatchObject({ code: 'proof_downgrade' })
   })
 })

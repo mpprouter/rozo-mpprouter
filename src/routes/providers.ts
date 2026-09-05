@@ -339,8 +339,9 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     })
     // A record established by a signature cannot be re-pointed by a weaker
     // proof. Checked after the proof runs so the caller learns their proof
-    // was valid AND insufficient, rather than guessing.
-    assertNoProofDowngrade(existing?.ownerKey.proof, auth.proof)
+    // was valid AND insufficient, rather than guessing. An absent marker
+    // means the record predates pluralised proofs and was signed.
+    assertNoProofDowngrade(existing?.ownerKey.proof, auth.proof, Boolean(existing))
   } catch (err: any) {
     if (err instanceof ProviderAuthError) {
       return json(401, {
@@ -351,6 +352,29 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
       })
     }
     throw err
+  }
+
+  // Creation and update are different acts. Neither non-signature proof
+  // identifies the CALLER — anyone can fetch a public 402 or read a token
+  // off a domain they do not run — so they may file a new record (whose
+  // money goes to the provider either way) but may not silently change an
+  // existing one, which would swap its routes and origin and mint a fresh
+  // dashboard credential. Updating with a non-signature proof therefore
+  // additionally requires that record's dashboard bearer token.
+  if (existing && auth.proof !== 'wallet_signature') {
+    const authorized = await verifyDashboardToken(
+      request.headers.get('authorization'),
+      existing.dashboardTokenHash,
+    )
+    if (!authorized) {
+      return json(401, {
+        error: 'unauthorized',
+        detail:
+          `Provider id "${validated.id}" already exists. Updating it with a ${auth.proof} proof ` +
+          'requires the dashboard token issued at registration, sent as an Authorization: Bearer ' +
+          'header. A wallet signature over the new payload also authorises the change.',
+      })
+    }
   }
 
   const now = new Date().toISOString()
