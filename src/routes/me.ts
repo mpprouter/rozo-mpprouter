@@ -4,6 +4,7 @@
  *
  *   GET /v1/me/ledger?limit=&cursor=   — this payer's LLM facade calls, newest first
  *   GET /v1/me/usage?window=24h|7d|30d — aggregates for the same payer
+ *   GET /v1/me/sessions                — this payer's own payment channels
  *
  * Authentication is the dashboard's own session: the portal verifies a
  * wallet signature (Sign-In-With-X) and issues an HS256 JWT whose `sub` is
@@ -19,6 +20,7 @@
  */
 
 import type { Env } from '../index'
+import { getChannelForAgent, getStellarChannel } from '../mpp/stellar-channel-store'
 
 const ISSUER = 'x402-dashboard'
 const AUDIENCE = 'session'
@@ -315,4 +317,117 @@ export async function handleMeUsage(request: Request, env: Env): Promise<Respons
     cached_tokens: Number(totals?.cached_tokens ?? 0),
     refunded_usd: 0,
   })
+}
+
+/**
+ * GET /v1/me/sessions — the verified payer's own Stellar payment channels.
+ *
+ * Data source, and why:
+ *   - Identity → channel: the KV secondary index `stellarAgent:<G>` that
+ *     src/mpp/stellar-channel-store.ts already maintains for the dispatch
+ *     path. It is keyed by the payer, so no new store and no migration are
+ *     needed. V2 is one channel per agent, so this returns at most one row.
+ *   - Channel metadata (deposit, open time, contract, asset): the
+ *     `stellarChannel:<C>` record behind that index.
+ *   - Spend: `MAX(channel_cursor_after)` over the payer's own rows in the D1
+ *     `llm_facade_requests` table (already indexed on wallet_address). That
+ *     column is the cumulative voucher watermark the proxy recorded, so the
+ *     newest value IS the amount vouched to the router — no summing, and it
+ *     stays correct even if individual rows are missing.
+ *
+ * The authoritative remaining balance lives on chain; this endpoint reports
+ * the router's own view and never signs or moves anything. Non-custodial:
+ * read-only, no balance held here.
+ *
+ * Only the channel whose stored `agentAccount` equals the verified payer is
+ * returned, so a stale or hand-edited index cannot leak another buyer's
+ * channel. Prompts, query strings and route ids are never included.
+ */
+
+/** Stellar USDC is 7-decimal; channel amounts are decimal strings of base units. */
+const STROOP = 10_000_000
+
+export interface MeSessionRow {
+  session_id: string
+  rail: 'stellar' | 'base'
+  status: 'open' | 'closing' | 'closed'
+  budget_usd: number
+  spent_usd: number
+  remaining_usd: number
+  opened_at: string
+  expires_at: string | null
+  channel_ref: string
+  /** Calls settled against this channel, from the payer's own D1 rows. */
+  calls: number
+  /** ISO-8601 of the newest voucher we recorded; null when never used. */
+  last_activity_at: string | null
+}
+
+/** Base units (decimal string) → USD. Bad input reads as 0 rather than NaN. */
+export function rawToUsd(raw: string | null | undefined): number {
+  if (!raw || !/^\d+$/.test(raw)) return 0
+  return Number(BigInt(raw)) / STROOP
+}
+
+/**
+ * A drained channel can no longer pay, so it is reported as `closed`. The
+ * router has no on-chain close watcher yet, so `closing` is never emitted —
+ * the dashboard renders it, but nothing here can observe it. See the PR body.
+ */
+export function channelStatus(remainingUsd: number): MeSessionRow['status'] {
+  return remainingUsd > 0 ? 'open' : 'closed'
+}
+
+export async function handleMeSessions(request: Request, env: Env): Promise<Response> {
+  const session = await verifyPortalSession(request, env)
+  if (!session) return json(401, { error: 'Unauthorized' })
+  if (!env.MPP_STORE) return json(503, { error: 'Channel store is not configured' })
+
+  const contract = await getChannelForAgent(env, session.payer)
+  if (!contract) return json(200, { ok: true, payer: session.payer, sessions: [] })
+
+  const state = await getStellarChannel(env, contract)
+  // Fail closed on a stale index: only a record that names this payer as the
+  // funder may be shown.
+  if (!state || state.agentAccount !== session.payer) {
+    return json(200, { ok: true, payer: session.payer, sessions: [] })
+  }
+
+  let spentRaw: string | null = null
+  let calls = 0
+  let lastActivityMs: number | null = null
+  if (env.COUPON_SECURITY_DB) {
+    const usage = await env.COUPON_SECURITY_DB.prepare(`
+      SELECT MAX(CAST(channel_cursor_after AS INTEGER)) AS cursor_after,
+        COUNT(*) AS calls,
+        MAX(created_at) AS last_activity
+      FROM llm_facade_requests
+      WHERE wallet_address = ? AND channel_cursor_after IS NOT NULL
+        AND status IN ('settled','fallback_used')
+    `).bind(session.payer).first<Record<string, number | null>>()
+    const cursor = usage?.cursor_after
+    spentRaw = cursor === null || cursor === undefined ? null : String(cursor)
+    calls = Number(usage?.calls ?? 0)
+    lastActivityMs = usage?.last_activity ?? null
+  }
+
+  const budget_usd = rawToUsd(state.depositRaw)
+  const spent_usd = rawToUsd(spentRaw)
+  const remaining_usd = Math.max(0, budget_usd - spent_usd)
+
+  const row: MeSessionRow = {
+    session_id: state.channelContract,
+    rail: 'stellar',
+    status: channelStatus(remaining_usd),
+    budget_usd,
+    spent_usd,
+    remaining_usd,
+    opened_at: state.openedAt,
+    expires_at: null,
+    channel_ref: state.channelContract,
+    calls,
+    last_activity_at: lastActivityMs ? new Date(lastActivityMs).toISOString() : null,
+  }
+
+  return json(200, { ok: true, payer: session.payer, sessions: [row] })
 }
