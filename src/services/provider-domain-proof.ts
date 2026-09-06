@@ -1,5 +1,5 @@
 import type { Env } from '../index'
-import { readBoundedText } from './provider-check'
+import { isRedirect, readBoundedText } from './provider-check'
 
 const PREFIX = 'providerDomainProof:'
 /**
@@ -188,11 +188,17 @@ export async function consumeDomainProof(
     try {
       response = await fetch(attempt.url, {
         headers: { Accept: attempt.kind === 'txt' ? 'text/plain' : 'application/json', 'User-Agent': 'mpprouter-domain-proof/1' },
-        redirect: 'error',
+        redirect: 'manual',
         signal: AbortSignal.timeout(10_000),
       })
     } catch {
       failures.push(`${attempt.url} could not be fetched over HTTPS without redirects`)
+      continue
+    }
+    if (isRedirect(response)) {
+      // Under 'manual' a redirect comes back as a 3xx instead of throwing.
+      // Following it would let a domain point its proof at someone else's file.
+      failures.push(`${attempt.url} redirects (HTTP ${response.status}); serve the token on this exact origin`)
       continue
     }
     if (!response.ok) {

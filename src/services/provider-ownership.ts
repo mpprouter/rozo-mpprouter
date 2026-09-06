@@ -64,7 +64,7 @@
 import type { Env } from '../index'
 import { ProviderAuthError, isSupportedPayoutNetwork, verifyRegistrationSignatures } from './provider-auth'
 import { consumeDomainProof, payToFromProofToken } from './provider-domain-proof'
-import { readBoundedText } from './provider-check'
+import { isRedirect, readBoundedText } from './provider-check'
 import { parseProviderChallenge } from './provider-verification'
 import type { RouteOperatorPayout } from './merchants-types'
 import type { ProviderRouteSpec } from './provider-registry'
@@ -194,12 +194,18 @@ export async function verifyX402PayToMatch(args: {
       method: spec.method,
       headers: { 'Content-Type': 'application/json', 'User-Agent': 'mpprouter-ownership/1' },
       ...(spec.method === 'POST' ? { body: '{}' } : {}),
-      redirect: 'error',
+      redirect: 'manual',
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     })
   } catch {
     throw new ProviderAuthError(
       `Could not fetch ${url} over HTTPS without redirects to read its 402.`,
+      'unreachable',
+    )
+  }
+  if (isRedirect(response)) {
+    throw new ProviderAuthError(
+      `${url} redirects (HTTP ${response.status}). The 402 must be served on the registered origin.`,
       'unreachable',
     )
   }

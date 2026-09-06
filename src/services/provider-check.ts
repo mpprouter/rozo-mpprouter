@@ -11,6 +11,21 @@ function check(key: ProviderCheck['key'], status: ProviderCheck['status'], detai
   return { key, label: LABELS[key], status, detail, checkedAt: new Date().toISOString() }
 }
 
+
+/**
+ * Workers has no `redirect: 'error'`.
+ *
+ * The runtime accepts only 'follow' or 'manual', and rejects the whole fetch
+ * otherwise — which is why every provider probe returned 422 in production
+ * while passing in tests, where undici does implement it. 'manual' preserves
+ * the intent (we must not follow a redirect off the origin we are vouching
+ * for) but returns the 3xx instead of throwing, so callers have to reject it
+ * explicitly. That is what this exists for.
+ */
+export function isRedirect(response: Response): boolean {
+  return response.status >= 300 && response.status < 400
+}
+
 export async function readBoundedText(response: Response, maxBytes = 65_536): Promise<string> {
   const declared = Number(response.headers.get('content-length') ?? '0')
   if (declared > maxBytes) throw new Error('response is too large')
@@ -39,8 +54,13 @@ export async function inspectProviderUrl(rawUrl: string) {
   if (url.protocol !== 'https:' || url.username || url.password) throw new Error('url must be a public HTTPS URL without credentials')
   validateApiBaseUrl(url.origin)
   const response = await fetch(url.toString(), {
-    method: 'GET', redirect: 'error', headers: { Accept: 'application/json', 'User-Agent': 'mpprouter-check/1' }, signal: AbortSignal.timeout(10_000),
+    method: 'GET', redirect: 'manual', headers: { Accept: 'application/json', 'User-Agent': 'mpprouter-check/1' }, signal: AbortSignal.timeout(10_000),
   })
+  // A redirect would take us off the origin whose ownership we are about to
+  // vouch for, so it is a failure rather than a hop to follow.
+  if (isRedirect(response)) {
+    throw new Error(`submitted URL redirects (HTTP ${response.status}); submit the final HTTPS URL directly`)
+  }
   const website = check('website_reachable', 'passed', `Host responded over HTTPS with HTTP ${response.status}.`)
   const text = await readBoundedText(response)
   const challenge = parseProviderChallenge(response.status, response.headers, text)
@@ -55,8 +75,9 @@ export async function inspectProviderUrl(rawUrl: string) {
       } catch {
         const manifestResponse = await fetch(`${url.origin}/.well-known/x402`, {
           headers: { Accept: 'application/json', 'User-Agent': 'mpprouter-check/1' },
-          redirect: 'error', signal: AbortSignal.timeout(10_000),
+          redirect: 'manual', signal: AbortSignal.timeout(10_000),
         })
+        if (isRedirect(manifestResponse)) throw new Error('well-known manifest redirects; serve it on the submitted origin')
         if (!manifestResponse.ok) throw new Error('well-known manifest unavailable')
         manifest = JSON.parse(await readBoundedText(manifestResponse)) as { resources?: Array<Record<string, unknown>> }
       }
@@ -69,7 +90,8 @@ export async function inspectProviderUrl(rawUrl: string) {
         }
         routeUrl = candidate.toString()
         method = String(resource.method ?? 'GET').toUpperCase() === 'POST' ? 'POST' : 'GET'
-        const probe = await fetch(routeUrl, { method, redirect: 'error', ...(method === 'POST' ? { body: '{}' } : {}), signal: AbortSignal.timeout(10_000) })
+        const probe = await fetch(routeUrl, { method, redirect: 'manual', ...(method === 'POST' ? { body: '{}' } : {}), signal: AbortSignal.timeout(10_000) })
+        if (isRedirect(probe)) throw new Error('route probe redirects; serve the route on the submitted origin')
         const probeText = await readBoundedText(probe)
         accepts = parseProviderChallenge(probe.status, probe.headers, probeText)?.accepts ?? []
       }
