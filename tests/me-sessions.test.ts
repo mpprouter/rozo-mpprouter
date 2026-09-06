@@ -86,6 +86,10 @@ function d1(row: Record<string, number | null> | null) {
 }
 
 const CUMULATIVE_KEY = `stellar:channel:cumulative:${CHANNEL}`
+// Lifecycle markers, built the way src/playground/channel-voucher-store.ts
+// builds them. Asserted below so a key rename in that module is caught here.
+const CLOSED_KEY = `pg:channel:closed:${CHANNEL}`
+const FENCED_KEY = `pg:channel:fenced:${CHANNEL}`
 
 function envWith(
   entries: Record<string, unknown>,
@@ -171,7 +175,7 @@ describe('GET /v1/me/sessions', () => {
     expect(await res.json()).toEqual({ ok: true, payer: PAYER, sessions: [] })
   })
 
-  it('reads spend from the same cumulative key the spend path uses', async () => {
+  it('reads spend and both lifecycle markers from the atomic store', async () => {
     const atomic = atomicStore({ [CUMULATIVE_KEY]: { amount: '5000000' } })
     const env = {
       PORTAL_SESSION_SECRET: SECRET,
@@ -180,7 +184,9 @@ describe('GET /v1/me/sessions', () => {
     } as Env
     const sessions = await sessionsFrom(env)
     expect(atomic.keysRead).toContain(CUMULATIVE_KEY)
-    expect(sessions[0]).toMatchObject({ spent_usd: 0.5, remaining_usd: 9.5 })
+    expect(atomic.keysRead).toContain(CLOSED_KEY)
+    expect(atomic.keysRead).toContain(FENCED_KEY)
+    expect(sessions[0]).toMatchObject({ spent_usd: 0.5, remaining_usd: 9.5, status: 'open' })
   })
 
   it('reports zero spend when no voucher has ever been accepted', async () => {
@@ -244,6 +250,44 @@ describe('GET /v1/me/sessions', () => {
   })
 })
 
+describe('GET /v1/me/sessions lifecycle', () => {
+  it('reports a settling channel as closing even with funds left', async () => {
+    const env = envWith(ownChannel(), null, { [CUMULATIVE_KEY]: { amount: '25000000', settling: true } })
+    expect(await sessionsFrom(env)).toMatchObject([{ status: 'closing', remaining_usd: 7.5 }])
+  })
+
+  it('a closed marker wins over a positive remaining balance', async () => {
+    const env = envWith(ownChannel(), null, {
+      [CUMULATIVE_KEY]: { amount: '25000000' },
+      [CLOSED_KEY]: { closedAt: '2026-09-02T00:00:00.000Z' },
+    })
+    expect(await sessionsFrom(env)).toMatchObject([{ status: 'closed', remaining_usd: 7.5 }])
+  })
+
+  it('a fenced channel is closed too — the dispatch gate rejects it either way', async () => {
+    const env = envWith(ownChannel(), null, {
+      [CUMULATIVE_KEY]: { amount: '25000000' },
+      [FENCED_KEY]: { fencedAt: '2026-09-02T00:00:00.000Z' },
+    })
+    expect(await sessionsFrom(env)).toMatchObject([{ status: 'closed' }])
+  })
+
+  it('a closed marker outranks settling', async () => {
+    const env = envWith(ownChannel(), null, {
+      [CUMULATIVE_KEY]: { amount: '25000000', settling: true },
+      [CLOSED_KEY]: { closedAt: '2026-09-02T00:00:00.000Z' },
+    })
+    expect(await sessionsFrom(env)).toMatchObject([{ status: 'closed' }])
+  })
+
+  it('with no markers the deposit still decides', async () => {
+    const open = envWith(ownChannel(), null, { [CUMULATIVE_KEY]: { amount: '25000000' } })
+    expect(await sessionsFrom(open)).toMatchObject([{ status: 'open' }])
+    const drained = envWith(ownChannel('10000000'), null, { [CUMULATIVE_KEY]: { amount: '12000000' } })
+    expect(await sessionsFrom(drained)).toMatchObject([{ status: 'closed' }])
+  })
+})
+
 describe('rawToUsd / channelStatus', () => {
   it('converts 7-decimal base units and treats junk as zero', () => {
     expect(rawToUsd('10000000')).toBe(1)
@@ -252,8 +296,13 @@ describe('rawToUsd / channelStatus', () => {
     expect(rawToUsd('not-a-number')).toBe(0)
   })
 
-  it('is open only while funds remain', () => {
-    expect(channelStatus(0.01)).toBe('open')
-    expect(channelStatus(0)).toBe('closed')
+  it('is open only while funds remain AND the channel is spendable', () => {
+    const live = { blocked: false, settling: false }
+    expect(channelStatus(0.01, live)).toBe('open')
+    expect(channelStatus(0, live)).toBe('closed')
+    expect(channelStatus(5, { blocked: false, settling: true })).toBe('closing')
+    expect(channelStatus(5, { blocked: true, settling: false })).toBe('closed')
+    // Blocked outranks settling: the gate already refuses the call.
+    expect(channelStatus(5, { blocked: true, settling: true })).toBe('closed')
   })
 })
