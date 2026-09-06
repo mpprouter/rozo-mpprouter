@@ -2,11 +2,30 @@ import type { Env } from '../index'
 import { readBoundedText } from './provider-check'
 
 const PREFIX = 'providerDomainProof:'
-const TTL_SECONDS = 10 * 60
+/**
+ * Seven days, because the proof is a human errand.
+ *
+ * Ten minutes was never a secrecy requirement — the token is published at a
+ * world-readable URL by design. It was compressing the takeover window: the
+ * token alone used to be sufficient to consume the proof, so anyone who read
+ * the provider's published file could submit it first and become the holder of
+ * that record's dashboard credential.
+ *
+ * The window is now closed by construction instead of by haste. Issuing
+ * returns a second value, the claim secret, which is never published and is
+ * required to consume. Reading the public file therefore tells an onlooker
+ * nothing they can use, and the token can live long enough for a real ops team
+ * to deploy a file through their normal pipeline — the first provider to reach
+ * this step could not have made ten minutes, and a requirement nobody can meet
+ * protects nobody.
+ */
+const TTL_SECONDS = 7 * 24 * 60 * 60
 const MAX_MANIFEST_BYTES = 32_768
 
 type StoredProof = {
   tokenHash: string
+  /** SHA-256 of the claim secret. The secret itself is never stored. */
+  claimSecretHash: string
   providerId: string
   domain: string
   payTo: string
@@ -62,9 +81,14 @@ async function proofKey(providerId: string, domain: string, payTo: string): Prom
 export async function issueDomainProof(env: Env, args: { providerId: string; url: string; payTo: string }) {
   const random = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '')
   const token = `${random}.${btoa(args.payTo).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}`
+  // Returned once, to the caller who asked for the proof, and never published.
+  // This is what separates "the world can read the file" from "the world can
+  // claim the record".
+  const claimSecret = crypto.randomUUID().replace(/-/g, '') + crypto.randomUUID().replace(/-/g, '')
   const domain = new URL(args.url).hostname.toLowerCase()
   const stored: StoredProof = {
     tokenHash: await sha256(token),
+    claimSecretHash: await sha256(claimSecret),
     providerId: args.providerId,
     domain,
     payTo: args.payTo,
@@ -86,6 +110,9 @@ export async function issueDomainProof(env: Env, args: { providerId: string; url
   await writeProof(env, key, JSON.stringify(stored))
   return {
     token,
+    claim_secret: claimSecret,
+    claim_secret_note:
+      'Keep this. Publishing the token is what the provider does; presenting this secret is how you prove you are the party that asked for it. It is shown once and cannot be recovered.',
     expires_at: stored.expiresAt,
     manifest_url: `https://${domain}/.well-known/mpp-provider.json`,
     manifest: { token, domain, provider_id: args.providerId, pay_to: args.payTo },
@@ -112,7 +139,7 @@ export function payToFromProofToken(token: string): string | null {
 
 export async function consumeDomainProof(
   env: Env,
-  args: { providerId: string; url: string; token: string },
+  args: { providerId: string; url: string; token: string; claimSecret?: string },
 ): Promise<{ ok: true; detail: string } | { ok: false; detail: string }> {
   const domain = new URL(args.url).hostname.toLowerCase()
   const payTo = payToFromProofToken(args.token)
@@ -129,6 +156,17 @@ export async function consumeDomainProof(
   }
   if (proof.providerId !== args.providerId || proof.domain !== domain || await sha256(args.token) !== proof.tokenHash) {
     return { ok: false, detail: 'Domain proof expired or no longer matches this registration.' }
+  }
+  // The published token proves the domain served what we issued. The claim
+  // secret proves the party submitting it is the one we issued it to. Without
+  // this second check the token's public URL is itself the credential, and a
+  // longer TTL would be a longer window for a stranger to claim the record.
+  // Checked before any outbound fetch so a wrong secret costs us no request.
+  if (!args.claimSecret || await sha256(args.claimSecret) !== proof.claimSecretHash) {
+    return {
+      ok: false,
+      detail: 'Missing or incorrect claim secret. Use the claim_secret returned when this proof was issued; it is not the token published on the domain.',
+    }
   }
   // Two accepted locations, tried in order. The plain-text file exists
   // because it is the smallest thing a provider can serve — the first real

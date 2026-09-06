@@ -91,7 +91,10 @@ export const OWNERSHIP_PROOF_GUIDE = {
       'Serve the token we issue at https://<your-domain>/.well-known/mpprouter-verify.txt ' +
       '(plain text, the token and nothing else), or at /.well-known/mpp-provider.json as ' +
       '{"token":…,"domain":…,"provider_id":…,"pay_to":…}, then submit ' +
-      '{"ownership_proof":{"type":"well_known","token":"…"}}.',
+      '{"ownership_proof":{"type":"well_known","token":"…","claim_secret":"…"}}. ' +
+      'The token is the public half, published on your domain; the claim secret is the private ' +
+      'half returned once when the proof was issued, and is what proves you are the party that ' +
+      'asked for it. Publishing alone is not enough, which is why the token may live for days.',
   },
   x402_pay_to: {
     type: 'x402_pay_to',
@@ -323,6 +326,14 @@ export async function resolveOwnershipProof(
       : requested?.token
         ? [String(requested.token)]
         : []
+    // Claim secrets pair positionally with tokens: the Nth secret belongs to
+    // the Nth token, exactly as they were issued. A single `claim_secret` is
+    // accepted for the single-token case, which is every case with one payout.
+    const rawSecrets = Array.isArray(requested?.claim_secrets)
+      ? (requested!.claim_secrets as unknown[]).map(String)
+      : requested?.claim_secret
+        ? [String(requested.claim_secret)]
+        : []
     if (rawTokens.length === 0) {
       throw new ProviderAuthError(
         'ownership_proof.token is required. Issue one with POST /v1/providers/check and publish it.',
@@ -350,7 +361,7 @@ export async function resolveOwnershipProof(
     // alongside it — so the proven set must cover every declared payout.
     const proven = new Set<string>()
     const details: string[] = []
-    for (const token of rawTokens) {
+    for (const [index, token] of rawTokens.entries()) {
       const tokenPayTo = payToFromProofToken(token)
       if (!tokenPayTo) {
         throw new ProviderAuthError('Domain proof token is malformed.', 'bad_token')
@@ -365,6 +376,7 @@ export async function resolveOwnershipProof(
         providerId: args.providerId,
         url: args.apiBaseUrl,
         token,
+        claimSecret: rawSecrets[index],
       })
       if (!result.ok) {
         throw new ProviderAuthError(result.detail, 'domain_proof_failed')

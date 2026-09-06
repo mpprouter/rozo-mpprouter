@@ -170,7 +170,7 @@ describe('resolveOwnershipProof', () => {
     const outcome = await resolveOwnershipProof(e, {
       providerId: 'agent402', digest: 'd', apiBaseUrl: 'https://agent402.tools',
       payouts: PAYOUTS, routes: ROUTES,
-      body: { ownership_proof: { type: 'well_known', token: proof.token } },
+      body: { ownership_proof: { type: 'well_known', token: proof.token, claim_secret: proof.claim_secret } },
     })
     expect(outcome.proof).toBe('well_known')
     expect(outcome.ownerKey).toMatchObject({ address: PROVIDER_ADDRESS, proof: 'well_known' })
@@ -187,7 +187,7 @@ describe('resolveOwnershipProof', () => {
     await expect(resolveOwnershipProof(e, {
       providerId: 'agent402', digest: 'd', apiBaseUrl: 'https://agent402.tools',
       payouts: PAYOUTS, routes: ROUTES,
-      body: { ownership_proof: { type: 'well_known', token: proof.token } },
+      body: { ownership_proof: { type: 'well_known', token: proof.token, claim_secret: proof.claim_secret } },
     })).rejects.toThrow(ProviderAuthError)
   })
 
@@ -223,7 +223,7 @@ describe('well-known tokens are bound to the declared payouts', () => {
     await expect(resolveOwnershipProof(e, {
       providerId: 'agent402', digest: 'd', apiBaseUrl: 'https://agent402.tools',
       payouts: PAYOUTS, routes: ROUTES,
-      body: { ownership_proof: { type: 'well_known', token: proof.token } },
+      body: { ownership_proof: { type: 'well_known', token: proof.token, claim_secret: proof.claim_secret } },
     })).rejects.toThrow(/does not declare/)
   })
 
@@ -242,7 +242,7 @@ describe('well-known tokens are bound to the declared payouts', () => {
         { network: 'stellar:testnet', payTo: PROVIDER_ADDRESS, asset: 'USDC' },
       ],
       routes: ROUTES,
-      body: { ownership_proof: { type: 'well_known', token: proof.token } },
+      body: { ownership_proof: { type: 'well_known', token: proof.token, claim_secret: proof.claim_secret } },
     })).rejects.toThrow(/share the same address/)
   })
 
@@ -261,7 +261,7 @@ describe('well-known tokens are bound to the declared payouts', () => {
       providerId: 'agent402', digest: 'd', apiBaseUrl: 'https://agent402.tools',
       payouts: [...PAYOUTS, { network: 'eip155:8453', payTo: '0xdead', asset: 'USDC' }],
       routes: ROUTES,
-      body: { ownership_proof: { type: 'well_known', token: proof.token } },
+      body: { ownership_proof: { type: 'well_known', token: proof.token, claim_secret: proof.claim_secret } },
     })).rejects.toThrow(/eip155:8453/)
   })
 })
