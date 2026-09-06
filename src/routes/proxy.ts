@@ -2354,6 +2354,11 @@ export async function handleProxy(
     wrapped.headers.set('X-MPPRouter-Upstream-Cost', upstreamCost)
     const payer = settledPayment?.payer ?? verifiedChannelPayer
     if (payer) wrapped.headers.set('X-MPPRouter-Payer', payer)
+    // How this call was paid, recorded by the facade ledger so a buyer's
+    // dashboard can label it (channel voucher vs single-shot charge) without
+    // inferring it from the shape of the settlement reference. The x402 path
+    // sets the same header to 'stellar.x402'.
+    wrapped.headers.set('X-Payment-Method', authKind === 'stellar.channel' ? 'stellar.channel' : 'stellar.charge')
     return wrapped
   }
 

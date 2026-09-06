@@ -86,7 +86,7 @@ describe('GET /v1/me/ledger', () => {
     const body = (await res.json()) as any
     expect(body.payer).toBe(PAYER)
     expect(body.rows).toHaveLength(2)
-    expect(body.next_cursor).toBe(String(rows[1].created_at))
+    expect(body.next_cursor).toBe(`${rows[1].created_at}:evt_1`)
     expect(body.rows[0]).toMatchObject({
       order_id: 'evt_0',
       route_id: 'anthropic/claude-sonnet-5',
@@ -103,8 +103,24 @@ describe('GET /v1/me/ledger', () => {
     })
     // The query is scoped to the authenticated wallet, never a caller-supplied one.
     expect(bind.mock.calls[0][0]).toBe(PAYER)
-    expect(bind.mock.calls[0][2]).toBe(3) // limit + 1 to detect the next page
-    expect(String(db.prepare.mock.calls[0][0])).toContain('WHERE wallet_address = ? AND created_at < ?')
+    expect(bind.mock.calls[0][4]).toBe(3) // limit + 1 to detect the next page
+    expect(String(db.prepare.mock.calls[0][0])).toContain(
+      'WHERE wallet_address = ? AND (created_at < ? OR (created_at = ? AND event_id < ?))',
+    )
+  })
+
+  it('pages on (created_at, event_id) so same-millisecond rows are not skipped', async () => {
+    const all = vi.fn().mockResolvedValue({ results: [] })
+    const bind = vi.fn(() => ({ all }))
+    const db = { prepare: vi.fn(() => ({ bind })) }
+    const env = { PORTAL_SESSION_SECRET: SECRET, COUPON_SECURITY_DB: db } as unknown as Env
+    const token = await sign(claims())
+
+    expect((await handleMeLedger(request('/v1/me/ledger?cursor=1760000000000:evt_7', token), env)).status).toBe(200)
+    expect(bind.mock.calls[0].slice(0, 4)).toEqual([PAYER, 1_760_000_000_000, 1_760_000_000_000, 'evt_7'])
+    // First-release cursors (bare timestamp) still work.
+    expect((await handleMeLedger(request('/v1/me/ledger?cursor=1760000000000', token), env)).status).toBe(200)
+    expect(bind.mock.calls[1].slice(0, 4)).toEqual([PAYER, 1_760_000_000_000, 1_760_000_000_000, ''])
   })
 
   it('validates limit and cursor', async () => {
@@ -112,6 +128,8 @@ describe('GET /v1/me/ledger', () => {
     const token = await sign(claims())
     expect((await handleMeLedger(request('/v1/me/ledger?limit=0', token), env)).status).toBe(400)
     expect((await handleMeLedger(request('/v1/me/ledger?cursor=abc', token), env)).status).toBe(400)
+    expect((await handleMeLedger(request('/v1/me/ledger?cursor=0:evt', token), env)).status).toBe(400)
+    expect((await handleMeLedger(request('/v1/me/ledger?cursor=123:', token), env)).status).toBe(400)
   })
 })
 
@@ -120,6 +138,11 @@ describe('toMeRow', () => {
     const session = { payer: PAYER, rail: 'stellar' as const }
     expect(toMeRow(facadeRow(0, { status: 'failed' }) as any, session)).toMatchObject({ upstream_status: 502, amount_usd: 0 })
     expect(toMeRow(facadeRow(0, { status: 'passthrough' }) as any, session).amount_usd).toBe(0)
+    // Explicit payment method recorded by the proxy wins over any inference.
+    expect(toMeRow(facadeRow(0, { payment_method: 'stellar.channel' }) as any, session).mode).toBe('session')
+    expect(toMeRow(facadeRow(0, { payment_method: 'stellar.charge' }) as any, session).mode).toBe('mpp-charge')
+    expect(toMeRow(facadeRow(0, { payment_method: 'stellar.x402', settlement_ref: 'rcpt' }) as any, session).mode).toBe('x402-exact')
+    // Rows from before the method was recorded fall back to the reference shape.
     expect(toMeRow(facadeRow(0, { channel_cursor_after: '5' }) as any, session).mode).toBe('session')
     expect(toMeRow(facadeRow(0, { settlement_ref: 'mpp-credential-id' }) as any, session).mode).toBe('mpp-charge')
     expect(toMeRow(facadeRow(0, { input_tokens: null, output_tokens: null }) as any, session)).toMatchObject({
