@@ -89,6 +89,7 @@ shared secret `PORTAL_SESSION_SECRET`):
 - `GET /v1/me/ledger?limit=&cursor=` — this wallet's LLM calls, newest first, with
   `model`, `provider`, `input_tokens`, `output_tokens`, `cached_tokens`, `settlement_ref`
 - `GET /v1/me/usage?window=24h|7d|30d` — spend and token aggregates for the same wallet
+- `GET /v1/me/sessions` — this wallet's own Stellar payment channels: deposit, spent, remaining, status
 
 Clients integrate only with Router URLs. Upstream provider domains and routing details are internal.
 

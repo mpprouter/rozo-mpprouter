@@ -103,7 +103,7 @@ import { sendDingTalkAlert } from './utils/dingtalk'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
 import { handleUsageActivity, handleUsageLogs } from './routes/usage-dashboard'
-import { handleMeLedger, handleMeUsage } from './routes/me'
+import { handleMeLedger, handleMeSessions, handleMeUsage } from './routes/me'
 import { handleUsageDashboard } from './routes/usage-dashboard-ui'
 
 export interface Env {
@@ -648,6 +648,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       if (url.pathname === '/v1/me/usage' && request.method === 'GET') {
         return handleMeUsage(request, env)
       }
+      if (url.pathname === '/v1/me/sessions' && request.method === 'GET') {
+        return handleMeSessions(request, env)
+      }
 
       // Public settlement ledger. Unauthenticated and read-only by design —
       // it is the evidence behind the "all visible on the ledger" claim, so
@@ -972,6 +975,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         '  GET /v1/ledger                       - Public settlement ledger\n' +
         '  GET /v1/me/ledger                    - Your LLM calls with tokens (dashboard session)\n' +
         '  GET /v1/me/usage                     - Your usage aggregates (dashboard session)\n' +
+        '  GET /v1/me/sessions                  - Your payment channels (dashboard session)\n' +
         '  GET /x402/supported                  - x402 discovery\n' +
         '  GET /llms.txt                        - LLM-readable description\n' +
         '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +

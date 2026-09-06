@@ -4,6 +4,7 @@
  *
  *   GET /v1/me/ledger?limit=&cursor=   — this payer's LLM facade calls, newest first
  *   GET /v1/me/usage?window=24h|7d|30d — aggregates for the same payer
+ *   GET /v1/me/sessions                — this payer's own payment channels
  *
  * Authentication is the dashboard's own session: the portal verifies a
  * wallet signature (Sign-In-With-X) and issues an HS256 JWT whose `sub` is
@@ -19,6 +20,10 @@
  */
 
 import type { Env } from '../index'
+import { getChannelForAgent, getStellarChannel } from '../mpp/stellar-channel-store'
+import { Store } from 'mppx/server'
+import { doAtomicParams } from '../mpp/kv-atomic-store'
+import { isChannelBlocked } from '../playground/channel-voucher-store'
 
 const ISSUER = 'x402-dashboard'
 const AUDIENCE = 'session'
@@ -315,4 +320,172 @@ export async function handleMeUsage(request: Request, env: Env): Promise<Respons
     cached_tokens: Number(totals?.cached_tokens ?? 0),
     refunded_usd: 0,
   })
+}
+
+/**
+ * GET /v1/me/sessions — the verified payer's own Stellar payment channels.
+ *
+ * Data source, and why:
+ *   - Identity → channel: the KV secondary index `stellarAgent:<G>` that
+ *     src/mpp/stellar-channel-store.ts already maintains for the dispatch
+ *     path. It is keyed by the payer, so no new store and no migration are
+ *     needed. V2 is one channel per agent, so this returns at most one row.
+ *   - Channel metadata (deposit, open time, contract, asset): the
+ *     `stellarChannel:<C>` record behind that index.
+ *   - Spend AND lifecycle: the cumulative voucher record mppx keeps at
+ *     `stellar:channel:cumulative:<C>` on the atomic (Durable Object) store —
+ *     read with exactly the same key and shape the spend path itself reads
+ *     (src/routes/proxy.ts and stellar-channel-dispatch.ts's rollback). Its
+ *     `amount` is in the same base units as `depositRaw`, which is what
+ *     proxy.ts compares it against in the capacity gate, and its `settling`
+ *     flag is the same one the rollback guard refuses to rewind past.
+ *   - Blocked state: the closed / fenced markers on that same atomic store,
+ *     read through `isChannelBlocked` rather than by retyping its keys.
+ *     All of these are plain reads; nothing here verifies, advances, rolls
+ *     back or settles a voucher.
+ *
+ * The D1 `llm_facade_requests.channel_cursor_after` column is deliberately
+ * NOT used for spend: nothing in the repo writes it, so it is NULL in
+ * production and would report every used channel as untouched. D1 is used
+ * only for the two informational counters, scoped to this channel by
+ * `payment_method = 'stellar.channel'` AND `created_at >= openedAt` so a
+ * previous channel's calls are not attributed to the current one after the
+ * agent rotates channels.
+ *
+ * The authoritative remaining balance lives on chain; this endpoint reports
+ * the router's own view and never signs or moves anything. Non-custodial:
+ * read-only, no balance held here.
+ *
+ * Only the channel whose stored `agentAccount` equals the verified payer is
+ * returned, so a stale or hand-edited index cannot leak another buyer's
+ * channel. Prompts, query strings and route ids are never included.
+ */
+
+/** Stellar USDC is 7-decimal; channel amounts are decimal strings of base units. */
+const STROOP = 10_000_000
+
+export interface MeSessionRow {
+  session_id: string
+  rail: 'stellar' | 'base'
+  status: 'open' | 'closing' | 'closed'
+  budget_usd: number
+  spent_usd: number
+  remaining_usd: number
+  opened_at: string
+  expires_at: string | null
+  channel_ref: string
+  /** Calls settled against this channel, from the payer's own D1 rows. */
+  calls: number
+  /** ISO-8601 of the newest call we recorded on this channel; null when never used. */
+  last_activity_at: string | null
+}
+
+/** Base units (decimal string) → USD. Bad input reads as 0 rather than NaN. */
+export function rawToUsd(raw: string | null | undefined): number {
+  if (!raw || !/^\d+$/.test(raw)) return 0
+  return Number(BigInt(raw)) / STROOP
+}
+
+/**
+ * Lifecycle, in precedence order, because a channel can be unspendable while
+ * money still appears to remain:
+ *
+ *   1. `blocked` — the channel carries a closed or fenced marker, so the
+ *      dispatch gate rejects every further call. Report `closed` even with a
+ *      positive remaining balance.
+ *   2. `settling` — a settlement is in flight on the cumulative record. mppx
+ *      will not accept a new voucher past it, so the channel is `closing`.
+ *   3. Otherwise the deposit decides: funds left → `open`, drained → `closed`.
+ *
+ * Deriving this from `remainingUsd` alone (the first cut) reported a settling
+ * or closed channel as `open`, which the dashboard would render as spendable.
+ */
+export function channelStatus(
+  remainingUsd: number,
+  lifecycle: { blocked: boolean; settling: boolean },
+): MeSessionRow['status'] {
+  if (lifecycle.blocked) return 'closed'
+  if (lifecycle.settling) return 'closing'
+  return remainingUsd > 0 ? 'open' : 'closed'
+}
+
+/**
+ * Read the cumulative voucher record for a channel: the vouched amount in the
+ * same base units as `depositRaw`, plus the in-flight settlement flag. The
+ * record mppx keeps is `{ amount, settling? }` — the exact shape
+ * `rollbackFailedChannelVoucher` inspects. A missing record means no voucher
+ * has ever been accepted. Read-only.
+ */
+export async function readChannelCumulative(
+  env: Env,
+  channelContract: string,
+): Promise<{ amountRaw: string; settling: boolean }> {
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+  const current = (await store.get(`stellar:channel:cumulative:${channelContract}`)) as
+    | { amount?: string | number; settling?: unknown }
+    | null
+  if (!current || typeof current !== 'object') return { amountRaw: '0', settling: false }
+  return {
+    amountRaw: current.amount === undefined ? '0' : String(current.amount),
+    settling: Boolean(current.settling),
+  }
+}
+
+export async function handleMeSessions(request: Request, env: Env): Promise<Response> {
+  const session = await verifyPortalSession(request, env)
+  if (!session) return json(401, { error: 'Unauthorized' })
+  if (!env.MPP_STORE || !env.ATOMIC_STORE) return json(503, { error: 'Channel store is not configured' })
+
+  const contract = await getChannelForAgent(env, session.payer)
+  if (!contract) return json(200, { ok: true, payer: session.payer, sessions: [] })
+
+  const state = await getStellarChannel(env, contract)
+  // Fail closed on a stale index: only a record that names this payer as the
+  // funder may be shown.
+  if (!state || state.agentAccount !== session.payer) {
+    return json(200, { ok: true, payer: session.payer, sessions: [] })
+  }
+
+  // Both reads hit the same strongly-consistent atomic store the spend path
+  // uses, so a channel that just became unspendable cannot still read `open`.
+  const [cumulative, blocked] = await Promise.all([
+    readChannelCumulative(env, state.channelContract),
+    isChannelBlocked(env, state.channelContract),
+  ])
+  const budget_usd = rawToUsd(state.depositRaw)
+  const spent_usd = rawToUsd(cumulative.amountRaw)
+  const remaining_usd = Math.max(0, budget_usd - spent_usd)
+
+  // Informational counters only. A channel opened before this row scoping
+  // existed simply reports fewer calls; it can never report another channel's.
+  const openedAtMs = Date.parse(state.openedAt)
+  let calls = 0
+  let lastActivityMs: number | null = null
+  if (env.COUPON_SECURITY_DB && Number.isFinite(openedAtMs)) {
+    const usage = await env.COUPON_SECURITY_DB.prepare(`
+      SELECT COUNT(*) AS calls, MAX(created_at) AS last_activity
+      FROM llm_facade_requests
+      WHERE wallet_address = ? AND created_at >= ?
+        AND status IN ('settled','fallback_used')
+        AND json_extract(charge_evidence_json, '$.payment_method') = 'stellar.channel'
+    `).bind(session.payer, openedAtMs).first<Record<string, number | null>>()
+    calls = Number(usage?.calls ?? 0)
+    lastActivityMs = usage?.last_activity ?? null
+  }
+
+  const row: MeSessionRow = {
+    session_id: state.channelContract,
+    rail: 'stellar',
+    status: channelStatus(remaining_usd, { blocked, settling: cumulative.settling }),
+    budget_usd,
+    spent_usd,
+    remaining_usd,
+    opened_at: state.openedAt,
+    expires_at: null,
+    channel_ref: state.channelContract,
+    calls,
+    last_activity_at: lastActivityMs ? new Date(lastActivityMs).toISOString() : null,
+  }
+
+  return json(200, { ok: true, payer: session.payer, sessions: [row] })
 }
