@@ -121,10 +121,10 @@ describe('provider check and domain ownership', () => {
     const e = env()
     const proof = await issueDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, payTo: address })
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(proof.manifest), { status: 200 }))
-    const first = await consumeDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, token: proof.token })
+    const first = await consumeDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, token: proof.token, claimSecret: proof.claim_secret })
     expect(first.ok).toBe(true)
     expect(await getDomainProofEvidence(e, record.id, record.apiBaseUrl, address)).toBeTruthy()
-    const replay = await consumeDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, token: proof.token })
+    const replay = await consumeDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, token: proof.token, claimSecret: proof.claim_secret })
     expect(replay.ok).toBe(false)
   })
 
@@ -278,5 +278,63 @@ describe('real-money verification claim', () => {
     const retry = await runClaimedPaidGate(e, record.id, 'v3', paid)
     expect(retry.status).toBe('uncertain')
     expect(paid).toHaveBeenCalledTimes(1)
+  })
+
+  describe('the claim secret is what lets the token live for days', () => {
+    it('refuses a token published on the domain when the claim secret is absent', async () => {
+      // The scenario the secret exists for: an onlooker reads the provider's
+      // public .well-known file and tries to claim the record with it. Before
+      // the secret, the only thing stopping them was a ten-minute window.
+      const e = env()
+      const proof = await issueDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, payTo: address })
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(proof.manifest), { status: 200 }))
+      const stolen = await consumeDomainProof(e, {
+        providerId: record.id, url: record.apiBaseUrl, token: proof.token,
+      })
+      expect(stolen.ok).toBe(false)
+      expect(stolen.detail).toContain('claim secret')
+    })
+
+    it('refuses a wrong claim secret', async () => {
+      const e = env()
+      const proof = await issueDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, payTo: address })
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify(proof.manifest), { status: 200 }))
+      const wrong = await consumeDomainProof(e, {
+        providerId: record.id, url: record.apiBaseUrl, token: proof.token, claimSecret: 'not-the-secret',
+      })
+      expect(wrong.ok).toBe(false)
+    })
+
+    it('does not reach out to the provider domain when the secret is wrong', async () => {
+      // Checked before the fetch, so a guessing attacker cannot use us to
+      // hammer someone else's origin.
+      const e = env()
+      const proof = await issueDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, payTo: address })
+      const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }))
+      await consumeDomainProof(e, {
+        providerId: record.id, url: record.apiBaseUrl, token: proof.token, claimSecret: 'wrong',
+      })
+      expect(spy).not.toHaveBeenCalled()
+    })
+
+    it('never stores the claim secret itself', async () => {
+      const e = env()
+      const proof = await issueDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, payTo: address })
+      const entries = [...(e.MPP_STORE as any).store.entries()]
+      // Guard the guard: an empty dump would pass this vacuously.
+      expect(entries.length).toBeGreaterThan(0)
+      const dumped = JSON.stringify(entries)
+      expect(dumped).not.toContain(proof.claim_secret)
+      // The hash is stored; the secret is not.
+      expect(dumped).toContain('claimSecretHash')
+    })
+
+    it('issues a proof that lasts seven days, not ten minutes', async () => {
+      const e = env()
+      const proof = await issueDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, payTo: address })
+      const lifetimeMs = Date.parse(proof.expires_at) - Date.now()
+      expect(lifetimeMs).toBeGreaterThan(6.5 * 24 * 60 * 60 * 1000)
+      expect(lifetimeMs).toBeLessThanOrEqual(7 * 24 * 60 * 60 * 1000 + 5000)
+    })
   })
 })

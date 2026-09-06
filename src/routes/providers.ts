@@ -675,6 +675,7 @@ export async function handleProviderDomainVerify(request: Request, env: Env): Pr
     const body = await readJson(request) as Record<string, unknown>
     const result = await consumeDomainProof(env, {
       providerId: String(body.provider_id ?? '').trim().toLowerCase(), url: String(body.url ?? '').trim(), token: String(body.token ?? ''),
+      claimSecret: String(body.claim_secret ?? ''),
     })
     return json(result.ok ? 200 : 422, result)
   } catch (error) {
