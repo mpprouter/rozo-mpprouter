@@ -21,6 +21,8 @@
 
 import type { Env } from '../index'
 import { getChannelForAgent, getStellarChannel } from '../mpp/stellar-channel-store'
+import { Store } from 'mppx/server'
+import { doAtomicParams } from '../mpp/kv-atomic-store'
 
 const ISSUER = 'x402-dashboard'
 const AUDIENCE = 'session'
@@ -329,11 +331,21 @@ export async function handleMeUsage(request: Request, env: Env): Promise<Respons
  *     needed. V2 is one channel per agent, so this returns at most one row.
  *   - Channel metadata (deposit, open time, contract, asset): the
  *     `stellarChannel:<C>` record behind that index.
- *   - Spend: `MAX(channel_cursor_after)` over the payer's own rows in the D1
- *     `llm_facade_requests` table (already indexed on wallet_address). That
- *     column is the cumulative voucher watermark the proxy recorded, so the
- *     newest value IS the amount vouched to the router — no summing, and it
- *     stays correct even if individual rows are missing.
+ *   - Spend: the cumulative voucher watermark mppx keeps at
+ *     `stellar:channel:cumulative:<C>` on the atomic (Durable Object) store —
+ *     read with exactly the same key and shape the spend path itself reads
+ *     (src/routes/proxy.ts and stellar-channel-dispatch.ts's rollback), and
+ *     in the same base units as `depositRaw`, which is what proxy.ts compares
+ *     it against in the capacity gate. This is a plain read; nothing here
+ *     verifies, advances or rolls back a voucher.
+ *
+ * The D1 `llm_facade_requests.channel_cursor_after` column is deliberately
+ * NOT used for spend: nothing in the repo writes it, so it is NULL in
+ * production and would report every used channel as untouched. D1 is used
+ * only for the two informational counters, scoped to this channel by
+ * `payment_method = 'stellar.channel'` AND `created_at >= openedAt` so a
+ * previous channel's calls are not attributed to the current one after the
+ * agent rotates channels.
  *
  * The authoritative remaining balance lives on chain; this endpoint reports
  * the router's own view and never signs or moves anything. Non-custodial:
@@ -359,7 +371,7 @@ export interface MeSessionRow {
   channel_ref: string
   /** Calls settled against this channel, from the payer's own D1 rows. */
   calls: number
-  /** ISO-8601 of the newest voucher we recorded; null when never used. */
+  /** ISO-8601 of the newest call we recorded on this channel; null when never used. */
   last_activity_at: string | null
 }
 
@@ -371,17 +383,32 @@ export function rawToUsd(raw: string | null | undefined): number {
 
 /**
  * A drained channel can no longer pay, so it is reported as `closed`. The
- * router has no on-chain close watcher yet, so `closing` is never emitted —
- * the dashboard renders it, but nothing here can observe it. See the PR body.
+ * router has no on-chain close watcher on this path yet, so `closing` is
+ * never emitted — the dashboard renders it, but nothing here can observe it.
+ * See the PR body.
  */
 export function channelStatus(remainingUsd: number): MeSessionRow['status'] {
   return remainingUsd > 0 ? 'open' : 'closed'
 }
 
+/**
+ * Read the cumulative vouched amount for a channel, in the same base units as
+ * `depositRaw`. The record mppx keeps is `{ amount: string }`; a missing
+ * record means no voucher has ever been accepted. Read-only.
+ */
+export async function readChannelCumulativeRaw(env: Env, channelContract: string): Promise<string> {
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+  const current = (await store.get(`stellar:channel:cumulative:${channelContract}`)) as
+    | { amount?: string | number }
+    | null
+  if (!current || typeof current !== 'object' || current.amount === undefined) return '0'
+  return String(current.amount)
+}
+
 export async function handleMeSessions(request: Request, env: Env): Promise<Response> {
   const session = await verifyPortalSession(request, env)
   if (!session) return json(401, { error: 'Unauthorized' })
-  if (!env.MPP_STORE) return json(503, { error: 'Channel store is not configured' })
+  if (!env.MPP_STORE || !env.ATOMIC_STORE) return json(503, { error: 'Channel store is not configured' })
 
   const contract = await getChannelForAgent(env, session.payer)
   if (!contract) return json(200, { ok: true, payer: session.payer, sessions: [] })
@@ -393,27 +420,27 @@ export async function handleMeSessions(request: Request, env: Env): Promise<Resp
     return json(200, { ok: true, payer: session.payer, sessions: [] })
   }
 
-  let spentRaw: string | null = null
-  let calls = 0
-  let lastActivityMs: number | null = null
-  if (env.COUPON_SECURITY_DB) {
-    const usage = await env.COUPON_SECURITY_DB.prepare(`
-      SELECT MAX(CAST(channel_cursor_after AS INTEGER)) AS cursor_after,
-        COUNT(*) AS calls,
-        MAX(created_at) AS last_activity
-      FROM llm_facade_requests
-      WHERE wallet_address = ? AND channel_cursor_after IS NOT NULL
-        AND status IN ('settled','fallback_used')
-    `).bind(session.payer).first<Record<string, number | null>>()
-    const cursor = usage?.cursor_after
-    spentRaw = cursor === null || cursor === undefined ? null : String(cursor)
-    calls = Number(usage?.calls ?? 0)
-    lastActivityMs = usage?.last_activity ?? null
-  }
-
+  const spentRaw = await readChannelCumulativeRaw(env, state.channelContract)
   const budget_usd = rawToUsd(state.depositRaw)
   const spent_usd = rawToUsd(spentRaw)
   const remaining_usd = Math.max(0, budget_usd - spent_usd)
+
+  // Informational counters only. A channel opened before this row scoping
+  // existed simply reports fewer calls; it can never report another channel's.
+  const openedAtMs = Date.parse(state.openedAt)
+  let calls = 0
+  let lastActivityMs: number | null = null
+  if (env.COUPON_SECURITY_DB && Number.isFinite(openedAtMs)) {
+    const usage = await env.COUPON_SECURITY_DB.prepare(`
+      SELECT COUNT(*) AS calls, MAX(created_at) AS last_activity
+      FROM llm_facade_requests
+      WHERE wallet_address = ? AND created_at >= ?
+        AND status IN ('settled','fallback_used')
+        AND json_extract(charge_evidence_json, '$.payment_method') = 'stellar.channel'
+    `).bind(session.payer, openedAtMs).first<Record<string, number | null>>()
+    calls = Number(usage?.calls ?? 0)
+    lastActivityMs = usage?.last_activity ?? null
+  }
 
   const row: MeSessionRow = {
     session_id: state.channelContract,
