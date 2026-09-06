@@ -161,6 +161,10 @@ async function recordUsage(
   const settlementRef = response.headers.get('X-Payment-Tx')
     ?? response.headers.get('Payment-Receipt')
   const payer = response.headers.get('X-MPPRouter-Payer')
+  // 'stellar.x402' | 'stellar.charge' | 'stellar.channel', set by the proxy on
+  // every settled response. Kept in charge_evidence_json so /v1/me/ledger can
+  // report the payment mode without guessing from the settlement reference.
+  const paymentMethod = response.headers.get('X-Payment-Method')
   const eventId = crypto.randomUUID()
   const status = classifyFacadeStatus(response, quote, fallbackReason)
   const refundStatus = response.headers.get('Refund-Status')
@@ -190,6 +194,7 @@ async function recordUsage(
         refund_id: refundId,
         refund_status: refundStatus,
         served_model: servedModel,
+        payment_method: paymentMethod,
         // Precomputed rather than derived at query time so a substitution is
         // one `json_extract(charge_evidence_json, '$.model_substituted')`
         // away. Null when the merchant reported no model at all.
