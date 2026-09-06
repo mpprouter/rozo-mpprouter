@@ -147,22 +147,53 @@ const MODE_BY_METHOD: Record<string, MeLedgerRow['mode']> = {
   'stellar.channel': 'session',
 }
 
+const TX_HASH = /^[0-9a-fA-F]{64}$/
+
+/**
+ * `llm_facade_requests.settlement_ref` stores the upstream `X-Payment-Tx`
+ * header verbatim. On Stellar that header is not a tx hash but a base64 JSON
+ * receipt wrapping one, e.g.
+ *   {"method":"stellar","reference":"<64 hex>","status":"success", ...}
+ * The dashboard's row contract expects the on-chain tx hash, and dedupes
+ * router rows against chain rows on it — passing the blob through made every
+ * LLM call appear twice. Unwrap receipt-shaped refs; leave anything else
+ * (already a hash, an mpp credential id, garbage) exactly as it came.
+ */
+export function normalizeSettlementRef(raw: string | null): string | null {
+  if (!raw) return raw
+  if (TX_HASH.test(raw)) return raw
+  try {
+    const pad = raw.length % 4 === 0 ? '' : '='.repeat(4 - (raw.length % 4))
+    const decoded = atob(raw.replace(/-/g, '+').replace(/_/g, '/') + pad)
+    const parsed = JSON.parse(decoded) as unknown
+    if (parsed && typeof parsed === 'object') {
+      const reference = (parsed as { reference?: unknown }).reference
+      if (typeof reference === 'string' && TX_HASH.test(reference)) return reference
+    }
+  } catch {
+    // Not a base64 JSON receipt — fall through and keep the raw value.
+  }
+  return raw
+}
+
 /**
  * Payment mode. The proxy records it explicitly (X-Payment-Method →
  * charge_evidence_json.payment_method); rows written before that existed fall
  * back to the shape of the settlement reference, which is only a heuristic.
+ * The heuristic sees the normalized ref, so a legacy row whose receipt wraps a
+ * tx hash reads as `x402-exact`, matching the chain view.
  */
-export function paymentMode(row: FacadeRow): MeLedgerRow['mode'] {
+export function paymentMode(row: FacadeRow, normalizedRef?: string | null): MeLedgerRow['mode'] {
   const explicit = row.payment_method ? MODE_BY_METHOD[row.payment_method] : undefined
   if (explicit) return explicit
   if (row.channel_cursor_after) return 'session'
-  const ref = row.settlement_ref ?? ''
-  return /^[0-9a-fA-F]{64}$/.test(ref) ? 'x402-exact' : 'mpp-charge'
+  const ref = (normalizedRef === undefined ? normalizeSettlementRef(row.settlement_ref ?? null) : normalizedRef) ?? ''
+  return TX_HASH.test(ref) ? 'x402-exact' : 'mpp-charge'
 }
 
 export function toMeRow(row: FacadeRow, session: PortalSession): MeLedgerRow {
-  const ref = row.settlement_ref ?? null
-  const mode = paymentMode(row)
+  const ref = normalizeSettlementRef(row.settlement_ref ?? null)
+  const mode = paymentMode(row, ref)
   const settled = SETTLED.has(row.status)
   return {
     order_id: row.event_id,
