@@ -337,4 +337,41 @@ describe('real-money verification claim', () => {
       expect(lifetimeMs).toBeLessThanOrEqual(7 * 24 * 60 * 60 * 1000 + 5000)
     })
   })
+
+  describe('redirects are refused, the way Workers actually allows', () => {
+    it('treats a 3xx on the well-known file as a failure, not a hop to follow', async () => {
+      // Under redirect:'manual' the runtime returns the 3xx rather than
+      // throwing, so it has to be rejected explicitly — otherwise a domain
+      // could point its proof at a file it does not control.
+      const e = env()
+      const proof = await issueDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, payTo: address })
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('', { status: 302, headers: { Location: 'https://elsewhere.example/token.txt' } }),
+      )
+      const result = await consumeDomainProof(e, {
+        providerId: record.id, url: record.apiBaseUrl, token: proof.token, claimSecret: proof.claim_secret,
+      })
+      expect(result.ok).toBe(false)
+      expect(result.detail).toContain('redirect')
+    })
+
+    it('never asks the runtime for a redirect mode it rejects', async () => {
+      // The production failure this pins: Workers accepts only 'follow' or
+      // 'manual', and rejected the whole fetch on 'error' — so every provider
+      // check returned 422 in production while passing here.
+      const e = env()
+      const proof = await issueDomainProof(e, { providerId: record.id, url: record.apiBaseUrl, payTo: address })
+      const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response(JSON.stringify(proof.manifest), { status: 200 }),
+      )
+      await consumeDomainProof(e, {
+        providerId: record.id, url: record.apiBaseUrl, token: proof.token, claimSecret: proof.claim_secret,
+      })
+      expect(spy).toHaveBeenCalled()
+      for (const call of spy.mock.calls) {
+        const init = call[1] as RequestInit | undefined
+        if (init?.redirect) expect(['follow', 'manual']).toContain(init.redirect)
+      }
+    })
+  })
 })

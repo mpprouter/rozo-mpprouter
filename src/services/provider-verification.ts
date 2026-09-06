@@ -238,7 +238,7 @@ export async function gateProbe402(
         // still reaches its 402. A provider whose 402 is gated behind a
         // valid body will fail here, and the message says so.
         ...(spec.method === 'POST' ? { body: '{}' } : {}),
-        redirect: 'error',
+        redirect: 'manual',
       },
       PROBE_TIMEOUT_MS,
     )
