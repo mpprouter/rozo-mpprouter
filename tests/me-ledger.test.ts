@@ -3,7 +3,7 @@
  * dashboard, gated on the dashboard's HS256 session JWT.
  */
 import { describe, expect, it, vi } from 'vitest'
-import { handleMeLedger, handleMeUsage, toMeRow, verifyPortalSession } from '../src/routes/me'
+import { handleMeLedger, handleMeUsage, normalizeSettlementRef, toMeRow, verifyPortalSession } from '../src/routes/me'
 import type { Env } from '../src/index'
 
 const SECRET = 'test-portal-session-secret-0123456789abcdef'
@@ -149,6 +149,42 @@ describe('toMeRow', () => {
       input_tokens: null,
       output_tokens: null,
     })
+  })
+})
+
+describe('normalizeSettlementRef', () => {
+  const TX = '477eed6222f0f2b9e4d4a0d4d1f0f9b0c7a1e5d3b9f8072615c4a3d2e1f0a9b8'
+  const receipt = JSON.stringify({ method: 'stellar', reference: TX, status: 'success', timestamp: '2026-08-24T03:04:07.098Z' })
+
+  it('passes a bare 64-hex tx hash through unchanged, case included', () => {
+    expect(normalizeSettlementRef(TX)).toBe(TX)
+    expect(normalizeSettlementRef(TX.toUpperCase())).toBe(TX.toUpperCase())
+  })
+
+  it('unwraps a base64 Stellar receipt to its on-chain reference', () => {
+    expect(normalizeSettlementRef(btoa(receipt))).toBe(TX)
+  })
+
+  it('unwraps the base64url variant without padding', () => {
+    const b64url = btoa(receipt).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    expect(normalizeSettlementRef(b64url)).toBe(TX)
+  })
+
+  it('returns anything it cannot decode unchanged', () => {
+    expect(normalizeSettlementRef('mpp-credential-id')).toBe('mpp-credential-id')
+    expect(normalizeSettlementRef(btoa('not json at all'))).toBe(btoa('not json at all'))
+    expect(normalizeSettlementRef(btoa(JSON.stringify({ method: 'stellar', reference: 'nope' })))).toBe(
+      btoa(JSON.stringify({ method: 'stellar', reference: 'nope' })),
+    )
+    expect(normalizeSettlementRef(null)).toBeNull()
+    expect(normalizeSettlementRef('')).toBe('')
+  })
+
+  it('gives the dashboard the tx hash and x402-exact mode for a legacy receipt row', () => {
+    const session = { payer: PAYER, rail: 'stellar' as const }
+    const row = toMeRow(facadeRow(0, { settlement_ref: btoa(receipt) }) as any, session)
+    expect(row.settlement_ref).toBe(TX)
+    expect(row.mode).toBe('x402-exact')
   })
 })
 
