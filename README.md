@@ -80,6 +80,15 @@ Public endpoints:
 - `GET /services`
 - `GET /v1/services/catalog`
 - `POST /v1/services/{service}/{operation}`
+- `GET /v1/ledger` — public settlement ledger (no token counts)
+
+Buyer endpoints for the [x402 dashboard](https://github.com/mpprouter/x402-dashboard),
+authenticated with the dashboard's wallet-signed session JWT (`Authorization: Bearer`,
+shared secret `PORTAL_SESSION_SECRET`):
+
+- `GET /v1/me/ledger?limit=&cursor=` — this wallet's LLM calls, newest first, with
+  `model`, `provider`, `input_tokens`, `output_tokens`, `cached_tokens`, `settlement_ref`
+- `GET /v1/me/usage?window=24h|7d|30d` — spend and token aggregates for the same wallet
 
 Clients integrate only with Router URLs. Upstream provider domains and routing details are internal.
 

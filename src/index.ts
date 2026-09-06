@@ -103,6 +103,7 @@ import { sendDingTalkAlert } from './utils/dingtalk'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
 import { handleUsageActivity, handleUsageLogs } from './routes/usage-dashboard'
+import { handleMeLedger, handleMeUsage } from './routes/me'
 import { handleUsageDashboard } from './routes/usage-dashboard-ui'
 
 export interface Env {
@@ -311,6 +312,12 @@ export interface Env {
   // It deliberately grants none of ADMIN_TOKEN's mutation authority.
   // Set via: wrangler secret put USAGE_READ_TOKEN
   USAGE_READ_TOKEN?: string
+  // Shared HS256 secret with the buyer dashboard (x402-dashboard
+  // SESSION_SECRET). The dashboard verifies a wallet signature and issues a
+  // session JWT whose `sub` is the wallet; /v1/me/* verifies it here so a
+  // buyer only ever reads their own rows. Unset ⇒ /v1/me/* answers 401.
+  // Set via: wrangler secret put PORTAL_SESSION_SECRET
+  PORTAL_SESSION_SECRET?: string
   // Dedicated least-authority token for the pull-only refund executor.
   REFUND_EXECUTOR_TOKEN?: string
   // Kill switch for the coupon admin endpoints (issue/resolve/get). Separate
@@ -631,6 +638,15 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
       if (url.pathname === '/usage' && request.method === 'GET') {
         return handleUsageDashboard()
+      }
+
+      // Buyer's own LLM usage (tokens, models) for the x402 dashboard. Gated
+      // on the dashboard session JWT (PORTAL_SESSION_SECRET); see routes/me.ts.
+      if (url.pathname === '/v1/me/ledger' && request.method === 'GET') {
+        return handleMeLedger(request, env)
+      }
+      if (url.pathname === '/v1/me/usage' && request.method === 'GET') {
+        return handleMeUsage(request, env)
       }
 
       // Public settlement ledger. Unauthenticated and read-only by design —
@@ -954,6 +970,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         '  GET /v1/services/catalog             - Versioned service catalog\n' +
         '  GET /v1/services/search              - Search/filter catalog\n' +
         '  GET /v1/ledger                       - Public settlement ledger\n' +
+        '  GET /v1/me/ledger                    - Your LLM calls with tokens (dashboard session)\n' +
+        '  GET /v1/me/usage                     - Your usage aggregates (dashboard session)\n' +
         '  GET /x402/supported                  - x402 discovery\n' +
         '  GET /llms.txt                        - LLM-readable description\n' +
         '  GET /openapi.json                    - OpenAPI 3.1 spec\n' +
