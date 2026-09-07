@@ -89,6 +89,9 @@ const CUMULATIVE_KEY = `stellar:channel:cumulative:${CHANNEL}`
 // Lifecycle markers, built the way src/playground/channel-voucher-store.ts
 // builds them. Asserted below so a key rename in that module is caught here.
 const CLOSED_KEY = `pg:channel:closed:${CHANNEL}`
+// mppx's own successful-close marker
+// (node_modules/@stellar/mpp/dist/channel/server/Channel.js:330).
+const MPPX_CLOSED_KEY = `stellar:channel:closed:${CHANNEL}`
 const FENCED_KEY = `pg:channel:fenced:${CHANNEL}`
 
 function envWith(
@@ -278,6 +281,25 @@ describe('GET /v1/me/sessions lifecycle', () => {
       [CLOSED_KEY]: { closedAt: '2026-09-02T00:00:00.000Z' },
     })
     expect(await sessionsFrom(env)).toMatchObject([{ status: 'closed' }])
+  })
+
+  it("mppx's own close marker outranks the settling flag it never clears", async () => {
+    // A production close writes `stellar:channel:closed:<C>` and leaves
+    // `settling: true` on the cumulative record for ever, so without this read
+    // the channel would report `closing` after it really closed.
+    const env = envWith(ownChannel(), null, {
+      [CUMULATIVE_KEY]: { amount: '25000000', settling: true },
+      [MPPX_CLOSED_KEY]: { closedAt: '2026-09-02T00:00:00.000Z', txHash: 'abc', amount: '25000000' },
+    })
+    expect(await sessionsFrom(env)).toMatchObject([{ status: 'closed', remaining_usd: 7.5 }])
+  })
+
+  it("mppx's close marker wins over a positive remaining balance", async () => {
+    const env = envWith(ownChannel(), null, {
+      [CUMULATIVE_KEY]: { amount: '25000000' },
+      [MPPX_CLOSED_KEY]: { closedAt: '2026-09-02T00:00:00.000Z' },
+    })
+    expect(await sessionsFrom(env)).toMatchObject([{ status: 'closed', remaining_usd: 7.5 }])
   })
 
   it('with no markers the deposit still decides', async () => {
