@@ -341,6 +341,15 @@ export async function handleMeUsage(request: Request, env: Env): Promise<Respons
  *     flag is the same one the rollback guard refuses to rewind past.
  *   - Blocked state: the closed / fenced markers on that same atomic store,
  *     read through `isChannelBlocked` rather than by retyping its keys.
+ *   - Production closes: mppx's OWN close marker at
+ *     `stellar:channel:closed:<C>`. The playground settlement path writes
+ *     `pg:channel:closed:<C>`, but a channel closed through the library's
+ *     `close` action is recorded only under mppx's key
+ *     (node_modules/@stellar/mpp/dist/channel/server/Channel.js:330, with
+ *     `STORE_PREFIX = 'stellar:channel'` at :41), and the cumulative record
+ *     keeps `settling: true` forever after a successful close (:239-243 set
+ *     it; :337 clears only the separate settling marker). Without this read a
+ *     closed production channel reports `closing` for ever.
  *     All of these are plain reads; nothing here verifies, advances, rolls
  *     back or settles a voucher.
  *
@@ -390,9 +399,10 @@ export function rawToUsd(raw: string | null | undefined): number {
  * Lifecycle, in precedence order, because a channel can be unspendable while
  * money still appears to remain:
  *
- *   1. `blocked` — the channel carries a closed or fenced marker, so the
- *      dispatch gate rejects every further call. Report `closed` even with a
- *      positive remaining balance.
+ *   1. `blocked` — the channel carries a closed or fenced marker (either the
+ *      playground's `pg:channel:closed|fenced:<C>` or mppx's own
+ *      `stellar:channel:closed:<C>`), so the dispatch gate rejects every
+ *      further call. Report `closed` even with a positive remaining balance.
  *   2. `settling` — a settlement is in flight on the cumulative record. mppx
  *      will not accept a new voucher past it, so the channel is `closing`.
  *   3. Otherwise the deposit decides: funds left → `open`, drained → `closed`.
@@ -416,6 +426,27 @@ export function channelStatus(
  * `rollbackFailedChannelVoucher` inspects. A missing record means no voucher
  * has ever been accepted. Read-only.
  */
+/**
+ * mppx's own successful-close marker, written by the library's `close` action
+ * at node_modules/@stellar/mpp/dist/channel/server/Channel.js:330 as
+ * `${STORE_PREFIX}:closed:<C>` with `STORE_PREFIX = 'stellar:channel'` (:41).
+ * The library exports no key builder for it (see
+ * dist/channel/server/index.d.ts), so the key is spelled out here, next to the
+ * cumulative key it sits beside on the same atomic store.
+ *
+ * Needed because the cumulative record's `settling` flag is never cleared on a
+ * successful close (:239-243 set it, :337 deletes only the separate settling
+ * marker), so a production channel that really did close would otherwise read
+ * `closing` for ever. Read-only.
+ */
+export async function readMppxChannelClosed(
+  env: Env,
+  channelContract: string,
+): Promise<boolean> {
+  const store = Store.cloudflare(doAtomicParams(env.ATOMIC_STORE))
+  return (await store.get(`stellar:channel:closed:${channelContract}`)) != null
+}
+
 export async function readChannelCumulative(
   env: Env,
   channelContract: string,
@@ -448,10 +479,14 @@ export async function handleMeSessions(request: Request, env: Env): Promise<Resp
 
   // Both reads hit the same strongly-consistent atomic store the spend path
   // uses, so a channel that just became unspendable cannot still read `open`.
-  const [cumulative, blocked] = await Promise.all([
+  const [cumulative, playgroundBlocked, mppxClosed] = await Promise.all([
     readChannelCumulative(env, state.channelContract),
     isChannelBlocked(env, state.channelContract),
+    readMppxChannelClosed(env, state.channelContract),
   ])
+  // Either marker means the channel is finished: the playground settlement
+  // path writes its own, a library-driven `close` writes mppx's.
+  const blocked = playgroundBlocked || mppxClosed
   const budget_usd = rawToUsd(state.depositRaw)
   const spent_usd = rawToUsd(cumulative.amountRaw)
   const remaining_usd = Math.max(0, budget_usd - spent_usd)
