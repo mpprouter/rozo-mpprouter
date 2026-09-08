@@ -269,11 +269,21 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
 /**
  * Model used for the optional one-line narrative in the Blend chip. Moved off
  * claude-haiku-4-5 on 2026-08-18 when the anthropic route was delisted — the
- * chip would otherwise pay for a call the merchant refuses. groq's
- * llama-3.1-8b-instant is charge-verified and was re-probed with a real paid
- * call on 2026-08-13.
+ * chip would otherwise pay for a call the merchant refuses.
+ *
+ * Moved off groq's llama-3.1-8b-instant on 2026-09-08 for exactly the same
+ * reason: that id is retired upstream. The merchant has answered
+ * model_not_found after payment since 2026-08-24 (documented in
+ * services/merchants.ts), and a paid /groq/models listing on 2026-09-08
+ * returned 14 ids without it, so the chip was paying for a call that could
+ * only be refunded. deepseek-v4-flash is the other charge-verified entry in
+ * PLAYGROUND_MODELS and was re-confirmed by a paid call on 2026-09-07.
+ *
+ * NOTE: the llama-3.1-8b-instant entry in PLAYGROUND_MODELS is still
+ * `available: true` and is deliberately left alone here — flipping it is a
+ * public-surface change that several test suites pin. Tracked separately.
  */
-export const BLEND_SUMMARY_MODEL_ID = 'llama-3.1-8b-instant'
+export const BLEND_SUMMARY_MODEL_ID = 'deepseek-v4-flash'
 
 export function findModel(id: string): PlaygroundModel | undefined {
   return PLAYGROUND_MODELS.find(m => m.id === id)

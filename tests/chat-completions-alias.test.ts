@@ -27,7 +27,12 @@ describe('OpenAI chat completions facade', () => {
     const body = await response.json() as { data: Array<{ id: string }> }
     expect(body.data.map(model => model.id).sort()).toEqual([
       'claude-haiku-4-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5',
-      'deepseek-v4-flash', 'grok-4.3', 'mistral-medium-2505',
+      // deepseek-v4-pro added 2026-09-08: paid list-models returned it and a
+      // paid /deepseek/chat echoed the id back in a completion.
+      'deepseek-v4-flash', 'deepseek-v4-pro', 'grok-4.3',
+      // mistral-medium-2505 retired upstream 2026-09-08 (absent from the paid
+      // /mistral/models listing); 2604 verified by a paid completion.
+      'mistral-medium-2604',
       // groq re-verified 2026-09-02 with the gpt-oss ids (llama ids retired).
       'openai/gpt-oss-120b', 'openai/gpt-oss-20b', 'sonar',
     ])

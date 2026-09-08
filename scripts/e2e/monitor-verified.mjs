@@ -85,7 +85,7 @@ const VERIFIED = [
   { id: 'alchemy', pathVars: { network: 'base-mainnet' }, body: { jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] } },
   { id: 'coingecko', body: { ids: 'bitcoin', vs_currencies: 'usd' } },
   { id: 'deepseek', body: { model: 'deepseek-chat', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
-  { id: 'groq', body: { model: 'llama-3.1-8b-instant', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
+  { id: 'groq', body: { model: 'openai/gpt-oss-20b', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
   // session-mode merchants (still zero-cost to probe — we only read the 402):
   { id: 'openai', body: { model: 'gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },
   { id: 'openrouter', body: { model: 'openai/gpt-4o-mini', messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 } },

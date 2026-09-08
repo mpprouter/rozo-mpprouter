@@ -519,11 +519,23 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-01T16:10:27Z',
-    // Facade: id resolved 2026-08-24 rather than guessed. The paid
-    // /mistral/models call (0.005 USDC) listed `mistral-medium-2505`
-    // (capabilities.completion_chat true), and a follow-up paid /mistral/chat
-    // (0.008 USDC) returned a real completion echoing that same id back.
-    facade: { models: [{ id: 'mistral-medium-2505', available: true }] },
+    // Facade: id resolved by paid probe, never guessed. Refreshed 2026-09-08:
+    // a paid /mistral/models call (0.005 USDC) returned 50 ids and
+    // `mistral-medium-2505` was no longer among them, so a follow-up paid
+    // /mistral/chat (0.008 USDC) on `mistral-medium-2604` returned a real
+    // completion echoing that id back. The retired id stays listed as
+    // unavailable rather than vanishing, per the groq precedent below.
+    facade: {
+      models: [
+        { id: 'mistral-medium-2604', available: true },
+        {
+          id: 'mistral-medium-2505',
+          available: false,
+          unavailableReason:
+            'Upstream retired this id: the paid /mistral/models listing on 2026-09-08 no longer includes it. Use mistral-medium-2604.',
+        },
+      ],
+    },
   },
   // Perplexity chat — paid 0.0092200 USDC, live sonar completion.
   // tx e17f10439d37aafd9594d6f1ef8173a7bdd9657632138bd83c39dad23c93359d
@@ -579,8 +591,15 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     chargeVerifiedAt: '2026-06-22T00:00:00Z',
     // Facade: `deepseek-v4-flash` was echoed back verbatim by a real paid
     // call (2026-06-22 through the router; re-verified 2026-08-13 direct to
-    // the merchant, see src/playground/models.ts).
-    facade: { models: [{ id: 'deepseek-v4-flash', available: true }] },
+    // the merchant, see src/playground/models.ts). `deepseek-v4-pro` added
+    // 2026-09-08: a paid /deepseek/list-models (0.003 USDC) returned it, and a
+    // paid /deepseek/chat (0.004 USDC) returned a completion echoing that id.
+    facade: {
+      models: [
+        { id: 'deepseek-v4-flash', available: true },
+        { id: 'deepseek-v4-pro', available: true },
+      ],
+    },
   },
   // Groq Chat — OpenAI-compatible, very fast inference, tempo.charge.
   // Price dynamic ($0.005–$0.10 by model/tokens).
