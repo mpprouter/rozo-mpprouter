@@ -140,7 +140,7 @@ describe('account masking', () => {
 describe('model allow-list', () => {
   it('accepts a charge-verified model', () => {
     // Was claude-haiku-4-5 until the 2026-08-18 anthropic delisting.
-    const model = assertModelCallable('llama-3.1-8b-instant')
+    const model = assertModelCallable('openai/gpt-oss-20b')
     expect(model.tier).toBe('cheap')
     expect(TIER_PRICE_USD[model.tier]).toBe('0.02')
   })

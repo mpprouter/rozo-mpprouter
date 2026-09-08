@@ -193,7 +193,7 @@ function chatReq() {
       // after taking payment) and every Claude entry became unavailable.
       // groq is charge-verified and the same $0.02 tier, so nothing this
       // file asserts changes.
-      model: 'llama-3.1-8b-instant',
+      model: 'openai/gpt-oss-20b',
       messages: [{ role: 'user', content: 'hello' }],
     }),
   })
