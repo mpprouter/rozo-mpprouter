@@ -169,16 +169,34 @@ const ANTHROPIC_DELISTED_REASON =
 export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
   // ---- cheap / fast tier ----
   {
-    // Re-verified 2026-08-13 with a REAL PAID CALL bypassing the router
-    // (probe-merchant-direct.ts → groq.mpp.paywithlocus.com/groq/chat,
-    // HTTP 200 + completion). Re-added while the Anthropic Tempo merchant is
-    // down (403-after-pay) — the paywithlocus merchants are healthy.
-    id: 'llama-3.1-8b-instant',
+    // The groq cheap-tier slot. Charge-verified end-to-end 2026-09-02 (real
+    // paid calls, see services/merchants.ts) and present on the paid
+    // /groq/models listing taken 2026-09-08. Took this slot from
+    // llama-3.1-8b-instant, which the merchant no longer serves.
+    id: 'openai/gpt-oss-20b',
     tier: 'cheap',
     provider: 'groq',
     routePublicPath: '/v1/services/groq/chat',
     routeMethod: 'POST',
     available: true,
+  },
+  {
+    // Retired upstream. This entry was `available: true` until 2026-09-08,
+    // which meant the playground offered a model every call to which the
+    // merchant answers model_not_found after taking payment — the router
+    // refunds, but the user's call still fails. Groq has behaved this way
+    // since 2026-08-24 (documented in services/merchants.ts) and the paid
+    // /groq/models listing on 2026-09-08 returned 14 ids without this one.
+    // Kept listed-but-unavailable rather than deleted, per the convention
+    // above.
+    id: 'llama-3.1-8b-instant',
+    tier: 'cheap',
+    provider: 'groq',
+    routePublicPath: '/v1/services/groq/chat',
+    routeMethod: 'POST',
+    available: false,
+    unavailableReason:
+      'Groq retired this id: the merchant answers model_not_found after payment (the router refunds automatically), and the paid /groq/models listing on 2026-09-08 no longer includes it. Use openai/gpt-oss-20b.',
   },
   {
     // Re-verified 2026-08-13 with a REAL PAID CALL bypassing the router
@@ -279,9 +297,8 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
  * only be refunded. deepseek-v4-flash is the other charge-verified entry in
  * PLAYGROUND_MODELS and was re-confirmed by a paid call on 2026-09-07.
  *
- * NOTE: the llama-3.1-8b-instant entry in PLAYGROUND_MODELS is still
- * `available: true` and is deliberately left alone here — flipping it is a
- * public-surface change that several test suites pin. Tracked separately.
+ * (That llama entry was flipped to `available: false` on 2026-09-08; the
+ * groq cheap-tier slot is now openai/gpt-oss-20b.)
  */
 export const BLEND_SUMMARY_MODEL_ID = 'deepseek-v4-flash'
 

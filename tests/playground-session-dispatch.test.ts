@@ -178,7 +178,7 @@ describe('seam selection', () => {
     const route = resolvePlaygroundRoute('/v1/services/groq/chat', 'POST')
     expect(route.upstreamPaymentMethod).toBe('tempo.charge')
 
-    await callUpstream(env, { route, body: { model: 'llama-3.1-8b-instant' }, budgetAtomic: ANY_BUDGET })
+    await callUpstream(env, { route, body: { model: 'openai/gpt-oss-20b' }, budgetAtomic: ANY_BUDGET })
 
     expect(payMerchant).toHaveBeenCalledTimes(1)
     expect(payMerchantSession).not.toHaveBeenCalled()
@@ -281,7 +281,7 @@ describe('channel not installed', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-500'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'call-500'),
       env,
     )
     expect(response.status).toBe(502)
@@ -308,7 +308,7 @@ describe('channel not installed', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-timeout'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'call-timeout'),
       env,
     )
     expect(response.status).toBe(502)
@@ -337,7 +337,7 @@ describe('channel not installed', () => {
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-leak'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'call-leak'),
       env,
     )
     expect(await response.text()).not.toContain('secret-upstream-detail')
@@ -352,7 +352,7 @@ describe('tier pricing through the full call path', () => {
     payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-cheap'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'call-cheap'),
       env,
     )
     expect(response.status).toBe(200)
@@ -404,7 +404,7 @@ describe('tier pricing through the full call path', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
+        model: 'openai/gpt-oss-20b',
         // Every one of these must be dropped: they are the fields that turn a
         // flat-priced demo call into an unbounded bill.
         max_tokens: 100000,
@@ -430,11 +430,11 @@ describe('tier pricing through the full call path', () => {
     const bearer = await token()
     payMerchant.mockImplementation(paidCharge)
 
-    await handlePlaygroundChat(chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'), env)
+    await handlePlaygroundChat(chatRequest('openai/gpt-oss-20b', bearer, 'call-retry'), env)
     expect(payMerchant).toHaveBeenCalledTimes(1)
 
     const retry = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-retry'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'call-retry'),
       env,
     )
     const body = await retry.json()
@@ -466,17 +466,20 @@ describe('model catalog after the 2026-08-18 anthropic delisting', () => {
     expect(flagship.filter(m => m.available)).toHaveLength(0)
   })
 
-  it('cheap tier: groq + deepseek callable, delisted claude-haiku-4-5 still listed', () => {
+  it('cheap tier: groq + deepseek callable, retired groq id and delisted claude-haiku-4-5 still listed', () => {
     const cheap = PLAYGROUND_MODELS.filter(m => m.tier === 'cheap')
     expect(cheap.map(m => m.id)).toEqual([
+      'openai/gpt-oss-20b',
+      // Retired upstream 2026-09-08, kept listed with a reason.
       'llama-3.1-8b-instant',
       'deepseek-v4-flash',
       'claude-haiku-4-5',
     ])
     expect(cheap.filter(m => m.available).map(m => m.id)).toEqual([
-      'llama-3.1-8b-instant',
+      'openai/gpt-oss-20b',
       'deepseek-v4-flash',
     ])
+    expect(findModel('llama-3.1-8b-instant')!.available).toBe(false)
     expect(findModel('claude-haiku-4-5')!.available).toBe(false)
     expect(TIER_PRICE_USD.cheap).toBe('0.02')
   })
@@ -613,7 +616,7 @@ describe('upstream budget ceiling (P0-2)', () => {
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-overbudget'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'call-overbudget'),
       env,
     )
     expect(response.status).toBe(502)
@@ -634,7 +637,7 @@ describe('upstream budget ceiling (P0-2)', () => {
     payMerchant.mockImplementation(paidCharge)
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'call-flat'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'call-flat'),
       env,
     )
     expect((await response.json()).charged_usd).toBe(TIER_PRICE_USD.cheap)
@@ -685,7 +688,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
     // branches on the request body's marker message — NOT on invocation order,
     // which races under Promise.all — so the outcome is deterministic and the
     // test actually isolates call-locality rather than scheduling luck.
-    // (Charge seam via groq's llama-3.1-8b-instant — the call-local `paid` flag is settled
+    // (Charge seam via groq's openai/gpt-oss-20b — the call-local `paid` flag is settled
     // identically on both seams; the session seam has no callable model now.)
     payMerchant.mockImplementation(async (_e, _u, init, opts) => {
       const sentBody = String((init as any)?.body ?? '')
@@ -700,7 +703,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
+        model: 'openai/gpt-oss-20b',
         call_id: 'concurrent-A',
         messages: [{ role: 'user', content: 'SIGN_THEN_FAIL' }],
       }),
@@ -709,7 +712,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${bearer}` },
       body: JSON.stringify({
-        model: 'llama-3.1-8b-instant',
+        model: 'openai/gpt-oss-20b',
         call_id: 'concurrent-B',
         messages: [{ role: 'user', content: 'REFUSE_BEFORE_SIGN' }],
       }),
@@ -743,7 +746,7 @@ describe('payment evidence is call-local, not route-wide (P0-3 hardening)', () =
     payMerchant.mockResolvedValue(new Response('down', { status: 500 }))
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'initial-500'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'initial-500'),
       env,
     )
     expect(response.status).toBe(502)
@@ -770,7 +773,7 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'sign-threw'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'sign-threw'),
       env,
     )
     expect(response.status).toBe(502)
@@ -797,7 +800,7 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'budget-after-sign'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'budget-after-sign'),
       env,
     )
     expect(response.status).toBe(502)
@@ -822,7 +825,7 @@ describe('paid flag is the single source of truth (settlement precision)', () =>
     )
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'budget-no-sign'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'budget-no-sign'),
       env,
     )
     expect(response.status).toBe(502)
@@ -845,7 +848,7 @@ describe('the ONLY commit predicate is paid === true', () => {
     payMerchant.mockResolvedValue(completion('a real-looking answer')) // no onCredentialSigned
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'unpaid-2xx'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'unpaid-2xx'),
       env,
     )
     expect(response.status).toBe(502)
@@ -873,7 +876,7 @@ describe('the ONLY commit predicate is paid === true', () => {
     })
 
     const response = await handlePlaygroundChat(
-      chatRequest('llama-3.1-8b-instant', bearer, 'paid-empty'),
+      chatRequest('openai/gpt-oss-20b', bearer, 'paid-empty'),
       env,
     )
     expect(response.status).toBe(502)
