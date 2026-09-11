@@ -16,9 +16,14 @@ SCF #44.
 - The off-chain router in this repository is a deferred second engagement.
 - Pre-audit status and reproducible commands:
   [`pre-audit-2026-08-09.md`](pre-audit-2026-08-09.md).
-- Independent report: add the final report PDF and its public URL under
-  `report/` when delivered. The independent audit, not the automated tools,
-  satisfies the tranche's independent-review deliverable.
+- Independent report: **HackenProof Private Security Audit, final report
+  2026-09-11** (audit window 2026-09-02 to 2026-09-08, target commit
+  `a2eb837`). 10 findings: 0 critical, 0 high, 1 medium, 3 low,
+  6 informational, all resolved before the final report. The 29 MB PDF is
+  attached to the `v0.2.1-tranche2` release rather than committed:
+  <https://github.com/mpprouter/rozo-mpprouter/releases/download/v0.2.1-tranche2/HackenProof.Audit.Report.for.MPP.Router.ROZO.pdf>.
+  The independent audit, not the automated tools, satisfies the tranche's
+  independent-review deliverable.
 
 ## Continuous AI review
 
