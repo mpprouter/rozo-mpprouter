@@ -275,6 +275,18 @@ describe('paid gate: receipts and dialects', () => {
     expect(calls).toHaveLength(1)
   })
 
+  it('ignores a non-Stellar MPP WWW-Authenticate and reads the x402 accepts[] beside it (Agent402 shape)', () => {
+    const evmRequest = btoa(JSON.stringify({ amount: '3000', currency: '0x' + 'a'.repeat(40), methodDetails: { chainId: 8453, decimals: 6 }, recipient: '0x' + '4'.repeat(40) }))
+    const headers = new Headers({
+      'www-authenticate': `Payment id="abc", realm="agent402.tools", method="evm", intent="charge", request="${evmRequest}"`,
+      'payment-required': b64(agent402Challenge()),
+    })
+    const parsed = parseProviderChallenge(402, headers, '')
+    expect(parsed?.dialect).toBe('x402')
+    expect(parsed?.accepts.find(a => a.network === 'stellar:pubnet')?.payTo).toBe(PROVIDER)
+    expect(parsed?.accepts.some(a => a.payTo.startsWith('0x') && a.network === 'stellar:pubnet')).toBe(false)
+  })
+
   it('parses v1 and v2 x402 bodies and mppx headers into one challenge shape', () => {
     const v1 = parseProviderChallenge(402, new Headers(), JSON.stringify({ x402Version: 1, accepts: [{ scheme: 'exact', network: 'base', payTo: '0x' + '1'.repeat(40), maxAmountRequired: '3000' }] }))
     expect(v1).toMatchObject({ dialect: 'x402', x402Version: 1, accepts: [{ network: 'base', amount: '3000', decimals: 6 }] })
