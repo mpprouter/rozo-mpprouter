@@ -11,6 +11,7 @@ import { getProviderRecord, resetProviderCache, routesForProvider } from '../src
 import { hostedOriginHeaders, hostedProviderIdFor, openHostingSecret, resolveHostedRoute, sealHosting, validateHosting } from '../src/services/provider-hosting'
 import { isDirectSettlementRoute } from '../src/routes/provider-relay'
 import { listCatalogWithOverlay } from '../src/services/catalog-overlay'
+import { handleProxy } from '../src/routes/proxy'
 
 const PAYOUT = Keypair.random().publicKey()
 
@@ -168,8 +169,37 @@ describe('hosted routes in the catalog and the proxy', () => {
     expect(entry.methods.stellar.intents).toEqual([])
     const resolved = await resolveHostedRoute(env, 'acme-data.pay.mpprouter.dev', '/v1/quote', 'GET')
     expect(resolved?.id).toBe('acme-data_quote')
+    // Resolvable while still pending, so the paid verification can reach it.
+    const fresh = makeEnv()
+    await handleProviderRegister(post(registration), fresh)
+    expect((await resolveHostedRoute(fresh, 'acme-data.pay.mpprouter.dev', '/v1/quote', 'GET'))?.id).toBe('acme-data_quote')
+    const rec = (await getProviderRecord(fresh, 'acme-data'))!
+    rec.status = 'suspended'; await fresh.MPP_STORE.put('provider:acme-data', JSON.stringify(rec))
+    expect(await resolveHostedRoute(fresh, 'acme-data.pay.mpprouter.dev', '/v1/quote', 'GET')).toBeUndefined()
     expect(await resolveHostedRoute(env, 'acme-data.pay.mpprouter.dev', '/v1/other', 'GET')).toBeUndefined()
     expect(await resolveHostedRoute(env, 'other.pay.mpprouter.dev', '/v1/quote', 'GET')).toBeUndefined()
+  })
+
+  it('never passes a non-x402 credential or a channel bootstrap through to the origin', async () => {
+    const env = makeEnv()
+    await handleProviderRegister(post(registration), env)
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('should not be called', { status: 200 }))
+    const ctx = { waitUntil() {} } as any
+    for (const req of [
+      new Request('https://acme-data.pay.mpprouter.dev/v1/quote', { headers: { Authorization: 'Bearer stolen-or-random' } }),
+      new Request('https://acme-data.pay.mpprouter.dev/v1/quote?payment=channel&agent=' + PAYOUT),
+    ]) {
+      const res = await handleProxy(req, env, ctx)
+      expect(res.status).toBe(402)
+      expect(await res.json()).toMatchObject({ error: 'x402 required' })
+    }
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('refuses a second payout network on a hosted registration', async () => {
+    const res = await handleProviderRegister(post({ ...registration, payouts: [...registration.payouts, { network: 'eip155:8453', pay_to: '0x' + '1'.repeat(40) }] }), makeEnv())
+    expect(res.status).toBe(400)
+    expect(await res.json()).toMatchObject({ field: 'payouts' })
   })
 
   it('builds origin headers with the provider credential and none of the buyer credentials', async () => {

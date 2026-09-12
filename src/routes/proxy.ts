@@ -1460,22 +1460,6 @@ export async function handleProxy(
     route.operator?.payouts.find(p => p.network.startsWith('stellar:'))?.payTo,
   )
 
-  // HOSTED PAYWALL (services/provider-hosting.ts): x402 only. The mppx
-  // charge/channel branches settle the buyer's money at verify time,
-  // before the origin is called; on a route we host that would charge a
-  // buyer for an origin 500 with no refund. The x402 branch settles only
-  // after the origin's 2xx, so an mppx credential is answered with the
-  // x402 challenge and nothing is settled.
-  if (route.hosted && (rawAuthKind === 'stellar.charge' || rawAuthKind === 'stellar.channel')) {
-    const header = route.fixedPricing
-      ? buildX402PaymentRequiredHeader(env, BigInt(fixedPriceToBaseUnits6(route.fixedPricing.amountUsd)), request.url, route.operator)
-      : null
-    return new Response(JSON.stringify({
-      error: 'x402 required',
-      detail: 'This router-hosted route accepts x402 payments only (PAYMENT-SIGNATURE). MPP charge credentials settle before delivery and are not accepted here.',
-    }), { status: 402, headers: { 'Content-Type': 'application/json', ...(header ? { 'Payment-Required': header } : {}) } })
-  }
-
   // V2 §6-D2 query-param bootstrap: agents that want the stellar.channel
   // flow on their FIRST request (before any credential has been signed)
   // advertise their intent by passing `?payment=channel&agent=G...` in
@@ -1493,6 +1477,24 @@ export async function handleProxy(
   let authKind: typeof rawAuthKind = rawAuthKind
   if (authKind === 'none' && paymentHint === 'channel' && agentHint) {
     authKind = 'stellar.channel'
+  }
+
+  // HOSTED PAYWALL (services/provider-hosting.ts): x402 only, and never
+  // passthrough. The mppx charge/channel branches settle the buyer's money
+  // at verify time, before the origin is called — on a route we host that
+  // would charge a buyer for an origin 500 with no refund. Passthrough
+  // would hand the origin an unpaid request. So anything that is not a
+  // Stellar x402 credential (or no credential, which yields the 402 below)
+  // is answered with the x402 challenge and nothing else happens. Checked
+  // AFTER the channel bootstrap so `?payment=channel` cannot slip past.
+  if (route.hosted && authKind !== 'stellar.x402' && authKind !== 'none') {
+    const header = route.fixedPricing
+      ? buildX402PaymentRequiredHeader(env, BigInt(fixedPriceToBaseUnits6(route.fixedPricing.amountUsd)), request.url, route.operator)
+      : null
+    return new Response(JSON.stringify({
+      error: 'x402 required',
+      detail: 'This router-hosted route accepts Stellar x402 payments only (PAYMENT-SIGNATURE, exact scheme, stellar:pubnet). Other credentials are not forwarded and nothing was charged.',
+    }), { status: 402, headers: { 'Content-Type': 'application/json', ...(header ? { 'Payment-Required': header } : {}) } })
   }
 
   if (authKind === 'passthrough') {

@@ -106,7 +106,8 @@ const MAX_ROUTES_PER_PROVIDER = 25
 
 /**
  * Calls per day the gateway will make to a hosted provider's origin, per
- * route. Protects the provider's own API quota from router-side traffic;
+ * PROVIDER (the cap key is the service id, shared by all its routes).
+ * Protects the provider's own API quota from router-side traffic;
  * enforced before any 402 is issued so a capped call costs nothing.
  */
 export const HOSTED_DAILY_CAP = 2000
@@ -285,6 +286,9 @@ const PRICE_PATTERN = /^\d+(?:\.\d{1,7})?$/
 const RESERVED_IDS = new Set([
   'rozo', 'mpp', 'mpprouter', 'router', 'admin', 'internal', 'system',
   'stellar', 'x402', 'playground', 'partner', 'coupon', 'health', 'stats',
+  // Snapshot service ids whose per-service rate-limit bucket a provider
+  // must not share (the cap key is `ratelimit:<service>:<day>`).
+  'mercury', 'pay', 'www', 'api', 'apiserver',
 ])
 
 export class ProviderValidationError extends Error {

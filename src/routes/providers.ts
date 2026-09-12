@@ -40,6 +40,7 @@ import {
   putProviderRecord,
   validateRegistration,
   publicPathFor,
+  validateApiBaseUrl,
   ProviderValidationError,
   type ProviderRecord,
   type ProviderCheck,
@@ -76,23 +77,11 @@ import {
   hostedOriginFor,
   hostedProviderIdFor,
   hostingAvailable,
+  routerFetch,
   sealHosting,
   validateHosting,
   type StoredHosting,
 } from '../services/provider-hosting'
-
-/**
- * fetch for verification probes: a hosted hostname is this Worker, and the
- * platform refuses a Worker's network request to itself, so those go
- * through the SELF service binding. Everything else is a normal fetch.
- */
-function routerFetch(env: Env): typeof fetch {
-  return (input: any, init?: any) => {
-    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
-    if (env.SELF && hostedProviderIdFor(env, new URL(url).hostname)) return env.SELF.fetch(new Request(url, init))
-    return fetch(input, init)
-  }
-}
 
 function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload, null, 2), {
@@ -272,7 +261,7 @@ function describeProof(proof: string | undefined): string | null {
     case 'x402_pay_to':
       return 'The live 402 at the registered origin advertises exactly the registered payout address: the endpoint\'s own payout configuration matches. Not key custody, and not proof of who submitted the form.'
     case 'hosted_origin_auth':
-      return 'MPP Router hosts the paywall; the origin served the paid verification call with the credential the registrant supplied or configured. Proves the registrant can authenticate to the origin. Not key custody of the payout address, and not proof of who runs the origin.'
+      return 'MPP Router hosts the paywall; the origin served the paid verification call carrying the credential the registrant supplied or configured. If the origin requires that credential this shows the registrant can authenticate to it; an origin that answers without checking it proves nothing about the registrant. Not key custody of the payout address, and not proof of who runs the origin.'
     default:
       return null
   }
@@ -465,8 +454,11 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
   if (!hostedRequested && hostedProviderIdFor(env, new URL(validated.apiBaseUrl).hostname)) {
     return json(400, { error: 'invalid_registration', field: 'api_base_url', detail: 'That hostname is a router-hosted paywall. Register with a hosting block instead.' })
   }
-  if (hostedRequested && !validated.payouts.some(p => p.network.startsWith('stellar:'))) {
-    return json(400, { error: 'invalid_registration', field: 'payouts', detail: 'A router-hosted paywall settles on Stellar; a stellar:pubnet payout is required.' })
+  if (hostedRequested && !(validated.payouts.length === 1 && validated.payouts[0].network.startsWith('stellar:'))) {
+    // The hosted 402 advertises every registered payout, but only the
+    // Stellar leg is verified and settled by this router; a Base/Solana
+    // entry would be an unpaid path to the origin. Stellar only.
+    return json(400, { error: 'invalid_registration', field: 'payouts', detail: 'A router-hosted paywall settles on Stellar only: register exactly one stellar:pubnet payout.' })
   }
 
   for (const payout of validated.payouts) {
@@ -600,7 +592,12 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
       if (!existing?.hosting) {
         return json(400, { error: 'invalid_registration', field: 'hosting', detail: 'auth.keep needs an existing hosted registration to keep the credential from.' })
       }
-      hosting = existing.hosting
+      // Keep the credential; a new origin_url in the same update still applies.
+      const nextOrigin = body.hosting?.origin_url ? validateApiBaseUrl(String(body.hosting.origin_url)) : existing.hosting.originUrl
+      if (hostedProviderIdFor(env, new URL(nextOrigin).hostname)) {
+        return json(400, { error: 'invalid_registration', field: 'hosting', detail: 'origin_url cannot point at a hosted hostname.' })
+      }
+      hosting = { ...existing.hosting, originUrl: nextOrigin }
     } else if (hosted) {
       hosting = await sealHosting(env, hosted)
     }

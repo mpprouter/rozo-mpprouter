@@ -46,7 +46,7 @@
 
 import type { Env } from '../index'
 import type { PublicServiceRoute } from './merchants-types'
-import { getProviderRecord, listOverlayRoutes, validateApiBaseUrl, ProviderValidationError } from './provider-registry'
+import { getProviderRecord, routesForProvider, validateApiBaseUrl, ProviderValidationError } from './provider-registry'
 
 export const DEFAULT_HOSTED_SUFFIX = 'pay.mpprouter.dev'
 
@@ -233,6 +233,24 @@ export async function resolveHostedRoute(
 ): Promise<PublicServiceRoute | undefined> {
   const id = hostedProviderIdFor(env, hostname)
   if (!id) return undefined
-  const routes = await listOverlayRoutes(env)
-  return routes.find(r => r.hosted && r.operator?.id === id && r.hostedPath === pathname && r.method === method.toUpperCase())
+  // From the authoritative record, not the published index: the paid
+  // verification that PUBLISHES a hosted provider has to reach its routes
+  // while the record is still `pending`. A pending hosted route is payable
+  // (money to the provider, origin called) but not listed anywhere.
+  const record = await getProviderRecord(env, id)
+  if (!record?.hosting || record.status === 'suspended') return undefined
+  return routesForProvider(record).find(r => r.hostedPath === pathname && r.method === method.toUpperCase())
+}
+
+/**
+ * fetch for anything that may address a hosted hostname: this Worker
+ * cannot make a network request to its own route, so those go through
+ * the SELF service binding; everything else is a plain fetch.
+ */
+export function routerFetch(env: Env): typeof fetch {
+  return (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    if (env.SELF && hostedProviderIdFor(env, new URL(url).hostname)) return env.SELF.fetch(new Request(url, init))
+    return fetch(input, init)
+  }
 }
