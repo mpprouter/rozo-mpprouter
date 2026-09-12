@@ -248,6 +248,14 @@ export interface PublicServiceRoute {
    * control.
    */
   operator?: RouteOperator
+  /**
+   * Which 402 dialect the operator's endpoint was observed to speak at
+   * verification. Only meaningful alongside `operator`; drives the
+   * catalog's `payment_hints.dialect` for relayed routes.
+   */
+  upstreamDialect?: 'x402' | 'mppx'
+  /** Explicit capability contract the operator declared for this route. */
+  capability?: string
 }
 
 /**
@@ -501,6 +509,8 @@ export interface PublicCatalogEntry {
     amount_usdc?: string | null
     asset_sac?: string
     requires_classic_usdc_trustline?: boolean
+    /** True when the router forwards the provider's own 402 rather than issuing one. */
+    relayed?: boolean
     recommended_wallet_preflight?: Array<
       'account_exists' | 'classic_usdc_trustline' | 'usdc_balance_gte_amount' | 'xlm_reserve_ok'
     >
@@ -540,4 +550,13 @@ export interface PublicCatalogEntry {
    *     address. No ROZO custody at any point.
    */
   settlement?: 'direct'
+  /**
+   * `'relay'` — the router forwards the buyer's request and payment
+   * credential to the provider's own endpoint and returns its answer,
+   * 402 included; it issues no challenge and settles nothing. The only
+   * mode direct-settlement routes have (see routes/provider-relay.ts).
+   */
+  settlement_mode?: 'relay'
+  /** Explicit capability contract the operator declared; see provider-capabilities.ts. */
+  capability?: string
 }

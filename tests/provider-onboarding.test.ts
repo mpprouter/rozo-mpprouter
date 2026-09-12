@@ -481,13 +481,45 @@ describe('probe-402 gate', () => {
     vi.restoreAllMocks()
   })
 
-  it('fails when the endpoint offers a chain the provider never registered', async () => {
+  it('fails when the endpoint never advertises the network the provider registered', async () => {
+    // Registered stellar:pubnet, but the live 402 only offers Base: the
+    // registered address is unproven against the server, so no listing.
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       challengeResponse(x402Body('0x' + '2'.repeat(40), '10000', 'eip155:8453')),
     )
     const result = await gateProbe402(record, spec)
     expect(result.ok).toBe(false)
-    expect(result.ok === false && result.code).toBe('unregistered_network')
+    expect(result.ok === false && result.code).toBe('payout_not_advertised')
+    vi.restoreAllMocks()
+  })
+
+  it('passes a multi-chain challenge and reports the networks it will not list', async () => {
+    // Agent402's shape: Base, Solana and Stellar in one accepts[]. Only the
+    // registered network has to match; the rest are reported, not listed.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      challengeResponse({
+        x402Version: 2,
+        accepts: [
+          { scheme: 'exact', network: 'eip155:8453', payTo: '0x' + '2'.repeat(40), amount: '10000', asset: '0x' + 'a'.repeat(40) },
+          { scheme: 'exact', network: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', payTo: 'So1anaAddress', amount: '10000' },
+          { scheme: 'exact', network: 'stellar:pubnet', payTo: PROVIDER_ADDRESS, amount: '100000', asset: 'USDC' },
+        ],
+      }),
+    )
+    const result = await gateProbe402(record, spec)
+    expect(result.ok).toBe(true)
+    expect(result.ok && result.dialect).toBe('x402')
+    expect(result.ok && result.unlistedNetworks).toEqual(['eip155:8453', 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp'])
+    vi.restoreAllMocks()
+  })
+
+  it('compares EVM payTo case-insensitively, exactly as the ownership proof does', async () => {
+    const evmRecord = { ...record, payouts: [{ network: 'eip155:8453', payTo: '0xABCDEF' + '1'.repeat(34), asset: 'USDC' }] }
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      challengeResponse(x402Body('0xabcdef' + '1'.repeat(34), '10000', 'eip155:8453')),
+    )
+    const result = await gateProbe402(evmRecord as any, spec)
+    expect(result.ok).toBe(true)
     vi.restoreAllMocks()
   })
 

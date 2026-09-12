@@ -64,6 +64,7 @@ import {
   getRouteWithOverlay,
 } from '../services/catalog-overlay'
 import type { Env } from '../index'
+import { isDirectSettlementRoute, relayDirectSettlementRoute } from './provider-relay'
 import { redactForAlert } from '../utils/alert-redaction'
 
 /**
@@ -1262,6 +1263,16 @@ export async function handleProxy(
       status: 400,
       headers: { 'Content-Type': 'application/json' },
     })
+  }
+
+  // DIRECT SETTLEMENT (2026-09-12): a self-serve provider route is relayed
+  // to the provider's own 402 and never enters the payment machinery below.
+  // See routes/provider-relay.ts for why the earlier "settle to the
+  // provider, then call them unpaid" shape charged the buyer for a 502.
+  // Placed first because nothing below may sign, settle or issue a
+  // challenge for a route whose money must not pass through us.
+  if (isDirectSettlementRoute(route)) {
+    return relayDirectSettlementRoute(request, env, ctx, route)
   }
 
   // SECURITY GATE (Option A, 2026-06-23): block ONLY routes we have

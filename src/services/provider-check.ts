@@ -67,6 +67,7 @@ export async function inspectProviderUrl(rawUrl: string) {
   let routeUrl = url.toString()
   let method: 'GET' | 'POST' = 'GET'
   let accepts = challenge?.accepts ?? []
+  let dialect = challenge?.dialect
   if (!challenge) {
     try {
       let manifest: { resources?: Array<Record<string, unknown>> }
@@ -93,7 +94,9 @@ export async function inspectProviderUrl(rawUrl: string) {
         const probe = await fetch(routeUrl, { method, redirect: 'manual', ...(method === 'POST' ? { body: '{}' } : {}), signal: AbortSignal.timeout(10_000) })
         if (isRedirect(probe)) throw new Error('route probe redirects; serve the route on the submitted origin')
         const probeText = await readBoundedText(probe)
-        accepts = parseProviderChallenge(probe.status, probe.headers, probeText)?.accepts ?? []
+        const probed = parseProviderChallenge(probe.status, probe.headers, probeText)
+        accepts = probed?.accepts ?? []
+        dialect = probed?.dialect
       }
     } catch { /* A live 402 is the fallback discovery format. */ }
   }
@@ -102,6 +105,7 @@ export async function inspectProviderUrl(rawUrl: string) {
   const route = new URL(routeUrl)
   const priceUsd = first ? (Number(first.amount) / 10 ** first.decimals).toFixed(first.decimals).replace(/0+$/, '').replace(/\.$/, '') : undefined
   return {
+    dialect: discovered ? dialect : undefined,
     checks: [
       website,
       check('service_discovered', discovered ? 'passed' : 'failed', discovered ? 'At least one live paid route was discovered.' : 'No usable route was found in a manifest or live 402.'),

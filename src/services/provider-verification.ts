@@ -9,11 +9,12 @@
  *
  *   Gate 1 — `probe-402` (free). Call the provider's endpoint with no
  *   credential and read the challenge it returns. It must be a 402, it
- *   must parse, its `payTo` must equal the address they registered and
- *   proved they hold, and its price must match what they declared. This
- *   catches the whole class of "the form says one thing and the server
- *   says another", including the important one: a server quoting an
- *   address the registrant does not control.
+ *   must parse, every payout address the provider REGISTERED must appear
+ *   in it on its own network with exactly that address, and the price on
+ *   those networks must match what they declared. This catches the whole
+ *   class of "the form says one thing and the server says another",
+ *   including the important one: a server quoting an address the
+ *   registrant does not control.
  *
  *   Gate 2 — the real-money gate. Our test wallet pays one minimal call
  *   through the provider's own 402 and asserts a 200 with a body. The
@@ -26,6 +27,28 @@
  * destination is a non-ROZO key, produced by the onboarding flow itself
  * rather than by an operator running a script.
  *
+ * ## Two dialects, one wallet
+ *
+ * A provider's 402 arrives in one of two shapes, and both are real:
+ * `@stellar/mpp` servers emit an mppx `WWW-Authenticate` challenge, and
+ * x402-native providers (Agent402 among them) emit `accepts[]` in a
+ * `PAYMENT-REQUIRED` header or JSON body. Gate 1 reads both; gate 2 pays
+ * each with the client that speaks it — `mppx` for the first, `@x402/core`
+ * + `@x402/stellar` for the second — from the same verification keypair.
+ * Paying an x402 challenge with the mppx client (the 2026-09-05 shape) did
+ * not fail loudly; it failed as `paid_call_failed` with a message about
+ * assets, which is what an x402-native provider would have hit at the
+ * last step of an otherwise honest flow.
+ *
+ * ## Networks the provider advertises but did not register
+ *
+ * A multi-chain x402 provider typically advertises Base, Solana and
+ * Stellar in one challenge. The registration only has to prove the
+ * networks it wants LISTED; the others are reported back as
+ * `unlisted_networks` and never published. Nothing in this router routes
+ * a buyer to an address that was not registered and proven, so an extra
+ * advertised network is the provider's business, not a gate failure.
+ *
  * ## Everything here fails closed
  *
  * Any error, timeout, unparseable response, missing config or unfunded
@@ -37,6 +60,9 @@
 import { Mppx } from 'mppx/client'
 import { stellar } from '@stellar/mpp/charge/client'
 import { Keypair } from '@stellar/stellar-sdk'
+import { x402Client, x402HTTPClient } from '@x402/core/client'
+import { ExactStellarScheme } from '@x402/stellar/exact/client'
+import { createEd25519Signer } from '@x402/stellar'
 import type { Env } from '../index'
 import type { ProviderRecord, ProviderRouteSpec } from './provider-registry'
 
@@ -63,30 +89,52 @@ const PAID_CALL_TIMEOUT_MS = 45_000
  * that the worst case of a completely hostile registry — every slot
  * filled, every one paid once — is a rounding error.
  */
-const MAX_VERIFY_PAYMENT_USD = 0.02
+export const MAX_VERIFY_PAYMENT_USD = 0.02
 
 /** Daily ceiling across all verifications, in USD. Same reasoning, aggregated. */
 const DAILY_VERIFY_BUDGET_USD = 2.0
 
 const DAILY_SPEND_PREFIX = 'providerVerifySpend:'
 
-export type GateResult =
-  | { ok: true; detail: string; txHash?: string; network?: string }
-  | { ok: false; code: string; detail: string }
+export type ChallengeDialect = 'x402' | 'mppx'
 
-function failure(code: string, detail: string): GateResult {
-  return { ok: false, code, detail }
+export type GateResult =
+  | {
+      ok: true
+      detail: string
+      txHash?: string
+      network?: string
+      dialect?: ChallengeDialect
+      /** Networks the provider advertises that the registration did not claim. */
+      unlistedNetworks?: string[]
+    }
+  | {
+      ok: false
+      code: string
+      detail: string
+      /**
+       * Set when money may already have moved. A failure that carries a
+       * hash is reconcilable from the chain; one without is not, and the
+       * claim store keeps it frozen rather than paying again.
+       */
+      txHash?: string
+      dialect?: ChallengeDialect
+    }
+
+function failure(code: string, detail: string, extra: { txHash?: string; dialect?: ChallengeDialect } = {}): GateResult {
+  return { ok: false, code, detail, ...extra }
 }
 
 async function fetchWithTimeout(
   url: string,
   init: RequestInit,
   timeoutMs: number,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    return await fetch(url, { ...init, signal: controller.signal })
+    return await fetchImpl(url, { ...init, signal: controller.signal })
   } finally {
     clearTimeout(timer)
   }
@@ -104,6 +152,16 @@ function toBaseUnits(decimalUsd: string, decimals: number): bigint | null {
   return BigInt(whole + frac.padEnd(decimals, '0'))
 }
 
+/**
+ * Address equality per network. EVM addresses are case-insensitive
+ * (EIP-55 is a checksum, not an identity); Stellar and Solana are
+ * case-sensitive base32/base58 and must match exactly. Shared with the
+ * ownership proof so the two gates cannot disagree about the same pair.
+ */
+export function sameAddress(network: string, a: string, b: string): boolean {
+  return network.startsWith('eip155:') ? a.toLowerCase() === b.toLowerCase() : a === b
+}
+
 // ---------------------------------------------------------------------
 // Challenge parsing
 // ---------------------------------------------------------------------
@@ -111,8 +169,10 @@ function toBaseUnits(decimalUsd: string, decimals: number): bigint | null {
 export interface ParsedProviderChallenge {
   /** Every settlement option the provider advertises. */
   accepts: Array<{ network: string; payTo: string; amount: string; decimals: number; asset?: string }>
-  /** Which dialect the challenge arrived in, for the error messages. */
-  dialect: 'x402' | 'mppx'
+  /** Which dialect the challenge arrived in, for the error messages and the payer. */
+  dialect: ChallengeDialect
+  /** x402 only: the protocol version the provider speaks (1 or 2). */
+  x402Version?: number
 }
 
 function parseX402Accepts(raw: unknown): ParsedProviderChallenge | null {
@@ -140,7 +200,9 @@ function parseX402Accepts(raw: unknown): ParsedProviderChallenge | null {
       ...(e.asset ? { asset: String(e.asset) } : {}),
     })
   }
-  return out.length > 0 ? { accepts: out, dialect: 'x402' } : null
+  if (out.length === 0) return null
+  const version = typeof body.x402Version === 'number' ? body.x402Version : undefined
+  return { accepts: out, dialect: 'x402', ...(version ? { x402Version: version } : {}) }
 }
 
 function parseMppxChallenge(wwwAuth: string): ParsedProviderChallenge | null {
@@ -225,6 +287,7 @@ export function providerEndpointUrl(record: ProviderRecord, spec: ProviderRouteS
 export async function gateProbe402(
   record: ProviderRecord,
   spec: ProviderRouteSpec,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<GateResult> {
   const url = providerEndpointUrl(record, spec)
   let response: Response
@@ -241,6 +304,7 @@ export async function gateProbe402(
         redirect: 'manual',
       },
       PROBE_TIMEOUT_MS,
+      fetchImpl,
     )
   } catch (err: any) {
     return failure(
@@ -268,33 +332,38 @@ export async function gateProbe402(
     )
   }
 
-  // Every advertised settlement option must point at an address this
-  // provider proved they hold. One good entry among several is not enough:
-  // a client is free to pick any of them, so an unproven entry is a live
-  // path to an unproven address.
-  const proven = new Map(record.payouts.map(p => [p.network, p.payTo]))
-  for (const accept of challenge.accepts) {
-    const expected = proven.get(accept.network)
-    if (!expected) {
+  // Every REGISTERED payout must be advertised, on its own network, with
+  // exactly the registered address. A registered address the endpoint never
+  // quotes is unproven by this gate; an advertised address that differs is
+  // the typo (or the impostor) the whole gate exists to catch.
+  const advertisedNetworks = new Set(challenge.accepts.map(a => a.network))
+  for (const payout of record.payouts) {
+    const onNetwork = challenge.accepts.filter(a => a.network === payout.network)
+    if (onNetwork.length === 0) {
       return failure(
-        'unregistered_network',
-        `The challenge offers settlement on ${accept.network}, which is not in your registration. ` +
-          'Every network your endpoint advertises must have a signature-proven payout address.',
+        'payout_not_advertised',
+        `Your registration lists a ${payout.network} payout, but the live 402 offers no ` +
+          `${payout.network} settlement option, so that address cannot be verified against your server.`,
+        { dialect: challenge.dialect },
       )
     }
-    if (accept.payTo !== expected) {
+    const match = onNetwork.find(a => sameAddress(payout.network, a.payTo, payout.payTo))
+    if (!match) {
       return failure(
         'paytoaddress_mismatch',
-        `The challenge pays ${accept.network} to an address that is not the one you registered. ` +
+        `The challenge pays ${payout.network} to an address that is not the one you registered. ` +
           'Registered and advertised addresses must match exactly.',
+        { dialect: challenge.dialect },
       )
     }
   }
 
   // The price must match what the catalog will advertise, or buyers get a
-  // 402 for one amount after reading another.
-  const declared = toBaseUnits(spec.priceUsd, 7)
+  // 402 for one amount after reading another. Checked on the networks the
+  // registration claims; an unlisted network's price is never published.
+  const registeredNetworks = new Set(record.payouts.map(p => p.network))
   for (const accept of challenge.accepts) {
+    if (!registeredNetworks.has(accept.network)) continue
     const advertised = (() => {
       try {
         return BigInt(accept.amount)
@@ -303,24 +372,32 @@ export async function gateProbe402(
       }
     })()
     if (advertised === null) {
-      return failure('bad_amount', `Challenge amount "${accept.amount}" is not an integer.`)
+      return failure('bad_amount', `Challenge amount "${accept.amount}" is not an integer.`, { dialect: challenge.dialect })
     }
     const declaredHere = toBaseUnits(spec.priceUsd, accept.decimals)
-    if (declaredHere === null || declared === null) {
-      return failure('bad_price', `Declared price "${spec.priceUsd}" is not representable.`)
+    if (declaredHere === null) {
+      return failure('bad_price', `Declared price "${spec.priceUsd}" is not representable.`, { dialect: challenge.dialect })
     }
     if (advertised !== declaredHere) {
       return failure(
         'price_mismatch',
         `Registered ${spec.priceUsd} USD for ${spec.operation}, but the endpoint charges ` +
           `${advertised} base units on ${accept.network} (expected ${declaredHere}).`,
+        { dialect: challenge.dialect },
       )
     }
   }
 
+  const unlisted = [...advertisedNetworks].filter(n => !registeredNetworks.has(n))
   return {
     ok: true,
-    detail: `402 well-formed; ${challenge.accepts.length} settlement option(s), all paying registered addresses.`,
+    detail:
+      `402 well-formed (${challenge.dialect}); every registered payout is advertised at the registered price.` +
+      (unlisted.length > 0
+        ? ` The endpoint also offers ${unlisted.join(', ')}, which is not registered and will not be listed.`
+        : ''),
+    dialect: challenge.dialect,
+    ...(unlisted.length > 0 ? { unlistedNetworks: unlisted } : {}),
   }
 }
 
@@ -354,11 +431,15 @@ async function reserveDailyBudget(env: Env, amountUsd: number): Promise<boolean>
  * prove where the money landed, and a provider who wanted to fake the
  * second thing would find the first one easy. So the destination is read
  * back from Horizon rather than inferred from what we intended to sign.
+ *
+ * Exported so an uncertain verification can be reconciled later from the
+ * hash alone, without paying again.
  */
-async function assertSettledToProvider(
+export async function assertSettledToProvider(
   env: Env,
   txHash: string,
   providerAddress: string,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<GateResult> {
   const horizon = (env.PLAYGROUND_HORIZON_URL || 'https://horizon.stellar.org').replace(/\/+$/, '')
   try {
@@ -366,9 +447,13 @@ async function assertSettledToProvider(
       `${horizon}/transactions/${txHash}/operations?limit=50`,
       { headers: { Accept: 'application/json' } },
       PROBE_TIMEOUT_MS,
+      fetchImpl,
     )
+    if (res.status === 404) {
+      return failure('tx_not_on_ledger', `Transaction ${txHash} is not on the ledger.`, { txHash })
+    }
     if (!res.ok) {
-      return failure('settlement_unverified', `Horizon returned ${res.status} for ${txHash}.`)
+      return failure('settlement_unverified', `Horizon returned ${res.status} for ${txHash}.`, { txHash })
     }
     const body = (await res.json()) as { _embedded?: { records?: any[] } }
     const records = body._embedded?.records ?? []
@@ -389,6 +474,7 @@ async function assertSettledToProvider(
             'settlement_not_direct',
             'The settlement transaction references the ROZO pool address. ' +
               'Direct settlement must pay the provider with no ROZO leg.',
+            { txHash },
           )
         }
         return { ok: true, detail: `Settled to ${providerAddress}.`, txHash }
@@ -397,10 +483,116 @@ async function assertSettledToProvider(
     return failure(
       'settlement_not_found',
       `Transaction ${txHash} does not show a payment to ${providerAddress}.`,
+      { txHash },
     )
   } catch (err: any) {
-    return failure('settlement_unverified', `Could not read ${txHash} from Horizon: ${err?.message}.`)
+    return failure('settlement_unverified', `Could not read ${txHash} from Horizon: ${err?.message}.`, { txHash })
   }
+}
+
+/**
+ * The paid HTTP call itself, dialect-specific.
+ *
+ * Injectable so the gate can be tested end to end against recorded 402 and
+ * receipt shapes without a funded key. The default pays with the client
+ * that speaks the provider's dialect.
+ */
+export interface PaidCallRequest {
+  dialect: ChallengeDialect
+  url: string
+  method: 'GET' | 'POST'
+  secret: string
+  /** Soroban RPC for the x402 client; mainnet has no public default. */
+  rpcUrl: string
+  network: string
+  signal: AbortSignal
+}
+export type PaidCallExecutor = (req: PaidCallRequest) => Promise<Response>
+
+async function payWithMppx(req: PaidCallRequest): Promise<Response> {
+  const client = Mppx.create({
+    methods: [stellar.charge({ keypair: Keypair.fromSecret(req.secret) })],
+    polyfill: false,
+  })
+  return client.fetch(req.url, {
+    method: req.method,
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'mpprouter-verify/1' },
+    ...(req.method === 'POST' ? { body: '{}' } : {}),
+    signal: req.signal,
+  } as RequestInit)
+}
+
+/**
+ * Pay an x402 `accepts[]` challenge on Stellar.
+ *
+ * `@x402/core` selects among the provider's offers by registered network,
+ * so a multi-chain challenge is paid on `stellar:pubnet` and nothing else
+ * — the Base and Solana offers are ignored by construction, not by luck.
+ * Version 1 (`X-PAYMENT`) and version 2 (`PAYMENT-SIGNATURE`) providers
+ * are both handled by the core client's header encoder.
+ */
+async function payWithX402(req: PaidCallRequest): Promise<Response> {
+  const signer = createEd25519Signer(req.secret, req.network as any)
+  const core = new x402Client()
+  core.register(req.network as any, new ExactStellarScheme(signer, { url: req.rpcUrl }))
+  const http = new x402HTTPClient(core)
+  const init: RequestInit = {
+    method: req.method,
+    headers: { 'Content-Type': 'application/json', 'User-Agent': 'mpprouter-verify/1' },
+    ...(req.method === 'POST' ? { body: '{}' } : {}),
+    signal: req.signal,
+  }
+  const first = await fetch(req.url, init)
+  if (first.status !== 402) return first
+  const bodyText = await first.text().catch(() => '')
+  let body: unknown = undefined
+  try {
+    body = JSON.parse(bodyText)
+  } catch {
+    // v2 carries the challenge in a header; a non-JSON body is fine.
+  }
+  const paymentRequired = http.getPaymentRequiredResponse(name => first.headers.get(name), body)
+  const payload = await http.createPaymentPayload(paymentRequired)
+  const paymentHeaders = http.encodePaymentSignatureHeader(payload)
+  return fetch(req.url, {
+    ...init,
+    headers: { ...(init.headers as Record<string, string>), ...paymentHeaders },
+  })
+}
+
+const defaultExecutor: PaidCallExecutor = req =>
+  req.dialect === 'x402' ? payWithX402(req) : payWithMppx(req)
+
+/** Pull a 64-hex transaction hash out of a receipt header in any encoding. */
+export function extractTxHash(header: string): string | null {
+  if (!header) return null
+  const direct = header.match(/\b([0-9a-f]{64})\b/i)
+  if (direct) return direct[1].toLowerCase()
+  try {
+    const decoded = atob(header.replace(/-/g, '+').replace(/_/g, '/'))
+    const inner = decoded.match(/\b([0-9a-f]{64})\b/i)
+    return inner ? inner[1].toLowerCase() : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The settlement receipt, wherever the provider's stack puts it.
+ *
+ * `payment-receipt` is mppx; `payment-response` is x402 v2; the
+ * `x-payment-response` spelling is x402 v1. The base64 JSON inside carries
+ * `transaction` for x402 and a hash for mppx; either way a 64-hex string
+ * is what gets read back from Horizon.
+ */
+export function receiptTxHash(headers: Headers): string | null {
+  for (const name of ['payment-receipt', 'payment-response', 'x-payment-response']) {
+    const value = headers.get(name)
+    if (!value) continue
+    const hash = extractTxHash(value)
+    if (hash) return hash
+  }
+  return null
 }
 
 /**
@@ -415,6 +607,8 @@ export async function gateRealMoneyCall(
   env: Env,
   record: ProviderRecord,
   spec: ProviderRouteSpec,
+  dialect: ChallengeDialect,
+  deps: { execute?: PaidCallExecutor; fetchImpl?: typeof fetch } = {},
 ): Promise<GateResult> {
   const secret = env.PROVIDER_VERIFY_STELLAR_SECRET
   if (!secret) {
@@ -450,6 +644,13 @@ export async function gateRealMoneyCall(
     )
   }
 
+  if (dialect === 'x402' && !env.STELLAR_RPC_URL) {
+    return failure(
+      'gate_unavailable',
+      'Paying an x402 challenge on Stellar needs a Soroban RPC (STELLAR_RPC_URL) on this deployment.',
+    )
+  }
+
   if (!(await reserveDailyBudget(env, priceUsd))) {
     return failure(
       'budget_exhausted',
@@ -457,90 +658,77 @@ export async function gateRealMoneyCall(
     )
   }
 
-  let keypair: Keypair
   try {
-    keypair = Keypair.fromSecret(secret)
+    Keypair.fromSecret(secret)
   } catch {
     return failure('gate_unavailable', 'The verification wallet secret is malformed.')
   }
 
   const url = providerEndpointUrl(record, spec)
-  const client = Mppx.create({
-    methods: [stellar.charge({ keypair })],
-    polyfill: false,
-  })
-
-  let response: Response
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), PAID_CALL_TIMEOUT_MS)
+  let response: Response
   try {
-    response = await client.fetch(url, {
+    response = await (deps.execute ?? defaultExecutor)({
+      dialect,
+      url,
       method: spec.method,
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'mpprouter-verify/1' },
-      ...(spec.method === 'POST' ? { body: '{}' } : {}),
+      secret,
+      rpcUrl: env.STELLAR_RPC_URL ?? '',
+      network: stellarPayout.network,
       signal: controller.signal,
-    } as RequestInit)
+    })
   } catch (err: any) {
     return failure(
       'paid_call_failed',
       `The paid call did not complete: ${err?.message ?? 'unknown error'}. ` +
         'Common causes: the challenge asks for an asset our wallet does not hold, ' +
         'or the endpoint rejects the credential it issued.',
+      { dialect },
     )
   } finally {
     clearTimeout(timer)
   }
 
+  // Read the receipt before judging the status: a 5xx that still carries a
+  // settlement hash is "paid, not served", which is reconcilable and must
+  // not be reported as if no money moved.
+  const txHash = receiptTxHash(response.headers)
+
   if (response.status !== 200) {
     return failure(
       'paid_call_not_200',
       `Paid call returned ${response.status}. A paying buyer must get a 200 and a body.`,
+      { dialect, ...(txHash ? { txHash } : {}) },
     )
   }
 
   const text = await response.text().catch(() => '')
   if (text.trim().length === 0) {
-    return failure('empty_body', 'Paid call returned 200 with an empty body.')
+    return failure('empty_body', 'Paid call returned 200 with an empty body.', { dialect, ...(txHash ? { txHash } : {}) })
   }
 
   // The receipt header carries the settlement reference. Absent it, we
   // cannot make the on-chain claim, and an unprovable claim is worse than
   // no publication: the payout gate is the whole point.
-  const receiptHeader =
-    response.headers.get('payment-receipt') ??
-    response.headers.get('x-payment-response') ??
-    ''
-  const txHash = extractTxHash(receiptHeader)
   if (!txHash) {
     return failure(
       'no_receipt',
       'The provider served the call but returned no settlement receipt, so we cannot ' +
         'confirm on-chain where the money landed.',
+      { dialect },
     )
   }
 
-  const settled = await assertSettledToProvider(env, txHash, stellarPayout.payTo)
-  if (!settled.ok) return settled
+  const settled = await assertSettledToProvider(env, txHash, stellarPayout.payTo, deps.fetchImpl)
+  if (!settled.ok) return { ...settled, dialect }
 
   return {
     ok: true,
     detail: `Paid call returned 200 (${text.length} bytes); settlement confirmed to ${stellarPayout.payTo}.`,
     txHash,
     network: stellarPayout.network,
-  }
-}
-
-/** Pull a 64-hex transaction hash out of a receipt header in any encoding. */
-function extractTxHash(header: string): string | null {
-  if (!header) return null
-  const direct = header.match(/\b([0-9a-f]{64})\b/i)
-  if (direct) return direct[1].toLowerCase()
-  try {
-    const decoded = atob(header.replace(/-/g, '+').replace(/_/g, '/'))
-    const inner = decoded.match(/\b([0-9a-f]{64})\b/i)
-    return inner ? inner[1].toLowerCase() : null
-  } catch {
-    return null
+    dialect,
   }
 }
 
@@ -550,8 +738,12 @@ function extractTxHash(header: string): string | null {
  * The cheapest one: verification pays real money, and the provider should
  * not be charged more than necessary to prove their server works. Ties
  * break on the first declared route so the choice is deterministic and a
- * retry probes the same endpoint.
+ * retry probes the same endpoint. A route the provider marked
+ * `verify_with` wins outright, so a request-dependent POST is never forced
+ * through an empty body when a documented no-input GET exists.
  */
 export function chooseVerificationRoute(record: ProviderRecord): ProviderRouteSpec {
+  const pinned = record.routes.find(r => r.verifyWith)
+  if (pinned) return pinned
   return [...record.routes].sort((a, b) => Number(a.priceUsd) - Number(b.priceUsd))[0]
 }
