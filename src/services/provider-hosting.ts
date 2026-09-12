@@ -48,20 +48,30 @@ import type { Env } from '../index'
 import type { PublicServiceRoute } from './merchants-types'
 import { getProviderRecord, routesForProvider, validateApiBaseUrl, ProviderValidationError } from './provider-registry'
 
-export const DEFAULT_HOSTED_SUFFIX = 'pay.mpprouter.dev'
+/**
+ * Hosted hostnames are `<id>-pay.mpprouter.dev` — ONE label under the
+ * zone, not `<id>.pay.mpprouter.dev`. Cloudflare Universal SSL covers
+ * `*.mpprouter.dev` and nothing deeper; a second-level wildcard needs a
+ * paid Advanced Certificate, which the first deploy (2026-09-12)
+ * discovered as a TLS handshake failure on `demo.pay.mpprouter.dev`.
+ * The suffix therefore begins with `-`; a `.`-prefixed value is still
+ * accepted for deployments that do have the certificate.
+ */
+export const DEFAULT_HOSTED_SUFFIX = '-pay.mpprouter.dev'
 
 export function hostedSuffix(env: Env): string {
-  return (env.PROVIDER_HOSTED_SUFFIX || DEFAULT_HOSTED_SUFFIX).toLowerCase()
+  const raw = (env.PROVIDER_HOSTED_SUFFIX || DEFAULT_HOSTED_SUFFIX).toLowerCase()
+  return raw.startsWith('-') || raw.startsWith('.') ? raw : `.${raw}`
 }
 
 /** The hosted origin a provider id is served on. */
 export function hostedOriginFor(env: Env, providerId: string): string {
-  return `https://${providerId}.${hostedSuffix(env)}`
+  return `https://${providerId}${hostedSuffix(env)}`
 }
 
 /** The provider id a hosted hostname names, or null when the host is not ours. */
 export function hostedProviderIdFor(env: Env, hostname: string): string | null {
-  const suffix = `.${hostedSuffix(env)}`
+  const suffix = hostedSuffix(env)
   const host = hostname.toLowerCase()
   if (!host.endsWith(suffix)) return null
   const id = host.slice(0, -suffix.length)
@@ -105,7 +115,7 @@ const MAX_SECRET_BYTES = 1024
 export function isForbiddenOriginHost(env: Env, hostname: string): boolean {
   const host = hostname.toLowerCase()
   const suffix = hostedSuffix(env)
-  if (host === suffix || host.endsWith(`.${suffix}`)) return true
+  if (host === suffix.replace(/^[-.]/, '') || host.endsWith(suffix)) return true
   if (host === 'apiserver.mpprouter.dev' || host === 'coupon.rozo.ai' || host === 'mpprouter.dev' || host === 'www.mpprouter.dev') return true
   if (host.endsWith('.workers.dev')) return true
   return false
