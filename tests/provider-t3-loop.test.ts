@@ -473,6 +473,12 @@ describe('retry never pays twice; uncertain outcomes reconcile from the ledger',
     expect(stillFrozen.status).toBe(409)
     expect(await stillFrozen.json()).toMatchObject({ code: 'unresolved' })
     expect(paidExecutor).toHaveBeenCalledTimes(1)
+    // A full page with nothing older than the attempt and no next link: the scan is
+    // incomplete, so still frozen — an unfinished scan never releases.
+    horizon.accountOps = Array.from({ length: 200 }, () => ({ type: 'payment', to: OTHER, created_at: new Date().toISOString() }))
+    const incomplete = await handleProviderVerify(post('/v1/providers/verify', { id: 'agent402' }), env, ctx)
+    expect(incomplete.status).toBe(409)
+    expect(paidExecutor).toHaveBeenCalledTimes(1)
     // Our wallet history is empty for that window: released, and only now may it pay again.
     horizon.accountOps = [{ type: 'payment', to: PROVIDER, created_at: '2026-01-01T00:00:00.000Z' }]
     const later = await handleProviderVerify(post('/v1/providers/verify', { id: 'agent402' }), env, ctx)

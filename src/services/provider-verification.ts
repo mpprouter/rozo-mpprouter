@@ -536,25 +536,37 @@ export async function verifyWalletPaidProviderSince(
   const from = verifyWalletPublicKey(env)
   if (!from) return null
   const horizon = (env.PLAYGROUND_HORIZON_URL || 'https://horizon.stellar.org').replace(/\/+$/, '')
-  try {
-    const res = await fetchWithTimeout(
-      `${horizon}/accounts/${from}/operations?order=desc&limit=200`,
-      { headers: { Accept: 'application/json' } },
-      PROBE_TIMEOUT_MS,
-      fetchImpl,
-    )
-    if (!res.ok) return null
-    const body = (await res.json()) as { _embedded?: { records?: any[] } }
-    const since = Date.parse(sinceIso)
-    for (const op of body._embedded?.records ?? []) {
-      if (op.created_at && Date.parse(op.created_at) < since) continue
+  const since = Date.parse(sinceIso)
+  if (!Number.isFinite(since)) return null
+  // Walk newest → oldest until an operation older than `since` proves the
+  // window is fully covered. A scan that ends before reaching that point —
+  // pagination cap, missing cursor, Horizon error — is INCOMPLETE and
+  // answers null: "not seen on the pages we read" is not "not paid".
+  let url = `${horizon}/accounts/${from}/operations?order=desc&limit=200`
+  for (let page = 0; page < 10; page++) {
+    let body: { _embedded?: { records?: any[] }; _links?: { next?: { href?: string } } }
+    try {
+      const res = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } }, PROBE_TIMEOUT_MS, fetchImpl)
+      if (!res.ok) return null
+      body = (await res.json()) as typeof body
+    } catch {
+      return null
+    }
+    const records = body._embedded?.records ?? []
+    for (const op of records) {
+      const createdAt = op.created_at ? Date.parse(op.created_at) : NaN
+      if (Number.isFinite(createdAt) && createdAt < since) return false
       if (op.transaction_successful === false) continue
       if (op.to === providerAddress || op.into === providerAddress || JSON.stringify(op).includes(providerAddress)) return true
     }
-    return false
-  } catch {
-    return null
+    // Fewer than a full page means the account history is exhausted
+    // before `since`: nothing older exists, so nothing was paid.
+    if (records.length < 200) return false
+    const next = body._links?.next?.href
+    if (!next) return null
+    url = next.startsWith('http') ? next : `${horizon}${next}`
   }
+  return null
 }
 
 /**
