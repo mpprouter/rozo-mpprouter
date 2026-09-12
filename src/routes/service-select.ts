@@ -45,7 +45,8 @@ export async function handleServiceSelect(request: Request, env: Env): Promise<R
   const selection = result as Exclude<typeof result, { error: { status: number } }>
   if (selection.error) {
     const status = selection.error.code === 'pinned_provider_not_found' ? 404 : selection.error.code === 'pinned_provider_offline' ? 409 : 404
-    return json(status, { error: selection.error.code, detail: selection.error.detail, ...selection, error_detail: undefined })
+    const { error, ...rest } = selection
+    return json(status, { error: error.code, detail: error.detail, ...rest })
   }
   return json(200, selection)
 }

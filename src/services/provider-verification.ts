@@ -207,6 +207,14 @@ function parseX402Accepts(raw: unknown): ParsedProviderChallenge | null {
 
 function parseMppxChallenge(wwwAuth: string): ParsedProviderChallenge | null {
   try {
+    // An MPP challenge names its method. Only `stellar` is a Stellar
+    // settlement; Agent402, for one, serves `method="evm"` (Base) in
+    // WWW-Authenticate NEXT TO an x402 accepts[] that does include Stellar.
+    // Reading the EVM request as a Stellar recipient labelled an 0x address
+    // `stellar:pubnet` in production on 2026-09-12. Anything other than
+    // stellar falls through to the x402 parser.
+    const methodMatch = wwwAuth.match(/method="([^"]+)"/)
+    if (methodMatch && methodMatch[1].toLowerCase() !== 'stellar') return null
     const requestMatch = wwwAuth.match(/request="([^"]+)"/)
     if (!requestMatch) return null
     const json = atob(requestMatch[1].replace(/-/g, '+').replace(/_/g, '/'))
