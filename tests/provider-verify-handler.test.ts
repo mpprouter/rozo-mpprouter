@@ -5,9 +5,12 @@ const paidGate = vi.hoisted(() => vi.fn())
 
 vi.mock('../src/services/provider-verification', () => ({
   chooseVerificationRoute: (record: any) => record.routes[0],
-  gateProbe402: vi.fn(async () => ({ ok: true, detail: 'probe passed' })),
+  gateProbe402: vi.fn(async () => ({ ok: true, detail: 'probe passed', dialect: 'x402' })),
   gateRealMoneyCall: paidGate,
   parseProviderChallenge: vi.fn(),
+  assertSettledToProvider: vi.fn(async () => ({ ok: false, code: 'settlement_unverified', detail: 'horizon down' })),
+  sameAddress: (network: string, a: string, b: string) => a === b,
+  MAX_VERIFY_PAYMENT_USD: 0.02,
 }))
 
 import { handleProviderVerify } from '../src/routes/providers'

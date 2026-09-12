@@ -70,6 +70,12 @@ import type {
   RouteOperator,
   RouteOperatorPayout,
 } from './merchants-types'
+import {
+  capabilityAcceptsRoute,
+  capabilityMethod,
+  isKnownCapability,
+  listCapabilityIds,
+} from './provider-capabilities'
 
 // ---------------------------------------------------------------------
 // Storage keys
@@ -121,6 +127,19 @@ export interface ProviderRouteSpec {
   description?: string
   /** Category tags for the catalog. Defaults to `['other']`. */
   categories?: string[]
+  /**
+   * Verification pays THIS route rather than the cheapest one. Set it on a
+   * documented no-input GET so a request-dependent POST is never forced
+   * through an empty body just because it happens to be cheapest.
+   */
+  verifyWith?: boolean
+  /**
+   * Explicit capability contract this route implements, from
+   * `provider-capabilities.ts`. Quality-based selection only ever chooses
+   * between routes that declare the SAME contract; a route without one is
+   * never substituted for anything. Never inferred from names.
+   */
+  capability?: string
 }
 
 /** Verification evidence, written by the gates in `provider-verification.ts`. */
@@ -144,6 +163,14 @@ export interface ProviderVerification {
    * accepted, they are not the same claim.
    */
   ownershipProof?: 'wallet_signature' | 'well_known' | 'x402_pay_to'
+  /**
+   * Which 402 dialect the provider's endpoint speaks, as observed by the
+   * probe. Decides which client pays the verification call and what the
+   * catalog tells buyers to speak.
+   */
+  challengeDialect?: 'x402' | 'mppx'
+  /** Networks the live 402 advertises that were not registered, hence not listed. */
+  unlistedNetworks?: string[]
   lastReachableAt?: string
   healthStatus?: 'pending' | 'healthy' | 'degraded' | 'offline'
   consecutiveProbeFailures?: number
@@ -359,6 +386,9 @@ export function validateRegistration(input: unknown): {
   if (rawRoutes.length > MAX_ROUTES_PER_PROVIDER) {
     fail('routes', `At most ${MAX_ROUTES_PER_PROVIDER} routes per provider.`)
   }
+  if (rawRoutes.filter(r => r && typeof r === 'object' && (r as Record<string, unknown>).verify_with === true).length > 1) {
+    fail('routes', 'At most one route may be marked verify_with.')
+  }
   const routes: ProviderRouteSpec[] = []
   const seenOps = new Set<string>()
   for (const entry of rawRoutes) {
@@ -395,6 +425,14 @@ export function validateRegistration(input: unknown): {
       ? e.categories.map(c => String(c).trim().toLowerCase()).filter(Boolean).slice(0, 5)
       : []
 
+    const capability = e.capability ? String(e.capability).trim().toLowerCase() : ''
+    if (capability && !isKnownCapability(capability)) {
+      fail('routes', `Unknown capability "${capability}". Declare one of: ${listCapabilityIds().join(', ')}, or omit it.`)
+    }
+    if (capability && !capabilityAcceptsRoute(capability, method)) {
+      fail('routes', `Capability "${capability}" is defined for ${capabilityMethod(capability)} routes, not ${method}.`)
+    }
+
     routes.push({
       operation,
       method,
@@ -402,6 +440,8 @@ export function validateRegistration(input: unknown): {
       priceUsd,
       description: e.description ? String(e.description).slice(0, 280) : undefined,
       categories: categories.length > 0 ? categories : ['other'],
+      ...(e.verify_with === true ? { verifyWith: true } : {}),
+      ...(capability ? { capability } : {}),
     })
   }
 
@@ -606,6 +646,8 @@ export function routesForProvider(record: ProviderRecord): PublicServiceRoute[] 
     sessionVerifiedAt: null,
     fixedPricing: { amountUsd: spec.priceUsd },
     operator,
+    ...(record.verification.challengeDialect ? { upstreamDialect: record.verification.challengeDialect } : {}),
+    ...(spec.capability ? { capability: spec.capability } : {}),
   }))
 }
 

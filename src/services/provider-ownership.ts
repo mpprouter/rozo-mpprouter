@@ -65,7 +65,7 @@ import type { Env } from '../index'
 import { ProviderAuthError, isSupportedPayoutNetwork, verifyRegistrationSignatures } from './provider-auth'
 import { consumeDomainProof, payToFromProofToken } from './provider-domain-proof'
 import { isRedirect, readBoundedText } from './provider-check'
-import { parseProviderChallenge } from './provider-verification'
+import { parseProviderChallenge, sameAddress } from './provider-verification'
 import type { RouteOperatorPayout } from './merchants-types'
 import type { ProviderRouteSpec } from './provider-registry'
 
@@ -153,15 +153,6 @@ export interface OwnershipOutcome {
 }
 
 const PROBE_TIMEOUT_MS = 10_000
-
-function sameAddress(network: string, a: string, b: string): boolean {
-  // EVM addresses are case-insensitive (EIP-55 is a checksum, not an
-  // identity). Stellar and Solana are case-sensitive base32/base58 and
-  // must match exactly.
-  return network.startsWith('eip155:')
-    ? a.toLowerCase() === b.toLowerCase()
-    : a === b
-}
 
 /**
  * Fetch one registered route unpaid and require the live 402 to name every

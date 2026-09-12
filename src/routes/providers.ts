@@ -69,7 +69,9 @@ import { inspectProviderUrl } from '../services/provider-check'
 import { readProviderRevenue } from '../services/provider-revenue'
 import { getStats } from '../services/stats'
 import { issueDashboardToken, verifyDashboardToken } from '../services/provider-dashboard-auth'
-import { runClaimedPaidGate } from '../services/provider-verify-claim'
+import { readClaimState, reconcileUncertainClaim, runClaimedPaidGate } from '../services/provider-verify-claim'
+import { assertSettledToProvider, MAX_VERIFY_PAYMENT_USD, verifyWalletPaidProviderSince, verifyWalletPublicKey, type GateResult } from '../services/provider-verification'
+import { CAPABILITY_CONTRACTS } from '../services/provider-capabilities'
 
 function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload, null, 2), {
@@ -185,6 +187,8 @@ function publicView(record: ProviderRecord) {
       method: r.method,
       price_usd: r.priceUsd,
       public_path: publicPathFor(record.id, r.operation),
+      ...(r.capability ? { capability: r.capability } : {}),
+      ...(r.verifyWith ? { verify_with: true } : {}),
     })),
     verification: {
       probe_402_at: record.verification.probe402At ?? null,
@@ -195,6 +199,9 @@ function publicView(record: ProviderRecord) {
       last_attempt_at: record.verification.lastAttemptAt ?? null,
       domain_verified_at: record.verification.domainVerifiedAt ?? null,
       ownership_proof: record.verification.ownershipProof ?? record.ownerKey.proof ?? null,
+      ownership_proof_means: describeProof(record.verification.ownershipProof ?? record.ownerKey.proof),
+      challenge_dialect: record.verification.challengeDialect ?? null,
+      unlisted_networks: record.verification.unlistedNetworks ?? [],
       last_reachable_at: record.verification.lastReachableAt ?? null,
       health_status: record.verification.healthStatus ?? 'pending',
       checks: record.verification.checks ?? [],
@@ -207,8 +214,96 @@ function publicView(record: ProviderRecord) {
       degraded: ['degraded', 'offline'].includes(record.verification.healthStatus ?? '') ? 'Service degraded' : null,
     },
     discovery: record.discovery ?? { submissionStatus: 'not_submitted' },
+    links: publicLinks(record),
     created_at: record.createdAt,
     updated_at: record.updatedAt,
+  }
+}
+
+/**
+ * What each proof actually established, in words a buyer or a reviewer
+ * can quote. `x402_pay_to` in particular is NOT key custody and must not
+ * read as if it were.
+ */
+function describeProof(proof: string | undefined): string | null {
+  switch (proof) {
+    case 'wallet_signature':
+      return 'The registrant signed with the payout private key: key custody proven.'
+    case 'well_known':
+      return 'A token we issued was published under the API origin and claimed with its private secret: origin control plus the registrant\'s assertion of the payout address. Not key custody.'
+    case 'x402_pay_to':
+      return 'The live 402 at the registered origin advertises exactly the registered payout address: the endpoint\'s own payout configuration matches. Not key custody, and not proof of who submitted the form.'
+    default:
+      return null
+  }
+}
+
+function explorerTxUrl(network: string | undefined, txHash: string | undefined | null): string | null {
+  if (!txHash) return null
+  if (!network || network.startsWith('stellar:')) return `https://stellar.expert/explorer/public/tx/${txHash}`
+  return null
+}
+
+/** Stable public URLs for a record; the result page and the report link to these. */
+function publicLinks(record: ProviderRecord) {
+  const tx = record.verification.paidCallTxHash
+  return {
+    status: `https://apiserver.mpprouter.dev/v1/providers/${record.id}`,
+    verification: `https://apiserver.mpprouter.dev/v1/providers/${record.id}/verification`,
+    listing: record.status === 'published' ? `https://www.mpprouter.dev/providers/${record.id}` : null,
+    catalog: record.status === 'published' ? 'https://apiserver.mpprouter.dev/services' : null,
+    metrics: record.status === 'published' ? `https://apiserver.mpprouter.dev/v1/services/${record.id}/metrics` : null,
+    settlement_tx: explorerTxUrl(record.verification.paidCallNetwork, tx),
+    horizon_tx: tx ? `https://horizon.stellar.org/transactions/${tx}` : null,
+  }
+}
+
+/**
+ * What a provider should do about a failed gate, keyed by code. Every
+ * failure the portal can show comes with one of these, and with a flag
+ * saying whether retrying can spend money — the frontend must never have
+ * to guess that.
+ */
+const NEXT_ACTIONS: Record<string, { action: string; can_safely_retry: boolean }> = {
+  unreachable: { action: 'Make the endpoint reachable over public HTTPS with no redirect, then retry. Nothing was paid.', can_safely_retry: true },
+  not_402: { action: 'The endpoint answered an unpaid request without a 402. Enable payment on this route, then retry. Nothing was paid.', can_safely_retry: true },
+  unparseable_challenge: { action: 'Serve an mpp WWW-Authenticate challenge or an x402 accepts[] challenge, then retry. Nothing was paid.', can_safely_retry: true },
+  payout_not_advertised: { action: 'Your 402 does not offer the network you registered. Add it to the endpoint or remove it from the registration (re-register), then retry. Nothing was paid.', can_safely_retry: true },
+  paytoaddress_mismatch: { action: 'The endpoint pays a different address than you registered. Correct whichever is wrong (re-register if the registration is wrong), then retry. Nothing was paid.', can_safely_retry: true },
+  price_mismatch: { action: 'The endpoint charges a different amount than you registered. Correct whichever is wrong, then retry. Nothing was paid.', can_safely_retry: true },
+  bad_amount: { action: 'The challenge amount is not an integer in base units. Fix the endpoint, then retry. Nothing was paid.', can_safely_retry: true },
+  bad_price: { action: 'The registered price is not representable on this network. Re-register with a valid price. Nothing was paid.', can_safely_retry: true },
+  gate_unavailable: { action: 'The verification wallet is not configured on this deployment. Your registration is kept; retry later. Nothing was paid.', can_safely_retry: true },
+  too_expensive_to_verify: { action: `Expose one route priced at or below $${MAX_VERIFY_PAYMENT_USD} (mark it verify_with) and re-register. Nothing was paid.`, can_safely_retry: true },
+  no_stellar_payout: { action: 'Add a stellar:pubnet payout (we can sponsor the account) and re-register. Nothing was paid.', can_safely_retry: true },
+  budget_exhausted: { action: 'The daily verification budget is spent. Retry tomorrow. Nothing was paid.', can_safely_retry: true },
+  challenge_mismatch: { action: 'Your endpoint served a different payTo or a higher amount to the paid call than to the probe. Nothing was signed or paid. Make the 402 consistent, then retry.', can_safely_retry: true },
+  paid_call_failed: { action: 'The paid call did not complete. Money may or may not have moved; this attempt is frozen. Check the verification status page before doing anything else.', can_safely_retry: false },
+  paid_call_not_200: { action: 'A payment was submitted but your endpoint did not return 200. Check the transaction, fix the endpoint, then re-register with a changed registration to start a fresh verification.', can_safely_retry: false },
+  empty_body: { action: 'A payment was submitted but your endpoint returned an empty body. Fix the endpoint, then re-register with a changed registration.', can_safely_retry: false },
+  no_receipt: { action: 'Your endpoint served the call but returned no settlement receipt header, so we cannot confirm where the money went. Add the receipt header, then re-register with a changed registration.', can_safely_retry: false },
+  settlement_unverified: { action: 'The ledger could not be read at the time. Open the verification status page to reconcile from the transaction hash; no second payment is made.', can_safely_retry: false },
+  settlement_not_found: { action: 'The transaction does not pay the registered address. This attempt is frozen with the hash attached; contact support with it.', can_safely_retry: false },
+  settlement_not_direct: { action: 'The settlement passed through the ROZO pool. Direct settlement must pay you with no ROZO leg; contact support with the hash.', can_safely_retry: false },
+  tx_not_on_ledger: { action: 'The receipt named a transaction the ledger does not have yet. Open the verification status page to reconcile; if it never lands, the attempt is released without payment.', can_safely_retry: false },
+  paid_call_uncertain: { action: 'The paid call ended without a definite result. This attempt is frozen; open the verification status page.', can_safely_retry: false },
+}
+
+function nextActionFor(code: string) {
+  return NEXT_ACTIONS[code] ?? { action: 'Check the verification status page before retrying.', can_safely_retry: false }
+}
+
+function gateEvidence(record: ProviderRecord, probe?: GateResult, paid?: GateResult) {
+  const txHash = paid && 'txHash' in paid ? paid.txHash : undefined
+  const network = record.payouts.find(p => p.network.startsWith('stellar:'))?.network
+  return {
+    probe_402: probe ? { ok: probe.ok, detail: probe.detail, ...(probe.ok ? { dialect: probe.dialect ?? null, unlisted_networks: probe.unlistedNetworks ?? [] } : { code: probe.code }) } : null,
+    real_money: paid ? { ok: paid.ok, detail: paid.detail, ...(paid.ok ? {} : { code: paid.code }) } : null,
+    settlement_tx: txHash ?? null,
+    settlement_network: txHash ? network ?? null : null,
+    settled_to: paid?.ok && txHash ? record.payouts.find(p => p.network.startsWith('stellar:'))?.payTo ?? null : null,
+    explorer_url: explorerTxUrl(network, txHash),
+    horizon_url: txHash ? `https://horizon.stellar.org/transactions/${txHash}` : null,
   }
 }
 
@@ -503,6 +598,7 @@ export async function handleProviderVerify(
     return json(200, { ...publicView(record), published: true, idempotent: true, evidence: {
       settlement_tx: record.verification.paidCallTxHash ?? null,
       paid_call_at: record.verification.paidCallAt ?? null,
+      explorer_url: explorerTxUrl(record.verification.paidCallNetwork, record.verification.paidCallTxHash),
     } })
   }
   if (record.status === 'suspended') {
@@ -521,11 +617,47 @@ export async function handleProviderVerify(
   })
   if (!record.verification.domainVerifiedAt) {
     record.verification.checks = buildChecks(record, undefined, undefined, 'Domain control has not been confirmed.')
-    return json(422, { error: 'verification_failed', gate: 'ownership', detail: 'Domain control and settlement-wallet control must both pass.', checks: record.verification.checks })
+    return json(422, {
+      error: 'verification_failed', gate: 'ownership', code: 'ownership_required',
+      detail: 'Ownership has not been proven for this registration.',
+      next_action: 'Complete a well_known or x402_pay_to proof (or a wallet signature plus domain proof) by re-registering. Nothing was paid.',
+      can_safely_retry: true,
+      checks: record.verification.checks,
+    })
   }
 
   const spec = chooseVerificationRoute(record)
   const attemptAt = new Date().toISOString()
+
+  // A frozen earlier attempt is settled from the ledger before anything
+  // else happens. This never pays; it reads the hash the receipt named.
+  const stellarPayTo = record.payouts.find(p => p.network.startsWith('stellar:'))?.payTo
+  if (env.ATOMIC_STORE && stellarPayTo) {
+    const claim = await readClaimState(env, record.id, verificationEpoch)
+    if (claim.state === 'uncertain') {
+      const outcome = await reconcileUncertainClaim(env, {
+        providerId: record.id,
+        registrationVersion: verificationEpoch,
+        settled: hash => assertSettledToProvider(env, hash, stellarPayTo, undefined, verifyWalletPublicKey(env)),
+        walletPaidSince: since => verifyWalletPaidProviderSince(env, stellarPayTo, since),
+        allowRelease: true,
+      })
+      if (outcome.status === 'paid_not_served' || outcome.status === 'unresolved') {
+        return json(409, {
+          error: 'payment_outcome_uncertain',
+          code: outcome.status,
+          detail: outcome.detail,
+          settlement_tx: 'txHash' in outcome ? outcome.txHash ?? null : null,
+          explorer_url: 'txHash' in outcome ? explorerTxUrl(record.payouts.find(p => p.network.startsWith('stellar:'))?.network, outcome.txHash) : null,
+          can_safely_retry: false,
+          next_action: outcome.detail,
+          retry: 'manual_status_check_required',
+        })
+      }
+      // `released` falls through to a fresh attempt; `settled_and_served`
+      // is picked up by runClaimedPaidGate as a completed claim below.
+    }
+  }
 
   const probe = await gateProbe402(record, spec)
   if (!probe.ok) {
@@ -547,23 +679,30 @@ export async function handleProviderVerify(
       gate: 'probe-402',
       code: probe.code,
       detail: probe.detail,
+      ...nextActionFor(probe.code),
       probed: { operation: spec.operation, method: spec.method },
       checks: buildChecks(record, probe),
+      evidence: gateEvidence(record, probe),
     })
   }
+  const dialect = probe.dialect ?? 'x402'
 
-  const claimed = await runClaimedPaidGate(env, record.id, verificationEpoch, () => gateRealMoneyCall(env, record, spec))
+  const claimed = await runClaimedPaidGate(env, record.id, verificationEpoch, () => gateRealMoneyCall(env, record, spec, dialect))
   if (claimed.status === 'in_progress') {
-    return json(202, { status: 'verification_in_progress', retry_after_seconds: claimed.retryAfterSeconds })
+    return json(202, { status: 'verification_in_progress', retry_after_seconds: claimed.retryAfterSeconds, can_safely_retry: false,
+      next_action: 'A verification is already running for this registration. Poll the status page; do not submit again.' })
   }
   if (claimed.status === 'uncertain') {
-    return json(409, { error: 'payment_outcome_uncertain', detail: claimed.detail, retry: 'manual_status_check_required' })
+    return json(409, { error: 'payment_outcome_uncertain', detail: claimed.detail, retry: 'manual_status_check_required', can_safely_retry: false,
+      next_action: 'Open the verification status page; it reconciles from the transaction hash without paying again.' })
   }
   const paid = claimed.result
   if (!paid.ok) {
     record.verification = {
       ...record.verification,
       probe402At: attemptAt,
+      challengeDialect: dialect,
+      unlistedNetworks: probe.unlistedNetworks,
       lastError: `real-money (${paid.code}): ${paid.detail}`,
       lastAttemptAt: attemptAt,
       checks: buildChecks(record, probe, paid),
@@ -583,8 +722,10 @@ export async function handleProviderVerify(
       gate: 'real-money',
       code: paid.code,
       detail: paid.detail,
+      ...nextActionFor(paid.code),
       probe_402: 'passed',
       checks: buildChecks(record, probe, paid),
+      evidence: gateEvidence(record, probe, paid),
     })
   }
 
@@ -592,6 +733,8 @@ export async function handleProviderVerify(
   record.verification = {
     probe402At: attemptAt,
     ownershipProof: record.verification.ownershipProof,
+    challengeDialect: dialect,
+    unlistedNetworks: probe.unlistedNetworks,
     paidCallAt: publishedAt,
     paidCallTxHash: paid.txHash,
     paidCallNetwork: paid.network,
@@ -620,12 +763,62 @@ export async function handleProviderVerify(
     ...publicView(latest),
     published: true,
     evidence: {
-      probe_402: probe.detail,
-      real_money: paid.detail,
-      settlement_tx: paid.txHash,
-      settled_to: latest.payouts.find(p => p.network.startsWith('stellar:'))?.payTo,
+      ...gateEvidence(latest, probe, paid),
+      paid_call_at: publishedAt,
     },
     catalog: latest.routes.map(r => publicPathFor(latest.id, r.operation)),
+  })
+}
+
+/**
+ * GET /v1/providers/:id/verification — the durable result page's source.
+ *
+ * Everything the portal shows after the fact comes from here, so a
+ * recording made an hour later reads the same evidence as the live run:
+ * the five checks, the paid-gate outcome, the settlement hash with public
+ * explorer links, and — when the paid gate is frozen — a reconciliation
+ * attempt from the ledger that never spends.
+ */
+export async function handleProviderVerificationStatus(env: Env, id: string): Promise<Response> {
+  const record = await getProviderRecord(env, id.trim().toLowerCase())
+  if (!record) return json(404, { error: 'not_found' })
+  const epoch = record.registrationVersion ?? await registrationDigest({
+    id: record.id, name: record.name, email: record.email, apiBaseUrl: record.apiBaseUrl, payouts: record.payouts, routes: record.routes,
+  })
+  let claim: Awaited<ReturnType<typeof readClaimState>> = { state: 'none' }
+  let reconciliation: unknown = null
+  const stellarPayTo = record.payouts.find(p => p.network.startsWith('stellar:'))?.payTo
+  if (env.ATOMIC_STORE) {
+    claim = await readClaimState(env, record.id, epoch)
+    if (claim.state === 'uncertain' && stellarPayTo && record.status !== 'published') {
+      // A public GET may complete a claim from the ledger (idempotent) but
+      // never release one: releasing re-arms a payment, and that decision
+      // belongs to the POST that would make it.
+      reconciliation = await reconcileUncertainClaim(env, {
+        providerId: record.id, registrationVersion: epoch,
+        settled: hash => assertSettledToProvider(env, hash, stellarPayTo, undefined, verifyWalletPublicKey(env)),
+        allowRelease: false,
+      })
+      claim = await readClaimState(env, record.id, epoch)
+    }
+  }
+  const frozenTx = claim.state === 'uncertain' && claim.result && !claim.result.ok ? claim.result.txHash ?? null : null
+  const lastCode = record.verification.lastError?.match(/\((\w+)\)/)?.[1]
+  return json(200, {
+    ...publicView(record),
+    paid_gate: {
+      state: record.status === 'published' ? 'passed' : claim.state,
+      ...(claim.state === 'uncertain' || claim.state === 'completed' ? { result: claim.result ?? null } : {}),
+      frozen_tx: frozenTx,
+      frozen_tx_explorer_url: explorerTxUrl(record.payouts.find(p => p.network.startsWith('stellar:'))?.network, frozenTx),
+      reconciliation,
+    },
+    ...(record.status !== 'published' && lastCode ? { next_action: nextActionFor(lastCode) } : {}),
+    recovery: {
+      safe_retry: 'POST /v1/providers/verify {"id"} — re-runs the free probe; the paid call runs only if no earlier paid attempt is frozen.',
+      fresh_attempt: 'Re-register with a changed registration (any field) — a new registration version starts a new paid attempt. Use only after fixing the endpoint; it will pay once more.',
+      never: 'Do not re-register with an identical payload to "retry": it maps to the same frozen attempt and changes nothing.',
+    },
   })
 }
 
@@ -654,15 +847,43 @@ export async function handleProviderCheck(request: Request, env: Env): Promise<R
     const host = new URL(url).hostname.toLowerCase()
     const providerId = host.replace(/^www\./, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 32)
     const payTo = inspected.draft?.payouts[0]?.pay_to
-    const domainProof = inspected.draft && payTo && providerId.length >= 3
-      ? await issueDomainProof(env, { providerId, url, payTo }) : null
+    // The well-known token is issued once per (provider, domain, address)
+    // and lives for days. A second check of the same URL used to throw
+    // here and fail the WHOLE check — so the one person most likely to
+    // check twice, the provider, was locked out for a week. Now the check
+    // succeeds without a token and says why; the x402 payTo proof needs no
+    // token at all.
+    let domainProof: Awaited<ReturnType<typeof issueDomainProof>> | null = null
+    let domainProofStatus: 'issued' | 'already_active' | 'not_applicable' = 'not_applicable'
+    if (inspected.draft && payTo && providerId.length >= 3) {
+      try {
+        domainProof = await issueDomainProof(env, { providerId, url, payTo })
+        domainProofStatus = 'issued'
+      } catch (error) {
+        if (error instanceof Error && error.message.startsWith('A domain proof')) domainProofStatus = 'already_active'
+        else throw error
+      }
+    }
     const registration = inspected.draft ? {
       id: providerId,
       name: host.replace(/^www\./, ''),
       email: '',
       ...inspected.draft,
     } : null
-    return json(200, { provider_id: providerId || null, registration, checks: inspected.checks, domain_proof: domainProof })
+    const stellar = inspected.draft?.payouts.some(p => p.network.startsWith('stellar:')) ?? false
+    return json(200, {
+      provider_id: providerId || null,
+      registration,
+      checks: inspected.checks,
+      dialect: inspected.dialect ?? null,
+      discovered_networks: inspected.draft?.payouts.map(p => p.network) ?? [],
+      stellar_payout_discovered: stellar,
+      domain_proof: domainProof,
+      domain_proof_status: domainProofStatus,
+      ownership_proofs: Object.values(OWNERSHIP_PROOF_GUIDE),
+      capabilities: CAPABILITY_CONTRACTS,
+      verify_payment_cap_usd: MAX_VERIFY_PAYMENT_USD,
+    })
   } catch (error) {
     return json(422, { error: 'check_failed', detail: error instanceof Error ? error.message : 'Service check failed.' })
   }

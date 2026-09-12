@@ -38,7 +38,7 @@ async function commit(env: Env, key: string, version: number, op: 'set' | 'delet
 }
 
 function canSafelyRetry(result: GateResult): boolean {
-  return !result.ok && ['gate_unavailable', 'too_expensive_to_verify', 'no_stellar_payout', 'budget_exhausted', 'bad_price'].includes(result.code)
+  return !result.ok && ['gate_unavailable', 'too_expensive_to_verify', 'no_stellar_payout', 'budget_exhausted', 'bad_price', 'challenge_mismatch'].includes(result.code)
 }
 
 export async function runClaimedPaidGate(
@@ -79,4 +79,140 @@ export async function runClaimedPaidGate(
   }
   await commit(env, key, claimed.version, 'set', JSON.stringify(state))
   return { status: 'ran', result }
+}
+
+/** Public, secret-free view of the claim behind a provider's paid gate. */
+export type ClaimView =
+  | { state: 'none' }
+  | { state: 'in_progress'; startedAt: string }
+  | { state: 'completed'; result: GateResult; updatedAt: string }
+  | { state: 'uncertain'; result?: GateResult; startedAt: string; updatedAt: string }
+
+export async function readClaimState(env: Env, providerId: string, registrationVersion: string): Promise<ClaimView> {
+  if (!env.ATOMIC_STORE) return { state: 'none' }
+  const current = await read(env, `providerVerifyClaim:${providerId}:${registrationVersion}`)
+  if (!current.value) return { state: 'none' }
+  const state = JSON.parse(current.value) as ClaimState
+  if (state.status === 'completed' && state.result) return { state: 'completed', result: state.result, updatedAt: state.updatedAt }
+  if (state.status === 'uncertain') return { state: 'uncertain', result: state.result, startedAt: state.startedAt, updatedAt: state.updatedAt }
+  // An attempt whose worker died mid-payment never wrote a result. The
+  // same 5-minute rule runClaimedPaidGate applies is applied here, so the
+  // status page and the reconciler see the frozen state, not "in progress".
+  if (Date.now() - Date.parse(state.startedAt) > STALE_IN_PROGRESS_MS) {
+    return { state: 'uncertain', result: STALLED_RESULT, startedAt: state.startedAt, updatedAt: state.updatedAt }
+  }
+  return { state: 'in_progress', startedAt: state.startedAt }
+}
+
+const STALE_IN_PROGRESS_MS = 5 * 60_000
+const STALLED_RESULT: GateResult = {
+  ok: false,
+  code: 'paid_call_uncertain',
+  detail: 'Verification stopped while a payment may have been in flight; no settlement receipt was recorded.',
+}
+
+export type ReconcileOutcome =
+  | { status: 'not_uncertain' }
+  /** The hash settled to the provider and the provider had served 200: publishable. */
+  | { status: 'settled_and_served'; result: GateResult }
+  /** Money reached the provider but the call was not served. Frozen; needs a new registration version. */
+  | { status: 'paid_not_served'; txHash: string; detail: string }
+  /** The hash never landed on the ledger long after the attempt: nothing was paid, retry is safe. */
+  | { status: 'released'; detail: string }
+  /** No hash to look up, or Horizon still cannot answer. Stays frozen. */
+  | { status: 'unresolved'; detail: string; txHash?: string }
+
+/**
+ * Settle an uncertain paid-gate outcome from the chain, never by paying again.
+ *
+ * The claim store freezes any attempt whose payment may have moved. This
+ * is the only way out of that state without a new registration version:
+ * read the transaction the receipt named and let the ledger say what
+ * happened. A hash that shows the provider was paid and the provider
+ * served 200 completes the gate; a hash that is absent from the ledger a
+ * long time after the attempt means nothing was paid and the claim is
+ * released; anything else stays frozen with the evidence attached.
+ */
+export async function reconcileUncertainClaim(
+  env: Env,
+  args: {
+    providerId: string
+    registrationVersion: string
+    settled: (txHash: string) => Promise<GateResult>
+    /**
+     * Independent check that OUR wallet paid the provider since the attempt
+     * started (see verifyWalletPaidProviderSince). `null` = unknown.
+     * Required for a release: a hash the provider handed us being absent
+     * from the ledger says nothing about what our wallet actually sent.
+     */
+    walletPaidSince?: (sinceIso: string) => Promise<boolean | null>
+    /** Minutes a missing hash must be missing before it is called unpaid. */
+    releaseAfterMinutes?: number
+    /** Read-only callers (a public GET) may complete a claim but never release one. */
+    allowRelease?: boolean
+  },
+): Promise<ReconcileOutcome> {
+  const key = `providerVerifyClaim:${args.providerId}:${args.registrationVersion}`
+  const current = await read(env, key)
+  if (!current.value) return { status: 'not_uncertain' }
+  let state = JSON.parse(current.value) as ClaimState
+  if (state.status === 'in_progress' && Date.now() - Date.parse(state.startedAt) > STALE_IN_PROGRESS_MS) {
+    // Persist the transition the gate only ever reported, so every later
+    // reader agrees this attempt is frozen rather than running.
+    state = { ...state, status: 'uncertain', updatedAt: new Date().toISOString(), result: STALLED_RESULT }
+    await commit(env, key, current.version, 'set', JSON.stringify(state))
+    return reconcileUncertainClaim(env, args)
+  }
+  if (state.status !== 'uncertain') return { status: 'not_uncertain' }
+  const failed = state.result && !state.result.ok ? state.result : undefined
+  const txHash = failed?.txHash
+  if (!txHash) {
+    return {
+      status: 'unresolved',
+      detail: 'No settlement hash was recorded for this attempt, so the ledger cannot be consulted. ' +
+        'Fix the endpoint if it was at fault, then re-register with a changed registration to start a fresh verification.',
+    }
+  }
+  const settled = await args.settled(txHash)
+  if (settled.ok) {
+    // Served 200 with a receipt but Horizon was unreadable at the time.
+    if (failed?.code === 'settlement_unverified') {
+      const completed: ClaimState = {
+        status: 'completed', startedAt: state.startedAt, updatedAt: new Date().toISOString(),
+        result: { ...settled, detail: `Reconciled from the ledger: ${settled.detail}` },
+      }
+      await commit(env, key, current.version, 'set', JSON.stringify(completed))
+      return { status: 'settled_and_served', result: completed.result! }
+    }
+    return {
+      status: 'paid_not_served',
+      txHash,
+      detail: `Transaction ${txHash} paid the provider, but the call was not served successfully ` +
+        `(${failed?.code}). This attempt stays frozen; fix the endpoint and re-register with a changed registration.`,
+    }
+  }
+  if (settled.code === 'tx_not_on_ledger') {
+    const ageMinutes = (Date.now() - Date.parse(state.startedAt)) / 60_000
+    if (ageMinutes >= (args.releaseAfterMinutes ?? 30) && args.allowRelease !== false) {
+      // The hash came from the provider. Its absence is not evidence that
+      // our wallet sent nothing; only our own account history is.
+      const paid = args.walletPaidSince ? await args.walletPaidSince(state.startedAt) : null
+      if (paid === false) {
+        await commit(env, key, current.version, 'delete')
+        return {
+          status: 'released',
+          detail: `Transaction ${txHash} is not on the ledger ${Math.floor(ageMinutes)} minutes after the attempt and the verification wallet sent nothing to this address since then; nothing was paid. Verification may be retried.`,
+        }
+      }
+      if (paid === true) {
+        return {
+          status: 'unresolved', txHash,
+          detail: `The receipt named ${txHash}, which is not on the ledger, but the verification wallet DID pay this address after the attempt started. The attempt stays frozen; contact support with this record.`,
+        }
+      }
+      return { status: 'unresolved', txHash, detail: `Transaction ${txHash} is not on the ledger and the verification wallet's history could not be read; still frozen.` }
+    }
+    return { status: 'unresolved', txHash, detail: `Transaction ${txHash} is not on the ledger yet. Check again later.` }
+  }
+  return { status: 'unresolved', txHash, detail: settled.detail }
 }

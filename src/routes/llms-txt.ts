@@ -203,8 +203,25 @@ ${operatorRoutes
     .map(r => `- ${r.publicPath} — ${r.operator!.name} (${r.price}), settles on ${r.operator!.payouts.map(p => p.network).join(', ')}`)
     .join('\n')}
 
+The router RELAYS these routes: it forwards your request and payment
+credential to the provider's own endpoint and returns its answer, 402
+included. Pay the provider's own challenge (dialect in
+\`payment_hints.dialect\`); the router issues no challenge and holds
+nothing.
+
 Providers onboard themselves at POST /v1/providers/register; listing is
-automatic after two verification gates and involves no ROZO human.`}
+automatic after two verification gates and involves no ROZO human.
+Self-serve portal: https://www.mpprouter.dev/onboard/x402`}
+
+## Choosing between equivalent providers
+
+GET /v1/services/capabilities lists explicit capability contracts.
+GET /v1/services/select?capability=<id> ranks published provider routes
+that declared that contract by observed success rate and latency
+(offline excluded, insufficient/stale samples ranked after known-good,
+ties broken by price then id) and names the route AND the payout address
+before any 402 is issued. Add &provider=<id> to pin a provider: you get
+that provider or an error, never a substitute.
 
 ## Errors
 

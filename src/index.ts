@@ -36,7 +36,9 @@ import {
   handleProviderCheck,
   handleProviderDomainVerify,
   handleProviderDashboard,
+  handleProviderVerificationStatus,
 } from './routes/providers'
+import { handleCapabilities, handleServiceSelect } from './routes/service-select'
 import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
 import { handleX402Supported } from './routes/x402-supported'
@@ -620,6 +622,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return handleServices(env)
       }
 
+      // Quality-based selection between provider routes sharing a declared
+      // capability, and the list of declarable capabilities. Both read-only.
+      if (url.pathname === '/v1/services/select' && request.method === 'GET') {
+        return handleServiceSelect(request, env)
+      }
+      if (url.pathname === '/v1/services/capabilities' && request.method === 'GET') {
+        return handleCapabilities()
+      }
       if (url.pathname === '/v1/services/search') {
         return handleSearch(url, env)
       }
@@ -950,6 +960,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         if (providerMatch && request.method === 'GET') {
           return handleProviderGet(env, providerMatch[1])
         }
+        const verificationMatch = url.pathname.match(/^\/v1\/providers\/([a-z0-9-]{3,32})\/verification$/)
+        if (verificationMatch && request.method === 'GET') {
+          return handleProviderVerificationStatus(env, verificationMatch[1])
+        }
         const dashboardMatch = url.pathname.match(/^\/v1\/providers\/([a-z0-9-]{3,32})\/dashboard$/)
         if (dashboardMatch && request.method === 'GET') {
           return handleProviderDashboard(request, env, dashboardMatch[1])
@@ -972,6 +986,8 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         '  GET /services                        - Public service catalog\n' +
         '  GET /v1/services/catalog             - Versioned service catalog\n' +
         '  GET /v1/services/search              - Search/filter catalog\n' +
+        '  GET /v1/services/select              - Quality-ranked provider for a capability\n' +
+        '  GET /v1/services/capabilities        - Declarable capability contracts\n' +
         '  GET /v1/ledger                       - Public settlement ledger\n' +
         '  GET /v1/me/ledger                    - Your LLM calls with tokens (dashboard session)\n' +
         '  GET /v1/me/usage                     - Your usage aggregates (dashboard session)\n' +
