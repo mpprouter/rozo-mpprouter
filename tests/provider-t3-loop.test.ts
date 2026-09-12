@@ -18,7 +18,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { Keypair } from '@stellar/stellar-sdk'
 
 const paidExecutor = vi.hoisted(() => vi.fn())
-const horizon = vi.hoisted(() => ({ ops: [] as any[], status: 200, byHash: {} as Record<string, { status: number; ops?: any[] }> }))
+const horizon = vi.hoisted(() => ({ ops: [] as any[], status: 200, byHash: {} as Record<string, { status: number; ops?: any[] }>, accountOps: [] as any[] }))
 
 // The paid call and the ledger are the only two things mocked. Everything
 // else — parsing, gates, claim store, handlers, catalog, relay, selection —
@@ -26,6 +26,9 @@ const horizon = vi.hoisted(() => ({ ops: [] as any[], status: 200, byHash: {} as
 vi.mock('../src/services/provider-verification', async importOriginal => {
   const actual = await importOriginal<typeof import('../src/services/provider-verification')>()
   const horizonFetch: typeof fetch = async (input: any) => {
+    if (/\/accounts\/G[A-Z0-9]+\/operations/.test(String(input))) {
+      return new Response(JSON.stringify({ _embedded: { records: horizon.accountOps } }), { status: 200 })
+    }
     const hash = String(input).match(/transactions\/([0-9a-f]{64})/)?.[1] ?? ''
     const override = horizon.byHash[hash]
     return new Response(JSON.stringify({ _embedded: { records: override?.ops ?? horizon.ops } }), { status: override?.status ?? horizon.status })
@@ -34,8 +37,10 @@ vi.mock('../src/services/provider-verification', async importOriginal => {
     ...actual,
     gateRealMoneyCall: (env: any, record: any, spec: any, dialect: any) =>
       actual.gateRealMoneyCall(env, record, spec, dialect, { execute: paidExecutor, fetchImpl: horizonFetch }),
-    assertSettledToProvider: (env: any, tx: string, addr: string) =>
-      actual.assertSettledToProvider(env, tx, addr, horizonFetch),
+    assertSettledToProvider: (env: any, tx: string, addr: string, _f: any, expectedFrom?: string) =>
+      actual.assertSettledToProvider(env, tx, addr, horizonFetch, expectedFrom),
+    verifyWalletPaidProviderSince: (env: any, addr: string, since: string) =>
+      actual.verifyWalletPaidProviderSince(env, addr, since, horizonFetch),
   }
 })
 
@@ -53,6 +58,7 @@ import { rankCandidates, selectProvider, type Candidate } from '../src/services/
 
 const PROVIDER = Keypair.random().publicKey()
 const OTHER = Keypair.random().publicKey()
+const VERIFIER = Keypair.random()
 const ROUTER_POOL = Keypair.random().publicKey()
 const TX = 'a'.repeat(63) + '1'
 const ORIGIN = 'https://agent402.example'
@@ -86,7 +92,7 @@ function makeEnv() {
     STELLAR_NETWORK: 'stellar:pubnet',
     STELLAR_ROUTER_PUBLIC: ROUTER_POOL,
     STELLAR_RPC_URL: 'https://rpc.example',
-    PROVIDER_VERIFY_STELLAR_SECRET: Keypair.random().secret(),
+    PROVIDER_VERIFY_STELLAR_SECRET: VERIFIER.secret(),
     PROVIDERS_ENDPOINT_ENABLED: 'true',
   } as any
 }
@@ -140,9 +146,10 @@ const registration = {
 
 beforeEach(() => {
   paidExecutor.mockReset()
-  horizon.ops = [{ type: 'invoke_host_function', parameters: [{ value: PROVIDER }] }]
+  horizon.ops = [{ type: 'invoke_host_function', source_account: VERIFIER.publicKey(), transaction_successful: true, parameters: [{ value: PROVIDER }] }]
   horizon.status = 200
   horizon.byHash = {}
+  horizon.accountOps = []
   resetProviderCache()
   vi.restoreAllMocks()
 })
@@ -201,10 +208,16 @@ describe('paid gate: receipts and dialects', () => {
     paidExecutor.mockImplementation(async () => paidOk('payment-response', b64({ success: true, transaction: TX })))
     const env = makeEnv()
     const r = record()
-    horizon.ops = [{ type: 'payment', to: OTHER }]
+    horizon.ops = [{ type: 'payment', source_account: VERIFIER.publicKey(), to: OTHER }]
     expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_found', txHash: TX })
-    horizon.ops = [{ type: 'invoke_host_function', parameters: [{ value: PROVIDER }, { value: ROUTER_POOL }] }]
+    horizon.ops = [{ type: 'invoke_host_function', source_account: VERIFIER.publicKey(), parameters: [{ value: PROVIDER }, { value: ROUTER_POOL }] }]
     expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_direct', txHash: TX })
+    // A hash of the provider's OWN old transfer to itself proves nothing about our payment.
+    horizon.ops = [{ type: 'payment', source_account: PROVIDER, from: PROVIDER, to: PROVIDER }]
+    expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_found', txHash: TX })
+    // A failed transaction that names the provider is not a settlement either.
+    horizon.ops = [{ type: 'payment', source_account: VERIFIER.publicKey(), to: PROVIDER, transaction_successful: false }]
+    expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_found', txHash: TX })
   })
 
   it('carries the hash on a paid-but-not-served failure so it can be reconciled, never re-paid', async () => {
@@ -408,10 +421,42 @@ describe('retry never pays twice; uncertain outcomes reconcile from the ledger',
     state.value = JSON.stringify(parsed)
     const TX2 = 'b'.repeat(64)
     paidExecutor.mockResolvedValue(paidOk('payment-response', b64({ success: true, transaction: TX2 })))
+    // The public status page never releases, even now.
+    const peek = await (await handleProviderVerificationStatus(env, 'agent402')).json() as any
+    expect(peek.paid_gate.state).toBe('uncertain')
+    expect(paidExecutor).toHaveBeenCalledTimes(1)
+    // Our own wallet history shows a payment to the provider since the attempt: still frozen.
+    horizon.accountOps = [{ type: 'payment', to: PROVIDER, created_at: new Date().toISOString(), transaction_successful: true }]
+    const stillFrozen = await handleProviderVerify(post('/v1/providers/verify', { id: 'agent402' }), env, ctx)
+    expect(stillFrozen.status).toBe(409)
+    expect(await stillFrozen.json()).toMatchObject({ code: 'unresolved' })
+    expect(paidExecutor).toHaveBeenCalledTimes(1)
+    // Our wallet history is empty for that window: released, and only now may it pay again.
+    horizon.accountOps = [{ type: 'payment', to: PROVIDER, created_at: '2026-01-01T00:00:00.000Z' }]
     const later = await handleProviderVerify(post('/v1/providers/verify', { id: 'agent402' }), env, ctx)
     expect(later.status).toBe(200)
     expect((await later.json() as any).evidence.settlement_tx).toBe(TX2)
     expect(paidExecutor).toHaveBeenCalledTimes(2)
+  })
+
+  it('a worker that died mid-payment leaves a claim the status page reports as frozen, not running', async () => {
+    mockProviderOrigin()
+    paidExecutor.mockImplementation(() => new Promise(() => {}))
+    const env = makeEnv()
+    await registerAgent402(env)
+    void handleProviderVerify(post('/v1/providers/verify', { id: 'agent402' }), env, ctx)
+    await new Promise(r => setTimeout(r, 10))
+    const key = [...env.atomic.keys()].find((k: string) => k.startsWith('providerVerifyClaim:'))!
+    const state = env.atomic.get(key)!
+    const parsed = JSON.parse(state.value!)
+    parsed.startedAt = new Date(Date.now() - 6 * 60_000).toISOString()
+    state.value = JSON.stringify(parsed)
+    const status = await (await handleProviderVerificationStatus(env, 'agent402')).json() as any
+    expect(status.paid_gate.state).toBe('uncertain')
+    expect(status.paid_gate.reconciliation.status).toBe('unresolved')
+    const retry = await handleProviderVerify(post('/v1/providers/verify', { id: 'agent402' }), env, ctx)
+    expect(retry.status).toBe(409)
+    expect(paidExecutor).toHaveBeenCalledTimes(1)
   })
 
   it('an in-flight claim answers 202 and does not start a second payment', async () => {
@@ -457,7 +502,7 @@ describe('published provider routes are relayed', () => {
       return challenge402(agent402Challenge(), { 'Payment-Required': b64(agent402Challenge()) })
     })
     const res = await handleProxy(new Request('https://router.test/v1/services/agent402/web-search?q=stellar', {
-      headers: { 'PAYMENT-SIGNATURE': 'buyer-x402-payload', Authorization: 'Payment mppx-credential', 'CF-Connecting-IP': '1.2.3.4' },
+      headers: { 'PAYMENT-SIGNATURE': 'buyer-x402-payload', Authorization: 'Payment mppx-credential', 'CF-Connecting-IP': '1.2.3.4', Cookie: 'partner_session=secret', Origin: 'https://coupon.rozo.ai', 'Sec-Fetch-Site': 'same-origin' },
     }), env, ctx)
     expect(res.status).toBe(402)
     expect(res.headers.get('payment-required')).toBe(b64(agent402Challenge()))
@@ -468,6 +513,13 @@ describe('published provider routes are relayed', () => {
     expect(seen[0].headers.get('payment-signature')).toBe('buyer-x402-payload')
     expect(seen[0].headers.get('authorization')).toBe('Payment mppx-credential')
     expect(seen[0].headers.get('cf-connecting-ip')).toBeNull()
+    expect(seen[0].headers.get('cookie')).toBeNull()
+    expect(seen[0].headers.get('origin')).toBeNull()
+    expect(seen[0].headers.get('sec-fetch-site')).toBeNull()
+    // A Bearer token is ours or a partner's, never the provider's business.
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init: any) => { seen.push(new Request(input, init)); return challenge402(agent402Challenge()) })
+    await handleProxy(new Request('https://router.test/v1/services/agent402/web-search', { headers: { Authorization: 'Bearer partner-token' } }), env, ctx)
+    expect(seen[1].headers.get('authorization')).toBeNull()
     // Nothing in the router touched a claim, a ledger or a payment key.
     expect([...env.kv.keys()].filter(k => k.startsWith('order:') || k.startsWith('ledger'))).toEqual([])
   })

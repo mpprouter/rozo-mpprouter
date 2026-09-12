@@ -53,7 +53,17 @@ const DROP_REQUEST_HEADERS = new Set([
   'host', 'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade',
   'proxy-authorization', 'proxy-authenticate', 'cf-connecting-ip', 'cf-ray', 'cf-visitor',
   'cf-ipcountry', 'x-forwarded-for', 'x-forwarded-proto', 'x-real-ip', 'content-length',
+  // Browser ambient credentials and origin hints. This Worker also serves
+  // partner surfaces with session cookies on other hostnames; a provider
+  // who passed a $0.02 gate must not receive them.
+  'cookie', 'origin', 'referer',
 ])
+
+/** Only payment credentials cross to the provider; a Bearer/Basic header is ours or a partner's. */
+function forwardableAuthorization(value: string | null): string | null {
+  if (!value) return null
+  return /^Payment\s/i.test(value.trim()) ? value : null
+}
 
 const DROP_RESPONSE_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'content-encoding', 'content-length',
@@ -74,9 +84,9 @@ export function relayTargetUrl(route: PublicServiceRoute, requestUrl: URL): stri
  * Forward one request to the provider and hand back what it said.
  *
  * The recorded outcome is the provider's HTTP status through the shared
- * classifier, so a relayed 402 (buyer did not pay) counts as
- * `caller_error`, not as a provider fault — the provider answered
- * correctly. Only 5xx, timeouts and connection failures count against it.
+ * classifier: a 402 to an UNPAID request is `caller_error` (the provider
+ * answered correctly), a 402 to a request that carried a credential is a
+ * provider fault, as are 5xx, redirects, timeouts and connection failures.
  */
 export async function relayDirectSettlementRoute(
   request: Request,
@@ -89,7 +99,13 @@ export async function relayDirectSettlementRoute(
   const target = relayTargetUrl(route, url)
   const headers = new Headers()
   for (const [key, value] of request.headers) {
-    if (DROP_REQUEST_HEADERS.has(key.toLowerCase())) continue
+    const lower = key.toLowerCase()
+    if (DROP_REQUEST_HEADERS.has(lower) || lower.startsWith('sec-')) continue
+    if (lower === 'authorization') {
+      const allowed = forwardableAuthorization(value)
+      if (allowed) headers.set(key, allowed)
+      continue
+    }
     headers.set(key, value)
   }
   headers.set('X-MPP-Router-Relay', route.id)
@@ -104,6 +120,7 @@ export async function relayDirectSettlementRoute(
       headers,
       body: request.method === 'GET' || request.method === 'HEAD' ? undefined : await request.arrayBuffer(),
       redirect: 'manual',
+      signal: controller.signal,
     })
   } catch (err: any) {
     clearTimeout(timer)
@@ -138,7 +155,15 @@ export async function relayDirectSettlementRoute(
     }), { status: 502, headers: { 'Content-Type': 'application/json' } })
   }
 
-  const outcome = classifyOutcome(upstream.status, { routerHoldsCredential: false })
+  // A 402 to a request that CARRIED a payment credential is the provider
+  // (or its facilitator) refusing a payment, not a buyer forgetting to pay.
+  const carriedCredential = Boolean(
+    request.headers.get('payment-signature') || request.headers.get('x-payment') ||
+    forwardableAuthorization(request.headers.get('authorization')),
+  )
+  const outcome = upstream.status === 402 && carriedCredential
+    ? 'provider_fault'
+    : classifyOutcome(upstream.status, { routerHoldsCredential: false })
   recordRouteCall(env, ctx, {
     routeId: route.id, method: request.method, outcome, upstreamStatus: upstream.status,
     ...(outcome === 'ok' ? { latencyMs } : {}),

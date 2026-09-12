@@ -440,6 +440,12 @@ export async function assertSettledToProvider(
   txHash: string,
   providerAddress: string,
   fetchImpl: typeof fetch = fetch,
+  /**
+   * Our verification wallet's public key. When known, the paying operation
+   * must originate from it: a hash the provider picked from its own
+   * history (any old transfer to itself) must not certify OUR payment.
+   */
+  expectedFrom?: string,
 ): Promise<GateResult> {
   const horizon = (env.PLAYGROUND_HORIZON_URL || 'https://horizon.stellar.org').replace(/\/+$/, '')
   try {
@@ -459,6 +465,20 @@ export async function assertSettledToProvider(
     const records = body._embedded?.records ?? []
     const routerAddress = env.STELLAR_ROUTER_PUBLIC
     for (const op of records) {
+      if (op.transaction_successful === false) {
+        return failure('settlement_not_found', `Transaction ${txHash} failed on the ledger.`, { txHash })
+      }
+      if (expectedFrom) {
+        const from = op.from ?? op.source_account ?? op.source
+        const fromText = JSON.stringify(op)
+        if (from !== expectedFrom && !fromText.includes(expectedFrom)) {
+          return failure(
+            'settlement_not_found',
+            `Transaction ${txHash} was not sent by the verification wallet, so it does not prove this verification's payment.`,
+            { txHash },
+          )
+        }
+      }
       // Classic payment leg.
       if (op.to === providerAddress || op.into === providerAddress) {
         return { ok: true, detail: `Settled to ${providerAddress}.`, txHash }
@@ -487,6 +507,53 @@ export async function assertSettledToProvider(
     )
   } catch (err: any) {
     return failure('settlement_unverified', `Could not read ${txHash} from Horizon: ${err?.message}.`, { txHash })
+  }
+}
+
+/** Public key of the verification wallet, or undefined when unconfigured/malformed. */
+export function verifyWalletPublicKey(env: Env): string | undefined {
+  try {
+    return env.PROVIDER_VERIFY_STELLAR_SECRET ? Keypair.fromSecret(env.PROVIDER_VERIFY_STELLAR_SECRET).publicKey() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * Did OUR verification wallet pay `providerAddress` since `sinceIso`?
+ *
+ * Independent of any hash the provider handed us: read our own account's
+ * recent operations from Horizon. `null` means the question could not be
+ * answered (no wallet, Horizon down) and callers must treat that as
+ * "possibly paid", never as "not paid".
+ */
+export async function verifyWalletPaidProviderSince(
+  env: Env,
+  providerAddress: string,
+  sinceIso: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<boolean | null> {
+  const from = verifyWalletPublicKey(env)
+  if (!from) return null
+  const horizon = (env.PLAYGROUND_HORIZON_URL || 'https://horizon.stellar.org').replace(/\/+$/, '')
+  try {
+    const res = await fetchWithTimeout(
+      `${horizon}/accounts/${from}/operations?order=desc&limit=200`,
+      { headers: { Accept: 'application/json' } },
+      PROBE_TIMEOUT_MS,
+      fetchImpl,
+    )
+    if (!res.ok) return null
+    const body = (await res.json()) as { _embedded?: { records?: any[] } }
+    const since = Date.parse(sinceIso)
+    for (const op of body._embedded?.records ?? []) {
+      if (op.created_at && Date.parse(op.created_at) < since) continue
+      if (op.transaction_successful === false) continue
+      if (op.to === providerAddress || op.into === providerAddress || JSON.stringify(op).includes(providerAddress)) return true
+    }
+    return false
+  } catch {
+    return null
   }
 }
 
@@ -531,7 +598,7 @@ async function payWithMppx(req: PaidCallRequest): Promise<Response> {
  * Version 1 (`X-PAYMENT`) and version 2 (`PAYMENT-SIGNATURE`) providers
  * are both handled by the core client's header encoder.
  */
-async function payWithX402(req: PaidCallRequest): Promise<Response> {
+async function payWithX402(req: PaidCallRequest, fetchImpl: typeof fetch = fetch): Promise<Response> {
   const signer = createEd25519Signer(req.secret, req.network as any)
   const core = new x402Client()
   core.register(req.network as any, new ExactStellarScheme(signer, { url: req.rpcUrl }))
@@ -542,7 +609,7 @@ async function payWithX402(req: PaidCallRequest): Promise<Response> {
     ...(req.method === 'POST' ? { body: '{}' } : {}),
     signal: req.signal,
   }
-  const first = await fetch(req.url, init)
+  const first = await fetchImpl(req.url, init)
   if (first.status !== 402) return first
   const bodyText = await first.text().catch(() => '')
   let body: unknown = undefined
@@ -554,7 +621,7 @@ async function payWithX402(req: PaidCallRequest): Promise<Response> {
   const paymentRequired = http.getPaymentRequiredResponse(name => first.headers.get(name), body)
   const payload = await http.createPaymentPayload(paymentRequired)
   const paymentHeaders = http.encodePaymentSignatureHeader(payload)
-  return fetch(req.url, {
+  return fetchImpl(req.url, {
     ...init,
     headers: { ...(init.headers as Record<string, string>), ...paymentHeaders },
   })
@@ -720,7 +787,7 @@ export async function gateRealMoneyCall(
     )
   }
 
-  const settled = await assertSettledToProvider(env, txHash, stellarPayout.payTo, deps.fetchImpl)
+  const settled = await assertSettledToProvider(env, txHash, stellarPayout.payTo, deps.fetchImpl, verifyWalletPublicKey(env))
   if (!settled.ok) return { ...settled, dialect }
 
   return {

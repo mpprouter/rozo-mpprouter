@@ -70,7 +70,7 @@ import { readProviderRevenue } from '../services/provider-revenue'
 import { getStats } from '../services/stats'
 import { issueDashboardToken, verifyDashboardToken } from '../services/provider-dashboard-auth'
 import { readClaimState, reconcileUncertainClaim, runClaimedPaidGate } from '../services/provider-verify-claim'
-import { assertSettledToProvider, MAX_VERIFY_PAYMENT_USD, type GateResult } from '../services/provider-verification'
+import { assertSettledToProvider, MAX_VERIFY_PAYMENT_USD, verifyWalletPaidProviderSince, verifyWalletPublicKey, type GateResult } from '../services/provider-verification'
 import { CAPABILITY_CONTRACTS } from '../services/provider-capabilities'
 
 function json(status: number, payload: unknown): Response {
@@ -300,7 +300,7 @@ function gateEvidence(record: ProviderRecord, probe?: GateResult, paid?: GateRes
     real_money: paid ? { ok: paid.ok, detail: paid.detail, ...(paid.ok ? {} : { code: paid.code }) } : null,
     settlement_tx: txHash ?? null,
     settlement_network: txHash ? network ?? null : null,
-    settled_to: txHash ? record.payouts.find(p => p.network.startsWith('stellar:'))?.payTo ?? null : null,
+    settled_to: paid?.ok && txHash ? record.payouts.find(p => p.network.startsWith('stellar:'))?.payTo ?? null : null,
     explorer_url: explorerTxUrl(network, txHash),
     horizon_url: txHash ? `https://horizon.stellar.org/transactions/${txHash}` : null,
   }
@@ -637,7 +637,9 @@ export async function handleProviderVerify(
       const outcome = await reconcileUncertainClaim(env, {
         providerId: record.id,
         registrationVersion: verificationEpoch,
-        settled: hash => assertSettledToProvider(env, hash, stellarPayTo),
+        settled: hash => assertSettledToProvider(env, hash, stellarPayTo, undefined, verifyWalletPublicKey(env)),
+        walletPaidSince: since => verifyWalletPaidProviderSince(env, stellarPayTo, since),
+        allowRelease: true,
       })
       if (outcome.status === 'paid_not_served' || outcome.status === 'unresolved') {
         return json(409, {
@@ -788,9 +790,13 @@ export async function handleProviderVerificationStatus(env: Env, id: string): Pr
   if (env.ATOMIC_STORE) {
     claim = await readClaimState(env, record.id, epoch)
     if (claim.state === 'uncertain' && stellarPayTo && record.status !== 'published') {
+      // A public GET may complete a claim from the ledger (idempotent) but
+      // never release one: releasing re-arms a payment, and that decision
+      // belongs to the POST that would make it.
       reconciliation = await reconcileUncertainClaim(env, {
         providerId: record.id, registrationVersion: epoch,
-        settled: hash => assertSettledToProvider(env, hash, stellarPayTo),
+        settled: hash => assertSettledToProvider(env, hash, stellarPayTo, undefined, verifyWalletPublicKey(env)),
+        allowRelease: false,
       })
       claim = await readClaimState(env, record.id, epoch)
     }
