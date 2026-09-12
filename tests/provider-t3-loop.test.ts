@@ -146,7 +146,7 @@ const registration = {
 
 beforeEach(() => {
   paidExecutor.mockReset()
-  horizon.ops = [{ type: 'invoke_host_function', source_account: VERIFIER.publicKey(), transaction_successful: true, parameters: [{ value: PROVIDER }] }]
+  horizon.ops = [{ type: 'invoke_host_function', source_account: VERIFIER.publicKey(), transaction_successful: true, asset_balance_changes: [{ type: 'transfer', from: VERIFIER.publicKey(), to: PROVIDER, amount: '0.0030000', asset_code: 'USDC' }] }]
   horizon.status = 200
   horizon.byHash = {}
   horizon.accountOps = []
@@ -210,8 +210,14 @@ describe('paid gate: receipts and dialects', () => {
     const r = record()
     horizon.ops = [{ type: 'payment', source_account: VERIFIER.publicKey(), to: OTHER }]
     expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_found', txHash: TX })
-    horizon.ops = [{ type: 'invoke_host_function', source_account: VERIFIER.publicKey(), parameters: [{ value: PROVIDER }, { value: ROUTER_POOL }] }]
+    horizon.ops = [{ type: 'invoke_host_function', source_account: VERIFIER.publicKey(), asset_balance_changes: [{ type: 'transfer', from: VERIFIER.publicKey(), to: ROUTER_POOL, amount: '0.0030000' }] }]
     expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_direct', txHash: TX })
+    // Both addresses appearing in invocation parameters without a transfer prove nothing.
+    horizon.ops = [{ type: 'invoke_host_function', source_account: VERIFIER.publicKey(), parameters: [{ value: PROVIDER }, { value: VERIFIER.publicKey() }], asset_balance_changes: [] }]
+    expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_found', txHash: TX })
+    // A transfer to the provider from someone else's wallet is not our payment.
+    horizon.ops = [{ type: 'invoke_host_function', source_account: OTHER, asset_balance_changes: [{ type: 'transfer', from: OTHER, to: PROVIDER, amount: '1' }] }]
+    expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_found', txHash: TX })
     // A hash of the provider's OWN old transfer to itself proves nothing about our payment.
     horizon.ops = [{ type: 'payment', source_account: PROVIDER, from: PROVIDER, to: PROVIDER }]
     expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'settlement_not_found', txHash: TX })

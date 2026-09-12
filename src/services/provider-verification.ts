@@ -464,45 +464,44 @@ export async function assertSettledToProvider(
     const body = (await res.json()) as { _embedded?: { records?: any[] } }
     const records = body._embedded?.records ?? []
     const routerAddress = env.STELLAR_ROUTER_PUBLIC
+    // Structured, never textual: a transfer is a classic `payment` op with
+    // typed from/to, or a Soroban invocation whose Horizon
+    // `asset_balance_changes[]` lists a `transfer` with typed from/to. A
+    // provider who controls the receipt header can name any hash, so a
+    // hash only counts when the ledger shows OUR wallet moving value to
+    // THEIR address — not when both strings merely appear somewhere in an
+    // invocation's parameters.
     for (const op of records) {
       if (op.transaction_successful === false) {
         return failure('settlement_not_found', `Transaction ${txHash} failed on the ledger.`, { txHash })
       }
-      if (expectedFrom) {
-        const from = op.from ?? op.source_account ?? op.source
-        const fromText = JSON.stringify(op)
-        if (from !== expectedFrom && !fromText.includes(expectedFrom)) {
-          return failure(
-            'settlement_not_found',
-            `Transaction ${txHash} was not sent by the verification wallet, so it does not prove this verification's payment.`,
-            { txHash },
-          )
+      const transfers: Array<{ from?: string; to?: string }> = []
+      if (op.type === 'payment' || op.type === 'path_payment_strict_send' || op.type === 'path_payment_strict_receive') {
+        transfers.push({ from: op.from, to: op.to })
+      }
+      if (op.type === 'invoke_host_function' && Array.isArray(op.asset_balance_changes)) {
+        for (const change of op.asset_balance_changes) {
+          if (change?.type === 'transfer') transfers.push({ from: change.from, to: change.to })
         }
       }
-      // Classic payment leg.
-      if (op.to === providerAddress || op.into === providerAddress) {
-        return { ok: true, detail: `Settled to ${providerAddress}.`, txHash }
-      }
-      // Soroban SEP-41 transfer: the destination sits in the invocation
-      // parameters rather than in a typed field, so match on the rendered
-      // form and require the provider address to be present while ours is
-      // not — the second half is what rules out a forward-through-us shape.
-      const asText = JSON.stringify(op)
-      if (asText.includes(providerAddress)) {
-        if (routerAddress && asText.includes(routerAddress)) {
+      for (const t of transfers) {
+        if (expectedFrom && t.from !== expectedFrom) continue
+        if (routerAddress && t.to === routerAddress) {
           return failure(
             'settlement_not_direct',
-            'The settlement transaction references the ROZO pool address. ' +
+            'The settlement transaction pays the ROZO pool address. ' +
               'Direct settlement must pay the provider with no ROZO leg.',
             { txHash },
           )
         }
-        return { ok: true, detail: `Settled to ${providerAddress}.`, txHash }
+        if (t.to === providerAddress) {
+          return { ok: true, detail: `Settled to ${providerAddress}.`, txHash }
+        }
       }
     }
     return failure(
       'settlement_not_found',
-      `Transaction ${txHash} does not show a payment to ${providerAddress}.`,
+      `Transaction ${txHash} shows no transfer${expectedFrom ? ' from the verification wallet' : ''} to ${providerAddress}.`,
       { txHash },
     )
   } catch (err: any) {
@@ -557,7 +556,9 @@ export async function verifyWalletPaidProviderSince(
       const createdAt = op.created_at ? Date.parse(op.created_at) : NaN
       if (Number.isFinite(createdAt) && createdAt < since) return false
       if (op.transaction_successful === false) continue
-      if (op.to === providerAddress || op.into === providerAddress || JSON.stringify(op).includes(providerAddress)) return true
+      if (op.to === providerAddress) return true
+      if (op.type === 'invoke_host_function' && Array.isArray(op.asset_balance_changes)
+        && op.asset_balance_changes.some((c: any) => c?.type === 'transfer' && c.to === providerAddress)) return true
     }
     // Fewer than a full page means the account history is exhausted
     // before `since`: nothing older exists, so nothing was paid.
