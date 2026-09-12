@@ -69,7 +69,7 @@ import { parseProviderChallenge, sameAddress } from './provider-verification'
 import type { RouteOperatorPayout } from './merchants-types'
 import type { ProviderRouteSpec } from './provider-registry'
 
-export type OwnershipProofType = 'wallet_signature' | 'well_known' | 'x402_pay_to'
+export type OwnershipProofType = 'wallet_signature' | 'well_known' | 'x402_pay_to' | 'hosted_origin_auth'
 
 export const OWNERSHIP_PROOF_TYPES: OwnershipProofType[] = [
   'wallet_signature',

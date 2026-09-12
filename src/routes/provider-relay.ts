@@ -74,7 +74,9 @@ const DROP_RESPONSE_HEADERS = new Set([
 ])
 
 export function isDirectSettlementRoute(route: PublicServiceRoute): boolean {
-  return Boolean(route.operator)
+  // A hosted route has no provider-side 402 to relay to: the router IS its
+  // paywall (services/provider-hosting.ts) and it takes the x402 branch.
+  return Boolean(route.operator) && !route.hosted
 }
 
 export function relayTargetUrl(route: PublicServiceRoute, requestUrl: URL): string {

@@ -389,6 +389,14 @@ export async function checkAndReserveNonce(
 export function buildPaymentRequirementsForAgentAmount(
   env: Env,
   agentSignedAmount: bigint,
+  /**
+   * The recipient the facilitator verifies and settles against. The
+   * router pool by default; the PROVIDER's own address for a
+   * direct-settlement route. This is the field that decides where the
+   * buyer's money goes, so callers on a provider route must pass it —
+   * a default here is the wrong default for them.
+   */
+  payTo: string = env.STELLAR_X402_PAY_TO,
 ): PaymentRequirements {
   const network = env.STELLAR_NETWORK as Network
   const asset = getUsdcAddress(network)
@@ -397,7 +405,7 @@ export function buildPaymentRequirementsForAgentAmount(
     network,
     amount: agentSignedAmount.toString(),
     asset,
-    payTo: env.STELLAR_X402_PAY_TO,
+    payTo,
     // Stellar auth entries have their own shorter expiration
     // baked in at sign time. This field is mostly advisory for
     // x402-over-HTTP clients deciding how long to cache the
@@ -719,12 +727,22 @@ export async function prepareStellarX402Inbound(
   env: Env,
   authHeader: string,
   merchantQuoteBaseUnits: bigint,
+  /** Recipient this route settles to; the router pool when omitted. */
+  expectedPayTo?: string,
 ): Promise<StellarX402PrepareOk | StellarX402PrepareFail> {
   const payload = parseStellarX402Header(authHeader)
   if (!payload) {
     return {
       ok: false,
       reason: 'invalid stellar x402 payload format',
+      statusCode: 402,
+    }
+  }
+  const payTo = expectedPayTo ?? env.STELLAR_X402_PAY_TO
+  if (!payTo || payload.accepted?.payTo !== payTo) {
+    return {
+      ok: false,
+      reason: 'stellar x402 payload pays a different recipient than this route settles to',
       statusCode: 402,
     }
   }
@@ -763,7 +781,7 @@ export async function prepareStellarX402Inbound(
       statusCode: 402,
     }
   }
-  const requirements = buildPaymentRequirementsForAgentAmount(env, signedAmount)
+  const requirements = buildPaymentRequirementsForAgentAmount(env, signedAmount, payTo)
   return {
     ok: true,
     payload,

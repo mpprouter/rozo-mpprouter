@@ -39,6 +39,7 @@ import {
   handleProviderVerificationStatus,
 } from './routes/providers'
 import { handleCapabilities, handleServiceSelect } from './routes/service-select'
+import { hostedProviderIdFor } from './services/provider-hosting'
 import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
 import { handleX402Supported } from './routes/x402-supported'
@@ -471,6 +472,16 @@ export interface Env {
   // `gate_unavailable` and registrations stay pending (fails closed).
   // Set via: wrangler secret put PROVIDER_VERIFY_STELLAR_SECRET
   PROVIDER_VERIFY_STELLAR_SECRET?: string
+  // Key-encryption key for hosted providers' origin credentials
+  // (services/provider-hosting.ts). Set via: wrangler secret put PROVIDER_HOSTING_KEK
+  // Absent → hosted registration answers 503; nothing is stored in the clear.
+  PROVIDER_HOSTING_KEK?: string
+  // Hostname suffix hosted paywalls are served on. Default pay.mpprouter.dev.
+  PROVIDER_HOSTED_SUFFIX?: string
+  // Service binding to this same Worker, so verification of a hosted
+  // route can reach the hosted hostname without a network round-trip to
+  // ourselves (which the platform refuses). [[services]] in wrangler.toml.
+  SELF?: Fetcher
 
   // Kill switch for POST /v1/providers/sponsor, which funds a new provider's
   // Stellar account reserve out of STELLAR_GAS_SECRET. Separate from
@@ -585,6 +596,14 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         const secure = new URL(url.toString())
         secure.protocol = 'https:'
         return Response.redirect(secure.toString(), 301)
+      }
+
+      // `<id>.pay.mpprouter.dev` — a router-hosted paywall for a provider
+      // without one of its own. Every path on such a hostname is a paid
+      // route (or 404 from the proxy); nothing else this Worker serves is
+      // reachable there. See services/provider-hosting.ts.
+      if (hostedProviderIdFor(env, url.hostname)) {
+        return handleProxy(request, env, ctx)
       }
 
       // coupon.rozo.ai is the partner-facing hostname, not an API endpoint.

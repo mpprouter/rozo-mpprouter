@@ -70,6 +70,7 @@ import type {
   RouteOperator,
   RouteOperatorPayout,
 } from './merchants-types'
+import type { StoredHosting } from './provider-hosting'
 import {
   capabilityAcceptsRoute,
   capabilityMethod,
@@ -102,6 +103,14 @@ const MAX_PROVIDERS = 500
 
 /** Ceiling on chargeable routes one provider may register. */
 const MAX_ROUTES_PER_PROVIDER = 25
+
+/**
+ * Calls per day the gateway will make to a hosted provider's origin, per
+ * PROVIDER (the cap key is the service id, shared by all its routes).
+ * Protects the provider's own API quota from router-side traffic;
+ * enforced before any 402 is issued so a capped call costs nothing.
+ */
+export const HOSTED_DAILY_CAP = 2000
 
 // ---------------------------------------------------------------------
 // Types
@@ -162,7 +171,7 @@ export interface ProviderVerification {
    * "the provider's own endpoint advertises this address" — both are
    * accepted, they are not the same claim.
    */
-  ownershipProof?: 'wallet_signature' | 'well_known' | 'x402_pay_to'
+  ownershipProof?: 'wallet_signature' | 'well_known' | 'x402_pay_to' | 'hosted_origin_auth'
   /**
    * Which 402 dialect the provider's endpoint speaks, as observed by the
    * probe. Decides which client pays the verification call and what the
@@ -238,8 +247,13 @@ export interface ProviderRecord {
      * value as "not a signature" deliberately — an old record can still be
      * updated with a signature, and upgrading a proof is never the risk.
      */
-    proof?: 'wallet_signature' | 'well_known' | 'x402_pay_to'
+    proof?: 'wallet_signature' | 'well_known' | 'x402_pay_to' | 'hosted_origin_auth'
   }
+  /**
+   * Set when the router hosts this provider's paywall: the origin we call
+   * and the (encrypted) credential we present. See provider-hosting.ts.
+   */
+  hosting?: StoredHosting
   /** Canonical signed-registration digest. Changes only on signed re-register. */
   registrationVersion?: string
   /** SHA-256 only. The bearer token is returned once after signed registration. */
@@ -272,6 +286,9 @@ const PRICE_PATTERN = /^\d+(?:\.\d{1,7})?$/
 const RESERVED_IDS = new Set([
   'rozo', 'mpp', 'mpprouter', 'router', 'admin', 'internal', 'system',
   'stellar', 'x402', 'playground', 'partner', 'coupon', 'health', 'stats',
+  // Snapshot service ids whose per-service rate-limit bucket a provider
+  // must not share (the cap key is `ratelimit:<service>:<day>`).
+  'mercury', 'pay', 'www', 'api', 'apiserver',
 ])
 
 export class ProviderValidationError extends Error {
@@ -614,8 +631,11 @@ export function toRouteOperator(record: ProviderRecord): RouteOperator {
  */
 export function routesForProvider(record: ProviderRecord): PublicServiceRoute[] {
   const operator = toRouteOperator(record)
-  const host = new URL(record.apiBaseUrl).host
-  const basePath = new URL(record.apiBaseUrl).pathname.replace(/\/+$/, '')
+  // A hosted provider's upstream is its ORIGIN, not the hosted hostname the
+  // buyer talks to; the hosted hostname is ours and resolves back here.
+  const upstreamBase = new URL(record.hosting ? record.hosting.originUrl : record.apiBaseUrl)
+  const host = upstreamBase.host
+  const basePath = upstreamBase.pathname.replace(/\/+$/, '')
 
   return record.routes.map(spec => ({
     id: `${record.id}_${spec.operation.replace(/-/g, '_')}`,
@@ -648,6 +668,15 @@ export function routesForProvider(record: ProviderRecord): PublicServiceRoute[] 
     operator,
     ...(record.verification.challengeDialect ? { upstreamDialect: record.verification.challengeDialect } : {}),
     ...(spec.capability ? { capability: spec.capability } : {}),
+    ...(record.hosting
+      ? {
+          hosted: true,
+          hostedPath: spec.upstreamPath,
+          // Router-issued 402 at the registered price; no origin 402 to probe.
+          fixedPricing: { amountUsd: spec.priceUsd },
+          rateLimit: { perDay: HOSTED_DAILY_CAP },
+        }
+      : {}),
   }))
 }
 

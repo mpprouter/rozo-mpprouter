@@ -1,6 +1,7 @@
 import type { Env } from '../index'
 import { getProviderRecord, listPublishedProviders, putProviderRecord } from './provider-registry'
 import { chooseVerificationRoute, gateProbe402 } from './provider-verification'
+import { routerFetch } from './provider-hosting'
 
 const DEGRADED_AFTER = 2
 const OFFLINE_AFTER = 5
@@ -18,7 +19,7 @@ export async function monitorPublishedProviders(env: Env): Promise<void> {
     const record = await getProviderRecord(env, indexed.id)
     if (!record || record.status !== 'published') continue
     const observedUpdatedAt = record.updatedAt
-    const result = await gateProbe402(record, chooseVerificationRoute(record))
+    const result = await gateProbe402(record, chooseVerificationRoute(record), routerFetch(env))
     const now = new Date().toISOString()
     const previous = record.verification.consecutiveProbeFailures ?? 0
     if (result.ok) {
