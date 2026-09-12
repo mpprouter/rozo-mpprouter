@@ -659,8 +659,10 @@ export async function payWithMppx(req: PaidCallRequest, fetchImpl: typeof fetch 
  * `@x402/core` selects among the provider's offers by registered network,
  * so a multi-chain challenge is paid on `stellar:pubnet` and nothing else
  * — the Base and Solana offers are ignored by construction, not by luck.
- * Version 1 (`X-PAYMENT`) and version 2 (`PAYMENT-SIGNATURE`) providers
- * are both handled by the core client's header encoder.
+ * Only x402 **v2** is payable here (the Stellar exact scheme is registered
+ * for v2; `registerV1` is not used). A v1 challenge parses in gate 1 and
+ * then fails closed in gate 2 with `challenge_mismatch`/`paid_call_failed`
+ * — the provider stays pending, nothing is signed.
  */
 export async function payWithX402(req: PaidCallRequest, fetchImpl: typeof fetch = fetch): Promise<Response> {
   const signer = createEd25519Signer(req.secret, req.network as any)
