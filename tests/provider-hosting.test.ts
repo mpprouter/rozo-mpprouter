@@ -75,7 +75,7 @@ describe('hosting config and sealing', () => {
     expect(() => validateHosting(env, { origin_url: 'https://api.acme.example', auth: { header: 'Cookie', value: 'x' } })).toThrow(/cannot be/)
     expect(() => validateHosting(env, { origin_url: 'https://10.0.0.1', auth: { generate: true } })).toThrow()
     // Never ourselves: a loop, and a stored credential handed to our own handlers.
-    for (const bad of ['https://apiserver.mpprouter.dev', 'https://other.pay.mpprouter.dev', 'https://pay.mpprouter.dev', 'https://x.workers.dev', 'https://coupon.rozo.ai']) {
+    for (const bad of ['https://apiserver.mpprouter.dev', 'https://other-pay.mpprouter.dev', 'https://pay.mpprouter.dev', 'https://x.workers.dev', 'https://coupon.rozo.ai']) {
       expect(() => validateHosting(env, { origin_url: bad, auth: { generate: true } })).toThrow(/cannot point/)
     }
   })
@@ -90,11 +90,15 @@ describe('hosting config and sealing', () => {
 
   it('maps hosted hostnames to provider ids and nothing else', () => {
     const env = makeEnv()
-    expect(hostedProviderIdFor(env, 'acme-data.pay.mpprouter.dev')).toBe('acme-data')
-    expect(hostedProviderIdFor(env, 'ACME-DATA.pay.mpprouter.dev')).toBe('acme-data')
+    expect(hostedProviderIdFor(env, 'acme-data-pay.mpprouter.dev')).toBe('acme-data')
+    expect(hostedProviderIdFor(env, 'ACME-DATA-pay.mpprouter.dev')).toBe('acme-data')
     expect(hostedProviderIdFor(env, 'apiserver.mpprouter.dev')).toBeNull()
-    expect(hostedProviderIdFor(env, 'evil.pay.mpprouter.dev.attacker.com')).toBeNull()
-    expect(hostedProviderIdFor(env, 'x.y.pay.mpprouter.dev')).toBeNull()
+    expect(hostedProviderIdFor(env, 'evil-pay.mpprouter.dev.attacker.com')).toBeNull()
+    expect(hostedProviderIdFor(env, 'x.y-pay.mpprouter.dev')).toBeNull()
+    expect(hostedProviderIdFor(env, '-pay.mpprouter.dev')).toBeNull()
+    // A dotted suffix still works where the certificate exists.
+    const dotted = makeEnv({ PROVIDER_HOSTED_SUFFIX: 'pay.mpprouter.dev' })
+    expect(hostedProviderIdFor(dotted, 'acme-data.pay.mpprouter.dev')).toBe('acme-data')
   })
 })
 
@@ -104,11 +108,11 @@ describe('hosted registration', () => {
     const res = await handleProviderRegister(post(registration), env)
     expect(res.status).toBe(201)
     const body = await res.json() as any
-    expect(body.api_base_url).toBe('https://acme-data.pay.mpprouter.dev')
+    expect(body.api_base_url).toBe('https://acme-data-pay.mpprouter.dev')
     expect(body.ownership_proof.type).toBe('hosted_origin_auth')
     expect(body.verification.ownership_proof_means).toMatch(/Not key custody/)
-    expect(body.hosting.hosted_origin).toBe('https://acme-data.pay.mpprouter.dev')
-    expect(body.hosting.paid_routes).toEqual(['https://acme-data.pay.mpprouter.dev/v1/quote'])
+    expect(body.hosting.hosted_origin).toBe('https://acme-data-pay.mpprouter.dev')
+    expect(body.hosting.paid_routes).toEqual(['https://acme-data-pay.mpprouter.dev/v1/quote'])
     expect(body.hosting.generated_secret).toBeUndefined()
     expect(JSON.stringify(body)).not.toContain('acme-live-key-123')
     const record = (await getProviderRecord(env, 'acme-data'))!
@@ -135,7 +139,7 @@ describe('hosted registration', () => {
     expect((await handleProviderRegister(post(registration), makeEnv({ PROVIDER_HOSTING_KEK: undefined }))).status).toBe(503)
     const noStellar = await handleProviderRegister(post({ ...registration, payouts: [{ network: 'eip155:8453', pay_to: '0x' + '1'.repeat(40) }] }), makeEnv())
     expect(noStellar.status).toBe(400)
-    const relayOnHosted = await handleProviderRegister(post({ ...registration, hosting: undefined, api_base_url: 'https://acme-data.pay.mpprouter.dev', ownership_proof: { type: 'x402_pay_to' } }), makeEnv())
+    const relayOnHosted = await handleProviderRegister(post({ ...registration, hosting: undefined, api_base_url: 'https://acme-data-pay.mpprouter.dev', ownership_proof: { type: 'x402_pay_to' } }), makeEnv())
     expect(relayOnHosted.status).toBe(400)
     expect(await relayOnHosted.json()).toMatchObject({ field: 'api_base_url' })
   })
@@ -167,17 +171,17 @@ describe('hosted routes in the catalog and the proxy', () => {
     expect(entry.settlement_mode).toBe('router_paywall')
     expect(entry.payment_hints).toMatchObject({ dialect: 'x402', relayed: false, pay_to: PAYOUT })
     expect(entry.methods.stellar.intents).toEqual([])
-    const resolved = await resolveHostedRoute(env, 'acme-data.pay.mpprouter.dev', '/v1/quote', 'GET')
+    const resolved = await resolveHostedRoute(env, 'acme-data-pay.mpprouter.dev', '/v1/quote', 'GET')
     expect(resolved?.id).toBe('acme-data_quote')
     // Resolvable while still pending, so the paid verification can reach it.
     const fresh = makeEnv()
     await handleProviderRegister(post(registration), fresh)
-    expect((await resolveHostedRoute(fresh, 'acme-data.pay.mpprouter.dev', '/v1/quote', 'GET'))?.id).toBe('acme-data_quote')
+    expect((await resolveHostedRoute(fresh, 'acme-data-pay.mpprouter.dev', '/v1/quote', 'GET'))?.id).toBe('acme-data_quote')
     const rec = (await getProviderRecord(fresh, 'acme-data'))!
     rec.status = 'suspended'; await fresh.MPP_STORE.put('provider:acme-data', JSON.stringify(rec))
-    expect(await resolveHostedRoute(fresh, 'acme-data.pay.mpprouter.dev', '/v1/quote', 'GET')).toBeUndefined()
-    expect(await resolveHostedRoute(env, 'acme-data.pay.mpprouter.dev', '/v1/other', 'GET')).toBeUndefined()
-    expect(await resolveHostedRoute(env, 'other.pay.mpprouter.dev', '/v1/quote', 'GET')).toBeUndefined()
+    expect(await resolveHostedRoute(fresh, 'acme-data-pay.mpprouter.dev', '/v1/quote', 'GET')).toBeUndefined()
+    expect(await resolveHostedRoute(env, 'acme-data-pay.mpprouter.dev', '/v1/other', 'GET')).toBeUndefined()
+    expect(await resolveHostedRoute(env, 'other-pay.mpprouter.dev', '/v1/quote', 'GET')).toBeUndefined()
   })
 
   it('never passes a non-x402 credential or a channel bootstrap through to the origin', async () => {
@@ -186,8 +190,8 @@ describe('hosted routes in the catalog and the proxy', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('should not be called', { status: 200 }))
     const ctx = { waitUntil() {} } as any
     for (const req of [
-      new Request('https://acme-data.pay.mpprouter.dev/v1/quote', { headers: { Authorization: 'Bearer stolen-or-random' } }),
-      new Request('https://acme-data.pay.mpprouter.dev/v1/quote?payment=channel&agent=' + PAYOUT),
+      new Request('https://acme-data-pay.mpprouter.dev/v1/quote', { headers: { Authorization: 'Bearer stolen-or-random' } }),
+      new Request('https://acme-data-pay.mpprouter.dev/v1/quote?payment=channel&agent=' + PAYOUT),
     ]) {
       const res = await handleProxy(req, env, ctx)
       expect(res.status).toBe(402)
@@ -205,7 +209,7 @@ describe('hosted routes in the catalog and the proxy', () => {
   it('builds origin headers with the provider credential and none of the buyer credentials', async () => {
     const env = makeEnv()
     await handleProviderRegister(post(registration), env)
-    const headers = (await hostedOriginHeaders(env, 'acme-data', new Request('https://acme-data.pay.mpprouter.dev/v1/quote', {
+    const headers = (await hostedOriginHeaders(env, 'acme-data', new Request('https://acme-data-pay.mpprouter.dev/v1/quote', {
       headers: { 'PAYMENT-SIGNATURE': 'buyer', Authorization: 'Payment x', Cookie: 'a=b', Accept: 'application/json', 'X-Forwarded-For': '1.1.1.1' },
     })))!
     expect(headers.get('x-api-key')).toBe('acme-live-key-123')
