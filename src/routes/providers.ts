@@ -277,6 +277,7 @@ const NEXT_ACTIONS: Record<string, { action: string; can_safely_retry: boolean }
   too_expensive_to_verify: { action: `Expose one route priced at or below $${MAX_VERIFY_PAYMENT_USD} (mark it verify_with) and re-register. Nothing was paid.`, can_safely_retry: true },
   no_stellar_payout: { action: 'Add a stellar:pubnet payout (we can sponsor the account) and re-register. Nothing was paid.', can_safely_retry: true },
   budget_exhausted: { action: 'The daily verification budget is spent. Retry tomorrow. Nothing was paid.', can_safely_retry: true },
+  challenge_mismatch: { action: 'Your endpoint served a different payTo or a higher amount to the paid call than to the probe. Nothing was signed or paid. Make the 402 consistent, then retry.', can_safely_retry: true },
   paid_call_failed: { action: 'The paid call did not complete. Money may or may not have moved; this attempt is frozen. Check the verification status page before doing anything else.', can_safely_retry: false },
   paid_call_not_200: { action: 'A payment was submitted but your endpoint did not return 200. Check the transaction, fix the endpoint, then re-register with a changed registration to start a fresh verification.', can_safely_retry: false },
   empty_body: { action: 'A payment was submitted but your endpoint returned an empty body. Fix the endpoint, then re-register with a changed registration.', can_safely_retry: false },

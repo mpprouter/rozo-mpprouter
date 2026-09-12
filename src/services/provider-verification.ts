@@ -573,14 +573,65 @@ export interface PaidCallRequest {
   rpcUrl: string
   network: string
   signal: AbortSignal
+  /**
+   * What the paid challenge is allowed to ask for. The free probe read ONE
+   * 402; the paid call fetches a fresh one, and a provider that serves a
+   * cheap, correctly-addressed challenge to the probe and a different one
+   * to the payment must be refused BEFORE anything is signed. Recipient
+   * must match exactly; amount must not exceed the registered price.
+   */
+  expected: { payTo: string; maxAmountBaseUnits: bigint }
 }
 export type PaidCallExecutor = (req: PaidCallRequest) => Promise<Response>
 
-async function payWithMppx(req: PaidCallRequest): Promise<Response> {
+/** Thrown by an executor when the paid-phase challenge disagrees with the registration. Nothing was signed. */
+export class ChallengeMismatchError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ChallengeMismatchError'
+  }
+}
+
+function assertChallengeWithinRegistration(
+  expected: PaidCallRequest['expected'],
+  network: string,
+  offered: { payTo: string; amount: string },
+): void {
+  if (!sameAddress(network, offered.payTo, expected.payTo)) {
+    throw new ChallengeMismatchError(
+      `The paid-phase 402 pays ${network} to a different address than the one registered and probed. Refusing to sign.`,
+    )
+  }
+  let amount: bigint
+  try {
+    amount = BigInt(offered.amount)
+  } catch {
+    throw new ChallengeMismatchError(`The paid-phase 402 amount "${offered.amount}" is not an integer. Refusing to sign.`)
+  }
+  if (amount > expected.maxAmountBaseUnits) {
+    throw new ChallengeMismatchError(
+      `The paid-phase 402 asks for ${amount} base units, above the registered ${expected.maxAmountBaseUnits}. Refusing to sign.`,
+    )
+  }
+}
+
+export async function payWithMppx(req: PaidCallRequest, fetchImpl: typeof fetch = fetch): Promise<Response> {
   const client = Mppx.create({
     methods: [stellar.charge({ keypair: Keypair.fromSecret(req.secret) })],
     polyfill: false,
-  })
+    fetch: fetchImpl,
+    // Runs before any credential is created: the recipient and amount in
+    // the live challenge are checked against the registration, and a
+    // mismatch aborts the whole paid call with nothing signed.
+    onChallenge: async (challenge: any, helpers: { createCredential: () => Promise<string> }) => {
+      const request = (challenge?.request ?? {}) as { recipient?: string; amount?: string }
+      assertChallengeWithinRegistration(req.expected, req.network, {
+        payTo: String(request.recipient ?? ''),
+        amount: String(request.amount ?? ''),
+      })
+      return helpers.createCredential()
+    },
+  } as any)
   return client.fetch(req.url, {
     method: req.method,
     headers: { 'Content-Type': 'application/json', 'User-Agent': 'mpprouter-verify/1' },
@@ -598,7 +649,7 @@ async function payWithMppx(req: PaidCallRequest): Promise<Response> {
  * Version 1 (`X-PAYMENT`) and version 2 (`PAYMENT-SIGNATURE`) providers
  * are both handled by the core client's header encoder.
  */
-async function payWithX402(req: PaidCallRequest, fetchImpl: typeof fetch = fetch): Promise<Response> {
+export async function payWithX402(req: PaidCallRequest, fetchImpl: typeof fetch = fetch): Promise<Response> {
   const signer = createEd25519Signer(req.secret, req.network as any)
   const core = new x402Client()
   core.register(req.network as any, new ExactStellarScheme(signer, { url: req.rpcUrl }))
@@ -618,7 +669,26 @@ async function payWithX402(req: PaidCallRequest, fetchImpl: typeof fetch = fetch
   } catch {
     // v2 carries the challenge in a header; a non-JSON body is fine.
   }
-  const paymentRequired = http.getPaymentRequiredResponse(name => first.headers.get(name), body)
+  // v2 puts the challenge in PAYMENT-REQUIRED; some servers (and every v1
+  // server) put it in the JSON body. Accept either, in that order.
+  let paymentRequired: any
+  try {
+    paymentRequired = http.getPaymentRequiredResponse(name => first.headers.get(name), body)
+  } catch {
+    const fromBody = body as { accepts?: unknown[] } | undefined
+    if (fromBody && Array.isArray(fromBody.accepts) && fromBody.accepts.length > 0) paymentRequired = fromBody
+    else throw new ChallengeMismatchError('The paid-phase 402 carried no readable x402 challenge. Refusing to sign.')
+  }
+  // Constrain BEFORE signing: only the registered network's entry, and only
+  // if it pays the registered address for no more than the registered
+  // price. The core client would otherwise happily sign whichever entry it
+  // selected from a challenge the probe never saw.
+  const offered = (paymentRequired.accepts ?? []).find((a: any) => a.network === req.network)
+  if (!offered) {
+    throw new ChallengeMismatchError(`The paid-phase 402 offers no ${req.network} settlement option. Refusing to sign.`)
+  }
+  assertChallengeWithinRegistration(req.expected, req.network, { payTo: String(offered.payTo ?? ''), amount: String(offered.amount ?? '') })
+  core.registerPolicy((_v, reqs) => reqs.filter(r => r.network === req.network && sameAddress(req.network, String(r.payTo), req.expected.payTo)))
   const payload = await http.createPaymentPayload(paymentRequired)
   const paymentHeaders = http.encodePaymentSignatureHeader(payload)
   return fetchImpl(req.url, {
@@ -732,6 +802,10 @@ export async function gateRealMoneyCall(
   }
 
   const url = providerEndpointUrl(record, spec)
+  const maxAmount = toBaseUnits(spec.priceUsd, 7)
+  if (maxAmount === null) {
+    return failure('bad_price', `Cannot express "${spec.priceUsd}" in Stellar base units.`)
+  }
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), PAID_CALL_TIMEOUT_MS)
   let response: Response
@@ -744,8 +818,14 @@ export async function gateRealMoneyCall(
       rpcUrl: env.STELLAR_RPC_URL ?? '',
       network: stellarPayout.network,
       signal: controller.signal,
+      expected: { payTo: stellarPayout.payTo, maxAmountBaseUnits: maxAmount },
     })
   } catch (err: any) {
+    if (err instanceof ChallengeMismatchError) {
+      // Nothing was signed; the provider's paid-phase challenge disagreed
+      // with what it showed the probe. Safe to retry, and worth recording.
+      return failure('challenge_mismatch', err.message, { dialect })
+    }
     return failure(
       'paid_call_failed',
       `The paid call did not complete: ${err?.message ?? 'unknown error'}. ` +

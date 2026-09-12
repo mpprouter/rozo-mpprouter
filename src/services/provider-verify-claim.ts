@@ -38,7 +38,7 @@ async function commit(env: Env, key: string, version: number, op: 'set' | 'delet
 }
 
 function canSafelyRetry(result: GateResult): boolean {
-  return !result.ok && ['gate_unavailable', 'too_expensive_to_verify', 'no_stellar_payout', 'budget_exhausted', 'bad_price'].includes(result.code)
+  return !result.ok && ['gate_unavailable', 'too_expensive_to_verify', 'no_stellar_payout', 'budget_exhausted', 'bad_price', 'challenge_mismatch'].includes(result.code)
 }
 
 export async function runClaimedPaidGate(

@@ -50,7 +50,7 @@ import {
   handleProviderVerify,
   handleProviderVerificationStatus,
 } from '../src/routes/providers'
-import { gateRealMoneyCall, receiptTxHash, parseProviderChallenge } from '../src/services/provider-verification'
+import { gateRealMoneyCall, receiptTxHash, parseProviderChallenge, payWithX402, payWithMppx, ChallengeMismatchError } from '../src/services/provider-verification'
 import { resetProviderCache } from '../src/services/provider-registry'
 import { listCatalogWithOverlay, getRouteWithOverlay } from '../src/services/catalog-overlay'
 import { handleProxy } from '../src/routes/proxy'
@@ -225,6 +225,43 @@ describe('paid gate: receipts and dialects', () => {
     const env = makeEnv()
     const r = record()
     expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'paid_call_not_200', txHash: TX })
+  })
+
+  it('passes the registered recipient and price cap to the executor', async () => {
+    paidExecutor.mockResolvedValue(paidOk('payment-response', b64({ success: true, transaction: TX })))
+    const env = makeEnv()
+    const r = record()
+    await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')
+    expect(paidExecutor.mock.calls[0][0].expected).toEqual({ payTo: PROVIDER, maxAmountBaseUnits: 30000n })
+  })
+
+  it('x402 payer refuses to sign when the paid-phase 402 changes the recipient or raises the price', async () => {
+    const calls: string[] = []
+    const mk = (challenge: unknown) => (async (input: any) => { calls.push(String(input)); return challenge402(challenge) }) as typeof fetch
+    const base = { dialect: 'x402' as const, url: `${ORIGIN}/api/stablecoin-peg`, method: 'GET' as const, secret: VERIFIER.secret(), rpcUrl: 'https://rpc.example', network: 'stellar:pubnet', signal: new AbortController().signal, expected: { payTo: PROVIDER, maxAmountBaseUnits: 30000n } }
+    await expect(payWithX402(base, mk(agent402Challenge(OTHER)))).rejects.toBeInstanceOf(ChallengeMismatchError)
+    await expect(payWithX402(base, mk(agent402Challenge(PROVIDER, '30001')))).rejects.toBeInstanceOf(ChallengeMismatchError)
+    // No Stellar option at all in the paid phase.
+    await expect(payWithX402(base, mk({ x402Version: 2, accepts: [{ scheme: 'exact', network: 'eip155:8453', payTo: '0x' + '4'.repeat(40), amount: '1' }] }))).rejects.toBeInstanceOf(ChallengeMismatchError)
+    // Exactly one fetch each: the challenge was read, nothing was signed or retried.
+    expect(calls).toHaveLength(3)
+    // The gate turns that into a safely-retryable code.
+    const env = makeEnv()
+    const r = record()
+    paidExecutor.mockImplementation(req => payWithX402(req, mk(agent402Challenge(OTHER))))
+    expect(await gateRealMoneyCall(env, r as any, r.routes[0], 'x402')).toMatchObject({ ok: false, code: 'challenge_mismatch' })
+  })
+
+  it('mppx payer refuses to sign when the paid-phase challenge changes the recipient', async () => {
+    const calls: string[] = []
+    const challenge = (recipient: string, amount: string) => {
+      const request = btoa(JSON.stringify({ amount, currency: 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75', recipient, decimals: 7 }))
+      return new Response('{}', { status: 402, headers: { 'WWW-Authenticate': `Payment id="c1", realm="stellar", method="stellar", intent="charge", request="${request}"` } })
+    }
+    const fetchImpl = (async (input: any) => { calls.push(String(input)); return challenge(OTHER, '30000') }) as typeof fetch
+    const req = { dialect: 'mppx' as const, url: `${ORIGIN}/api/stablecoin-peg`, method: 'GET' as const, secret: VERIFIER.secret(), rpcUrl: '', network: 'stellar:pubnet', signal: new AbortController().signal, expected: { payTo: PROVIDER, maxAmountBaseUnits: 30000n } }
+    await expect(payWithMppx(req, fetchImpl)).rejects.toBeInstanceOf(ChallengeMismatchError)
+    expect(calls).toHaveLength(1)
   })
 
   it('parses v1 and v2 x402 bodies and mppx headers into one challenge shape', () => {
