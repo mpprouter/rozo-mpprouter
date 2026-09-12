@@ -61,22 +61,27 @@ beforeEach(() => { resetProviderCache(); vi.restoreAllMocks() })
 
 describe('hosting config and sealing', () => {
   it('validates the hosting block and generates a gateway secret on request', () => {
-    const supplied = validateHosting(registration.hosting)
+    const env = makeEnv()
+    const supplied = validateHosting(env, registration.hosting)
     expect(supplied).toMatchObject({ originUrl: 'https://api.acme.example', auth: { header: 'X-API-Key', scheme: 'raw', value: 'acme-live-key-123', generated: false } })
-    const generated = validateHosting({ origin_url: 'https://api.acme.example', auth: { generate: true } })
+    const generated = validateHosting(env, { origin_url: 'https://api.acme.example', auth: { generate: true } })
     expect(generated.auth.generated).toBe(true)
     expect(generated.auth.value).toMatch(/^mppg_[0-9a-f]{64}$/)
     expect(generated.auth.header).toBe('Authorization')
     expect(generated.auth.scheme).toBe('bearer')
-    expect(() => validateHosting({ origin_url: 'http://api.acme.example', auth: { generate: true } })).toThrow(/https/)
-    expect(() => validateHosting({ origin_url: 'https://api.acme.example', auth: {} })).toThrow(/auth.value/)
-    expect(() => validateHosting({ origin_url: 'https://api.acme.example', auth: { header: 'Cookie', value: 'x' } })).toThrow(/cannot be/)
-    expect(() => validateHosting({ origin_url: 'https://10.0.0.1', auth: { generate: true } })).toThrow()
+    expect(() => validateHosting(env, { origin_url: 'http://api.acme.example', auth: { generate: true } })).toThrow(/https/)
+    expect(() => validateHosting(env, { origin_url: 'https://api.acme.example', auth: {} })).toThrow(/auth.value/)
+    expect(() => validateHosting(env, { origin_url: 'https://api.acme.example', auth: { header: 'Cookie', value: 'x' } })).toThrow(/cannot be/)
+    expect(() => validateHosting(env, { origin_url: 'https://10.0.0.1', auth: { generate: true } })).toThrow()
+    // Never ourselves: a loop, and a stored credential handed to our own handlers.
+    for (const bad of ['https://apiserver.mpprouter.dev', 'https://other.pay.mpprouter.dev', 'https://pay.mpprouter.dev', 'https://x.workers.dev', 'https://coupon.rozo.ai']) {
+      expect(() => validateHosting(env, { origin_url: bad, auth: { generate: true } })).toThrow(/cannot point/)
+    }
   })
 
   it('seals the credential with the KEK and never stores it in the clear', async () => {
     const env = makeEnv()
-    const stored = await sealHosting(env, validateHosting(registration.hosting))
+    const stored = await sealHosting(env, validateHosting(env, registration.hosting))
     expect(JSON.stringify(stored)).not.toContain('acme-live-key-123')
     expect(await openHostingSecret(env, stored)).toBe('acme-live-key-123')
     expect(await openHostingSecret(makeEnv({ PROVIDER_HOSTING_KEK: 'z'.repeat(48) }), stored)).toBeNull()

@@ -441,7 +441,7 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     const id = String(body?.id ?? '').trim().toLowerCase()
     if (id) body.api_base_url = hostedOriginFor(env, id)
     try {
-      hosted = body.hosting?.auth?.keep === true ? { keep: true } : validateHosting(body.hosting)
+      hosted = body.hosting?.auth?.keep === true ? { keep: true } : validateHosting(env, body.hosting)
     } catch (err: any) {
       if (err instanceof ProviderValidationError) {
         return json(400, { error: 'invalid_registration', field: err.field, detail: err.message })

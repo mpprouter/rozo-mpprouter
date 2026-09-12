@@ -95,11 +95,30 @@ export interface StoredHosting {
 const HEADER_PATTERN = /^[A-Za-z0-9-]{1,64}$/
 const MAX_SECRET_BYTES = 1024
 
+
+/**
+ * Hostnames the gateway must never call as an origin: this Worker's own
+ * surfaces (a hosted route calling apiserver would loop, and would carry
+ * a stored credential into our own request handling), any hosted
+ * hostname, and the platform's default workers.dev.
+ */
+export function isForbiddenOriginHost(env: Env, hostname: string): boolean {
+  const host = hostname.toLowerCase()
+  const suffix = hostedSuffix(env)
+  if (host === suffix || host.endsWith(`.${suffix}`)) return true
+  if (host === 'apiserver.mpprouter.dev' || host === 'coupon.rozo.ai' || host === 'mpprouter.dev' || host === 'www.mpprouter.dev') return true
+  if (host.endsWith('.workers.dev')) return true
+  return false
+}
+
 /** Parse and validate the `hosting` block of a registration body. */
-export function validateHosting(raw: unknown): HostedConfig {
+export function validateHosting(env: Env, raw: unknown): HostedConfig {
   if (!raw || typeof raw !== 'object') throw new ProviderValidationError('hosting', 'Expected an object.')
   const h = raw as Record<string, unknown>
   const originUrl = validateApiBaseUrl(String(h.origin_url ?? ''))
+  if (isForbiddenOriginHost(env, new URL(originUrl).hostname)) {
+    throw new ProviderValidationError('hosting', 'origin_url cannot point at MPP Router or a hosted hostname.')
+  }
   const authRaw = (h.auth ?? {}) as Record<string, unknown>
   const header = String(authRaw.header ?? 'Authorization').trim()
   if (!HEADER_PATTERN.test(header)) throw new ProviderValidationError('hosting', 'auth.header must be a plain header name.')

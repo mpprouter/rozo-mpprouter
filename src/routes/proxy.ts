@@ -775,6 +775,9 @@ async function payMerchantAndGetBodyInner(
         method: request.method,
         headers: originHeaders,
         body: requestBody,
+        // Never follow: a redirect would carry the injected credential to
+        // whatever host the origin (or an open redirect on it) names.
+        redirect: 'manual',
       })
     } catch (err: any) {
       return {
@@ -795,6 +798,21 @@ async function payMerchantAndGetBodyInner(
       }
     }
     const latencyMs = Date.now() - startedAt
+    if (providerResponse.status >= 300 && providerResponse.status < 400) {
+      return {
+        kind: 'error',
+        refundReason: 'upstream_5xx',
+        merchantStatus: providerResponse.status,
+        latencyMs,
+        routerSideFailure: false,
+        response: new Response(JSON.stringify({
+          error: 'Provider request failed',
+          provider: route.operator.id,
+          status: providerResponse.status,
+          detail: 'The origin redirected; direct-settlement origins must answer on the registered host.',
+        }), { status: 502, headers: { 'Content-Type': 'application/json' } }),
+      }
+    }
     const contentType = providerResponse.headers.get('content-type') || 'application/json'
     const body = await providerResponse.text()
     if (!providerResponse.ok) {
@@ -1777,10 +1795,15 @@ export async function handleProxy(
     // Phase A: local prepare (parse + amount policy + payload hash).
     // No RPC calls. Cheap. Failures here mean the payload is
     // structurally invalid or violates the overpay policy.
+    // A direct-settlement (hosted) route verifies and settles against the
+    // PROVIDER's address; anything else against the pool. Passing it here
+    // is what makes the facilitator's verify/settle authority the provider
+    // rather than us — classifyAuth only decided which branch to take.
     const prepared = await prepareStellarX402Inbound(
       env,
       authHeader,
       merchantQuoteStellarBaseUnits,
+      route.operator?.payouts.find(p => p.network.startsWith('stellar:'))?.payTo,
     )
     if (!prepared.ok) {
       console.log(`[proxy] stellar.x402 prepare rejected: ${prepared.reason}`)
