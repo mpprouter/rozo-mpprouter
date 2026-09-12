@@ -145,11 +145,11 @@ function overlayCatalogEntry(
       // advertises OUR facilitator address, which is precisely the wrong
       // answer here. The per-chain addresses live in `operator.payouts`
       // below and in the live 402.
-      stellar: { intents: route.upstreamDialect === 'mppx' ? ['charge'] : [] },
+      stellar: { intents: !route.hosted && route.upstreamDialect === 'mppx' ? ['charge'] : [] },
       tempo: { intents: [], role: 'upstream' },
     },
     settlement: 'direct',
-    settlement_mode: 'relay',
+    settlement_mode: route.hosted ? 'router_paywall' : 'relay',
     ...(route.capability ? { capability: route.capability } : {}),
     operator: {
       id: operator.id,
@@ -167,8 +167,8 @@ function overlayCatalogEntry(
       // What the provider's own endpoint speaks, as observed at
       // verification. `x402` means pay the relayed `accepts[]` challenge
       // with an x402 client; `mpp` means an mppx `WWW-Authenticate` one.
-      dialect: route.upstreamDialect === 'x402' ? 'x402' : 'mpp',
-      relayed: true,
+      dialect: route.hosted ? 'x402' : route.upstreamDialect === 'x402' ? 'x402' : 'mpp',
+      relayed: !route.hosted,
       // The provider's Stellar address, when they registered one — NOT
       // ours. A wallet that reads this hint and pays it is paying the
       // right party. Omitted rather than defaulted when the provider

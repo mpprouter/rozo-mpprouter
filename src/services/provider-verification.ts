@@ -738,8 +738,9 @@ export async function payWithX402(req: PaidCallRequest, fetchImpl: typeof fetch 
   })
 }
 
-const defaultExecutor: PaidCallExecutor = req =>
-  req.dialect === 'x402' ? payWithX402(req) : payWithMppx(req)
+function executorWith(fetchImpl: typeof fetch): PaidCallExecutor {
+  return req => (req.dialect === 'x402' ? payWithX402(req, fetchImpl) : payWithMppx(req, fetchImpl))
+}
 
 /** Pull a 64-hex transaction hash out of a receipt header in any encoding. */
 export function extractTxHash(header: string): string | null {
@@ -764,7 +765,7 @@ export function extractTxHash(header: string): string | null {
  * is what gets read back from Horizon.
  */
 export function receiptTxHash(headers: Headers): string | null {
-  for (const name of ['payment-receipt', 'payment-response', 'x-payment-response']) {
+  for (const name of ['payment-receipt', 'payment-response', 'x-payment-response', 'x-payment-tx']) {
     const value = headers.get(name)
     if (!value) continue
     const hash = extractTxHash(value)
@@ -851,7 +852,7 @@ export async function gateRealMoneyCall(
   const timer = setTimeout(() => controller.abort(), PAID_CALL_TIMEOUT_MS)
   let response: Response
   try {
-    response = await (deps.execute ?? defaultExecutor)({
+    response = await (deps.execute ?? executorWith(deps.fetchImpl ?? fetch))({
       dialect,
       url,
       method: spec.method,

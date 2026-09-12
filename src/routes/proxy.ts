@@ -65,6 +65,7 @@ import {
 } from '../services/catalog-overlay'
 import type { Env } from '../index'
 import { isDirectSettlementRoute, relayDirectSettlementRoute } from './provider-relay'
+import { hostedOriginHeaders, resolveHostedRoute, hostedProviderIdFor } from '../services/provider-hosting'
 import { redactForAlert } from '../utils/alert-redaction'
 
 /**
@@ -77,6 +78,9 @@ import { redactForAlert } from '../utils/alert-redaction'
  * nothing.
  */
 async function resolveRoute(env: Env, url: URL, method: string) {
+  // On a hosted hostname (`<id>.pay.mpprouter.dev`) the path mirrors the
+  // provider's origin path; on our own hostname the usual catalog path.
+  if (hostedProviderIdFor(env, url.hostname)) return resolveHostedRoute(env, url.hostname, url.pathname, method)
   return getRouteWithOverlay(env, url.pathname, method)
 }
 
@@ -746,11 +750,30 @@ async function payMerchantAndGetBodyInner(
   // upstream out of our funds.
   if (route.operator) {
     const startedAt = Date.now()
+    // Hosted routes present the provider's stored origin credential and
+    // nothing of the buyer's; relayed routes never reach this branch.
+    let originHeaders: HeadersInit = forwardHeaders(request)
+    if (route.hosted) {
+      const injected = await hostedOriginHeaders(env, route.operator.id, request)
+      if (!injected) {
+        return {
+          kind: 'error',
+          refundReason: 'timeout',
+          routerSideFailure: true,
+          response: new Response(JSON.stringify({
+            error: 'Hosted route misconfigured',
+            provider: route.operator.id,
+            detail: 'The origin credential for this hosted route could not be loaded. Nothing was charged.',
+          }), { status: 503, headers: { 'Content-Type': 'application/json' } }),
+        }
+      }
+      originHeaders = injected
+    }
     let providerResponse: Response
     try {
       providerResponse = await fetch(merchantUrl, {
         method: request.method,
-        headers: forwardHeaders(request),
+        headers: originHeaders,
         body: requestBody,
       })
     } catch (err: any) {
@@ -1417,6 +1440,22 @@ export async function handleProxy(
     route.operator?.payouts.find(p => p.network.startsWith('stellar:'))?.payTo,
   )
 
+  // HOSTED PAYWALL (services/provider-hosting.ts): x402 only. The mppx
+  // charge/channel branches settle the buyer's money at verify time,
+  // before the origin is called; on a route we host that would charge a
+  // buyer for an origin 500 with no refund. The x402 branch settles only
+  // after the origin's 2xx, so an mppx credential is answered with the
+  // x402 challenge and nothing is settled.
+  if (route.hosted && (rawAuthKind === 'stellar.charge' || rawAuthKind === 'stellar.channel')) {
+    const header = route.fixedPricing
+      ? buildX402PaymentRequiredHeader(env, BigInt(fixedPriceToBaseUnits6(route.fixedPricing.amountUsd)), request.url, route.operator)
+      : null
+    return new Response(JSON.stringify({
+      error: 'x402 required',
+      detail: 'This router-hosted route accepts x402 payments only (PAYMENT-SIGNATURE). MPP charge credentials settle before delivery and are not accepted here.',
+    }), { status: 402, headers: { 'Content-Type': 'application/json', ...(header ? { 'Payment-Required': header } : {}) } })
+  }
+
   // V2 §6-D2 query-param bootstrap: agents that want the stellar.channel
   // flow on their FIRST request (before any credential has been signed)
   // advertise their intent by passing `?payment=channel&agent=G...` in
@@ -1916,6 +1955,15 @@ export async function handleProxy(
     }
     if (prepared.payer) headers['X-MPPRouter-Payer'] = prepared.payer
     if (settle.transaction) headers['X-Payment-Tx'] = settle.transaction
+    // Spec-shaped settlement receipt for x402 clients (@x402/core reads
+    // PAYMENT-RESPONSE); the X-Payment-Tx form above is kept for existing readers.
+    headers['PAYMENT-RESPONSE'] = btoa(JSON.stringify({
+      success: settle.success,
+      transaction: settle.transaction ?? '',
+      network: env.STELLAR_NETWORK,
+      ...(prepared.payer ? { payer: prepared.payer } : {}),
+      ...(settle.errorReason ? { errorReason: settle.errorReason } : {}),
+    }))
     headers['X-Payment-Method'] = 'stellar.x402'
     if (!settle.success) {
       headers['X-Payment-Settle-Status'] = 'failed'
@@ -2303,6 +2351,9 @@ export async function handleProxy(
         const mppxChallenge = verifyResult.challenge
         const newHeaders = new Headers(mppxChallenge.headers)
         newHeaders.set('Payment-Required', x402HeaderValue)
+        // Hosted routes are x402-only (see above): do not advertise an
+        // mppx challenge a client would then be refused for using.
+        if (route.hosted) newHeaders.delete('WWW-Authenticate')
         return new Response(mppxChallenge.body, {
           status: mppxChallenge.status,
           statusText: mppxChallenge.statusText,

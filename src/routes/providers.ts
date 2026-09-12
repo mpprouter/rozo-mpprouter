@@ -72,6 +72,27 @@ import { issueDashboardToken, verifyDashboardToken } from '../services/provider-
 import { readClaimState, reconcileUncertainClaim, runClaimedPaidGate } from '../services/provider-verify-claim'
 import { assertSettledToProvider, MAX_VERIFY_PAYMENT_USD, verifyWalletPaidProviderSince, verifyWalletPublicKey, type GateResult } from '../services/provider-verification'
 import { CAPABILITY_CONTRACTS } from '../services/provider-capabilities'
+import {
+  hostedOriginFor,
+  hostedProviderIdFor,
+  hostingAvailable,
+  sealHosting,
+  validateHosting,
+  type StoredHosting,
+} from '../services/provider-hosting'
+
+/**
+ * fetch for verification probes: a hosted hostname is this Worker, and the
+ * platform refuses a Worker's network request to itself, so those go
+ * through the SELF service binding. Everything else is a normal fetch.
+ */
+function routerFetch(env: Env): typeof fetch {
+  return (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    if (env.SELF && hostedProviderIdFor(env, new URL(url).hostname)) return env.SELF.fetch(new Request(url, init))
+    return fetch(input, init)
+  }
+}
 
 function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload, null, 2), {
@@ -173,6 +194,22 @@ async function readJson(request: Request): Promise<unknown> {
   }
 }
 
+/**
+ * Ownership for a hosted record: nothing to prove up front. The paid gate
+ * is the proof — the origin either serves the gateway's authenticated call
+ * or it does not. Recorded as `hosted_origin_auth`; describeProof states
+ * exactly what that means.
+ */
+async function resolveHostedOwnership(validated: { payouts: Array<{ network: string; payTo: string }> }) {
+  const first = validated.payouts[0]
+  return {
+    proof: 'hosted_origin_auth' as const,
+    ownerKey: { network: first.network, address: first.payTo, proof: 'hosted_origin_auth' as const },
+    domainVerifiedAt: new Date().toISOString(),
+    detail: 'Router-hosted paywall: origin authentication is proven by the paid verification call.',
+  }
+}
+
 /** Public view of a record. Email, signatures and owner key never appear. */
 function publicView(record: ProviderRecord) {
   return {
@@ -181,6 +218,7 @@ function publicView(record: ProviderRecord) {
     status: record.status,
     api_base_url: record.apiBaseUrl,
     settlement: 'direct',
+    ...(record.hosting ? { hosting: { mode: 'router', origin_host: new URL(record.hosting.originUrl).host, auth_header: record.hosting.auth.header } } : {}),
     payouts: record.payouts.map(p => ({ network: p.network, pay_to: p.payTo, asset: p.asset })),
     routes: record.routes.map(r => ({
       operation: r.operation,
@@ -233,6 +271,8 @@ function describeProof(proof: string | undefined): string | null {
       return 'A token we issued was published under the API origin and claimed with its private secret: origin control plus the registrant\'s assertion of the payout address. Not key custody.'
     case 'x402_pay_to':
       return 'The live 402 at the registered origin advertises exactly the registered payout address: the endpoint\'s own payout configuration matches. Not key custody, and not proof of who submitted the form.'
+    case 'hosted_origin_auth':
+      return 'MPP Router hosts the paywall; the origin served the paid verification call with the credential the registrant supplied or configured. Proves the registrant can authenticate to the origin. Not key custody of the payout address, and not proof of who runs the origin.'
     default:
       return null
   }
@@ -390,6 +430,26 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     return json(400, { error: 'invalid_body', field: err.field, detail: err.message })
   }
 
+  // Hosted paywall: the registrant has an origin but no 402 of their own.
+  // Their public origin becomes `<id>.<hosted suffix>`, served by us.
+  const hostedRequested = Boolean(body?.hosting)
+  let hosted: ReturnType<typeof validateHosting> | { keep: true } | null = null
+  if (hostedRequested) {
+    if (!(await hostingAvailable(env))) {
+      return json(503, { error: 'hosting_unavailable', detail: 'Router-hosted paywalls are not enabled on this deployment.' })
+    }
+    const id = String(body?.id ?? '').trim().toLowerCase()
+    if (id) body.api_base_url = hostedOriginFor(env, id)
+    try {
+      hosted = body.hosting?.auth?.keep === true ? { keep: true } : validateHosting(body.hosting)
+    } catch (err: any) {
+      if (err instanceof ProviderValidationError) {
+        return json(400, { error: 'invalid_registration', field: err.field, detail: err.message })
+      }
+      throw err
+    }
+  }
+
   let validated
   try {
     validated = validateRegistration(body)
@@ -398,6 +458,15 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
       return json(400, { error: 'invalid_registration', field: err.field, detail: err.message })
     }
     throw err
+  }
+
+  // Only a hosted registration may live on a hosted hostname; a relayed
+  // record pointing at `<x>.pay.mpprouter.dev` would relay to ourselves.
+  if (!hostedRequested && hostedProviderIdFor(env, new URL(validated.apiBaseUrl).hostname)) {
+    return json(400, { error: 'invalid_registration', field: 'api_base_url', detail: 'That hostname is a router-hosted paywall. Register with a hosting block instead.' })
+  }
+  if (hostedRequested && !validated.payouts.some(p => p.network.startsWith('stellar:'))) {
+    return json(400, { error: 'invalid_registration', field: 'payouts', detail: 'A router-hosted paywall settles on Stellar; a stellar:pubnet payout is required.' })
   }
 
   for (const payout of validated.payouts) {
@@ -454,16 +523,25 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     }
   }
 
+  if (!hostedRequested && existing?.hosting) {
+    // A hosted record re-registered without a hosting block would silently
+    // become a relayed record pointing at our own hostname. Refuse before
+    // any proof runs.
+    return json(400, { error: 'invalid_registration', field: 'hosting', detail: 'This provider is router-hosted; include the hosting block (auth.keep=true to keep the stored credential).' })
+  }
+
   let auth
   try {
-    auth = await resolveOwnershipProof(env, {
-      providerId: validated.id,
-      digest,
-      apiBaseUrl: validated.apiBaseUrl,
-      payouts: validated.payouts,
-      routes: validated.routes,
-      body: (body ?? {}) as Record<string, unknown>,
-    })
+    auth = hostedRequested
+      ? await resolveHostedOwnership(validated)
+      : await resolveOwnershipProof(env, {
+          providerId: validated.id,
+          digest,
+          apiBaseUrl: validated.apiBaseUrl,
+          payouts: validated.payouts,
+          routes: validated.routes,
+          body: (body ?? {}) as Record<string, unknown>,
+        })
     // A record established by a signature cannot be re-pointed by a weaker
     // proof. Checked after the proof runs so the caller learns their proof
     // was valid AND insufficient, rather than guessing. An absent marker
@@ -516,6 +594,17 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
 
   const now = new Date().toISOString()
   const dashboardCredential = await issueDashboardToken()
+  let hosting: StoredHosting | undefined
+  if (hostedRequested) {
+    if (hosted && 'keep' in hosted) {
+      if (!existing?.hosting) {
+        return json(400, { error: 'invalid_registration', field: 'hosting', detail: 'auth.keep needs an existing hosted registration to keep the credential from.' })
+      }
+      hosting = existing.hosting
+    } else if (hosted) {
+      hosting = await sealHosting(env, hosted)
+    }
+  }
   // A proof that already demonstrated control of the origin carries its own
   // timestamp; a wallet signature does not, and still relies on a separately
   // completed domain proof exactly as before.
@@ -552,6 +641,7 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
       : auth.ownerKey,
     registrationVersion: digest,
     dashboardTokenHash: dashboardCredential.hash,
+    ...(hosting ? { hosting } : {}),
   }
   await putProviderRecord(env, record)
 
@@ -559,6 +649,20 @@ export async function handleProviderRegister(request: Request, env: Env): Promis
     ...publicView(record),
     ownership_proof: { type: auth.proof, detail: auth.detail },
     dashboard_token: dashboardCredential.token,
+    ...(hosting ? {
+      hosting: {
+        hosted_origin: hostedOriginFor(env, record.id),
+        origin_url: hosting.originUrl,
+        auth_header: hosting.auth.header,
+        auth_scheme: hosting.auth.scheme,
+        auth_digest: hosting.authDigest,
+        // Shown exactly once. The provider configures their origin to
+        // accept it; we never return it again.
+        ...(hosted && !('keep' in hosted) && hosted.auth.generated ? { generated_secret: hosted.auth.value } : {}),
+        paid_routes: record.routes.map(r => `${hostedOriginFor(env, record.id)}${r.upstreamPath}`),
+        note: 'Buyers call the hosted origin (or the /v1/services path) and pay x402 on Stellar straight to your payout address; the router calls your origin with the stored credential and settles only after your origin answers 2xx.',
+      },
+    } : {}),
     next_step: {
       endpoint: 'POST /v1/providers/verify',
       body: { id: record.id },
@@ -659,7 +763,7 @@ export async function handleProviderVerify(
     }
   }
 
-  const probe = await gateProbe402(record, spec)
+  const probe = await gateProbe402(record, spec, routerFetch(env))
   if (!probe.ok) {
     record.verification = {
       ...record.verification,
@@ -687,7 +791,7 @@ export async function handleProviderVerify(
   }
   const dialect = probe.dialect ?? 'x402'
 
-  const claimed = await runClaimedPaidGate(env, record.id, verificationEpoch, () => gateRealMoneyCall(env, record, spec, dialect))
+  const claimed = await runClaimedPaidGate(env, record.id, verificationEpoch, () => gateRealMoneyCall(env, record, spec, dialect, { fetchImpl: routerFetch(env) }))
   if (claimed.status === 'in_progress') {
     return json(202, { status: 'verification_in_progress', retry_after_seconds: claimed.retryAfterSeconds, can_safely_retry: false,
       next_action: 'A verification is already running for this registration. Poll the status page; do not submit again.' })

@@ -24,6 +24,22 @@ custom_domain = true
 pattern = "coupon.rozo.ai"
 custom_domain = true
 
+# Router-hosted paywalls (2026-09-12): `<provider-id>.pay.mpprouter.dev`.
+# A zone route, not a custom domain — wildcards are only supported as
+# routes — so it also needs a proxied DNS record `*.pay` on mpprouter.dev
+# pointing anywhere (e.g. AAAA 100:: ) for Cloudflare to accept the request.
+# See services/provider-hosting.ts.
+[[routes]]
+pattern = "*.pay.mpprouter.dev/*"
+zone_name = "mpprouter.dev"
+
+# The Worker bound to itself: verification of a hosted route has to reach
+# the hosted hostname, and the platform refuses a Worker's network request
+# to its own route. `env.SELF.fetch(...)` takes the in-process path.
+[[services]]
+binding = "SELF"
+service = "mpprouter"
+
 # Workers Logs retention. Without this block Cloudflare keeps NO request logs,
 # so a production payment incident can only be debugged by catching it live with
 # `wrangler tail` — useless after the fact. Established 2026-08-01 after a real
@@ -137,6 +153,8 @@ migrations_dir = "migrations-metrics"
 # Public keys (not secrets, safe to commit)
 [vars]
 PROVIDERS_ENDPOINT_ENABLED = "true"
+# Hostname suffix for router-hosted paywalls (services/provider-hosting.ts).
+PROVIDER_HOSTED_SUFFIX = "pay.mpprouter.dev"
 # Browser-only OpenRouter fee canary. Founder activated the 1% canary on
 # 2026-09-02 (Sep 6 gate: >=30 orders, $600 GMV, conversion drop <=20%).
 # Invalid/missing values resolve to 0 in code; set back to "0" to roll back.

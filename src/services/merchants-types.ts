@@ -256,6 +256,14 @@ export interface PublicServiceRoute {
   upstreamDialect?: 'x402' | 'mppx'
   /** Explicit capability contract the operator declared for this route. */
   capability?: string
+  /**
+   * The router hosts this route's paywall: it issues the 402 (x402 only,
+   * payTo = operator), calls `upstreamHost` with the provider's stored
+   * credential injected, and settles after a 2xx. Never relayed.
+   */
+  hosted?: boolean
+  /** Path on the hosted hostname, mirroring the origin path. */
+  hostedPath?: string
 }
 
 /**
@@ -556,7 +564,7 @@ export interface PublicCatalogEntry {
    * 402 included; it issues no challenge and settles nothing. The only
    * mode direct-settlement routes have (see routes/provider-relay.ts).
    */
-  settlement_mode?: 'relay'
+  settlement_mode?: 'relay' | 'router_paywall'
   /** Explicit capability contract the operator declared; see provider-capabilities.ts. */
   capability?: string
 }
