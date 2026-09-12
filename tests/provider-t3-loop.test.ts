@@ -243,8 +243,13 @@ describe('paid gate: receipts and dialects', () => {
     await expect(payWithX402(base, mk(agent402Challenge(PROVIDER, '30001')))).rejects.toBeInstanceOf(ChallengeMismatchError)
     // No Stellar option at all in the paid phase.
     await expect(payWithX402(base, mk({ x402Version: 2, accepts: [{ scheme: 'exact', network: 'eip155:8453', payTo: '0x' + '4'.repeat(40), amount: '1' }] }))).rejects.toBeInstanceOf(ChallengeMismatchError)
+    // A cheap entry with an unsupported scheme in front of an expensive exact one.
+    await expect(payWithX402(base, mk({ x402Version: 2, accepts: [
+      { scheme: 'upto', network: 'stellar:pubnet', payTo: PROVIDER, amount: '1' },
+      { scheme: 'exact', network: 'stellar:pubnet', payTo: PROVIDER, amount: '999999999', extra: { areFeesSponsored: true } },
+    ] }))).rejects.toBeInstanceOf(ChallengeMismatchError)
     // Exactly one fetch each: the challenge was read, nothing was signed or retried.
-    expect(calls).toHaveLength(3)
+    expect(calls).toHaveLength(4)
     // The gate turns that into a safely-retryable code.
     const env = makeEnv()
     const r = record()
@@ -539,7 +544,7 @@ describe('published provider routes are relayed', () => {
       return challenge402(agent402Challenge(), { 'Payment-Required': b64(agent402Challenge()) })
     })
     const res = await handleProxy(new Request('https://router.test/v1/services/agent402/web-search?q=stellar', {
-      headers: { 'PAYMENT-SIGNATURE': 'buyer-x402-payload', Authorization: 'Payment mppx-credential', 'CF-Connecting-IP': '1.2.3.4', Cookie: 'partner_session=secret', Origin: 'https://coupon.rozo.ai', 'Sec-Fetch-Site': 'same-origin' },
+      headers: { 'PAYMENT-SIGNATURE': 'buyer-x402-payload', Authorization: 'Payment mppx-credential', 'CF-Connecting-IP': '1.2.3.4', Cookie: 'partner_session=secret', Origin: 'https://coupon.rozo.ai', 'Sec-Fetch-Site': 'same-origin', 'X-API-Key': 'someone-elses', 'CF-Access-Client-Secret': 'nope', Accept: 'application/json' },
     }), env, ctx)
     expect(res.status).toBe(402)
     expect(res.headers.get('payment-required')).toBe(b64(agent402Challenge()))
@@ -553,6 +558,9 @@ describe('published provider routes are relayed', () => {
     expect(seen[0].headers.get('cookie')).toBeNull()
     expect(seen[0].headers.get('origin')).toBeNull()
     expect(seen[0].headers.get('sec-fetch-site')).toBeNull()
+    expect(seen[0].headers.get('x-api-key')).toBeNull()
+    expect(seen[0].headers.get('cf-access-client-secret')).toBeNull()
+    expect(seen[0].headers.get('accept')).toBe('application/json')
     // A Bearer token is ours or a partner's, never the provider's business.
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init: any) => { seen.push(new Request(input, init)); return challenge402(agent402Challenge()) })
     await handleProxy(new Request('https://router.test/v1/services/agent402/web-search', { headers: { Authorization: 'Bearer partner-token' } }), env, ctx)

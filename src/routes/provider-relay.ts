@@ -48,15 +48,18 @@ import { recordRouteFailure, recordRouteSuccess } from '../services/route-health
 /** Wall-clock ceiling on one relayed call; the provider's job, not ours, if it is slow. */
 const RELAY_TIMEOUT_MS = 60_000
 
-/** Hop-by-hop and origin-specific headers that must not be forwarded. */
-const DROP_REQUEST_HEADERS = new Set([
-  'host', 'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade',
-  'proxy-authorization', 'proxy-authenticate', 'cf-connecting-ip', 'cf-ray', 'cf-visitor',
-  'cf-ipcountry', 'x-forwarded-for', 'x-forwarded-proto', 'x-real-ip', 'content-length',
-  // Browser ambient credentials and origin hints. This Worker also serves
-  // partner surfaces with session cookies on other hostnames; a provider
-  // who passed a $0.02 gate must not receive them.
-  'cookie', 'origin', 'referer',
+/**
+ * Request headers that cross to the provider. An allowlist, not a denylist:
+ * the target is a self-registered third party, and any header not on this
+ * list — an `X-API-Key` for some other surface, a `CF-Access-*` token, a
+ * partner header — is nobody's business but ours. Payment credentials, the
+ * MPP negotiation headers and ordinary content negotiation are enough for
+ * a buyer to pay and be served.
+ */
+const FORWARD_REQUEST_HEADERS = new Set([
+  'accept', 'accept-language', 'accept-encoding', 'content-type',
+  'payment-signature', 'x-payment', 'accept-payment', 'payment-required',
+  'x-mpp-client-id', 'idempotency-key', 'x-request-id', 'user-agent',
 ])
 
 /** Only payment credentials cross to the provider; a Bearer/Basic header is ours or a partner's. */
@@ -100,13 +103,12 @@ export async function relayDirectSettlementRoute(
   const headers = new Headers()
   for (const [key, value] of request.headers) {
     const lower = key.toLowerCase()
-    if (DROP_REQUEST_HEADERS.has(lower) || lower.startsWith('sec-')) continue
     if (lower === 'authorization') {
       const allowed = forwardableAuthorization(value)
       if (allowed) headers.set(key, allowed)
       continue
     }
-    headers.set(key, value)
+    if (FORWARD_REQUEST_HEADERS.has(lower)) headers.set(key, value)
   }
   headers.set('X-MPP-Router-Relay', route.id)
 

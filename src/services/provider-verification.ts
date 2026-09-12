@@ -683,13 +683,31 @@ export async function payWithX402(req: PaidCallRequest, fetchImpl: typeof fetch 
   // if it pays the registered address for no more than the registered
   // price. The core client would otherwise happily sign whichever entry it
   // selected from a challenge the probe never saw.
-  const offered = (paymentRequired.accepts ?? []).find((a: any) => a.network === req.network)
-  if (!offered) {
-    throw new ChallengeMismatchError(`The paid-phase 402 offers no ${req.network} settlement option. Refusing to sign.`)
+  // EVERY entry the client could pick must pass, not just the first one on
+  // the network: a challenge can list a cheap unsupported-scheme entry
+  // first and an expensive `exact` one second. So the candidate set is
+  // reduced to entries that individually satisfy scheme, network, address
+  // and cap, and the client is only allowed to choose among those.
+  const acceptable = (paymentRequired.accepts ?? []).filter((a: any) => {
+    if (String(a.scheme ?? '') !== 'exact' || a.network !== req.network) return false
+    try {
+      assertChallengeWithinRegistration(req.expected, req.network, { payTo: String(a.payTo ?? ''), amount: String(a.amount ?? '') })
+      return true
+    } catch {
+      return false
+    }
+  })
+  if (acceptable.length === 0) {
+    const onNetwork = (paymentRequired.accepts ?? []).filter((a: any) => a.network === req.network)
+    if (onNetwork.length === 0) {
+      throw new ChallengeMismatchError(`The paid-phase 402 offers no ${req.network} settlement option. Refusing to sign.`)
+    }
+    // Re-run the check on the first on-network entry for a precise message.
+    assertChallengeWithinRegistration(req.expected, req.network, { payTo: String(onNetwork[0].payTo ?? ''), amount: String(onNetwork[0].amount ?? '') })
+    throw new ChallengeMismatchError(`The paid-phase 402 has no exact-scheme ${req.network} entry within the registration. Refusing to sign.`)
   }
-  assertChallengeWithinRegistration(req.expected, req.network, { payTo: String(offered.payTo ?? ''), amount: String(offered.amount ?? '') })
-  core.registerPolicy((_v, reqs) => reqs.filter(r => r.network === req.network && sameAddress(req.network, String(r.payTo), req.expected.payTo)))
-  const payload = await http.createPaymentPayload(paymentRequired)
+  core.registerPolicy((_v, reqs) => reqs.filter(r => acceptable.includes(r)))
+  const payload = await http.createPaymentPayload({ ...paymentRequired, accepts: acceptable })
   const paymentHeaders = http.encodePaymentSignatureHeader(payload)
   return fetchImpl(req.url, {
     ...init,
