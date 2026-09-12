@@ -833,7 +833,9 @@ async function payMerchantAndGetBodyInner(
             error: 'Provider request failed',
             provider: route.operator.id,
             status: providerResponse.status,
-            detail: sanitizeUpstreamErrorDetail(false, body),
+            // A hosted origin was called with a stored credential; its error
+            // body is treated exactly like a router-held-credential route's.
+            detail: sanitizeUpstreamErrorDetail(Boolean(route.hosted), body),
           }),
           { status: 502, headers: { 'Content-Type': 'application/json' } },
         ),
