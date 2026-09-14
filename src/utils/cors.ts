@@ -17,6 +17,9 @@
  *     - payment-required     (x402 402 challenge)
  *     - x-request-id
  *     - retry-after          (429 backoff, read by browser checkout UIs)
+ *     - payment-response / x-payment-* / x-mpprouter-* / refund-*
+ *                            (settlement receipt + refund status on paid
+ *                             responses, read by browser wallets)
  *
  * Echoing the Origin (rather than `*`) keeps the door open for
  * credentialed requests later without a code change.
@@ -45,6 +48,26 @@ const EXPOSED_RESPONSE_HEADERS = [
   // cross-origin — the header is present on the wire but hidden from JS — so
   // the client has no way to back off correctly.
   'retry-after',
+  // Settlement receipt / status headers on a paid response. A browser
+  // x402 client (a wallet paying on the user's behalf) needs these to show
+  // the user what was settled and whether a refund is in flight; without
+  // exposing them the headers are on the wire but invisible to JS.
+  'payment-response',
+  'x-payment-tx',
+  'x-payment-method',
+  'x-payment-settle-status',
+  'x-payment-settle-reason',
+  'x-mpprouter-quoted-amount',
+  'x-mpprouter-upstream-cost',
+  'x-mpprouter-payer',
+  'x-mpprouter-request-id',
+  'x-mpprouter-provider',
+  'x-mpprouter-model',
+  'x-idempotent',
+  'refund-status',
+  'refund-status-url',
+  'refund-id',
+  'refund-mode',
 ].join(', ')
 
 const ALLOWED_METHODS = 'GET, POST, OPTIONS'
