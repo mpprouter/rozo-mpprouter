@@ -1,4 +1,4 @@
-# MPP Router — open, multi-operator: provider onboarding and direct settlement
+# MPP Router, open and multi-operator: provider onboarding and direct settlement
 
 MPP Router by ROZO · Stellar mainnet · last updated 2026-09-14
 
@@ -8,7 +8,7 @@ MPP Router is not a single-operator gateway. Independent providers run their own
 
 ## 2. Operators live today
 
-Two independent operators serve paid calls through MPP Router with payment settling to their own Stellar keys, both onboarded through the self-serve flow with no ROZO approval step. A third, Mercury Data, is a provider-authorised managed integration:
+Three third-party operators are live. Agent402 and Stellar Indexer serve paid calls with payment settling to their own Stellar keys, both onboarded through the self-serve flow with no ROZO approval step. Mercury Data provides Stellar contract infrastructure through a provider-authorised managed setup:
 
 | Operator | Shape | Verified by a real paid call | Settlement |
 | --- | --- | --- | --- |
@@ -34,12 +34,12 @@ Catalog effect: `GET https://apiserver.mpprouter.dev/services` now carries route
 
 Flow (all public endpoints, no ROZO human in the path):
 
-1. `POST /v1/providers/check` — free: reachability, 402 discovery, dialect (MPP or x402), advertised networks and payouts.
-2. `POST /v1/providers/register` — one of three ownership proofs, chosen by the provider: `x402_pay_to` (the live 402 advertises the registered address), `well_known` (a token published under the provider's origin), or `wallet_signature`. A router-hosted registration uses `hosted_origin_auth` (the origin accepts the supplied credential). The public record states in words what each proof does and does not prove.
-3. `POST /v1/providers/verify` — free 402 probe, then one bounded real payment (≤ $0.02, from the router's verification wallet, to the provider's registered address), then automatic `published`. Failures return a machine-readable `code`, an `action`, and `can_safely_retry` (the router never pays twice for one registration version; a frozen attempt is reconciled from the ledger, not re-paid).
-4. `GET /v1/providers/:id/verification` — the durable public record.
+1. `POST /v1/providers/check`: free: reachability, 402 discovery, dialect (MPP or x402), advertised networks and payouts.
+2. `POST /v1/providers/register`: one of three ownership proofs, chosen by the provider: `x402_pay_to` (the live 402 advertises the registered address), `well_known` (a token published under the provider's origin), or `wallet_signature`. A router-hosted registration uses `hosted_origin_auth` (the origin accepts the supplied credential). The public record states in words what each proof does and does not prove.
+3. `POST /v1/providers/verify`: free 402 probe, then one bounded real payment (≤ $0.02, from the router's verification wallet, to the provider's registered address), then automatic `published`. Failures return a machine-readable `code`, an `action`, and `can_safely_retry` (the router never pays twice for one registration version; a frozen attempt is reconciled from the ledger, not re-paid).
+4. `GET /v1/providers/:id/verification`: the durable public record.
 
-Both listings above were produced by exactly this path. Portal: https://www.mpprouter.dev/onboard/x402 (providers with a 402) and https://www.mpprouter.dev/onboard/start (providers without a payment layer — the hosted paywall).
+Both listings above were produced by exactly this path. Portal: https://www.mpprouter.dev/onboard/x402 (providers with a 402) and https://www.mpprouter.dev/onboard/start (providers without a payment layer: the hosted paywall).
 
 ### 3.3 Provider-onboarding tooling
 
@@ -51,12 +51,12 @@ Both listings above were produced by exactly this path. Portal: https://www.mppr
 ### 3.4 Service-quality routing
 
 - Per-route metrics (provider success rate, p50 latency, refund rate, caller-error vs router-fault attribution) are recorded at the proxy chokepoint every paid call passes through and published at `GET /v1/stats` and https://www.mpprouter.dev/stats.
-- Selection: `GET /v1/services/select?capability=<id>` chooses among published routes that declare the same capability contract (`GET /v1/services/capabilities`), ordered deterministically — healthy providers with ≥ 5 fresh samples by success rate, then p50 latency, then price; providers without enough samples by price; degraded last; `offline` excluded. The response names the selected provider's `public_path` and `pay_to` before any quote, and `&provider=<id>` pins a provider (never silently replaced). Policy and thresholds are returned with every response.
+- Selection: `GET /v1/services/select?capability=<id>` chooses among published routes that declare the same capability contract (`GET /v1/services/capabilities`), ordered deterministically: healthy providers with ≥ 5 fresh samples by success rate, then p50 latency, then price; providers without enough samples by price; degraded last; `offline` excluded. The response names the selected provider's `public_path` and `pay_to` before any quote, and `&provider=<id>` pins a provider (never silently replaced). Policy and thresholds are returned with every response.
 - Honest status: at report time no published third-party route declares a capability id, so the endpoint answers `no_eligible_provider` with the policy; the ordering is covered by the test suite (`tests/provider-t3-loop.test.ts`). It engages as soon as two operators declare the same contract.
 
 ### 3.5 Independent security review
 
-HackenProof audit report: https://github.com/mpprouter/rozo-mpprouter/releases/download/v0.2.1-tranche2/HackenProof.Audit.Report.for.MPP.Router.ROZO.pdf (attached to the `v0.2.1` release).
+HackenProof audit report: https://github.com/mpprouter/rozo-mpprouter/releases/download/v0.2.2/HackenProof.Audit.Report.for.MPP.Router.ROZO.pdf (attached to release [v0.2.2](https://github.com/mpprouter/rozo-mpprouter/releases/tag/v0.2.2)).
 
 ## 4. What is and is not claimed
 
@@ -76,4 +76,4 @@ HackenProof audit report: https://github.com/mpprouter/rozo-mpprouter/releases/d
 | Metrics | https://www.mpprouter.dev/stats · https://apiserver.mpprouter.dev/v1/stats |
 | Onboarding | https://www.mpprouter.dev/onboard/x402 · https://www.mpprouter.dev/onboard/start |
 | Spec releases | https://github.com/mpprouter/rozo-mpprouter/releases |
-| Audit | HackenProof report on the `v0.2.1` release |
+| Audit | HackenProof report on release `v0.2.2` |
