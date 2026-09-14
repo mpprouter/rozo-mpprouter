@@ -30,6 +30,7 @@
 
 import mppSnapshot from './mpp-catalog-snapshot.json'
 import { buildRoutesFromMppSnapshot } from './build-routes'
+import { operatorCatalogFields, withEnvDirectSettlement } from './catalog-direct-settlement'
 import type {
   PublicServiceRoute,
   PublicServiceRouteOverlay,
@@ -124,6 +125,12 @@ const RECOMMENDED_SERVICE_IDS = new Set([
   'perplexity_perplexity_chat',
   'tavily_tavily_search',
 ])
+
+const MERCURY_DIRECT_SETTLEMENT = {
+  providerId: 'mercurydata',
+  providerName: 'Mercury Data',
+  payToBinding: 'MERCURYDATA_X402_ADDRESS',
+} as const
 
 export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   // Parallel Search — first verified route, hand-tested 2026-04-11
@@ -760,6 +767,13 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       'body key is `i`, not `input`; the merchant pre-validates and 400s ' +
       'before the 402 challenge is issued if it is missing.',
   },
+  // Mercury direct settlement (2026-09-14): Mercury gave us their own
+  // Stellar mainnet address for payouts. With the `MERCURYDATA_X402_ADDRESS`
+  // Worker var set, every mercury route becomes a router-hosted x402
+  // paywall whose 402 names that address; the buyer's transfer settles to
+  // Mercury after Mercury's own upstream answers 2xx, and the router keeps
+  // only the held JWT for the upstream call. Var unset → pooled as before.
+  // See services/catalog-direct-settlement.ts.
   // ---------------------------------------------------------------
   // Mercury (Stellar indexer, xycloo Labs) — MVP router-held-credential
   // service (design: ainative todos/20260811-mercury-mpp-router-
@@ -800,6 +814,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-11T16:48:00Z',
     launchGate: 'MERCURY_LAUNCH_MODE',
+    directSettlement: MERCURY_DIRECT_SETTLEMENT,
     verifiedNote:
       'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
       'Stellar tx 8b3a36f2b359328a37652b7f32e89e19b253487e9b28bc01a257161e1cf6b8c6 ' +
@@ -815,6 +830,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     verifiedMode: 'charge',
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-18T02:35:01Z',
+    directSettlement: MERCURY_DIRECT_SETTLEMENT,
     verifiedNote:
       'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-18T02:35:01Z, ' +
       'Stellar tx 5028a601460bc30228b51d62072722b07df8c29b5bdb6100c92fa26d74064f0d ' +
@@ -837,6 +853,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-11T16:48:00Z',
     launchGate: 'MERCURY_LAUNCH_MODE',
+    directSettlement: MERCURY_DIRECT_SETTLEMENT,
     verifiedNote:
       'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
       'Stellar tx c82da0fc01501df246df43e5cbfb85d60bc5d9dd7df31a95addeb59af95f4b98 ' +
@@ -854,6 +871,7 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     chargeVerified: true,
     chargeVerifiedAt: '2026-08-11T16:48:00Z',
     launchGate: 'MERCURY_LAUNCH_MODE',
+    directSettlement: MERCURY_DIRECT_SETTLEMENT,
     verifiedNote:
       'Mercury MVP (~3mo token, renew by ~2026-11-12). charge-verified 2026-08-11T16:48:00Z, ' +
       'Stellar tx 871099bf7ed2f36605ed568aa927d811d43893afc70863fb8a3fdf4279c07cdb ' +
@@ -931,6 +949,8 @@ function stellarIntentsFor(route: PublicServiceRoute): Array<'charge'> {
  */
 export type CatalogEnvView = {
   X402_ENABLED?: string
+  /** Payout binding for env-bound direct settlement (`PublicServiceRoute.directSettlement`). */
+  MERCURYDATA_X402_ADDRESS?: string
   STELLAR_NETWORK?: string
   STELLAR_X402_PAY_TO?: string
   STELLAR_ROUTER_PUBLIC?: string
@@ -1108,6 +1128,23 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
     }
     if (route.verifiedNote !== undefined) {
       entry.verified_note = route.verifiedNote
+    }
+    // Env-bound direct settlement (Mercury, 2026-09-14): when the payout
+    // binding is set the buyer pays the provider, so the entry must say so
+    // in the same fields a registry provider uses — the pooled
+    // `methods.stellar_x402` / `payment_hints.pay_to` built above would
+    // name OUR address, which is exactly the wrong party.
+    const direct = withEnvDirectSettlement(route, env as Record<string, unknown> | undefined)
+    if (direct.operator) {
+      Object.assign(entry, operatorCatalogFields(direct, env))
+      // A malformed binding resolves to an operator with no payouts: the
+      // proxy answers 503, so the catalog must not call the route payable.
+      if (direct.operator.payouts.length === 0) {
+        entry.payment_status = 'unavailable'
+        entry.payment_enabled = false
+        entry.payment_status_note = 'Provider settlement address is misconfigured; the route is not chargeable until it is fixed.'
+        delete entry.payment_hints
+      }
     }
     return entry
   })

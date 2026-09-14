@@ -357,6 +357,13 @@ export interface Env {
   // Dev-only counterpart against testnet.mercurydata.app. Not read by any
   // production code path — used only by local smoke scripts.
   MERCURYDATA_TESTNET_JWT?: string
+  // Mercury's own Stellar mainnet payout address (2026-09-14). When set,
+  // the four mercury routes become router-hosted x402 paywalls whose 402
+  // names this address: the buyer's USDC settles straight to Mercury after
+  // the upstream 2xx and never enters the ROZO pool. Unset → pooled as
+  // before. Public key only; set as a Worker var.
+  // See services/catalog-direct-settlement.ts.
+  MERCURYDATA_X402_ADDRESS?: string
   // Launch gate for the Mercury MVP routes (P1 fix, codex review
   // 2026-08-12). verifiedMode: false 403s these routes unconditionally —
   // set this var to 'verify' to let the operator's own first real paid
