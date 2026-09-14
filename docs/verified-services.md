@@ -222,7 +222,7 @@ met with one service of headroom.
 
 #### Probed and rejected — did not pay
 
-These were free-probed first (Step 1 of `docs/SOP-provider-e2e-test.md`, costs
+These were free-probed first (Step 1 of `docs/operations/SOP-provider-e2e-test.md`, costs
 nothing) and excluded before any money moved. Recorded here because a rejected
 candidate is as much a result as a passing one.
 
@@ -273,7 +273,7 @@ the Tranche 2 number. Cheap follow-ups whenever route coverage is the goal.
 > | `anthropic_chat_completions` | `claude-haiku-4-5` | `cd1ab46e6f89fb6842556e520bc15686533e2879e485d7c286ae21ece3a9c03c` | `delivered`, upstream 200 |
 >
 > A third call the same minute is the useful negative control: the retired id
-> `claude-3-5-haiku-20241022` (still the body in `docs/SOP-provider-e2e-test.md`)
+> `claude-3-5-haiku-20241022` (still the body in `docs/operations/SOP-provider-e2e-test.md`)
 > returned upstream **404 `not_found_error`**, settled, and auto-refunded
 > (tx `a844bbeb3c564ee8897423109e2e678397092190c62f1d4695a311d91fadd4ba`,
 > ledger `refunded`). A stale model id in the SOP therefore looks like a broken

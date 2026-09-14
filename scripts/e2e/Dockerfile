@@ -1,5 +1,5 @@
 # Railway cron service `mpprouter-charge-eval` — real-money provider
-# charge suite, Mon + Thu 01:00 UTC. See docs/SOP-provider-e2e-test.md.
+# charge suite, Mon + Thu 01:00 UTC. See docs/operations/SOP-provider-e2e-test.md.
 FROM node:22-slim
 RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

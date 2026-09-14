@@ -2,7 +2,7 @@
  * Catalog price labels must not lie to paying agents.
  *
  * Two regressions this guards against, both observed live on
- * 2026-07-31 (see docs/service-probe-2026-07-31.md):
+ * 2026-07-31 (see docs/archive/service-probe-2026-07-31.md):
  *
  *   1. Dynamically-priced endpoints advertised as "free". Tavily
  *      search said `free` and its live 402 asked $0.09; Dune SQL

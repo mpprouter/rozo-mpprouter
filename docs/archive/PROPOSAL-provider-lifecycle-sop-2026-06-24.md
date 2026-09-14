@@ -2,11 +2,11 @@
 
 > Status: **PROPOSAL — not implemented.** This document is for codex review of the
 > *approach* before any code/SOP is written. It extends the existing reactive
-> `docs/SOP-provider-e2e-test.md` into a full lifecycle: onboard → verify →
+> `docs/operations/SOP-provider-e2e-test.md` into a full lifecycle: onboard → verify →
 > monitor → triage.
 >
 > Owner: Rozo. Date: 2026-06-24. Trigger: the stableemail `502 "Invalid base64
-> JSON header"` incident (see `docs/rootcause-invalid-base64-json-header-2026-06-24.md`).
+> JSON header"` incident (see `docs/archive/rootcause-invalid-base64-json-header-2026-06-24.md`).
 
 ---
 

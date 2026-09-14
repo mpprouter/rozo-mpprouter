@@ -122,7 +122,7 @@ Steps:
    This overwrites the KV entry with a new channel that includes the `descriptor`.
 3. Verify with `npx tsx scripts/admin/inspect-channels.ts` that the `descriptor` field
    is present in each entry.
-4. Run the paid E2E retest (see `docs/SOP-provider-e2e-test.md`), specifically for
+4. Run the paid E2E retest (see `docs/operations/SOP-provider-e2e-test.md`), specifically for
    anthropic and openai session merchants.
 
 ---

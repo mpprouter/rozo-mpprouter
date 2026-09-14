@@ -1,6 +1,6 @@
 # Codex Security Review — Catalog v2 Plan (2026-06-23)
 
-> Independent codex review (gpt-5.x, high reasoning) of `docs/catalog-drift-fix-plan-2026-06-22.md`
+> Independent codex review (gpt-5.x, high reasoning) of `docs/archive/catalog-drift-fix-plan-2026-06-22.md`
 > "v2 (FINAL)" section: remove the blanket payment gate, make all routes payable by default,
 > add 4 per-mode `rozo_verified` trust fields. Reviewed with a hostile-customer (Argens) threat
 > model. **Verdict: v2 as written is UNSAFE. Do NOT ship the un-gate as-is.**
