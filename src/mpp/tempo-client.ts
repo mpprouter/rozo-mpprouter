@@ -140,7 +140,7 @@ const EVM_CAIP2 = /^eip155:\d+$/
 /**
  * Defensive fetch wrapper for the router→merchant leg.
  *
- * Root cause (docs/rootcause-invalid-base64-json-header-2026-06-24.md):
+ * Root cause (docs/archive/rootcause-invalid-base64-json-header-2026-06-24.md):
  * mppx 0.7.0's `x402Challenges` decodes the WHOLE `payment-required`
  * header against a strict EVM-only schema. If ANY `accepts[]` offer
  * carries an unrecognized network (e.g. a merchant that added a
@@ -207,7 +207,7 @@ function mppxCanParse(resp: Response): boolean {
  *    to the `www-authenticate` (Tempo) challenge when present, else
  *    forward UNCHANGED so mppx raises its own real error (never swallow)
  *
- * See the wrapper's doc comment + docs/rootcause-...-2026-06-24.md.
+ * See the wrapper's doc comment + docs/archive/rootcause-...-2026-06-24.md.
  */
 export function sanitize402Response(
   response: Response,

@@ -1334,7 +1334,7 @@ export async function handleProxy(
   // unverified routes and manage it with honest catalog flags
   // (charge_rozo_verified/session_rozo_verified) rather than gating every
   // unverified route — the client sees what we've vetted and decides. See
-  // docs/codex-review-catalog-v2-2026-06-23.md.
+  // docs/archive/codex-review-catalog-v2-2026-06-23.md.
   //
   // We still gate here (not just in the catalog) because catalog hiding
   // doesn't stop an attacker — or a stale snapshot — from POSTing a

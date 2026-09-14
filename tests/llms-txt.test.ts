@@ -2,7 +2,7 @@
  * /llms.txt must never drift from the live catalog again — this file
  * used to hardcode "489 paid API endpoints across 88 services" and a
  * hand-typed services prose list that went stale the moment the
- * catalog snapshot changed (see docs/service-probe-2026-07-31.md for
+ * catalog snapshot changed (see docs/archive/service-probe-2026-07-31.md for
  * the same class of bug in catalog price labels).
  */
 import { describe, expect, it } from 'vitest'

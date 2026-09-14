@@ -9,7 +9,7 @@
  * Endpoint counts and the services list below are derived live from
  * `listPublicCatalog` / `PUBLIC_SERVICE_ROUTES` — the same source
  * `/v1/services/catalog` reads — so this file never drifts from the
- * real catalog (see docs/service-probe-2026-07-31.md for the history
+ * real catalog (see docs/archive/service-probe-2026-07-31.md for the history
  * of hand-typed numbers going stale).
  */
 import { listPublicCatalog, PUBLIC_SERVICE_ROUTES } from '../services/merchants'

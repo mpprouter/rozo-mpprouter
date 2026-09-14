@@ -2,7 +2,7 @@
  * Unit tests for the router→merchant 402 sanitizer
  * (src/mpp/tempo-client.ts sanitize402Response).
  *
- * Root cause it defends (docs/rootcause-invalid-base64-json-header-2026-06-24.md):
+ * Root cause it defends (docs/archive/rootcause-invalid-base64-json-header-2026-06-24.md):
  * mppx 0.7.0's x402 parser rejects the WHOLE `payment-required` header if any
  * `accepts[]` offer has a non-EVM network (e.g. a `solana:` offer), which also
  * discards the usable www-authenticate (Tempo) challenge and 502s the request.

@@ -1,7 +1,7 @@
 /**
  * ZERO-COST daily health monitor for verified MPP Router providers.
  *
- * Why this exists (docs/PROPOSAL-provider-lifecycle-sop-2026-06-24.md, codex
+ * Why this exists (docs/archive/PROPOSAL-provider-lifecycle-sop-2026-06-24.md, codex
  * review 2026-06-24): a previously-working provider can break SILENTLY when a
  * merchant changes its 402 challenge (e.g. stableemail added a `solana:` offer)
  * or when we upgrade a shared dep. The first signal today is a customer report.
