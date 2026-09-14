@@ -283,6 +283,13 @@ export async function handleChatCompletions(
   headers.set('X-MPPRouter-Model', actualModel.id)
   if (fallbackReason) headers.set('X-MPPRouter-Fallback-Reason', fallbackReason)
   const result = new Response(response.body, { status: response.status, statusText: response.statusText, headers })
-  if (result.status !== 402) ctx.waitUntil(recordUsage(env, requestId, requestedModel.id, actualModel, result, fallbackReason))
+  // A replayed result (X-Idempotent) was already recorded when it was first
+  // delivered; writing it again would double-count the purchase in the
+  // facade ledger. The header is trustworthy here because handleProxy never
+  // forwards merchant response headers: every delivered response is rebuilt
+  // from {body, contentType} plus router-set receipt headers, so only the
+  // router's own cache-hit paths can set it.
+  const replayed = result.headers.get('X-Idempotent') === 'true'
+  if (result.status !== 402 && !replayed) ctx.waitUntil(recordUsage(env, requestId, requestedModel.id, actualModel, result, fallbackReason))
   return result
 }

@@ -30,7 +30,7 @@ import {
   payMerchantSession,
 } from '../mpp/tempo-client'
 import { bumpCumulative } from '../mpp/channel-store'
-import { buildIdempotencyKey } from '../mpp/idempotency'
+import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult, type X402CachedResult } from '../mpp/idempotency'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
 import {
   createStellarPayment,
@@ -1827,7 +1827,36 @@ export async function handleProxy(
     // to clients. KV reservation gives us a clean, fast,
     // deterministic "replay detected" response.
     const reserve = await checkAndReserveNonce(env, prepared.payloadHash)
+    const x402ReplayKey = await buildX402ReplayKey({
+      payloadHash: prepared.payloadHash,
+      routeId: route.id,
+      method: request.method,
+      upstreamPath,
+      forwardedSearch,
+      body: requestBody,
+    })
     if (!reserve.ok) {
+      // Recovery path. A client whose connection dropped after we settled
+      // cannot sign a fresh payload without paying twice, so its natural
+      // retry re-presents the SAME signed payload for the same call. If
+      // that payment already bought a result, hand it back instead of a
+      // replay error: the payload hash is the proof it is the same payer
+      // (see buildX402ReplayKey). Only the identical route + body hits;
+      // anything else is still a replay.
+      const cached = await env.MPP_STORE.get(x402ReplayKey)
+      if (cached) {
+        let stored: X402CachedResult | null = null
+        try { stored = parseX402CachedResult(JSON.parse(cached)) } catch { /* fall through to replay error */ }
+        if (stored) {
+          console.log(
+            `[proxy] stellar.x402 replay served from cache for payloadHash=${prepared.payloadHash}`,
+          )
+          return new Response(stored.body, {
+            status: stored.status,
+            headers: { ...stored.headers, 'X-Idempotent': 'true' },
+          })
+        }
+      }
       console.log(
         `[proxy] stellar.x402 replay rejected for payloadHash=${prepared.payloadHash}`,
       )
@@ -1931,14 +1960,12 @@ export async function handleProxy(
       )
     }
 
-    // Payment log. Still no idempotency cache entry on this branch.
-    // prepare() now decodes the payer for LEDGER ATTRIBUTION only, and that
-    // is deliberately a best-effort value that can be null — it is NOT the
-    // "verified payer" an idempotency key would need. Scoping a cached
-    // merchant response to a best-effort identity would reintroduce exactly
-    // the cross-account disclosure this branch removed. Restoring x402
-    // idempotency needs the payer to be verified (i.e. proven by the
-    // facilitator's simulate result), not merely parsed; still a follow-up.
+    // Payment log. The idempotency cache on this branch is keyed on the
+    // signed payload hash, not on the decoded payer: prepare() decodes the
+    // payer for LEDGER ATTRIBUTION only, and that is a best-effort value that
+    // can be null, so it must never scope a cached paid response. The
+    // payload hash is the credential itself (see buildX402ReplayKey), which
+    // is what lets a dropped-connection retry recover the result below.
     ctx.waitUntil((async () => {
       console.log(
         `[payment] route=${route.id} method=stellar.x402 merchant=${merchantHost} upstreamPath=${upstreamPath}`,
@@ -1997,6 +2024,21 @@ export async function handleProxy(
       if (settle.errorReason) headers['X-Payment-Settle-Reason'] = settle.errorReason
     } else {
       headers['X-Payment-Settle-Status'] = 'settled'
+    }
+    // Cache the delivered result under the payload hash so a retry with the
+    // same signed payload (the only retry a client can make without paying
+    // again) recovers it. 24h matches the payer-keyed cache. Written after
+    // settle so a hit always reflects the receipt the client would have
+    // seen, including a settle failure.
+    // Awaited, not waitUntil: the recovery case IS the client that never
+    // sees this response, so the entry has to exist before we answer. A
+    // failed write is logged and the response still goes out; the nonce
+    // reservation already guarantees the payment cannot be spent twice.
+    const cachedResult: X402CachedResult = { status: 200, body: payResult.body, headers }
+    try {
+      await env.MPP_STORE.put(x402ReplayKey, JSON.stringify(cachedResult), { expirationTtl: 86400 })
+    } catch (error) {
+      console.error(`[proxy] stellar.x402 replay cache write failed for ${route.id}: ${String(error)}`)
     }
     return new Response(payResult.body, { status: 200, headers })
   }
