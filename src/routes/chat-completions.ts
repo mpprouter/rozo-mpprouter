@@ -283,6 +283,10 @@ export async function handleChatCompletions(
   headers.set('X-MPPRouter-Model', actualModel.id)
   if (fallbackReason) headers.set('X-MPPRouter-Fallback-Reason', fallbackReason)
   const result = new Response(response.body, { status: response.status, statusText: response.statusText, headers })
-  if (result.status !== 402) ctx.waitUntil(recordUsage(env, requestId, requestedModel.id, actualModel, result, fallbackReason))
+  // A replayed result (X-Idempotent) was already recorded when it was first
+  // delivered; writing it again would double-count the purchase in the
+  // facade ledger.
+  const replayed = result.headers.get('X-Idempotent') === 'true'
+  if (result.status !== 402 && !replayed) ctx.waitUntil(recordUsage(env, requestId, requestedModel.id, actualModel, result, fallbackReason))
   return result
 }

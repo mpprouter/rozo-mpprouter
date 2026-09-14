@@ -95,3 +95,50 @@ export async function buildIdempotencyKey(params: {
   ].map(lengthPrefixed).join('')
   return `${IDEMPOTENCY_KEY_PREFIX}${await sha256Hex(material)}`
 }
+
+const X402_REPLAY_KEY_PREFIX = 'idempotency:x402:'
+
+/**
+ * Cache key for the stellar.x402 branch, where the *signed payload itself*
+ * is the identity.
+ *
+ * That branch could not use buildIdempotencyKey(): the payer there is
+ * decoded from XDR for ledger attribution only and may be null, and scoping
+ * a cached paid response to an unverified identity is exactly the
+ * cross-account leak the payer-keyed cache exists to prevent.
+ *
+ * The payload hash sidesteps that. Only the holder of the signing key can
+ * produce the signed transaction, a payload is single-use on this router
+ * (checkAndReserveNonce), and a bearer who re-presents it is by construction
+ * the same party who paid with it. So a hit can only ever hand back the
+ * result that this very payment already bought. Route, method, upstream path
+ * + query and body are still folded in: the signature covers the Soroban
+ * invoke, not the HTTP request, so without them one payment could be
+ * replayed against a different upstream call.
+ */
+export async function buildX402ReplayKey(params: {
+  payloadHash: string
+  routeId: string
+  method: string
+  upstreamPath: string
+  forwardedSearch: string
+  body: string | undefined
+}): Promise<string> {
+  const bodyHash = await sha256Hex(params.body ?? '')
+  const material = [
+    params.payloadHash,
+    params.routeId,
+    params.method,
+    params.upstreamPath,
+    params.forwardedSearch,
+    bodyHash,
+  ].map(lengthPrefixed).join('')
+  return `${X402_REPLAY_KEY_PREFIX}${await sha256Hex(material)}`
+}
+
+/** What the x402 replay cache stores: the delivered body plus its receipt. */
+export interface X402CachedResult {
+  status: number
+  body: string
+  headers: Record<string, string>
+}
