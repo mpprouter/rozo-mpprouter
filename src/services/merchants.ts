@@ -1135,7 +1135,17 @@ export function listPublicCatalog(env?: CatalogEnvView): PublicCatalogEntry[] {
     // `methods.stellar_x402` / `payment_hints.pay_to` built above would
     // name OUR address, which is exactly the wrong party.
     const direct = withEnvDirectSettlement(route, env as Record<string, unknown> | undefined)
-    if (direct.operator) Object.assign(entry, operatorCatalogFields(direct, env))
+    if (direct.operator) {
+      Object.assign(entry, operatorCatalogFields(direct, env))
+      // A malformed binding resolves to an operator with no payouts: the
+      // proxy answers 503, so the catalog must not call the route payable.
+      if (direct.operator.payouts.length === 0) {
+        entry.payment_status = 'unavailable'
+        entry.payment_enabled = false
+        entry.payment_status_note = 'Provider settlement address is misconfigured; the route is not chargeable until it is fixed.'
+        delete entry.payment_hints
+      }
+    }
     return entry
   })
 }

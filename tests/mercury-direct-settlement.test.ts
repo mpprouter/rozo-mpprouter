@@ -66,6 +66,11 @@ describe('withEnvDirectSettlement', () => {
     expect(direct.hosted).toBe(true)
     expect(direct.operator?.payouts).toEqual([])
     expect(err).toHaveBeenCalled()
+    const entry = listPublicCatalog({ ...baseEnv, MERCURYDATA_X402_ADDRESS: '0x1234' }).find(x => x.id === mercuryRoutes()[0].id)!
+    expect(entry.payment_enabled).toBe(false)
+    expect(entry.payment_status).toBe('unavailable')
+    expect(entry.payment_hints).toBeUndefined()
+    expect(JSON.stringify(entry)).not.toContain(POOL_G)
     err.mockRestore()
   })
 
