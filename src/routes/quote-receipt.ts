@@ -1,6 +1,11 @@
 import { MAX_CHECKOUT_WEB_FEE_BPS } from './checkout-web-pricing'
 
-const RECEIPT_TTL_SECONDS = 60
+// 10 minutes. Was 60s when the checkout quoted and created back-to-back;
+// since rozo-chat-ai #40 the page quotes on mount and only creates on the
+// Pay click, and real dwell time before Pay is 2-18 min (rozo-chat-ai #47).
+// The receipt is HMAC-signed and pins amount/fee/pricingVersion, so a longer
+// TTL only widens the window in which a fee change is honoured at the old price.
+const RECEIPT_TTL_SECONDS = 600
 const encoder = new TextEncoder()
 
 export interface QuoteReceiptPayload {
