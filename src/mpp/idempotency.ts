@@ -142,3 +142,25 @@ export interface X402CachedResult {
   body: string
   headers: Record<string, string>
 }
+
+/**
+ * Validate a value read back from KV before serving it. The entry is our
+ * own write, but a stale or malformed record must degrade to the ordinary
+ * replay error rather than throw inside the payment path. Only the header
+ * set the x402 branch itself constructs (content type + payment receipt)
+ * is accepted; nothing else is ever stored, so nothing else is replayed.
+ */
+const X402_CACHED_HEADER = /^(content-type|payment-response|x-payment-[a-z-]+|x-mpprouter-[a-z-]+)$/i
+
+export function parseX402CachedResult(value: unknown): X402CachedResult | null {
+  if (!value || typeof value !== 'object') return null
+  const v = value as Record<string, unknown>
+  if (v.status !== 200 || typeof v.body !== 'string') return null
+  if (!v.headers || typeof v.headers !== 'object' || Array.isArray(v.headers)) return null
+  const headers: Record<string, string> = {}
+  for (const [name, val] of Object.entries(v.headers as Record<string, unknown>)) {
+    if (typeof val !== 'string' || !X402_CACHED_HEADER.test(name)) return null
+    headers[name] = val
+  }
+  return { status: 200, body: v.body, headers }
+}

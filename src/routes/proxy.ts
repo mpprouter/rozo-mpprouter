@@ -30,7 +30,7 @@ import {
   payMerchantSession,
 } from '../mpp/tempo-client'
 import { bumpCumulative } from '../mpp/channel-store'
-import { buildIdempotencyKey, buildX402ReplayKey, type X402CachedResult } from '../mpp/idempotency'
+import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult, type X402CachedResult } from '../mpp/idempotency'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
 import {
   createStellarPayment,
@@ -1846,7 +1846,7 @@ export async function handleProxy(
       const cached = await env.MPP_STORE.get(x402ReplayKey)
       if (cached) {
         let stored: X402CachedResult | null = null
-        try { stored = JSON.parse(cached) as X402CachedResult } catch { /* fall through to replay error */ }
+        try { stored = parseX402CachedResult(JSON.parse(cached)) } catch { /* fall through to replay error */ }
         if (stored) {
           console.log(
             `[proxy] stellar.x402 replay served from cache for payloadHash=${prepared.payloadHash}`,
@@ -2030,8 +2030,16 @@ export async function handleProxy(
     // again) recovers it. 24h matches the payer-keyed cache. Written after
     // settle so a hit always reflects the receipt the client would have
     // seen, including a settle failure.
+    // Awaited, not waitUntil: the recovery case IS the client that never
+    // sees this response, so the entry has to exist before we answer. A
+    // failed write is logged and the response still goes out; the nonce
+    // reservation already guarantees the payment cannot be spent twice.
     const cachedResult: X402CachedResult = { status: 200, body: payResult.body, headers }
-    ctx.waitUntil(env.MPP_STORE.put(x402ReplayKey, JSON.stringify(cachedResult), { expirationTtl: 86400 }))
+    try {
+      await env.MPP_STORE.put(x402ReplayKey, JSON.stringify(cachedResult), { expirationTtl: 86400 })
+    } catch (error) {
+      console.error(`[proxy] stellar.x402 replay cache write failed for ${route.id}: ${String(error)}`)
+    }
     return new Response(payResult.body, { status: 200, headers })
   }
   // ---- end stellar.x402 branch ------------------------------------

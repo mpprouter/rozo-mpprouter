@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { buildIdempotencyKey, buildX402ReplayKey } from '../src/mpp/idempotency'
+import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult } from '../src/mpp/idempotency'
 
 const BASE = {
   requestId: 'req-12345',
@@ -157,5 +157,25 @@ describe('buildX402ReplayKey', () => {
       body: X402.body,
     })
     expect(await buildX402ReplayKey(X402)).not.toBe(payerKeyed)
+  })
+})
+
+describe('parseX402CachedResult', () => {
+  const good = {
+    status: 200,
+    body: '{"ok":true}',
+    headers: { 'Content-Type': 'application/json', 'X-Payment-Tx': 'abc', 'PAYMENT-RESPONSE': 'e30=', 'X-MPPRouter-Quoted-Amount': '0.008' },
+  }
+  it('accepts an entry the x402 branch wrote', () => {
+    expect(parseX402CachedResult(good)).toEqual(good)
+  })
+  it('rejects malformed or foreign records instead of throwing', () => {
+    expect(parseX402CachedResult(null)).toBeNull()
+    expect(parseX402CachedResult('{}')).toBeNull()
+    expect(parseX402CachedResult({ ...good, status: 500 })).toBeNull()
+    expect(parseX402CachedResult({ ...good, body: 1 })).toBeNull()
+    expect(parseX402CachedResult({ ...good, headers: [] })).toBeNull()
+    expect(parseX402CachedResult({ ...good, headers: { ...good.headers, 'Set-Cookie': 'a=b' } })).toBeNull()
+    expect(parseX402CachedResult({ ...good, headers: { ...good.headers, 'X-Payment-Tx': 5 } })).toBeNull()
   })
 })
