@@ -1,6 +1,6 @@
-# SCF #44 — Tranche 3 report: an open, multi-operator MPP Router
+# MPP Router — open, multi-operator: provider onboarding and direct settlement
 
-Stellar Community Fund award #44 · MPP Router by ROZO · Tranche 3 (mainnet)
+MPP Router by ROZO · mainnet · prepared for Stellar Community Fund #44 review
 Report date: 2026-09-14
 
 ## 1. What Tranche 3 asked for
