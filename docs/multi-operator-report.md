@@ -45,7 +45,7 @@ Both listings above were produced by exactly this path. Portal: https://www.mppr
 
 - Self-serve registration, verification and public records: `mpprouter/rozo-mpprouter` PR #135, #149, #150.
 - Router-hosted paywall for APIs without a payment layer (credential stored encrypted under a Worker secret, never returned): PR #151, #152.
-- Provider dashboard (token-gated): `/providers/:id/dashboard`; public provider pages and the `/services` listing: `mpprouter/mpprouter-landingpage` PR #44, #46, #47, #48–#52.
+- Provider dashboard (token-gated): `/providers/:id/dashboard`; public provider pages and the `/services` listing: `mpprouter/mpprouter-landingpage` PR #44, #46, #47, #48 to #52.
 - Machine discovery: `/.well-known/x402` and `/llms.txt` carry third-party routes with per-route `payTo`.
 
 ### 3.4 Service-quality routing
