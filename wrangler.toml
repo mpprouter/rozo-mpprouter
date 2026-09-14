@@ -226,6 +226,15 @@ X402_ENABLED = "true"
 #   - src/mpp/stellar-x402-server.ts:436  (buildX402PaymentRequiredHeader)
 STELLAR_X402_PAY_TO = "GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB"
 
+# Mercury Data's own Stellar mainnet payout address (received from the
+# provider 2026-09-14; funded, USDC trustline present at set time). With this
+# set, the four mercury routes are router-hosted x402 paywalls whose 402
+# names THIS address: the buyer's USDC settles straight to Mercury after the
+# upstream 2xx and never enters the pool above. Public key only. Remove the
+# line to fall back to the pooled path. See
+# src/services/catalog-direct-settlement.ts.
+MERCURYDATA_X402_ADDRESS = "GC5KJLF3UOKRWWWQCRGNXP4A3CFBNUD6ZQFVSJNBA4UVNICZXPBLMHC3"
+
 # Coupon admin endpoints (issue/resolve/get) kill switch. Public
 # redeem/status are always on. Deliberately separate from
 # ADMIN_ENDPOINT_ENABLED (which gates /admin/pay-invoice and stays

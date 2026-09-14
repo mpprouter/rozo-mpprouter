@@ -37,6 +37,7 @@ import {
 } from './merchants'
 import type { PublicCatalogEntry, PublicServiceRoute } from './merchants-types'
 import { listOverlayRoutes } from './provider-registry'
+import { operatorCatalogFields, withEnvDirectSettlement } from './catalog-direct-settlement'
 import type { Env } from '../index'
 
 /** `publicPath` + `method`, the catalog's real primary key. */
@@ -85,7 +86,7 @@ export async function getRouteWithOverlay(
   method: string,
 ): Promise<PublicServiceRoute | undefined> {
   const fromSnapshot = getRouteByPublicPath(pathname, method)
-  if (fromSnapshot) return fromSnapshot
+  if (fromSnapshot) return withEnvDirectSettlement(fromSnapshot, env as unknown as Record<string, unknown>)
   const wanted = routeKey(pathname, method)
   const overlay = await listOverlayRoutes(env)
   return overlay.find(r => routeKey(r.publicPath, r.method) === wanted)
@@ -114,7 +115,6 @@ function overlayCatalogEntry(
   route: PublicServiceRoute,
   env?: CatalogEnvView,
 ): PublicCatalogEntry {
-  const operator = route.operator!
   return {
     id: route.id,
     name: route.name,
@@ -136,50 +136,7 @@ function overlayCatalogEntry(
     session_rozo_verified: null,
     session_rozo_verified_at: null,
     docs_url: `https://apiserver.mpprouter.dev/docs/integration#${route.id.replace(/_/g, '-')}`,
-    methods: {
-      // The router relays the PROVIDER's own 402 for these routes; it does
-      // not issue a challenge of its own. A buyer speaks whichever dialect
-      // the provider speaks (see `payment_hints.dialect`), pays the
-      // provider's address with the provider's facilitator, and the
-      // router never touches the money. No `stellar_x402` block: that one
-      // advertises OUR facilitator address, which is precisely the wrong
-      // answer here. The per-chain addresses live in `operator.payouts`
-      // below and in the live 402.
-      stellar: { intents: !route.hosted && route.upstreamDialect === 'mppx' ? ['charge'] : [] },
-      tempo: { intents: [], role: 'upstream' },
-    },
-    settlement: 'direct',
-    settlement_mode: route.hosted ? 'router_paywall' : 'relay',
-    ...(route.capability ? { capability: route.capability } : {}),
-    operator: {
-      id: operator.id,
-      name: operator.name,
-      ...(operator.verifiedAt ? { verified_at: operator.verifiedAt } : {}),
-      payouts: operator.payouts.map(p => ({
-        network: p.network,
-        pay_to: p.payTo,
-        asset: p.asset,
-      })),
-    },
-    payment_hints: {
-      network: env?.STELLAR_NETWORK,
-      intent: 'charge',
-      // What the provider's own endpoint speaks, as observed at
-      // verification. `x402` means pay the relayed `accepts[]` challenge
-      // with an x402 client; `mpp` means an mppx `WWW-Authenticate` one.
-      dialect: route.hosted ? 'x402' : route.upstreamDialect === 'x402' ? 'x402' : 'mpp',
-      relayed: !route.hosted,
-      // The provider's Stellar address, when they registered one — NOT
-      // ours. A wallet that reads this hint and pays it is paying the
-      // right party. Omitted rather than defaulted when the provider
-      // settles only on other chains: a wrong hint here is worse than a
-      // missing one, because the client would sign against it.
-      ...(() => {
-        const stellarPayout = operator.payouts.find(p => p.network.startsWith('stellar:'))
-        return stellarPayout ? { pay_to: stellarPayout.payTo } : {}
-      })(),
-      requires_classic_usdc_trustline: true,
-    },
+    ...operatorCatalogFields(route, env),
   }
 }
 

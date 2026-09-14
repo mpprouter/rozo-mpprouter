@@ -521,6 +521,11 @@ export function buildRoutesFromMppSnapshot(
         if (overlayEntry.launchGate !== undefined) {
           route.launchGate = overlayEntry.launchGate
         }
+        // Env-bound direct settlement (Mercury, 2026-09-14) — see
+        // `PublicServiceRoute.directSettlement`.
+        if (overlayEntry.directSettlement !== undefined) {
+          route.directSettlement = overlayEntry.directSettlement
+        }
         // OpenAI-compatible facade registration (2026-08-24) — see
         // `PublicServiceRoute.facade`. Operator-only: mpp.dev's snapshot
         // does not know which routes this operator has paid-verified.

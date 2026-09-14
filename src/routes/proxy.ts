@@ -742,10 +742,12 @@ async function payMerchantAndGetBodyInner(
   // need to leave one. All that remains is to fetch the provider's own
   // endpoint and hand back what it serves.
   //
-  // This branch is gated on `route.operator`, which exists only on runtime
-  // overlay routes. Every one of the 674 snapshot routes has it undefined,
-  // so none of them can reach this code and the pooled path below is
-  // untouched. Placed FIRST because it is the cheapest test and because a
+  // This branch is gated on `route.operator`, which exists on runtime
+  // overlay routes and on the catalog routes that opt into env-bound direct
+  // settlement (`route.directSettlement`, resolved in
+  // services/catalog-direct-settlement.ts — today only Mercury). Every
+  // other snapshot route has it undefined, so none of them can reach this
+  // code and the pooled path below is untouched. Placed FIRST because it is the cheapest test and because a
   // provider route must never fall through into a branch that would pay an
   // upstream out of our funds.
   if (route.operator) {
@@ -753,7 +755,12 @@ async function payMerchantAndGetBodyInner(
     // Hosted routes present the provider's stored origin credential and
     // nothing of the buyer's; relayed routes never reach this branch.
     let originHeaders: HeadersInit = forwardHeaders(request)
-    if (route.hosted) {
+    if (route.hosted && route.upstreamAuth) {
+      // Env-bound direct settlement (Mercury, 2026-09-14): the credential is
+      // a router-held Worker secret, not a registry record — inject it the
+      // way the router-held-credential branch below always has.
+      originHeaders = injectUpstreamAuth(originHeaders, route, env)
+    } else if (route.hosted) {
       const injected = await hostedOriginHeaders(env, route.operator.id, request)
       if (!injected) {
         return {

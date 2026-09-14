@@ -195,6 +195,20 @@ export interface PublicServiceRoute {
    */
   launchGate?: string
   /**
+   * Catalog route settled straight to the provider through the
+   * router-hosted paywall (`hosted`), with the payout address read from
+   * the Worker binding `payToBinding` at request time rather than from a
+   * self-serve registry record. Written for Mercury (2026-09-14): the
+   * router keeps its held credential (`upstreamAuth`) for the upstream
+   * call, but the buyer's x402 transfer now names the provider's own
+   * Stellar address and the facilitator settles it there after the
+   * upstream's 2xx. Binding unset → the route stays on the pooled path
+   * exactly as before; binding set to something that is not a Stellar
+   * public key → the route answers 503 rather than paying anyone. See
+   * `services/catalog-direct-settlement.ts`.
+   */
+  directSettlement?: CatalogDirectSettlement
+  /**
    * OpenAI-compatible facade registration (2026-08-24).
    *
    * When present, this route is reachable through `POST
@@ -290,6 +304,16 @@ export interface RouteOperator {
   verifiedAt?: string
 }
 
+/** See `PublicServiceRoute.directSettlement`. */
+export interface CatalogDirectSettlement {
+  /** Stable provider id, slug-shaped; becomes `operator.id`. */
+  providerId: string
+  /** Display name; becomes `operator.name`. */
+  providerName: string
+  /** Name of the Worker var/secret holding the provider's Stellar payout address. */
+  payToBinding: string
+}
+
 export interface RouteOperatorPayout {
   /**
    * CAIP-2-style network id, matching what the x402 `accepts[]` entry
@@ -374,6 +398,8 @@ export interface PublicServiceRouteOverlay {
    * catalog.
    */
   launchGate?: string
+  /** See `PublicServiceRoute.directSettlement`. */
+  directSettlement?: CatalogDirectSettlement
   /** See `PublicServiceRoute.facade`. */
   facade?: {
     models: readonly {
