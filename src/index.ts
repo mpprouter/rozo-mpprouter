@@ -708,7 +708,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // `/v1/playground/*` does not collide with the `/v1/services/`
       // catch-all further down.
       if (url.pathname === '/v1/playground/config' && request.method === 'GET') {
-        return handlePlaygroundConfig(env)
+        return handlePlaygroundConfig(env, url.origin)
       }
       if (url.pathname === '/v1/playground/session/intent' && request.method === 'POST') {
         return handlePlaygroundIntent(request, env)

@@ -86,6 +86,22 @@ async function main() {
   const cfg = cfgRaw.channel;
   log("config:", cfg.factory_contract, "collector", cfg.channel_to, "period", cfg.refund_waiting_period);
 
+  // ---- 0. The 402 OFFER (spec §3.4): an unknown agent's first call must be
+  //         answered with a scheme:"channel" entry in accepts[] that names
+  //         the same factory / collector / asset the config does.
+  {
+    const probe = await fetch(`${API}/v1/playground/channel/tx-decode?agent=${sdk.Keypair.random().publicKey()}`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx_hash: "00" }),
+    });
+    const hdr = probe.headers.get("payment-required");
+    let offer = null;
+    try { offer = JSON.parse(Buffer.from(hdr, "base64").toString("utf8")).accepts.find((a) => a.scheme === "channel"); } catch {}
+    check("402 carries channel offer", probe.status === 402 && !!offer
+      && offer.extra?.factory === cfg.factory_contract && offer.payTo === cfg.channel_to && offer.asset === cfg.token_sac
+      && offer.extra?.register === `${API}/v1/playground/channel/register` && offer.extra?.refundWaitingPeriodMinLedgers === cfg.refund_waiting_period,
+      `status=${probe.status} offer=${JSON.stringify(offer)}`);
+  }
+
   // ---- 1. OPEN through the factory ----
   const commitmentKp = sdk.Keypair.random();
   const salt = Buffer.from(sdk.Keypair.random().rawPublicKey());

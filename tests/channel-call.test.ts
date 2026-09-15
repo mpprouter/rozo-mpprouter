@@ -260,6 +260,27 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(h.release).toHaveBeenCalled()
   })
 
+  it('the 402 carries the spec §3.4 channel offer when the trust anchors are configured', async () => {
+    h.state.sufficient = false
+    const offerEnv = {
+      ...env(),
+      PLAYGROUND_CHANNEL_FACTORY: 'CCR2HE6CAMBYNUQG4N27CH5EAYELGYTQIONTYJ72K63XQZSL23OV7RTX',
+      PLAYGROUND_CHANNEL_TO: 'GBD64XFGJHG42CEVQKH4TYCIAMEHVBMW7A24KS22TKOSSA73IVW3CYIK',
+      PLAYGROUND_CHANNEL_WASM_HASH: 'ab'.repeat(32),
+    }
+    const res = await handleChannelChat(chatReq(), offerEnv)
+    expect(res.status).toBe(402)
+    const header = res.headers.get('Payment-Required')
+    expect(header).toBeTruthy()
+    const body = JSON.parse(Buffer.from(header!, 'base64').toString('utf8'))
+    expect(body.accepts[0].scheme).toBe('channel')
+    expect(body.accepts[0].amount).toBe(h.state.capturedAmount.replace('.', '').replace(/^0+/, ''))
+    expect(body.accepts[0].extra.register).toBe('https://api.test/v1/playground/channel/register')
+    // Without a factory configured, no offer is made (fail closed).
+    const bare = await handleChannelChat(chatReq(), env())
+    expect(bare.headers.get('Payment-Required')).toBeNull()
+  })
+
   it('single source of truth: a 2xx with paid=false rolls the voucher back', async () => {
     h.callUpstream.mockResolvedValue({
       value: { choices: [{ message: { content: 'served without payment' } }] },

@@ -122,6 +122,7 @@ import {
   channelPlaygroundEnabled,
   channelPricingConfig,
 } from '../playground/channel-config'
+import { channelOffer } from '../playground/channel-offer'
 
 // ---------------------------------------------------------------------------
 // small response helpers
@@ -254,7 +255,7 @@ function ledgerErrorResponse(e: Extract<LedgerResult<unknown>, { ok: false }>): 
  * drift from. Unavailable models are included WITH their reason so the UI can
  * grey them honestly instead of hiding them.
  */
-export function handlePlaygroundConfig(env: Env): Response {
+export function handlePlaygroundConfig(env: Env, origin: string): Response {
   const turnstileDisabled = isPlaygroundTurnstileDisabled(env)
   return json({
     enabled: playgroundEnabled(env),
@@ -276,6 +277,9 @@ export function handlePlaygroundConfig(env: Env): Response {
       deposit_options: CHANNEL_DEPOSIT_OPTIONS,
       min_deposit_usd: CHANNEL_MIN_DEPOSIT_USD,
       max_deposit_usd: CHANNEL_MAX_DEPOSIT_USD,
+      // The same `scheme: "channel"` offer the metered endpoints put in their
+      // 402 `accepts[]` (mpp-spec §3.4), for discovery before the first call.
+      offer: channelOffer(env, origin),
       ...channelPricingConfig(env),
     },
     turnstile: {

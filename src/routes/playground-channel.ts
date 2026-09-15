@@ -72,6 +72,7 @@ import {
   type OnChainChannel,
 } from '../playground/channel-onchain'
 import { deriveChannelAddress, parseSaltHex } from '../playground/channel-address'
+import { withChannelOffer } from '../playground/channel-offer'
 import { verifyChannelRegisterSignature } from '../playground/channel-register-auth'
 import {
   fenceChannelPersistent,
@@ -450,11 +451,19 @@ async function verifyChannelVoucher(
     resolved = await resolvePgChannelMppx(env, authHeader, agentHint)
   } catch (err: any) {
     if (err instanceof StellarChannelNotRegisteredError) {
+      // No channel for this agent yet: the 402 carries the channel OFFER
+      // (spec §3.4) so the agent can open one against the factory and
+      // register it, without any out-of-band configuration.
       return {
         kind: 'respond',
-        response: fail(402, 'channel_not_registered', err.message, {
-          hint: 'Open a channel and POST /v1/playground/channel/register first.',
-        }),
+        response: withChannelOffer(
+          fail(402, 'channel_not_registered', err.message, {
+            hint: 'Open a channel and POST /v1/playground/channel/register first.',
+          }),
+          env,
+          request.url,
+          priceRaw,
+        ),
       }
     }
     return {
@@ -532,11 +541,16 @@ async function verifyChannelVoucher(
       const remaining = depositRaw > prevRaw ? depositRaw - prevRaw : 0n
       return {
         kind: 'respond',
-        response: fail(
-          402,
-          'insufficient_channel_balance',
-          'this call would exceed the channel deposit; top up or open a new channel',
-          { remaining_usd: formatUsd(remaining), price_usd: formatUsd(priceRaw) },
+        response: withChannelOffer(
+          fail(
+            402,
+            'insufficient_channel_balance',
+            'this call would exceed the channel deposit; top up or open a new channel',
+            { remaining_usd: formatUsd(remaining), price_usd: formatUsd(priceRaw) },
+          ),
+          env,
+          request.url,
+          priceRaw,
         ),
       }
     }
@@ -572,7 +586,9 @@ async function verifyChannelVoucher(
     if (lockId) await releaseChannelDeliveryLock(env, channelContract, lockId)
     // No credential yet (first probe) or a rejected/replayed voucher. Return
     // the challenge so the client's channel method signs the next cumulative.
-    return { kind: 'respond', response: verifyResult.challenge }
+    // The same 402 also carries the channel offer (spec §3.4) as an x402
+    // `Payment-Required` header; mppx clients keep reading WWW-Authenticate.
+    return { kind: 'respond', response: withChannelOffer(verifyResult.challenge, env, request.url, priceRaw) }
   }
 
   // Defensive recovery — mppx isolates observer callbacks, so reconstruct the
