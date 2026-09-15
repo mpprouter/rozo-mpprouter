@@ -39,3 +39,8 @@ export function presentMerchantEnvelope(body: string, contentType: string): stri
   if (keys.length !== 2 || !keys.includes('success') || !keys.includes('data')) return body
   return JSON.stringify({ ...(data as Record<string, unknown>), success: true, data })
 }
+
+/** Locus operates its merchants under `<service>.mpp.paywithlocus.com`. */
+export function isLocusMerchantHost(host: string | undefined): boolean {
+  return typeof host === 'string' && /(^|\.)mpp\.paywithlocus\.com$/i.test(host)
+}

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { presentMerchantEnvelope } from '../src/routes/merchant-envelope'
+import { isLocusMerchantHost, presentMerchantEnvelope } from '../src/routes/merchant-envelope'
 
 const groqBody = JSON.stringify({
   success: true,
@@ -47,5 +47,15 @@ describe('presentMerchantEnvelope', () => {
     expect(out.success).toBe(true)
     expect(out.data).toEqual({ success: false, data: 'inner', x: 1 })
     expect(out.x).toBe(1)
+  })
+})
+
+describe('isLocusMerchantHost', () => {
+  it('matches only Locus merchant hosts', () => {
+    expect(isLocusMerchantHost('groq.mpp.paywithlocus.com')).toBe(true)
+    expect(isLocusMerchantHost('deepseek.mpp.paywithlocus.com')).toBe(true)
+    expect(isLocusMerchantHost('openai.mpp.tempo.xyz')).toBe(false)
+    expect(isLocusMerchantHost('evil-paywithlocus.com')).toBe(false)
+    expect(isLocusMerchantHost(undefined)).toBe(false)
   })
 })
