@@ -277,7 +277,14 @@ export async function handleChannelRegister(
     if (!factory) {
       return fail(503, 'factory_not_configured', 'playground channel factory is not configured')
     }
-    const derived = deriveChannelAddress(factory, agentAccount, salt, channelNetworkPassphrase(env))
+    // The regexes above only check shape; a StrKey with a bad checksum would
+    // throw inside the derivation, so answer it as the validation error it is.
+    let derived: string
+    try {
+      derived = deriveChannelAddress(factory, agentAccount, salt, channelNetworkPassphrase(env))
+    } catch {
+      return fail(400, 'invalid_funder', 'from is not a valid Stellar public key (checksum)')
+    }
     if (derived !== channelContract) {
       return fail(400, 'address_mismatch', 'channel is not the address the factory deploys for this from + salt')
     }

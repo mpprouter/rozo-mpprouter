@@ -21,3 +21,4 @@ bun.lockb
 internal-docs/
 .env*
 !.env.example
+scripts/e2e/channel-register-spec-state.json

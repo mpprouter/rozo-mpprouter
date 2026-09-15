@@ -230,6 +230,13 @@ describe('handleChannelRegister — spec body', () => {
     expect(res.status).toBe(401)
   })
 
+  it('rejects a from with a bad StrKey checksum as 400, not 500', async () => {
+    const badFrom = FUNDER.slice(0, -1) + (FUNDER.endsWith('A') ? 'B' : 'A')
+    const res = await handleChannelRegister(registerReq(specBody({ from: badFrom })), makeEnv(kv), { readChannelOnChain: async () => goodOnChain() })
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toBe('invalid_funder')
+  })
+
   it('fails closed (503) when the factory is not configured', async () => {
     const env = { ...makeEnv(kv), PLAYGROUND_CHANNEL_FACTORY: '' }
     const res = await handleChannelRegister(registerReq(specBody()), env, { readChannelOnChain: async () => goodOnChain() })
