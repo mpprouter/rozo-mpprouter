@@ -189,7 +189,10 @@ async function main() {
   log(`waiting for ledger ${target} (~${Math.round((cfg.refund_waiting_period * 5.6) / 60)} min)…`);
   for (;;) {
     await new Promise((r) => setTimeout(r, 20000));
-    const now = (await server.getLatestLedger()).sequence;
+    // One RPC hiccup during a 9-minute wait must not abandon a funded channel
+    // (2026-09-15 run 8: ECONNRESET here, the router's close later refunded it).
+    let now;
+    try { now = (await server.getLatestLedger()).sequence; } catch (e) { log("ledger poll failed, retrying:", String(e).slice(0, 80)); continue; }
     if (now >= target) break;
   }
   // refund via the SDK failed on 2026-09-15 with "unknown SorobanCredentialsType
