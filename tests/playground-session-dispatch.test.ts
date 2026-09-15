@@ -470,18 +470,24 @@ describe('model catalog after the 2026-08-18 anthropic delisting', () => {
     const cheap = PLAYGROUND_MODELS.filter(m => m.tier === 'cheap')
     expect(cheap.map(m => m.id)).toEqual([
       'openai/gpt-oss-20b',
+      // Added 2026-09-15 after the weekly paid probe (founder decision).
+      'openai/gpt-oss-120b',
       // Retired upstream 2026-09-08, kept listed with a reason.
       'llama-3.1-8b-instant',
       // deepseek-flash is the id the paid listing carries since 2026-09-15;
       // deepseek-v4-flash is its still-served alias.
       'deepseek-flash',
       'deepseek-v4-flash',
+      // Added 2026-09-15 after the weekly paid probe (founder decision).
+      'deepseek-v4-pro',
       'claude-haiku-4-5',
     ])
     expect(cheap.filter(m => m.available).map(m => m.id)).toEqual([
       'openai/gpt-oss-20b',
+      'openai/gpt-oss-120b',
       'deepseek-flash',
       'deepseek-v4-flash',
+      'deepseek-v4-pro',
     ])
     expect(findModel('llama-3.1-8b-instant')!.available).toBe(false)
     expect(findModel('claude-haiku-4-5')!.available).toBe(false)
