@@ -101,7 +101,9 @@ async function main() {
     // still be there for mppx.
     let offer = null;
     try { offer = (await probe.json()).accepts.find((a) => a.scheme === "channel"); } catch {}
-    check("402 carries channel offer", probe.status === 402 && !!offer && !probe.headers.get("payment-required") && !!probe.headers.get("www-authenticate")
+    // (No WWW-Authenticate here: an unknown agent has no channel to challenge
+    // against; the mppx challenge appears once a channel is registered.)
+    check("402 carries channel offer", probe.status === 402 && !!offer && !probe.headers.get("payment-required")
       && offer.extra?.factory === cfg.factory_contract && offer.payTo === cfg.channel_to && offer.asset === cfg.token_sac
       && offer.extra?.register === `${API}/v1/playground/channel/register` && offer.extra?.refundWaitingPeriodMinLedgers === cfg.refund_waiting_period,
       `status=${probe.status} offer=${JSON.stringify(offer)}`);
