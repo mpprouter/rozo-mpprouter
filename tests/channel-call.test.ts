@@ -108,7 +108,8 @@ vi.mock('../src/playground/channel-pg-dispatch', () => {
         h.state.capturedAmount = params.amount
         return (_input: Request) => {
           if (!h.state.sufficient) {
-            return { status: 402, challenge: new Response('voucher required', { status: 402 }) }
+            // mppx's real first-probe challenge has a null body + WWW-Authenticate.
+            return { status: 402, challenge: new Response(null, { status: 402, headers: { 'WWW-Authenticate': 'Payment x' } }) }
           }
           cb?.({
             challenge: { id: 'chal-1' },
@@ -260,7 +261,7 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     expect(h.release).toHaveBeenCalled()
   })
 
-  it('the 402 carries the spec §3.4 channel offer when the trust anchors are configured', async () => {
+  it('the 402 body carries the spec §3.4 channel offer when the trust anchors are configured', async () => {
     h.state.sufficient = false
     const offerEnv = {
       ...env(),
@@ -270,15 +271,16 @@ describe('handleChannelChat — real-cost voucher metering', () => {
     }
     const res = await handleChannelChat(chatReq(), offerEnv)
     expect(res.status).toBe(402)
-    const header = res.headers.get('Payment-Required')
-    expect(header).toBeTruthy()
-    const body = JSON.parse(Buffer.from(header!, 'base64').toString('utf8'))
+    // Never in the Payment-Required header: mppx 0.7.0 clients choke on it.
+    expect(res.headers.get('Payment-Required')).toBeNull()
+    const body = (await res.json()) as any
     expect(body.accepts[0].scheme).toBe('channel')
     expect(body.accepts[0].amount).toBe(h.state.capturedAmount.replace('.', '').replace(/^0+/, ''))
     expect(body.accepts[0].extra.register).toBe('https://api.test/v1/playground/channel/register')
     // Without a factory configured, no offer is made (fail closed).
     const bare = await handleChannelChat(chatReq(), env())
-    expect(bare.headers.get('Payment-Required')).toBeNull()
+    expect(await bare.text()).toBe('')
+    expect(bare.headers.get('WWW-Authenticate')).toBe('Payment x')
   })
 
   it('single source of truth: a 2xx with paid=false rolls the voucher back', async () => {

@@ -96,10 +96,12 @@ async function main() {
     const probe = await fetch(`${API}/v1/playground/channel/tx-decode?agent=${sdk.Keypair.random().publicKey()}`, {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx_hash: "9589ef539d04558edc048b88ca5205ac8ac30fadc97ec8d9eb66268e066fc254" }),
     });
-    const hdr = probe.headers.get("payment-required");
+    // The offer travels in the 402 BODY (never the Payment-Required header,
+    // which mppx 0.7.0 clients cannot parse past); WWW-Authenticate must
+    // still be there for mppx.
     let offer = null;
-    try { offer = JSON.parse(Buffer.from(hdr, "base64").toString("utf8")).accepts.find((a) => a.scheme === "channel"); } catch {}
-    check("402 carries channel offer", probe.status === 402 && !!offer
+    try { offer = (await probe.json()).accepts.find((a) => a.scheme === "channel"); } catch {}
+    check("402 carries channel offer", probe.status === 402 && !!offer && !probe.headers.get("payment-required") && !!probe.headers.get("www-authenticate")
       && offer.extra?.factory === cfg.factory_contract && offer.payTo === cfg.channel_to && offer.asset === cfg.token_sac
       && offer.extra?.register === `${API}/v1/playground/channel/register` && offer.extra?.refundWaitingPeriodMinLedgers === cfg.refund_waiting_period,
       `status=${probe.status} offer=${JSON.stringify(offer)}`);

@@ -456,7 +456,7 @@ async function verifyChannelVoucher(
       // register it, without any out-of-band configuration.
       return {
         kind: 'respond',
-        response: withChannelOffer(
+        response: await withChannelOffer(
           fail(402, 'channel_not_registered', err.message, {
             hint: 'Open a channel and POST /v1/playground/channel/register first.',
           }),
@@ -541,7 +541,7 @@ async function verifyChannelVoucher(
       const remaining = depositRaw > prevRaw ? depositRaw - prevRaw : 0n
       return {
         kind: 'respond',
-        response: withChannelOffer(
+        response: await withChannelOffer(
           fail(
             402,
             'insufficient_channel_balance',
@@ -586,9 +586,13 @@ async function verifyChannelVoucher(
     if (lockId) await releaseChannelDeliveryLock(env, channelContract, lockId)
     // No credential yet (first probe) or a rejected/replayed voucher. Return
     // the challenge so the client's channel method signs the next cumulative.
-    // The same 402 also carries the channel offer (spec §3.4) as an x402
-    // `Payment-Required` header; mppx clients keep reading WWW-Authenticate.
-    return { kind: 'respond', response: withChannelOffer(verifyResult.challenge, env, request.url, priceRaw) }
+    // The same 402 also carries the channel offer (spec §3.4) in its JSON
+    // body; mppx clients keep reading WWW-Authenticate (see channel-offer.ts
+    // for why it must not be the Payment-Required header).
+    return {
+      kind: 'respond',
+      response: await withChannelOffer(verifyResult.challenge, env, request.url, priceRaw),
+    }
   }
 
   // Defensive recovery — mppx isolates observer callbacks, so reconstruct the
