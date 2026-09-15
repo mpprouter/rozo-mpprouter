@@ -9,8 +9,11 @@
  *   → close_start → wait the refund window → refund
  *
  * Usage (secret only from env, never an argument):
- *   STELLAR_SECRET=$(stellar keys show <identity>) \
+ *   STELLAR_SECRET=$(stellar keys show <identity>) STELLAR_CLI_SOURCE=<identity> \
  *     node scripts/e2e/channel-register-spec.mjs [--skip-close] [--api URL]
+ *
+ * STELLAR_CLI_SOURCE is the stellar CLI identity used as a refund fallback
+ * when the SDK cannot decode the network's XDR.
  *
  * Net cost ≈ one metered call (~$0.03) + ~0.3 XLM gas; the deposit refunds.
  */
@@ -185,11 +188,28 @@ async function main() {
     const now = (await server.getLatestLedger()).sequence;
     if (now >= target) break;
   }
-  const s2 = await server.getAccount(FUNDER);
-  const { hash: refundTx } = await submit(
-    new sdk.TransactionBuilder(s2, { fee: FEE, networkPassphrase: state.networkPassphrase }).addOperation(contract.call("refund")).setTimeout(180).build(),
-    "refund"
-  );
+  // refund via the SDK failed on 2026-09-15 with "unknown SorobanCredentialsType
+  // member for value 2" (the pinned stellar-sdk XDR is older than the network
+  // protocol), so retry the SDK path once and fall back to the stellar CLI,
+  // which is what scripts/refund-stellar-channel.ts uses. Mainnet needs an
+  // explicit inclusion fee or the CLI submission times out.
+  let refundTx = "";
+  try {
+    const s2 = await server.getAccount(FUNDER);
+    ({ hash: refundTx } = await submit(
+      new sdk.TransactionBuilder(s2, { fee: FEE, networkPassphrase: state.networkPassphrase }).addOperation(contract.call("refund")).setTimeout(180).build(),
+      "refund"
+    ));
+  } catch (err) {
+    log("refund via SDK failed:", String(err).slice(0, 120));
+    const cli = process.env.STELLAR_CLI_SOURCE;
+    if (!cli) throw new Error("refund failed and STELLAR_CLI_SOURCE (stellar CLI identity name) not set; run: npm run refund-channel -- claim --channel " + channel + " --source <identity>");
+    const { spawnSync } = await import("node:child_process");
+    const r = spawnSync("stellar", ["contract", "invoke", "--id", channel, "--source-account", cli, "--network", "mainnet", "--fee", FEE, "--send=yes", "--", "refund"], { encoding: "utf8" });
+    if (r.status !== 0) throw new Error("CLI refund failed: " + (r.stderr || "").slice(-300));
+    refundTx = (r.stderr.match(/Signing transaction: ([0-9a-f]{64})/) || [])[1] || "cli";
+    log("refund via stellar CLI: SUCCESS", refundTx);
+  }
   writeFileSync(STATE_FILE, JSON.stringify({ done: true, channel, openTx, closeTx, refundTx, results }, null, 2));
   log("E2E COMPLETE:", results.every((x) => x.ok) ? "ALL PASSED" : "SOME FAILED", JSON.stringify(results));
 }
