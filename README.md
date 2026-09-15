@@ -24,6 +24,34 @@ sends it to the Router. `refund()` fails safely if the waiting period has not
 elapsed. This flow refunds the channel remainder only; it does not reverse an
 amount the Router already settled from a valid signed commitment.
 
+### Refund waiting period: 100 ledgers, and how the Router meets it
+
+The unilateral close is `close_start`, then a wait of `refund_waiting_period`
+ledgers, then `refund`. That window is the Router's only chance to submit the
+latest signed voucher on chain; a voucher not submitted before the window
+elapses is lost with the refund. Integrators who write their own channel
+contract or spec ask how long the window has to be. The answer for this Router:
+
+- **Production value: 100 ledgers** (about 8 to 10 minutes on pubnet). It is
+  enforced, not advisory: `register` rejects any channel whose on-chain
+  `refund_waiting_period` is not exactly 100
+  (`src/playground/channel-onchain.ts`), the same way it rejects a foreign
+  WASM hash. `GET /v1/playground/config` advertises it as
+  `refund_waiting_period`.
+- **Settlement runs from a 2-minute cron** (`wrangler.toml`,
+  `src/playground/channel-settle.ts`). On the first tick that observes
+  `close_start` the channel is durably fenced and the latest voucher is
+  submitted through the channel's `close`. A failed submission (lock
+  contention, RPC error) is retried on every following tick until it lands,
+  so the window holds 4 to 5 attempts.
+- **No new spend on a closing channel.** The call path checks the channel's
+  current close state before paying upstream and refuses once `close_start`
+  has been called (`src/playground/channel-close-guard.ts`). Exposure is
+  bounded to vouchers already served before the close began.
+- **Design floor: 60 ledgers** (`CLOSE_SAFETY_MARGIN_LEDGERS`, two cron ticks
+  plus settle latency). 100 is the value the Router requires; a spec that
+  needs one number should use 100.
+
 MPP Router is a Cloudflare Worker that exposes a stable public API for paid services over a Stellar-based payment flow.
 
 ## Automatic non-delivery refunds
