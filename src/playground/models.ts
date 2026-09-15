@@ -163,8 +163,9 @@ export const MAX_MESSAGE_CHARS = 8_000
  */
 const ANTHROPIC_DELISTED_REASON =
   'The upstream Anthropic merchant accepts payment and then rejects the call ' +
-  '(403 after payment, re-confirmed with paid probes on 2026-08-18), so the ' +
-  'route is delisted. Unavailable until a paid re-probe returns a completion.'
+  '(403 after payment, re-confirmed with paid probes on 2026-08-18 and ' +
+  '2026-09-15), so the route is delisted. Unavailable until a paid re-probe ' +
+  'returns a completion.'
 
 export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
   // ---- cheap / fast tier ----
@@ -173,6 +174,9 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     // paid calls, see services/merchants.ts) and present on the paid
     // /groq/models listing taken 2026-09-08. Took this slot from
     // llama-3.1-8b-instant, which the merchant no longer serves.
+    // Re-probed 2026-09-15 through the router (/v1/services/groq/chat, paid
+    // 0.008 USDC): HTTP 200 + completion, id echoed verbatim; the same day's
+    // paid /groq/models listing (14 ids) still carries it.
     id: 'openai/gpt-oss-20b',
     tier: 'cheap',
     provider: 'groq',
@@ -188,7 +192,9 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     // since 2026-08-24 (documented in services/merchants.ts) and the paid
     // /groq/models listing on 2026-09-08 returned 14 ids without this one.
     // Kept listed-but-unavailable rather than deleted, per the convention
-    // above.
+    // above. Re-confirmed 2026-09-15: a paid call through the router still
+    // gets model_not_found after payment (refunded) and the id is absent
+    // from that day's paid listing.
     id: 'llama-3.1-8b-instant',
     tier: 'cheap',
     provider: 'groq',
@@ -199,9 +205,25 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
       'Groq retired this id: the merchant answers model_not_found after payment (the router refunds automatically), and the paid /groq/models listing on 2026-09-08 no longer includes it. Use openai/gpt-oss-20b.',
   },
   {
-    // Re-verified 2026-08-13 with a REAL PAID CALL bypassing the router
-    // (probe-merchant-direct.ts → deepseek.mpp.paywithlocus.com/deepseek/chat,
-    // HTTP 200 + completion, id echoed back verbatim).
+    // The id DeepSeek lists today. The paid /deepseek/list-models call on
+    // 2026-09-15 returned exactly two ids, `deepseek-flash` and
+    // `deepseek-v4-pro`; a paid /deepseek/chat through the router the same
+    // day (0.004 USDC) returned HTTP 200 + completion echoing `deepseek-flash`.
+    id: 'deepseek-flash',
+    tier: 'cheap',
+    provider: 'deepseek',
+    routePublicPath: '/v1/services/deepseek/chat',
+    routeMethod: 'POST',
+    available: true,
+  },
+  {
+    // Legacy alias of `deepseek-flash`, kept callable because existing callers
+    // pin it. Re-verified 2026-08-13 direct to the merchant and again
+    // 2026-09-15 through the router (paid, HTTP 200 + completion) — but since
+    // 2026-09-15 the merchant echoes `deepseek-flash` as the served model and
+    // the paid listing no longer carries this id. Flip to `available: false`
+    // (with a reason pointing at `deepseek-flash`) the first time a paid probe
+    // gets model_not_found for it.
     id: 'deepseek-v4-flash',
     tier: 'cheap',
     provider: 'deepseek',
@@ -299,8 +321,12 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
  *
  * (That llama entry was flipped to `available: false` on 2026-09-08; the
  * groq cheap-tier slot is now openai/gpt-oss-20b.)
+ *
+ * 2026-09-15: moved from the `deepseek-v4-flash` alias to `deepseek-flash`,
+ * the id DeepSeek's paid listing carries and the merchant echoes back; both
+ * were paid-verified through the router that day.
  */
-export const BLEND_SUMMARY_MODEL_ID = 'deepseek-v4-flash'
+export const BLEND_SUMMARY_MODEL_ID = 'deepseek-flash'
 
 export function findModel(id: string): PlaygroundModel | undefined {
   return PLAYGROUND_MODELS.find(m => m.id === id)
