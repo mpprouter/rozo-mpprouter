@@ -253,25 +253,16 @@ describe('handleChannelRegister — spec body', () => {
     expect(kv.map.size).toBe(0)
   })
 
-  it('rejects a body that mixes both shapes', async () => {
-    const res = await handleChannelRegister(
-      registerReq({ ...specBody(), channel_contract: CHANNEL }),
-      makeEnv(kv),
-      { readChannelOnChain: async () => goodOnChain() },
-    )
-    expect(res.status).toBe(400)
-    expect((await res.json()).error).toBe('ambiguous_body')
-  })
-
-  it('legacy snake_case body still works without salt or signature', async () => {
+  it('rejects the legacy snake_case body with a pointed error, no chain read', async () => {
+    const read = vi.fn(async () => goodOnChain())
     const res = await handleChannelRegister(
       registerReq({ channel_contract: CHANNEL, funder: FUNDER, commitment_key: COMMIT_G, token: USDC_SAC, network: 'stellar:pubnet', deposit_raw: '2000000' }),
       makeEnv(kv),
-      { readChannelOnChain: async () => goodOnChain() },
+      { readChannelOnChain: read },
     )
-    expect(res.status).toBe(200)
-    const j = (await res.json()) as any
-    expect(j.funder).toBe(FUNDER)
-    expect(j.commitment_key).toBe(COMMIT_G)
+    expect(res.status).toBe(400)
+    expect((await res.json()).error).toBe('legacy_body')
+    expect(read).not.toHaveBeenCalled()
+    expect(kv.map.size).toBe(0)
   })
 })

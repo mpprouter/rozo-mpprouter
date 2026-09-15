@@ -197,40 +197,21 @@ export async function handleChannelRegister(
     return fail(503, 'rate_limit_unavailable', 'could not check rate limit; try again shortly')
   }
 
-  // Two body shapes are accepted.
-  //
-  //   spec (mpp-spec §3.4, camelCase):
-  //     { channel, commitmentKey, salt, from, signature }
-  //     `salt` + `from` let the router recompute the factory's deterministic
-  //     deploy address; `signature` authenticates the request as `from`.
-  //
-  //   legacy (playground frontend, PR #20, snake_case):
-  //     { channel_contract, funder, commitment_key, token, network, deposit_raw, open_tx_hash? }
-  //     Kept until the frontend migrates. It carries no salt and no signature,
-  //     so it gets neither check — only the on-chain read + per-IP rate limit.
-  //
-  // The shape is chosen by which channel field is present; a body naming both
-  // is rejected rather than guessed at.
+  // mpp-spec §3.4 body (camelCase): { channel, commitmentKey, salt, from, signature }.
+  // `salt` + `from` let the router recompute the factory's deterministic
+  // deploy address; `signature` authenticates the request as `from`. The
+  // legacy snake_case playground body (no salt, no signature) was removed on
+  // 2026-09-15 once the frontend migrated (mpprouter-landingpage #57); it is
+  // answered with a pointed error rather than silently treated as malformed.
   const body = await readJsonBody(request)
-  const specShape = typeof body.channel === 'string'
-  if (specShape && typeof body.channel_contract === 'string') {
-    return fail(400, 'ambiguous_body', 'send either the spec body (channel, commitmentKey, salt, from, signature) or the legacy body (channel_contract, funder, commitment_key), not both')
+  if (typeof body.channel_contract === 'string' && typeof body.channel !== 'string') {
+    return fail(400, 'legacy_body', 'the snake_case register body is no longer accepted; send { channel, commitmentKey, salt, from, signature } (mpp-spec §3.4)')
   }
-  const channelContract = specShape
-    ? (body.channel as string).trim()
-    : typeof body.channel_contract === 'string' ? body.channel_contract.trim() : ''
-  const agentAccount = specShape
-    ? typeof body.from === 'string' ? body.from.trim() : ''
-    : typeof body.funder === 'string' ? body.funder.trim() : ''
-  const commitmentKey = specShape
-    ? typeof body.commitmentKey === 'string' ? body.commitmentKey.trim() : ''
-    : typeof body.commitment_key === 'string' ? body.commitment_key.trim() : ''
+  const channelContract = typeof body.channel === 'string' ? body.channel.trim() : ''
+  const agentAccount = typeof body.from === 'string' ? body.from.trim() : ''
+  const commitmentKey = typeof body.commitmentKey === 'string' ? body.commitmentKey.trim() : ''
   const currency = typeof body.token === 'string' ? body.token.trim() : ''
   const network = typeof body.network === 'string' ? body.network.trim() : env.STELLAR_NETWORK
-  // open_tx_hash is accepted for client correlation/logging only — the trust
-  // comes from the on-chain read below, never from a client-supplied tx hash.
-  const openTxHash = typeof body.open_tx_hash === 'string' ? body.open_tx_hash.trim() : ''
-  if (openTxHash) console.log(`[channel] register ${channelContract} open_tx=${openTxHash}`)
 
   if (!C_ADDRESS.test(channelContract)) {
     return fail(400, 'invalid_channel', 'channel must be a Soroban contract address (C...)')
@@ -242,30 +223,17 @@ export async function handleChannelRegister(
     return fail(400, 'invalid_commitment_key', 'commitmentKey must be an ed25519 public key (G...)')
   }
 
-  // Shape the response the way the request was made: camelCase for the spec
-  // body, snake_case for the legacy frontend body.
   const reply = (replayed: boolean, depositRaw: string) =>
-    json(
-      specShape
-        ? {
-            ok: true,
-            replayed,
-            channel: channelContract,
-            from: agentAccount,
-            commitmentKey,
-            depositUsd: formatUsd(parseAtomic(depositRaw)),
-          }
-        : {
-            ok: true,
-            replayed,
-            channel: channelContract,
-            funder: agentAccount,
-            commitment_key: commitmentKey,
-            deposit_usd: formatUsd(parseAtomic(depositRaw)),
-          },
-    )
+    json({
+      ok: true,
+      replayed,
+      channel: channelContract,
+      from: agentAccount,
+      commitmentKey,
+      depositUsd: formatUsd(parseAtomic(depositRaw)),
+    })
 
-  if (specShape) {
+  {
     // §3.4 check 1 — provenance of the ADDRESS: it must be exactly what the
     // factory deploys for (from, salt). A channel deployed any other way (or
     // by another funder) cannot be registered under this `from`, whatever its
