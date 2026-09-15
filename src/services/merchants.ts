@@ -601,8 +601,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     // the merchant, see src/playground/models.ts). `deepseek-v4-pro` added
     // 2026-09-08: a paid /deepseek/list-models (0.003 USDC) returned it, and a
     // paid /deepseek/chat (0.004 USDC) returned a completion echoing that id.
+    // `deepseek-flash` added 2026-09-15: the paid listing that day returned
+    // only `deepseek-flash` and `deepseek-v4-pro`, and paid /deepseek/chat
+    // calls (0.004 USDC each) returned completions for all three ids — the
+    // merchant now echoes `deepseek-flash` even when `deepseek-v4-flash` is
+    // sent, so the v4 id is a still-served alias, kept for existing callers.
     facade: {
       models: [
+        { id: 'deepseek-flash', available: true },
         { id: 'deepseek-v4-flash', available: true },
         { id: 'deepseek-v4-pro', available: true },
       ],

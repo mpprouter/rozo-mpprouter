@@ -472,11 +472,15 @@ describe('model catalog after the 2026-08-18 anthropic delisting', () => {
       'openai/gpt-oss-20b',
       // Retired upstream 2026-09-08, kept listed with a reason.
       'llama-3.1-8b-instant',
+      // deepseek-flash is the id the paid listing carries since 2026-09-15;
+      // deepseek-v4-flash is its still-served alias.
+      'deepseek-flash',
       'deepseek-v4-flash',
       'claude-haiku-4-5',
     ])
     expect(cheap.filter(m => m.available).map(m => m.id)).toEqual([
       'openai/gpt-oss-20b',
+      'deepseek-flash',
       'deepseek-v4-flash',
     ])
     expect(findModel('llama-3.1-8b-instant')!.available).toBe(false)
@@ -498,6 +502,8 @@ describe('model catalog after the 2026-08-18 anthropic delisting', () => {
     const blend = findModel(BLEND_SUMMARY_MODEL_ID)!
     expect(blend.available).toBe(true)
     expect(blend.provider).not.toBe('anthropic')
+    // 2026-09-15: pinned to the id DeepSeek's paid listing carries.
+    expect(BLEND_SUMMARY_MODEL_ID).toBe('deepseek-flash')
   })
 
   it('keeps gpt-4o-mini dropped; groq/deepseek re-added after 2026-08-13 re-verification', () => {

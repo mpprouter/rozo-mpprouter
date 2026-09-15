@@ -203,14 +203,19 @@ block above that entry in `merchants.ts`.
 
 ## Model availability
 
+As of the paid re-probe on 2026-09-15 (`src/playground/models.ts` is the
+source of truth; this table is a snapshot):
+
 | Model | Tier | Price | Callable | Route |
 | --- | --- | --- | --- | --- |
-| `llama-3.1-8b-instant` | cheap | $0.02 | yes | groq (charge) |
-| `deepseek-v4-flash` | cheap | $0.02 | yes | deepseek (charge) |
-| `claude-haiku-4-5` | cheap | $0.02 | yes | anthropic chat_completions (charge) |
-| `gpt-4o-mini` | cheap | $0.02 | yes | openai chat (session) |
-| `claude-opus-5` | flagship | $0.10 | yes | anthropic chat_completions (charge) |
-| `claude-sonnet-5` | flagship | $0.10 | yes | anthropic chat_completions (charge) |
+| `openai/gpt-oss-20b` | cheap | $0.02 | yes | groq (charge) |
+| `llama-3.1-8b-instant` | cheap | $0.02 | **no** (retired by Groq, model_not_found after payment) | groq (charge) |
+| `deepseek-flash` | cheap | $0.02 | yes | deepseek (charge) |
+| `deepseek-v4-flash` | cheap | $0.02 | yes (alias of `deepseek-flash`, still served) | deepseek (charge) |
+| `claude-haiku-4-5` | cheap | $0.02 | **no** (merchant 403 after payment) | anthropic chat_completions (charge) |
+| `claude-opus-5` | flagship | $0.10 | **no** (merchant 403 after payment) | anthropic chat_completions (charge) |
+| `claude-sonnet-5` | flagship | $0.10 | **no** (merchant 403 after payment) | anthropic chat_completions (charge) |
+| `claude-opus-4-8` | flagship | $0.10 | **no** (merchant 403 after payment) | anthropic chat_completions (charge) |
 | `openai-flagship-pending-verification` | flagship | $0.10 | **no** | openai chat (session) |
 
 The Claude ids come from the 2026-08-09 paid-verification list in

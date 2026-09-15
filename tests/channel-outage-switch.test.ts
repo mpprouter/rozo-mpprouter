@@ -34,6 +34,7 @@ describe('provider-scoped outage stop (CSV value)', () => {
     const cfg = channelPricingConfig(env)
     const byProvider = Object.fromEntries(cfg.models.map(m => [m.id, m.available]))
     expect(byProvider['openai/gpt-oss-20b']).toBe(true)
+    expect(byProvider['deepseek-flash']).toBe(true)
     expect(byProvider['deepseek-v4-flash']).toBe(true)
     expect(byProvider['claude-haiku-4-5']).toBe(false)
     expect(byProvider['claude-opus-5']).toBe(false)
