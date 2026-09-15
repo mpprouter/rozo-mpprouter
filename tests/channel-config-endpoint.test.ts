@@ -25,7 +25,7 @@ function env(overrides: Record<string, unknown> = {}) {
 
 describe('playground config — channel block', () => {
   it('advertises the full open-tx contract', async () => {
-    const res = handlePlaygroundConfig(env())
+    const res = handlePlaygroundConfig(env(), 'https://api.test')
     const body = (await res.json()) as any
     const ch = body.channel
     expect(ch.enabled).toBe(true)
@@ -50,6 +50,7 @@ describe('playground config — channel block', () => {
   it('reports factory_contract null and disabled when unset/off', async () => {
     const res = handlePlaygroundConfig(
       env({ PLAYGROUND_CHANNEL_ENABLED: 'false', PLAYGROUND_CHANNEL_FACTORY: '' }),
+      'https://api.test',
     )
     const body = (await res.json()) as any
     expect(body.channel.enabled).toBe(false)
@@ -57,7 +58,7 @@ describe('playground config — channel block', () => {
   })
 
   it('uses the testnet passphrase when the router is on testnet', async () => {
-    const res = handlePlaygroundConfig(env({ STELLAR_NETWORK: 'stellar:testnet' }))
+    const res = handlePlaygroundConfig(env({ STELLAR_NETWORK: 'stellar:testnet' }), 'https://api.test')
     const body = (await res.json()) as any
     expect(body.channel.network_passphrase).toBe('Test SDF Network ; September 2015')
   })
