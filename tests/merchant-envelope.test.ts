@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isLocusMerchantHost, presentMerchantEnvelope } from '../src/routes/merchant-envelope'
+import { isEnvelopeLiftedRoute, presentMerchantEnvelope } from '../src/routes/merchant-envelope'
 
 const groqBody = JSON.stringify({
   success: true,
@@ -50,12 +50,11 @@ describe('presentMerchantEnvelope', () => {
   })
 })
 
-describe('isLocusMerchantHost', () => {
-  it('matches only Locus merchant hosts', () => {
-    expect(isLocusMerchantHost('groq.mpp.paywithlocus.com')).toBe(true)
-    expect(isLocusMerchantHost('deepseek.mpp.paywithlocus.com')).toBe(true)
-    expect(isLocusMerchantHost('openai.mpp.tempo.xyz')).toBe(false)
-    expect(isLocusMerchantHost('evil-paywithlocus.com')).toBe(false)
-    expect(isLocusMerchantHost(undefined)).toBe(false)
+describe('isEnvelopeLiftedRoute', () => {
+  it('covers only the two Locus chat routes', () => {
+    expect(isEnvelopeLiftedRoute('groq_chat')).toBe(true)
+    expect(isEnvelopeLiftedRoute('deepseek_chat')).toBe(true)
+    expect(isEnvelopeLiftedRoute('openai_chat')).toBe(false)
+    expect(isEnvelopeLiftedRoute('coingecko_simple_price')).toBe(false)
   })
 })

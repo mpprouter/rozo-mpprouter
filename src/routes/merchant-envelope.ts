@@ -40,7 +40,14 @@ export function presentMerchantEnvelope(body: string, contentType: string): stri
   return JSON.stringify({ ...(data as Record<string, unknown>), success: true, data })
 }
 
-/** Locus operates its merchants under `<service>.mpp.paywithlocus.com`. */
-export function isLocusMerchantHost(host: string | undefined): boolean {
-  return typeof host === 'string' && /(^|\.)mpp\.paywithlocus\.com$/i.test(host)
+/**
+ * Routes whose delivered body gets the envelope lift. Both are Locus-operated
+ * (`<service>.mpp.paywithlocus.com`) OpenAI-compatible chat endpoints that
+ * clients read with `choices[0]`. Add a route here only after a paid call has
+ * shown the `{success,data}` wrapper on it.
+ */
+const ENVELOPE_LIFTED_ROUTES = new Set(['groq_chat', 'deepseek_chat'])
+
+export function isEnvelopeLiftedRoute(routeId: string): boolean {
+  return ENVELOPE_LIFTED_ROUTES.has(routeId)
 }
