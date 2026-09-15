@@ -209,9 +209,11 @@ source of truth; this table is a snapshot):
 | Model | Tier | Price | Callable | Route |
 | --- | --- | --- | --- | --- |
 | `openai/gpt-oss-20b` | cheap | $0.02 | yes | groq (charge) |
+| `openai/gpt-oss-120b` | cheap | $0.02 | yes (added 2026-09-15) | groq (charge) |
 | `llama-3.1-8b-instant` | cheap | $0.02 | **no** (retired by Groq, model_not_found after payment) | groq (charge) |
 | `deepseek-flash` | cheap | $0.02 | yes | deepseek (charge) |
 | `deepseek-v4-flash` | cheap | $0.02 | yes (alias of `deepseek-flash`, still served) | deepseek (charge) |
+| `deepseek-v4-pro` | cheap | $0.02 | yes (added 2026-09-15) | deepseek (charge) |
 | `claude-haiku-4-5` | cheap | $0.02 | **no** (merchant 403 after payment) | anthropic chat_completions (charge) |
 | `claude-opus-5` | flagship | $0.10 | **no** (merchant 403 after payment) | anthropic chat_completions (charge) |
 | `claude-sonnet-5` | flagship | $0.10 | **no** (merchant 403 after payment) | anthropic chat_completions (charge) |

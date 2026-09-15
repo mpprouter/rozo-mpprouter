@@ -185,6 +185,18 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     available: true,
   },
   {
+    // Added 2026-09-15 (founder decision) after the weekly paid probe:
+    // through the router, HTTP 200 + completion, id echoed, 0.008 USDC per
+    // call — same cost as gpt-oss-20b, so the cheap tier's $0.02 upstream
+    // ceiling covers it with the forced 800-token completion.
+    id: 'openai/gpt-oss-120b',
+    tier: 'cheap',
+    provider: 'groq',
+    routePublicPath: '/v1/services/groq/chat',
+    routeMethod: 'POST',
+    available: true,
+  },
+  {
     // Retired upstream. This entry was `available: true` until 2026-09-08,
     // which meant the playground offered a model every call to which the
     // merchant answers model_not_found after taking payment — the router
@@ -225,6 +237,18 @@ export const PLAYGROUND_MODELS: readonly PlaygroundModel[] = [
     // (with a reason pointing at `deepseek-flash`) the first time a paid probe
     // gets model_not_found for it.
     id: 'deepseek-v4-flash',
+    tier: 'cheap',
+    provider: 'deepseek',
+    routePublicPath: '/v1/services/deepseek/chat',
+    routeMethod: 'POST',
+    available: true,
+  },
+  {
+    // Added 2026-09-15 (founder decision) after the weekly paid probe: the
+    // merchant's paid list-models names it alongside deepseek-flash, and a
+    // paid call through the router returned a completion for 0.004 USDC.
+    // Cheap tier: the observed cost sits well under the $0.02 ceiling.
+    id: 'deepseek-v4-pro',
     tier: 'cheap',
     provider: 'deepseek',
     routePublicPath: '/v1/services/deepseek/chat',
