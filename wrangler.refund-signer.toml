@@ -8,6 +8,16 @@ account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
 [triggers]
 crons = ["* * * * *"]
 
+# Retain this worker's logs. Without it a rejected refund's code exists only
+# in the DingTalk alert and in a `wrangler tail` that nobody was running: the
+# 2026-09-15 parked refund (payment tx 8923c579...) could not be diagnosed
+# from the router side. Log lines here are the structured refund_* events
+# and the error messages runRefundSigner already prints; the signing secret
+# is never part of either.
+[observability]
+enabled = true
+head_sampling_rate = 1
+
 [[durable_objects.bindings]]
 name = "SIGNER_COORDINATOR"
 class_name = "RefundSignerCoordinator"

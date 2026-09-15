@@ -21,11 +21,13 @@ import {
 } from '@stellar/stellar-sdk'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  REFUND_MAX_INCLUSION_FEE_STROOPS,
   REFUND_TX_MIN_TIME_GRACE_SECONDS,
   REFUND_TX_VALIDITY_SECONDS,
   RefundSequenceGuard,
   consumesSequence,
   isRetryableSendError,
+  refundInclusionFee,
   sendErrorCode,
   reportStuckRefunds,
   runRefundSigner,
@@ -532,6 +534,7 @@ describe('park only fatal submission errors', () => {
   it('classifies only self-healing rejections as retryable', () => {
     expect(isRetryableSendError('txBadSeq')).toBe(true)
     expect(isRetryableSendError('txTooLate')).toBe(true)
+    expect(isRetryableSendError('txInsufficientFee')).toBe(true)
     expect(isRetryableSendError('txBadAuth')).toBe(false)
     expect(isRetryableSendError('txInsufficientBalance')).toBe(false)
     expect(isRetryableSendError(undefined)).toBe(false) // undecodable = fatal = park
@@ -564,6 +567,44 @@ describe('park only fatal submission errors', () => {
     expect(ledger.enqueueAlert).not.toHaveBeenCalled()
   })
 
+  /**
+   * Regression for the 2026-09-15 stuck refund (groq_chat, 0.008 USDC, payment
+   * tx 8923c579…): a refund bidding the base inclusion fee into a surged
+   * ledger is rejected with txInsufficientFee. Nothing is consumed, so the
+   * job must stay `submitted` for the dead-envelope recovery, not park.
+   */
+  it('a txInsufficientFee rejection does NOT park the job into manual_review', async () => {
+    const signer = Keypair.random()
+    const { env, server, ledger, submitted } = signerHarness(signer, ['10000'], () => 'ERROR')
+    const { xdr } = require('@stellar/stellar-sdk') as typeof import('@stellar/stellar-sdk')
+    const insufficientFee = new xdr.TransactionResult({
+      feeCharged: xdr.Int64.fromString('0'),
+      result: xdr.TransactionResultResult.txInsufficientFee(),
+      ext: xdr.TransactionResultExt.fromXDR(Buffer.from([0, 0, 0, 0])),
+    })
+    expect(sendErrorCode({ errorResult: insufficientFee })).toBe('txInsufficientFee')
+    const erroringServer: RefundSignerRpc = {
+      ...server,
+      sendTransaction: async (tx) => {
+        const base = await server.sendTransaction(tx)
+        return { ...base, status: 'ERROR', errorResult: insufficientFee } as unknown as rpc.Api.SendTransactionResponse
+      },
+    }
+
+    await runRefundSigner(env, ledger, erroringServer)
+
+    expect(submitted).toHaveLength(1)
+    const fetchMock = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    const parkCalls = fetchMock.mock.calls.filter(([input, init]: [string | URL | Request, RequestInit?]) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (!url.endsWith('/admin/refunds/complete')) return false
+      const body = init?.body ? JSON.parse(String(init.body)) as { state?: string } : {}
+      return body.state === 'manual_review'
+    })
+    expect(parkCalls).toHaveLength(0)
+    expect(ledger.enqueueAlert).not.toHaveBeenCalled()
+  })
+
   it('a fatal rejection still parks exactly as before', async () => {
     const signer = Keypair.random()
     const { env, server, ledger } = signerHarness(signer, ['10000'], () => 'ERROR')
@@ -579,5 +620,66 @@ describe('park only fatal submission errors', () => {
     })
     expect(parkCalls).toHaveLength(1)
     expect(ledger.enqueueAlert).toHaveBeenCalledTimes(1)
+  })
+})
+
+/**
+ * The inclusion fee a refund bids. `BASE_FEE` (100 stroops) is a fixed bid
+ * into a lane that surge-prices; the refund must follow what the network is
+ * actually accepting, within a hard ceiling, and never depend on the
+ * statistic being available.
+ */
+describe('refund inclusion fee', () => {
+  const feeStats = (p90: unknown) => ({
+    sorobanInclusionFee: { p90 },
+    inclusionFee: {},
+    latestLedger: 1,
+  }) as unknown as rpc.Api.GetFeeStatsResponse
+  const rpcWith = (getFeeStats?: () => Promise<rpc.Api.GetFeeStatsResponse>): RefundSignerRpc => ({
+    getAccount: async () => { throw new Error('unused') },
+    prepareTransaction: async () => { throw new Error('unused') },
+    sendTransaction: async () => { throw new Error('unused') },
+    getTransaction: async () => { throw new Error('unused') },
+    ...(getFeeStats ? { getFeeStats } : {}),
+  })
+
+  it('bids the base fee when the RPC exposes no fee stats', async () => {
+    expect(await refundInclusionFee(rpcWith())).toBe('100')
+  })
+
+  it('bids the base fee when fee stats fail or are malformed', async () => {
+    expect(await refundInclusionFee(rpcWith(async () => { throw new Error('rpc down') }))).toBe('100')
+    expect(await refundInclusionFee(rpcWith(async () => feeStats(undefined)))).toBe('100')
+    expect(await refundInclusionFee(rpcWith(async () => feeStats('not-a-number')))).toBe('100')
+    expect(await refundInclusionFee(rpcWith(async () => feeStats(200)))).toBe('100')
+  })
+
+  it('follows the accepted p90 above the base fee', async () => {
+    expect(await refundInclusionFee(rpcWith(async () => feeStats('100')))).toBe('100')
+    expect(await refundInclusionFee(rpcWith(async () => feeStats('50')))).toBe('100')
+    expect(await refundInclusionFee(rpcWith(async () => feeStats('45000')))).toBe('45000')
+  })
+
+  it('never bids above the hard ceiling', async () => {
+    expect(await refundInclusionFee(rpcWith(async () => feeStats('5000000'))))
+      .toBe(REFUND_MAX_INCLUSION_FEE_STROOPS.toString())
+  })
+
+  it('signs the refund with the surge bid, not the base fee', async () => {
+    const signer = Keypair.random()
+    const { env, server, ledger, submitted } = signerHarness(signer, ['10000'])
+    const surgeServer: RefundSignerRpc = {
+      ...server,
+      getFeeStats: async () => feeStats('45000'),
+      // Mirror the SDK: assembled fee = inclusion fee + resource fee (0 here).
+      prepareTransaction: async (tx: Transaction) => TransactionBuilder.cloneFrom(tx as Transaction, {
+        fee: (tx as Transaction).fee, sorobanData: new SorobanDataBuilder().build(),
+      }).build(),
+    }
+
+    await runRefundSigner(env, ledger, surgeServer)
+
+    expect(submitted).toHaveLength(1)
+    expect(submitted[0].fee).toBe('45000')
   })
 })

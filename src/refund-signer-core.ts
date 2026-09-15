@@ -47,6 +47,8 @@ export interface RefundSignerRpc {
   prepareTransaction: rpc.Server['prepareTransaction']
   sendTransaction: rpc.Server['sendTransaction']
   getTransaction: rpc.Server['getTransaction']
+  /** Optional: absent or failing, the refund bids the base inclusion fee. */
+  getFeeStats?: rpc.Server['getFeeStats']
 }
 
 export type RefundPolicy = 'auto' | 'auto_alert' | 'hold_alert'
@@ -295,6 +297,15 @@ export function sendErrorCode(send: { errorResult?: unknown }): string | undefin
  *     maxTime double-pays nothing.
  *   - txTooLate: the envelope is already past maxTime — the recovery path's
  *     own trigger condition.
+ *   - txInsufficientFee: the inclusion bid was below the surge minimum of the
+ *     ledger it hit. Nothing was consumed and no sequence moved; the same
+ *     dead-envelope recovery re-signs it later, with a fresh fee bid from
+ *     `refundInclusionFee`. Parking it treats a few surged ledgers as a
+ *     permanent fault. Context: on 2026-09-15 a groq_chat refund (0.008 USDC,
+ *     payment tx 8923c579…) was parked on its first and only submission while
+ *     an identical refund 40s later confirmed; the signer had no log
+ *     retention, so the rejection code survives only in the DingTalk alert.
+ *     Whatever that code was, a fee rejection must not be a parking offence.
  *
  * Everything else (txBadAuth, txInsufficientBalance, txMalformed, or a result
  * we cannot even decode) parks into manual_review as before: retrying those
@@ -307,7 +318,45 @@ export function sendErrorCode(send: { errorResult?: unknown }): string | undefin
  * reserved for rejections that cannot heal themselves.
  */
 export function isRetryableSendError(code: string | undefined): boolean {
-  return code === 'txBadSeq' || code === 'txTooLate'
+  return code === 'txBadSeq' || code === 'txTooLate' || code === 'txInsufficientFee'
+}
+
+/**
+ * Ceiling on the per-operation inclusion fee a refund will bid, in stroops
+ * (0.1 XLM). This repo has had to pay this much to get mainnet deploys through
+ * congestion (see `utils/stellar-gas-balance.ts`); above it the refund is
+ * held until the surge passes rather than outbidding it. Refund transactions
+ * carry exactly one operation, so this is also the whole inclusion bid, and
+ * `HARD_MAX_FEE_STROOPS` still caps inclusion + resource fee together.
+ */
+export const REFUND_MAX_INCLUSION_FEE_STROOPS = 1_000_000n
+
+/**
+ * Inclusion fee to bid for one refund, from the RPC's recent Soroban fee
+ * distribution. The p90 of what the network actually accepted over the last
+ * ledgers, never below `BASE_FEE`, never above the ceiling. Falls back to
+ * `BASE_FEE` when the RPC has no fee stats or the call fails: a refund must
+ * not be blocked by a missing statistic, only bid conservatively.
+ *
+ * WHY: `BASE_FEE` (100 stroops) is a fixed bid into a lane that surge-prices.
+ * On 2026-09-15 the router pool's other traffic was bidding 60k-80k stroops
+ * per ledger while every refund still bid 100; a refund that lands in a
+ * surged ledger is rejected outright (`txInsufficientFee`), and until this
+ * change that rejection parked it in `manual_review` for good.
+ */
+export async function refundInclusionFee(server: RefundSignerRpc): Promise<string> {
+  const floor = BigInt(BASE_FEE)
+  if (!server.getFeeStats) return BASE_FEE
+  try {
+    const stats = await server.getFeeStats()
+    const p90 = stats?.sorobanInclusionFee?.p90
+    if (typeof p90 !== 'string' || !/^[0-9]+$/.test(p90)) return BASE_FEE
+    const bid = BigInt(p90)
+    if (bid <= floor) return BASE_FEE
+    return (bid > REFUND_MAX_INCLUSION_FEE_STROOPS ? REFUND_MAX_INCLUSION_FEE_STROOPS : bid).toString()
+  } catch {
+    return BASE_FEE
+  }
 }
 
 async function buildSignedRefund(
@@ -318,7 +367,8 @@ async function buildSignedRefund(
   sequence: RefundSequenceGuard,
 ): Promise<{ prepared: Transaction; signedXdr: string; refundTx: string }> {
   const account = sequence.advance(await server.getAccount(signer.publicKey()))
-  const base = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: Networks.PUBLIC })
+  const fee = await refundInclusionFee(server)
+  const base = new TransactionBuilder(account, { fee, networkPassphrase: Networks.PUBLIC })
     .addOperation(new Contract(job.payment.asset).call(
       'transfer',
       Address.fromString(signer.publicKey()).toScVal(),
