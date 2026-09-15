@@ -94,7 +94,7 @@ async function main() {
   //         the same factory / collector / asset the config does.
   {
     const probe = await fetch(`${API}/v1/playground/channel/tx-decode?agent=${sdk.Keypair.random().publicKey()}`, {
-      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx_hash: "00" }),
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx_hash: "9589ef539d04558edc048b88ca5205ac8ac30fadc97ec8d9eb66268e066fc254" }),
     });
     const hdr = probe.headers.get("payment-required");
     let offer = null;
