@@ -68,6 +68,9 @@ curl -s -X POST "$BASE/v1/services/<svc>/<path>" \
 
 ## 3. Step 2 — 付费实测(真打一笔,判定责任)
 
+> 🚨 **必须在新加坡机 `mpay-prod`（`~/rozo-mpp-test/route-smoke.mjs`）上跑，不要在本地笔记本跑（2026-09-15 踩坑）**。Router 会把客户端 IP 透传给商家、商家再透传给 OpenAI / Anthropic。从香港出口跑，openai 路由回 `403 unsupported_country_region_territory`、anthropic 回 `403 Request not allowed`，看起来像商家腿坏了、目录 verified 过期；同一分钟从新加坡跑两条都 200。本地 403 不构成「商家坏了」的证据。
+> 另外 `gpt-5*` 只认 `max_completion_tokens`，传 `max_tokens` 会 400；推理模型预算 ≤64 会得到空 content + `finish_reason: length`，这也不是故障。
+
 ```bash
 cd ~/workspace/mpprouter/stellar-agent-wallet-skill/   # skill 仓库(或插件缓存目录)
 npx tsx skills/pay-per-call/run.ts \
