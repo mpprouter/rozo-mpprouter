@@ -90,6 +90,9 @@ import { checkAndBumpDailyLimit, utcDateKey } from '../mpp/rate-limit-do'
  */
 export type PaymentEvidence = 'no' | 'maybe' | 'yes'
 
+/** User-Agent the playground sends upstream (some merchant WAFs 403 an empty one). */
+export const PLAYGROUND_USER_AGENT = 'mpprouter-playground/1.0 (+https://mpprouter.dev)'
+
 export class UpstreamError extends Error {
   readonly code: string
   readonly status: number
@@ -217,7 +220,14 @@ export async function callUpstream(
   const search = searchParams.toString()
   const merchantUrl = `https://${route.upstreamHost}${path}${search ? `?${search}` : ''}`
 
-  const headers = new Headers({ accept: 'application/json' })
+  // Merchants behind the paywithlocus WAF (groq, deepseek) answer 403 to any
+  // request with no User-Agent, before the 402 handshake, and a Workers
+  // `fetch` sends none. The proxy never hit this because it forwards the
+  // buyer's own UA; the playground builds its headers from scratch, so every
+  // playground chat call to those merchants failed pre-payment (confirmed
+  // 2026-09-15 by probing the merchants directly: empty UA → 403, any UA →
+  // 402). Identify ourselves explicitly.
+  const headers = new Headers({ accept: 'application/json', 'user-agent': PLAYGROUND_USER_AGENT })
   let payload: string | undefined
   if (args.body !== undefined) {
     payload = JSON.stringify(args.body)
