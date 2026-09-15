@@ -135,16 +135,22 @@ async function main() {
   r = await post("/v1/playground/channel/register", { ...tuple, salt: saltHex, signature: signRegister(tuple, funderKp) });
   check("re-register replays", r.status === 200 && r.body?.replayed === true, `${r.status} replayed=${r.body?.replayed}`);
 
-  // ---- 4. ONE VOUCHER CALL ----
+  // ---- 4. VOUCHER CALLS ----
   const method = mpp.stellar.channel({ commitmentSecret: state.commitmentSecret, allowedChannels: [channel], rpcUrl: RPC });
   const client = Mppx.create({ methods: [method], polyfill: false });
-  const res = await client.fetch(`${API}/v1/playground/channel/chat?agent=${FUNDER}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "llama-3.1-8b-instant", messages: [{ role: "user", content: "Reply with exactly: PONG" }] }),
-  });
-  const out = await res.json().catch(() => ({}));
-  check("voucher call", res.ok, `status=${res.status} charged=${out.charged_usd ?? "-"} answer=${String(out.message ?? "").slice(0, 40)}`);
+  const cases = [
+    ["voucher tx-decode", "/v1/playground/channel/tx-decode", { tx_hash: "9589ef539d04558edc048b88ca5205ac8ac30fadc97ec8d9eb66268e066fc254" }],
+    ["voucher chat/deepseek", "/v1/playground/channel/chat", { model: "deepseek-v4-flash", messages: [{ role: "user", content: "Reply with exactly: PONG" }] }],
+  ];
+  for (const [name, path, body] of cases) {
+    const res = await client.fetch(`${API}${path}?agent=${FUNDER}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const out = await res.json().catch(() => ({}));
+    check(name, res.ok, `status=${res.status} charged=${out.charged_usd ?? "-"} ${String(out.message ?? out.summary ?? out.error ?? "").slice(0, 60).replace(/\n/g, " ")}`);
+  }
 
   if (skipClose) { log("--skip-close: leaving channel open"); return; }
 
