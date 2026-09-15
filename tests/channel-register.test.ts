@@ -20,6 +20,9 @@ vi.mock('../src/mpp/rate-limit-do', () => ({
 
 import { checkChannelMatches, type OnChainChannel } from '../src/playground/channel-onchain'
 import { handleChannelRegister } from '../src/routes/playground-channel'
+import { deriveChannelAddress } from '../src/playground/channel-address'
+import { signChannelRegister } from '../src/playground/channel-register-auth'
+import { Networks } from '@stellar/stellar-sdk'
 
 const USDC_SAC = 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75'
 // Dedicated hot collector (Option A) — the channel must pay TO this.
@@ -27,14 +30,16 @@ const COLLECTOR = 'GBD64XFGJHG42CEVQKH4TYCIAMEHVBMW7A24KS22TKOSSA73IVW3CYIK'
 // Our known channel WASM hash (lowercase hex) — the provenance anchor.
 const WASM_HASH = 'ab'.repeat(32)
 
-// Valid channel contract address (C..., 56 chars). Deterministic fixture.
-const CHANNEL = 'C' + 'A'.repeat(55)
+const FACTORY = 'CCR2HE6CAMBYNUQG4N27CH5EAYELGYTQIONTYJ72K63XQZSL23OV7RTX'
+const SALT = Buffer.from('11'.repeat(32), 'hex')
 
 const funderKp = Keypair.random()
 const FUNDER = funderKp.publicKey()
 const commitKp = Keypair.random()
 const COMMIT_G = commitKp.publicKey()
 const COMMIT_HEX = Buffer.from(commitKp.rawPublicKey()).toString('hex')
+// The channel the factory deploys for (FUNDER, SALT) — what register expects.
+const CHANNEL = deriveChannelAddress(FACTORY, FUNDER, SALT, Networks.PUBLIC)
 
 function goodOnChain(overrides: Partial<OnChainChannel> = {}): OnChainChannel {
   return {
@@ -149,6 +154,7 @@ function makeEnv(kv: ReturnType<typeof makeKv>) {
     PLAYGROUND_CHANNEL_ENABLED: 'true',
     PLAYGROUND_CHANNEL_TO: COLLECTOR,
     PLAYGROUND_CHANNEL_WASM_HASH: WASM_HASH,
+    PLAYGROUND_CHANNEL_FACTORY: FACTORY,
   } as any
 }
 
@@ -160,14 +166,16 @@ function registerReq(body: unknown) {
   })
 }
 
-// Frontend (PR #20) snake_case contract.
+// mpp-spec §3.4 body, signed by the funder.
+const TUPLE = { channel: CHANNEL, commitmentKey: COMMIT_G, saltHex: SALT.toString('hex'), from: FUNDER }
 const GOOD_BODY = {
-  channel_contract: CHANNEL,
-  funder: FUNDER,
-  commitment_key: COMMIT_G,
+  channel: CHANNEL,
+  commitmentKey: COMMIT_G,
+  salt: SALT.toString('hex'),
+  from: FUNDER,
+  signature: signChannelRegister(TUPLE, funderKp),
   token: USDC_SAC,
   network: 'stellar:pubnet',
-  deposit_raw: '2000000',
 }
 
 describe('handleChannelRegister', () => {
@@ -213,8 +221,8 @@ describe('handleChannelRegister', () => {
     expect(json.ok).toBe(true)
     expect(json.replayed).toBe(false)
     expect(json.channel).toBe(CHANNEL)
-    expect(json.funder).toBe(FUNDER)
-    expect(json.commitment_key).toBe(COMMIT_G)
+    expect(json.from).toBe(FUNDER)
+    expect(json.commitmentKey).toBe(COMMIT_G)
     expect(read).toHaveBeenCalledOnce()
     // Written to the ISOLATED playground namespace (pgChannel/pgAgent), NOT the
     // production stellarChannel/stellarAgent path. deposit persisted from the
@@ -342,7 +350,15 @@ describe('handleChannelRegister', () => {
     await handleChannelRegister(registerReq(GOOD_BODY), env, {
       readChannelOnChain: async () => goodOnChain(),
     })
-    const conflicting = { ...GOOD_BODY, funder: Keypair.random().publicKey() }
+    // A different funder would change the derived address (400 upstream of
+    // this check), so the conflict that can reach here is a different
+    // commitment key for the same (from, salt), honestly signed by the funder.
+    const otherCommit = Keypair.random().publicKey()
+    const conflicting = {
+      ...GOOD_BODY,
+      commitmentKey: otherCommit,
+      signature: signChannelRegister({ ...TUPLE, commitmentKey: otherCommit }, funderKp),
+    }
     const res = await handleChannelRegister(registerReq(conflicting), env, {
       readChannelOnChain: async () => goodOnChain(),
     })
