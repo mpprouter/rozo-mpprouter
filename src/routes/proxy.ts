@@ -31,6 +31,7 @@ import {
 } from '../mpp/tempo-client'
 import { bumpCumulative } from '../mpp/channel-store'
 import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult, type X402CachedResult } from '../mpp/idempotency'
+import { presentMerchantEnvelope } from './merchant-envelope'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
 import {
   createStellarPayment,
@@ -669,6 +670,14 @@ async function payMerchantAndGetBody(
     recordRouteFailure(env, ctx, route.id, result.refundReason ?? 'upstream_error')
   } else {
     recordRouteSuccess(env, ctx, route.id)
+  }
+
+  // Delivered sync bodies from paywithlocus merchants carry a
+  // `{success,data}` envelope; expose the provider fields at the top level
+  // while keeping the envelope (see merchant-envelope.ts). Async detection
+  // above ran on the raw body on purpose; only a delivered 200 is reshaped.
+  if (result.kind === 'ok' && result.merchantStatus === 200 && !asyncInfo.isAsync) {
+    result = { ...result, body: presentMerchantEnvelope(result.body, result.contentType) }
   }
 
   recordRouteCall(env, ctx, {
