@@ -130,6 +130,24 @@ curl https://apiserver.mpprouter.dev/v1/services/catalog
 
 For integration details, see [docs/integration.md](docs/integration.md).
 
+## Recommended first paid call
+
+```bash
+curl -s -X POST https://apiserver.mpprouter.dev/v1/services/openai/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o-mini","max_tokens":16,"messages":[{"role":"user","content":"Say hi in three words."}]}'
+```
+
+Without a payment this returns 402 with the quote (0.001 USDC on 2026-09-15). With
+a valid `Payment-Signature` it returns the plain OpenAI chat-completion body,
+`finish_reason: "stop"`. Use this as the integration smoke test before anything
+else. Three things that look like router failures but are not: reasoning models
+(`gpt-5*`, `gpt-oss-*`) return empty `content` with `finish_reason: "length"`
+when the token budget is 64 or less; the `groq` and `deepseek` routes wrap the
+provider body in `{"success":true,"data":{...}}`; and the `openai` / `anthropic`
+routes inherit the provider's region policy (unsupported region: 502 with the
+provider's 403 in `detail`, payment auto-refunded). Details in `/llms.txt`.
+
 ## Agent framework guides
 
 - [Vercel AI SDK](docs/guides/vercel-ai-sdk.md) — two tools, a Stellar wallet

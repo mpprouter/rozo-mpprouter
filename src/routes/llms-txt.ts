@@ -134,6 +134,38 @@ GET /llms.txt                 — This file
 Use @x402/core/client + @x402/stellar/exact/client — same client that
 works against any x402 v2 server, no router-specific code needed.
 
+## Recommended first paid call (smoke test)
+
+Use this exact request to prove your wallet integration end to end.
+It is the cheapest verified LLM route (0.001 USDC per call as of
+2026-09-15; confirm with the live 402 quote) and returns the plain
+OpenAI chat-completion shape with no wrapper:
+
+  POST /v1/services/openai/chat
+  {"model":"gpt-4o-mini","max_tokens":16,
+   "messages":[{"role":"user","content":"Say hi in three words."}]}
+
+Expect 200 with choices[0].message.content set and
+finish_reason "stop". Alternative at the same price:
+POST /v1/services/anthropic/messages with model claude-haiku-4-5
+(Anthropic Messages shape: content[0].text, stop_reason "end_turn").
+
+Pitfalls seen in real integrations:
+
+- Reasoning models (gpt-5*, openai/gpt-oss-*, deepseek-r1) spend
+  the completion budget on hidden reasoning first. With
+  max_tokens 64 or less you get content "" and finish_reason
+  "length" even though the call was paid and delivered. Give them
+  max_completion_tokens (OpenAI gpt-5*) or max_tokens (others) of
+  256 or more, or use a non-reasoning model for smoke tests.
+- The groq and deepseek routes are served by a third-party MPP
+  merchant that wraps the provider body: {"success":true,"data":{...}}.
+  Read data.choices[0].message.content there, not choices[0].
+- openai and anthropic routes are subject to the upstream provider's
+  region policy. A caller in an unsupported region gets 502 with the
+  provider's 403 in detail, and the payment is refunded automatically.
+  The groq and deepseek routes have no region restriction.
+
 ## Quick start (mppx, legacy)
 
 1. POST /v1/services/{service}/{operation} with no Authorization header.
