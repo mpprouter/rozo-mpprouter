@@ -14,7 +14,7 @@ body:
     id: name
     attributes:
       label: Wallet name
-      placeholder: "Scopuly"
+      placeholder: "My Wallet"
     validations:
       required: true
 
@@ -30,8 +30,8 @@ body:
   - type: textarea
     id: description
     attributes:
-      label: Short description (40 to 80 words)
-      description: Shown on your wallet detail page. Plain text, no markdown, no marketing superlatives. Say what the wallet is, which platforms, and how a user approves an MPP payment in it.
+      label: Short description (one or two sentences)
+      description: Shown on the wallet card. Plain text, what the wallet is and how a user approves an MPP payment in it.
     validations:
       required: true
 
@@ -39,7 +39,7 @@ body:
     id: website
     attributes:
       label: Website URL
-      placeholder: "https://scopuly.com"
+      placeholder: "https://mywallet.example"
     validations:
       required: true
 
@@ -83,7 +83,7 @@ body:
     attributes:
       label: Demo or integration page URL (optional)
       description: A page where a user can try the MPP flow in your wallet, if you have one.
-      placeholder: "https://app.scopuly.com/mpp-pilot/"
+      placeholder: "https://mywallet.example/mpp-demo"
 
   - type: input
     id: first_request
