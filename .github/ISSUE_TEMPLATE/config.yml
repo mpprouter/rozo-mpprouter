@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: List an MPP service (API provider)
+    url: https://www.mpprouter.dev/integration.md
+    about: To list an API service on the router instead of a wallet, use the service listing flow.

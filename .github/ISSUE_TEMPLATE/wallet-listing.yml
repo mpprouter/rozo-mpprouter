@@ -1,0 +1,109 @@
+name: "Wallet listing: add my wallet to MPP Router"
+description: "Your wallet lets users pay MPP 402 challenges? List it on mpprouter.dev next to the agent wallet options."
+title: "[Wallet] <wallet name>"
+labels: ["wallet-listing"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for integrating MPP Router. Fill this in and we will add your wallet to the
+        wallet showcase on https://www.mpprouter.dev/how-it-works#use-with-agents (name, logo,
+        one-line tagline, short description, link to your site). Everything you submit here is public.
+
+  - type: input
+    id: name
+    attributes:
+      label: Wallet name
+      placeholder: "Scopuly"
+    validations:
+      required: true
+
+  - type: input
+    id: tagline
+    attributes:
+      label: One-line tagline (max 60 characters)
+      description: Shown under the logo in the wallet card.
+      placeholder: "Non-custodial Stellar DeFi wallet"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Short description (40 to 80 words)
+      description: Shown on your wallet detail page. Plain text, no markdown, no marketing superlatives. Say what the wallet is, which platforms, and how a user approves an MPP payment in it.
+    validations:
+      required: true
+
+  - type: input
+    id: website
+    attributes:
+      label: Website URL
+      placeholder: "https://scopuly.com"
+    validations:
+      required: true
+
+  - type: input
+    id: logo
+    attributes:
+      label: Logo URL
+      description: Public direct link to a square logo, SVG or PNG, at least 256x256, transparent or dark-friendly background. We copy it into our repo, so the link only needs to work once.
+      placeholder: "https://example.com/logo.png"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platforms
+    attributes:
+      label: Platforms
+      multiple: true
+      options:
+        - Web
+        - iOS
+        - Android
+        - Browser extension
+        - Desktop
+        - CLI / agent skill
+    validations:
+      required: true
+
+  - type: dropdown
+    id: status
+    attributes:
+      label: MPP integration status
+      options:
+        - Live (users can pay MPP services today)
+        - Pilot (working, limited or manual rollout)
+        - In development
+    validations:
+      required: true
+
+  - type: input
+    id: demo
+    attributes:
+      label: Demo or integration page URL (optional)
+      description: A page where a user can try the MPP flow in your wallet, if you have one.
+      placeholder: "https://app.scopuly.com/mpp-pilot/"
+
+  - type: input
+    id: first_request
+    attributes:
+      label: X-Request-Id of one successful paid call through your wallet (optional)
+      description: Lets us verify the integration on the router side before listing it as Live.
+
+  - type: input
+    id: contact
+    attributes:
+      label: Contact (email, Discord handle or GitHub handle)
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I am authorized to represent this wallet and the logo may be displayed on mpprouter.dev.
+          required: true
+        - label: The wallet is non-custodial or clearly states its custody model on its website.
+          required: true
