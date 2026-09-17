@@ -1046,6 +1046,12 @@ export async function sweepInFlightStripeRecords(
     .map(parseRecord)
     .filter((r): r is StripeFulfillmentRecord => !!r && RECONCILE_IN_FLIGHT.has(r.status))
   out.inFlight = inFlight.length
+  // Fair scheduling under the per-run bound: least-recently-checked first
+  // (never-checked records first of all), so a few long-running `processing`
+  // records at the head of storage order cannot starve the rest.
+  const checkedAt = (r: StripeFulfillmentRecord) =>
+    r.lastProviderCheckAt ? Date.parse(r.lastProviderCheckAt) || 0 : 0
+  inFlight.sort((a, b) => checkedAt(a) - checkedAt(b))
   for (const rec of inFlight.slice(0, RECONCILE_SWEEP_MAX)) {
     try {
       const r = await reconcileStripeRecordWithProvider(env, rec.invoiceKey, now)

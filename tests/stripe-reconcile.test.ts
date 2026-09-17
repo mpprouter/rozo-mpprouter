@@ -538,6 +538,37 @@ describe('sweepInFlightStripeRecords (cron)', () => {
     expect(JSON.stringify(out)).not.toContain('CDMQARoXBLOB')
   })
 
+  it('bounded batch is least-recently-checked first (no starvation)', async () => {
+    const env = makeEnv()
+    const keys = Array.from({ length: 25 }, (_, i) => `cpis_${String(i).padStart(3, '0')}`)
+    for (const k of keys) {
+      await seedStripeRecord(env, { invoiceKey: k, merchantAccount: 'acct', invoiceAmountAtomic: '1000000', invoiceCurrency: 'usd', lockFingerprint: 'x', stripeUrl: `https://crypto.stripe.com/pay/${k}`, rozoPaymentId: null })
+      const { value } = await casRead(env, stripeKvKey(k))
+      const r = JSON.parse(value!)
+      r.status = 'provider_paying'
+      // The first 20 in storage order were checked recently; the last 5 never.
+      r.lastProviderCheckAt = keys.indexOf(k) < 20 ? '2026-09-17T08:00:00.000Z' : null
+      const { version } = await casRead(env, stripeKvKey(k))
+      await (env.ATOMIC_STORE as any).get(null).fetch(new Request('https://x/commit', { method: 'POST', body: JSON.stringify({ key: stripeKvKey(k), expectedVersion: version, op: 'set', value: JSON.stringify(r) }) }))
+    }
+    const checked: string[] = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('resume_payin_session')) {
+        const body = String(init?.body ?? '')
+        const m = body.match(/session_hash=(cpis_\d+)/)
+        if (m) checked.push(m[1])
+        return Response.json({ sessionId: m?.[1] ?? 'cpis_x', clientSecret: 'cs', publishableKey: 'pk' })
+      }
+      return Response.json({ id: 'x', merchant: 'acct', business_name: 'b', state: 'processing', payment_details: { amount: 100, currency: 'usd' }, supported_currencies: [], transaction_details: {}, valid_before: '1' })
+    })
+    const out = await sweepInFlightStripeRecords(env, new Date('2026-09-17T09:00:00Z'))
+    expect(out.inFlight).toBe(25)
+    expect(out.checked).toBe(20)
+    // All five never-checked records are in this batch.
+    for (const k of keys.slice(20)) expect(checked).toContain(k)
+  })
+
   it('swallows a DO scan failure (never breaks the cron)', async () => {
     const env = makeEnv()
     ;(env.ATOMIC_STORE as any).get = () => ({ fetch: async () => new Response('boom', { status: 500 }) })
