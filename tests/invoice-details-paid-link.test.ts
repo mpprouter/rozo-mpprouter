@@ -16,6 +16,7 @@ function makeDoNamespace() {
     const url = new URL(req.url); const body: any = await req.json()
     if (url.pathname === '/read') return Response.json({ value: store.get(body.key) ?? null, version: versions.get(body.key) ?? 0 })
     if (url.pathname === '/commit') { const cur = versions.get(body.key) ?? 0; if (cur !== body.expectedVersion) return Response.json({ ok: false }); store.set(body.key, body.value); versions.set(body.key, cur + 1); return Response.json({ ok: true }) }
+    if (url.pathname === '/scan') return Response.json({ values: [...store.entries()].filter(([k]) => k.startsWith(body.prefix)).map(([, v]) => v) })
     return new Response('nf', { status: 404 }) } }
   return { idFromName: () => ({}), get: () => stub }
 }
@@ -79,6 +80,21 @@ describe('invoice-details on a paid / expired Stripe link', () => {
     expect(body.routerState.paidAt).toBe('2026-09-17T09:19:31.692Z')
     expect(JSON.stringify(body)).not.toContain('CDMQARoXBLOBTUOQ')
     expect(hits.filter((u) => u.includes('resume_payin_session')).length).toBe(1)
+  })
+
+  it('410 on a pre-index record: backfills from the fulfillment record (no Stripe call, blob never stored)', async () => {
+    const env = makeEnv(); await setPaid(env) // seeded with URL_, but NOT indexed
+    const hits = mockStripe(410)
+    const body: any = await (await handleInvoiceDetails(req(URL_), env)).json()
+    expect(body).toMatchObject({ reason: 'expired', invoiceKey: KEY, rozo_payment_id: ROZO })
+    expect(body.routerState.status).toBe('paid')
+    expect(hits.filter((u) => u.includes('stripe.com')).length).toBe(1) // only the failed resume
+    expect(JSON.stringify([...env.MPP_STORE.store.entries()])).not.toContain('CDMQARoXBLOBTUOQ')
+    // Indexed now: a second lookup needs no scan.
+    expect(await lookupStripeSession(env, URL_)).toBe(KEY)
+    // A different blob does not match this record.
+    const other: any = await (await handleInvoiceDetails(req('https://crypto.stripe.com/pay/SOMEOTHERBLOB'), env)).json()
+    expect(other.invoiceKey).toBeUndefined()
   })
 
   it('410 on a link we never saw stays a bare expired', async () => {
