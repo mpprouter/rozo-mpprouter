@@ -116,6 +116,15 @@ export interface StripeFulfillmentRecord {
   // Consecutive reconciler checks that Stripe answered with "session gone"
   // (resume 404/410). Reset on any successful read.
   providerGoneChecks?: number
+  // Human resolution of a manual_review record (admin endpoint). Who verified
+  // what, when, and the settlement tx they pointed at.
+  manualResolution?: {
+    resolution: 'paid' | 'failed_provider'
+    evidence: string
+    txHash: string | null
+    resolvedBy: string
+    at: string
+  } | null
   webhookEventIds: string[]
   events: Array<{ kind: string; at: string; event_id?: string; detail?: unknown }>
 }
@@ -1062,4 +1071,64 @@ export async function sweepInFlightStripeRecords(
     }
   }
   return out
+}
+
+// ── Human resolution of manual_review (admin) ───────────────────────────────
+
+export type ManualResolveOutcome =
+  | { kind: 'no_record' }
+  | { kind: 'not_manual_review'; status: StripeRouterStatus }
+  | { kind: 'resolved' | 'already_resolved'; status: StripeRouterStatus; paidAt: string | null }
+
+/**
+ * Move a `manual_review` record to `paid` or `failed_provider` on human
+ * evidence. Monotonic: only manual_review is accepted as the source state;
+ * everything else (in-flight, paid, other terminals) is refused so this can
+ * never bypass the reconciler or downgrade a terminal state. Idempotent on
+ * repeat of the same resolution.
+ */
+export async function resolveManualReview(
+  env: Env,
+  invoiceKey: string,
+  args: {
+    resolution: 'paid' | 'failed_provider'
+    evidence: string
+    txHash: string | null
+    resolvedBy: string
+    now: Date
+  },
+): Promise<ManualResolveOutcome> {
+  const existing = await loadStripeRecord(env, invoiceKey)
+  if (!existing) return { kind: 'no_record' }
+  const nowIso = args.now.toISOString()
+  return updateStripeRecord<ManualResolveOutcome>(env, invoiceKey, existing.orderId, (rec) => {
+    if (rec.status === args.resolution && rec.manualResolution) {
+      return { noop: { kind: 'already_resolved', status: rec.status, paidAt: rec.paidAt } }
+    }
+    if (rec.status !== 'manual_review') {
+      return { noop: { kind: 'not_manual_review', status: rec.status } }
+    }
+    rec.status = args.resolution
+    rec.manualResolution = {
+      resolution: args.resolution,
+      evidence: args.evidence,
+      txHash: args.txHash,
+      resolvedBy: args.resolvedBy,
+      at: nowIso,
+    }
+    if (args.resolution === 'paid') {
+      rec.paidAt = nowIso
+      rec.failureReason = null
+      const prev = rec.providerResult && typeof rec.providerResult === 'object' ? (rec.providerResult as Record<string, unknown>) : {}
+      rec.providerResult = { ...prev, manualResolution: 'paid', blockchainTxId: args.txHash }
+    } else {
+      rec.failureReason = `manual_review resolved as failed_provider by ${args.resolvedBy}`
+    }
+    rec.events.push({
+      kind: `manual_review_resolved_${args.resolution}`,
+      at: nowIso,
+      detail: { resolvedBy: args.resolvedBy, txHash: args.txHash, invoiceKey: maskInvoiceKey(invoiceKey) },
+    })
+    return { rec, result: { kind: 'resolved', status: rec.status, paidAt: rec.paidAt } }
+  })
 }
