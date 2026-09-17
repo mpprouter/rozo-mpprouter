@@ -64,7 +64,7 @@ export async function handleStripeFulfillmentResolve(request: Request, env: Env)
     return json(400, { error: 'resolution "paid" requires txHash (0x + 64 hex) of the settlement transaction' })
   }
   // Never let the evidence string smuggle a capability into the record.
-  if (/crypto\.stripe\.com\/pay\//i.test(evidence) || /client_secret|cs_live|cs_test/i.test(evidence)) {
+  if (evidenceCarriesCapability(evidence)) {
     return json(400, { error: 'evidence must not contain a Stripe pay URL or client secret' })
   }
 
@@ -90,4 +90,27 @@ export async function handleStripeFulfillmentResolve(request: Request, env: Env)
     changed: out.kind === 'resolved',
     paidAt: out.paidAt,
   })
+}
+
+/**
+ * True if `evidence` contains a Stripe pay/setup capability URL (any host
+ * serialization: port, trailing dot, case, userinfo) or a client secret.
+ * URLs are parsed and their hostname/path normalized rather than matched as
+ * one literal spelling.
+ */
+export function evidenceCarriesCapability(evidence: string): boolean {
+  if (/client_secret|\bcs_(live|test)_/i.test(evidence)) return true
+  const urlish = evidence.match(/[a-z][a-z0-9+.-]*:\/\/[^\s<>"']+/gi) ?? []
+  for (const raw of urlish) {
+    let u: URL
+    try {
+      u = new URL(raw)
+    } catch {
+      continue
+    }
+    const host = u.hostname.toLowerCase().replace(/\.+$/, '')
+    if ((host === 'stripe.com' || host.endsWith('.stripe.com')) && /\/(pay|setup)\//i.test(u.pathname)) return true
+  }
+  // Schemeless spellings ("crypto.stripe.com/pay/…") are still a capability.
+  return /stripe\.com\.?(:\d+)?\/(pay|setup)\//i.test(evidence)
 }
