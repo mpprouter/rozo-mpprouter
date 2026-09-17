@@ -943,6 +943,27 @@ export async function confirmWithProvider(
   } catch {
     return rec
   }
+  // `queued` means the record exists but execution never started (the
+  // executor was not called), so a provider success here is someone else's
+  // payment and can never be attributed to this order.
+  if (rec.state === 'queued') {
+    const createdMs = Date.parse(rec.createdAt)
+    if (live.terminal === 'success') {
+      return (await transition(env, orderId, 'failed', {
+        kind: 'paid_by_other_party',
+        providerFinalState: live.normalized.state,
+        failureReason: 'invoice settled before this order executed',
+      })) ?? rec
+    }
+    if (Number.isFinite(createdMs) && nowMs - createdMs > PROCESSING_STALE_MS) {
+      return (await transition(env, orderId, 'failed', {
+        kind: 'never_executed',
+        providerFinalState: live.normalized.state,
+        failureReason: 'execution never started',
+      })) ?? rec
+    }
+    return rec
+  }
   if (live.terminal === 'success') {
     return (await transition(env, orderId, 'paid', {
       kind: 'provider_confirmed',

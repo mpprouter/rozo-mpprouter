@@ -703,3 +703,26 @@ describe('Coinbase webhook vs UPI claim', () => {
     expect(world.payCalls.length).toBe(0)
   })
 })
+
+describe('queued records never become paid', () => {
+  it('a queued order whose invoice gets settled by someone else is failed, not paid', async () => {
+    const { casUpdate } = await import('../src/routes/stripe-atomic')
+    const { fulfillmentKey } = await import('../src/routes/upi-invoice')
+    const env = makeEnv()
+    const nowIso = new Date().toISOString()
+    await casUpdate(env, fulfillmentKey(ORDER), () => ({
+      op: 'set',
+      value: JSON.stringify({
+        orderId: ORDER, provider: 'coinbase_v3', invoiceKey: 'paymentSession_xyz789', bodyHash: 'h',
+        baseAmountMinor: '136', stablecoinAmountAtomic: '1360000', state: 'queued',
+        providerFinalState: null, executionRef: null, failureReason: null, razorpayPaymentId: 'p',
+        createdAt: nowIso, updatedAt: nowIso, events: [],
+      }),
+      result: true,
+    }))
+    world.v3 = v3Session({ status: 'PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED' })
+    const s = await status(env, ORDER)
+    expect(s.body.state).toBe('failed')
+    expect(world.payCalls.length).toBe(0)
+  })
+})
