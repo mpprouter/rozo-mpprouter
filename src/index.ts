@@ -934,7 +934,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // checks funder balance, triggers agentapi/pay-invoice to settle
       // the underlying Coinbase Payment Link.
       if (url.pathname === '/v1/services/rozo-agent-api/webhook') {
-        return handleRozoWebhook(request, env)
+        return handleRozoWebhook(request, env, ctx)
       }
 
       // Public invoice status — accepts pl_* or Rozo paymentId, returns
