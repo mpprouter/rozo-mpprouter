@@ -53,7 +53,7 @@ import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
 import { extractCoinbaseCheckoutId } from './pay-invoice-admin'
 import { parseUsdc, formatUsdc } from './create-invoice'
 import { callAgentApiPayInvoice, reservedAtomic, FUNDER_WALLET } from './webhook'
-import { claimInvoiceKey } from './invoice-claim'
+import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { identifierKeys } from '../utils/redact'
@@ -1119,6 +1119,9 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     return { op: 'set', value: JSON.stringify(r), result: true }
   })
   if (!enteredPaying) {
+    // Definite pre-payment failure: give the invoice claim back so a later
+    // payer (UPI or another attempt) is not blocked by a claim that never paid.
+    await releaseInvoiceClaim(env, plId, 'crypto', `coupon:${code}`)
     if (reservedFunds) await releaseFunds(env, attemptId)
     return done(
       json(409, {

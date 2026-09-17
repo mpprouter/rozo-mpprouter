@@ -58,9 +58,13 @@ All require `X-Internal-Key`. Never expose to browsers.
 ## Cross-channel claim
 
 `invoice-claim:v1:<invoice_key>` on the `stripe-fulfillment` AtomicStoreDO
-singleton (versioned CAS, linearizable). UPI and crypto exclude each other; a
-second UPI order for the same invoice is refused; crypto-vs-crypto is left to
-the existing per-flow guards. The Coinbase webhook, the Stripe webhook branch
-and coupon redemption all take this claim before paying and stop with
-`claimed_by_other_channel` (webhook) / `LINK_CLAIMED` (coupon) if UPI holds it.
-Claims are never released automatically.
+singleton (versioned CAS, linearizable). Exactly one (channel, ref) holds an
+invoice: UPI vs crypto, a second UPI order, and the distinct crypto flows
+(webhook vs coupon) all exclude each other; the holder may re-enter (webhook
+retries under the same plId, Stripe under the same orderId). The Coinbase
+webhook, the Stripe webhook branch and coupon redemption all take this claim
+before paying and stop with `claimed_by_other_channel` (webhook) /
+`LINK_CLAIMED` (coupon) if someone else holds it. A claim is released only by
+its holder on a definite pre-payment failure (coupon lost its own transition
+before any executor call); once an executor was called it stays for human
+reconciliation.

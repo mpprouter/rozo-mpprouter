@@ -15,15 +15,17 @@
 //
 // Semantics:
 //   - absent            → claim inserted, ok
-//   - held by same channel, same ref → ok (idempotent re-entry / retry)
-//   - held by 'crypto', new 'crypto' ref → ok. Crypto-vs-crypto serialization
-//     stays with the existing per-flow guards; this module only adds the
-//     cross-channel rule so it cannot change existing crypto replay behaviour.
-//   - held by another channel, or by 'upi' with a different order → refused,
-//     the holder is returned so the caller can decide (409 / refund path).
+//   - held by same channel AND same ref → ok (idempotent re-entry / retry:
+//     the Coinbase webhook retries under the same plId, the Stripe branch
+//     under the same orderId)
+//   - anything else → refused, the holder is returned so the caller can
+//     decide (409 / refund path). This also serializes the crypto flows
+//     against each other (webhook vs coupon), which their separate per-flow
+//     records never did.
 //
-// The claim is never released automatically: a claimed invoice that failed to
-// settle is reconciled by a human, exactly like the existing failure states.
+// A claim is released ONLY by the holder, and only on a definite pre-payment
+// failure (nothing was sent to an executor). Once an executor call has been
+// made the claim stays until a human reconciles.
 
 import type { Env } from '../index'
 import { casUpdate, casRead } from './stripe-atomic'
@@ -57,9 +59,7 @@ function parseClaim(raw: string | null): InvoiceClaim | null {
 }
 
 function claimAllows(holder: InvoiceClaim, channel: ClaimChannel, ref: string): boolean {
-  if (holder.channel !== channel) return false
-  if (channel === 'crypto') return true
-  return holder.ref === ref
+  return holder.channel === channel && holder.ref === ref
 }
 
 /** Atomically claim `invoiceKey` for `channel`/`ref`. Linearizable (DO CAS). */
@@ -87,4 +87,22 @@ export async function claimInvoiceKey(
 export async function readInvoiceClaim(env: Env, invoiceKey: string): Promise<InvoiceClaim | null> {
   const { value } = await casRead(env, invoiceClaimKey(invoiceKey))
   return parseClaim(value)
+}
+
+/**
+ * Release a claim held by exactly this channel/ref. No-op otherwise. For
+ * definite pre-payment failures only (no executor call was made).
+ */
+export async function releaseInvoiceClaim(
+  env: Env,
+  invoiceKey: string,
+  channel: ClaimChannel,
+  ref: string,
+): Promise<boolean> {
+  return casUpdate<boolean>(env, invoiceClaimKey(invoiceKey), (raw) => {
+    const holder = parseClaim(raw)
+    if (!holder || !claimAllows(holder, channel, ref)) return { op: 'noop', result: false }
+    // An empty value parses as "no claim" (parseClaim → null).
+    return { op: 'set', value: '', result: true }
+  })
 }

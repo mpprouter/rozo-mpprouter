@@ -600,13 +600,19 @@ describe('invoice claim (cross-channel)', () => {
     expect((await claimInvoiceKey(env, 'pl_race', 'upi', loserRef)).ok).toBe(false)
   })
 
-  it('crypto vs UPI is mutually exclusive; crypto vs crypto is left to the existing guards', async () => {
+  it('claims are exclusive across channels AND across distinct crypto flows; holder re-entry is idempotent', async () => {
+    const { releaseInvoiceClaim } = await import('../src/routes/invoice-claim')
     const env = makeEnv()
     expect((await claimInvoiceKey(env, 'pl_x', 'crypto', 'pl_x')).ok).toBe(true)
-    expect((await claimInvoiceKey(env, 'pl_x', 'crypto', 'coupon:ABC')).ok).toBe(true)
+    expect((await claimInvoiceKey(env, 'pl_x', 'crypto', 'pl_x')).ok).toBe(true) // webhook retry
+    expect((await claimInvoiceKey(env, 'pl_x', 'crypto', 'coupon:ABC')).ok).toBe(false)
     const upi = await claimInvoiceKey(env, 'pl_x', 'upi', ORDER)
     expect(upi.ok).toBe(false)
     if (!upi.ok) expect(upi.holder.channel).toBe('crypto')
+    // Only the holder can release; after release the invoice is claimable again.
+    expect(await releaseInvoiceClaim(env, 'pl_x', 'crypto', 'coupon:ABC')).toBe(false)
+    expect(await releaseInvoiceClaim(env, 'pl_x', 'crypto', 'pl_x')).toBe(true)
+    expect((await claimInvoiceKey(env, 'pl_x', 'upi', ORDER)).ok).toBe(true)
   })
 
   it('two concurrent verified-pay-in orders for the same invoice: one settles, the other 409s', async () => {
