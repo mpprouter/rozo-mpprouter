@@ -391,6 +391,10 @@ export async function getRouteQuality(
 export async function getRouteQualityWithAvailability(
   env: Env,
   serviceId?: string,
+  // Reference time for the rolling windows. Callers that already carry an
+  // injectable clock (provider selection) pass theirs so the window and the
+  // staleness judgement agree; everything else uses the wall clock.
+  now: number = Date.now(),
 ): Promise<{ stats: Record<MetricsWindow, RouteQualityStats>; availability: QualityAvailability }> {
   const db = env.ROUTE_METRICS_DB
   const empty = Object.fromEntries(
@@ -414,7 +418,6 @@ export async function getRouteQualityWithAvailability(
     return { stats: empty, availability: 'read_failed' }
   }
 
-  const now = Date.now()
   return {
     stats: Object.fromEntries(
       ALL_WINDOWS.map((w) => [

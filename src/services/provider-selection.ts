@@ -202,7 +202,7 @@ export async function selectProvider(
   for (const record of providers) {
     for (const spec of record.routes) {
       if (spec.capability !== contract.id) continue
-      const quality = await getRouteQualityWithAvailability(env, record.id)
+      const quality = await getRouteQualityWithAvailability(env, record.id, now)
       if (quality.availability !== 'ok') availability = quality.availability
       const stats = quality.stats[window]
       const metrics: CandidateMetrics = {
