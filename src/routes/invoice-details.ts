@@ -24,6 +24,8 @@ import {
   type NormalizedInvoice,
 } from './invoice-provider'
 import { createQuoteReceipt } from './quote-receipt'
+import { indexStripeSession, lookupStripeSession } from './stripe-session-index'
+import { loadStripeRecordForStatus, pickStripeRouterStateSafe } from './stripe-fulfillment'
 import {
   formatUsdcAtomic,
   resolveCheckoutPricing,
@@ -242,15 +244,24 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
     } catch (err) {
       if (err instanceof StripeResolveError) {
         // err.message is authored to be address/secret-free by construction.
+        //
+        // "expired" also covers a session Stripe simply stopped resuming after
+        // it was PAID. If this link resolved through us before, name the
+        // invoice and its router state (read-only, KV + DO, no Stripe call) so
+        // a customer reopening a paid link can reach invoice-status instead of
+        // an error card.
+        const known = err.kind === 'expired' ? await knownStripeInvoice(env, rawUrl) : null
         return json(statusFor(err.kind), {
           ok: false,
           provider,
           error: err.message,
           reason: err.kind,
+          ...(known ?? {}),
         })
       }
       return json(502, { ok: false, provider, error: 'Failed to resolve Stripe invoice' })
     }
+    await indexStripeSession(env, rawUrl, invoice.invoiceKey)
   } else {
     // Coinbase: read-only normalization of the same data the checkout page
     // shows. This issues NO quote receipt and is NOT a replacement for
@@ -270,6 +281,11 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
     }
   }
   if (provider === 'stripe_crypto') {
+    // Not entry-payable (already paid / in flight / terminal): attach the
+    // router-side state so the caller can tell "paid through us" from "used
+    // elsewhere" without a second round trip. Response shape is otherwise
+    // unchanged (pricing fields stay for display).
+    const known = invoice.payable ? null : await knownStripeInvoice(env, rawUrl, invoice.invoiceKey)
     const pricing = resolveCheckoutPricing(
       BigInt(invoice.stablecoinAmountAtomic),
       invoice.merchantTitle,
@@ -307,8 +323,35 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
       invoice,
       ...pricingFields,
       ...(quoteReceipt ? { quoteReceipt } : {}),
+      ...(known ?? {}),
     })
   }
 
   return json(200, { ok: true, invoice })
+}
+
+/**
+ * Router-side identity of a Stripe invoice we have seen before: the cpis_* id
+ * (from the argument or the pay-URL index), the Rozo payment id and the safe
+ * router state from the fulfillment record. Read-only; never calls Stripe;
+ * never returns the capability. Null when the link is unknown to us.
+ */
+async function knownStripeInvoice(
+  env: Env,
+  rawUrl: string,
+  invoiceKey?: string,
+): Promise<{ invoiceKey: string; rozo_payment_id: string | null; routerState: unknown } | null> {
+  const key = invoiceKey ?? (await lookupStripeSession(env, rawUrl))
+  if (!key) return null
+  let rec = null
+  try {
+    rec = await loadStripeRecordForStatus(env, key)
+  } catch {
+    rec = null
+  }
+  return {
+    invoiceKey: key,
+    rozo_payment_id: rec?.rozoPaymentId ?? null,
+    routerState: pickStripeRouterStateSafe(rec),
+  }
 }
