@@ -261,7 +261,7 @@ export async function seedStripeRecord(
   // Pay-URL hash → invoiceKey index (read-only status recovery after Stripe
   // stops resuming the session). Written before the record so the record's
   // `sessionIndexed` mark never claims an entry that does not exist.
-  await indexStripeSession(env, args.stripeUrl, args.invoiceKey)
+  const indexed = await indexStripeSession(env, args.stripeUrl, args.invoiceKey)
   await updateStripeRecord<true>(env, args.invoiceKey, orderId, (rec) => {
     // Fill only missing lock fields; never overwrite values already locked.
     rec.merchantAccount = rec.merchantAccount ?? args.merchantAccount
@@ -269,7 +269,9 @@ export async function seedStripeRecord(
     rec.invoiceCurrency = rec.invoiceCurrency ?? args.invoiceCurrency
     rec.lockFingerprint = rec.lockFingerprint ?? args.lockFingerprint
     rec.stripeUrlEncrypted = rec.stripeUrlEncrypted ?? stripeUrlEncrypted
-    rec.sessionIndexed = true
+    // Only a CONFIRMED index write may set the marker; a failed write leaves
+    // the record for the cron backfill (codex P1, #185).
+    if (indexed) rec.sessionIndexed = true
     if (!rec.rozoPaymentId && args.rozoPaymentId) rec.rozoPaymentId = args.rozoPaymentId
     // Monotonic: only set the initial state when the record is brand new
     // (still at rank 0). Never roll an advanced record back.
@@ -1162,13 +1164,22 @@ export async function sweepStripeSessionIndex(env: Env): Promise<{ indexed: numb
     .filter((r): r is StripeFulfillmentRecord => !!r && !r.sessionIndexed && !!r.stripeUrlEncrypted)
   out.remaining = pending.length
   for (const rec of pending.slice(0, SESSION_INDEX_BACKFILL_PER_RUN)) {
+    let url: string
     try {
-      const url = await decryptCapability(rec.stripeUrlEncrypted!, env)
-      await indexStripeSession(env, url, rec.invoiceKey)
+      url = await decryptCapability(rec.stripeUrlEncrypted!, env)
     } catch {
-      // Undecryptable (rotated key) records stay unindexed; mark them so the
-      // sweep does not retry them forever.
+      // Undecryptable (rotated-away key): it can never be indexed. Mark it
+      // with a distinct reason so the sweep does not retry it forever.
+      await updateStripeRecord<true>(env, rec.invoiceKey, rec.orderId, (r) => {
+        r.sessionIndexed = true
+        r.events.push({ kind: 'session_index_skipped_undecryptable', at: new Date().toISOString() })
+        return { rec: r, result: true }
+      })
+      out.remaining--
+      continue
     }
+    // Transient KV failure: leave the record unmarked so the next run retries.
+    if (!(await indexStripeSession(env, url, rec.invoiceKey))) continue
     await updateStripeRecord<true>(env, rec.invoiceKey, rec.orderId, (r) => {
       r.sessionIndexed = true
       return { rec: r, result: true }

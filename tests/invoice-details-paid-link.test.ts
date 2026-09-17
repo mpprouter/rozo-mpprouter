@@ -100,6 +100,32 @@ describe('invoice-details on a paid / expired Stripe link', () => {
     expect(await sweepStripeSessionIndex(env)).toEqual({ indexed: 0, remaining: 0 })
   })
 
+  it('a failed KV write never sets the marker: seed and cron both leave it for the next sweep', async () => {
+    const env = makeEnv()
+    const realPut = env.MPP_STORE.put.bind(env.MPP_STORE)
+    let fail = true
+    env.MPP_STORE.put = async (k: string, v: string) => { if (fail && k.startsWith('stripe-session-index:')) throw new Error('kv down'); return realPut(k, v) }
+    await seedStripeRecord(env, { invoiceKey: KEY, merchantAccount: 'acct_x', invoiceAmountAtomic: '1360000', invoiceCurrency: 'usd', lockFingerprint: 'x', stripeUrl: URL_, rozoPaymentId: ROZO })
+    expect(JSON.parse((await casRead(env, stripeKvKey(KEY))).value!).sessionIndexed).toBeUndefined()
+    expect(await sweepStripeSessionIndex(env)).toEqual({ indexed: 0, remaining: 1 })
+    expect(JSON.parse((await casRead(env, stripeKvKey(KEY))).value!).sessionIndexed).toBeUndefined()
+    fail = false
+    expect(await sweepStripeSessionIndex(env)).toEqual({ indexed: 1, remaining: 0 })
+    expect(await lookupStripeSession(env, URL_)).toBe(KEY)
+  })
+
+  it('an undecryptable record is marked (with a reason) so the sweep does not loop on it', async () => {
+    const env = makeEnv(); await setPaid(env)
+    env.MPP_STORE.store.clear()
+    { const { value, version } = await casRead(env, stripeKvKey(KEY)); const r = JSON.parse(value!); delete r.sessionIndexed; r.stripeUrlEncrypted = 'not-a-valid-blob'
+      await env.ATOMIC_STORE.get().fetch(new Request('https://x/commit', { method: 'POST', body: JSON.stringify({ key: stripeKvKey(KEY), expectedVersion: version, op: 'set', value: JSON.stringify(r) }) })) }
+    expect(await sweepStripeSessionIndex(env)).toEqual({ indexed: 0, remaining: 0 })
+    const r = JSON.parse((await casRead(env, stripeKvKey(KEY))).value!)
+    expect(r.sessionIndexed).toBe(true)
+    expect(r.events.at(-1).kind).toBe('session_index_skipped_undecryptable')
+    expect(await lookupStripeSession(env, URL_)).toBeNull()
+  })
+
   it('seeding a record indexes its link (no cron needed for new records)', async () => {
     const env = makeEnv(); await setPaid(env)
     expect(await lookupStripeSession(env, URL_)).toBe(KEY)

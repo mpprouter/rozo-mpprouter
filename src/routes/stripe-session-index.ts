@@ -22,14 +22,19 @@ async function blobHash(blob: string): Promise<string> {
     .join('')
 }
 
-/** Remember that `payUrl` resolved to `invoiceKey`. Best effort; never throws. */
-export async function indexStripeSession(env: Env, payUrl: string, invoiceKey: string): Promise<void> {
+/**
+ * Remember that `payUrl` resolved to `invoiceKey`. Never throws; returns true
+ * only when the KV write was confirmed, so callers may set a "done" marker.
+ */
+export async function indexStripeSession(env: Env, payUrl: string, invoiceKey: string): Promise<boolean> {
   try {
     const blob = extractStripeSessionBlob(payUrl)
-    if (!blob || !invoiceKey.startsWith('cpis_')) return
+    if (!blob || !invoiceKey.startsWith('cpis_')) return false
     await env.MPP_STORE.put(PREFIX + (await blobHash(blob)), invoiceKey, { expirationTtl: TTL_S })
+    return true
   } catch {
     // index is an optimisation for the expired path; never block the caller
+    return false
   }
 }
 
