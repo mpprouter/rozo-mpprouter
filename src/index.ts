@@ -22,6 +22,7 @@
 
 import { handleProxy } from './routes/proxy'
 import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './routes/job-status'
+import { sweepInFlightStripeRecords } from './routes/stripe-fulfillment'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleAllServiceMetrics, handleServiceMetrics } from './routes/service-metrics'
@@ -539,6 +540,10 @@ export default {
   },
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil(reconcileAsyncRefunds(env))
+    // Stripe Crypto: confirm in-flight settlements against the live session
+    // (the webhook request that started them may have been cut off by the
+    // sender's 10s timeout). Read-only towards Stripe; never signs.
+    ctx.waitUntil(sweepInFlightStripeRecords(env))
     // Option A online settlement: collect spent channel funds to the collector
     // before users can unilaterally refund. No-op unless the channel playground
     // is enabled AND the collector signer secret is set.

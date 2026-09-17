@@ -9,7 +9,9 @@ import {
   handleStripeWebhookEvent,
   reconcileStripeRecordWithProvider,
   RECONCILE_MIN_INTERVAL_MS,
+  RECONCILE_GONE_ESCALATE_AFTER,
   readDailySpentAtomic,
+  sweepInFlightStripeRecords,
 } from '../src/routes/stripe-fulfillment'
 import { casRead } from '../src/routes/stripe-atomic'
 import { handleInvoiceStatus, handleRozoWebhook } from '../src/routes/webhook'
@@ -34,6 +36,10 @@ function makeDoNamespace() {
         else store.delete(body.key)
         versions.set(body.key, body.expectedVersion + 1)
         return Response.json({ ok: true })
+      }
+      if (url.pathname === '/scan') {
+        const vals = [...store.entries()].filter(([k]) => k.startsWith(body.prefix)).map(([, v]) => v)
+        return Response.json({ values: vals })
       }
       return new Response('Not Found', { status: 404 })
     },
@@ -473,5 +479,68 @@ describe('invoice-status Stripe lookups', () => {
     expect(res.status).toBe(200)
     expect(body.routerState.status).toBe('provider_paying')
     expect(body.reconcile).toMatchObject({ checked: true, error: 'stripe_upstream' })
+  })
+})
+
+describe('provider gone (410) escalation', () => {
+  it('parks the record in manual_review after repeated 410s instead of hitting Stripe forever', async () => {
+    const env = makeEnv()
+    await seed(env)
+    await forceStatus(env, 'provider_paying')
+    const hits = mockStripe('x', null, (u) => (u.includes('resume_payin_session') ? new Response('gone', { status: 410 }) : null))
+    const t0 = Date.parse('2026-09-17T08:40:00Z')
+    for (let i = 1; i < RECONCILE_GONE_ESCALATE_AFTER; i++) {
+      const out = await reconcileStripeRecordWithProvider(env, KEY, new Date(t0 + i * RECONCILE_MIN_INTERVAL_MS))
+      expect(out).toEqual({ checked: true, error: 'stripe_expired', transition: null })
+      expect((await loadRec(env)).status).toBe('provider_paying')
+    }
+    const last = await reconcileStripeRecordWithProvider(env, KEY, new Date(t0 + RECONCILE_GONE_ESCALATE_AFTER * RECONCILE_MIN_INTERVAL_MS))
+    expect(last).toEqual({ checked: true, error: 'stripe_expired', transition: 'manual_review' })
+    const rec = await loadRec(env)
+    expect(rec.status).toBe('manual_review')
+    expect(rec.paidAt).toBeNull()
+    expect(rec.failureReason).toContain('410')
+    // Terminal now: further sweeps make no Stripe calls.
+    const before = hits.length
+    expect(await reconcileStripeRecordWithProvider(env, KEY, new Date(t0 + 10 * RECONCILE_MIN_INTERVAL_MS))).toEqual({ checked: false, reason: 'not_in_flight' })
+    expect(hits.length).toBe(before)
+  })
+
+  it('a successful read resets the gone counter', async () => {
+    const env = makeEnv()
+    await seed(env)
+    await forceStatus(env, 'provider_paying', { providerGoneChecks: 2 })
+    mockStripe('processing')
+    await reconcileStripeRecordWithProvider(env, KEY, new Date())
+    expect((await loadRec(env)).providerGoneChecks).toBe(0)
+  })
+})
+
+describe('sweepInFlightStripeRecords (cron)', () => {
+  it('reconciles only in-flight records and reports transitions', async () => {
+    const env = makeEnv()
+    await seed(env)
+    await forceStatus(env, 'provider_paying')
+    // A second, already-paid record must be scanned but never checked.
+    await seedStripeRecord(env, {
+      invoiceKey: 'cpis_done', merchantAccount: 'acct_x', invoiceAmountAtomic: '1000000', invoiceCurrency: 'usd',
+      lockFingerprint: 'sha256:d', stripeUrl: 'https://crypto.stripe.com/pay/DONE', rozoPaymentId: 'rp-done',
+    })
+    const { value } = await casRead(env, stripeKvKey('cpis_done'))
+    const done = JSON.parse(value!); done.status = 'paid'
+    const { version } = await casRead(env, stripeKvKey('cpis_done'))
+    await (env.ATOMIC_STORE as any).get(null).fetch(new Request('https://x/commit', { method: 'POST', body: JSON.stringify({ key: stripeKvKey('cpis_done'), expectedVersion: version, op: 'set', value: JSON.stringify(done) }) }))
+    const hits = mockStripe('fulfillment_complete', '0x6900')
+    const out = await sweepInFlightStripeRecords(env, new Date('2026-09-17T08:05:00Z'))
+    expect(out).toEqual({ scanned: 2, inFlight: 1, checked: 1, transitions: ['cpis_1UGa…zGep:paid'] })
+    expect((await loadRec(env)).status).toBe('paid')
+    expect(hits.filter((u) => u.includes('resume_payin_session')).length).toBe(1)
+    expect(JSON.stringify(out)).not.toContain('CDMQARoXBLOB')
+  })
+
+  it('swallows a DO scan failure (never breaks the cron)', async () => {
+    const env = makeEnv()
+    ;(env.ATOMIC_STORE as any).get = () => ({ fetch: async () => new Response('boom', { status: 500 }) })
+    expect(await sweepInFlightStripeRecords(env)).toEqual({ scanned: 0, inFlight: 0, checked: 0, transitions: [] })
   })
 })

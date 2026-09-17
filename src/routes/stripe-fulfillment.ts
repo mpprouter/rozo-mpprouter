@@ -20,7 +20,7 @@
 import type { Env } from '../index'
 import { bumpReserved, reservedAtomic, maskAddresses } from './webhook'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
-import { casRead, casUpdate } from './stripe-atomic'
+import { casRead, casUpdate, casScan } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
 import { claimInvoiceKey } from './invoice-claim'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
@@ -113,6 +113,9 @@ export interface StripeFulfillmentRecord {
   // Last time the reconciler asked Stripe for the live session state (ISO).
   // Optional: records written before the reconciler existed lack it.
   lastProviderCheckAt?: string | null
+  // Consecutive reconciler checks that Stripe answered with "session gone"
+  // (resume 404/410). Reset on any successful read.
+  providerGoneChecks?: number
   webhookEventIds: string[]
   events: Array<{ kind: string; at: string; event_id?: string; detail?: unknown }>
 }
@@ -921,11 +924,15 @@ const RECONCILE_IN_FLIGHT = new Set<StripeRouterStatus>([
 const STRIPE_PAID_STATES = new Set(['fulfillment_complete'])
 const STRIPE_FAILED_STATES = new Set(['failed', 'canceled', 'error'])
 export const RECONCILE_MIN_INTERVAL_MS = 15_000
+export const RECONCILE_GONE_ESCALATE_AFTER = 3
+// Per cron sweep: bounded so a burst of stuck records cannot turn the cron
+// into a Stripe request storm. The sweep runs every 2 minutes.
+export const RECONCILE_SWEEP_MAX = 20
 
 export type StripeReconcileOutcome =
   | { checked: false; reason: 'no_record' | 'not_in_flight' | 'no_capability' | 'throttled' }
   | { checked: true; providerState: string; transition: 'paid' | 'failed_provider' | null }
-  | { checked: true; error: string; transition: null }
+  | { checked: true; error: string; transition: 'manual_review' | null }
 
 export async function reconcileStripeRecordWithProvider(
   env: Env,
@@ -964,11 +971,26 @@ export async function reconcileStripeRecordWithProvider(
   } catch (err) {
     const error =
       err instanceof StripeResolveError ? `stripe_${err.kind}` : 'provider_check_failed'
+    const gone = error === 'stripe_expired'
+    let escalated = false
     await updateStripeRecord<true>(env, invoiceKey, orderId, (r) => {
+      r.providerGoneChecks = gone ? (r.providerGoneChecks ?? 0) + 1 : 0
       r.events.push({ kind: 'stripe_reconcile_error', at: nowIso, detail: { error } })
+      // Stripe stops resuming a session some time after it completes (observed
+      // 410 ~30 min after fulfillment on 2026-09-17). Once that has happened
+      // repeatedly the provider can never confirm this record, so park it in
+      // the human-gated terminal state instead of pretending it is still in
+      // flight (and instead of hitting Stripe every sweep forever).
+      if (gone && RECONCILE_IN_FLIGHT.has(r.status) && r.providerGoneChecks >= RECONCILE_GONE_ESCALATE_AFTER) {
+        r.status = 'manual_review'
+        r.failureReason =
+          'stripe session no longer resumable (410) while settlement was in flight — confirm merchant credit by hand'
+        r.events.push({ kind: 'stripe_reconcile_manual_review', at: nowIso, detail: { error } })
+        escalated = true
+      }
       return { rec: r, result: true }
     })
-    return { checked: true, error, transition: null }
+    return { checked: true, error, transition: escalated ? 'manual_review' : null }
   }
 
   let transition: 'paid' | 'failed_provider' | null = null
@@ -977,6 +999,7 @@ export async function reconcileStripeRecordWithProvider(
 
   await updateStripeRecord<true>(env, invoiceKey, orderId, (r) => {
     const detail = { state: providerState, blockchainTxId }
+    r.providerGoneChecks = 0
     // Re-check under CAS: another isolate may have finalized meanwhile.
     if (transition && RECONCILE_IN_FLIGHT.has(r.status)) {
       r.status = transition
@@ -998,4 +1021,39 @@ export async function reconcileStripeRecordWithProvider(
     return { rec: r, result: true }
   })
   return { checked: true, providerState, transition }
+}
+
+/**
+ * Cron sweep: reconcile every in-flight Stripe record against the provider.
+ * Runs on the 2-minute schedule so a settlement whose webhook request died
+ * (2026-09-17) is confirmed while Stripe still lets us read the session,
+ * whether or not anybody polls invoice-status. Swallows its own errors: a
+ * monitor that can break the cron it rides on is strictly worse than none.
+ */
+export async function sweepInFlightStripeRecords(
+  env: Env,
+  now: Date = new Date(),
+): Promise<{ scanned: number; inFlight: number; checked: number; transitions: string[] }> {
+  const out = { scanned: 0, inFlight: 0, checked: 0, transitions: [] as string[] }
+  let values: string[]
+  try {
+    values = await casScan(env, 'invoice-fulfillment:v2:stripe_crypto:')
+  } catch {
+    return out
+  }
+  out.scanned = values.length
+  const inFlight = values
+    .map(parseRecord)
+    .filter((r): r is StripeFulfillmentRecord => !!r && RECONCILE_IN_FLIGHT.has(r.status))
+  out.inFlight = inFlight.length
+  for (const rec of inFlight.slice(0, RECONCILE_SWEEP_MAX)) {
+    try {
+      const r = await reconcileStripeRecordWithProvider(env, rec.invoiceKey, now)
+      if (r.checked) out.checked++
+      if (r.checked && r.transition) out.transitions.push(`${maskInvoiceKey(rec.invoiceKey)}:${r.transition}`)
+    } catch {
+      // next record
+    }
+  }
+  return out
 }

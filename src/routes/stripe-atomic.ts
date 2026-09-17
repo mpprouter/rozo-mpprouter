@@ -97,3 +97,9 @@ export async function casUpdate<R>(
   }
   throw new Error(`stripe-atomic casUpdate exhausted ${MAX_CAS_RETRIES} retries for key ${key}`)
 }
+
+/** List every raw value under `prefix` in the DO (values only, no keys). */
+export async function casScan(env: Env, prefix: string): Promise<string[]> {
+  const r = await doPost<{ values: string[] }>(env, '/scan', { prefix })
+  return Array.isArray(r.values) ? r.values : []
+}
