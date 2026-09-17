@@ -99,6 +99,11 @@ import {
 import { settlePlaygroundChannels } from './playground/channel-settle'
 import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
+import {
+  handleUpiResolve,
+  handleUpiVerifiedPayIn,
+  handleUpiFulfillmentStatus,
+} from './routes/upi-invoice'
 import { handlePreflight, withCors } from './utils/cors'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
@@ -403,6 +408,23 @@ export interface Env {
   INVOICE_CAPABILITY_KEY_ID_PREVIOUS?: string
   // Key id stamped into new capability blobs (default "v1"). Bump on rotation.
   INVOICE_CAPABILITY_KEY_ID?: string
+
+  // ---- UPI invoice payment (MuggleLink → router, server-to-server) ------
+  // Shared secret with MuggleLink for POST /api/invoice/resolve,
+  // POST /api/invoice/verified-pay-in and GET /api/invoice/fulfillment/*.
+  // Sent as X-Internal-Key, and also the HMAC key for the verified-pay-in
+  // body signature (X-Signature) and for quote_id. Min 16 chars; unset ⇒ every
+  // /api/invoice/* route answers 503 (feature inert). Deliberately its own
+  // secret: it must be rotatable without touching PAYINVOICE_ADMIN_SECRET.
+  // Set via: wrangler secret put UPI_INTERNAL_KEY
+  UPI_INTERNAL_KEY?: string
+  // CSV of providers the UPI channel may settle: coinbase_v1, coinbase_v3,
+  // stripe_crypto. Unset/empty ⇒ nothing is payable over UPI (fail closed).
+  // Plain var in wrangler.toml. See routes/upi-invoice.ts.
+  UPI_PROVIDERS_ENABLED?: string
+  // Minimum seconds of validity an invoice must have left at resolve time to
+  // be reported payable over UPI. Default 900. Plain var.
+  UPI_MIN_VALIDITY_S?: string
 
   // Caller-side daily-spend cap for Stripe fulfillment, in whole USD (e.g.
   // "200"). The webhook reserves against this ledger BEFORE calling pay-invoice
@@ -926,6 +948,21 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Moves no money; rate-limited per-IP and per-session.
       if (url.pathname === '/v1/services/rozo-agent-api/invoice-details') {
         return handleInvoiceDetails(request, env)
+      }
+
+      // UPI invoice payment — internal, server-to-server with MuggleLink
+      // (X-Internal-Key). Resolve a pasted invoice, accept a verified UPI
+      // capture and settle the invoice through the existing executors, and
+      // report fulfillment state. See routes/upi-invoice.ts.
+      if (url.pathname === '/api/invoice/resolve') {
+        return handleUpiResolve(request, env)
+      }
+      if (url.pathname === '/api/invoice/verified-pay-in') {
+        return handleUpiVerifiedPayIn(request, env, { ctx })
+      }
+      const upiStatusMatch = url.pathname.match(/^\/api\/invoice\/fulfillment\/([^/]+)$/)
+      if (upiStatusMatch) {
+        return handleUpiFulfillmentStatus(request, env, upiStatusMatch[1])
       }
 
       // Public per-service statistics feed for the /stats page.

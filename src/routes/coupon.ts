@@ -53,6 +53,7 @@ import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
 import { extractCoinbaseCheckoutId } from './pay-invoice-admin'
 import { parseUsdc, formatUsdc } from './create-invoice'
 import { callAgentApiPayInvoice, reservedAtomic, FUNDER_WALLET } from './webhook'
+import { claimInvoiceKey } from './invoice-claim'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { identifierKeys } from '../utils/redact'
@@ -1082,6 +1083,23 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
         'insufficient_funds',
       )
     }
+  }
+
+  // Step 3b — cross-channel claim (invoice-claim.ts). If the UPI fiat channel
+  // already holds this link, do not pay it a second time: roll the coupon back
+  // to issued (nothing moved) and tell the caller.
+  const channelClaim = await claimInvoiceKey(env, plId, 'crypto', `coupon:${code}`)
+  if (!channelClaim.ok) {
+    if (reservedFunds) await releaseFunds(env, attemptId)
+    await rollbackToIssued(`invoice already claimed by ${channelClaim.holder.channel} channel`)
+    return done(
+      json(409, {
+        error: 'LINK_CLAIMED',
+        message: 'This payment link is already being paid through another channel. Your coupon is still valid.',
+      }),
+      'rejected',
+      'link_claimed',
+    )
   }
 
   // Step 4 — point of no return: redeeming → paying. From here on, failure

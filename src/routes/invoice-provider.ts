@@ -832,7 +832,7 @@ export async function normalizeCoinbasePayment(
  * checkout page itself. No credentials are involved — the Origin/Referer pair
  * is what the browser sends. Mirrors `fetchCoinbasePayment` in webhook.ts.
  */
-async function fetchCoinbasePayment(paymentId: string): Promise<CoinbasePayment> {
+export async function fetchCoinbasePayment(paymentId: string): Promise<CoinbasePayment> {
   const resource = isCoinbasePaymentSessionId(paymentId) ? 'payment-sessions' : 'payment-links'
   const path = `${resource}/${encodeURIComponent(paymentId)}`
   let res: Response
