@@ -53,6 +53,7 @@ import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
 import { extractCoinbaseCheckoutId } from './pay-invoice-admin'
 import { parseUsdc, formatUsdc } from './create-invoice'
 import { callAgentApiPayInvoice, reservedAtomic, FUNDER_WALLET } from './webhook'
+import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { identifierKeys } from '../utils/redact'
@@ -1084,6 +1085,23 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     }
   }
 
+  // Step 3b — cross-channel claim (invoice-claim.ts). If the UPI fiat channel
+  // already holds this link, do not pay it a second time: roll the coupon back
+  // to issued (nothing moved) and tell the caller.
+  const channelClaim = await claimInvoiceKey(env, plId, 'crypto', `coupon:${code}`)
+  if (!channelClaim.ok) {
+    if (reservedFunds) await releaseFunds(env, attemptId)
+    await rollbackToIssued(`invoice already claimed by ${channelClaim.holder.channel} channel`)
+    return done(
+      json(409, {
+        error: 'LINK_CLAIMED',
+        message: 'This payment link is already being paid through another channel. Your coupon is still valid.',
+      }),
+      'rejected',
+      'link_claimed',
+    )
+  }
+
   // Step 4 — point of no return: redeeming → paying. From here on, failure
   // NEVER rolls back to issued (the pay call may have succeeded upstream even
   // when we see an error). Ambiguity parks in manual_review + ops alert.
@@ -1101,6 +1119,9 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     return { op: 'set', value: JSON.stringify(r), result: true }
   })
   if (!enteredPaying) {
+    // Definite pre-payment failure: give the invoice claim back so a later
+    // payer (UPI or another attempt) is not blocked by a claim that never paid.
+    await releaseInvoiceClaim(env, plId, 'crypto', `coupon:${code}`)
     if (reservedFunds) await releaseFunds(env, attemptId)
     return done(
       json(409, {

@@ -235,6 +235,18 @@ STELLAR_X402_PAY_TO = "GDK3AVW3YE6UL3J4WLNKBMP65KSY32YPUKIOC6PXW65XJ3LEG3YIDXXB"
 # src/services/catalog-direct-settlement.ts.
 MERCURYDATA_X402_ADDRESS = "GC5KJLF3UOKRWWWQCRGNXP4A3CFBNUD6ZQFVSJNBA4UVNICZXPBLMHC3"
 
+# UPI invoice payment (MuggleLink → router). CSV of providers the UPI channel
+# may settle: coinbase_v1, coinbase_v3, stripe_crypto. Unset/empty ⇒ resolve
+# reports every invoice payable=false (reason provider_disabled) and
+# verified-pay-in refuses to execute — fail closed. stripe_crypto is NOT listed
+# because the Stripe signing branch of pay-invoice is itself fail-closed
+# disabled; add it only once that branch is enabled, or every captured UPI
+# payment for a Stripe invoice would end in the refund path.
+# See src/routes/upi-invoice.ts.
+UPI_PROVIDERS_ENABLED = "coinbase_v1,coinbase_v3"
+# Seconds of validity an invoice must still have at resolve time (default 900).
+UPI_MIN_VALIDITY_S = "900"
+
 # Coupon admin endpoints (issue/resolve/get) kill switch. Public
 # redeem/status are always on. Deliberately separate from
 # ADMIN_ENDPOINT_ENABLED (which gates /admin/pay-invoice and stays
@@ -378,6 +390,13 @@ PLAYGROUND_CHANNEL_WASM_HASH = "d6717aa80e0a1e6f5e6e6b5a8a4c00219ecbd1d3c5be61a4
 #                                  RECEIPT_SIGNER_RETIRED_ADDRESSES var below,
 #                                  or every receipt it signed silently stops
 #                                  verifying.
+# UPI_INTERNAL_KEY               — shared secret with MuggleLink for the
+#                                  /api/invoice/* server-to-server routes
+#                                  (X-Internal-Key, the X-Signature body
+#                                  HMAC and quote_id). Min 16 chars. Unset ⇒
+#                                  those routes answer 503. Own secret so it
+#                                  rotates independently of
+#                                  PAYINVOICE_ADMIN_SECRET.
 # REFUND_EXECUTOR_TOKEN          — dedicated bearer token for the pull-only
 #                                  refund executor admin endpoints.
 # MERCURYDATA_MAINNET_JWT        — Mercury (Stellar indexer, xycloo Labs) scoped

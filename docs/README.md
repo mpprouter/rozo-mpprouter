@@ -8,6 +8,7 @@
 | You want to know which catalog services were verified with real paid calls, and when | [verified-services.md](verified-services.md) · machine-readable [verified-runs.json](verified-runs.json) |
 | You want the browser playground design | [playground.md](playground.md) |
 | You operate the router (E2E suite, provider re-verification SOP) | [operations/](operations/) |
+| You operate the UPI invoice payment channel with MuggleLink (routes, secret, state machine, cross-channel claim) | [operations/upi-invoice-payment.md](operations/upi-invoice-payment.md) |
 | You need the history: design notes, root causes, review notes, dated results | [archive/](archive/) |
 
 Live surfaces: catalog `https://apiserver.mpprouter.dev/services` · metrics `https://www.mpprouter.dev/stats` · onboarding `https://www.mpprouter.dev/onboard/x402`.

@@ -22,6 +22,7 @@ import { bumpReserved, reservedAtomic, maskAddresses } from './webhook'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { casRead, casUpdate } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
+import { claimInvoiceKey } from './invoice-claim'
 
 // Provider-qualified order id. Rozo orderIds are used verbatim as our KV key
 // discriminator, so we avoid ':' (design §6 fallback) and use underscores.
@@ -82,6 +83,8 @@ export type StripeRouterStatus =
   | 'failed_insufficient_balance'
   | 'failed_provider'
   | 'manual_review'
+  // Another channel (UPI fiat) claimed this invoice first. Terminal.
+  | 'claimed_by_other_channel'
 
 export interface StripeFulfillmentRecord {
   provider: 'stripe_crypto'
@@ -151,6 +154,7 @@ const STATUS_RANK: Record<StripeRouterStatus, number> = {
   failed_insufficient_balance: 9,
   failed_provider: 9,
   manual_review: 9,
+  claimed_by_other_channel: 9,
 }
 
 /**
@@ -484,7 +488,11 @@ export async function handleStripeWebhookEvent(
     // webhook event must NOT be able to reclaim the record and auto-submit a
     // payment, which would bypass the manual-review-only path (design §12).
     // Persist the event for audit but never transition back into settlement.
-    if (rec.status === 'manual_review' || rec.status === 'failed_provider') {
+    if (
+      rec.status === 'manual_review' ||
+      rec.status === 'failed_provider' ||
+      rec.status === 'claimed_by_other_channel'
+    ) {
       return { rec, result: { kind: 'terminal', status: rec.status } }
     }
 
@@ -565,6 +573,18 @@ export async function handleStripeWebhookEvent(
 
   // ── We hold the claim. From here we own the single in-flight slot. ──────────
   const invoiceAtomic = BigInt(claim.invoiceAtomic)
+
+  // Cross-channel claim (invoice-claim.ts): the UPI fiat channel may already be
+  // settling this session. The per-record CAS above serializes Stripe-vs-Stripe;
+  // this one serializes crypto-vs-UPI. Held elsewhere → terminal, never sign.
+  const channelClaim = await claimInvoiceKey(env, invoiceKey, 'crypto', orderId)
+  if (!channelClaim.ok) {
+    await finalizeClaim(env, invoiceKey, orderId, nowIso, 'claimed_by_other_channel', {
+      failureReason: `invoice already claimed by ${channelClaim.holder.channel} channel`,
+      event: { kind: 'claimed_by_other_channel' },
+    })
+    return { ok: true, provider: 'stripe_crypto', status: 'claimed_by_other_channel' }
+  }
 
   // Balance check against the SHARED funder pool + reserved counter (design §7:
   // Coinbase and Stripe compete for the same available balance). If the funder

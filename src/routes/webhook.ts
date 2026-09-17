@@ -10,6 +10,7 @@ import {
   pickStripeRouterStateSafe,
 } from './stripe-fulfillment'
 import { redactForAlert } from '../utils/alert-redaction'
+import { claimInvoiceKey } from './invoice-claim'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -89,6 +90,10 @@ interface FulfillmentRecord {
     | 'paid'
     | 'failed_insufficient_balance'
     | 'failed_pay_invoice'
+    // The invoice was claimed by another channel (UPI fiat) before this
+    // crypto payin could settle it. Terminal: the caller's crypto needs a
+    // human refund, and the invoice must NOT be paid a second time.
+    | 'claimed_by_other_channel'
   pl_id: string | null
   rozoPaymentId: string | null
   invoiceAmountAtomic: string | null
@@ -420,7 +425,11 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
   })
 
   // If already paid or terminally failed, just persist the event and 200.
-  if (rec.status === 'paid' || rec.status === 'failed_pay_invoice') {
+  if (
+    rec.status === 'paid' ||
+    rec.status === 'failed_pay_invoice' ||
+    rec.status === 'claimed_by_other_channel'
+  ) {
     await saveRecord(env, plId, rec)
     return json(200, { ok: true, alreadyTerminal: rec.status, plId })
   }
@@ -532,6 +541,25 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
       available: available?.toString() ?? null,
       invoice: invoiceAtomic.toString(),
     })
+  }
+
+  // 8b. Cross-channel claim (linearizable DO CAS, see invoice-claim.ts). If
+  // the UPI channel already holds this invoice, never pay it again from here:
+  // the caller's crypto is refunded by a human, the invoice is settled once.
+  const claim = await claimInvoiceKey(env, plId, 'crypto', plId)
+  if (!claim.ok) {
+    rec.status = 'claimed_by_other_channel'
+    rec.failureReason = `invoice already claimed by ${claim.holder.channel} channel`
+    rec.events.push({ kind: 'claimed_by_other_channel', at: new Date().toISOString() })
+    await sendInvoiceFailureAlert(env, {
+      kind: 'failed_pay_invoice',
+      plId,
+      invoiceAtomic,
+      funderBalanceAtomic: balance,
+      failureReason: rec.failureReason,
+    })
+    await saveRecord(env, plId, rec)
+    return json(200, { ok: true, status: rec.status, plId })
   }
 
   // 9. Reserve, transition to paying, persist BEFORE calling pay-invoice.
@@ -687,6 +715,7 @@ const ROUTER_STATES_IMPLYING_PAYIN = new Set([
   'provider_submitted_ambiguous',
   'provider_disabled',
   'paid',
+  'claimed_by_other_channel',
 ])
 
 const ROZO_STATUSES_IMPLYING_PAYIN = new Set([

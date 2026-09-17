@@ -200,11 +200,21 @@ export function makeAtomicStoreMock(): DurableObjectNamespace {
   }
 
   // Stub that routes fetch() to the DO instance.
+  //
+  // Calls are SERIALIZED: the real platform runs at most one event handler
+  // per DO at a time (input gates hold other requests while a handler awaits
+  // storage), which is exactly what makes the /commit get-compare-set atomic.
+  // Without this chain, two `Promise.all`-ed callers interleave inside the
+  // in-memory transaction and both "win" a CAS — a mock artefact that would
+  // hide real races from the tests that exist to catch them.
+  let chain: Promise<unknown> = Promise.resolve()
   const stub: DurableObjectStub = {
     id: mockId,
     fetch: (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const req = input instanceof Request ? input : new Request(input, init)
-      return doInstance.fetch(req)
+      const run = chain.then(() => doInstance.fetch(req))
+      chain = run.catch(() => undefined)
+      return run
     },
   } as unknown as DurableObjectStub
 
