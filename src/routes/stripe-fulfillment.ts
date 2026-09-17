@@ -587,6 +587,10 @@ export async function handleStripeWebhookEvent(
   // can retry; a throw once the call has started → provider_submitted_ambiguous
   // (pay-invoice MAY have signed; reconcile, never re-fire).
   let payInvoiceStarted = false
+  // Accounting acquired so far, so the pre-call error path can unwind it
+  // instead of leaving the shared pool / daily cap charged for a retry.
+  let poolReserved = false
+  let dailyReserved = false
   try {
     return await settleClaimedStripeInvoice()
   } catch (err) {
@@ -597,6 +601,12 @@ export async function handleStripeWebhookEvent(
         event: { kind: 'stripe_settlement_threw', detail },
       })
       return { ok: true, provider: 'stripe_crypto', status: 'provider_submitted_ambiguous', ambiguous: true }
+    }
+    try {
+      if (poolReserved) await bumpReserved(env, -invoiceAtomic)
+      if (dailyReserved) await releaseDailySpend(env, now, invoiceAtomic)
+    } catch {
+      // Best effort: the record release below is what re-opens the retry.
     }
     await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', null, {
       kind: 'stripe_claim_released_on_error',
@@ -655,6 +665,7 @@ export async function handleStripeWebhookEvent(
   // Reserve against the shared pool (accounting) now that we're committing to
   // the pay-invoice call.
   await bumpReserved(env, invoiceAtomic)
+  poolReserved = true
 
   // Atomically RESERVE the daily-spend headroom BEFORE signing (design §9). If
   // the reservation would exceed the daily cap, release everything and defer —
@@ -662,6 +673,7 @@ export async function handleStripeWebhookEvent(
   // spend to hand pay-invoice as spent_today_atomic.
   const spentBefore = await reserveDailySpend(env, now, invoiceAtomic)
   if (spentBefore === null) {
+    poolReserved = false
     await bumpReserved(env, -invoiceAtomic)
     await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', balance, {
       kind: 'daily_cap_reached',
@@ -669,6 +681,7 @@ export async function handleStripeWebhookEvent(
     })
     return { ok: true, deferred: 'daily_cap_reached', provider: 'stripe_crypto' }
   }
+  dailyReserved = true
 
   // Load the claimed record to read the locked binding + url for the call.
   const claimed = await loadStripeRecord(env, invoiceKey)
@@ -901,7 +914,11 @@ const RECONCILE_IN_FLIGHT = new Set<StripeRouterStatus>([
   'provider_submitted',
   'provider_submitted_ambiguous',
 ])
-const STRIPE_PAID_STATES = new Set(['fulfillment_complete', 'succeeded'])
+// Only the state the pay-stripe-crypto runbook documents as "merchant has been
+// credited". Earlier states (purchase_complete, fulfillment_initiated) mean the
+// customer leg landed but the merchant is not paid yet; `succeeded` is not a
+// documented Payin Session fulfillment state and is deliberately NOT accepted.
+const STRIPE_PAID_STATES = new Set(['fulfillment_complete'])
 const STRIPE_FAILED_STATES = new Set(['failed', 'canceled', 'error'])
 export const RECONCILE_MIN_INTERVAL_MS = 15_000
 
@@ -921,18 +938,20 @@ export async function reconcileStripeRecordWithProvider(
   if (!RECONCILE_IN_FLIGHT.has(rec.status)) return { checked: false, reason: 'not_in_flight' }
   if (!rec.stripeUrlEncrypted) return { checked: false, reason: 'no_capability' }
   const minInterval = opts.minIntervalMs ?? RECONCILE_MIN_INTERVAL_MS
-  const last = rec.lastProviderCheckAt ? Date.parse(rec.lastProviderCheckAt) : NaN
-  if (Number.isFinite(last) && now.getTime() - last < minInterval) {
-    return { checked: false, reason: 'throttled' }
-  }
   const nowIso = now.toISOString()
   const orderId = rec.orderId
 
-  // Stamp the check time FIRST so a failing provider call is throttled too.
-  await updateStripeRecord<true>(env, invoiceKey, orderId, (r) => {
+  // Claim the throttle interval INSIDE the CAS so concurrent status polls
+  // cannot all read the stale timestamp and each hit Stripe. Stamping first
+  // also throttles a failing provider call.
+  const claimed = await updateStripeRecord<boolean>(env, invoiceKey, orderId, (r) => {
+    if (!RECONCILE_IN_FLIGHT.has(r.status)) return { noop: false }
+    const last = r.lastProviderCheckAt ? Date.parse(r.lastProviderCheckAt) : NaN
+    if (Number.isFinite(last) && now.getTime() - last < minInterval) return { noop: false }
     r.lastProviderCheckAt = nowIso
     return { rec: r, result: true }
   })
+  if (!claimed) return { checked: false, reason: 'throttled' }
 
   let providerState: string
   let blockchainTxId: string | null = null

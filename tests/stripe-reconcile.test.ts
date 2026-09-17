@@ -9,6 +9,7 @@ import {
   handleStripeWebhookEvent,
   reconcileStripeRecordWithProvider,
   RECONCILE_MIN_INTERVAL_MS,
+  readDailySpentAtomic,
 } from '../src/routes/stripe-fulfillment'
 import { casRead } from '../src/routes/stripe-atomic'
 import { handleInvoiceStatus, handleRozoWebhook } from '../src/routes/webhook'
@@ -158,9 +159,36 @@ describe('reconcileStripeRecordWithProvider', () => {
     const env = makeEnv()
     await seed(env)
     await forceStatus(env, status)
-    mockStripe('succeeded')
+    mockStripe('fulfillment_complete')
     const out = await reconcileStripeRecordWithProvider(env, KEY, new Date())
     expect(out).toMatchObject({ transition: 'paid' })
+  })
+
+  it.each(['purchase_complete', 'fulfillment_initiated', 'succeeded', 'unknown_state'])(
+    'does NOT mark paid on %s (only fulfillment_complete proves the merchant was credited)',
+    async (state) => {
+      const env = makeEnv()
+      await seed(env)
+      await forceStatus(env, 'provider_submitted')
+      mockStripe(state)
+      const out = await reconcileStripeRecordWithProvider(env, KEY, new Date())
+      expect(out).toMatchObject({ checked: true, transition: null })
+      expect((await loadRec(env)).status).toBe('provider_submitted')
+    },
+  )
+
+  it('concurrent polls claim the throttle atomically: only one Stripe round-trip', async () => {
+    const env = makeEnv()
+    await seed(env)
+    await forceStatus(env, 'provider_paying')
+    const hits = mockStripe('processing')
+    const now = new Date('2026-09-17T08:20:00Z')
+    const outs = await Promise.all(
+      Array.from({ length: 5 }, () => reconcileStripeRecordWithProvider(env, KEY, now)),
+    )
+    expect(outs.filter((o) => o.checked).length).toBe(1)
+    expect(outs.filter((o) => !o.checked && o.reason === 'throttled').length).toBe(4)
+    expect(hits.filter((u) => u.includes('resume_payin_session')).length).toBe(1)
   })
 
   it('marks failed_provider when Stripe reports a failed/canceled session', async () => {
@@ -257,6 +285,54 @@ describe('handleStripeWebhookEvent safety net', () => {
     expect(rec.status).toBe('payout_seen')
     expect(rec.events.at(-1).kind).toBe('stripe_claim_released_on_error')
     expect(spy.mock.calls.some(([u]: any) => String(u.url ?? u).includes('pay-invoice'))).toBe(false)
+  })
+
+  it('a throw after reservations but before pay-invoice unwinds pool + daily ledger', async () => {
+    const env = makeEnv()
+    await seed(env)
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16).padStart(64, '0') }), { status: 200 }),
+    )
+    // Make the DO read that loads the claimed record (after both reservations)
+    // fail once, by breaking the capability decrypt input instead: simplest is
+    // to make the DO /read throw on the 4th+ call after reservations. Use a
+    // counter on the DO stub fetch.
+    const ns: any = env.ATOMIC_STORE
+    const stub = ns.get(null)
+    const realFetch = stub.fetch.bind(stub)
+    let armed = false
+    let fired = false
+    stub.fetch = async (req: Request) => {
+      const clone = req.clone()
+      const body: any = await clone.json()
+      if (armed && !fired && new URL(req.url).pathname === '/read' && String(body.key).startsWith('invoice-fulfillment:v2:')) {
+        fired = true
+        throw new Error('DO hiccup')
+      }
+      return realFetch(req)
+    }
+    // Arm once the daily ledger has been reserved (the last step before loadStripeRecord).
+    const origPut = (env.MPP_STORE as any).put
+    ;(env.MPP_STORE as any).put = async (k: string, v: string) => { await origPut(k, v) }
+    const now = new Date('2026-09-17T08:20:00Z')
+    // reserveDailySpend commits a stripe-daily-spent key via /commit; arm after that.
+    const realCommitFetch = stub.fetch
+    stub.fetch = async (req: Request) => {
+      const clone = req.clone()
+      const body: any = await clone.json()
+      if (!fired && new URL(req.url).pathname === '/commit' && String(body.key).startsWith('stripe-daily-spent:')) armed = true
+      return realCommitFetch(req)
+    }
+    const out = await handleStripeWebhookEvent(
+      env,
+      { eventId: 'e-unwind', eventType: 'payment_payout_completed', orderId: ORDER, rozoPaymentId: ROZO_ID, invoiceAmountStr: '1.38' },
+      now,
+    )
+    expect(out).toMatchObject({ deferred: 'settlement_error', retryable: true })
+    expect((await loadRec(env)).status).toBe('payout_seen')
+    // Both reservations unwound.
+    expect(await (env.MPP_STORE as any).get('funder-reserved-atomic')).toBe('0')
+    expect(await readDailySpentAtomic(env, now)).toBe(0n)
   })
 
   it('a throw AFTER the pay-invoice call started ends in provider_submitted_ambiguous (never re-fired)', async () => {
