@@ -3,9 +3,9 @@
  *
  * The policy is cut by product line and defaults off:
  *   - every invoice created through the mpprouter checkout endpoints pays the
- *     fee (checkout.rozo.ai, agent.rozo.ai, and any API caller), whatever the
- *     merchant on the pasted Coinbase/Stripe link. Rozo Intents integrators
- *     never reach this code — they use rozo-intents-api under their own appId;
+ *     default fee, except a server-authenticated checkout channel with an
+ *     explicit rate. Rozo Intents integrators never reach this code because
+ *     they use rozo-intents-api under their own appId;
  *   - the free-text `client` label is telemetry only. It is caller-supplied
  *     and unverified, so it must never decide whether someone pays;
  *   - an absent, malformed, non-integer, or out-of-range env value is 0 bps.
@@ -23,11 +23,13 @@ export const CHECKOUT_WEB_CLIENT = 'rozo-checkout-web'
 // in which receipts signed under the old rule are accepted under the new one.
 // v2 (2026-09-02): pricing no longer depends on the client label; receipts
 // signed by the v1 build (client-bound) are rejected and the client re-quotes.
-export const CHECKOUT_PRICING_VERSION = 'checkout-web-fee-v2'
+export const CHECKOUT_PRICING_VERSION = 'checkout-web-fee-v3'
 // This surface is approved only for the 1% canary. Keep a code-level ceiling
 // so a configuration typo cannot turn the narrow experiment into a 10%/100%
 // surcharge. A future increase requires a reviewed code change, not just a var.
 export const MAX_CHECKOUT_WEB_FEE_BPS = 100
+export const AGENT_BETA_CHANNEL = 'agent-beta'
+export const CHECKOUT_CHANNEL_PROOF_HEADER = 'x-rozo-checkout-channel-proof'
 
 const CLIENT_MAX_LEN = 64
 // Mirrors ATTRIBUTION_VALUE_RE in payment-api/utm-attribution.ts, plus `/` so
@@ -41,10 +43,8 @@ const CLIENT_UNSAFE = /[^A-Za-z0-9_.\- /]/g
 const FEE_EXEMPT_MERCHANTS: ReadonlySet<string> = new Set<string>([])
 
 /**
- * Whether an invoice for `merchant` pays the checkout service fee. The only
- * input is the merchant label on the resolved invoice: the caller's `client`
- * string is not consulted because it is self-declared. Single source of truth
- * for the create path and the signed-receipt replay check alike.
+ * Whether an invoice for `merchant` is eligible for the checkout service fee.
+ * The caller's `client` string is never consulted because it is self-declared.
  */
 export function isFeeEligibleMerchant(merchant: string): boolean {
   return !FEE_EXEMPT_MERCHANTS.has(merchant.trim())
@@ -56,6 +56,11 @@ export interface CheckoutPricing {
   callerPaysAtomic: bigint
   feeBps: number
   pricingVersion: typeof CHECKOUT_PRICING_VERSION
+}
+
+export interface TrustedCheckoutChannel {
+  id: typeof AGENT_BETA_CHANNEL
+  feeBps: number
 }
 
 /** Parse a non-negative decimal USDC amount to 6-decimal atomic units. */
@@ -95,6 +100,63 @@ export function parseCheckoutWebFeeBps(raw: unknown): number {
   return parsed
 }
 
+/** Channel overrides fail closed to the default checkout fee when misconfigured. */
+function parseChannelFeeBps(raw: unknown): number | null {
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null
+  const parsed = Number(raw.trim())
+  return Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= MAX_CHECKOUT_WEB_FEE_BPS
+    ? parsed
+    : null
+}
+
+const encoder = new TextEncoder()
+
+function base64UrlDecode(value: string): Uint8Array {
+  const padded = value.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(value.length / 4) * 4, '=')
+  const binary = atob(padded)
+  return Uint8Array.from(binary, (char) => char.charCodeAt(0))
+}
+
+async function refHash(ref: string): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(ref)))
+  let binary = ''
+  for (const byte of digest) binary += String.fromCharCode(byte)
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+async function verifyChannelProof(proof: string, ref: string, secret: string, now: number): Promise<boolean> {
+  const [payloadPart, signaturePart, extra] = proof.split('.')
+  if (!payloadPart || !signaturePart || extra) return false
+  try {
+    const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify'])
+    const valid = await crypto.subtle.verify('HMAC', key, base64UrlDecode(signaturePart), encoder.encode(payloadPart))
+    if (!valid) return false
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(payloadPart))) as Record<string, unknown>
+    return payload.v === 1 && payload.channel === AGENT_BETA_CHANNEL && payload.refHash === await refHash(ref) &&
+      typeof payload.iat === 'number' && typeof payload.exp === 'number' && payload.iat <= now + 30 && payload.exp > now
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Authenticate a server-side checkout channel. Browser-controlled client,
+ * Host and Origin values are deliberately ignored. Each discounted checkout
+ * gets its own secret so one surface cannot claim another surface's rate.
+ */
+export async function resolveTrustedCheckoutChannel(
+  request: Request,
+  ref: string,
+  config: { agentBetaSecret?: string; agentBetaFeeBps?: string },
+  now = Math.floor(Date.now() / 1000),
+): Promise<TrustedCheckoutChannel | null> {
+  const proof = request.headers.get(CHECKOUT_CHANNEL_PROOF_HEADER) ?? ''
+  const secret = config.agentBetaSecret?.trim() ?? ''
+  const feeBps = parseChannelFeeBps(config.agentBetaFeeBps)
+  if (!proof || !secret || feeBps === null || !(await verifyChannelProof(proof, ref, secret, now))) return null
+  return { id: AGENT_BETA_CHANNEL, feeBps }
+}
+
 const ATOMIC_PER_CENT = 10_000n
 // bps -> cents: divide by 10_000 (bps) and again by 10_000 (atomic per cent).
 const CENT_DIVISOR = 10_000n * ATOMIC_PER_CENT
@@ -117,8 +179,10 @@ export function resolveCheckoutPricing(
   originalAtomic: bigint,
   merchant: string,
   configuredFeeBps: unknown,
+  channelFeeBps?: number,
 ): CheckoutPricing {
-  const feeBps = isFeeEligibleMerchant(merchant) ? parseCheckoutWebFeeBps(configuredFeeBps) : 0
+  const configured = channelFeeBps ?? parseCheckoutWebFeeBps(configuredFeeBps)
+  const feeBps = isFeeEligibleMerchant(merchant) ? configured : 0
   const serviceFeeAtomic = computeServiceFeeAtomic(originalAtomic, feeBps)
   return {
     originalAtomic,

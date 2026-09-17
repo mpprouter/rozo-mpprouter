@@ -177,8 +177,9 @@ async function openRouterFeeReceipt(nowSeconds = Math.floor(Date.now() / 1000)) 
       serviceFee: '0.1',
       callerPays: '10.1',
       feeBps: 100,
-      pricingVersion: 'checkout-web-fee-v2',
+      pricingVersion: 'checkout-web-fee-v3',
       client: null,
+        channel: null,
     },
   )
 }

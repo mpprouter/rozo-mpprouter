@@ -449,9 +449,10 @@ function pricingFromReceipt(
   originalAtomic: bigint,
   merchant: string,
 ): CheckoutPricing | null {
-  // Pricing no longer depends on who the caller says they are, so the receipt
-  // carries no client identity: a v2 receipt minted with one is stale.
-  if (receipt?.v !== 2 || receipt.client !== null) return null
+  // v3 binds an authenticated server-side checkout channel. The legacy
+  // caller-supplied client label remains forbidden as a pricing identity.
+  if (receipt?.v !== 3 || receipt.client !== null) return null
+  if (receipt.channel !== null && receipt.channel !== 'agent-beta') return null
   if (
     receipt.pricingVersion !== CHECKOUT_PRICING_VERSION ||
     receipt.original === undefined ||
@@ -918,7 +919,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   }
 
   // Step 2: compute the browser-only fee (default off), or honor the exact
-  // signed v2 quote snapshot when the same client submits it within its TTL.
+  // signed v3 quote snapshot when the same client submits it within its TTL.
   let invoiceAtomic: bigint
   try {
     invoiceAtomic = parseUsdc(invoiceAmount)
@@ -946,7 +947,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     merchantName,
   )
   if (
-    (currentPricing.feeBps > 0 && receipt?.v === 2 && !receiptPricing) ||
+    (currentPricing.feeBps > 0 && receipt?.v === 3 && !receiptPricing) ||
     (receipt?.v === 1 && currentPricing.feeBps !== 0)
   ) {
     return quoteReceiptErrorResponse({ linkId })
@@ -1653,7 +1654,7 @@ export async function handleStripeCreateInvoice(
     invoice.merchantTitle,
   )
   if (
-    (currentPricing.feeBps > 0 && receipt?.v === 2 && !receiptPricing) ||
+    (currentPricing.feeBps > 0 && receipt?.v === 3 && !receiptPricing) ||
     (receipt?.v === 1 && currentPricing.feeBps !== 0)
   ) {
     return quoteReceiptErrorResponse({

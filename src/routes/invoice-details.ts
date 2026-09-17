@@ -29,6 +29,7 @@ import { loadStripeRecordForStatus, pickStripeRouterStateSafe } from './stripe-f
 import {
   formatUsdcAtomic,
   resolveCheckoutPricing,
+  resolveTrustedCheckoutChannel,
 } from './checkout-web-pricing'
 
 // Rate limits (design doc §5.1). Per-IP protects the endpoint; the per-invoice
@@ -286,10 +287,15 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
     // elsewhere" without a second round trip. Response shape is otherwise
     // unchanged (pricing fields stay for display).
     const known = invoice.payable ? null : await knownStripeInvoice(env, rawUrl, invoice.invoiceKey)
+    const channel = await resolveTrustedCheckoutChannel(request, `stripe:${rawUrl}`, {
+      agentBetaSecret: env.CHECKOUT_AGENT_BETA_CHANNEL_SECRET,
+      agentBetaFeeBps: env.CHECKOUT_AGENT_BETA_FEE_BPS,
+    })
     const pricing = resolveCheckoutPricing(
       BigInt(invoice.stablecoinAmountAtomic),
       invoice.merchantTitle,
       env.CHECKOUT_WEB_FEE_BPS,
+      channel?.feeBps,
     )
     const pricingFields = {
       original: formatUsdcAtomic(pricing.originalAtomic),
@@ -315,7 +321,7 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
           invoice.merchantTitle,
           env.PAYINVOICE_ADMIN_SECRET,
           Math.floor(Date.now() / 1000),
-          { ...pricingFields, client: null },
+          { ...pricingFields, client: null, channel: channel?.id ?? null },
         )
       : null
     return json(200, {

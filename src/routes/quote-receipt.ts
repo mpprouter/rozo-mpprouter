@@ -9,7 +9,7 @@ const RECEIPT_TTL_SECONDS = 600
 const encoder = new TextEncoder()
 
 export interface QuoteReceiptPayload {
-  v: 1 | 2
+  v: 1 | 2 | 3
   paymentId: string
   amount: string
   merchant: string
@@ -20,6 +20,8 @@ export interface QuoteReceiptPayload {
   feeBps?: number
   pricingVersion?: string
   client?: string | null
+  /** Authenticated server-side checkout identity. Present on v3 receipts. */
+  channel?: string | null
   iat: number
   exp: number
 }
@@ -31,6 +33,7 @@ export interface QuoteReceiptPricing {
   feeBps: number
   pricingVersion: string
   client: string | null
+  channel?: string | null
 }
 
 function base64UrlEncode(bytes: Uint8Array): string {
@@ -64,7 +67,7 @@ export async function createQuoteReceipt(
   pricing?: QuoteReceiptPricing,
 ): Promise<string> {
   const payload: QuoteReceiptPayload = {
-    v: pricing ? 2 : 1,
+    v: pricing ? (Object.prototype.hasOwnProperty.call(pricing, 'channel') ? 3 : 2) : 1,
     paymentId,
     amount,
     merchant,
@@ -103,7 +106,7 @@ export async function verifyQuoteReceipt(
       new TextDecoder().decode(base64UrlDecode(encodedPayload)),
     ) as Partial<QuoteReceiptPayload>
     if (
-      (payload.v !== 1 && payload.v !== 2) ||
+      (payload.v !== 1 && payload.v !== 2 && payload.v !== 3) ||
       payload.paymentId !== expectedPaymentId ||
       typeof payload.amount !== 'string' ||
       typeof payload.merchant !== 'string' ||
@@ -116,7 +119,7 @@ export async function verifyQuoteReceipt(
       return null
     }
     if (
-      payload.v === 2 &&
+      (payload.v === 2 || payload.v === 3) &&
       (typeof payload.original !== 'string' ||
         typeof payload.serviceFee !== 'string' ||
         typeof payload.callerPays !== 'string' ||
@@ -130,6 +133,7 @@ export async function verifyQuoteReceipt(
     ) {
       return null
     }
+    if (payload.v === 3 && payload.channel !== null && typeof payload.channel !== 'string') return null
     return payload as QuoteReceiptPayload
   } catch {
     return null

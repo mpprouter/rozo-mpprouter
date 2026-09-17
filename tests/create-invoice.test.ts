@@ -19,7 +19,22 @@ import {
   isFeeEligibleMerchant,
   parseCheckoutWebFeeBps,
   resolveCheckoutPricing,
+  resolveTrustedCheckoutChannel,
 } from '../src/routes/checkout-web-pricing'
+
+async function channelProof(ref: string, secret: string, now = Math.floor(Date.now() / 1000)): Promise<string> {
+  const encoder = new TextEncoder()
+  const b64 = (bytes: Uint8Array) => {
+    let binary = ''
+    for (const byte of bytes) binary += String.fromCharCode(byte)
+    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  }
+  const refHash = b64(new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(ref))))
+  const payload = b64(encoder.encode(JSON.stringify({ v: 1, channel: 'agent-beta', refHash, iat: now, exp: now + 60 })))
+  const key = await crypto.subtle.importKey('raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign'])
+  const signature = new Uint8Array(await crypto.subtle.sign('HMAC', key, encoder.encode(payload)))
+  return `${payload}.${b64(signature)}`
+}
 
 describe('quote receipt', () => {
   it('round-trips a signed quote and binds it to the payment id', async () => {
@@ -61,7 +76,7 @@ describe('quote receipt', () => {
     ).resolves.toBeNull()
   })
 
-  it('rejects a signed v2 receipt above the code-level 100 bps ceiling', async () => {
+  it('rejects a signed v3 receipt above the code-level 100 bps ceiling', async () => {
     const receipt = await createQuoteReceipt(
       'pl_test123',
       '10',
@@ -73,8 +88,9 @@ describe('quote receipt', () => {
         serviceFee: '0.101',
         callerPays: '10.101',
         feeBps: 101,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     await expect(
@@ -149,14 +165,15 @@ describe('quote receipt', () => {
         serviceFee: '0.11',
         callerPays: '10.12',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
       })
       expect(body.quote.callerPaysAtomicUsdc).toBe('10120000')
       await expect(
         verifyQuoteReceipt(body.quoteReceipt, 'pl_fee_quote', 'test-secret'),
       ).resolves.toMatchObject({
-        v: 2,
+        v: 3,
         client: null,
+        channel: null,
         original: '10.01',
         serviceFee: '0.11',
         callerPays: '10.12',
@@ -203,6 +220,69 @@ describe('quote receipt', () => {
 })
 
 describe('browser checkout fee policy', () => {
+  it('authenticates only a fresh proof bound to the exact invoice reference', async () => {
+    const proof = await channelProof('coinbase:pl_x', 'server-only-secret', 1_000)
+    const config = { agentBetaSecret: 'server-only-secret', agentBetaFeeBps: '0' }
+    await expect(resolveTrustedCheckoutChannel(
+      new Request('https://mpp.test', { headers: { 'x-rozo-checkout-channel-proof': proof } }),
+      'coinbase:pl_x',
+      config,
+      1_001,
+    )).resolves.toEqual({ id: 'agent-beta', feeBps: 0 })
+    await expect(resolveTrustedCheckoutChannel(
+      new Request('https://mpp.test', { headers: { 'x-rozo-checkout-channel-proof': proof } }),
+      'coinbase:pl_other',
+      config,
+      1_001,
+    )).resolves.toBeNull()
+    await expect(resolveTrustedCheckoutChannel(
+      new Request('https://mpp.test', { headers: { 'x-rozo-checkout-channel-proof': proof } }),
+      'coinbase:pl_x',
+      { ...config, agentBetaFeeBps: 'not-a-rate' },
+      1_001,
+    )).resolves.toBeNull()
+  })
+
+  it('uses the authenticated Agent rate while a spoofed client label stays on the default rate', async () => {
+    const { handleQuoteInvoice } = await import('../src/routes/pay-invoice-admin')
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async () => Response.json({
+      linkId: 'pl_channel_fee',
+      merchant: 'OpenRouter, Inc.',
+      invoice: { amount: '10' },
+    })) as typeof fetch
+    const env = {
+      PAYINVOICE_ADMIN_SECRET: 'test-secret',
+      CHECKOUT_WEB_FEE_BPS: '100',
+      CHECKOUT_AGENT_BETA_CHANNEL_SECRET: 'server-only-secret',
+      CHECKOUT_AGENT_BETA_FEE_BPS: '0',
+    } as import('../src/index').Env
+    try {
+      const spoofed = await handleQuoteInvoice(new Request('https://mpp.test/quote-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ payment_id: 'pl_channel_fee', client: 'agent-beta' }),
+      }), env)
+      expect(await spoofed.json()).toMatchObject({ feeBps: 100, serviceFee: '0.1' })
+
+      const proof = await channelProof('coinbase:pl_channel_fee', 'server-only-secret')
+      const authenticated = await handleQuoteInvoice(new Request('https://mpp.test/quote-invoice', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-rozo-checkout-channel-proof': proof,
+        },
+        body: JSON.stringify({ payment_id: 'pl_channel_fee', client: 'anything' }),
+      }), env)
+      const body = await authenticated.json() as any
+      expect(body).toMatchObject({ feeBps: 0, serviceFee: '0', callerPays: '10' })
+      await expect(verifyQuoteReceipt(body.quoteReceipt, 'pl_channel_fee', 'test-secret'))
+        .resolves.toMatchObject({ v: 3, channel: 'agent-beta', feeBps: 0 })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('charges every merchant on the checkout product line; the exemption set is empty', () => {
     for (const merchant of [
       'OpenRouter, Inc.',
@@ -756,8 +836,9 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     for (const source of [
@@ -779,7 +860,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
       })
       expect(createBody.type === 'exactOut'
         ? createBody.destination.amount
@@ -790,7 +871,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
       })
     }
   })
@@ -847,7 +928,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(createBody.source.amount).toBe('77')
   })
 
-  it('honors the exact signed v2 browser price across quote → create', async () => {
+  it('honors the exact signed v3 browser price across quote → create', async () => {
     const quoteReceipt = await createQuoteReceipt(
       'pl_test123',
       '77',
@@ -859,8 +940,9 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '0.77',
         callerPays: '77.77',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     // Even if the env changes during the receipt's 60-second TTL, the signed
@@ -876,10 +958,38 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(createBody.source.amount).toBe('77.77')
   })
 
+  it('honors a signed agent-beta zero-fee receipt while the default remains 1%', async () => {
+    const quoteReceipt = await createQuoteReceipt(
+      'pl_test123',
+      '77',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '77',
+        serviceFee: '0',
+        callerPays: '77',
+        feeBps: 0,
+        pricingVersion: 'checkout-web-fee-v3',
+        client: null,
+        channel: 'agent-beta',
+      },
+    )
+    const { status, json, createBody, quoteFetches } = await run({
+      payment_id: 'pl_test123',
+      client: 'rozo-checkout-agent/0.1.0',
+      quoteReceipt,
+    }, '100')
+    expect(status).toBe(200)
+    expect(quoteFetches).toBe(0)
+    expect(json).toMatchObject({ original: '77', serviceFee: '0', callerPays: '77', feeBps: 0 })
+    expect(createBody.source.amount).toBe('77')
+  })
+
   it('rejects a receipt signed under the previous pricing version once the fee is on', async () => {
     // Regression for the cross-deploy window: a receipt minted by the earlier
     // build carried pricingVersion v1 and could be zero-fee. It must not be
-    // honoured under v2 even though its signature and amounts still verify.
+    // honoured under v3 even though its signature and amounts still verify.
     const quoteReceipt = await createQuoteReceipt(
       'pl_test123',
       '105',
@@ -893,6 +1003,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         feeBps: 0,
         pricingVersion: 'checkout-web-fee-v1',
         client: null,
+        channel: null,
       },
     )
     const { status, json, createBody } = await run({
@@ -963,8 +1074,9 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         serviceFee: '0',
         callerPays: '77',
         feeBps: 0,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     const { status, json, createBody } = await run({
@@ -1487,8 +1599,9 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     const { status, json, checkoutBody } = await runReuse(
@@ -1517,7 +1630,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
           serviceFee: '1.05',
           callerPays: '106.05',
           feeBps: 100,
-          pricingVersion: 'checkout-web-fee-v2',
+          pricingVersion: 'checkout-web-fee-v3',
         },
       },
       { payment_id: 'pl_test123', source: { chainId: '1500', tokenSymbol: 'USDC' } },
@@ -1538,8 +1651,9 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
         serviceFee: '1.05',
         callerPays: '106.05',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     const { status, json, createBody } = await runReuse(

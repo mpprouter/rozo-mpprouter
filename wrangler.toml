@@ -157,10 +157,11 @@ migrations_dir = "migrations-metrics"
 PROVIDERS_ENDPOINT_ENABLED = "true"
 # Hostname suffix for router-hosted paywalls (services/provider-hosting.ts).
 PROVIDER_HOSTED_SUFFIX = "-pay.mpprouter.dev"
-# Browser-only OpenRouter fee canary. Founder activated the 1% canary on
-# 2026-09-02 (Sep 6 gate: >=30 orders, $600 GMV, conversion drop <=20%).
+# Default checkout fee. checkout.rozo.ai and the existing agent.rozo.ai use
+# this rate. Authenticated agent-beta uses its explicit rate below.
 # Invalid/missing values resolve to 0 in code; set back to "0" to roll back.
 CHECKOUT_WEB_FEE_BPS = "100"
+CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 STELLAR_NETWORK = "stellar:pubnet"
 STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
 # Comma-separated POOL, round-robined per request (src/mpp/tempo-rpc.ts).

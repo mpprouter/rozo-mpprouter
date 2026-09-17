@@ -176,8 +176,9 @@ async function openRouterFeeReceipt(nowSeconds = Math.floor(Date.now() / 1000)) 
       serviceFee: '0.1',
       callerPays: '10.1',
       feeBps: 100,
-      pricingVersion: 'checkout-web-fee-v2',
+      pricingVersion: 'checkout-web-fee-v3',
       client: null,
+        channel: null,
     },
   )
 }
@@ -254,7 +255,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
       expiresAt: '2999-01-01T00:00:00.000Z',
       paymentLink: 'https://pay.rozo.ai/existing',
       source: { chainId: '1500', tokenSymbol: 'USDC', receiverAddress: 'GHUB', receiverMemo: '123' },
-      metadata: { internal: { original: '10', serviceFee: '0', callerPays: '10', feeBps: 0, pricingVersion: 'checkout-web-fee-v2' } },
+      metadata: { internal: { original: '10', serviceFee: '0', callerPays: '10', feeBps: 0, pricingVersion: 'checkout-web-fee-v3' } },
     }
     const { status, json } = await createInvoice({
       url: STRIPE_URL,
@@ -276,7 +277,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
       expiresAt: '2999-01-01T00:00:00.000Z',
       paymentLink: 'https://pay.rozo.ai/existing',
       source: { chainId: '1500', tokenSymbol: 'USDC', receiverAddress: 'CPERPAY', receiverAddressContract: 'CBRIDGE', receiverMemoContract: 'memo_1' },
-      metadata: { internal: { original: '10', serviceFee: '0', callerPays: '10', feeBps: 0, pricingVersion: 'checkout-web-fee-v2' } },
+      metadata: { internal: { original: '10', serviceFee: '0', callerPays: '10', feeBps: 0, pricingVersion: 'checkout-web-fee-v3' } },
     }
     const { status, json } = await createInvoice({
       url: STRIPE_URL,
@@ -294,7 +295,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
       expiresAt: '2999-01-01T00:00:00.000Z',
       paymentLink: 'https://pay.rozo.ai/existing',
       source: { chainId: '1500', tokenSymbol: 'USDC', receiverAddress: 'CPERPAY', receiverAddressContract: 'CBRIDGE', receiverMemoContract: 'memo_1' },
-      metadata: { internal: { original: '10', serviceFee: '0', callerPays: '10', feeBps: 0, pricingVersion: 'checkout-web-fee-v2' } },
+      metadata: { internal: { original: '10', serviceFee: '0', callerPays: '10', feeBps: 0, pricingVersion: 'checkout-web-fee-v3' } },
     }
     const { status, json } = await createInvoice({
       url: STRIPE_URL,
@@ -341,7 +342,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
       })
       expect(createdIntent.type === 'exactOut'
         ? createdIntent.destination.amount
@@ -353,7 +354,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
       })
     }
   })
@@ -375,7 +376,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
       serviceFee: '0.1',
       callerPays: '10.1',
       feeBps: 100,
-      pricingVersion: 'checkout-web-fee-v2',
+      pricingVersion: 'checkout-web-fee-v3',
     })
     await expect(
       verifyQuoteReceipt(body.quoteReceipt, 'cpis_test123', 'test-admin-secret'),
@@ -384,6 +385,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
       serviceFee: '0.1',
       callerPays: '10.1',
       client: null,
+        channel: null,
     })
   })
 
@@ -431,8 +433,9 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         serviceFee: '0',
         callerPays: '10',
         feeBps: 0,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     for (const quoteReceipt of ['tampered.receipt', clientMismatched]) {
@@ -460,8 +463,9 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
 
@@ -543,8 +547,9 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     existingIntent = {
@@ -579,8 +584,9 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
         client: null,
+        channel: null,
       },
     )
     existingIntent = {
@@ -616,7 +622,7 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
         serviceFee: '0.1',
         callerPays: '10.1',
         feeBps: 100,
-        pricingVersion: 'checkout-web-fee-v2',
+        pricingVersion: 'checkout-web-fee-v3',
       },
     }
 
