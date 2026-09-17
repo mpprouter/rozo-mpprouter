@@ -5,6 +5,7 @@ import {
   formatUsdcAtomic,
   parseUsdcAtomic,
   resolveCheckoutPricing,
+  resolveTrustedCheckoutChannel,
 } from './checkout-web-pricing'
 
 // ── Error code constants ─────────────────────────────────────────────────────
@@ -459,10 +460,15 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       link_id_detected,
     })
   }
+  const channel = await resolveTrustedCheckoutChannel(request, `coinbase:${paymentId}`, {
+    agentBetaSecret: env.CHECKOUT_AGENT_BETA_CHANNEL_SECRET,
+    agentBetaFeeBps: env.CHECKOUT_AGENT_BETA_FEE_BPS,
+  })
   const pricing = resolveCheckoutPricing(
     originalAtomic,
     merchant,
     env.CHECKOUT_WEB_FEE_BPS,
+    channel?.feeBps,
   )
   const pricingFields = {
     original: formatUsdcAtomic(pricing.originalAtomic),
@@ -478,7 +484,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     merchant,
     env.PAYINVOICE_ADMIN_SECRET,
     Math.floor(Date.now() / 1000),
-    { ...pricingFields, client: null },
+    { ...pricingFields, client: null, channel: channel?.id ?? null },
   )
   // Display fields, so a client can render the full invoice card from the quote
   // alone — before any order exists. `merchant` and `linkId` already reach the
