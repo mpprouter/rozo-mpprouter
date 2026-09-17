@@ -341,9 +341,9 @@ export async function releaseDailySpend(
 
 // The Stripe branch of the Supabase pay-invoice edge function REQUIRES the
 // locked binding + daily ledger before it will sign (design §9). It is
-// fail-closed: unless STRIPE_FULFILLMENT_DISABLED=0 is set on that function it
-// returns 403 and signs nothing — which is the expected state for this shadow
-// phase.
+// fail-closed: unless STRIPE_FULFILLMENT_ENABLED=true is set on that function it
+// returns 403 and signs nothing. It has been enabled in production since
+// 2026-08-18; the 403 handling below stays as the kill-switch path.
 export const STRIPE_PAY_INVOICE_DEFAULT_URL = 'https://agentapi.rozo.ai/pay-invoice'
 
 export interface StripePayInvoiceResult {

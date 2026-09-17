@@ -238,12 +238,15 @@ MERCURYDATA_X402_ADDRESS = "GC5KJLF3UOKRWWWQCRGNXP4A3CFBNUD6ZQFVSJNBA4UVNICZXPBL
 # UPI invoice payment (MuggleLink → router). CSV of providers the UPI channel
 # may settle: coinbase_v1, coinbase_v3, stripe_crypto. Unset/empty ⇒ resolve
 # reports every invoice payable=false (reason provider_disabled) and
-# verified-pay-in refuses to execute — fail closed. stripe_crypto is NOT listed
-# because the Stripe signing branch of pay-invoice is itself fail-closed
-# disabled; add it only once that branch is enabled, or every captured UPI
-# payment for a Stripe invoice would end in the refund path.
+# verified-pay-in refuses to execute — fail closed. stripe_crypto is listed
+# because the Stripe signing branch of pay-invoice has been enabled in
+# production since 2026-08-18 (STRIPE_FULFILLMENT_ENABLED=true on project
+# wlfqutceffdblxbdgygs, real E2E to fulfillment_complete); it still honours
+# that function's own merchant/amount lock and daily cap. If that branch is
+# ever switched off again, remove stripe_crypto here first, or every captured
+# UPI payment for a Stripe invoice would end in the refund path.
 # See src/routes/upi-invoice.ts.
-UPI_PROVIDERS_ENABLED = "coinbase_v1,coinbase_v3"
+UPI_PROVIDERS_ENABLED = "coinbase_v1,coinbase_v3,stripe_crypto"
 # Seconds of validity an invoice must still have at resolve time (default 900).
 UPI_MIN_VALIDITY_S = "900"
 
