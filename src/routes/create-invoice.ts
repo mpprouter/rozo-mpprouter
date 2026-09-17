@@ -759,17 +759,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         message: 'Stripe invoice requires a url.',
       })
     }
-    if (payinIntent) {
-      // The Stripe branch builds its own intents body and does not carry the
-      // intent through; dropping it silently would hand the caller a classic
-      // G-address order they did not ask for (same rationale as source above).
-      return errorResponse(400, {
-        code: 'INVALID_INTENT',
-        message: 'intent "stellar_payin_contracts" is not supported for Stripe invoices yet.',
-        normalized_input: normalized,
-        link_id_detected,
-      })
-    }
     return handleStripeCreateInvoice(
       stripeUrl,
       env,
@@ -777,6 +766,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       provenance,
       typeof receiptRaw === 'string' ? receiptRaw : null,
       forwardedHint,
+      payinIntent,
     )
   }
 
@@ -1562,6 +1552,17 @@ export async function handleStripeCreateInvoice(
   provenance: CallerProvenance = {},
   quoteReceiptRaw: string | null = null,
   forwardedHint: string | null = null,
+  // Stellar contract pay-in (ROZO smart wallet). Passed through to the intents
+  // body on create so upstream freezes the order in contract mode and exposes
+  // receiverAddressContract + receiverMemoContract. Unlike the Coinbase branch
+  // there is no classic→contract supersede here: the Stripe fulfillment lock is
+  // keyed by invoiceKey/orderId, so a contract caller who meets a reused classic
+  // order gets a 409 INTENT_MISMATCH (a smart wallet cannot pay a G-address +
+  // memo, so a 200 with a warning would be an unpayable success) instead of a
+  // sibling order under a variant orderId. The reverse case (no intent, row is
+  // contract-mode) stays a 200 + intentMismatch warning: a classic wallet can
+  // still be told which rail to pay.
+  payinIntent: 'stellar_payin_contracts' | null = null,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -1749,6 +1750,9 @@ export async function handleStripeCreateInvoice(
   }
   let sourceRotated = false
   let rotationFailure: string | null = null
+  // Requested pay-in mode vs the frozen mode of a reused order (see the
+  // Coinbase branch for the two-sided rationale).
+  let intentMismatch = false
 
   if (existing) {
     // The order is unpaid, so if this caller wants a different chain/token we
@@ -1796,6 +1800,28 @@ export async function handleStripeCreateInvoice(
         rozoPaymentId: row?.id ?? existing?.id ?? null,
         status: postRotationStatus,
         expiresAt: row?.expiresAt ?? existing?.expiresAt ?? null,
+      })
+    }
+    const rowIsContractMode = Boolean(row?.source?.receiverAddressContract)
+    intentMismatch = (payinIntent !== null) !== rowIsContractMode
+    if (intentMismatch && payinIntent !== null) {
+      return json(409, {
+        ok: false,
+        provider: 'stripe_crypto',
+        code: 'INTENT_MISMATCH',
+        error: {
+          code: 'INTENT_MISMATCH',
+          message:
+            'This invoice already has an unpaid order created without ' +
+            '"stellar_payin_contracts", and the pay-in mode cannot be changed ' +
+            'after creation. Wait for that order to expire, or pay it from a ' +
+            'classic Stellar wallet using raw.source (receiverAddress + receiverMemo).',
+        },
+        invoiceKey: invoice.invoiceKey,
+        rozoPaymentId: row?.id ?? existing?.id ?? null,
+        expiresAt: row?.expiresAt ?? existing?.expiresAt ?? null,
+        source: { chainId: reusedSource.chainId, tokenSymbol: reusedSource.tokenSymbol },
+        raw: row ?? existing ?? null,
       })
     }
     rozoPaymentId = row?.id ?? existing?.id ?? null
@@ -1851,6 +1877,9 @@ export async function handleStripeCreateInvoice(
             tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
           },
           metadata: lockedMetadata,
+          // Optional Stellar contract pay-in — validated by handleCreateInvoice
+          // (Stellar source only). Same field the Coinbase branch sends.
+          ...(payinIntent ? { intent: payinIntent } : {}),
         }
     let intentsResp: Response
     try {
@@ -1931,6 +1960,16 @@ export async function handleStripeCreateInvoice(
   if (reused && rotationFailure) {
     warnings.push(sourceMismatchWarning(reusedSource, source, rotationFailure))
   }
+  if (intentMismatch) {
+    // Only the "no intent, contract-mode row" direction reaches here; the
+    // other direction returned 409 INTENT_MISMATCH above.
+    warnings.push(
+      'The existing unpaid order for this invoice was created with intent ' +
+        '"stellar_payin_contracts" (contract pay-in): pay via the contract ' +
+        'rail in raw.source (receiverAddressContract + receiverMemoContract), ' +
+        'NOT a classic G-address payment.',
+    )
+  }
 
   return json(200, {
     ok: true,
@@ -1945,6 +1984,7 @@ export async function handleStripeCreateInvoice(
       : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
     ...(sourceRotated ? { sourceRotated: true } : {}),
     ...(rotationFailure ? { sourceMismatch: true } : {}),
+    ...(intentMismatch ? { intentMismatch: true } : {}),
     ...(warnings.length ? { warnings } : {}),
     invoiceKey: invoice.invoiceKey,
     merchant: invoice.merchantTitle,
