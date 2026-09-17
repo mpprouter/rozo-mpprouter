@@ -450,7 +450,9 @@ export async function normalizeStripeSession(session: StripePayinSession): Promi
     state,
     payable,
     payableReason,
-    validBefore: typeof session.valid_before === 'string' ? session.valid_before : null,
+    // Stripe reports valid_before as epoch seconds (string); normalise to ISO
+    // so the model's contract holds and UPI resolve can compare it.
+    validBefore: toIsoTimestamp(session.valid_before),
     settlement: {
       chainId: '8453',
       network: 'base',
