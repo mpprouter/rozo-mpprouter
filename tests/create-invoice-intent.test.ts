@@ -520,10 +520,10 @@ describe('create-invoice — stellar_payin_contracts intent', () => {
     expect(createdIntent.orderId).toBe(`${PAYMENT_ID}__contract2`)
   })
 
-  it('rejects the intent on Stripe invoices instead of silently dropping it', async () => {
+  it('still rejects the intent on Stripe invoices for a non-Stellar source', async () => {
     const { status, json } = await createInvoice({
       url: 'https://crypto.stripe.com/pay/CDMTestBlob_ABC123xyz',
-      source: STELLAR_SOURCE,
+      source: { chainId: '8453', tokenSymbol: 'USDC' },
       intent: 'stellar_payin_contracts',
     })
     expect(status).toBe(400)

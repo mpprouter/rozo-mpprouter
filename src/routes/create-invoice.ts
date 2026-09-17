@@ -759,17 +759,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         message: 'Stripe invoice requires a url.',
       })
     }
-    if (payinIntent) {
-      // The Stripe branch builds its own intents body and does not carry the
-      // intent through; dropping it silently would hand the caller a classic
-      // G-address order they did not ask for (same rationale as source above).
-      return errorResponse(400, {
-        code: 'INVALID_INTENT',
-        message: 'intent "stellar_payin_contracts" is not supported for Stripe invoices yet.',
-        normalized_input: normalized,
-        link_id_detected,
-      })
-    }
     return handleStripeCreateInvoice(
       stripeUrl,
       env,
@@ -777,6 +766,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       provenance,
       typeof receiptRaw === 'string' ? receiptRaw : null,
       forwardedHint,
+      payinIntent,
     )
   }
 
@@ -1562,6 +1552,14 @@ export async function handleStripeCreateInvoice(
   provenance: CallerProvenance = {},
   quoteReceiptRaw: string | null = null,
   forwardedHint: string | null = null,
+  // Stellar contract pay-in (ROZO smart wallet). Passed through to the intents
+  // body on create so upstream freezes the order in contract mode and exposes
+  // receiverAddressContract + receiverMemoContract. Unlike the Coinbase branch
+  // there is no classic→contract supersede here: the Stripe fulfillment lock is
+  // keyed by invoiceKey/orderId, so a reused classic order is reported via
+  // intentMismatch (the caller pays the address + memo rail shown in raw.source)
+  // instead of minting a sibling order under a variant orderId.
+  payinIntent: 'stellar_payin_contracts' | null = null,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -1749,6 +1747,9 @@ export async function handleStripeCreateInvoice(
   }
   let sourceRotated = false
   let rotationFailure: string | null = null
+  // Requested pay-in mode vs the frozen mode of a reused order (see the
+  // Coinbase branch for the two-sided rationale).
+  let intentMismatch = false
 
   if (existing) {
     // The order is unpaid, so if this caller wants a different chain/token we
@@ -1798,6 +1799,8 @@ export async function handleStripeCreateInvoice(
         expiresAt: row?.expiresAt ?? existing?.expiresAt ?? null,
       })
     }
+    const rowIsContractMode = Boolean(row?.source?.receiverAddressContract)
+    intentMismatch = (payinIntent !== null) !== rowIsContractMode
     rozoPaymentId = row?.id ?? existing?.id ?? null
     paymentLink = row?.paymentLink ?? row?.url ?? row?.payment_link ?? null
     expiresAt = row?.expiresAt ?? existing?.expiresAt ?? null
@@ -1851,6 +1854,9 @@ export async function handleStripeCreateInvoice(
             tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
           },
           metadata: lockedMetadata,
+          // Optional Stellar contract pay-in — validated by handleCreateInvoice
+          // (Stellar source only). Same field the Coinbase branch sends.
+          ...(payinIntent ? { intent: payinIntent } : {}),
         }
     let intentsResp: Response
     try {
@@ -1931,6 +1937,19 @@ export async function handleStripeCreateInvoice(
   if (reused && rotationFailure) {
     warnings.push(sourceMismatchWarning(reusedSource, source, rotationFailure))
   }
+  if (intentMismatch) {
+    warnings.push(
+      payinIntent !== null
+        ? 'Requested intent "stellar_payin_contracts", but this unpaid order was ' +
+          'created without it and the pay-in mode cannot be changed after ' +
+          'creation. Pay the source shown in raw.source (receiverAddress + ' +
+          'receiverMemo for Stellar).'
+        : 'The existing unpaid order for this invoice was created with intent ' +
+          '"stellar_payin_contracts" (contract pay-in): pay via the contract ' +
+          'rail in raw.source (receiverAddressContract + receiverMemoContract), ' +
+          'NOT a classic G-address payment.',
+    )
+  }
 
   return json(200, {
     ok: true,
@@ -1945,6 +1964,7 @@ export async function handleStripeCreateInvoice(
       : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
     ...(sourceRotated ? { sourceRotated: true } : {}),
     ...(rotationFailure ? { sourceMismatch: true } : {}),
+    ...(intentMismatch ? { intentMismatch: true } : {}),
     ...(warnings.length ? { warnings } : {}),
     invoiceKey: invoice.invoiceKey,
     merchant: invoice.merchantTitle,
