@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
 import {
   normalizePayInvoiceBody,
   type PayInvoiceErrorCode,
@@ -670,6 +671,11 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const clientRaw = (parsed as Record<string, unknown> | null)?.client
   const clientLabel = resolveClient(clientRaw)
   if (clientLabel) provenance.client = clientLabel
+  // Kept OUT of `provenance`: that object is spread into order metadata, which
+  // GET /payments/{id} returns to anyone holding the id. The hint (UA, IP) goes
+  // upstream as a header only; payment-api files it under its server-only
+  // `internal` namespace.
+  const forwardedHint = forwardedClientHintHeader(request, clientLabel)
 
   // Channel attribution rides as a top-level intent field, untouched. The web
   // checkout has been sending it since launch and this route dropped it, so
@@ -770,6 +776,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       source,
       provenance,
       typeof receiptRaw === 'string' ? receiptRaw : null,
+      forwardedHint,
     )
   }
 
@@ -1310,10 +1317,13 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   try {
     intentsResp = await fetch(ROZO_INTENTS_URL, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'X-API-Key': env.ROZO_INTENTS_API_KEY,
-      },
+      headers: withForwardedClientHint(
+        {
+          'content-type': 'application/json',
+          'X-API-Key': env.ROZO_INTENTS_API_KEY,
+        },
+        forwardedHint,
+      ),
       body: JSON.stringify(intentsBody),
     })
   } catch (err: any) {
@@ -1551,6 +1561,7 @@ export async function handleStripeCreateInvoice(
   source: ResolvedSource,
   provenance: CallerProvenance = {},
   quoteReceiptRaw: string | null = null,
+  forwardedHint: string | null = null,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -1845,7 +1856,10 @@ export async function handleStripeCreateInvoice(
     try {
       intentsResp = await fetch(ROZO_INTENTS_URL, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'X-API-Key': env.ROZO_INTENTS_API_KEY },
+        headers: withForwardedClientHint(
+          { 'content-type': 'application/json', 'X-API-Key': env.ROZO_INTENTS_API_KEY },
+          forwardedHint,
+        ),
         body: JSON.stringify(intentsBody),
       })
     } catch (err: any) {
