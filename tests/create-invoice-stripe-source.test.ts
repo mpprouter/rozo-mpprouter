@@ -247,7 +247,7 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
     expect(createdIntent.intent).toBeUndefined()
   })
 
-  it('flags intentMismatch when the intent is requested but the reused Stripe order is classic', async () => {
+  it('returns 409 INTENT_MISMATCH when the intent is requested but the reused Stripe order is classic', async () => {
     existingIntent = {
       id: 'rozo-existing',
       status: 'payment_unpaid',
@@ -261,11 +261,30 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
       source: { chainId: '1500', tokenSymbol: 'USDC' },
       intent: 'stellar_payin_contracts',
     })
-    expect(status).toBe(200)
-    expect(json.reused).toBe(true)
-    expect(json.intentMismatch).toBe(true)
+    expect(status).toBe(409)
+    expect(json.ok).toBe(false)
+    expect(json.code).toBe('INTENT_MISMATCH')
+    expect(json.rozoPaymentId).toBe('rozo-existing')
     expect(createdIntent).toBeNull()
-    expect(json.warnings.join(' ')).toContain('cannot be changed after creation')
+    expect(JSON.stringify(json)).not.toContain('crypto.stripe.com')
+  })
+
+  it('keeps 200 + intentMismatch warning when no intent is sent but the reused order is contract-mode', async () => {
+    existingIntent = {
+      id: 'rozo-existing',
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      source: { chainId: '1500', tokenSymbol: 'USDC', receiverAddress: 'CPERPAY', receiverAddressContract: 'CBRIDGE', receiverMemoContract: 'memo_1' },
+      metadata: { internal: { original: '10', serviceFee: '0', callerPays: '10', feeBps: 0, pricingVersion: 'checkout-web-fee-v2' } },
+    }
+    const { status, json } = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: '1500', tokenSymbol: 'USDC' },
+    })
+    expect(status).toBe(200)
+    expect(json.intentMismatch).toBe(true)
+    expect(json.warnings.join(' ')).toContain('receiverAddressContract')
   })
 
   it('does not flag intentMismatch when the reused Stripe order is already contract-mode', async () => {

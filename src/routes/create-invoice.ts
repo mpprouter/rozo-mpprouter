@@ -1556,9 +1556,12 @@ export async function handleStripeCreateInvoice(
   // body on create so upstream freezes the order in contract mode and exposes
   // receiverAddressContract + receiverMemoContract. Unlike the Coinbase branch
   // there is no classic→contract supersede here: the Stripe fulfillment lock is
-  // keyed by invoiceKey/orderId, so a reused classic order is reported via
-  // intentMismatch (the caller pays the address + memo rail shown in raw.source)
-  // instead of minting a sibling order under a variant orderId.
+  // keyed by invoiceKey/orderId, so a contract caller who meets a reused classic
+  // order gets a 409 INTENT_MISMATCH (a smart wallet cannot pay a G-address +
+  // memo, so a 200 with a warning would be an unpayable success) instead of a
+  // sibling order under a variant orderId. The reverse case (no intent, row is
+  // contract-mode) stays a 200 + intentMismatch warning: a classic wallet can
+  // still be told which rail to pay.
   payinIntent: 'stellar_payin_contracts' | null = null,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
@@ -1801,6 +1804,26 @@ export async function handleStripeCreateInvoice(
     }
     const rowIsContractMode = Boolean(row?.source?.receiverAddressContract)
     intentMismatch = (payinIntent !== null) !== rowIsContractMode
+    if (intentMismatch && payinIntent !== null) {
+      return json(409, {
+        ok: false,
+        provider: 'stripe_crypto',
+        code: 'INTENT_MISMATCH',
+        error: {
+          code: 'INTENT_MISMATCH',
+          message:
+            'This invoice already has an unpaid order created without ' +
+            '"stellar_payin_contracts", and the pay-in mode cannot be changed ' +
+            'after creation. Wait for that order to expire, or pay it from a ' +
+            'classic Stellar wallet using raw.source (receiverAddress + receiverMemo).',
+        },
+        invoiceKey: invoice.invoiceKey,
+        rozoPaymentId: row?.id ?? existing?.id ?? null,
+        expiresAt: row?.expiresAt ?? existing?.expiresAt ?? null,
+        source: { chainId: reusedSource.chainId, tokenSymbol: reusedSource.tokenSymbol },
+        raw: row ?? existing ?? null,
+      })
+    }
     rozoPaymentId = row?.id ?? existing?.id ?? null
     paymentLink = row?.paymentLink ?? row?.url ?? row?.payment_link ?? null
     expiresAt = row?.expiresAt ?? existing?.expiresAt ?? null
@@ -1938,16 +1961,13 @@ export async function handleStripeCreateInvoice(
     warnings.push(sourceMismatchWarning(reusedSource, source, rotationFailure))
   }
   if (intentMismatch) {
+    // Only the "no intent, contract-mode row" direction reaches here; the
+    // other direction returned 409 INTENT_MISMATCH above.
     warnings.push(
-      payinIntent !== null
-        ? 'Requested intent "stellar_payin_contracts", but this unpaid order was ' +
-          'created without it and the pay-in mode cannot be changed after ' +
-          'creation. Pay the source shown in raw.source (receiverAddress + ' +
-          'receiverMemo for Stellar).'
-        : 'The existing unpaid order for this invoice was created with intent ' +
-          '"stellar_payin_contracts" (contract pay-in): pay via the contract ' +
-          'rail in raw.source (receiverAddressContract + receiverMemoContract), ' +
-          'NOT a classic G-address payment.',
+      'The existing unpaid order for this invoice was created with intent ' +
+        '"stellar_payin_contracts" (contract pay-in): pay via the contract ' +
+        'rail in raw.source (receiverAddressContract + receiverMemoContract), ' +
+        'NOT a classic G-address payment.',
     )
   }
 
