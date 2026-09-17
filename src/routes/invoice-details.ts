@@ -24,7 +24,7 @@ import {
   type NormalizedInvoice,
 } from './invoice-provider'
 import { createQuoteReceipt } from './quote-receipt'
-import { indexStripeSession, lookupStripeSessionWithBackfill } from './stripe-session-index'
+import { indexStripeSession, lookupStripeSession } from './stripe-session-index'
 import { loadStripeRecordForStatus, pickStripeRouterStateSafe } from './stripe-fulfillment'
 import {
   formatUsdcAtomic,
@@ -341,7 +341,7 @@ async function knownStripeInvoice(
   rawUrl: string,
   invoiceKey?: string,
 ): Promise<{ invoiceKey: string; rozo_payment_id: string | null; routerState: unknown } | null> {
-  const key = invoiceKey ?? (await lookupStripeSessionWithBackfill(env, rawUrl))
+  const key = invoiceKey ?? (await lookupStripeSession(env, rawUrl))
   if (!key) return null
   let rec = null
   try {

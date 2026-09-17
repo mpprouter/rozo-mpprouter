@@ -24,6 +24,7 @@ import { casRead, casUpdate, casScan } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
 import { claimInvoiceKey } from './invoice-claim'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
+import { indexStripeSession } from './stripe-session-index'
 
 // Provider-qualified order id. Rozo orderIds are used verbatim as our KV key
 // discriminator, so we avoid ':' (design §6 fallback) and use underscores.
@@ -116,6 +117,10 @@ export interface StripeFulfillmentRecord {
   // Consecutive reconciler checks that Stripe answered with "session gone"
   // (resume 404/410). Reset on any successful read.
   providerGoneChecks?: number
+  // True once the pay-URL hash → invoiceKey index entry has been written for
+  // this record (stripe-session-index.ts). Set by the create path (new
+  // records) or the cron backfill (older ones).
+  sessionIndexed?: boolean
   // Human resolution of a manual_review record (admin endpoint). Who verified
   // what, when, and the settlement tx they pointed at.
   manualResolution?: {
@@ -253,6 +258,10 @@ export async function seedStripeRecord(
   // closed — the caller then refuses to hand back a payable link (P1-1). We
   // never store a plaintext fallback.
   const stripeUrlEncrypted = await encryptCapability(args.stripeUrl, env)
+  // Pay-URL hash → invoiceKey index (read-only status recovery after Stripe
+  // stops resuming the session). Written before the record so the record's
+  // `sessionIndexed` mark never claims an entry that does not exist.
+  await indexStripeSession(env, args.stripeUrl, args.invoiceKey)
   await updateStripeRecord<true>(env, args.invoiceKey, orderId, (rec) => {
     // Fill only missing lock fields; never overwrite values already locked.
     rec.merchantAccount = rec.merchantAccount ?? args.merchantAccount
@@ -260,6 +269,7 @@ export async function seedStripeRecord(
     rec.invoiceCurrency = rec.invoiceCurrency ?? args.invoiceCurrency
     rec.lockFingerprint = rec.lockFingerprint ?? args.lockFingerprint
     rec.stripeUrlEncrypted = rec.stripeUrlEncrypted ?? stripeUrlEncrypted
+    rec.sessionIndexed = true
     if (!rec.rozoPaymentId && args.rozoPaymentId) rec.rozoPaymentId = args.rozoPaymentId
     // Monotonic: only set the initial state when the record is brand new
     // (still at rank 0). Never roll an advanced record back.
@@ -1132,3 +1142,40 @@ export async function resolveManualReview(
     return { rec, result: { kind: 'resolved', status: rec.status, paidAt: rec.paidAt } }
   })
 }
+
+/**
+ * Cron: index the pay-URL hash of records created before the session index
+ * existed. Each record's capability is decrypted once, in memory; only the
+ * hash is written; the record is then marked `sessionIndexed`. Bounded per
+ * run; swallows its own errors.
+ */
+export async function sweepStripeSessionIndex(env: Env): Promise<{ indexed: number; remaining: number }> {
+  const out = { indexed: 0, remaining: 0 }
+  let values: string[]
+  try {
+    values = await casScan(env, 'invoice-fulfillment:v2:stripe_crypto:')
+  } catch {
+    return out
+  }
+  const pending = values
+    .map(parseRecord)
+    .filter((r): r is StripeFulfillmentRecord => !!r && !r.sessionIndexed && !!r.stripeUrlEncrypted)
+  out.remaining = pending.length
+  for (const rec of pending.slice(0, SESSION_INDEX_BACKFILL_PER_RUN)) {
+    try {
+      const url = await decryptCapability(rec.stripeUrlEncrypted!, env)
+      await indexStripeSession(env, url, rec.invoiceKey)
+    } catch {
+      // Undecryptable (rotated key) records stay unindexed; mark them so the
+      // sweep does not retry them forever.
+    }
+    await updateStripeRecord<true>(env, rec.invoiceKey, rec.orderId, (r) => {
+      r.sessionIndexed = true
+      return { rec: r, result: true }
+    })
+    out.indexed++
+    out.remaining--
+  }
+  return out
+}
+const SESSION_INDEX_BACKFILL_PER_RUN = 50

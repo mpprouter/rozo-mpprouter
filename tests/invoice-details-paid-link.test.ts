@@ -2,7 +2,7 @@
 // still name the invoice + router state (read-only) instead of a bare 410.
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { handleInvoiceDetails } from '../src/routes/invoice-details'
-import { seedStripeRecord, stripeKvKey } from '../src/routes/stripe-fulfillment'
+import { seedStripeRecord, stripeKvKey, sweepStripeSessionIndex } from '../src/routes/stripe-fulfillment'
 import { indexStripeSession, lookupStripeSession } from '../src/routes/stripe-session-index'
 import { casRead } from '../src/routes/stripe-atomic'
 
@@ -82,19 +82,28 @@ describe('invoice-details on a paid / expired Stripe link', () => {
     expect(hits.filter((u) => u.includes('resume_payin_session')).length).toBe(1)
   })
 
-  it('410 on a pre-index record: backfills from the fulfillment record (no Stripe call, blob never stored)', async () => {
-    const env = makeEnv(); await setPaid(env) // seeded with URL_, but NOT indexed
-    const hits = mockStripe(410)
+  it('410 on a pre-index record: public path does NOT scan; the cron backfill indexes it once', async () => {
+    const env = makeEnv(); await setPaid(env)
+    // Simulate a record written before the index existed.
+    env.MPP_STORE.store.clear()
+    { const { value, version } = await casRead(env, stripeKvKey(KEY)); const r = JSON.parse(value!); delete r.sessionIndexed
+      await env.ATOMIC_STORE.get().fetch(new Request('https://x/commit', { method: 'POST', body: JSON.stringify({ key: stripeKvKey(KEY), expectedVersion: version, op: 'set', value: JSON.stringify(r) }) })) }
+    mockStripe(410)
+    const bare: any = await (await handleInvoiceDetails(req(URL_), env)).json()
+    expect(bare.invoiceKey).toBeUndefined() // no store walk on the public path
+    expect(await sweepStripeSessionIndex(env)).toEqual({ indexed: 1, remaining: 0 })
+    expect(JSON.stringify([...env.MPP_STORE.store.entries()])).not.toContain('CDMQARoXBLOBTUOQ')
     const body: any = await (await handleInvoiceDetails(req(URL_), env)).json()
     expect(body).toMatchObject({ reason: 'expired', invoiceKey: KEY, rozo_payment_id: ROZO })
     expect(body.routerState.status).toBe('paid')
-    expect(hits.filter((u) => u.includes('stripe.com')).length).toBe(1) // only the failed resume
-    expect(JSON.stringify([...env.MPP_STORE.store.entries()])).not.toContain('CDMQARoXBLOBTUOQ')
-    // Indexed now: a second lookup needs no scan.
+    // Marked: a second sweep decrypts nothing.
+    expect(await sweepStripeSessionIndex(env)).toEqual({ indexed: 0, remaining: 0 })
+  })
+
+  it('seeding a record indexes its link (no cron needed for new records)', async () => {
+    const env = makeEnv(); await setPaid(env)
     expect(await lookupStripeSession(env, URL_)).toBe(KEY)
-    // A different blob does not match this record.
-    const other: any = await (await handleInvoiceDetails(req('https://crypto.stripe.com/pay/SOMEOTHERBLOB'), env)).json()
-    expect(other.invoiceKey).toBeUndefined()
+    expect(await sweepStripeSessionIndex(env)).toEqual({ indexed: 0, remaining: 0 })
   })
 
   it('410 on a link we never saw stays a bare expired', async () => {
@@ -110,6 +119,6 @@ describe('invoice-details on a paid / expired Stripe link', () => {
     expect(body.invoice.payable).toBe(false)
     expect(body).toMatchObject({ invoiceKey: KEY, rozo_payment_id: ROZO })
     expect(body.routerState.status).toBe('paid')
-    expect(body.callerPays).toBe('1.38')
+    expect(body.original).toBe('1.36')
   })
 })
