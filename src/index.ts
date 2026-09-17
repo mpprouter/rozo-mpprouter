@@ -52,6 +52,7 @@ import { handleOpenApi } from './routes/openapi'
 import { handleAiPlugin } from './routes/ai-plugin'
 import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-admin'
 import { handleAdminSeedStore } from './routes/admin-seed-store'
+import { handleStripeFulfillmentResolve } from './routes/stripe-fulfillment-admin'
 import { handleCreateInvoice } from './routes/create-invoice'
 import {
   handleIssueCoupon,
@@ -802,6 +803,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Gated by x-admin-secret (same as /admin/pay-invoice).
       if (url.pathname === '/admin/seed-atomic-store') {
         return handleAdminSeedStore(request, env)
+      }
+
+      // Human resolution of a Stripe fulfillment record parked in
+      // manual_review (evidence + tx hash recorded on the record; monotonic).
+      // Gated by x-admin-secret. See routes/stripe-fulfillment-admin.ts.
+      if (url.pathname === '/admin/stripe-fulfillment/resolve') {
+        return handleStripeFulfillmentResolve(request, env)
       }
 
       // ── Partner platform ──────────────────────────────────────────────
