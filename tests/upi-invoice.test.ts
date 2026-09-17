@@ -304,6 +304,18 @@ describe('POST /api/invoice/resolve', () => {
     expect(raw).not.toContain('blob_ABC')
   })
 
+  it('accepts Stripe valid_before given as epoch seconds (production shape)', async () => {
+    // Production Stripe sessions report valid_before as a numeric string of
+    // epoch seconds, not ISO. 2026-09-17 a real link came back
+    // `expiry_unverifiable` because of this.
+    const env = makeEnv()
+    world.stripe = { ...world.stripe, valid_before: String(Math.floor(FUTURE.getTime() / 1000)) }
+    const st = await resolve(env, STRIPE_URL)
+    expect(st.status).toBe(200)
+    expect(st.body).toMatchObject({ provider: 'stripe_crypto', payable: true })
+    expect(Date.parse((st.body as any).expires_at)).toBe(Math.floor(FUTURE.getTime() / 1000) * 1000)
+  })
+
   it('rejects unsupported URLs with 400 unsupported_url', async () => {
     const env = makeEnv()
     for (const u of ['https://checkout.stripe.com/c/pay/cs_1', 'https://crypto.stripe.com/setup/x', 'https://evil.com/']) {
