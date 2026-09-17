@@ -8,6 +8,7 @@ import {
   invoiceKeyFromOrderId,
   loadStripeRecordForStatus,
   pickStripeRouterStateSafe,
+  reconcileStripeRecordWithProvider,
 } from './stripe-fulfillment'
 import { redactForAlert } from '../utils/alert-redaction'
 import { claimInvoiceKey } from './invoice-claim'
@@ -306,7 +307,11 @@ export async function callAgentApiPayInvoice(
   return { ok: resp.ok, status: resp.status, body: parsed }
 }
 
-export async function handleRozoWebhook(request: Request, env: Env): Promise<Response> {
+export async function handleRozoWebhook(
+  request: Request,
+  env: Env,
+  ctx?: ExecutionContext,
+): Promise<Response> {
   if (request.method !== 'POST') {
     return json(405, { error: 'Method not allowed' })
   }
@@ -393,7 +398,7 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
   // reservation guard. Coinbase (pl_*) falls through to the unchanged logic
   // below. This keeps the two providers fully isolated (design §9 Layer 1/2).
   if (isStripeOrderId(plId)) {
-    const summary = await handleStripeWebhookEvent(
+    const settlement = handleStripeWebhookEvent(
       env,
       {
         eventId,
@@ -405,6 +410,16 @@ export async function handleRozoWebhook(request: Request, env: Env): Promise<Res
       },
       new Date(now),
     )
+    // Rozo's sender aborts delivery at 10s (merchant-webhook.ts). The
+    // settlement above claims the record and then calls pay-invoice inline,
+    // which can take longer than that; when the client disconnects the
+    // runtime may cancel this invocation, leaving the record stuck in
+    // provider_paying (2026-09-17 incident). Registering the promise with
+    // waitUntil keeps the settlement running to its finalize step even after
+    // the sender gives up. We still await it so a fast path answers with the
+    // real summary.
+    ctx?.waitUntil(settlement.catch(() => undefined))
+    const summary = await settlement
     return json(200, summary)
   }
 
@@ -806,6 +821,52 @@ function pickCoinbaseCallerSafe(cp: any) {
   }
 }
 
+// Stripe Crypto status (design §11). Reconciles an in-flight record against
+// Stripe's live session state BEFORE reporting, so a settlement whose webhook
+// request died mid-flight (or whose pay-invoice answer was ambiguous) still
+// reaches `paid` / an honest terminal state through this read path.
+async function stripeInvoiceStatus(
+  env: Env,
+  invoiceKey: string,
+  rozoId: string | null,
+  prefetchedRozo: any | null,
+): Promise<Response> {
+  let reconcile: unknown = null
+  try {
+    reconcile = await reconcileStripeRecordWithProvider(env, invoiceKey, new Date())
+  } catch {
+    // Reconciliation is best-effort; the status read below must never fail
+    // because the provider check did.
+    reconcile = { checked: false, reason: 'reconcile_threw' }
+  }
+  const stripeRec = await loadStripeRecordForStatus(env, invoiceKey)
+  let rozoPayment: any = prefetchedRozo
+  const rid = rozoId ?? stripeRec?.rozoPaymentId ?? null
+  if (!rozoPayment && rid) rozoPayment = await fetchRozoPaymentById(env, rid)
+  if (!stripeRec && !rozoPayment) {
+    return json(404, {
+      ok: false,
+      error: 'no Stripe fulfillment record or Rozo payment found',
+      provider: 'stripe_crypto',
+    })
+  }
+  const stripeRouterState = pickStripeRouterStateSafe(stripeRec)
+  const stripeRozo = pickRozoCallerSafe(rozoPayment)
+  return json(200, {
+    ok: true,
+    provider: 'stripe_crypto',
+    invoiceKey,
+    rozo_payment_id: rid,
+    // Stripe orders never carry a Coinbase object; the key is present and
+    // null so a caller can tell "no Coinbase side" from "field missing".
+    coinbase: null,
+    payin: derivePayinTruth(stripeRozo, null, stripeRouterState),
+    routerState: stripeRouterState,
+    rozoPayment: stripeRozo,
+    reconcile,
+  })
+}
+
 export async function handleInvoiceStatus(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'GET') {
     return json(405, { error: 'Method not allowed' })
@@ -819,6 +880,9 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
   // Stripe Crypto branch (design §11). Accepts invoice_key=cpis_*, or a
   // payment_id/pl that is a cpis_ session id or a stripe_crypto_ orderId.
   const invoiceKeyParam = url.searchParams.get('invoice_key')
+  // Accepted spellings of a Stripe key: cpis_*, stripe_crypto_cpis_* (the Rozo
+  // orderId) and stripe:<either> (what some callers prefix the provider with).
+  if (plId && plId.startsWith('stripe:')) plId = plId.slice('stripe:'.length)
   const stripeKeyCandidate =
     invoiceKeyParam ??
     (plId && (plId.startsWith('cpis_') || isStripeOrderId(plId)) ? plId : null)
@@ -826,30 +890,7 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
     const invoiceKey = isStripeOrderId(stripeKeyCandidate)
       ? invoiceKeyFromOrderId(stripeKeyCandidate)
       : stripeKeyCandidate
-    const stripeRec = await loadStripeRecordForStatus(env, invoiceKey)
-    let rozoPayment: any = null
-    const rid = rozoId ?? stripeRec?.rozoPaymentId ?? null
-    if (rid) rozoPayment = await fetchRozoPaymentById(env, rid)
-    if (!stripeRec && !rozoPayment) {
-      return json(404, {
-        ok: false,
-        error: 'no Stripe fulfillment record or Rozo payment found',
-        provider: 'stripe_crypto',
-      })
-    }
-    const stripeRouterState = pickStripeRouterStateSafe(stripeRec)
-    const stripeRozo = pickRozoCallerSafe(rozoPayment)
-    return json(200, {
-      ok: true,
-      provider: 'stripe_crypto',
-      invoiceKey,
-      // Stripe orders never carry a Coinbase object; the key is present and
-      // null so a caller can tell "no Coinbase side" from "field missing".
-      coinbase: null,
-      payin: derivePayinTruth(stripeRozo, null, stripeRouterState),
-      routerState: stripeRouterState,
-      rozoPayment: stripeRozo,
-    })
+    return stripeInvoiceStatus(env, invoiceKey, rozoId, null)
   }
 
   // Accept payment_id with a uuid value (some callers will paste the
@@ -876,6 +917,12 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
   }
   if (rozoId) {
     rozo = await fetchRozoPaymentById(env, rozoId)
+    // A Rozo payment whose orderId is a Stripe order belongs to the Stripe
+    // branch: the checkout UI polls by rozo_payment_id, and without this it
+    // never saw routerState (nor triggered reconciliation) for Stripe orders.
+    if (isStripeOrderId(rozo?.orderId)) {
+      return stripeInvoiceStatus(env, invoiceKeyFromOrderId(rozo.orderId), rozoId, rozo)
+    }
     // If Rozo lookup returned a Coinbase orderId, surface
     // the corresponding Coinbase state too (caller may want both).
     const inferredPl =

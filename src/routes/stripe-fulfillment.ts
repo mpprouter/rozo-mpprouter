@@ -23,6 +23,7 @@ import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { casRead, casUpdate } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
 import { claimInvoiceKey } from './invoice-claim'
+import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 
 // Provider-qualified order id. Rozo orderIds are used verbatim as our KV key
 // discriminator, so we avoid ':' (design §6 fallback) and use underscores.
@@ -109,6 +110,9 @@ export interface StripeFulfillmentRecord {
   paidAt: string | null
   failureReason: string | null
   providerResult: unknown | null
+  // Last time the reconciler asked Stripe for the live session state (ISO).
+  // Optional: records written before the reconciler existed lack it.
+  lastProviderCheckAt?: string | null
   webhookEventIds: string[]
   events: Array<{ kind: string; at: string; event_id?: string; detail?: unknown }>
 }
@@ -574,6 +578,34 @@ export async function handleStripeWebhookEvent(
   // ── We hold the claim. From here we own the single in-flight slot. ──────────
   const invoiceAtomic = BigInt(claim.invoiceAtomic)
 
+  // Safety net (2026-09-17 incident, cpis_1UGa8x…Gzep): every step below runs
+  // inline in the webhook request. If anything THROWS after the claim, the
+  // record used to stay `provider_paying` forever — a durable in-flight guard
+  // with nobody holding it, which no later webhook event can clear
+  // (`already_in_flight`). Now: a throw BEFORE the pay-invoice call released
+  // nothing money-wise → step the claim back to payout_seen so a later event
+  // can retry; a throw once the call has started → provider_submitted_ambiguous
+  // (pay-invoice MAY have signed; reconcile, never re-fire).
+  let payInvoiceStarted = false
+  try {
+    return await settleClaimedStripeInvoice()
+  } catch (err) {
+    const detail = { error: err instanceof Error ? err.message.slice(0, 200) : 'unknown' }
+    if (payInvoiceStarted) {
+      await finalizeClaim(env, invoiceKey, orderId, nowIso, 'provider_submitted_ambiguous', {
+        failureReason: 'settlement threw after pay-invoice call started — needs reconciliation',
+        event: { kind: 'stripe_settlement_threw', detail },
+      })
+      return { ok: true, provider: 'stripe_crypto', status: 'provider_submitted_ambiguous', ambiguous: true }
+    }
+    await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', null, {
+      kind: 'stripe_claim_released_on_error',
+      detail,
+    })
+    return { ok: true, provider: 'stripe_crypto', deferred: 'settlement_error', retryable: true }
+  }
+
+  async function settleClaimedStripeInvoice(): Promise<Record<string, unknown>> {
   // Cross-channel claim (invoice-claim.ts): the UPI fiat channel may already be
   // settling this session. The per-record CAS above serializes Stripe-vs-Stripe;
   // this one serializes crypto-vs-UPI. Held elsewhere → terminal, never sign.
@@ -675,6 +707,7 @@ export async function handleStripeWebhookEvent(
   }
 
   let payResult: StripePayInvoiceResult
+  payInvoiceStarted = true
   try {
     payResult = await callStripePayInvoice(env, {
       stripeUrl,
@@ -746,6 +779,7 @@ export async function handleStripeWebhookEvent(
     event: { kind: 'stripe_fulfillment_failed', detail: { status: payResult.status } },
   })
   return { ok: true, provider: 'stripe_crypto', status: 'failed_provider' }
+  }
 }
 
 // Whitelist projection of a pay-invoice result for storage in the record. NEVER
@@ -841,4 +875,108 @@ export function pickStripeRouterStateSafe(rec: StripeFulfillmentRecord | null) {
     funderBalanceAtomic: rec.funderBalanceAtomic,
     merchantAccount: rec.merchantAccount,
   }
+}
+
+// ── Provider reconciliation (the "status reconciler" the states above assume) ─
+//
+// The webhook layer only ever advances a record to provider_submitted (or
+// leaves it provider_paying if the request died mid-settlement — see the
+// safety net in handleStripeWebhookEvent). Terminal `paid` was documented as
+// "confirmed later by the status reconciler", but no reconciler existed, so a
+// settled invoice reported provider_paying forever (2026-09-17 incident: Rozo's
+// webhook sender aborts at 10s, the inline pay-invoice call outlived it, Stripe
+// showed PAID, our record never moved).
+//
+// This asks Stripe for the live Payin Session state (read-only, via the
+// encrypted capability we already hold) and advances the record:
+//   fulfillment_complete / succeeded  → paid
+//   failed / canceled / error         → failed_provider (terminal, human-gated)
+//   anything else                     → unchanged (still in flight)
+// Only in-flight records are ever touched; terminal states are never
+// downgraded (monotonic CAS). Throttled per record so a polling UI cannot turn
+// the public status endpoint into a Stripe request amplifier.
+
+const RECONCILE_IN_FLIGHT = new Set<StripeRouterStatus>([
+  'provider_paying',
+  'provider_submitted',
+  'provider_submitted_ambiguous',
+])
+const STRIPE_PAID_STATES = new Set(['fulfillment_complete', 'succeeded'])
+const STRIPE_FAILED_STATES = new Set(['failed', 'canceled', 'error'])
+export const RECONCILE_MIN_INTERVAL_MS = 15_000
+
+export type StripeReconcileOutcome =
+  | { checked: false; reason: 'no_record' | 'not_in_flight' | 'no_capability' | 'throttled' }
+  | { checked: true; providerState: string; transition: 'paid' | 'failed_provider' | null }
+  | { checked: true; error: string; transition: null }
+
+export async function reconcileStripeRecordWithProvider(
+  env: Env,
+  invoiceKey: string,
+  now: Date,
+  opts: { minIntervalMs?: number } = {},
+): Promise<StripeReconcileOutcome> {
+  const rec = await loadStripeRecord(env, invoiceKey)
+  if (!rec) return { checked: false, reason: 'no_record' }
+  if (!RECONCILE_IN_FLIGHT.has(rec.status)) return { checked: false, reason: 'not_in_flight' }
+  if (!rec.stripeUrlEncrypted) return { checked: false, reason: 'no_capability' }
+  const minInterval = opts.minIntervalMs ?? RECONCILE_MIN_INTERVAL_MS
+  const last = rec.lastProviderCheckAt ? Date.parse(rec.lastProviderCheckAt) : NaN
+  if (Number.isFinite(last) && now.getTime() - last < minInterval) {
+    return { checked: false, reason: 'throttled' }
+  }
+  const nowIso = now.toISOString()
+  const orderId = rec.orderId
+
+  // Stamp the check time FIRST so a failing provider call is throttled too.
+  await updateStripeRecord<true>(env, invoiceKey, orderId, (r) => {
+    r.lastProviderCheckAt = nowIso
+    return { rec: r, result: true }
+  })
+
+  let providerState: string
+  let blockchainTxId: string | null = null
+  try {
+    // Decrypt in memory only to query Stripe; the URL never leaves this scope.
+    const stripeUrl = await decryptCapability(rec.stripeUrlEncrypted, env)
+    const live = await resolveStripeInvoice(stripeUrl)
+    providerState = live.state
+    blockchainTxId = live.transaction?.blockchainTxId ?? null
+  } catch (err) {
+    const error =
+      err instanceof StripeResolveError ? `stripe_${err.kind}` : 'provider_check_failed'
+    await updateStripeRecord<true>(env, invoiceKey, orderId, (r) => {
+      r.events.push({ kind: 'stripe_reconcile_error', at: nowIso, detail: { error } })
+      return { rec: r, result: true }
+    })
+    return { checked: true, error, transition: null }
+  }
+
+  let transition: 'paid' | 'failed_provider' | null = null
+  if (STRIPE_PAID_STATES.has(providerState)) transition = 'paid'
+  else if (STRIPE_FAILED_STATES.has(providerState)) transition = 'failed_provider'
+
+  await updateStripeRecord<true>(env, invoiceKey, orderId, (r) => {
+    const detail = { state: providerState, blockchainTxId }
+    // Re-check under CAS: another isolate may have finalized meanwhile.
+    if (transition && RECONCILE_IN_FLIGHT.has(r.status)) {
+      r.status = transition
+      if (transition === 'paid') {
+        r.paidAt = nowIso
+        r.failureReason = null
+      } else {
+        r.failureReason = `stripe session state "${providerState}" after settlement attempt`
+      }
+      const prev =
+        r.providerResult && typeof r.providerResult === 'object'
+          ? (r.providerResult as Record<string, unknown>)
+          : {}
+      r.providerResult = { ...prev, reconciledState: providerState, blockchainTxId }
+      r.events.push({ kind: `stripe_reconciled_${transition}`, at: nowIso, detail })
+    } else {
+      r.events.push({ kind: 'stripe_reconcile_checked', at: nowIso, detail })
+    }
+    return { rec: r, result: true }
+  })
+  return { checked: true, providerState, transition }
 }
