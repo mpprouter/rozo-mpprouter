@@ -11,6 +11,7 @@ import {
   type NormalizedInvoice,
 } from './invoice-provider'
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
+import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { contractVariantIds } from '../mpp/contract-variant'
 import { verifyQuoteReceipt, type QuoteReceiptPayload } from './quote-receipt'
@@ -1568,6 +1569,7 @@ export async function handleStripeCreateInvoice(
   let invoice: NormalizedInvoice
   try {
     invoice = await resolveStripeInvoice(stripeUrl)
+    await indexStripeSession(env, stripeUrl, invoice.invoiceKey)
   } catch (err) {
     if (err instanceof StripeResolveError) {
       const status =
