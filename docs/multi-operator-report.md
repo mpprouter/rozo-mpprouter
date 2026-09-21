@@ -1,20 +1,20 @@
 # MPP Router, open and multi-operator: provider onboarding and direct settlement
 
-MPP Router by ROZO · Stellar mainnet · last updated 2026-09-14
+MPP Router by ROZO · Stellar mainnet · last updated 2026-09-21
 
-## 1. The claim
+## 1. Description
 
-MPP Router is not a single-operator gateway. Independent providers run their own servers, list themselves without anyone at ROZO approving, and get paid on their own keys. This document is the evidence: who is live, how they got there, and what each proof does and does not show.
+MPP Router is not a single-operator gateway. Independent providers run their own servers, list themselves without anyone at ROZO approving, and get paid on their own keys. This document describes who is live, how they got there, and what each proof does and does not show.
 
 ## 2. Operators live today
 
-Three third-party operators are live. Agent402 and Stellar Indexer serve paid calls with payment settling to their own Stellar keys, both onboarded through the self-serve flow with no ROZO approval step. Mercury Data provides Stellar contract infrastructure through a provider-authorised managed setup:
+Three third-party operators are live. Agent402 and Stellar Indexer serve paid calls with payment settling to their own Stellar keys, both onboarded through the self-serve flow with no ROZO approval step. Mercury Data provides Stellar contract infrastructure behind a router-hosted paywall, with payment settling directly to Mercury's own Stellar address:
 
 | Operator | Shape | Verified by a real paid call | Settlement |
 | --- | --- | --- | --- |
 | **Agent402** (agent402.tools) | Runs its own x402 endpoints; the router relays the buyer's request and payment credential unchanged | 2026-09-12 · tx [`cb81cc75…838e`](https://stellar.expert/explorer/public/tx/cb81cc75af8ad64925d0a594efa17483d25aef26f01e12e82b12f3d6ed98838e) | Buyer → Agent402's Stellar address, directly |
 | **Stellar Indexer** by Creit Tech (stellarindexer.com) | Runs its own authenticated API; MPP Router hosts the x402 paywall in front of it | 2026-09-14 · tx [`e577302e…28de`](https://stellar.expert/explorer/public/tx/e577302ef37e8edeb0ed5af40f679bce6b02198a238f584d2e21f9278ef728de) | Buyer → Creit Tech's Stellar address, directly; the router settles only after the origin answered 2xx |
-| **Mercury Data** by xycloo Labs (mercurydata.app) | Runs its own indexer; MPP Router fronts it with a router-held credential at `/v1/services/mercury` (three routes, $0.001/call), by agreement with the operator | Charge-verified 2026-08-11 (see [verified-services.md](verified-services.md)) | Buyer → router pool, settled to Mercury by agreement; moving to direct settlement once Mercury supplies a payout address |
+| **Mercury Data** by xycloo Labs (mercurydata.app) | Runs its own indexer; MPP Router hosts the x402 paywall in front of it (four routes, $0.001/call) and calls the origin with a provider-authorised credential only after payment | Direct settlement verified 2026-09-20: [tx 3a22c2ce…](https://stellar.expert/explorer/public/tx/3a22c2ce1cb2a60d71dc402c5545d25da5faae22f500374aaa4bf6bd49775d1e), [ledger record](https://apiserver.mpprouter.dev/v1/ledger?tx=3a22c2ce1cb2a60d71dc402c5545d25da5faae22f500374aaa4bf6bd49775d1e) (delivered, upstream 200); earlier charge-verified 2026-08-11 via the router pool | Buyer → Mercury's own Stellar address, settled after the origin answers 2xx (since 2026-09-15) |
 
 In both transactions the USDC transfer goes from the router's verification wallet to the operator's own address; no ROZO account is in the path. Each operator's public verification record shows the checks, the proof type and its exact meaning, and the settlement transaction:
 
@@ -58,10 +58,10 @@ Both listings above were produced by exactly this path. Portal: https://www.mppr
 
 HackenProof audit report: https://github.com/mpprouter/rozo-mpprouter/releases/download/v0.2.2/HackenProof.Audit.Report.for.MPP.Router.ROZO.pdf (attached to release [v0.2.2](https://github.com/mpprouter/rozo-mpprouter/releases/tag/v0.2.2)).
 
-## 4. What is and is not claimed
+## 4. Scope and limits
 
 - Both self-serve verification payments were technical validation spend by ROZO ($0.003 and $0.004), not organic buyer demand.
-- Mercury Data is a managed integration, not an independent operator in the sense of §3.1: the router holds the credential and the pool receives the payment. It is listed because it is a real third-party service with a real agreement, and because it is the next candidate for direct settlement.
+- Mercury Data is a provider-authorised managed integration, not a self-serve onboarding in the sense of §3.1: ROZO configured the routes and the router holds the origin credential by agreement. Settlement is direct to Mercury's own address since 2026-09-15; the 2026-09-20 verification payment was ROZO technical validation spend ($0.001), not organic demand.
 - `x402_pay_to` and `hosted_origin_auth` prove that the endpoint's payment configuration matches the registered address (and, for hosted, that the registrant can authenticate to the origin). Neither proves private-key custody; the public records say so verbatim.
 - The hosted-paywall shape keeps the paywall on ROZO infrastructure; the operator's API and key stay theirs and settlement is still direct. Agent402 is the fully self-operated sample; Stellar Indexer is the hosted sample.
 - Operator addresses are not reproduced in this report; they are visible in the linked verification records and on-chain.
