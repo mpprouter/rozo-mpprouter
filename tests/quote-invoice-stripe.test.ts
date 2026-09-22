@@ -20,21 +20,21 @@ class FakeKV {
 }
 const env = { PAYINVOICE_ADMIN_SECRET: 'test-secret', MPP_STORE: new FakeKV() } as unknown as import('../src/index').Env
 
-function session(state: string) {
+function session(state: string, paymentOptions: string[] = ['wallet_connect']) {
   return {
     id: KEY, merchant: 'acct_x', business_name: 'Command Code', state,
     payment_details: { amount: 136, currency: 'usd' },
-    supported_currencies: [{ id: 'usdc.base', currency_network: 'base', chain_id: 8453, asset_code: 'usdc', contract_address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', payment_options: ['wallet_connect'] }],
+    supported_currencies: [{ id: 'usdc.base', currency_network: 'base', chain_id: 8453, asset_code: 'usdc', contract_address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', payment_options: paymentOptions }],
     transaction_details: {}, valid_before: '1789980699',
   }
 }
-function mockStripe(resume: 'ok' | 410, state = 'checkout') {
+function mockStripe(resume: 'ok' | 410, state = 'checkout', paymentOptions: string[] = ['wallet_connect']) {
   const hits: string[] = []
   vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     hits.push(u)
     if (u.includes('resume_payin_session')) return resume === 'ok' ? Response.json({ sessionId: KEY, clientSecret: 'cs', publishableKey: 'pk' }) : new Response('gone', { status: 410 })
-    if (u.includes('payin_session')) return Response.json(session(state))
+    if (u.includes('payin_session')) return Response.json(session(state, paymentOptions))
     return new Response('unexpected ' + u, { status: 500 })
   })
   return hits
@@ -86,6 +86,15 @@ describe('quote-invoice: Stripe branch', () => {
     const res = await handleQuoteInvoice(post({ url: URL_ }), env)
     expect(res.status).toBe(410)
     expect(((await res.json()) as any).code).toBe('LINK_USED_OR_EXPIRED')
+  })
+
+  it('reports a still-open session without wallet_connect as 422 QUOTE_UNAVAILABLE, not expired', async () => {
+    mockStripe('ok', 'checkout', ['direct_deposit'])
+    const res = await handleQuoteInvoice(post({ url: URL_ }), env)
+    const body = (await res.json()) as any
+    expect(res.status).toBe(422)
+    expect(body.code).toBe('QUOTE_UNAVAILABLE')
+    expect(body.message).toContain('wallet_connect')
   })
 
   it('shares invoice-details per-invoice rate limit: once limited, Stripe is not called again', async () => {

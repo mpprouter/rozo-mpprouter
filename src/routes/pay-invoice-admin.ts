@@ -601,6 +601,18 @@ async function quoteStripeInvoice(request: Request, env: Env, url: string): Prom
   }
 
   if (!invoice.payable) {
+    // A session that is still open but whose merchant does not offer Base
+    // USDC / wallet_connect is a settlement-rail mismatch, not a dead link: a
+    // fresh link from the merchant would not help, so do not say "expired".
+    const stillOpen = invoice.state === 'initialized' || invoice.state === 'checkout'
+    if (stillOpen) {
+      return errorResponse(422, {
+        code: 'QUOTE_UNAVAILABLE',
+        message: `Stripe invoice cannot be settled by this router (${invoice.payableReason ?? 'unsupported settlement option'}).`,
+        hint: 'Pay this invoice directly with the merchant; it is still valid.',
+        link_id_detected: null,
+      })
+    }
     return errorResponse(410, {
       code: 'LINK_USED_OR_EXPIRED',
       message: `Stripe invoice is not payable (${invoice.payableReason ?? invoice.state}).`,
