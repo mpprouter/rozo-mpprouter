@@ -989,6 +989,20 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const originalStr = priced.original
   const discountStr = '0'
   const title = buildCheckoutTitle(merchantName, pricing)
+  // Per-order merchant identity for the Rozo payment response (founder
+  // 2026-09-22). Every order this route creates is filed under the single
+  // aggregator appId OPENROUTER_APP_ID, and the payment response's
+  // `merchant` block is otherwise built purely from that appId's merchants
+  // row -- so an invoice for any other merchant rendered "Pay OpenRouter" on
+  // invoice.rozo.ai, which displays merchant.name/description directly.
+  // merchantName is the real merchant from the upstream quote (required
+  // above: a missing one already 502s), so this needs no per-merchant config
+  // and a new merchant works the moment the quote names it. Presentation
+  // only -- appId, settlement, fees and webhooks are unchanged.
+  const merchantDisplay = {
+    merchantName,
+    merchantDescription: `${merchantName} via ROZO Checkout`,
+  }
 
   // Step 3a: idempotency — if an order already exists for this Coinbase
   // link, reuse it instead of creating a new one. The Rozo payment-api
@@ -1284,6 +1298,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         display: {
           title,
           currency: 'USD',
+          ...merchantDisplay,
         },
         source: {
           chainId: 'lightning',
@@ -1314,6 +1329,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         display: {
           title,
           currency: 'USD',
+          ...merchantDisplay,
         },
         source: {
           chainId: source.chainId,
