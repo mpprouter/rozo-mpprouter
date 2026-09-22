@@ -45,8 +45,8 @@ describe('quote-invoice upstream error classification', () => {
     expect(body.hint).toContain('pl_01ABCxyz')
   })
 
-  it('maps other 4xx from agentapi to 422 LINK_NOT_PAYABLE', async () => {
-    mockAgentApi(403)
+  it('maps other link-level 4xx from agentapi to 422 LINK_NOT_PAYABLE', async () => {
+    mockAgentApi(400)
     const res = await handleQuoteInvoice(post(), env)
     const body = (await res.json()) as any
     expect(res.status).toBe(422)
@@ -63,6 +63,23 @@ describe('quote-invoice upstream error classification', () => {
       expect(body.code).toBe('LINK_USED_OR_EXPIRED')
     }
   })
+
+  // Not every 4xx is the link's fault. agentapi answers 401/403 when it rejects
+  // OUR admin secret and 408/429 when it is timing out or throttling US. Those
+  // are our outage: calling them LINK_NOT_PAYABLE would blame the buyer's link
+  // and leave the Cloudflare 5xx alert silent through a total checkout outage.
+  // (Verified 2026-09-22: an unauthenticated POST to agentapi.rozo.ai/quote-invoice
+  // answers 401 {"error":"unauthorized"}.)
+  it.each([401, 403, 408, 429])(
+    'keeps upstream %i (our fault, not the link) as 502 QUOTE_UNAVAILABLE',
+    async (status) => {
+      mockAgentApi(status)
+      const res = await handleQuoteInvoice(post(), env)
+      const body = (await res.json()) as any
+      expect(res.status).toBe(502)
+      expect(body.code).toBe('QUOTE_UNAVAILABLE')
+    },
+  )
 
   it('keeps a 5xx from agentapi as 502 QUOTE_UNAVAILABLE', async () => {
     mockAgentApi(500)

@@ -1432,14 +1432,25 @@ describe('handleCreateInvoice — already-paid vs expired', () => {
     expect(json.code).toBe('LINK_NOT_FOUND')
   })
 
-  it('other upstream 4xx → 422 LINK_NOT_PAYABLE, not 502', async () => {
+  it('other link-level upstream 4xx → 422 LINK_NOT_PAYABLE, not 502', async () => {
     const { status, json } = await runWithQuoteError(
-      403,
+      400,
       JSON.stringify({ error: 'Coinbase rejected this payment link' }),
     )
     expect(status).toBe(422)
     expect(json.code).toBe('LINK_NOT_PAYABLE')
   })
+
+  // agentapi rejecting our admin secret (401/403) or throttling us (429) is our
+  // outage, not a dead link: it must stay a 5xx so the alert still fires.
+  it.each([401, 403, 408, 429])(
+    'upstream %i (our fault) stays 502 QUOTE_FETCH_FAILED, not 422',
+    async (status) => {
+      const { status: got, json } = await runWithQuoteError(status, 'unauthorized')
+      expect(got).toBe(502)
+      expect(json.code).toBe('QUOTE_FETCH_FAILED')
+    },
+  )
 
   it('upstream 5xx stays 502 QUOTE_FETCH_FAILED', async () => {
     const { status, json } = await runWithQuoteError(500, 'upstream exploded')

@@ -562,6 +562,16 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
 //
 // The 409 / 410 "already used or expired" cases are handled by the caller
 // before this runs and keep their existing code and status.
+//
+// Not every 4xx is the link's fault. agentapi answers 401/403 when it rejects
+// OUR x-admin-secret and 408/429 when it is timing out or throttling US. Those
+// are total-checkout outages on our side: calling them LINK_NOT_PAYABLE would
+// blame the buyer's link AND keep the Cloudflare 5xx alert silent through the
+// outage, which is the exact failure this classification exists to prevent.
+// 4xx codes from agentapi that describe OUR relationship with it (rejected
+// admin secret, timeout, throttling), never the caller's payment link.
+export const UPSTREAM_OUR_FAULT_4XX = new Set([401, 403, 408, 429])
+
 function classifyQuoteUpstreamError(
   upstreamStatus: number,
   detail: string,
@@ -576,7 +586,7 @@ function classifyQuoteUpstreamError(
       ...context,
     }]
   }
-  if (upstreamStatus >= 400 && upstreamStatus < 500) {
+  if (upstreamStatus >= 400 && upstreamStatus < 500 && !UPSTREAM_OUR_FAULT_4XX.has(upstreamStatus)) {
     return [422, {
       code: 'LINK_NOT_PAYABLE',
       message: 'This payment link cannot be quoted.',
