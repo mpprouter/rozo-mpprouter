@@ -16,6 +16,8 @@ export type PayInvoiceErrorCode =
   | 'INVALID_INPUT'
   | 'QUOTE_UNAVAILABLE'
   | 'LINK_USED_OR_EXPIRED'
+  | 'LINK_NOT_FOUND'
+  | 'LINK_NOT_PAYABLE'
   | 'UPSTREAM_ERROR'
 
 export interface PayInvoiceError {
@@ -462,13 +464,10 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
         link_id_detected,
       })
     }
-    return errorResponse(502, {
-      code: 'QUOTE_UNAVAILABLE',
-      message: 'Quote upstream returned an error.',
-      hint: detail.substring(0, 300),
+    return errorResponse(...classifyQuoteUpstreamError(upstream.status, detail, {
       normalized_input: normalized,
       link_id_detected,
-    })
+    }))
   }
 
   const quote: any = await upstream.json().catch(() => null)
@@ -551,6 +550,46 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     },
     quoteReceipt,
   })
+}
+
+// ── Upstream quote failure classification ────────────────────────────────────
+// A bad link is the caller's problem, not an outage. agentapi answers 404 for a
+// payment link Coinbase has never heard of and other 4xx for one it refuses to
+// serve; wrapping those as 502 told the user "server error" when the honest
+// answer was "this link is dead", and made every stale link look like one of
+// our 5xx in the Cloudflare alert. Only agentapi being unreachable or broken
+// (5xx, transport failure) is still ours to own.
+//
+// The 409 / 410 "already used or expired" cases are handled by the caller
+// before this runs and keep their existing code and status.
+function classifyQuoteUpstreamError(
+  upstreamStatus: number,
+  detail: string,
+  context: Pick<PayInvoiceError, 'normalized_input' | 'link_id_detected'>,
+): [number, PayInvoiceError] {
+  const hint = detail.substring(0, 300)
+  if (upstreamStatus === 404) {
+    return [404, {
+      code: 'LINK_NOT_FOUND',
+      message: 'No such payment link. It may have been deleted, or the link may be mistyped.',
+      hint,
+      ...context,
+    }]
+  }
+  if (upstreamStatus >= 400 && upstreamStatus < 500) {
+    return [422, {
+      code: 'LINK_NOT_PAYABLE',
+      message: 'This payment link cannot be quoted.',
+      hint,
+      ...context,
+    }]
+  }
+  return [502, {
+    code: 'QUOTE_UNAVAILABLE',
+    message: 'Quote upstream returned an error.',
+    hint,
+    ...context,
+  }]
 }
 
 // ── Stripe quote branch ───────────────────────────────────────────────────────
