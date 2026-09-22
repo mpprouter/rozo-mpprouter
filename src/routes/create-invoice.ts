@@ -4,6 +4,7 @@ import {
   normalizePayInvoiceBody,
   type PayInvoiceErrorCode,
   type PayInvoiceError,
+  UPSTREAM_OUR_FAULT_4XX,
 } from './pay-invoice-admin'
 import {
   resolveStripeInvoice,
@@ -898,7 +899,14 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           link_id_detected,
         })
       }
-      if (quoteResp.status >= 400 && quoteResp.status < 500) {
+      // 401/403/408/429 describe our own relationship with agentapi (rejected
+      // admin secret, timeout, throttling), not a dead link — they stay 502 so
+      // the outage still reaches the Cloudflare 5xx alert.
+      if (
+        quoteResp.status >= 400 &&
+        quoteResp.status < 500 &&
+        !UPSTREAM_OUR_FAULT_4XX.has(quoteResp.status)
+      ) {
         return errorResponse(422, {
           code: 'LINK_NOT_PAYABLE',
           message: 'This payment link cannot be quoted.',
