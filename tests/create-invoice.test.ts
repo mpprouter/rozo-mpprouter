@@ -1419,6 +1419,33 @@ describe('handleCreateInvoice — already-paid vs expired', () => {
     expect(json.code).toBe('LINK_USED_OR_EXPIRED')
     expect(json.payment_status).toBe('PAYMENT_SESSION_STATUS_EXPIRED')
   })
+
+  // A link Coinbase cannot find is the buyer's link being dead, not our
+  // upstream being down. It used to come back as 502 QUOTE_FETCH_FAILED, which
+  // both read as "server error" to the buyer and counted as one of our 5xx.
+  it('unknown link (upstream 404) → 404 LINK_NOT_FOUND, not 502', async () => {
+    const { status, json } = await runWithQuoteError(
+      404,
+      JSON.stringify({ code: 'LINK_NOT_FOUND', error: 'Coinbase has no payment link with that id' }),
+    )
+    expect(status).toBe(404)
+    expect(json.code).toBe('LINK_NOT_FOUND')
+  })
+
+  it('other upstream 4xx → 422 LINK_NOT_PAYABLE, not 502', async () => {
+    const { status, json } = await runWithQuoteError(
+      403,
+      JSON.stringify({ error: 'Coinbase rejected this payment link' }),
+    )
+    expect(status).toBe(422)
+    expect(json.code).toBe('LINK_NOT_PAYABLE')
+  })
+
+  it('upstream 5xx stays 502 QUOTE_FETCH_FAILED', async () => {
+    const { status, json } = await runWithQuoteError(500, 'upstream exploded')
+    expect(status).toBe(502)
+    expect(json.code).toBe('QUOTE_FETCH_FAILED')
+  })
 })
 
 // ── Coinbase line: reuse of an existing intent ──────────────────────────────

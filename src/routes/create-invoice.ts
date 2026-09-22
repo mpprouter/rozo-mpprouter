@@ -884,6 +884,29 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           ...(paymentStatus ? { payment_status: paymentStatus } : {}),
         })
       }
+      // Same split as quote-invoice: a link agentapi could not find (404) or
+      // refused to quote (other 4xx) is the caller's link being dead, not our
+      // upstream being down. Only a 5xx or an unreachable agentapi stays 502,
+      // so a stale link no longer reads as "server error" to the buyer or as
+      // one of our 5xx in the Cloudflare alert.
+      if (quoteResp.status === 404) {
+        return errorResponse(404, {
+          code: 'LINK_NOT_FOUND',
+          message: 'No such payment link. It may have been deleted, or the link may be mistyped.',
+          hint: detail.substring(0, 300),
+          normalized_input: normalized,
+          link_id_detected,
+        })
+      }
+      if (quoteResp.status >= 400 && quoteResp.status < 500) {
+        return errorResponse(422, {
+          code: 'LINK_NOT_PAYABLE',
+          message: 'This payment link cannot be quoted.',
+          hint: detail.substring(0, 300),
+          normalized_input: normalized,
+          link_id_detected,
+        })
+      }
       return errorResponse(502, {
         code: 'QUOTE_FETCH_FAILED',
         message: 'Quote upstream returned an error.',
