@@ -1,5 +1,7 @@
 import type { Env } from '../index'
 import { createQuoteReceipt } from './quote-receipt'
+import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
+import { invoiceResolveRateLimit } from './invoice-details'
 import {
   buildCheckoutTitle,
   formatUsdcAtomic,
@@ -63,11 +65,34 @@ export function detectProvider(raw: string): InvoiceProvider | null {
   } catch {
     return null
   }
-  if (u.protocol !== 'https:') return null
+  // Plain http:// is accepted and treated as https://: both providers only
+  // serve checkout over TLS, so an http link is a copy/paste artifact (mail
+  // clients and chat apps strip the scheme), never a different invoice.
+  // normalizeInvoiceUrl() rewrites it before anything is fetched or keyed.
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null
   const host = u.hostname.toLowerCase()
   if (STRIPE_HOSTS.has(host)) return 'stripe_crypto'
   if (COINBASE_HOSTS.has(host)) return 'coinbase'
   return null
+}
+
+/**
+ * Canonicalize an invoice URL from a recognized provider: upgrade `http://`
+ * to `https://` so the resolver fetch, KV session keys and quote receipts all
+ * see one spelling. Returns the input unchanged when it is already https, is
+ * not a URL, or is not on the provider allowlist (those fail later with the
+ * existing errors — this never widens what is accepted).
+ */
+export function normalizeInvoiceUrl(raw: string): string {
+  if (detectProvider(raw) === null) return raw
+  try {
+    const u = new URL(raw)
+    if (u.protocol !== 'http:') return raw
+    u.protocol = 'https:'
+    return u.toString()
+  } catch {
+    return raw
+  }
 }
 
 // ── Coinbase checkout ID extraction ──────────────────────────────────────────
@@ -199,7 +224,7 @@ export function normalizePayInvoiceBody(input: unknown): NormalizedPayInvoiceRes
   let rawUrl = ''
   for (const alias of URL_ALIASES) {
     if (typeof body[alias] === 'string' && (body[alias] as string).trim()) {
-      rawUrl = (body[alias] as string).trim()
+      rawUrl = normalizeInvoiceUrl((body[alias] as string).trim())
       break
     }
   }
@@ -386,7 +411,8 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     return json(400, { code: 'INVALID_INPUT', error: 'Invalid JSON body' })
   }
 
-  const { normalized, error, link_id_detected, raw_url } = normalizePayInvoiceBody(parsed)
+  const { normalized, error, link_id_detected, raw_url, provider_detected } =
+    normalizePayInvoiceBody(parsed)
   if (!normalized || error) {
     const errPayload = error ?? {
       code: 'INVALID_INPUT' as PayInvoiceErrorCode,
@@ -394,6 +420,15 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       link_id_detected,
     }
     return errorResponse(400, errPayload)
+  }
+
+  // Stripe Crypto Payin links never reach agentapi (its quote-invoice only
+  // understands Coinbase ids and answers "Invalid Coinbase Payment Link").
+  // Resolve them read-only here and answer in the same shape as the Coinbase
+  // branch, so a client that always quotes first (the web checkout does, for
+  // both providers) gets one contract. No order, no money movement.
+  if (provider_detected === 'stripe_crypto' && 'url' in normalized && normalized.url) {
+    return quoteStripeInvoice(request, env, normalized.url)
   }
 
   let upstream: Response
@@ -508,6 +543,146 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     currency: 'USD',
     quote: {
       ...(quote?.quote && typeof quote.quote === 'object' ? quote.quote : {}),
+      originalAtomicUsdc: pricing.originalAtomic.toString(),
+      serviceFeeAtomicUsdc: pricing.serviceFeeAtomic.toString(),
+      callerPaysAtomicUsdc: pricing.callerPaysAtomic.toString(),
+      feeBps: pricing.feeBps,
+      pricingVersion: pricing.pricingVersion,
+    },
+    quoteReceipt,
+  })
+}
+
+// ── Stripe quote branch ───────────────────────────────────────────────────────
+// Mirrors invoice-details' Stripe pricing + receipt issuance, but returns the
+// quote-invoice envelope (linkId / merchant / invoice.amount / pricing fields /
+// quoteReceipt) that create-invoice's Stripe path already verifies against
+// (receipt keyed by the cpis_* invoiceKey).
+
+const STRIPE_QUOTE_ERROR_CODES: Record<string, PayInvoiceErrorCode> = {
+  invalid_url: 'INVALID_INPUT',
+  expired: 'LINK_USED_OR_EXPIRED',
+  unsupported: 'QUOTE_UNAVAILABLE',
+  upstream: 'QUOTE_UNAVAILABLE',
+}
+const STRIPE_QUOTE_ERROR_STATUS: Record<string, number> = {
+  invalid_url: 400,
+  expired: 410,
+  unsupported: 422,
+  upstream: 502,
+}
+
+async function quoteStripeInvoice(request: Request, env: Env, url: string): Promise<Response> {
+  // Never echo the /pay/<blob> URL back in error payloads: the blob can be
+  // replayed to resume the session. The caller already holds it.
+  // Same per-IP / per-invoice buckets as invoice-details: every request here
+  // resumes a live Stripe session, so quote-invoice must not be a second,
+  // unmetered path to the same upstream (codex P2 on #188).
+  const limited = await invoiceResolveRateLimit(request, env, url)
+  if (limited) return limited
+
+  let invoice
+  try {
+    invoice = await resolveStripeInvoice(url)
+  } catch (err) {
+    if (err instanceof StripeResolveError) {
+      return errorResponse(STRIPE_QUOTE_ERROR_STATUS[err.kind] ?? 502, {
+        code: STRIPE_QUOTE_ERROR_CODES[err.kind] ?? 'QUOTE_UNAVAILABLE',
+        message: err.message,
+        hint: err.kind === 'expired' ? 'Request a new payment link from the merchant.' : undefined,
+        link_id_detected: null,
+      })
+    }
+    return errorResponse(502, {
+      code: 'QUOTE_UNAVAILABLE',
+      message: 'Failed to resolve Stripe invoice.',
+      link_id_detected: null,
+    })
+  }
+
+  if (!invoice.payable) {
+    // A session that is still open but whose merchant does not offer Base
+    // USDC / wallet_connect is a settlement-rail mismatch, not a dead link: a
+    // fresh link from the merchant would not help, so do not say "expired".
+    const stillOpen = invoice.state === 'initialized' || invoice.state === 'checkout'
+    if (stillOpen) {
+      return errorResponse(422, {
+        code: 'QUOTE_UNAVAILABLE',
+        message: `Stripe invoice cannot be settled by this router (${invoice.payableReason ?? 'unsupported settlement option'}).`,
+        hint: 'Pay this invoice directly with the merchant; it is still valid.',
+        link_id_detected: null,
+      })
+    }
+    return errorResponse(410, {
+      code: 'LINK_USED_OR_EXPIRED',
+      message: `Stripe invoice is not payable (${invoice.payableReason ?? invoice.state}).`,
+      hint: 'Request a new payment link from the merchant.',
+      link_id_detected: null,
+    })
+  }
+
+  let originalAtomic: bigint
+  try {
+    originalAtomic = BigInt(invoice.stablecoinAmountAtomic)
+  } catch {
+    return errorResponse(502, {
+      code: 'QUOTE_UNAVAILABLE',
+      message: 'Stripe invoice returned an unparseable amount.',
+      link_id_detected: null,
+    })
+  }
+  if (originalAtomic <= 0n) {
+    return errorResponse(422, {
+      code: 'QUOTE_UNAVAILABLE',
+      message: 'Invoice amount must be positive.',
+      link_id_detected: null,
+    })
+  }
+
+  // Same channel key as invoice-details so both quote surfaces price alike.
+  const channel = await resolveTrustedCheckoutChannel(request, `stripe:${url}`, {
+    agentBetaSecret: env.CHECKOUT_AGENT_BETA_CHANNEL_SECRET,
+    agentBetaFeeBps: env.CHECKOUT_AGENT_BETA_FEE_BPS,
+  })
+  const pricing = resolveCheckoutPricing(
+    originalAtomic,
+    invoice.merchantTitle,
+    env.CHECKOUT_WEB_FEE_BPS,
+    channel?.feeBps,
+  )
+  const pricingFields = {
+    original: formatUsdcAtomic(pricing.originalAtomic),
+    serviceFee: formatUsdcAtomic(pricing.serviceFeeAtomic),
+    callerPays: formatUsdcAtomic(pricing.callerPaysAtomic),
+    feeBps: pricing.feeBps,
+    pricingVersion: pricing.pricingVersion,
+  }
+  const quoteReceipt = await createQuoteReceipt(
+    invoice.invoiceKey,
+    invoice.stablecoinAmount,
+    invoice.merchantTitle,
+    env.PAYINVOICE_ADMIN_SECRET,
+    Math.floor(Date.now() / 1000),
+    { ...pricingFields, client: null, channel: channel?.id ?? null },
+  )
+
+  return json(200, {
+    ok: true,
+    provider: 'stripe_crypto',
+    linkId: invoice.invoiceKey,
+    merchant: invoice.merchantTitle,
+    invoice: {
+      amount: invoice.stablecoinAmount,
+      currency: 'USD',
+      invoiceKey: invoice.invoiceKey,
+      state: invoice.state,
+      validBefore: invoice.validBefore,
+    },
+    ...pricingFields,
+    invoiceUrl: url,
+    title: buildCheckoutTitle(invoice.merchantTitle, pricing),
+    currency: 'USD',
+    quote: {
       originalAtomicUsdc: pricing.originalAtomic.toString(),
       serviceFeeAtomicUsdc: pricing.serviceFeeAtomic.toString(),
       callerPaysAtomicUsdc: pricing.callerPaysAtomic.toString(),

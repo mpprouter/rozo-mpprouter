@@ -7,6 +7,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   detectProvider,
+  normalizeInvoiceUrl,
   extractStripeSessionBlob,
   extractPaymentLinkId,
   normalizePayInvoiceBody,
@@ -50,8 +51,11 @@ describe('detectProvider — strict host allowlist', () => {
     expect(detectProvider('https://example.com/pay/CDM')).toBeNull()
   })
 
-  it('rejects http:// (must be https)', () => {
-    expect(detectProvider('http://crypto.stripe.com/pay/CDM')).toBeNull()
+  it('accepts http:// on allowlisted hosts (upgraded to https by normalizeInvoiceUrl)', () => {
+    expect(detectProvider('http://crypto.stripe.com/pay/CDM')).toBe('stripe_crypto')
+    expect(detectProvider('http://payments.coinbase.com/payment-links/pl_abc')).toBe('coinbase')
+    expect(detectProvider('http://crypto.stripe.com.evil.com/pay/CDM')).toBeNull()
+    expect(detectProvider('ftp://crypto.stripe.com/pay/CDM')).toBeNull()
   })
 
   it('rejects a malformed URL', () => {
@@ -122,5 +126,31 @@ describe('normalizePayInvoiceBody — provider_detected additive field', () => {
   it('provider_detected is null for an unknown host URL', () => {
     const r = normalizePayInvoiceBody({ url: 'https://example.com/checkout' })
     expect(r.provider_detected).toBeNull()
+  })
+})
+
+describe('normalizeInvoiceUrl — http:// is rewritten to https:// for known providers', () => {
+  it('upgrades http on stripe and coinbase hosts', () => {
+    expect(normalizeInvoiceUrl('http://crypto.stripe.com/pay/CDM')).toBe(
+      'https://crypto.stripe.com/pay/CDM',
+    )
+    expect(normalizeInvoiceUrl('http://payments.coinbase.com/payment-links/pl_abc')).toBe(
+      'https://payments.coinbase.com/payment-links/pl_abc',
+    )
+  })
+  it('leaves https and unknown inputs byte-identical', () => {
+    const https = 'https://crypto.stripe.com/pay/CDM'
+    expect(normalizeInvoiceUrl(https)).toBe(https)
+    expect(normalizeInvoiceUrl('http://example.com/pay/CDM')).toBe('http://example.com/pay/CDM')
+    expect(normalizeInvoiceUrl('not a url')).toBe('not a url')
+    expect(normalizeInvoiceUrl('pl_abc')).toBe('pl_abc')
+  })
+  it('normalizePayInvoiceBody exposes the https form and classifies the provider', () => {
+    const r = normalizePayInvoiceBody({ url: 'http://crypto.stripe.com/pay/CDM' })
+    expect(r.provider_detected).toBe('stripe_crypto')
+    expect(r.normalized).toEqual({ url: 'https://crypto.stripe.com/pay/CDM' })
+    const c = normalizePayInvoiceBody({ url: 'http://payments.coinbase.com/payment-links/pl_abc' })
+    expect(c.provider_detected).toBe('coinbase')
+    expect(c.link_id_detected).toBe('pl_abc')
   })
 })

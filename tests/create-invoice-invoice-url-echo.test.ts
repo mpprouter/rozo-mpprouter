@@ -255,7 +255,30 @@ describe('quote-invoice echoes the caller-supplied invoice URL', () => {
   })
 
   it('echoes a Stripe URL just the same — it is the caller\'s own string', async () => {
-    const { json } = await quote({ url: STRIPE_URL })
+    // Stripe links are now resolved by the router itself (never proxied to
+    // agentapi), so stub the two Stripe calls instead of the agentapi quote.
+    const { handleQuoteInvoice } = await import('../src/routes/pay-invoice-admin')
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('resume_payin_session')) return Response.json({ sessionId: 'cpis_echo', clientSecret: 'cs', publishableKey: 'pk' })
+      if (u.includes('payin_session')) return Response.json({
+        id: 'cpis_echo', merchant: 'acct_x', business_name: 'Command Code', state: 'checkout',
+        payment_details: { amount: 136, currency: 'usd' },
+        supported_currencies: [{ id: 'usdc.base', currency_network: 'base', chain_id: 8453, asset_code: 'usdc', contract_address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', payment_options: ['wallet_connect'] }],
+        transaction_details: {}, valid_before: '1789980699',
+      })
+      return new Response('unexpected ' + u, { status: 500 })
+    }) as typeof fetch)
+    const res = await handleQuoteInvoice(
+      new Request('https://mpp.test/quote-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url: STRIPE_URL }),
+      }),
+      { PAYINVOICE_ADMIN_SECRET: 'test-secret' } as Env,
+    )
+    const json = (await res.json()) as any
+    expect(res.status).toBe(200)
     expect(json.invoiceUrl).toBe(STRIPE_URL)
   })
 

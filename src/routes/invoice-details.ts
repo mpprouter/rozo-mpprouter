@@ -15,7 +15,7 @@
 // capacity and (for Stripe) touches a live session.
 
 import type { Env } from '../index'
-import { detectProvider, extractCoinbaseCheckoutId } from './pay-invoice-admin'
+import { detectProvider, extractCoinbaseCheckoutId, normalizeInvoiceUrl } from './pay-invoice-admin'
 import {
   CoinbaseResolveError,
   resolveCoinbaseInvoice,
@@ -147,6 +147,45 @@ async function sessionBucketId(url: string): Promise<string | null> {
   }
 }
 
+/**
+ * The per-IP + per-invoice guard handleInvoiceDetails applies before touching
+ * a provider. Exported so quote-invoice's Stripe branch shares the SAME KV
+ * buckets (a caller cannot double its Stripe resolve budget by alternating
+ * endpoints). Returns the 429 Response to send, or null when allowed.
+ */
+export async function invoiceResolveRateLimit(
+  request: Request,
+  env: Env,
+  url: string,
+): Promise<Response | null> {
+  const ip = request.headers.get('CF-Connecting-IP') ?? 'unknown'
+  const ipLimit = await rateLimitOk(env, `ip:${ip}`, PER_IP_LIMIT, PER_IP_WINDOW_S)
+  if (!ipLimit.ok) {
+    return json(
+      429,
+      { ok: false, code: 'RATE_LIMITED', error: RATE_LIMIT_MESSAGE, scope: 'ip', retry_after_s: ipLimit.retryAfterS },
+      { 'Retry-After': String(ipLimit.retryAfterS) },
+    )
+  }
+  const sessBucket = await sessionBucketId(url)
+  if (sessBucket) {
+    const sessLimit = await rateLimitOk(
+      env,
+      `session:${sessBucket}:ip:${ip}`,
+      PER_SESSION_LIMIT,
+      PER_SESSION_WINDOW_S,
+    )
+    if (!sessLimit.ok) {
+      return json(
+        429,
+        { ok: false, code: 'RATE_LIMITED', error: RATE_LIMIT_MESSAGE, scope: 'invoice', retry_after_s: sessLimit.retryAfterS },
+        { 'Retry-After': String(sessLimit.retryAfterS) },
+      )
+    }
+  }
+  return null
+}
+
 export async function handleInvoiceDetails(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') {
     return json(405, { error: 'Method not allowed' })
@@ -160,12 +199,13 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
   }
 
   const body = (parsed ?? {}) as Record<string, unknown>
-  const rawUrl =
+  const rawUrl = normalizeInvoiceUrl(
     typeof body.url === 'string'
       ? body.url.trim()
       : typeof body.payment_link === 'string'
         ? (body.payment_link as string).trim()
-        : ''
+        : '',
+  )
 
   if (!rawUrl) {
     return json(400, {
