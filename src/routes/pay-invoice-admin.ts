@@ -1,6 +1,7 @@
 import type { Env } from '../index'
 import { createQuoteReceipt } from './quote-receipt'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
+import { invoiceResolveRateLimit } from './invoice-details'
 import {
   buildCheckoutTitle,
   formatUsdcAtomic,
@@ -574,6 +575,12 @@ const STRIPE_QUOTE_ERROR_STATUS: Record<string, number> = {
 async function quoteStripeInvoice(request: Request, env: Env, url: string): Promise<Response> {
   // Never echo the /pay/<blob> URL back in error payloads: the blob can be
   // replayed to resume the session. The caller already holds it.
+  // Same per-IP / per-invoice buckets as invoice-details: every request here
+  // resumes a live Stripe session, so quote-invoice must not be a second,
+  // unmetered path to the same upstream (codex P2 on #188).
+  const limited = await invoiceResolveRateLimit(request, env, url)
+  if (limited) return limited
+
   let invoice
   try {
     invoice = await resolveStripeInvoice(url)

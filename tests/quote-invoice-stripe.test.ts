@@ -13,7 +13,12 @@ import { verifyQuoteReceipt } from '../src/routes/quote-receipt'
 
 const KEY = 'cpis_1UIMzfDSZgxV3MJKGYmbSlu0'
 const URL_ = 'https://crypto.stripe.com/pay/CDMQARoXBLOBTUOQ'
-const env = { PAYINVOICE_ADMIN_SECRET: 'test-secret' } as import('../src/index').Env
+class FakeKV {
+  store = new Map<string, string>()
+  async get(key: string) { return this.store.get(key) ?? null }
+  async put(key: string, value: string) { this.store.set(key, value) }
+}
+const env = { PAYINVOICE_ADMIN_SECRET: 'test-secret', MPP_STORE: new FakeKV() } as unknown as import('../src/index').Env
 
 function session(state: string) {
   return {
@@ -81,5 +86,22 @@ describe('quote-invoice: Stripe branch', () => {
     const res = await handleQuoteInvoice(post({ url: URL_ }), env)
     expect(res.status).toBe(410)
     expect(((await res.json()) as any).code).toBe('LINK_USED_OR_EXPIRED')
+  })
+
+  it('shares invoice-details per-invoice rate limit: once limited, Stripe is not called again', async () => {
+    const hits = mockStripe('ok')
+    const limitedEnv = { PAYINVOICE_ADMIN_SECRET: 'test-secret', MPP_STORE: new FakeKV() } as unknown as import('../src/index').Env
+    const req = () => new Request('https://mpp.test/quote-invoice', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'CF-Connecting-IP': '203.0.113.9' },
+      body: JSON.stringify({ url: URL_ }),
+    })
+    for (let i = 0; i < 30; i++) expect((await handleQuoteInvoice(req(), limitedEnv)).status).toBe(200)
+    const before = hits.length
+    const res = await handleQuoteInvoice(req(), limitedEnv)
+    expect(res.status).toBe(429)
+    expect(res.headers.get('Retry-After')).toBeTruthy()
+    expect(((await res.json()) as any).code).toBe('RATE_LIMITED')
+    expect(hits.length).toBe(before)
   })
 })
