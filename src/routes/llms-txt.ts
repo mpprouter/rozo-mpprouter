@@ -100,6 +100,11 @@ payments.coinbase.com/payment-sessions/paymentSession_*), OpenRouter invoices,
 and Stripe Crypto checkout links.
 Payment is made with Stellar USDC via the normal 402 flow.
 
+The sibling endpoints quote-invoice, create-invoice, invoice-details and
+invoice-status take the same { "url": ... } input. Since #188 quote-invoice
+resolves Stripe Crypto Payin links (crypto.stripe.com/pay/*) natively, and an
+http:// invoice URL on a supported host is normalized to https://.
+
 ## Don't have a Stellar wallet yet?
 
 Discovery is free, but **calling** a service requires a Stellar USDC
