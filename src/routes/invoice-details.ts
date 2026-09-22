@@ -15,7 +15,7 @@
 // capacity and (for Stripe) touches a live session.
 
 import type { Env } from '../index'
-import { detectProvider, extractCoinbaseCheckoutId } from './pay-invoice-admin'
+import { detectProvider, extractCoinbaseCheckoutId, normalizeInvoiceUrl } from './pay-invoice-admin'
 import {
   CoinbaseResolveError,
   resolveCoinbaseInvoice,
@@ -160,12 +160,13 @@ export async function handleInvoiceDetails(request: Request, env: Env): Promise<
   }
 
   const body = (parsed ?? {}) as Record<string, unknown>
-  const rawUrl =
+  const rawUrl = normalizeInvoiceUrl(
     typeof body.url === 'string'
       ? body.url.trim()
       : typeof body.payment_link === 'string'
         ? (body.payment_link as string).trim()
-        : ''
+        : '',
+  )
 
   if (!rawUrl) {
     return json(400, {

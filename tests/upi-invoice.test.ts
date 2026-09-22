@@ -236,12 +236,24 @@ describe('classifyUpiUrl', () => {
     expect(classifyUpiUrl(STRIPE_URL)).toMatchObject({ provider: 'stripe_crypto' })
   })
 
+  it('upgrades http:// to https:// on known hosts so the stored payUrl is the TLS form', () => {
+    expect(classifyUpiUrl('http://payments.coinbase.com/payment-links/pl_abc')).toEqual({
+      provider: 'coinbase_v1',
+      invoiceKey: 'pl_abc',
+      payUrl: 'https://payments.coinbase.com/payment-links/pl_abc',
+    })
+    expect(classifyUpiUrl(STRIPE_URL.replace('https://', 'http://'))).toMatchObject({
+      provider: 'stripe_crypto',
+      payUrl: STRIPE_URL,
+    })
+  })
+
   it('rejects card checkout, setup links, commerce charges, look-alikes and junk', () => {
     expect(classifyUpiUrl('https://checkout.stripe.com/c/pay/cs_live_abc')).toBeNull()
     expect(classifyUpiUrl('https://crypto.stripe.com/setup/blob')).toBeNull()
     expect(classifyUpiUrl('https://commerce.coinbase.com/pay/0b1c2d')).toBeNull()
     expect(classifyUpiUrl('https://crypto.stripe.com.evil.com/pay/blob')).toBeNull()
-    expect(classifyUpiUrl('http://payments.coinbase.com/payment-links/pl_abc')).toBeNull()
+    expect(classifyUpiUrl('ftp://payments.coinbase.com/payment-links/pl_abc')).toBeNull()
     expect(classifyUpiUrl('not a url')).toBeNull()
     expect(classifyUpiUrl('https://example.com/pay/x')).toBeNull()
   })

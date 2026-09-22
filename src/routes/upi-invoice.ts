@@ -36,6 +36,7 @@ import {
   extractCoinbaseCheckoutId,
   extractStripeSessionBlob,
   isCoinbasePaymentSessionId,
+  normalizeInvoiceUrl,
 } from './pay-invoice-admin'
 import {
   CoinbaseResolveError,
@@ -221,19 +222,22 @@ export type ClassifiedUrl =
  */
 export function classifyUpiUrl(raw: string): ClassifiedUrl {
   if (typeof raw !== 'string' || raw.length > 2048) return null
-  const provider = detectProvider(raw.trim())
+  // http:// on a known provider host is upgraded to https:// so the stored
+  // payUrl (encrypted, later resumed by the fulfiller) is always the TLS form.
+  const url = normalizeInvoiceUrl(raw.trim())
+  const provider = detectProvider(url)
   if (provider === 'coinbase') {
-    const id = extractCoinbaseCheckoutId(raw.trim())
+    const id = extractCoinbaseCheckoutId(url)
     if (!id) return null
     return {
       provider: isCoinbasePaymentSessionId(id) ? 'coinbase_v3' : 'coinbase_v1',
       invoiceKey: id,
-      payUrl: raw.trim(),
+      payUrl: url,
     }
   }
   if (provider === 'stripe_crypto') {
-    if (!extractStripeSessionBlob(raw.trim())) return null
-    return { provider: 'stripe_crypto', invoiceKey: null, payUrl: raw.trim() }
+    if (!extractStripeSessionBlob(url)) return null
+    return { provider: 'stripe_crypto', invoiceKey: null, payUrl: url }
   }
   return null
 }
