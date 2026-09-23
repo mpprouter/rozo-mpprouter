@@ -471,7 +471,39 @@ describe('create-invoice — stellar_payin_contracts intent', () => {
     })
     expect(status).toBe(502)
     expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.stage).toBe('order_lookup')
+    expect(json.upstream_status).toBe(500)
     expect(createdIntent).toBeNull()
+  })
+
+  it('tags an upstream create HTTP error with stage and upstream_status', async () => {
+    createResponseOverride = () => new Response('boom', { status: 503 })
+    const { status, json } = await createInvoice({ payment_id: PAYMENT_ID, source: STELLAR_SOURCE })
+    expect(status).toBe(502)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.stage).toBe('create_http_error')
+    expect(json.upstream_status).toBe(503)
+    expect(json.hint).toBe('boom')
+  })
+
+  it('tags a non-JSON upstream create body with stage and upstream_status', async () => {
+    createResponseOverride = () => new Response('<html>', { status: 200 })
+    const { status, json } = await createInvoice({ payment_id: PAYMENT_ID, source: STELLAR_SOURCE })
+    expect(status).toBe(502)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.stage).toBe('create_non_json')
+    expect(json.upstream_status).toBe(200)
+  })
+
+  it('tags an unreachable upstream create with a null upstream_status', async () => {
+    createResponseOverride = () => {
+      throw new TypeError('network down')
+    }
+    const { status, json } = await createInvoice({ payment_id: PAYMENT_ID, source: STELLAR_SOURCE })
+    expect(status).toBe(502)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.stage).toBe('create_unreachable')
+    expect(json.upstream_status).toBeNull()
   })
 
   it('blocks on an in-flight sibling even after its expiresAt has passed', async () => {
