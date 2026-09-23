@@ -155,3 +155,7 @@ provider's 403 in `detail`, payment auto-refunded). Details in `/llms.txt`.
   [`examples/vercel-ai-sdk/`](examples/vercel-ai-sdk/).
 - [OpenClaw / Claude Code skill](https://github.com/mpprouter/stellar-agent-wallet-skill)
   — the same protocol packaged as a skill.
+
+## Secret scanning
+
+Enable the local gitleaks pre-commit hook once per clone: `brew install gitleaks pre-commit && pre-commit install` (config in `.pre-commit-config.yaml`). CI also runs a report-only scan in `.github/workflows/secret-scan.yml`.
