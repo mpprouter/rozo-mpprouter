@@ -263,9 +263,20 @@ const STRIPE_RESOLVE_ERROR_CODES: Record<string, CreateInvoiceErrorCode> = {
   unsupported: 'UNSUPPORTED_SOURCE',
 }
 
+/** Which upstream call produced an INTENTS_API_FAILED, for triage/telemetry. */
+export type IntentsApiFailureStage =
+  | 'order_lookup'
+  | 'create_unreachable'
+  | 'create_http_error'
+  | 'create_non_json'
+
 export interface CreateInvoiceError extends Omit<PayInvoiceError, 'code'> {
   code: CreateInvoiceErrorCode
   payment_status?: string
+  /** Set on INTENTS_API_FAILED only: which upstream call failed. */
+  stage?: IntentsApiFailureStage
+  /** Set on INTENTS_API_FAILED only: upstream HTTP status, null when no response was received. */
+  upstream_status?: number | null
 }
 
 function json(status: number, payload: unknown): Response {
@@ -1038,7 +1049,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   type OrderLookup =
     | { state: 'found'; row: any }
     | { state: 'missing' }
-    | { state: 'error' }
+    | { state: 'error'; status: number | null }
   const lookupOrder = async (id: string): Promise<OrderLookup> => {
     let lookup: Response
     try {
@@ -1050,12 +1061,12 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         },
       )
     } catch {
-      return { state: 'error' }
+      return { state: 'error', status: null }
     }
     if (lookup.status === 404) return { state: 'missing' }
-    if (!lookup.ok) return { state: 'error' }
+    if (!lookup.ok) return { state: 'error', status: lookup.status }
     const row = await lookup.json().catch(() => undefined)
-    if (row === undefined) return { state: 'error' }
+    if (row === undefined) return { state: 'error', status: lookup.status }
     return { state: 'found', row }
   }
 
@@ -1063,9 +1074,14 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     // Scan the base orderId and every contract-variant slot in parallel.
     const allIds = [orderId, ...contractVariantIds(orderId)]
     const scanned = await Promise.all(allIds.map((id) => lookupOrder(id)))
-    if (scanned.some((r) => r.state === 'error')) {
+    const failedLookup = scanned.find(
+      (r): r is { state: 'error'; status: number | null } => r.state === 'error',
+    )
+    if (failedLookup) {
       return errorResponse(502, {
         code: 'INTENTS_API_FAILED',
+        stage: 'order_lookup',
+        upstream_status: failedLookup.status,
         message:
           'Could not verify the existing orders for this payment link. ' +
           'Retry shortly — creating a new order without that check could ' +
@@ -1368,6 +1384,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   } catch (err: any) {
     return errorResponse(502, {
       code: 'INTENTS_API_FAILED',
+      stage: 'create_unreachable',
+      upstream_status: null,
       message: `Rozo intents API unreachable: ${err?.message ?? 'unknown error'}`,
       normalized_input: normalized,
       link_id_detected,
@@ -1464,6 +1482,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     }
     return errorResponse(502, {
       code: 'INTENTS_API_FAILED',
+      stage: 'create_http_error',
+      upstream_status: intentsResp.status,
       message: `Rozo intents API returned ${intentsResp.status}.`,
       hint: intentsText.substring(0, 500),
       normalized_input: normalized,
@@ -1477,6 +1497,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   } catch {
     return errorResponse(502, {
       code: 'INTENTS_API_FAILED',
+      stage: 'create_non_json',
+      upstream_status: intentsResp.status,
       message: 'Rozo intents API returned non-JSON body.',
       hint: intentsText.substring(0, 300),
       normalized_input: normalized,
