@@ -17,6 +17,11 @@ import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { contractVariantIds } from '../mpp/contract-variant'
 import { verifyQuoteReceipt, type QuoteReceiptPayload } from './quote-receipt'
 import {
+  attributionMetadata,
+  buildOrderAttribution,
+  type OrderAttribution,
+} from './order-attribution'
+import {
   CHECKOUT_PRICING_VERSION,
   computeServiceFeeAtomic,
   formatUsdcAtomic,
@@ -699,6 +704,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     attributionRaw && typeof attributionRaw === 'object' && !Array.isArray(attributionRaw)
       ? { attribution: attributionRaw }
       : {}
+  // Order-level attribution (surface + campaign), written to
+  // metadata.attribution on creation only. Separate from the passthrough above
+  // and from pricing: it is computed here and only ever spread into metadata.
+  const orderAttribution = attributionMetadata(buildOrderAttribution(attributionRaw, request))
   const receiptRaw = (parsed as Record<string, unknown> | null)?.quoteReceipt
   if (sourceResult.error) {
     return errorResponse(400, {
@@ -781,6 +790,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       typeof receiptRaw === 'string' ? receiptRaw : null,
       forwardedHint,
       payinIntent,
+      orderAttribution,
     )
   }
 
@@ -1332,6 +1342,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
           ...provenance,
+          ...orderAttribution,
           ...priced,
         },
       }
@@ -1364,6 +1375,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
           ...provenance,
+          ...orderAttribution,
           ...priced,
         },
   }
@@ -1634,6 +1646,9 @@ export async function handleStripeCreateInvoice(
   // contract-mode) stays a 200 + intentMismatch warning: a classic wallet can
   // still be told which rail to pay.
   payinIntent: 'stellar_payin_contracts' | null = null,
+  // Order-level attribution for metadata.attribution (see order-attribution.ts).
+  // Written on create only; a reused order keeps whatever it was created with.
+  orderAttribution: { attribution?: OrderAttribution } = {},
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -1795,6 +1810,7 @@ export async function handleStripeCreateInvoice(
   const lockedMetadata = {
     source: 'mpprouter-create-invoice',
     ...provenance,
+    ...orderAttribution,
     invoiceProvider: 'stripe_crypto',
     invoiceKey: invoice.invoiceKey,
     invoiceLockFingerprint: invoice.lockFingerprint,
