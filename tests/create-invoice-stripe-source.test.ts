@@ -208,6 +208,16 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
     expect(json.source).toEqual({ chainId: '900', tokenSymbol: 'USDT' })
   })
 
+  it('writes sanitized metadata.attribution into the Stripe locked metadata', async () => {
+    const { status } = await createInvoice({
+      url: STRIPE_URL,
+      attribution: { client: 'rozo-checkout-web', utm_source: 'x', bogus: 'dropped' },
+    })
+    expect(status).toBe(200)
+    expect(createdIntent.metadata.attribution).toEqual({ client: 'rozo-checkout-web', utm_source: 'x' })
+    expect(createdIntent.metadata.invoiceProvider).toBe('stripe_crypto')
+  })
+
   it('still defaults to Base USDC when no source is given', async () => {
     const { status, json } = await createInvoice({ url: STRIPE_URL })
     expect(status).toBe(200)
