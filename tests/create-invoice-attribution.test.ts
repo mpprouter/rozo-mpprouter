@@ -30,7 +30,7 @@ describe('sanitizeOrderAttribution', () => {
         utm_term: 'dropped',
         ref: 'dropped',
         evil: 'dropped',
-        referrer: 'https://www.google.com/search?q=secret#frag',
+        referrer: 'https://checkout.rozo.ai/blog/post-1?q=secret#frag',
         landing_path: '/btc?utm_source=x#top',
       }),
     ).toEqual({
@@ -39,7 +39,7 @@ describe('sanitizeOrderAttribution', () => {
       utm_medium: 'social',
       utm_campaign: 'launch',
       utm_content: 'post-1',
-      referrer: 'https://www.google.com/search',
+      referrer: 'https://checkout.rozo.ai/blog/post-1',
       landing_path: '/btc',
     })
   })
@@ -61,20 +61,32 @@ describe('sanitizeOrderAttribution', () => {
       client: 'c'.repeat(500),
       utm_campaign: 'u'.repeat(500),
       landing_path: '/' + 'p'.repeat(1000),
-      referrer: 'https://example.com/' + 'r'.repeat(2000),
+      referrer: 'https://agent.rozo.ai/' + 'r'.repeat(2000),
     })!
     expect(out.client!.length).toBe(64)
     expect(out.utm_campaign!.length).toBe(100)
     expect(out.landing_path!.length).toBe(256)
     expect(out.referrer!.length).toBe(512)
-    expect(out.referrer!.startsWith('https://example.com/')).toBe(true)
+    expect(out.referrer!.startsWith('https://agent.rozo.ai/')).toBe(true)
   })
 
   it('drops non-http referrers and unparseable ones', () => {
     expect(sanitizeOrderAttribution({ referrer: 'javascript:alert(1)' })).toBeNull()
     expect(sanitizeOrderAttribution({ referrer: 'not a url' })).toBeNull()
-    expect(sanitizeOrderAttribution({ referrer: 'https://user:pw@host.example/p?q=1' })).toEqual({
-      referrer: 'https://host.example/p',
+    expect(sanitizeOrderAttribution({ referrer: 'https://user:pw@checkout.rozo.ai/p?q=1' })).toEqual({
+      referrer: 'https://checkout.rozo.ai/p',
+    })
+  })
+
+  it('keeps only the origin of a third-party referrer (path may carry PII)', () => {
+    expect(sanitizeOrderAttribution({ referrer: 'https://mail.example.com/u/alice@example.com/inbox' })).toEqual({
+      referrer: 'https://mail.example.com',
+    })
+    expect(sanitizeOrderAttribution({ referrer: 'https://evilrozo.ai/secret' })).toEqual({
+      referrer: 'https://evilrozo.ai',
+    })
+    expect(sanitizeOrderAttribution({ referrer: 'https://rozo.ai.evil.com/secret' })).toEqual({
+      referrer: 'https://rozo.ai.evil.com',
     })
   })
 
@@ -212,7 +224,7 @@ describe('create-invoice — metadata.attribution', () => {
     expect(createdIntent.metadata.attribution).toEqual({
       client: 'rozo-checkout-web/landing',
       utm_source: 'x',
-      referrer: 'https://t.co/abc',
+      referrer: 'https://t.co',
       landing_path: '/zh',
     })
     // Existing metadata keys are untouched.

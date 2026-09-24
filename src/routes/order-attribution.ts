@@ -17,7 +17,8 @@
  *
  * Contract (shared with the frontends, fixed 2026-09-25):
  *  - allowed keys only: client (<=64), utm_source / utm_medium / utm_campaign /
- *    utm_content (<=100 each), referrer (<=512, origin + path only), and
+ *    utm_content (<=100 each), referrer (<=512, origin + path for our own
+ *    hosts, origin only for third-party hosts), and
  *    landing_path (<=256, query stripped)
  *  - unknown keys and non-string values are dropped; control and format
  *    characters are stripped; over-length values are truncated
@@ -58,7 +59,15 @@ function cleanString(raw: unknown, max: number): string | null {
   return cleaned.length ? cleaned : null
 }
 
-/** origin + path of an absolute http(s) URL; query and fragment dropped. */
+// Hosts whose paths are our own pages. A third-party referrer path can carry
+// someone else's token, invite code or email address, and metadata is returned
+// to anyone holding the order id, so only our own paths are kept (codex P1).
+const OWN_HOST = /(^|\.)(rozo\.ai|mpprouter\.dev)$/i
+
+/**
+ * Referrer of an absolute http(s) URL with query and fragment dropped:
+ * origin + path for our own hosts, origin only for everyone else.
+ */
 function cleanReferrer(raw: unknown): string | null {
   const value = cleanString(raw, REFERRER_MAX * 4)
   if (!value) return null
@@ -69,7 +78,7 @@ function cleanReferrer(raw: unknown): string | null {
     return null
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
-  const out = `${url.origin}${url.pathname}`
+  const out = OWN_HOST.test(url.hostname) ? `${url.origin}${url.pathname}` : url.origin
   return cleanString(out, REFERRER_MAX)
 }
 
