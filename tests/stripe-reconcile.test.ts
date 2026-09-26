@@ -276,8 +276,18 @@ describe('handleStripeWebhookEvent safety net', () => {
     const env = makeEnv()
     await seed(env)
     // The balance RPC throws synchronously inside fetch → getBaseUsdcBalance may
-    // swallow it; force a throw from the shared-pool reservation instead.
-    ;(env.MPP_STORE as any).get = async () => { throw new Error('kv down') }
+    // swallow it; force a throw from the daily-spend reservation (the last
+    // pre-call accounting step; the shared KV pool counter no longer exists).
+    const ns: any = env.ATOMIC_STORE
+    const stub = ns.get(null)
+    const realFetch = stub.fetch.bind(stub)
+    stub.fetch = async (req: Request) => {
+      const body: any = await req.clone().json()
+      if (new URL(req.url).pathname === '/commit' && String(body.key).startsWith('stripe-daily-spent:')) {
+        throw new Error('DO down')
+      }
+      return realFetch(req)
+    }
     const spy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
       new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16).padStart(64, '0') }), { status: 200 }),
     )
@@ -336,8 +346,8 @@ describe('handleStripeWebhookEvent safety net', () => {
     )
     expect(out).toMatchObject({ deferred: 'settlement_error', retryable: true })
     expect((await loadRec(env)).status).toBe('payout_seen')
-    // Both reservations unwound.
-    expect(await (env.MPP_STORE as any).get('funder-reserved-atomic')).toBe('0')
+    // Daily reservation unwound; the removed shared KV pool counter is never written.
+    expect(await (env.MPP_STORE as any).get('funder-reserved-atomic')).toBeNull()
     expect(await readDailySpentAtomic(env, now)).toBe(0n)
   })
 
@@ -354,12 +364,18 @@ describe('handleStripeWebhookEvent safety net', () => {
       }
       return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16).padStart(64, '0') }), { status: 200 })
     })
-    // … and the very next step (releasing the shared-pool reservation via KV)
-    // throws. Before the safety net this left the record at provider_paying.
-    const realPut = (env.MPP_STORE as any).put
-    ;(env.MPP_STORE as any).put = async (k: string, v: string) => {
-      if (payInvoiceCalls > 0 && k === 'funder-reserved-atomic') throw new Error('kv down after sign')
-      return realPut(k, v)
+    // … and the very next storage step (finalizing the record in the DO)
+    // throws once. Before the safety net this left the record at provider_paying.
+    const ns: any = env.ATOMIC_STORE
+    const stub = ns.get(null)
+    const realFetch = stub.fetch.bind(stub)
+    let thrown = false
+    stub.fetch = async (req: Request) => {
+      if (payInvoiceCalls > 0 && !thrown) {
+        thrown = true
+        throw new Error('DO down after sign')
+      }
+      return realFetch(req)
     }
     const out = await handleStripeWebhookEvent(
       env,
@@ -371,8 +387,6 @@ describe('handleStripeWebhookEvent safety net', () => {
     const rec = await loadRec(env)
     expect(rec.status).toBe('provider_submitted_ambiguous')
     expect(rec.events.at(-1).kind).toBe('stripe_settlement_threw')
-    // Restore KV so the replay below can run its accounting.
-    ;(env.MPP_STORE as any).put = realPut
     // Replay → guarded, no second signing attempt.
     const again = await handleStripeWebhookEvent(
       env,

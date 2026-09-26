@@ -356,7 +356,8 @@ describe('handleStripeWebhookEvent', () => {
     const now = new Date(Date.UTC(2026, 6, 12))
     const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev1' }), now)
     expect(summary.status).toBe('provider_disabled')
-    expect(await kv.get('funder-reserved-atomic')).toBe('0')
+    // The shared KV pool counter was removed; nothing writes it.
+    expect(await kv.get('funder-reserved-atomic')).toBeNull()
     // no money moved → daily ledger back to 0 (reservation released).
     expect(await readDailySpentAtomic(env, now)).toBe(0n)
   })

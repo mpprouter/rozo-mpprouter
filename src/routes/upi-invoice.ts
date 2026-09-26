@@ -51,8 +51,6 @@ import { claimInvoiceKey } from './invoice-claim'
 import {
   FUNDER_WALLET,
   callAgentApiPayInvoice,
-  bumpReserved,
-  reservedAtomic,
   sendInvoiceFailureAlert,
 } from './webhook'
 import {
@@ -765,41 +763,34 @@ async function executeFulfillment(
   const invoiceAtomic = BigInt(inv.stablecoinAmountAtomic)
   const now = new Date()
 
-  // Wallet inventory gate — identical to the crypto webhook: real balance minus
-  // the shared reserved counter. An unreadable balance attempts anyway because
-  // the executor re-checks the funder as the final gate.
+  // Wallet inventory gate — identical to the crypto webhook: the funder's real
+  // on-chain balance (the shared reservation counter was removed 2026-09-26).
+  // An unreadable balance attempts anyway because the executor re-checks the
+  // funder as the final gate.
   const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
   const balance = balanceResult.balance
   if (balance !== null) {
-    const reserved = await reservedAtomic(env)
-    const available = balance - reserved
-    if (available < invoiceAtomic) {
+    if (balance < invoiceAtomic) {
       await transition(env, orderId, 'failed', {
         kind: 'insufficient_funder_balance',
         failureReason: 'insufficient_funder_balance',
-        extra: { balance: balance.toString(), reserved: reserved.toString(), invoice: invoiceAtomic.toString() },
+        extra: { balance: balance.toString(), invoice: invoiceAtomic.toString() },
       })
       await sendInvoiceFailureAlert(env, {
         kind: 'failed_insufficient_balance',
         plId: `${invoiceKey} (UPI order ${orderId})`,
         invoiceAtomic,
         funderBalanceAtomic: balance,
-        availableAtomic: available,
         failureReason: 'UPI captured but funder cannot cover the invoice',
       })
       return
     }
   }
 
-  await bumpReserved(env, invoiceAtomic)
-  try {
-    if (provider === 'stripe_crypto') {
-      await executeStripe(env, orderId, inv, payUrl, invoiceAtomic, now)
-    } else {
-      await executeCoinbase(env, orderId, invoiceKey, inv)
-    }
-  } finally {
-    await bumpReserved(env, -invoiceAtomic)
+  if (provider === 'stripe_crypto') {
+    await executeStripe(env, orderId, inv, payUrl, invoiceAtomic, now)
+  } else {
+    await executeCoinbase(env, orderId, invoiceKey, inv)
   }
 }
 
