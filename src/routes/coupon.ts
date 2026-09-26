@@ -135,9 +135,9 @@ const STRIPE_MIN_VALIDITY_MS = 5 * 60 * 1000
 const STRIPE_SESSION_ID_RE = /^cpis_[A-Za-z0-9_]+$/
 
 /**
- * Amount policy. Exact match is accepted for every provider. Additionally, a
- * Stripe Crypto invoice from OpenRouter's Stripe account is accepted when it
- * falls within [face - $1.00, face + $0.15]. The caller always pays the
+ * Amount policy. Coinbase: exact match only (unchanged). Stripe Crypto: only
+ * OpenRouter's Stripe account is payable at all (exact or not), and the invoice
+ * must fall within [face - $1.00, face + $0.15]. The caller always pays the
  * INVOICE amount, never the face value.
  */
 export function couponAmountAccepted(
@@ -147,9 +147,15 @@ export function couponAmountAccepted(
   merchantAccount: string | null,
 ): boolean {
   if (invoiceAtomic <= 0n) return false
+  if (provider === 'stripe_crypto') {
+    // Coupons are OpenRouter credit. A Stripe link from any other merchant is
+    // refused even at the exact face value, so a leaked code cannot be spent
+    // on an attacker-controlled Stripe checkout.
+    if (merchantAccount !== OPENROUTER_STRIPE_ACCOUNT) return false
+  } else {
+    return invoiceAtomic === faceAtomic
+  }
   if (invoiceAtomic === faceAtomic) return true
-  if (provider !== 'stripe_crypto') return false
-  if (merchantAccount !== OPENROUTER_STRIPE_ACCOUNT) return false
   return (
     invoiceAtomic >= faceAtomic - STRIPE_TOLERANCE_BELOW_ATOMIC &&
     invoiceAtomic <= faceAtomic + STRIPE_TOLERANCE_ABOVE_ATOMIC

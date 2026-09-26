@@ -1049,7 +1049,7 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
       .join('\n')
   }
 
-  it('amount policy: exact for all, tolerant window only for OpenRouter Stripe', () => {
+  it('amount policy: Coinbase exact only, Stripe OpenRouter-only with a tolerant window', () => {
     const face = 5_800_000n
     expect(couponAmountAccepted('coinbase', face, face, null)).toBe(true)
     expect(couponAmountAccepted('coinbase', 5_830_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
@@ -1059,11 +1059,15 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     expect(couponAmountAccepted('stripe_crypto', 4_790_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
     expect(couponAmountAccepted('stripe_crypto', 5_960_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
     expect(couponAmountAccepted('stripe_crypto', 5_830_000n, face, 'acct_other')).toBe(false)
+    // Exact face value does NOT bypass the merchant check for Stripe.
+    expect(couponAmountAccepted('stripe_crypto', face, face, 'acct_other')).toBe(false)
+    expect(couponAmountAccepted('stripe_crypto', face, face, null)).toBe(false)
+    expect(couponAmountAccepted('stripe_crypto', face, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
     expect(couponAmountAccepted('stripe_crypto', 0n, 500_000n, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
   })
 
   it('exact match: pays the Stripe branch with locked merchant + invoice amount, stores no plaintext URL', async () => {
-    const { env, hits, payBodies, alerts, d1 } = makeStripeEnv({ merchant: 'acct_someoneElse', cents: 2000 })
+    const { env, hits, payBodies, alerts, d1 } = makeStripeEnv({ merchant: OPENROUTER_STRIPE_ACCOUNT, cents: 2000 })
     const code = await issueCoupon(env, '20')
     const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
     const body: any = await resp.json()
@@ -1075,7 +1079,7 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     expect(hits.pay).toBe(1)
     expect(payBodies[0]).toMatchObject({
       url: STRIPE_URL,
-      expected_merchant_account: 'acct_someoneElse',
+      expected_merchant_account: OPENROUTER_STRIPE_ACCOUNT,
       expected_amount_atomic: '20000000',
       spent_today_atomic: '0',
     })
@@ -1083,7 +1087,7 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     const rec = await record(env, code)
     expect(rec).toMatchObject({
       status: 'redeemed', provider: 'stripe_crypto', invoiceKey: CPIS,
-      paidAmountAtomic: '20000000', merchantAccount: 'acct_someoneElse',
+      paidAmountAtomic: '20000000', merchantAccount: OPENROUTER_STRIPE_ACCOUNT,
     })
     expect(rec.stripeUrlEncrypted).toMatch(/^v1:/)
     // Whitelisted projection only — the echoed URL in the pay body is dropped.
@@ -1139,6 +1143,7 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     [479, OPENROUTER_STRIPE_ACCOUNT, '4.79 (below -$1.00)'],
     [596, OPENROUTER_STRIPE_ACCOUNT, '5.96 (above +$0.15)'],
     [583, 'acct_notOpenRouter', '5.83 from a non-OpenRouter account'],
+    [580, 'acct_notOpenRouter', 'exactly 5.80 from a non-OpenRouter account'],
   ] as const) {
     it(`face 5.80, invoice ${label} → AMOUNT_MISMATCH, coupon back to issued, no pay`, async () => {
       const { env, hits } = makeStripeEnv({ cents, merchant })
