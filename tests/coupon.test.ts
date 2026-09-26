@@ -1206,6 +1206,22 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     })
   }
 
+  for (const [label, payBody] of [
+    ['success:false', { success: false, state: 'purchase_complete' }],
+    ['a body without success', { state: 'submitted' }],
+  ] as const) {
+    it(`pay-invoice 200 with ${label} → manual_review, claim/gate/daily reservation all kept`, async () => {
+      const { env, hits } = makeStripeEnv({ cents: 2000, payStatus: 200, payBody })
+      const code = await issueCoupon(env, '20')
+      await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+      expect(hits.pay).toBe(1)
+      expect(await couponState(env, code)).toBe('manual_review')
+      expect(await readInvoiceClaim(env, CPIS)).toMatchObject({ channel: 'crypto', ref: `coupon:${code}` })
+      expect(await readCoinbaseExecGate(env, CPIS)).not.toBeNull()
+      expect(await readDailySpentAtomic(env, new Date())).toBe(20_000_000n)
+    })
+  }
+
   it('daily cap reached → 503, claim + gate released, coupon reusable once headroom exists', async () => {
     const { env, hits } = makeStripeEnv({ cents: 2000 }, { STRIPE_FULFILLMENT_DAILY_CAP_USD: '10' })
     const code = await issueCoupon(env, '20')

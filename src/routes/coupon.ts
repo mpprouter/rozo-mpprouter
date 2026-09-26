@@ -1255,6 +1255,35 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     }
   }
 
+  // Step 3d (Stripe only) — reserve today's Stripe spend headroom BEFORE
+  // signing (same daily ledger + cap the webhook/UPI Stripe paths use; the
+  // pre-reservation total is handed to pay-invoice as spent_today_atomic).
+  // Reserved BEFORE the cross-channel claim (codex P1): claiming first and then
+  // hitting the cap would release a claim a Stripe webhook may already have
+  // seen and gone terminal on (claimed_by_other_channel), leaving no payer.
+  // Over the cap → nothing claimed, nothing sent: give the coupon back.
+  const spendDay = new Date()
+  let spentBefore: bigint | null = null
+  if (isStripe) {
+    try {
+      spentBefore = await reserveDailySpend(env, spendDay, invoiceAtomic)
+    } catch {
+      spentBefore = null
+    }
+    if (spentBefore === null) {
+      if (reservedFunds) await releaseFunds(env, attemptId)
+      await rollbackToIssued('stripe daily cap reached')
+      return done(
+        json(503, {
+          error: 'TEMPORARILY_UNAVAILABLE',
+          message: 'Redemption is temporarily unavailable. Your coupon is still valid — try again later.',
+        }),
+        'rejected',
+        'daily_cap_reached',
+      )
+    }
+  }
+
   // Step 3b — cross-channel claim (invoice-claim.ts). If the UPI fiat channel
   // (or, for Stripe, the Stripe webhook) already holds this link, do not pay
   // it a second time: roll the coupon back to issued (nothing moved) and tell
@@ -1262,6 +1291,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   const channelClaim = await claimInvoiceKey(env, execKey, 'crypto', `coupon:${code}`)
   if (!channelClaim.ok) {
     if (reservedFunds) await releaseFunds(env, attemptId)
+    if (isStripe) await releaseDailySpend(env, spendDay, invoiceAtomic)
     await rollbackToIssued(`invoice already claimed by ${channelClaim.holder.channel} channel`)
     return done(
       json(409, {
@@ -1283,6 +1313,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   const gate = await acquireCoinbaseExecGate(env, execKey, gateHolder)
   if (!gate.ok) {
     if (reservedFunds) await releaseFunds(env, attemptId)
+    if (isStripe) await releaseDailySpend(env, spendDay, invoiceAtomic)
     await rollbackToIssued(`exec_gate_held by ${gate.holder.holder}`)
     return done(
       json(409, {
@@ -1292,35 +1323,6 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       'rejected',
       'exec_gate_held',
     )
-  }
-
-  // Step 3d (Stripe only) — reserve today's Stripe spend headroom BEFORE
-  // signing (same daily ledger + cap the webhook/UPI Stripe paths use; the
-  // pre-reservation total is handed to pay-invoice as spent_today_atomic).
-  // Over the cap → nothing was sent: release the claim + gate, give the coupon
-  // back.
-  const spendDay = new Date()
-  let spentBefore: bigint | null = null
-  if (isStripe) {
-    try {
-      spentBefore = await reserveDailySpend(env, spendDay, invoiceAtomic)
-    } catch {
-      spentBefore = null
-    }
-    if (spentBefore === null) {
-      await releaseInvoiceClaim(env, execKey, 'crypto', `coupon:${code}`)
-      await releaseCoinbaseExecGate(env, execKey, gateHolder)
-      if (reservedFunds) await releaseFunds(env, attemptId)
-      await rollbackToIssued('stripe daily cap reached')
-      return done(
-        json(503, {
-          error: 'TEMPORARILY_UNAVAILABLE',
-          message: 'Redemption is temporarily unavailable. Your coupon is still valid — try again later.',
-        }),
-        'rejected',
-        'daily_cap_reached',
-      )
-    }
   }
 
   // Step 4 — point of no return: redeeming → paying. From here on, failure
@@ -1393,7 +1395,15 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       // Stripe before releasing it. Ambiguous outcomes keep the reservation.
       await releaseDailySpend(env, spendDay, invoiceAtomic)
     }
-    payOk = sp.ok
+    // A 2xx only counts when pay-invoice says so (codex P1): its body carries
+    // success=true only once the Stripe session reached fulfillment_initiated/
+    // complete/succeeded. A 2xx with a malformed body or success!==true is
+    // ambiguous: claim, gate and daily reservation stay held and the coupon
+    // parks in manual_review.
+    const confirmed =
+      sp.ok && sp.body !== null && typeof sp.body === 'object' && (sp.body as any).success === true
+    if (sp.ok && !confirmed) sp = { ...sp, ambiguous: true }
+    payOk = confirmed
     payStatus = sp.status
     // Whitelisted projection only — the raw body could echo the pay URL.
     storedResult = safeProviderResult(sp)
