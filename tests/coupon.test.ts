@@ -9,6 +9,8 @@ import {
 } from '../src/routes/coupon'
 import type { Env } from '../src/index'
 import { CIRCUIT_THRESHOLD, WARN_THRESHOLD } from '../src/routes/coupon-security'
+import { acquireCoinbaseExecGate, readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
+import { handleCoinbaseExecGateClear } from '../src/routes/coinbase-exec-gate-admin'
 
 /** In-memory stand-in for a Cloudflare D1Database (prepare/bind/run + all). */
 class FakeD1 {
@@ -172,6 +174,13 @@ function makeEnv(cfg: Partial<UpstreamConfig> = {}) {
     }
     if (url.includes('dingtalk')) {
       return new Response('{"errcode":0}', { status: 200 })
+    }
+    if (url.includes('payments.coinbase.com/next-api/')) {
+      // Public Coinbase status read (exec-gate admin clear): unsettled v1 link.
+      return new Response(
+        JSON.stringify({ id: 'pl_test123', status: 'ACTIVE', usageCount: 0, maxUsage: 1 }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
     }
     // Anything else is treated as a Base JSON-RPC balance call.
     return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: upstream.balanceHex }), {
@@ -542,9 +551,31 @@ describe('POST /coupon/redeem', () => {
     expect(retryBody.status).toBe('processing')
     expect(calls.pay).toBe(1)
 
-    // Operator resolves: release → issued → redeem works again.
+    // Operator resolves: release → issued.
     const rel = await handleResolveCoupon(resolveReq({ code, action: 'release', reason: 'verified no payment' }), env)
     expect(rel.status).toBe(200)
+    // The first pay request WAS sent, so the Coinbase exec gate stays held:
+    // a re-redeem is refused, pays nothing, and the coupon stays usable.
+    const blocked = await handleRedeemCoupon(redeemReq(code), env)
+    expect(blocked.status).toBe(409)
+    expect(((await blocked.json()) as any).error).toBe('LINK_CLAIMED')
+    expect(calls.pay).toBe(1)
+    // Runbook: a human verifies Coinbase is NOT settled and clears the gate
+    // (recorded), then the redeem works again.
+    const clr = await handleCoinbaseExecGateClear(
+      new Request('https://router.test/admin/coinbase-exec-gate/clear', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-admin-secret': 'test-pay-secret' },
+        body: JSON.stringify({
+          plId: 'pl_test123',
+          evidence: 'checked Coinbase: link unused, pay-invoice returned 502',
+          clearedBy: 'ops-test',
+        }),
+      }),
+      env,
+    )
+    expect(clr.status).toBe(200)
+    expect(((await clr.json()) as any).changed).toBe(true)
     const final = await handleRedeemCoupon(redeemReq(code), env)
     expect(((await final.json()) as any).status).toBe('redeemed')
     expect(calls.pay).toBe(2)
@@ -836,5 +867,60 @@ describe('pair freeze cannot permanently DoS a valid coupon', () => {
 
     const good = await handleRedeemCoupon(redeemReqT(code, undefined, '55.0.9.9'), env)
     expect(((await good.json()) as any).status).toBe('redeemed')
+  })
+})
+
+describe('coupon redemption: Coinbase exec gate', () => {
+  let originalFetch: typeof fetch
+  beforeEach(() => {
+    originalFetch = globalThis.fetch
+  })
+  afterEach(() => {
+    globalThis.fetch = originalFetch
+  })
+
+  it('a successful redeem takes the per-link exec gate (holder coupon:<code>:…)', async () => {
+    const { env, calls, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env)
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(((await resp.json()) as any).status).toBe('redeemed')
+    expect(calls.pay).toBe(1)
+    const gate = await readCoinbaseExecGate(env, 'pl_test123')
+    expect(gate?.holder.startsWith(`coupon:${code}:`)).toBe(true)
+  })
+
+  it('gate already held (e.g. the webhook sent pay-invoice) → coupon does not pay, stays issued', async () => {
+    const { env, calls, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env)
+    const held = await acquireCoinbaseExecGate(env, 'pl_test123', 'evt-webhook-1')
+    expect(held.ok).toBe(true)
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp.status).toBe(409)
+    expect(((await resp.json()) as any).error).toBe('LINK_CLAIMED')
+    expect(calls.pay).toBe(0)
+    expect(await couponState(env, code)).toBe('issued')
+  })
+
+  it('admin clear refuses when Coinbase reports the link settled', async () => {
+    const { env, fetchMock } = makeEnv()
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('payments.coinbase.com/next-api/')) {
+        return Response.json({ id: 'pl_test123', status: 'COMPLETED', usageCount: 1, maxUsage: 1 })
+      }
+      return fetchMock(input, init)
+    }) as any
+    await acquireCoinbaseExecGate(env, 'pl_test123', 'evt-webhook-1')
+    const clr = await handleCoinbaseExecGateClear(
+      new Request('https://router.test/admin/coinbase-exec-gate/clear', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-admin-secret': 'test-pay-secret' },
+        body: JSON.stringify({ plId: 'pl_test123', evidence: 'operator wants a re-pay for testing', clearedBy: 'ops-test' }),
+      }),
+      env,
+    )
+    expect(clr.status).toBe(409)
+    expect((await readCoinbaseExecGate(env, 'pl_test123'))?.holder).toBe('evt-webhook-1')
   })
 })

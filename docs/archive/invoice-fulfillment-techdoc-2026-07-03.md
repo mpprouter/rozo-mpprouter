@@ -86,8 +86,9 @@ and `event_id` = `webhooks_log.id` on the Rozo side (paste it into portal Delive
 find the record).
 
 Worker reaction per event:
-- `payin_completed` → **optimistic**: check funder Base-USDC balance (minus reserved
-  counter); if `available ≥ invoice` → pay now; else defer and wait for payout.
+- `payin_completed` → **optimistic**: check funder Base-USDC balance; if
+  `balance ≥ invoice` → pay now; else defer and wait for payout. (The shared
+  reserved counter was removed 2026-09-26, see §9.)
 - `payout_completed` → funds have landed on the funder wallet → always attempt
   (if balance still short → `failed_insufficient_balance`, see §5).
 
@@ -115,11 +116,12 @@ Pre-pay checks (both modes): link `usageCount < maxUsage` (else 409),
 
 ## 4. Double-spend protection (3 layers)
 
-1. **Worker KV state machine**: event_id dedup; record status guard
-   (`paid` / `failed_pay_invoice` terminal → no re-fire; `paying` → no double-fire);
-   `funder-reserved-atomic` counter prevents concurrent invoices from spending the
-   same balance. *Caveat: CF KV is eventually consistent — a near-simultaneous
-   payin+payout pair has a narrow race window.*
+1. **Worker KV state machine + execution gate**: event_id dedup; record status
+   guard (`paid` / `capture_pending` / `manual_review` / `failed_pay_invoice` /
+   `claimed_by_other_channel` terminal → no re-fire; `paying` → no double-fire).
+   Since 2026-09-26 the KV guard is backed by a linearizable per-link execution
+   gate (`coinbase-pay-exec:v1:<plId>`, AtomicStoreDO CAS) taken right before the
+   pay-invoice call, so the KV race window no longer allows a second call. See §9.
 2. **pay-invoice live check**: re-fetches the link; `usageCount >= maxUsage` → 409.
    *Caveat: read-then-pay race.*
 3. **Coinbase link itself (hard backstop)**: `maxUsage: 1` — one-shot. A second
@@ -183,3 +185,66 @@ are Base USDC.
 3. Rozo-side webhook retry/backoff (currently single-shot per event).
 4. E2E test wallets are dry (EVM `0x49CD…eEe0`: no Base ETH/USDC; Stellar
    `GAN3YS…4UYY`: no USDC) — blocks the smoke suite.
+
+## 9. Runbook: execution gate, delivery status, manual re-pay (2026-09-26)
+
+Changes (code: `src/routes/webhook.ts`, `coinbase-exec-gate.ts`,
+`coinbase-exec-gate-admin.ts`, `coinbase-sweep.ts`):
+
+- **Shared reservation counter removed.** `funder-reserved-atomic` (and
+  `reservedAtomic` / `bumpReserved`) no longer exist. It was a non-atomic KV
+  read-modify-write that leaked every time a record got stuck in `paying` and
+  blocked payable invoices (2026-09-25: 7e75a2d6 refused with 231 USDC on hand).
+  Coinbase, Stripe and UPI now check the funder's real on-chain balance; agentapi
+  pay-invoice re-checks it as the final gate. Two concurrent invoices can both pass
+  the check; the second then fails in pay-invoice (`failed_pay_invoice` + DingTalk)
+  and needs a human, but nothing is overpaid. Stripe's own per-invoice claim and
+  daily-spend cap are unchanged. The old KV key can be deleted after deploy.
+- **Capture truth.** A pay-invoice HTTP 200 is `paid` only when the body shows
+  Coinbase captured (`captured: true`, session
+  `PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED`, or v1 `usageCount >= maxUsage`).
+  A 200 without capture is `capture_pending`: the pay request was sent, so it is
+  terminal for paying.
+- **Execution gate.** Key `coinbase-pay-exec:v1:<plId>` in the `stripe-fulfillment`
+  AtomicStoreDO. The webhook (holder = event id) and coupon redemption (holder =
+  `coupon:<code>:<attempt>`) take it as the last step before calling pay-invoice.
+  Once the request is sent it is **never released automatically**. A refused
+  webhook records `exec_gate_held` and pays nothing.
+- **Cron sweep** (`sweepCoinbaseFulfillments`, every scheduled run, ≤20 records,
+  never calls pay-invoice): `paying` > 10 min or `capture_pending` → read Coinbase;
+  settled → `paid`; failed/expired or still pending > 30 min after `payingAt` →
+  `manual_review` + one "NOT delivered" alert. `payin_seen` /
+  `failed_insufficient_balance` whose Rozo payment is `payment_payout_completed`
+  while Coinbase is unsettled > 10 min → one alert (payout webhook likely lost).
+  `paid` + Coinbase settled → `POST /payments/<rozoPaymentId>/delivered` to Rozo;
+  only HTTP 200 sets `deliveredReported`; one alert after 5 failures. Delivery
+  reporting (sweep and webhook) is gated by `ROZO_DELIVERED_REPORT_ENABLED` in
+  `wrangler.toml` (default `"false"`): flip it only once rozo-intents-api serves
+  `/delivered`, otherwise every paid record 404s and raises a give-up alert.
+
+### Manual re-pay (a record in `manual_review`, or a coupon blocked by the gate)
+
+1. Confirm on Coinbase that the link/session is **not** settled
+   (`GET /v1/services/rozo-agent-api/invoice-status?payment_id=<plId>` →
+   `coinbase.settled: false`). If it is settled, stop: the invoice is paid.
+2. Clear the gate with a record of who/why. The endpoint re-checks Coinbase itself
+   and refuses (409) if settled, or (502) if Coinbase cannot be read:
+
+   ```bash
+   curl -sS -X POST https://apiserver.mpprouter.dev/admin/coinbase-exec-gate/clear \
+     -H "x-admin-secret: $PAYINVOICE_ADMIN_SECRET" -H 'content-type: application/json' \
+     -d '{"plId":"pl_…","evidence":"what you verified (20-1000 chars)","clearedBy":"<name>"}'
+   ```
+
+   The clear is appended to DO key `coinbase-pay-exec-clear-log:v1:<plId>` and as an
+   `exec_gate_cleared_by_admin` event on the KV fulfillment record. Never delete the
+   gate key any other way.
+3. Pay deliberately, through exactly one route:
+   - coupon: release the coupon via `/admin/coupon/resolve` and redeem again (the
+     new attempt takes the gate again, so a concurrent second re-pay is refused);
+   - webhook record in `manual_review` / `failed_pay_invoice`: these statuses are
+     terminal, so a replayed payout webhook will NOT pay. Pay with the agentapi
+     `pay-invoice` admin call directly (same call the router makes). The terminal
+     KV status keeps the router from paying in parallel.
+4. Note the outcome (tx / Coinbase status) in the ops channel.
+

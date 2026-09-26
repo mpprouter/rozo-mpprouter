@@ -23,6 +23,7 @@
 import { handleProxy } from './routes/proxy'
 import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './routes/job-status'
 import { sweepInFlightStripeRecords, sweepStripeSessionIndex } from './routes/stripe-fulfillment'
+import { sweepCoinbaseFulfillments } from './routes/coinbase-sweep'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleAllServiceMetrics, handleServiceMetrics } from './routes/service-metrics'
@@ -53,6 +54,7 @@ import { handleAiPlugin } from './routes/ai-plugin'
 import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-admin'
 import { handleAdminSeedStore } from './routes/admin-seed-store'
 import { handleStripeFulfillmentResolve } from './routes/stripe-fulfillment-admin'
+import { handleCoinbaseExecGateClear } from './routes/coinbase-exec-gate-admin'
 import { handleCreateInvoice } from './routes/create-invoice'
 import {
   handleIssueCoupon,
@@ -336,6 +338,9 @@ export interface Env {
   // pay-invoice posture. "true" in wrangler.toml [vars]; flip + redeploy to
   // stop issuance instantly without touching secrets.
   COUPON_ENDPOINT_ENABLED?: string
+  // "true" enables delivery reports to Rozo (POST /payments/<id>/delivered)
+  // from the Coinbase webhook and cron sweep. See wrangler.toml.
+  ROZO_DELIVERED_REPORT_ENABLED?: string
 
   // Rozo Intents API key for creating discounted payment intents from
   // Coinbase Payment Links via POST /v1/services/rozo-agent-api/create-invoice.
@@ -549,6 +554,10 @@ export default {
     // (the webhook request that started them may have been cut off by the
     // sender's 10s timeout). Read-only towards Stripe; never signs.
     ctx.waitUntil(sweepInFlightStripeRecords(env))
+    // Coinbase: resolve `paying` / `capture_pending` records from Coinbase,
+    // alert on payouts that never reached pay-invoice, and report delivery to
+    // Rozo. Reads Coinbase only; never calls pay-invoice.
+    ctx.waitUntil(sweepCoinbaseFulfillments(env))
     // One-time backfill of the pay-URL → session index for records created
     // before the index existed (bounded per run; no-op once caught up).
     ctx.waitUntil(sweepStripeSessionIndex(env))
@@ -817,6 +826,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Gated by x-admin-secret. See routes/stripe-fulfillment-admin.ts.
       if (url.pathname === '/admin/stripe-fulfillment/resolve') {
         return handleStripeFulfillmentResolve(request, env)
+      }
+
+      // Manual re-pay escape hatch for the Coinbase execution gate: verifies
+      // Coinbase is NOT settled, records who/why, then clears the gate. Pays
+      // nothing. Gated by x-admin-secret. See routes/coinbase-exec-gate-admin.ts.
+      if (url.pathname === '/admin/coinbase-exec-gate/clear') {
+        return handleCoinbaseExecGateClear(request, env)
       }
 
       // ── Partner platform ──────────────────────────────────────────────

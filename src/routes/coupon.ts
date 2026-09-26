@@ -52,8 +52,9 @@ import type { Env } from '../index'
 import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
 import { extractCoinbaseCheckoutId } from './pay-invoice-admin'
 import { parseUsdc, formatUsdc } from './create-invoice'
-import { callAgentApiPayInvoice, reservedAtomic, FUNDER_WALLET } from './webhook'
+import { callAgentApiPayInvoice, FUNDER_WALLET } from './webhook'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
+import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { identifierKeys } from '../utils/redact'
@@ -317,19 +318,18 @@ async function bumpCounter(
 
 // ── Atomic funder reservation (coupon-side) ─────────────────────────────────
 //
-// The webhook path's KV-based reserved counter is read-then-write and openly
-// documents its race as acceptable for rare webhook concurrency. The public
-// redeem endpoint cannot accept that: two valid coupons redeemed concurrently
-// must not BOTH pass a balance check the pool can only cover once. So the
+// The public redeem endpoint must not let two valid coupons redeemed
+// concurrently BOTH pass a balance check the pool can only cover once. So the
 // coupon side does check-and-reserve in a single CAS on the coupon DO:
-// the decision (balance - webhookReserved - couponReserved >= invoice) and
-// the reservation insert commit atomically. Entries carry a lease so a
-// worker death cannot leak a reservation forever (pay-invoice is a
-// synchronous few-second call; anything older than the lease is dead).
+// the decision (balance - couponReserved >= invoice) and the reservation
+// insert commit atomically. Entries carry a lease so a worker death cannot
+// leak a reservation forever (pay-invoice is a synchronous few-second call;
+// anything older than the lease is dead).
 //
-// The webhook path keeps its own KV counter and doesn't see in-flight coupon
-// reservations for the few seconds they exist — acceptable because agentapi
-// pay-invoice re-checks the funder balance itself as the final gate.
+// This is coupon-vs-coupon only. The webhook/Stripe/UPI paths used to share a
+// KV reserved counter; it was removed 2026-09-26 because it leaked. Those
+// paths check the real balance, and agentapi pay-invoice re-checks the funder
+// balance itself as the final gate.
 
 const RESERVE_KEY = 'funder-reserve'
 const RESERVE_LEASE_MS = 10 * 60 * 1000
@@ -358,7 +358,6 @@ async function tryReserveFunds(
   attemptId: string,
   invoiceAtomic: bigint,
   balance: bigint,
-  webhookReserved: bigint,
 ): Promise<boolean> {
   const now = Date.now()
   return casUpdate<boolean>(
@@ -377,7 +376,7 @@ async function tryReserveFunds(
           /* corrupt entry — ignore */
         }
       }
-      const available = balance - webhookReserved - couponReserved
+      const available = balance - couponReserved
       if (available < invoiceAtomic) return { op: 'noop', result: false }
       st.entries[attemptId] = { amt: invoiceAtomic.toString(), at: now }
       return { op: 'set', value: JSON.stringify(st), result: true }
@@ -1058,15 +1057,15 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   const balance = balanceResult.balance
   let reservedFunds = false
   if (balance !== null) {
-    // Founder decision 2026-08-27: do not count webhook reservations against
-    // coupon redemptions — the best-effort counter drifts (leaked $75.22 and
-    // blocked a valid $525 redeem). Coupon-vs-coupon CAS still applies below;
-    // agentapi re-checks the real funder balance as the final gate.
-    const webhookReserved = 0n
-    reservedFunds = await tryReserveFunds(env, attemptId, invoiceAtomic, balance, webhookReserved)
+    // Founder decision 2026-08-27: coupon redemptions never counted the
+    // webhook-side KV reservation counter (it drifted, leaked $75.22 and
+    // blocked a valid $525 redeem); that counter was removed entirely
+    // 2026-09-26. Coupon-vs-coupon CAS still applies; agentapi re-checks the
+    // real funder balance as the final gate.
+    reservedFunds = await tryReserveFunds(env, attemptId, invoiceAtomic, balance)
     if (!reservedFunds) {
       await rollbackToIssued(
-        `insufficient funder balance: balance ${balance}, webhookReserved ${webhookReserved} < invoice ${invoiceAtomic}`,
+        `insufficient funder balance: balance ${balance} < invoice ${invoiceAtomic}`,
       )
       if (env.DINGTALK_ACCESS_TOKEN) {
         await sendDingTalkAlert(
@@ -1102,6 +1101,27 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     )
   }
 
+  // Step 3c — per-link execution gate (coinbase-exec-gate.ts): at most one
+  // pay-invoice request per link, whichever path sends it. The claim above is
+  // re-entrant for the same coupon ref, so it cannot stop a second send on
+  // its own. Held → a pay request for this link was already sent: do not pay.
+  // Keep the invoice claim (the link was executed; releasing it would let
+  // another channel pay it again) and give the coupon back.
+  const gateHolder = `coupon:${code}:${attemptId}`
+  const gate = await acquireCoinbaseExecGate(env, plId, gateHolder)
+  if (!gate.ok) {
+    if (reservedFunds) await releaseFunds(env, attemptId)
+    await rollbackToIssued(`exec_gate_held by ${gate.holder.holder}`)
+    return done(
+      json(409, {
+        error: 'LINK_CLAIMED',
+        message: 'This payment link has already been submitted for payment. Your coupon is still valid.',
+      }),
+      'rejected',
+      'exec_gate_held',
+    )
+  }
+
   // Step 4 — point of no return: redeeming → paying. From here on, failure
   // NEVER rolls back to issued (the pay call may have succeeded upstream even
   // when we see an error). Ambiguity parks in manual_review + ops alert.
@@ -1122,6 +1142,8 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     // Definite pre-payment failure: give the invoice claim back so a later
     // payer (UPI or another attempt) is not blocked by a claim that never paid.
     await releaseInvoiceClaim(env, plId, 'crypto', `coupon:${code}`)
+    // Nothing was sent: the exec gate may be released too.
+    await releaseCoinbaseExecGate(env, plId, gateHolder)
     if (reservedFunds) await releaseFunds(env, attemptId)
     return done(
       json(409, {

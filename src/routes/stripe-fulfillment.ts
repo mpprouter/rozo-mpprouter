@@ -18,7 +18,7 @@
 // separate provider-qualified namespace so the two never collide.
 
 import type { Env } from '../index'
-import { bumpReserved, reservedAtomic, maskAddresses } from './webhook'
+import { maskAddresses } from './webhook'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { casRead, casUpdate, casScan } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
@@ -612,8 +612,7 @@ export async function handleStripeWebhookEvent(
   // (pay-invoice MAY have signed; reconcile, never re-fire).
   let payInvoiceStarted = false
   // Accounting acquired so far, so the pre-call error path can unwind it
-  // instead of leaving the shared pool / daily cap charged for a retry.
-  let poolReserved = false
+  // instead of leaving the daily cap charged for a retry.
   let dailyReserved = false
   try {
     return await settleClaimedStripeInvoice()
@@ -627,7 +626,6 @@ export async function handleStripeWebhookEvent(
       return { ok: true, provider: 'stripe_crypto', status: 'provider_submitted_ambiguous', ambiguous: true }
     }
     try {
-      if (poolReserved) await bumpReserved(env, -invoiceAtomic)
       if (dailyReserved) await releaseDailySpend(env, now, invoiceAtomic)
     } catch {
       // Best effort: the record release below is what re-opens the retry.
@@ -652,15 +650,15 @@ export async function handleStripeWebhookEvent(
     return { ok: true, provider: 'stripe_crypto', status: 'claimed_by_other_channel' }
   }
 
-  // Balance check against the SHARED funder pool + reserved counter (design §7:
-  // Coinbase and Stripe compete for the same available balance). If the funder
-  // can't cover the ORIGINAL invoice, release the claim and defer.
+  // Balance check against the funder's real on-chain balance (design §7:
+  // Coinbase and Stripe compete for the same wallet). The shared KV
+  // reservation counter was removed 2026-09-26 (it leaked and blocked payable
+  // invoices); pay-invoice re-checks the balance as the final gate. If the
+  // funder can't cover the ORIGINAL invoice, release the claim and defer.
   const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
   const balance = balanceResult.balance
   if (balance !== null) {
-    const reserved = await reservedAtomic(env)
-    const available = balance - reserved
-    if (available < invoiceAtomic) {
+    if (balance < invoiceAtomic) {
       // Insufficient: for payin this is normal (await payout); for payout it's a
       // real funding gap. Release the claim so a later event can retry.
       const releaseTo: StripeRouterStatus =
@@ -671,8 +669,6 @@ export async function handleStripeWebhookEvent(
         kind: 'balance_check',
         detail: {
           balance: balance.toString(),
-          reserved: reserved.toString(),
-          available: available.toString(),
           invoice: invoiceAtomic.toString(),
           sufficient: false,
         },
@@ -686,19 +682,12 @@ export async function handleStripeWebhookEvent(
     }
   }
 
-  // Reserve against the shared pool (accounting) now that we're committing to
-  // the pay-invoice call.
-  await bumpReserved(env, invoiceAtomic)
-  poolReserved = true
-
   // Atomically RESERVE the daily-spend headroom BEFORE signing (design §9). If
   // the reservation would exceed the daily cap, release everything and defer —
   // never sign past the cap. On success `spentBefore` is the pre-reservation
   // spend to hand pay-invoice as spent_today_atomic.
   const spentBefore = await reserveDailySpend(env, now, invoiceAtomic)
   if (spentBefore === null) {
-    poolReserved = false
-    await bumpReserved(env, -invoiceAtomic)
     await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', balance, {
       kind: 'daily_cap_reached',
       detail: { invoice: invoiceAtomic.toString() },
@@ -717,7 +706,6 @@ export async function handleStripeWebhookEvent(
   ) {
     // Should be impossible (we just claimed with these set) — treat as ambiguous
     // rather than risk anything. Release accounting; do NOT auto-retry.
-    await bumpReserved(env, -invoiceAtomic)
     await releaseDailySpend(env, now, invoiceAtomic)
     await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
       failureReason: 'claimed record vanished before call',
@@ -734,7 +722,6 @@ export async function handleStripeWebhookEvent(
   try {
     stripeUrl = await decryptCapability(claimed.stripeUrlEncrypted, env)
   } catch {
-    await bumpReserved(env, -invoiceAtomic)
     await releaseDailySpend(env, now, invoiceAtomic)
     await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
       failureReason: 'capability decrypt failed',
@@ -758,9 +745,8 @@ export async function handleStripeWebhookEvent(
     payResult = { ok: false, status: 0, disabled: false, ambiguous: true, body: null }
   }
 
-  // Release the shared-pool accounting (the record status is now the durable
-  // guard). The daily reservation is settled below per outcome.
-  await bumpReserved(env, -invoiceAtomic)
+  // The record status is now the durable guard. The daily reservation is
+  // settled below per outcome.
 
   // AMBIGUOUS outcome (transport error / 5xx / unparseable): pay-invoice MAY
   // have signed. Do NOT release the daily reservation (keep it counted,
@@ -837,8 +823,7 @@ function safeProviderResult(result: StripePayInvoiceResult): Record<string, unkn
   }
 }
 
-// Release a held claim back to `releaseTo` (a non-in-flight state) and release
-// the shared-pool reservation. Used when we bail AFTER claiming but BEFORE the
+// Release a held claim back to `releaseTo` (a non-in-flight state). Used when we bail AFTER claiming but BEFORE the
 // pay-invoice call (balance/cap gates). Atomic via CAS; monotonic-safe.
 async function releaseClaim(
   env: Env,

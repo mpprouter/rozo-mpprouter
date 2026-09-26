@@ -384,11 +384,20 @@ describe('handleRozoWebhook failure alerts (state machine integration)', () => {
     expect(content).not.toContain(FUNDER_FULL)
   })
 
-  it('paid path (agentapi 200) fires NO alert', async () => {
+  it('paid path (agentapi 200, captured) fires NO alert', async () => {
     const dingtalkCalls = stubFetch({
       balanceAtomic: 10_000_000n,
       payInvoiceStatus: 200,
-      payInvoiceBody: { ok: true },
+      payInvoiceBody: {
+        success: true,
+        mode: 'admin',
+        coinbase: {
+          success: true,
+          protocolVersion: 'v3',
+          session: { id: 'pl_testInvoiceAlert1', status: 'PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED' },
+          captured: true,
+        },
+      },
     })
     const { env, kv } = makeEnv()
 
