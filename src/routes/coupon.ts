@@ -1288,7 +1288,17 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // (or, for Stripe, the Stripe webhook) already holds this link, do not pay
   // it a second time: roll the coupon back to issued (nothing moved) and tell
   // the caller.
-  const channelClaim = await claimInvoiceKey(env, execKey, 'crypto', `coupon:${code}`)
+  // A throw from the claim/gate DOs must not strand today's Stripe reservation
+  // (codex P1 r3): nothing was sent yet, so hand the headroom back and rethrow.
+  const releaseSpendOnThrow = async <T>(fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn()
+    } catch (e) {
+      if (isStripe) await releaseDailySpend(env, spendDay, invoiceAtomic)
+      throw e
+    }
+  }
+  const channelClaim = await releaseSpendOnThrow(() => claimInvoiceKey(env, execKey, 'crypto', `coupon:${code}`))
   if (!channelClaim.ok) {
     if (reservedFunds) await releaseFunds(env, attemptId)
     if (isStripe) await releaseDailySpend(env, spendDay, invoiceAtomic)
@@ -1310,7 +1320,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // Keep the invoice claim (the link was executed; releasing it would let
   // another channel pay it again) and give the coupon back.
   const gateHolder = `coupon:${code}:${attemptId}`
-  const gate = await acquireCoinbaseExecGate(env, execKey, gateHolder)
+  const gate = await releaseSpendOnThrow(() => acquireCoinbaseExecGate(env, execKey, gateHolder))
   if (!gate.ok) {
     if (reservedFunds) await releaseFunds(env, attemptId)
     if (isStripe) await releaseDailySpend(env, spendDay, invoiceAtomic)
