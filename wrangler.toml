@@ -262,7 +262,7 @@ COUPON_ENDPOINT_ENABLED = "true"
 # webhook and the cron sweep. Keep "false" until rozo-intents-api has the
 # /delivered endpoint live: before that every paid record would 404 five times
 # and raise a give-up alert. Flip to "true" + redeploy afterwards.
-ROZO_DELIVERED_REPORT_ENABLED = "false"
+ROZO_DELIVERED_REPORT_ENABLED = "true"
 
 # Partner platform kill switch. Covers the pages AND the API together: a
 # half-open surface looks usable and then fails at the point where money moves.
