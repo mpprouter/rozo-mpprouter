@@ -11,6 +11,9 @@ import type { Env } from '../src/index'
 import { CIRCUIT_THRESHOLD, WARN_THRESHOLD } from '../src/routes/coupon-security'
 import { acquireCoinbaseExecGate, readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
 import { handleCoinbaseExecGateClear } from '../src/routes/coinbase-exec-gate-admin'
+import { OPENROUTER_STRIPE_ACCOUNT, couponAmountAccepted } from '../src/routes/coupon'
+import { claimInvoiceKey, readInvoiceClaim } from '../src/routes/invoice-claim'
+import { readDailySpentAtomic } from '../src/routes/stripe-fulfillment'
 
 /** In-memory stand-in for a Cloudflare D1Database (prepare/bind/run + all). */
 class FakeD1 {
@@ -944,5 +947,371 @@ describe('coupon redemption: Coinbase exec gate', () => {
     )
     expect(clr.status).toBe(409)
     expect((await readCoinbaseExecGate(env, 'pl_test123'))?.holder).toBe('evt-webhook-1')
+  })
+})
+
+// ── Stripe Crypto links (crypto.stripe.com/pay/<blob>) ───────────────────────
+
+
+describe('POST /coupon/redeem — Stripe Crypto links', () => {
+  const CPIS = 'cpis_1TestSessionAbC'
+  const BLOB = 'CDMQARoXSecretBlobValue123'
+  const STRIPE_URL = `https://crypto.stripe.com/pay/${BLOB}`
+
+  interface StripeCfg {
+    resumeStatus: number
+    merchant: string
+    cents: number
+    state: string
+    validBeforeSec: number
+    payStatus: number
+    payBody: any
+  }
+
+  function makeStripeEnv(over: Partial<StripeCfg> = {}, envOver: Record<string, string> = {}) {
+    const base = makeEnv()
+    const cfg: StripeCfg = {
+      resumeStatus: 200,
+      merchant: OPENROUTER_STRIPE_ACCOUNT,
+      cents: 2000,
+      state: 'checkout',
+      validBeforeSec: Math.floor(Date.now() / 1000) + 3600,
+      payStatus: 200,
+      payBody: { success: true, state: 'submitted', provider: 'stripe_crypto', echo: STRIPE_URL },
+      ...over,
+    }
+    const hits = { stripe: 0, pay: 0, agentQuote: 0 }
+    const payBodies: any[] = []
+    const alerts: string[] = []
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url
+      if (url.includes('resume_payin_session')) {
+        hits.stripe++
+        if (cfg.resumeStatus !== 200) return new Response('gone', { status: cfg.resumeStatus })
+        return Response.json({ sessionId: CPIS, clientSecret: 'cs_secret', publishableKey: 'pk_live_x' })
+      }
+      if (url.includes('payin_session')) {
+        hits.stripe++
+        return Response.json({
+          id: CPIS,
+          merchant: cfg.merchant,
+          business_name: 'OpenRouter',
+          state: cfg.state,
+          payment_details: { amount: cfg.cents, currency: 'usd' },
+          supported_currencies: [{
+            id: 'usdc.base', currency_network: 'base', chain_id: 8453, asset_code: 'usdc',
+            contract_address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', payment_options: ['wallet_connect'],
+          }],
+          transaction_details: {},
+          valid_before: String(cfg.validBeforeSec),
+        })
+      }
+      if (url.includes('quote-invoice')) {
+        hits.agentQuote++
+        return new Response('{}', { status: 500 })
+      }
+      if (url.includes('pay-invoice')) {
+        hits.pay++
+        payBodies.push(JSON.parse(String(init?.body ?? '{}')))
+        return new Response(JSON.stringify(cfg.payBody), {
+          status: cfg.payStatus,
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (url.includes('dingtalk')) {
+        alerts.push(String(init?.body ?? ''))
+        return new Response('{"errcode":0}', { status: 200 })
+      }
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16) }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })
+    })
+    Object.assign(base.env as any, {
+      INVOICE_CAPABILITY_ENCRYPTION_KEY: Buffer.from(new Uint8Array(32).fill(7)).toString('base64'),
+      DINGTALK_ACCESS_TOKEN: 'dt-test',
+      ...envOver,
+    })
+    globalThis.fetch = fetchMock as any
+    return { env: base.env, cfg, hits, payBodies, alerts, d1: base.d1 }
+  }
+
+  async function record(env: Env, code: string): Promise<any> {
+    const ns = (env as any).ATOMIC_STORE
+    const store = ns.get(ns.idFromName('coupon')).store as Map<string, { value: string }>
+    return JSON.parse(store.get(`coupon:${code}`)!.value)
+  }
+
+  function stripeDump(env: Env): string {
+    const ns = (env as any).ATOMIC_STORE
+    return [...ns.instances.values()]
+      .flatMap((d: any) => [...d.store.values()].map((v: any) => String(v.value)))
+      .join('\n')
+  }
+
+  it('amount policy: exact for all, tolerant window only for OpenRouter Stripe', () => {
+    const face = 5_800_000n
+    expect(couponAmountAccepted('coinbase', face, face, null)).toBe(true)
+    expect(couponAmountAccepted('coinbase', 5_830_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
+    expect(couponAmountAccepted('stripe_crypto', 5_830_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
+    expect(couponAmountAccepted('stripe_crypto', 4_800_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
+    expect(couponAmountAccepted('stripe_crypto', 5_950_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
+    expect(couponAmountAccepted('stripe_crypto', 4_790_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
+    expect(couponAmountAccepted('stripe_crypto', 5_960_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
+    expect(couponAmountAccepted('stripe_crypto', 5_830_000n, face, 'acct_other')).toBe(false)
+    expect(couponAmountAccepted('stripe_crypto', 0n, 500_000n, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
+  })
+
+  it('exact match: pays the Stripe branch with locked merchant + invoice amount, stores no plaintext URL', async () => {
+    const { env, hits, payBodies, alerts, d1 } = makeStripeEnv({ merchant: 'acct_someoneElse', cents: 2000 })
+    const code = await issueCoupon(env, '20')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    const body: any = await resp.json()
+    expect(resp.status).toBe(200)
+    expect(body.status).toBe('redeemed')
+    expect(body.paidAmountUsd).toBe('20')
+    expect(body.plId).toMatch(/^stripe:[0-9a-f]{64}$/)
+    expect(hits.agentQuote).toBe(0)
+    expect(hits.pay).toBe(1)
+    expect(payBodies[0]).toMatchObject({
+      url: STRIPE_URL,
+      expected_merchant_account: 'acct_someoneElse',
+      expected_amount_atomic: '20000000',
+      spent_today_atomic: '0',
+    })
+    expect(payBodies[0].payment_id).toBeUndefined()
+    const rec = await record(env, code)
+    expect(rec).toMatchObject({
+      status: 'redeemed', provider: 'stripe_crypto', invoiceKey: CPIS,
+      paidAmountAtomic: '20000000', merchantAccount: 'acct_someoneElse',
+    })
+    expect(rec.stripeUrlEncrypted).toMatch(/^v1:/)
+    // Whitelisted projection only — the echoed URL in the pay body is dropped.
+    expect(rec.coinbaseResult).toEqual({ ok: true, status: 200, success: true, state: 'submitted', provider: 'stripe_crypto' })
+    // No plaintext blob anywhere: records, claims, gates, ledger, audit, alerts, response.
+    expect(stripeDump(env)).not.toContain(BLOB)
+    expect(JSON.stringify(d1.rows)).not.toContain(BLOB)
+    expect(alerts.join('\n')).not.toContain(BLOB)
+    expect(JSON.stringify(body)).not.toContain(BLOB)
+    // Claim + gate are keyed on the BARE cpis_ id.
+    expect(await readInvoiceClaim(env, CPIS)).toMatchObject({ channel: 'crypto', ref: `coupon:${code}` })
+    expect((await readCoinbaseExecGate(env, CPIS))?.holder).toMatch(new RegExp(`^coupon:${code}:`))
+    expect(await readDailySpentAtomic(env, new Date())).toBe(20_000_000n)
+
+    // Idempotent replay of the same (code, link) — no second pay call.
+    const again = await handleRedeemCoupon(redeemReq(code, STRIPE_URL, '5.6.7.8'), env)
+    const againBody: any = await again.json()
+    expect(againBody.status).toBe('redeemed')
+    expect(againBody.paidAmountUsd).toBe('20')
+    expect(hits.pay).toBe(1)
+  })
+
+  it('http:// Stripe link is canonicalised to https before resolve/pay', async () => {
+    const { env, payBodies } = makeStripeEnv({ cents: 2000 })
+    const code = await issueCoupon(env, '20')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL.replace('https://', 'http://')), env)
+    expect(((await resp.json()) as any).status).toBe('redeemed')
+    expect(payBodies[0].url).toBe(STRIPE_URL)
+  })
+
+  it('tolerant: face 5.80, OpenRouter invoice 5.83 → pays 5830000 (invoice, not face)', async () => {
+    const { env, payBodies } = makeStripeEnv({ cents: 583 })
+    const code = await issueCoupon(env, '5.80')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    const body: any = await resp.json()
+    expect(body.status).toBe('redeemed')
+    expect(body.amountUsd).toBe('5.8')
+    expect(body.paidAmountUsd).toBe('5.83')
+    expect(payBodies[0].expected_amount_atomic).toBe('5830000')
+    expect((await record(env, code)).paidAmountAtomic).toBe('5830000')
+    expect(await readDailySpentAtomic(env, new Date())).toBe(5_830_000n)
+  })
+
+  it('tolerant: face 5.80, OpenRouter invoice 5.00 → pays 5000000', async () => {
+    const { env, payBodies } = makeStripeEnv({ cents: 500 })
+    const code = await issueCoupon(env, '5.80')
+    const body: any = await (await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)).json()
+    expect(body.status).toBe('redeemed')
+    expect(payBodies[0].expected_amount_atomic).toBe('5000000')
+  })
+
+  for (const [cents, merchant, label] of [
+    [479, OPENROUTER_STRIPE_ACCOUNT, '4.79 (below -$1.00)'],
+    [596, OPENROUTER_STRIPE_ACCOUNT, '5.96 (above +$0.15)'],
+    [583, 'acct_notOpenRouter', '5.83 from a non-OpenRouter account'],
+  ] as const) {
+    it(`face 5.80, invoice ${label} → AMOUNT_MISMATCH, coupon back to issued, no pay`, async () => {
+      const { env, hits } = makeStripeEnv({ cents, merchant })
+      const code = await issueCoupon(env, '5.80')
+      const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+      expect(resp.status).toBe(400)
+      expect(((await resp.json()) as any).error).toBe('AMOUNT_MISMATCH')
+      expect(hits.pay).toBe(0)
+      expect(await couponState(env, code)).toBe('issued')
+      expect(await readInvoiceClaim(env, CPIS)).toBeNull()
+      expect(await readDailySpentAtomic(env, new Date())).toBe(0n)
+    })
+  }
+
+  it('Coinbase stays exact-only: face 5.80 vs invoice 5.83 → AMOUNT_MISMATCH', async () => {
+    const { env, fetchMock, calls } = makeEnv({ quoteBody: { invoice: { amount: '5.83' } } })
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env, '5.80')
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp.status).toBe(400)
+    expect(((await resp.json()) as any).error).toBe('AMOUNT_MISMATCH')
+    expect(calls.pay).toBe(0)
+    expect(await couponState(env, code)).toBe('issued')
+  })
+
+  it('Coinbase exact redeem is unchanged: agentapi payment_id body, no Stripe traffic', async () => {
+    const { env, fetchMock, calls } = makeEnv()
+    const bodies: any[] = []
+    const urls: string[] = []
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      urls.push(String(input))
+      if (String(input).includes('pay-invoice')) bodies.push(JSON.parse(String(init?.body)))
+      return fetchMock(input, init)
+    }) as any
+    const code = await issueCoupon(env, '20')
+    const body: any = await (await handleRedeemCoupon(redeemReq(code), env)).json()
+    expect(body).toMatchObject({ ok: true, status: 'redeemed', plId: 'pl_test123', amountUsd: '20', paidAmountUsd: '20' })
+    expect(calls.pay).toBe(1)
+    expect(bodies).toEqual([{ payment_id: 'pl_test123' }])
+    expect(urls.some((u) => u.includes('stripe.com'))).toBe(false)
+    expect(await readInvoiceClaim(env, 'pl_test123')).toMatchObject({ ref: `coupon:${code}` })
+    expect((await record(env, code)).provider).toBe('coinbase')
+  })
+
+  for (const [channel, ref] of [
+    ['crypto', `stripe_crypto_cpis_1TestSessionAbC`],
+    ['upi', '3f1c2a9e-8f7b-4d2a-9c1e-0a1b2c3d4e5f'],
+  ] as const) {
+    it(`claim already held by ${channel}:${ref.slice(0, 14)}… → 409 LINK_CLAIMED, coupon reusable`, async () => {
+      const { env, hits } = makeStripeEnv()
+      await claimInvoiceKey(env, CPIS, channel, ref)
+      const code = await issueCoupon(env, '20')
+      const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+      expect(resp.status).toBe(409)
+      expect(((await resp.json()) as any).error).toBe('LINK_CLAIMED')
+      expect(hits.pay).toBe(0)
+      expect(await couponState(env, code)).toBe('issued')
+      expect(await readInvoiceClaim(env, CPIS)).toMatchObject({ channel, ref })
+      expect(await readDailySpentAtomic(env, new Date())).toBe(0n)
+    })
+  }
+
+  it('daily cap reached → 503, claim + gate released, coupon reusable once headroom exists', async () => {
+    const { env, hits } = makeStripeEnv({ cents: 2000 }, { STRIPE_FULFILLMENT_DAILY_CAP_USD: '10' })
+    const code = await issueCoupon(env, '20')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(resp.status).toBe(503)
+    expect(((await resp.json()) as any).error).toBe('TEMPORARILY_UNAVAILABLE')
+    expect(hits.pay).toBe(0)
+    expect(await couponState(env, code)).toBe('issued')
+    expect(await readInvoiceClaim(env, CPIS)).toBeNull()
+    expect(await readCoinbaseExecGate(env, CPIS)).toBeNull()
+    expect(await readDailySpentAtomic(env, new Date())).toBe(0n)
+
+    ;(env as any).STRIPE_FULFILLMENT_DAILY_CAP_USD = '200'
+    const retry: any = await (await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)).json()
+    expect(retry.status).toBe('redeemed')
+    expect(hits.pay).toBe(1)
+  })
+
+  it('pay-invoice 500 (ambiguous) → manual_review, daily reservation + gate kept, alert has no URL', async () => {
+    const { env, hits, alerts } = makeStripeEnv({ payStatus: 500, payBody: { error: 'boom', url: STRIPE_URL } })
+    const code = await issueCoupon(env, '20')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(resp.status).toBe(200)
+    expect(((await resp.json()) as any).status).toBe('processing')
+    const rec = await record(env, code)
+    expect(rec.status).toBe('manual_review')
+    expect(rec.failureReason).toContain('ambiguous')
+    expect(JSON.stringify(rec)).not.toContain(BLOB)
+    expect(await readDailySpentAtomic(env, new Date())).toBe(20_000_000n)
+    expect(await readCoinbaseExecGate(env, CPIS)).not.toBeNull()
+    expect(await readInvoiceClaim(env, CPIS)).not.toBeNull()
+    expect(alerts.some((a) => a.includes('MANUAL REVIEW'))).toBe(true)
+    expect(alerts.join('\n')).not.toContain(BLOB)
+
+    // Never auto-retried: a repeat of the same request is "processing", no 2nd pay.
+    const again: any = await (await handleRedeemCoupon(redeemReq(code, STRIPE_URL, '9.9.9.9'), env)).json()
+    expect(again.status).toBe('processing')
+    expect(hits.pay).toBe(1)
+  })
+
+  it('pay-invoice definite 4xx → manual_review, daily reservation released', async () => {
+    const { env, hits } = makeStripeEnv({ payStatus: 422, payBody: { error: 'amount_mismatch' } })
+    const code = await issueCoupon(env, '20')
+    await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(hits.pay).toBe(1)
+    expect((await record(env, code)).status).toBe('manual_review')
+    expect(await readDailySpentAtomic(env, new Date())).toBe(0n)
+    expect(await readCoinbaseExecGate(env, CPIS)).not.toBeNull()
+  })
+
+  it('expired link (Stripe resume 410) → 410 LINK_USED_OR_EXPIRED, coupon back to issued', async () => {
+    const { env, hits } = makeStripeEnv({ resumeStatus: 410 })
+    const code = await issueCoupon(env, '20')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(resp.status).toBe(410)
+    const body: any = await resp.json()
+    expect(body.error).toBe('LINK_USED_OR_EXPIRED')
+    expect(JSON.stringify(body)).not.toContain('/pay/')
+    expect(hits.pay).toBe(0)
+    expect(await couponState(env, code)).toBe('issued')
+  })
+
+  it('already-paid session and <5 min validity → 410; unsupported → 400; coupon stays issued', async () => {
+    for (const [over, status, error] of [
+      [{ state: 'succeeded' }, 410, 'LINK_USED_OR_EXPIRED'],
+      [{ validBeforeSec: Math.floor(Date.now() / 1000) + 120 }, 410, 'LINK_USED_OR_EXPIRED'],
+      [{ merchant: undefined as any }, 400, 'LINK_NOT_SUPPORTED'],
+    ] as const) {
+      const { env, hits } = makeStripeEnv(over as any)
+      const code = await issueCoupon(env, '20')
+      const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+      expect(resp.status).toBe(status)
+      expect(((await resp.json()) as any).error).toBe(error)
+      expect(hits.pay).toBe(0)
+      expect(await couponState(env, code)).toBe('issued')
+    }
+  })
+
+  it('upstream resolve error → 502 QUOTE_UNAVAILABLE, coupon back to issued', async () => {
+    const { env } = makeStripeEnv({ resumeStatus: 500 })
+    const code = await issueCoupon(env, '20')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(resp.status).toBe(502)
+    expect(((await resp.json()) as any).error).toBe('QUOTE_UNAVAILABLE')
+    expect(await couponState(env, code)).toBe('issued')
+  })
+
+  it('missing capability key → 503 before any claim, coupon issued', async () => {
+    const { env, hits } = makeStripeEnv({}, { INVOICE_CAPABILITY_ENCRYPTION_KEY: '' })
+    const code = await issueCoupon(env, '20')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(resp.status).toBe(503)
+    expect(hits.pay).toBe(0)
+    expect(await couponState(env, code)).toBe('issued')
+    expect(await readInvoiceClaim(env, CPIS)).toBeNull()
+  })
+
+  it('an unknown code never makes the router call Stripe (claim before resolve)', async () => {
+    const { env, hits } = makeStripeEnv()
+    const resp = await handleRedeemCoupon(redeemReq('1234567890', STRIPE_URL), env)
+    expect(resp.status).toBe(400)
+    expect(((await resp.json()) as any).error).toBe('INVALID_COUPON')
+    expect(hits.stripe).toBe(0)
+  })
+
+  it('a Stripe URL without a /pay/<blob> segment is malformed (uniform error)', async () => {
+    const { env, hits } = makeStripeEnv()
+    const code = await issueCoupon(env, '20')
+    const resp = await handleRedeemCoupon(redeemReq(code, 'https://crypto.stripe.com/other'), env)
+    expect(((await resp.json()) as any).error).toBe('INVALID_COUPON')
+    expect(hits.stripe).toBe(0)
+    expect(await couponState(env, code)).toBe('issued')
   })
 })

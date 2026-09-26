@@ -50,7 +50,22 @@
 
 import type { Env } from '../index'
 import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
-import { extractCoinbaseCheckoutId } from './pay-invoice-admin'
+import {
+  detectProvider,
+  extractCoinbaseCheckoutId,
+  extractStripeSessionBlob,
+  normalizeInvoiceUrl,
+  type InvoiceProvider,
+} from './pay-invoice-admin'
+import { resolveStripeInvoice, StripeResolveError, type NormalizedInvoice } from './invoice-provider'
+import {
+  callStripePayInvoice,
+  reserveDailySpend,
+  releaseDailySpend,
+  safeProviderResult,
+  type StripePayInvoiceResult,
+} from './stripe-fulfillment'
+import { encryptCapability } from './invoice-capability-crypto'
 import { parseUsdc, formatUsdc } from './create-invoice'
 import { callAgentApiPayInvoice, FUNDER_WALLET } from './webhook'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
@@ -94,6 +109,57 @@ const CODE_LOCK_MS = 60 * 60 * 1000
 const GLOBAL_LIMIT_PER_HOUR = 500
 
 const QUOTE_INVOICE_URL = 'https://agentapi.rozo.ai/quote-invoice'
+
+// ── Stripe Crypto links (crypto.stripe.com/pay/<blob>) ───────────────────────
+//
+// agentapi quote-invoice only knows Coinbase ids, so Stripe links are quoted
+// here via the read-only resolver and paid through the Stripe branch of
+// pay-invoice (callStripePayInvoice), exactly like the UPI Stripe executor.
+
+// OpenRouter's Stripe connected account. Its Stripe Crypto invoices are the
+// only ones allowed the tolerant amount match below: OpenRouter's Stripe
+// checkout adds its own fee/rounding on top of the credit amount, so a
+// customer asking for "$5.80 of credits" gets an invoice that is a few cents
+// off the coupon face value.
+export const OPENROUTER_STRIPE_ACCOUNT = 'acct_1Mxuu2DhhPj8i4PA'
+// Tolerance window for OpenRouter Stripe invoices, relative to the coupon face
+// value, in atomic USDC: the invoice may be up to $1.00 BELOW face (the
+// customer tops up slightly less than the coupon is worth; no partial refund)
+// or up to $0.15 ABOVE face (we absorb the difference). Coinbase stays
+// exact-match only.
+const STRIPE_TOLERANCE_BELOW_ATOMIC = 1_000_000n // $1.00
+const STRIPE_TOLERANCE_ABOVE_ATOMIC = 150_000n // $0.15
+// A Stripe session must stay valid at least this long after quoting so the
+// pay-invoice call (a few seconds) cannot race its expiry.
+const STRIPE_MIN_VALIDITY_MS = 5 * 60 * 1000
+const STRIPE_SESSION_ID_RE = /^cpis_[A-Za-z0-9_]+$/
+
+/**
+ * Amount policy. Exact match is accepted for every provider. Additionally, a
+ * Stripe Crypto invoice from OpenRouter's Stripe account is accepted when it
+ * falls within [face - $1.00, face + $0.15]. The caller always pays the
+ * INVOICE amount, never the face value.
+ */
+export function couponAmountAccepted(
+  provider: InvoiceProvider,
+  invoiceAtomic: bigint,
+  faceAtomic: bigint,
+  merchantAccount: string | null,
+): boolean {
+  if (invoiceAtomic <= 0n) return false
+  if (invoiceAtomic === faceAtomic) return true
+  if (provider !== 'stripe_crypto') return false
+  if (merchantAccount !== OPENROUTER_STRIPE_ACCOUNT) return false
+  return (
+    invoiceAtomic >= faceAtomic - STRIPE_TOLERANCE_BELOW_ATOMIC &&
+    invoiceAtomic <= faceAtomic + STRIPE_TOLERANCE_ABOVE_ATOMIC
+  )
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input))
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('')
+}
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -144,6 +210,24 @@ export interface CouponRecord {
    * a coupon writes TWO ledger rows over its life (debit on issue, credit on
    * void/expiry) and one field would clobber the first with the second. */
   refundLedgerId?: string | null
+  /**
+   * Stripe-support fields (2026-09-27). Absent on every record written before
+   * then; readers must tolerate that. Set when the claim enters `paying`.
+   *   provider           — which checkout the link belongs to
+   *   invoiceKey         — provider id used for the cross-channel claim + exec
+   *                        gate (Coinbase pl_/paymentSession_, Stripe cpis_)
+   *   paidAmountAtomic   — the INVOICE amount sent to pay-invoice (may differ
+   *                        from the face value for tolerant Stripe matches)
+   *   merchantAccount    — Stripe acct_* the payment was locked to
+   *   stripeUrlEncrypted — AES-GCM capability blob of the Stripe pay URL
+   *                        (never the plaintext URL)
+   * For Stripe links `plId` holds `stripe:<sha256(blob)>`, not a Coinbase id.
+   */
+  provider?: InvoiceProvider
+  invoiceKey?: string | null
+  paidAmountAtomic?: string | null
+  merchantAccount?: string | null
+  stripeUrlEncrypted?: string | null
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────
@@ -738,10 +822,20 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   const code = String(body?.code ?? '').trim()
   const turnstileToken = typeof body?.turnstileToken === 'string' ? body.turnstileToken : null
   const urlRaw = String(body?.url ?? body?.link ?? body?.payment_link ?? '').trim()
-  const plId =
-    /^(?:pl_[A-Za-z0-9_-]+|paymentSession_[A-Za-z0-9_-]+)$/.test(urlRaw)
+  // Stripe Crypto link: the idempotency key is `stripe:<sha256(blob)>`. The
+  // blob is never stored, logged or echoed; the cpis_ session id is only
+  // learned AFTER the coupon is claimed (resolving it calls Stripe, which an
+  // unauthenticated caller must not be able to trigger).
+  const stripeUrl =
+    detectProvider(urlRaw) === 'stripe_crypto' ? normalizeInvoiceUrl(urlRaw) : null
+  const stripeBlob = stripeUrl ? extractStripeSessionBlob(stripeUrl) : null
+  const isStripe = stripeBlob !== null
+  const plId = isStripe
+    ? `stripe:${await sha256Hex(stripeBlob)}`
+    : /^(?:pl_[A-Za-z0-9_-]+|paymentSession_[A-Za-z0-9_-]+)$/.test(urlRaw)
       ? urlRaw
       : extractCoinbaseCheckoutId(urlRaw)
+  const provider: InvoiceProvider = isStripe ? 'stripe_crypto' : 'coinbase'
 
   const validCode = CODE_RE.test(code) ? code : null
   const ids = await identifierKeys(env.COUPON_HASH_SECRET, {
@@ -943,6 +1037,9 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
         code,
         plId,
         amountUsd: claim.rec.amountUsd,
+        paidAmountUsd: claim.rec.paidAmountAtomic
+          ? formatUsdc(BigInt(claim.rec.paidAmountAtomic))
+          : claim.rec.amountUsd,
         redeemedAt: claim.rec.redeemedAt,
       }),
       'success',
@@ -971,68 +1068,129 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     })
   }
 
-  // Step 2 — quote the invoice and enforce the exact-amount policy.
-  let quote: any
-  try {
-    const quoteResp = await fetch(QUOTE_INVOICE_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
-      },
-      body: JSON.stringify({ payment_id: plId }),
+  const quoteUnavailable = () =>
+    json(502, {
+      error: 'QUOTE_UNAVAILABLE',
+      message: 'Could not verify the payment link right now. Your coupon is still valid — try again in a minute.',
     })
-    if (!quoteResp.ok) {
-      const status = quoteResp.status
-      await rollbackToIssued(`quote ${status}`)
-      if (status === 409 || status === 410) {
-        return done(
-          json(status, {
-            error: 'LINK_USED_OR_EXPIRED',
-            message: 'This payment link has already been used or has expired. Create a new payment link and try again — your coupon is still valid.',
-          }),
-          'failure',
-          'link_used_or_expired',
-        )
+  const linkUsedOrExpired = (status: number) =>
+    json(status, {
+      error: 'LINK_USED_OR_EXPIRED',
+      message: 'This payment link has already been used or has expired. Create a new payment link and try again — your coupon is still valid.',
+    })
+  const linkNotSupported = () =>
+    json(400, {
+      error: 'LINK_NOT_SUPPORTED',
+      message: 'This payment link cannot be paid with a coupon. Create a new payment link and try again — your coupon is still valid.',
+    })
+
+  // Step 2 — quote the invoice and enforce the amount policy.
+  let invoiceAtomic: bigint
+  // Stripe only: the resolved invoice + the encrypted pay-URL capability.
+  let stripeInv: NormalizedInvoice | null = null
+  let stripeUrlEncrypted: string | null = null
+  if (isStripe) {
+    // agentapi quote-invoice cannot resolve Stripe links: resolve read-only
+    // here. The coupon is already claimed, so only a caller holding a live
+    // code can make the router talk to Stripe.
+    try {
+      stripeInv = await resolveStripeInvoice(stripeUrl!)
+    } catch (err) {
+      const kind = err instanceof StripeResolveError ? err.kind : 'upstream'
+      await rollbackToIssued(`stripe resolve ${kind}`)
+      if (kind === 'expired') {
+        return done(linkUsedOrExpired(410), 'failure', 'link_used_or_expired')
       }
+      return done(quoteUnavailable(), 'rejected', 'quote_unavailable')
+    }
+
+    const inv = stripeInv
+    const entryState = inv.state === 'initialized' || inv.state === 'checkout'
+    if (!entryState) {
+      // Terminal or already in flight (someone else is paying / has paid).
+      await rollbackToIssued(`stripe state ${inv.state}`)
+      return done(linkUsedOrExpired(410), 'failure', 'link_used_or_expired')
+    }
+    const expMs = inv.validBefore ? Date.parse(inv.validBefore) : NaN
+    if (Number.isFinite(expMs) && expMs - Date.now() < STRIPE_MIN_VALIDITY_MS) {
+      await rollbackToIssued(expMs <= Date.now() ? 'stripe link expired' : 'stripe link expires too soon')
+      return done(linkUsedOrExpired(410), 'failure', 'link_used_or_expired')
+    }
+    let stripeAtomic: bigint | null = null
+    try {
+      stripeAtomic = BigInt(inv.stablecoinAmountAtomic)
+    } catch {
+      stripeAtomic = null
+    }
+    const notSupported =
+      !inv.payable
+        ? (inv.payableReason ?? 'not payable')
+        : inv.fiatCurrency !== 'usd'
+          ? 'non-USD'
+          : !inv.merchantAccount
+            ? 'no merchant account'
+            : !Number.isFinite(expMs)
+              ? 'expiry unverifiable'
+              : !STRIPE_SESSION_ID_RE.test(inv.invoiceKey)
+                ? 'unexpected session id'
+                : stripeAtomic === null || stripeAtomic <= 0n
+                  ? 'bad amount'
+                  : null
+    if (notSupported) {
+      await rollbackToIssued(`stripe link not supported: ${notSupported}`)
+      return done(linkNotSupported(), 'rejected', 'link_not_supported')
+    }
+    invoiceAtomic = stripeAtomic!
+
+    // Persist only an encrypted capability, never the plaintext URL. Fail
+    // closed (nothing claimed or reserved yet) when the key is not configured.
+    try {
+      stripeUrlEncrypted = await encryptCapability(stripeUrl!, env)
+    } catch {
+      await rollbackToIssued('stripe capability encryption failed')
       return done(
-        json(502, {
-          error: 'QUOTE_UNAVAILABLE',
-          message: 'Could not verify the payment link right now. Your coupon is still valid — try again in a minute.',
+        json(503, {
+          error: 'TEMPORARILY_UNAVAILABLE',
+          message: 'Redemption is temporarily unavailable. Your coupon is still valid — try again later.',
         }),
         'rejected',
-        'quote_unavailable',
+        'capability_encrypt_failed',
       )
     }
-    quote = await quoteResp.json()
-  } catch {
-    await rollbackToIssued('quote unreachable')
-    return done(
-      json(502, {
-        error: 'QUOTE_UNAVAILABLE',
-        message: 'Could not verify the payment link right now. Your coupon is still valid — try again in a minute.',
-      }),
-      'rejected',
-      'quote_unreachable',
-    )
+  } else {
+    let quote: any
+    try {
+      const quoteResp = await fetch(QUOTE_INVOICE_URL, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
+        },
+        body: JSON.stringify({ payment_id: plId }),
+      })
+      if (!quoteResp.ok) {
+        const status = quoteResp.status
+        await rollbackToIssued(`quote ${status}`)
+        if (status === 409 || status === 410) {
+          return done(linkUsedOrExpired(status), 'failure', 'link_used_or_expired')
+        }
+        return done(quoteUnavailable(), 'rejected', 'quote_unavailable')
+      }
+      quote = await quoteResp.json()
+    } catch {
+      await rollbackToIssued('quote unreachable')
+      return done(quoteUnavailable(), 'rejected', 'quote_unreachable')
+    }
+
+    try {
+      invoiceAtomic = parseUsdc(String(quote?.invoice?.amount ?? ''))
+    } catch {
+      await rollbackToIssued('quote amount unparseable')
+      return done(quoteUnavailable(), 'rejected', 'quote_unparseable')
+    }
   }
 
-  let invoiceAtomic: bigint
-  try {
-    invoiceAtomic = parseUsdc(String(quote?.invoice?.amount ?? ''))
-  } catch {
-    await rollbackToIssued('quote amount unparseable')
-    return done(
-      json(502, {
-        error: 'QUOTE_UNAVAILABLE',
-        message: 'Could not verify the payment link right now. Your coupon is still valid — try again in a minute.',
-      }),
-      'rejected',
-      'quote_unparseable',
-    )
-  }
-
-  if (invoiceAtomic !== faceAtomic) {
+  if (!couponAmountAccepted(provider, invoiceAtomic, faceAtomic, stripeInv?.merchantAccount ?? null)) {
     await rollbackToIssued(
       `amount mismatch: invoice ${invoiceAtomic} != face ${faceAtomic}`,
     )
@@ -1048,11 +1206,18 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     )
   }
 
+  // The id the cross-channel claim and the exec gate are keyed on. Coinbase:
+  // the pl_/paymentSession_ id. Stripe: the BARE cpis_ session id, so it
+  // collides with the Stripe webhook (ref stripe_crypto_cpis_*) and the UPI
+  // channel, which both claim the bare cpis_ id.
+  const execKey = isStripe ? stripeInv!.invoiceKey : plId
+
   // Step 3 — funder balance gate. The decision and the reservation commit in
   // ONE CAS (tryReserveFunds) so concurrent redemptions of different coupons
   // cannot both pass a check the pool only covers once. If balance is
   // unreadable, attempt anyway without a reservation — same philosophy as the
   // webhook path; agentapi re-checks the funder balance as the final gate.
+  // The reservation is for the INVOICE amount (what is actually paid).
   const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
   const balance = balanceResult.balance
   let reservedFunds = false
@@ -1085,9 +1250,10 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   }
 
   // Step 3b — cross-channel claim (invoice-claim.ts). If the UPI fiat channel
-  // already holds this link, do not pay it a second time: roll the coupon back
-  // to issued (nothing moved) and tell the caller.
-  const channelClaim = await claimInvoiceKey(env, plId, 'crypto', `coupon:${code}`)
+  // (or, for Stripe, the Stripe webhook) already holds this link, do not pay
+  // it a second time: roll the coupon back to issued (nothing moved) and tell
+  // the caller.
+  const channelClaim = await claimInvoiceKey(env, execKey, 'crypto', `coupon:${code}`)
   if (!channelClaim.ok) {
     if (reservedFunds) await releaseFunds(env, attemptId)
     await rollbackToIssued(`invoice already claimed by ${channelClaim.holder.channel} channel`)
@@ -1108,7 +1274,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // Keep the invoice claim (the link was executed; releasing it would let
   // another channel pay it again) and give the coupon back.
   const gateHolder = `coupon:${code}:${attemptId}`
-  const gate = await acquireCoinbaseExecGate(env, plId, gateHolder)
+  const gate = await acquireCoinbaseExecGate(env, execKey, gateHolder)
   if (!gate.ok) {
     if (reservedFunds) await releaseFunds(env, attemptId)
     await rollbackToIssued(`exec_gate_held by ${gate.holder.holder}`)
@@ -1120,6 +1286,35 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       'rejected',
       'exec_gate_held',
     )
+  }
+
+  // Step 3d (Stripe only) — reserve today's Stripe spend headroom BEFORE
+  // signing (same daily ledger + cap the webhook/UPI Stripe paths use; the
+  // pre-reservation total is handed to pay-invoice as spent_today_atomic).
+  // Over the cap → nothing was sent: release the claim + gate, give the coupon
+  // back.
+  const spendDay = new Date()
+  let spentBefore: bigint | null = null
+  if (isStripe) {
+    try {
+      spentBefore = await reserveDailySpend(env, spendDay, invoiceAtomic)
+    } catch {
+      spentBefore = null
+    }
+    if (spentBefore === null) {
+      await releaseInvoiceClaim(env, execKey, 'crypto', `coupon:${code}`)
+      await releaseCoinbaseExecGate(env, execKey, gateHolder)
+      if (reservedFunds) await releaseFunds(env, attemptId)
+      await rollbackToIssued('stripe daily cap reached')
+      return done(
+        json(503, {
+          error: 'TEMPORARILY_UNAVAILABLE',
+          message: 'Redemption is temporarily unavailable. Your coupon is still valid — try again later.',
+        }),
+        'rejected',
+        'daily_cap_reached',
+      )
+    }
   }
 
   // Step 4 — point of no return: redeeming → paying. From here on, failure
@@ -1135,15 +1330,23 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       return { op: 'noop', result: false }
     }
     r.status = 'paying'
+    r.provider = provider
+    r.invoiceKey = execKey
+    r.paidAmountAtomic = invoiceAtomic.toString()
+    if (isStripe) {
+      r.merchantAccount = stripeInv!.merchantAccount
+      r.stripeUrlEncrypted = stripeUrlEncrypted
+    }
     r.events.push({ kind: 'paying', at: nowIso() })
     return { op: 'set', value: JSON.stringify(r), result: true }
   })
   if (!enteredPaying) {
     // Definite pre-payment failure: give the invoice claim back so a later
     // payer (UPI or another attempt) is not blocked by a claim that never paid.
-    await releaseInvoiceClaim(env, plId, 'crypto', `coupon:${code}`)
+    await releaseInvoiceClaim(env, execKey, 'crypto', `coupon:${code}`)
     // Nothing was sent: the exec gate may be released too.
-    await releaseCoinbaseExecGate(env, plId, gateHolder)
+    await releaseCoinbaseExecGate(env, execKey, gateHolder)
+    if (isStripe) await releaseDailySpend(env, spendDay, invoiceAtomic)
     if (reservedFunds) await releaseFunds(env, attemptId)
     return done(
       json(409, {
@@ -1155,11 +1358,53 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     )
   }
 
-  let payResult: { ok: boolean; status: number; body: any }
-  try {
-    payResult = await callAgentApiPayInvoice(env, plId)
-  } catch (err: any) {
-    payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }
+  // Pay. Coinbase: agentapi pay-invoice by link id. Stripe: the Stripe branch
+  // of pay-invoice, locked to the resolved merchant account and the INVOICE
+  // amount (never the coupon face value).
+  let payOk: boolean
+  let payStatus: number
+  let storedResult: unknown
+  let failureDetail: unknown
+  let failureReason: string
+  if (isStripe) {
+    let sp: StripePayInvoiceResult
+    try {
+      sp = await callStripePayInvoice(env, {
+        stripeUrl: stripeUrl!,
+        expectedMerchantAccount: stripeInv!.merchantAccount!,
+        expectedAmountAtomic: stripeInv!.stablecoinAmountAtomic,
+        spentTodayAtomic: spentBefore!.toString(),
+      })
+    } catch {
+      // callStripePayInvoice maps transport errors itself; a throw here is
+      // still treated as ambiguous (pay-invoice may have signed).
+      sp = { ok: false, status: 0, disabled: false, ambiguous: true, body: null }
+    }
+    if (!sp.ok && !sp.ambiguous) {
+      // Definite refusal before signing (parseable 4xx, or the fail-closed
+      // disabled switch): no spend happened, so return the daily headroom.
+      // The coupon still parks in manual_review — an operator confirms on
+      // Stripe before releasing it. Ambiguous outcomes keep the reservation.
+      await releaseDailySpend(env, spendDay, invoiceAtomic)
+    }
+    payOk = sp.ok
+    payStatus = sp.status
+    // Whitelisted projection only — the raw body could echo the pay URL.
+    storedResult = safeProviderResult(sp)
+    failureDetail = { status: sp.status, disabled: sp.disabled, ambiguous: sp.ambiguous }
+    failureReason = `stripe pay-invoice ${sp.status}${sp.disabled ? ' (disabled)' : sp.ambiguous ? ' (ambiguous)' : ''}`
+  } else {
+    let payResult: { ok: boolean; status: number; body: any }
+    try {
+      payResult = await callAgentApiPayInvoice(env, plId)
+    } catch (err: any) {
+      payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }
+    }
+    payOk = payResult.ok
+    payStatus = payResult.status
+    storedResult = payResult.body
+    failureDetail = { status: payResult.status, body: payResult.body }
+    failureReason = `agentapi pay-invoice ${payResult.status}`
   }
   if (reservedFunds) await releaseFunds(env, attemptId)
 
@@ -1176,12 +1421,12 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       return { op: 'set', value: JSON.stringify(r), result: r }
     })
 
-  if (payResult.ok) {
+  if (payOk) {
     const finalRec = await finalize((r) => {
       r.status = 'redeemed'
       r.redeemedAt = nowIso()
-      r.coinbaseResult = payResult.body
-      r.events.push({ kind: 'pay_invoice_succeeded', at: r.redeemedAt!, detail: { status: payResult.status } })
+      r.coinbaseResult = storedResult
+      r.events.push({ kind: 'pay_invoice_succeeded', at: r.redeemedAt!, detail: { status: payStatus } })
     })
     if (!finalRec && env.DINGTALK_ACCESS_TOKEN) {
       await sendDingTalkAlert(
@@ -1196,6 +1441,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
         code,
         plId,
         amountUsd: rec.amountUsd,
+        paidAmountUsd: formatUsdc(invoiceAtomic),
         redeemedAt: finalRec?.redeemedAt ?? nowIso(),
       }),
       'success',
@@ -1206,23 +1452,27 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // Failure after the pay attempt — ambiguous by definition. Park it.
   const parked = await finalize((r) => {
     r.status = 'manual_review'
-    r.failureReason = `agentapi pay-invoice ${payResult.status}`
+    r.failureReason = failureReason
     r.events.push({
       kind: 'pay_invoice_failed',
       at: nowIso(),
-      detail: { status: payResult.status, body: payResult.body },
+      detail: failureDetail,
     })
   })
   if (!parked && env.DINGTALK_ACCESS_TOKEN) {
     await sendDingTalkAlert(
       env.DINGTALK_ACCESS_TOKEN,
-      redactForAlert(`[MPP Router] ⚠️ Coupon ${code}: pay-invoice failed (${payResult.status}) AND the record was modified mid-payment. Reconcile ${plId} manually.`),
+      redactForAlert(`[MPP Router] ⚠️ Coupon ${code}: pay-invoice failed (${payStatus}) AND the record was modified mid-payment. Reconcile ${plId} manually.`),
     )
   }
   if (env.DINGTALK_ACCESS_TOKEN) {
     await sendDingTalkAlert(
       env.DINGTALK_ACCESS_TOKEN,
-      redactForAlert(`[MPP Router] 🚨 Coupon redemption needs MANUAL REVIEW: pay-invoice returned ${payResult.status} for coupon ${code} / ${plId} (${rec.amountUsd} USD). Check invoice-status + Coinbase before releasing or marking redeemed (/admin/coupon/resolve).`),
+      redactForAlert(
+        isStripe
+          ? `[MPP Router] 🚨 Coupon redemption needs MANUAL REVIEW: Stripe pay-invoice returned ${payStatus} for coupon ${code} / ${execKey} (paid amount ${formatUsdc(invoiceAtomic)} USD, face ${rec.amountUsd} USD). Check the Stripe session state before releasing or marking redeemed (/admin/coupon/resolve).`
+          : `[MPP Router] 🚨 Coupon redemption needs MANUAL REVIEW: pay-invoice returned ${payStatus} for coupon ${code} / ${plId} (${rec.amountUsd} USD). Check invoice-status + Coinbase before releasing or marking redeemed (/admin/coupon/resolve).`,
+      ),
     )
   }
   return done(
