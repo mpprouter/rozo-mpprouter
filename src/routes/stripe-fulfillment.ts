@@ -808,7 +808,7 @@ export async function handleStripeWebhookEvent(
 // Whitelist projection of a pay-invoice result for storage in the record. NEVER
 // store the raw downstream body — it could echo the Stripe url, client_secret,
 // or a pk_. Only router-relevant scalars survive. (P1-2)
-function safeProviderResult(result: StripePayInvoiceResult): Record<string, unknown> {
+export function safeProviderResult(result: StripePayInvoiceResult): Record<string, unknown> {
   const body = result.body as Record<string, unknown> | null
   const pick = (k: string) =>
     body && typeof body === 'object' && (typeof body[k] === 'string' || typeof body[k] === 'boolean' || typeof body[k] === 'number')
