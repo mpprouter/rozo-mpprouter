@@ -15,7 +15,9 @@ import {
   type FulfillmentRecord,
 } from '../src/routes/webhook'
 import { sweepCoinbaseFulfillments } from '../src/routes/coinbase-sweep'
-import { readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
+import { acquireCoinbaseExecGate, readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
+import { handleCoinbaseExecGateClear, coinbaseExecGateClearLogKey } from '../src/routes/coinbase-exec-gate-admin'
+import { casRead } from '../src/routes/stripe-atomic'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
@@ -327,6 +329,28 @@ describe('saveRecordGuarded', () => {
     expect(rec.events.map((e) => e.kind)).toEqual(['a', 'b'])
   })
 
+  it('never lowers the status rank between terminal states', async () => {
+    const { env, kv } = makeEnv()
+    // Stale capture_pending (rank 2) over manual_review (rank 3) → manual_review kept.
+    seedRec(kv, { status: 'manual_review', alertedManualReview: true })
+    await saveRecordGuarded(env, PL, { ...readRec(kv), status: 'capture_pending', alertedManualReview: false })
+    expect(readRec(kv).status).toBe('manual_review')
+    expect(readRec(kv).alertedManualReview).toBe(true)
+    // Equal rank 3: failed_pay_invoice does not replace manual_review.
+    await saveRecordGuarded(env, PL, { ...readRec(kv), status: 'failed_pay_invoice' })
+    expect(readRec(kv).status).toBe('manual_review')
+    // paid (rank 4) is never downgraded by anything.
+    for (const st of ['manual_review', 'failed_pay_invoice', 'claimed_by_other_channel', 'capture_pending', 'paying', 'payin_seen'] as const) {
+      seedRec(kv, { status: 'paid' })
+      await saveRecordGuarded(env, PL, { ...readRec(kv), status: st })
+      expect(readRec(kv).status).toBe('paid')
+    }
+    // Rank 0 transitions still work: payin_seen → failed_insufficient_balance.
+    seedRec(kv, { status: 'payin_seen' })
+    await saveRecordGuarded(env, PL, { ...readRec(kv), status: 'failed_insufficient_balance' })
+    expect(readRec(kv).status).toBe('failed_insufficient_balance')
+  })
+
   it('a terminal stored status wins over a non-terminal write, a terminal write goes through', async () => {
     const { env, kv } = makeEnv()
     seedRec(kv, { status: 'capture_pending' })
@@ -461,6 +485,98 @@ describe('sweepCoinbaseFulfillments', () => {
     const out = await sweepCoinbaseFulfillments(env)
     expect(out.scanned).toBe(0)
     expect(calls.coinbase).toBe(0)
+  })
+})
+
+// ── Admin exec-gate clear (manual re-pay escape hatch) ─────────────────────
+
+describe('POST /admin/coinbase-exec-gate/clear', () => {
+  const V3_CREATED = { paymentSessionId: PL, status: 'PAYMENT_SESSION_STATUS_CREATED', expiresAt: new Date(Date.now() + 86400_000).toISOString() }
+  const clearReq = (body: Record<string, unknown>) =>
+    new Request('https://router.test/admin/coinbase-exec-gate/clear', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-admin-secret': 'test-admin-secret' },
+      body: JSON.stringify({ plId: PL, evidence: 'verified on Coinbase: session still CREATED', clearedBy: 'ops-test', ...body }),
+    })
+
+  async function setup(recStatus: FulfillmentRecord['status'] | null, coinbase: Record<string, unknown> | null) {
+    const { calls } = stubFetch({ coinbase })
+    const { env, kv } = makeEnv()
+    if (recStatus) seedRec(kv, { status: recStatus })
+    expect((await acquireCoinbaseExecGate(env, PL, 'evt-1')).ok).toBe(true)
+    return { env, kv, calls }
+  }
+
+  it('happy path: manual_review + Coinbase CREATED + matching holder → cleared and recorded', async () => {
+    const { env, kv, calls } = await setup('manual_review', V3_CREATED)
+    const res = await handleCoinbaseExecGateClear(clearReq({ expectedHolder: 'evt-1' }), env)
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as any).changed).toBe(true)
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+    const log = JSON.parse((await casRead(env, coinbaseExecGateClearLogKey(PL))).value!)
+    expect(log).toHaveLength(1)
+    expect(log[0].clearedBy).toBe('ops-test')
+    expect(readRec(kv).events.some((e) => e.kind === 'exec_gate_cleared_by_admin')).toBe(true)
+    expect(readRec(kv).status).toBe('manual_review')
+    expect(calls.pay).toBe(0)
+  })
+
+  it('happy path also for failed_pay_invoice with a v1 link usageCount < maxUsage', async () => {
+    const { env } = await setup('failed_pay_invoice', { id: PL, status: 'ACTIVE', usageCount: 0, maxUsage: 1 })
+    const res = await handleCoinbaseExecGateClear(clearReq({ expectedHolder: 'evt-1' }), env)
+    expect(res.status).toBe(200)
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+  })
+
+  for (const st of ['paying', 'capture_pending', 'paid', 'payin_seen', null] as const) {
+    it(`refuses when the record is ${st ?? 'missing'} (pay may be in flight / settled)`, async () => {
+      const { env, calls } = await setup(st, V3_CREATED)
+      const res = await handleCoinbaseExecGateClear(clearReq({ expectedHolder: 'evt-1' }), env)
+      expect(res.status).toBe(409)
+      expect((await readCoinbaseExecGate(env, PL))?.holder).toBe('evt-1')
+      expect(calls.coinbase).toBe(0)
+    })
+  }
+
+  const notExplicitlyUnsettled: Array<[string, Record<string, unknown>]> = [
+    ['v3 CAPTURE_PENDING', { paymentSessionId: PL, status: 'PAYMENT_SESSION_STATUS_CAPTURE_PENDING' }],
+    ['v3 CAPTURE_SUCCEEDED', { paymentSessionId: PL, status: 'PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED' }],
+    ['v3 empty status', { paymentSessionId: PL }],
+    ['v1 settled', { id: PL, usageCount: 1, maxUsage: 1 }],
+    ['v1 non-numeric usage', { id: PL, usageCount: '0', maxUsage: '1' }],
+    ['unrecognized object', { foo: 'bar' }],
+  ]
+  for (const [label, cb] of notExplicitlyUnsettled) {
+    it(`refuses (409) when Coinbase is not explicitly unsettled: ${label}`, async () => {
+      const { env } = await setup('manual_review', cb)
+      const res = await handleCoinbaseExecGateClear(clearReq({ expectedHolder: 'evt-1' }), env)
+      expect(res.status).toBe(409)
+      expect((await readCoinbaseExecGate(env, PL))?.holder).toBe('evt-1')
+    })
+  }
+
+  it('refuses (502) when Coinbase cannot be read', async () => {
+    const { env } = await setup('manual_review', null)
+    const res = await handleCoinbaseExecGateClear(clearReq({ expectedHolder: 'evt-1' }), env)
+    expect(res.status).toBe(502)
+    expect((await readCoinbaseExecGate(env, PL))?.holder).toBe('evt-1')
+  })
+
+  it('requires expectedHolder (400) and refuses a mismatched holder (409)', async () => {
+    const { env } = await setup('manual_review', V3_CREATED)
+    expect((await handleCoinbaseExecGateClear(clearReq({}), env)).status).toBe(400)
+    expect((await handleCoinbaseExecGateClear(clearReq({ expectedHolder: 'evt-other' }), env)).status).toBe(409)
+    expect((await readCoinbaseExecGate(env, PL))?.holder).toBe('evt-1')
+  })
+
+  it('rejects a wrong admin secret (401)', async () => {
+    const { env } = await setup('manual_review', V3_CREATED)
+    const req = new Request('https://router.test/admin/coinbase-exec-gate/clear', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-admin-secret': 'nope' },
+      body: JSON.stringify({ plId: PL, evidence: 'x'.repeat(30), clearedBy: 'a', expectedHolder: 'evt-1' }),
+    })
+    expect((await handleCoinbaseExecGateClear(req, env)).status).toBe(401)
   })
 })
 

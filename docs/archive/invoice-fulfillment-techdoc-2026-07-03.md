@@ -222,19 +222,33 @@ Changes (code: `src/routes/webhook.ts`, `coinbase-exec-gate.ts`,
   `wrangler.toml` (default `"false"`): flip it only once rozo-intents-api serves
   `/delivered`, otherwise every paid record 404s and raises a give-up alert.
 
-### Manual re-pay (a record in `manual_review`, or a coupon blocked by the gate)
+### Manual re-pay (a record in `manual_review` / `failed_pay_invoice`, or a coupon in `manual_review`)
 
 1. Confirm on Coinbase that the link/session is **not** settled
    (`GET /v1/services/rozo-agent-api/invoice-status?payment_id=<plId>` →
    `coinbase.settled: false`). If it is settled, stop: the invoice is paid.
-2. Clear the gate with a record of who/why. The endpoint re-checks Coinbase itself
-   and refuses (409) if settled, or (502) if Coinbase cannot be read:
+2. Read the current gate holder (the `exec_gate_held` / `pay_invoice_*` events on the
+   record name the event id; a coupon holder is `coupon:<code>:<attemptId>`), then
+   clear the gate with a record of who/why:
 
    ```bash
    curl -sS -X POST https://apiserver.mpprouter.dev/admin/coinbase-exec-gate/clear \
      -H "x-admin-secret: $PAYINVOICE_ADMIN_SECRET" -H 'content-type: application/json' \
-     -d '{"plId":"pl_…","evidence":"what you verified (20-1000 chars)","clearedBy":"<name>"}'
+     -d '{"plId":"pl_…","expectedHolder":"<holder>","evidence":"what you verified (20-1000 chars)","clearedBy":"<name>"}'
    ```
+
+   The endpoint clears ONLY when all of these hold, otherwise it refuses and the
+   gate stays:
+   - the holder's record is parked for a human: webhook holder → KV fulfillment
+     record is `manual_review` or `failed_pay_invoice` (never `paying`,
+     `capture_pending`, `paid`, `payin_seen`); coupon holder → the coupon record is
+     `manual_review` for that same attempt and link (so clear BEFORE releasing the
+     coupon);
+   - Coinbase explicitly reports NOT settled: v3 status exactly
+     `PAYMENT_SESSION_STATUS_CREATED`, v1 numeric `usageCount < maxUsage`. Anything
+     else → 409; Coinbase unreadable → 502;
+   - `expectedHolder` equals the stored holder; the release is one CAS on that
+     holder (409 if it changed).
 
    The clear is appended to DO key `coinbase-pay-exec-clear-log:v1:<plId>` and as an
    `exec_gate_cleared_by_admin` event on the KV fulfillment record. Never delete the
@@ -248,3 +262,6 @@ Changes (code: `src/routes/webhook.ts`, `coinbase-exec-gate.ts`,
      KV status keeps the router from paying in parallel.
 4. Note the outcome (tx / Coinbase status) in the ops channel.
 
+Note: `/admin/pay-invoice` (router) and a direct agentapi `pay-invoice` call do NOT
+take the execution gate. Never use them on a link whose gate is held by an
+in-flight or unresolved attempt; clear the gate through the endpoint above first.

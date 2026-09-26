@@ -187,12 +187,40 @@ function mergeEvents(
   return out.sort((x, y) => (x.at < y.at ? -1 : x.at > y.at ? 1 : 0))
 }
 
+// Monotonic progress rank for guarded saves. A write never moves a record to a
+// lower rank than what is stored.
+const STATUS_RANK: Record<FulfillmentStatus, number> = {
+  payin_seen: 0,
+  failed_insufficient_balance: 0,
+  paying: 1,
+  capture_pending: 2,
+  manual_review: 3,
+  failed_pay_invoice: 3,
+  claimed_by_other_channel: 3,
+  paid: 4,
+}
+
+function keepStoredStatus(stored: FulfillmentStatus, next: FulfillmentStatus): boolean {
+  const s = STATUS_RANK[stored] ?? 0
+  const n = STATUS_RANK[next] ?? 0
+  if (n < s) return true
+  // Equal rank keeps the stored status, except in the pre-pay rank 0 where
+  // payin_seen <-> failed_insufficient_balance are ordinary transitions
+  // (a payout event with a short balance must be able to record the failure).
+  if (n === s && s > 0) return stored !== next
+  return false
+}
+
 /**
  * Save with a re-read so the webhook and the cron sweep cannot roll each other
- * back (KV has no conditional write). If the stored status is terminal and the
- * new one is not, the stored status wins (events are merged). `paid` is never
- * overwritten by anything else. `deliveredReported` only goes false → true and
- * one-shot alert flags only go false → true. Returns what was written.
+ * back: a write never lowers the stored status rank (STATUS_RANK); on a kept
+ * status the events are still merged. `deliveredReported` and the one-shot
+ * alert flags only go false → true.
+ *
+ * NOTE: the KV re-read + write is NOT atomic (KV has no conditional write), so
+ * this narrows races but cannot close them. Money safety does not rely on it:
+ * at most one pay-invoice request per link is guaranteed by the exec gate
+ * (coinbase-exec-gate.ts, DO CAS). Returns what was written.
  */
 export async function saveRecordGuarded(
   env: Env,
@@ -202,9 +230,7 @@ export async function saveRecordGuarded(
   const stored = await loadRecord(env, plId)
   let out: FulfillmentRecord = rec
   if (stored) {
-    const keepStored =
-      (TERMINAL_STATUSES.has(stored.status) && !TERMINAL_STATUSES.has(rec.status)) ||
-      (stored.status === 'paid' && rec.status !== 'paid')
+    const keepStored = keepStoredStatus(stored.status, rec.status)
     const base = keepStored ? stored : rec
     out = {
       ...base,
