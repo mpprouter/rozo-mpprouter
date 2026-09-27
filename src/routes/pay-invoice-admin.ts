@@ -362,6 +362,16 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
     return errorResponse(400, errPayload)
   }
 
+  // Internal test invoices have nothing to pay on Coinbase.
+  if ('payment_id' in normalized && isTestPaymentId(normalized.payment_id)) {
+    return errorResponse(400, {
+      code: 'INVALID_INPUT',
+      message: 'Test payment ids cannot be paid.',
+      normalized_input: normalized,
+      link_id_detected,
+    })
+  }
+
   let upstream: Response
   try {
     upstream = await fetch('https://agentapi.rozo.ai/pay-invoice', {

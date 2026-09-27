@@ -968,6 +968,7 @@ export async function fetchRozoPaymentById(env: Env, rozoId: string): Promise<an
 
 // Router states that are only reachable after the payin was observed.
 const ROUTER_STATES_IMPLYING_PAYIN = new Set([
+  'test_settled',
   'payin_seen',
   'payout_seen',
   'provider_paying',

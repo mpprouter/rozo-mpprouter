@@ -159,6 +159,31 @@ export function resolveClient(raw: unknown): string | null {
   return normalizeCheckoutClient(raw)
 }
 
+/**
+ * Native orders carry a price lock shorter than the order itself
+ * (rozo-intents-api quoteExpiresAt). A reused order must surface it: after the
+ * lock ends the shown coin amount is only honoured at the arrival price within
+ * tolerance, so the caller has to know the quote is stale.
+ */
+export function nativeQuoteFields(row: any): Record<string, unknown> {
+  const quoteExpiresAt = typeof row?.quoteExpiresAt === 'string' ? row.quoteExpiresAt : null
+  if (!quoteExpiresAt) return {}
+  const expired = Date.parse(quoteExpiresAt) <= Date.now()
+  return {
+    quoteExpiresAt,
+    nativeAmount: row?.source?.amount ?? null,
+    ...(expired
+      ? {
+          quoteExpired: true,
+          quoteExpiredWarning:
+            'The coin price for this order was locked until quoteExpiresAt and has expired. ' +
+            'A payment of nativeAmount is still accepted, but it is valued at the price when it ' +
+            'arrives and may need manual review if the price moved. Pay with USDC/USDT for an exact amount.',
+        }
+      : {}),
+  }
+}
+
 export function resolveSource(
   raw: unknown,
   nativeAllowed: ReadonlySet<string> = new Set(),
@@ -1367,6 +1392,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           row?.paymentLink ?? row?.url ?? row?.payment_link ?? null,
         rozoPaymentId: row?.id ?? existing?.id ?? null,
         expiresAt: row?.expiresAt ?? existingExpiresAt,
+        ...nativeQuoteFields(row),
         // The source the order actually pays from now — rotated to the
         // requested one when that worked, otherwise the pre-existing one.
         source: {
@@ -1553,6 +1579,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
               winner?.paymentLink ?? winner?.url ?? winner?.payment_link ?? null,
             rozoPaymentId: winner?.id ?? null,
             expiresAt: winnerExpiresAt,
+            ...nativeQuoteFields(winner),
             source: {
               chainId: winnerSource.chainId,
               tokenSymbol: winnerSource.tokenSymbol,
@@ -1663,12 +1690,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     paymentLink,
     rozoPaymentId,
     expiresAt,
-    ...(nativeSource
-      ? {
-          quoteExpiresAt: intentsJson?.quoteExpiresAt ?? null,
-          nativeAmount: intentsJson?.source?.amount ?? null,
-        }
-      : {}),
+    ...(nativeSource ? nativeQuoteFields(intentsJson) : {}),
     ...(testInvoiceCents !== null ? { testInvoice: true } : {}),
     source: {
       chainId: source.chainId,
