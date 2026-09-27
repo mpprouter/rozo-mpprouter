@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { isTestPaymentId } from './native-sources'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { baseLinkIdOf } from '../mpp/contract-variant'
 import { sendDingTalkAlert } from '../utils/dingtalk'
@@ -103,6 +104,9 @@ export type FulfillmentStatus =
   // crypto payin could settle it. Terminal: the caller's crypto needs a
   // human refund, and the invoice must NOT be paid a second time.
   | 'claimed_by_other_channel'
+  // Internal rozotest_ invoice (native-sources.ts): the Rozo order completed,
+  // there is no Coinbase link to pay. Terminal; never calls pay-invoice.
+  | 'test_settled'
 
 export interface FulfillmentRecord {
   status: FulfillmentStatus
@@ -139,6 +143,7 @@ export interface FulfillmentRecord {
 // Statuses from which no path may call pay-invoice again. A non-terminal
 // write never overwrites one of these (saveRecordGuarded).
 export const TERMINAL_STATUSES: ReadonlySet<FulfillmentStatus> = new Set<FulfillmentStatus>([
+  'test_settled',
   'paid',
   'capture_pending',
   'manual_review',
@@ -198,6 +203,7 @@ const STATUS_RANK: Record<FulfillmentStatus, number> = {
   failed_pay_invoice: 3,
   claimed_by_other_channel: 3,
   paid: 4,
+  test_settled: 4,
 }
 
 function keepStoredStatus(stored: FulfillmentStatus, next: FulfillmentStatus): boolean {
@@ -635,6 +641,17 @@ async function settleCoinbaseEvent(
   if (!shouldAttempt) {
     await saveRecordGuarded(env, plId, rec)
     return { ok: true, ignored_type: eventType, plId }
+  }
+
+  // Internal test invoice: nothing to pay on Coinbase. Close it once the
+  // payout landed (the same point a real invoice is paid for certain).
+  if (isTestPaymentId(plId)) {
+    if (eventType === 'payment_payout_completed') {
+      rec.status = 'test_settled'
+      rec.events.push({ kind: 'test_settled', at: new Date().toISOString() })
+    }
+    await saveRecordGuarded(env, plId, rec)
+    return { ok: true, test_invoice: true, status: rec.status, plId }
   }
 
   // Already in-flight? Don't double-fire. (Advisory only: KV is not atomic.
@@ -1142,7 +1159,8 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
   let coinbase: any = null
   let rozo: any = null
 
-  if (plId) {
+  // Internal test invoices have no Coinbase link behind them.
+  if (plId && !isTestPaymentId(plId)) {
     coinbase = await fetchCoinbasePayment(plId)
   }
   if (rozoId) {
@@ -1160,6 +1178,8 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
     if (typeof inferredPl === 'string' && isCoinbasePaymentId(inferredPl) && !coinbase) {
       plId = inferredPl
       coinbase = await fetchCoinbasePayment(plId)
+    } else if (!plId && isTestPaymentId(inferredPl)) {
+      plId = inferredPl as string
     }
   }
 

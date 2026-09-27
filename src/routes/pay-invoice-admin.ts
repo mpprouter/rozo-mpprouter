@@ -1,4 +1,13 @@
 import type { Env } from '../index'
+import {
+  ALL_NATIVE_SOURCES,
+  STABLE_SOURCES,
+  TEST_MERCHANT_NAME,
+  isTestPaymentId,
+  parseNativeSources,
+  supportedSources,
+  verifyTestPaymentId,
+} from './native-sources'
 import { createQuoteReceipt } from './quote-receipt'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { invoiceResolveRateLimit } from './invoice-details'
@@ -433,6 +442,45 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     return quoteStripeInvoice(request, env, normalized.url)
   }
 
+  // Internal test invoice (native-sources.ts): no Coinbase link behind it.
+  // Quoted like a real one (the test merchant is not fee-eligible) and every
+  // native coin is offered.
+  const testId = 'payment_id' in normalized ? normalized.payment_id : null
+  if (isTestPaymentId(testId)) {
+    const cents = await verifyTestPaymentId(env.ROZO_TEST_LINK_SECRET, testId as string)
+    if (cents === null) {
+      return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid test payment id.' })
+    }
+    const amount = (cents / 100).toFixed(2)
+    const pricing = resolveCheckoutPricing(parseUsdcAtomic(amount), TEST_MERCHANT_NAME, env.CHECKOUT_WEB_FEE_BPS)
+    const pricingFields = {
+      original: formatUsdcAtomic(pricing.originalAtomic),
+      serviceFee: formatUsdcAtomic(pricing.serviceFeeAtomic),
+      callerPays: formatUsdcAtomic(pricing.callerPaysAtomic),
+      feeBps: pricing.feeBps,
+      pricingVersion: pricing.pricingVersion,
+    }
+    const quoteReceipt = await createQuoteReceipt(
+      testId as string,
+      amount,
+      TEST_MERCHANT_NAME,
+      env.PAYINVOICE_ADMIN_SECRET,
+      Math.floor(Date.now() / 1000),
+      { ...pricingFields, client: null, channel: null },
+    )
+    return json(200, {
+      linkId: testId,
+      merchant: TEST_MERCHANT_NAME,
+      invoice: { amount, currency: 'USD' },
+      testInvoice: true,
+      ...pricingFields,
+      title: buildCheckoutTitle(TEST_MERCHANT_NAME, pricing),
+      currency: 'USD',
+      supportedSources: supportedSources(STABLE_SOURCES, ALL_NATIVE_SOURCES),
+      quoteReceipt,
+    })
+  }
+
   let upstream: Response
   try {
     upstream = await fetch('https://agentapi.rozo.ai/quote-invoice', {
@@ -540,6 +588,8 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     ...(raw_url ? { invoiceUrl: raw_url } : {}),
     title: buildCheckoutTitle(merchant, pricing),
     currency: 'USD',
+    // Coins this checkout may be paid with (stablecoins + open native coins).
+    supportedSources: supportedSources(STABLE_SOURCES, parseNativeSources(env.NATIVE_SOURCES)),
     quote: {
       ...(quote?.quote && typeof quote.quote === 'object' ? quote.quote : {}),
       originalAtomicUsdc: pricing.originalAtomic.toString(),
