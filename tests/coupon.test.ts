@@ -1063,9 +1063,11 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     // Above: 5.80 + 27% (1.566) + 0.15 = 7.516.
     expect(couponAmountAccepted('stripe_crypto', 7_516_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
     expect(couponAmountAccepted('stripe_crypto', 7_517_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
-    expect(couponAmountAccepted('stripe_crypto', 5_830_000n, face, 'acct_other')).toBe(false)
-    // Exact face value does NOT bypass the merchant check for Stripe.
-    expect(couponAmountAccepted('stripe_crypto', face, face, 'acct_other')).toBe(false)
+    // Any Stripe merchant is accepted with the same window; a missing account is not.
+    expect(couponAmountAccepted('stripe_crypto', 5_830_000n, face, 'acct_other')).toBe(true)
+    expect(couponAmountAccepted('stripe_crypto', 6_900_000n, face, 'acct_other')).toBe(true)
+    expect(couponAmountAccepted('stripe_crypto', 7_517_000n, face, 'acct_other')).toBe(false)
+    expect(couponAmountAccepted('stripe_crypto', face, face, 'acct_other')).toBe(true)
     expect(couponAmountAccepted('stripe_crypto', face, face, null)).toBe(false)
     expect(couponAmountAccepted('stripe_crypto', face, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
     expect(couponAmountAccepted('stripe_crypto', 0n, 500_000n, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
@@ -1079,6 +1081,15 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     const big = 20_000_000n
     expect(couponAmountAccepted('stripe_crypto', 23_000_000n, big, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
     expect(couponAmountAccepted('stripe_crypto', 23_010_000n, big, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
+  })
+
+  it('any merchant: face 5.80, non-OpenRouter invoice 6.00 → pays locked to that merchant', async () => {
+    const { env, payBodies } = makeStripeEnv({ cents: 600, merchant: 'acct_notOpenRouter' })
+    const code = await issueCoupon(env, '5.80')
+    const body: any = await (await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)).json()
+    expect(body.status).toBe('redeemed')
+    expect(payBodies[0].expected_amount_atomic).toBe('6000000')
+    expect(JSON.stringify(payBodies[0])).toContain('acct_notOpenRouter')
   })
 
   it('tolerant: face 5.80, Cyprus VAT invoice 6.90 → pays 6900000', async () => {
@@ -1165,8 +1176,7 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
   for (const [cents, merchant, label] of [
     [479, OPENROUTER_STRIPE_ACCOUNT, '4.79 (below -$1.00)'],
     [752, OPENROUTER_STRIPE_ACCOUNT, '7.52 (above +27% +$0.15)'],
-    [583, 'acct_notOpenRouter', '5.83 from a non-OpenRouter account'],
-    [580, 'acct_notOpenRouter', 'exactly 5.80 from a non-OpenRouter account'],
+    [752, 'acct_notOpenRouter', '7.52 from a non-OpenRouter account (above +27% +$0.15)'],
   ] as const) {
     it(`face 5.80, invoice ${label} → AMOUNT_MISMATCH, coupon back to issued, no pay`, async () => {
       const { env, hits } = makeStripeEnv({ cents, merchant })

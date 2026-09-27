@@ -116,13 +116,11 @@ const QUOTE_INVOICE_URL = 'https://agentapi.rozo.ai/quote-invoice'
 // here via the read-only resolver and paid through the Stripe branch of
 // pay-invoice (callStripePayInvoice), exactly like the UPI Stripe executor.
 
-// OpenRouter's Stripe connected account. Its Stripe Crypto invoices are the
-// only ones allowed the tolerant amount match below: OpenRouter's Stripe
-// checkout adds its own fee/rounding on top of the credit amount, so a
-// customer asking for "$5.80 of credits" gets an invoice that is a few cents
-// off the coupon face value.
+// OpenRouter's Stripe connected account. Since 2026-09-27 (founder decision)
+// coupons may pay a Stripe Crypto link from ANY merchant, with the same
+// tolerant amount window; the constant is kept as the reference merchant.
 export const OPENROUTER_STRIPE_ACCOUNT = 'acct_1Mxuu2DhhPj8i4PA'
-// Tolerance window for OpenRouter Stripe invoices, relative to the coupon face
+// Tolerance window for Stripe Crypto invoices, relative to the coupon face
 // value, in atomic USDC: the invoice may be up to $1.00 BELOW face (the
 // customer tops up slightly less than the coupon is worth; no partial refund)
 // or ABOVE face by up to 27% of face plus $0.15 rounding slack, capped at
@@ -146,8 +144,8 @@ const STRIPE_MIN_VALIDITY_MS = 5 * 60 * 1000
 const STRIPE_SESSION_ID_RE = /^cpis_[A-Za-z0-9_]+$/
 
 /**
- * Amount policy. Coinbase: exact match only (unchanged). Stripe Crypto: only
- * OpenRouter's Stripe account is payable at all (exact or not), and the invoice
+ * Amount policy. Coinbase: exact match only (unchanged). Stripe Crypto: any
+ * merchant (the payment stays locked to the quoted account), and the invoice
  * must fall within [face - $1.00, face + min(27% of face + $0.15, $3.00)].
  * The caller always pays the
  * INVOICE amount, never the face value.
@@ -160,10 +158,10 @@ export function couponAmountAccepted(
 ): boolean {
   if (invoiceAtomic <= 0n) return false
   if (provider === 'stripe_crypto') {
-    // Coupons are OpenRouter credit. A Stripe link from any other merchant is
-    // refused even at the exact face value, so a leaked code cannot be spent
-    // on an attacker-controlled Stripe checkout.
-    if (merchantAccount !== OPENROUTER_STRIPE_ACCOUNT) return false
+    // Any Stripe merchant is accepted (founder decision 2026-09-27, risk of a
+    // code being paid to a holder-controlled checkout accepted). The quoted
+    // merchant account is still required and pay-invoice is locked to it.
+    if (!merchantAccount) return false
   } else {
     return invoiceAtomic === faceAtomic
   }
