@@ -125,10 +125,21 @@ export const OPENROUTER_STRIPE_ACCOUNT = 'acct_1Mxuu2DhhPj8i4PA'
 // Tolerance window for OpenRouter Stripe invoices, relative to the coupon face
 // value, in atomic USDC: the invoice may be up to $1.00 BELOW face (the
 // customer tops up slightly less than the coupon is worth; no partial refund)
-// or up to $0.15 ABOVE face (we absorb the difference). Coinbase stays
+// or ABOVE face by up to 27% of face plus $0.15 rounding slack, capped at
+// $3.00 (we absorb the difference). OpenRouter's Stripe checkout adds VAT by
+// the buyer's country (19% in Cyprus/Germany, up to 27% in Hungary), so a
+// $5.80 coupon arrives as a $6.90 invoice from Cyprus. Coinbase stays
 // exact-match only.
 const STRIPE_TOLERANCE_BELOW_ATOMIC = 1_000_000n // $1.00
-const STRIPE_TOLERANCE_ABOVE_ATOMIC = 150_000n // $0.15
+const STRIPE_TOLERANCE_ABOVE_ROUNDING_ATOMIC = 150_000n // $0.15
+const STRIPE_TOLERANCE_ABOVE_VAT_PERCENT = 27n
+const STRIPE_TOLERANCE_ABOVE_CAP_ATOMIC = 3_000_000n // $3.00
+
+export function stripeToleranceAboveAtomic(faceAtomic: bigint): bigint {
+  const allowance =
+    (faceAtomic * STRIPE_TOLERANCE_ABOVE_VAT_PERCENT) / 100n + STRIPE_TOLERANCE_ABOVE_ROUNDING_ATOMIC
+  return allowance < STRIPE_TOLERANCE_ABOVE_CAP_ATOMIC ? allowance : STRIPE_TOLERANCE_ABOVE_CAP_ATOMIC
+}
 // A Stripe session must stay valid at least this long after quoting so the
 // pay-invoice call (a few seconds) cannot race its expiry.
 const STRIPE_MIN_VALIDITY_MS = 5 * 60 * 1000
@@ -137,7 +148,8 @@ const STRIPE_SESSION_ID_RE = /^cpis_[A-Za-z0-9_]+$/
 /**
  * Amount policy. Coinbase: exact match only (unchanged). Stripe Crypto: only
  * OpenRouter's Stripe account is payable at all (exact or not), and the invoice
- * must fall within [face - $1.00, face + $0.15]. The caller always pays the
+ * must fall within [face - $1.00, face + min(27% of face + $0.15, $3.00)].
+ * The caller always pays the
  * INVOICE amount, never the face value.
  */
 export function couponAmountAccepted(
@@ -158,7 +170,7 @@ export function couponAmountAccepted(
   if (invoiceAtomic === faceAtomic) return true
   return (
     invoiceAtomic >= faceAtomic - STRIPE_TOLERANCE_BELOW_ATOMIC &&
-    invoiceAtomic <= faceAtomic + STRIPE_TOLERANCE_ABOVE_ATOMIC
+    invoiceAtomic <= faceAtomic + stripeToleranceAboveAtomic(faceAtomic)
   )
 }
 
