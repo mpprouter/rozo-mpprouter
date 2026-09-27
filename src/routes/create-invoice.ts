@@ -17,6 +17,20 @@ import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { contractVariantIds } from '../mpp/contract-variant'
 import { verifyQuoteReceipt, type QuoteReceiptPayload } from './quote-receipt'
 import {
+  ALL_NATIVE_SOURCES,
+  STABLE_SOURCES,
+  NATIVE_SOURCE_DEFS,
+  TEST_MERCHANT_NAME,
+  isNativeSymbol,
+  isTestPaymentId,
+  nativeMaxUsd,
+  nativeSourceFor,
+  parseNativeSources,
+  supportedSources,
+  verifyTestPaymentId,
+  type NativeSymbol,
+} from './native-sources'
+import {
   attributionMetadata,
   buildOrderAttribution,
   type OrderAttribution,
@@ -67,14 +81,7 @@ const SETTLEMENT_RECEIVER = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
 // any tokenAddress the caller sends and warn them in the response.
 type SourceToken = 'USDC' | 'USDT'
 
-const SUPPORTED_SOURCE: Record<string, SourceToken[]> = {
-  '1':    ['USDC', 'USDT'],   // Ethereum
-  '56':   ['USDC', 'USDT'],   // BNB Smart Chain (BSC) — downstream sol/evm monitors live
-  '137':  ['USDC', 'USDT'],   // Polygon
-  '8453': ['USDC'],           // Base
-  '900':  ['USDC', 'USDT'],   // Solana — USDT payin supported (sol-pool-monitor)
-  '1500': ['USDC'],           // Stellar
-}
+const SUPPORTED_SOURCE: Record<string, readonly SourceToken[]> = STABLE_SOURCES
 
 const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
   '1':    {
@@ -105,7 +112,7 @@ const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
 
 export interface ResolvedSource {
   chainId: string
-  tokenSymbol: SourceToken | 'BTC'
+  tokenSymbol: SourceToken | 'BTC' | NativeSymbol
   // Empty string for chains without an ERC-20-style token address (e.g.
   // Lightning BTC, where the payment rail carries no contract address).
   tokenAddress: string
@@ -115,7 +122,7 @@ export interface ResolvedSource {
 export interface SourceError {
   code: 'INVALID_SOURCE' | 'UNSUPPORTED_SOURCE'
   message: string
-  supported?: Record<string, SourceToken[]>
+  supported?: Record<string, string[]>
 }
 
 /**
@@ -152,7 +159,35 @@ export function resolveClient(raw: unknown): string | null {
   return normalizeCheckoutClient(raw)
 }
 
-export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?: never } | { resolved?: never; error: SourceError } {
+/**
+ * Native orders carry a price lock shorter than the order itself
+ * (rozo-intents-api quoteExpiresAt). A reused order must surface it: after the
+ * lock ends the shown coin amount is only honoured at the arrival price within
+ * tolerance, so the caller has to know the quote is stale.
+ */
+export function nativeQuoteFields(row: any): Record<string, unknown> {
+  const quoteExpiresAt = typeof row?.quoteExpiresAt === 'string' ? row.quoteExpiresAt : null
+  if (!quoteExpiresAt) return {}
+  const expired = Date.parse(quoteExpiresAt) <= Date.now()
+  return {
+    quoteExpiresAt,
+    nativeAmount: row?.source?.amount ?? null,
+    ...(expired
+      ? {
+          quoteExpired: true,
+          quoteExpiredWarning:
+            'The coin price for this order was locked until quoteExpiresAt and has expired. ' +
+            'A payment of nativeAmount is still accepted, but it is valued at the price when it ' +
+            'arrives and may need manual review if the price moved. Pay with USDC/USDT for an exact amount.',
+        }
+      : {}),
+  }
+}
+
+export function resolveSource(
+  raw: unknown,
+  nativeAllowed: ReadonlySet<string> = new Set(),
+): { resolved: ResolvedSource; error?: never } | { resolved?: never; error: SourceError } {
   const warnings: string[] = []
 
   // No source provided → default Base USDC.
@@ -182,6 +217,7 @@ export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?:
 
   const chainId = String(src.chainId)
   const tokenSymbol = src.tokenSymbol.toUpperCase() as SourceToken | 'BTC'
+  const supported = supportedSources(SUPPORTED_SOURCE, nativeAllowed)
 
   // Lightning (BTC) source: no chain contract address, settled via exactOut so
   // the caller pays the BTC equivalent while the merchant receives full USDC on
@@ -192,11 +228,30 @@ export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?:
         error: {
           code: 'UNSUPPORTED_SOURCE',
           message: `tokenSymbol ${tokenSymbol} is not supported on chainId lightning — only BTC.`,
-          supported: SUPPORTED_SOURCE,
+          supported,
         },
       }
     }
     return { resolved: { chainId: 'lightning', tokenSymbol: 'BTC', tokenAddress: '', warnings } }
+  }
+
+  // Native coin (ETH/BNB/SOL): exactOut like Lightning, token address is the
+  // chain's native sentinel. Only coins open for this request are accepted.
+  if (isNativeSymbol(chainId, tokenSymbol)) {
+    const def = nativeSourceFor(chainId, tokenSymbol, nativeAllowed)
+    if (!def) {
+      return {
+        error: {
+          code: 'UNSUPPORTED_SOURCE',
+          message: `Native ${tokenSymbol} on chainId ${chainId} is not available for this checkout. See "supported" for valid (chainId, tokenSymbol) pairs.`,
+          supported,
+        },
+      }
+    }
+    if ('tokenAddress' in src && src.tokenAddress !== undefined && src.tokenAddress !== null && src.tokenAddress !== '') {
+      warnings.push('source.tokenAddress was ignored for a native coin source.')
+    }
+    return { resolved: { chainId, tokenSymbol: def.symbol, tokenAddress: def.tokenAddress, warnings } }
   }
 
   const allowedTokens = SUPPORTED_SOURCE[chainId]
@@ -205,7 +260,7 @@ export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?:
       error: {
         code: 'UNSUPPORTED_SOURCE',
         message: `chainId ${chainId} is not supported as a source. See "supported" for valid (chainId, tokenSymbol) pairs.`,
-        supported: SUPPORTED_SOURCE,
+        supported,
       },
     }
   }
@@ -214,7 +269,7 @@ export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?:
       error: {
         code: 'UNSUPPORTED_SOURCE',
         message: `tokenSymbol ${tokenSymbol} is not supported on chainId ${chainId}. See "supported" for valid (chainId, tokenSymbol) pairs.`,
-        supported: SUPPORTED_SOURCE,
+        supported,
       },
     }
   }
@@ -235,7 +290,7 @@ export function resolveSource(raw: unknown): { resolved: ResolvedSource; error?:
       error: {
         code: 'UNSUPPORTED_SOURCE',
         message: `no tokenAddress mapping for (${chainId}, ${tokenSymbol}).`,
-        supported: SUPPORTED_SOURCE,
+        supported,
       },
     }
   }
@@ -682,8 +737,25 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // the intent was forced to Base USDC — worse than rejecting it, because the
   // caller was charged on a chain they did not ask for with no error. Both
   // providers now share one source-resolution path and one error contract.
+  // Internal test invoice (rozotest_<cents>_<nonce>_<sig>): skips the
+  // Coinbase quote and opens every native coin, so native checkout can be
+  // exercised end to end with a few cents before a chain is public.
+  const testIdCandidate = 'payment_id' in normalized ? normalized.payment_id : null
+  let testInvoiceCents: number | null = null
+  if (isTestPaymentId(testIdCandidate)) {
+    testInvoiceCents = await verifyTestPaymentId(env.ROZO_TEST_LINK_SECRET, testIdCandidate as string)
+    if (testInvoiceCents === null) {
+      return errorResponse(400, {
+        code: 'INVALID_INPUT',
+        message: 'Invalid test payment id.',
+      })
+    }
+  }
+  const nativeAllowed: ReadonlySet<string> =
+    testInvoiceCents !== null ? ALL_NATIVE_SOURCES : parseNativeSources(env.NATIVE_SOURCES)
+
   const sourceRaw = (parsed as Record<string, unknown> | null)?.source
-  const sourceResult = resolveSource(sourceRaw)
+  const sourceResult = resolveSource(sourceRaw, nativeAllowed)
 
   // Caller provenance. Never fails the request — bad input is dropped, not rejected.
   const provenance: CallerProvenance = {}
@@ -717,9 +789,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       link_id_detected,
       // Surface supported (chainId, tokenSymbol) combos so agents self-correct.
       ...(sourceResult.error.supported ? { supported_sources: sourceResult.error.supported } : {}),
-    } as CreateInvoiceError & { supported_sources?: Record<string, SourceToken[]> })
+    } as CreateInvoiceError & { supported_sources?: Record<string, string[]> })
   }
   const source = sourceResult.resolved
+  const nativeSource = isNativeSymbol(source.chainId, source.tokenSymbol)
 
   // Echo of the invoice URL the CALLER supplied in THIS request, so a client
   // that keeps only our response can still link back to the merchant's own
@@ -774,6 +847,14 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // money movement done by the (disabled-by-default) Supabase pay-invoice
   // Stripe branch, driven later by the webhook. Coinbase is unaffected.
   if (provider_detected === 'stripe_crypto') {
+    if (nativeSource) {
+      return errorResponse(400, {
+        code: 'UNSUPPORTED_SOURCE',
+        message: 'Native coin payment is only available for Coinbase payment links.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
     const stripeUrl = (normalized as { url?: string }).url
     if (!stripeUrl) {
       // Should be unreachable: provider_detected requires a URL. Never echo it.
@@ -806,7 +887,13 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         )
       : null
 
-  if (receipt) {
+  if (testInvoiceCents !== null) {
+    quote = {
+      invoice: { amount: (testInvoiceCents / 100).toFixed(2) },
+      merchant: TEST_MERCHANT_NAME,
+      linkId: testIdCandidate,
+    }
+  } else if (receipt) {
     quote = {
       invoice: { amount: receipt.amount },
       merchant: receipt.merchant,
@@ -1007,6 +1094,14 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
+  if (nativeSource && Number(callerPays) > nativeMaxUsd(env.NATIVE_MAX_USD)) {
+    return errorResponse(400, {
+      code: 'UNSUPPORTED_SOURCE',
+      message: `Native coin payment is limited to $${nativeMaxUsd(env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`,
+      normalized_input: normalized,
+      link_id_detected,
+    })
+  }
   const originalStr = priced.original
   const discountStr = '0'
   const title = buildCheckoutTitle(merchantName, pricing)
@@ -1201,9 +1296,15 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       // support, so a mismatch on either side is reported, never rotated.
       const lightningInvolved =
         source.chainId === 'lightning' || rowSource.chainId === 'lightning'
+      // Native orders are exactOut with a price-locked quote: like Lightning
+      // they cannot be rotated to or from another source.
+      const nativeInvolved =
+        nativeSource || isNativeSymbol(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
       if (sourceDiffers(rowSource, source) && existing?.id) {
         if (lightningInvolved) {
           rotationFailure = 'lightning_not_rotatable'
+        } else if (nativeInvolved) {
+          rotationFailure = 'native_not_rotatable'
         } else {
           const rotated = await rotateExistingSource(env, String(existing.id), source)
           if (rotated.ok) {
@@ -1291,6 +1392,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           row?.paymentLink ?? row?.url ?? row?.payment_link ?? null,
         rozoPaymentId: row?.id ?? existing?.id ?? null,
         expiresAt: row?.expiresAt ?? existingExpiresAt,
+        ...nativeQuoteFields(row),
         // The source the order actually pays from now — rotated to the
         // requested one when that worked, otherwise the pre-existing one.
         source: {
@@ -1316,7 +1418,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // Non-Lightning (existing EVM USDC/USDT) source → exactIn: the caller pays the
   // full invoice amount on source, destination carries no amount.
   const isLightning = source.chainId === 'lightning'
-  const intentsBody = isLightning
+  // Native coins (ETH/BNB/SOL) settle exactOut like Lightning: the merchant
+  // receives exactly callerPays in Base USDC and rozo-intents-api quotes the
+  // coin amount (locked price + buffer).
+  const intentsBody = isLightning || nativeSource
     ? {
         appId: OPENROUTER_APP_ID,
         orderId: createOrderId ?? `mpprouter-${Date.now()}`,
@@ -1326,10 +1431,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           currency: 'USD',
           ...merchantDisplay,
         },
-        source: {
-          chainId: 'lightning',
-          tokenSymbol: 'BTC',
-        },
+        source: isLightning
+          ? { chainId: 'lightning', tokenSymbol: 'BTC' }
+          : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
         destination: {
           chainId: SETTLEMENT_CHAIN_ID,
           receiverAddress: SETTLEMENT_RECEIVER,
@@ -1475,6 +1579,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
               winner?.paymentLink ?? winner?.url ?? winner?.payment_link ?? null,
             rozoPaymentId: winner?.id ?? null,
             expiresAt: winnerExpiresAt,
+            ...nativeQuoteFields(winner),
             source: {
               chainId: winnerSource.chainId,
               tokenSymbol: winnerSource.tokenSymbol,
@@ -1585,6 +1690,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     paymentLink,
     rozoPaymentId,
     expiresAt,
+    ...(nativeSource ? nativeQuoteFields(intentsJson) : {}),
+    ...(testInvoiceCents !== null ? { testInvoice: true } : {}),
     source: {
       chainId: source.chainId,
       tokenSymbol: source.tokenSymbol,
