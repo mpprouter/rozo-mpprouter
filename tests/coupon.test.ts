@@ -11,7 +11,7 @@ import type { Env } from '../src/index'
 import { CIRCUIT_THRESHOLD, WARN_THRESHOLD } from '../src/routes/coupon-security'
 import { acquireCoinbaseExecGate, readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
 import { handleCoinbaseExecGateClear } from '../src/routes/coinbase-exec-gate-admin'
-import { OPENROUTER_STRIPE_ACCOUNT, couponAmountAccepted } from '../src/routes/coupon'
+import { OPENROUTER_STRIPE_ACCOUNT, couponAmountAccepted, stripeToleranceAboveAtomic } from '../src/routes/coupon'
 import { claimInvoiceKey, readInvoiceClaim } from '../src/routes/invoice-claim'
 import { readDailySpentAtomic } from '../src/routes/stripe-fulfillment'
 
@@ -1057,13 +1057,36 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     expect(couponAmountAccepted('stripe_crypto', 4_800_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
     expect(couponAmountAccepted('stripe_crypto', 5_950_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
     expect(couponAmountAccepted('stripe_crypto', 4_790_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
-    expect(couponAmountAccepted('stripe_crypto', 5_960_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
+    // EU VAT: Cyprus 19% on 5.80 = 6.90 (the 2026-09-26 customer), Hungary 27% = 7.37.
+    expect(couponAmountAccepted('stripe_crypto', 6_900_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
+    expect(couponAmountAccepted('stripe_crypto', 7_370_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
+    // Above: 5.80 + 27% (1.566) + 0.15 = 7.516.
+    expect(couponAmountAccepted('stripe_crypto', 7_516_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
+    expect(couponAmountAccepted('stripe_crypto', 7_517_000n, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
     expect(couponAmountAccepted('stripe_crypto', 5_830_000n, face, 'acct_other')).toBe(false)
     // Exact face value does NOT bypass the merchant check for Stripe.
     expect(couponAmountAccepted('stripe_crypto', face, face, 'acct_other')).toBe(false)
     expect(couponAmountAccepted('stripe_crypto', face, face, null)).toBe(false)
     expect(couponAmountAccepted('stripe_crypto', face, face, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
     expect(couponAmountAccepted('stripe_crypto', 0n, 500_000n, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
+  })
+
+  it('above-face allowance is 27% of face + $0.15, capped at $3.00', () => {
+    expect(stripeToleranceAboveAtomic(5_800_000n)).toBe(1_716_000n)
+    expect(stripeToleranceAboveAtomic(10_500_000n)).toBe(2_985_000n)
+    expect(stripeToleranceAboveAtomic(20_000_000n)).toBe(3_000_000n)
+    expect(stripeToleranceAboveAtomic(1_050_000_000n)).toBe(3_000_000n)
+    const big = 20_000_000n
+    expect(couponAmountAccepted('stripe_crypto', 23_000_000n, big, OPENROUTER_STRIPE_ACCOUNT)).toBe(true)
+    expect(couponAmountAccepted('stripe_crypto', 23_010_000n, big, OPENROUTER_STRIPE_ACCOUNT)).toBe(false)
+  })
+
+  it('tolerant: face 5.80, Cyprus VAT invoice 6.90 → pays 6900000', async () => {
+    const { env, payBodies } = makeStripeEnv({ cents: 690 })
+    const code = await issueCoupon(env, '5.80')
+    const body: any = await (await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)).json()
+    expect(body.status).toBe('redeemed')
+    expect(payBodies[0].expected_amount_atomic).toBe('6900000')
   })
 
   it('exact match: pays the Stripe branch with locked merchant + invoice amount, stores no plaintext URL', async () => {
@@ -1141,7 +1164,7 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
 
   for (const [cents, merchant, label] of [
     [479, OPENROUTER_STRIPE_ACCOUNT, '4.79 (below -$1.00)'],
-    [596, OPENROUTER_STRIPE_ACCOUNT, '5.96 (above +$0.15)'],
+    [752, OPENROUTER_STRIPE_ACCOUNT, '7.52 (above +27% +$0.15)'],
     [583, 'acct_notOpenRouter', '5.83 from a non-OpenRouter account'],
     [580, 'acct_notOpenRouter', 'exactly 5.80 from a non-OpenRouter account'],
   ] as const) {
