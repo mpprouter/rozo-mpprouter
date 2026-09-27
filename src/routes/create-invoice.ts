@@ -584,10 +584,14 @@ function readMetadataObject(row: any): Record<string, unknown> | null {
  */
 function pendingPricingMatches(row: any, pricing: CheckoutPricing): boolean {
   const source = readRowSource(row)
-  const rowAmountRaw =
-    source.chainId === 'lightning'
-      ? row?.destination?.amount ?? row?.destination_amount
-      : row?.source?.amount ?? row?.source_amount
+  // exactOut rows (Lightning, native coins) carry the USD price on the
+  // destination; their source amount is in BTC / coin units.
+  const exactOutRow =
+    source.chainId === 'lightning' ||
+    isNativeSymbol(String(source.chainId ?? ''), String(source.tokenSymbol ?? ''))
+  const rowAmountRaw = exactOutRow
+    ? row?.destination?.amount ?? row?.destination_amount
+    : row?.source?.amount ?? row?.source_amount
 
   let amountMatches: boolean | null = null
   if (typeof rowAmountRaw === 'string') {

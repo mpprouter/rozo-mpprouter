@@ -220,6 +220,38 @@ describe('test invoice with the production fee', () => {
   })
 })
 
+describe('reusing an unpaid native order', () => {
+  it('matches pricing on the USD destination, not the coin amount', async () => {
+    const env = makeEnv({ NATIVE_SOURCES: 'ETH@1' })
+    vi.restoreAllMocks()
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('/quote-invoice')) {
+        return new Response(JSON.stringify({ invoice: { amount: '10.5' }, merchant: 'OpenRouter, Inc', linkId: 'paymentSession_native_test' }), { status: 200 })
+      }
+      if (u.includes('/payments/order/')) {
+        return new Response(JSON.stringify({
+          id: 'rozo-pay-existing',
+          status: 'payment_unpaid',
+          expiresAt: '2999-01-01T12:00:00.000Z',
+          quoteExpiresAt: '2999-01-01T00:00:00.000Z',
+          source: { chainId: '1', tokenSymbol: 'ETH', amount: '0.00388' },
+          destination: { amount: '10.5' },
+          metadata: { original: '10.5', serviceFee: '0', callerPays: '10.5', feeBps: 0, pricingVersion: 'checkout-web-fee-v3' },
+        }), { status: 200 })
+      }
+      if (u.includes('/payment-api')) return new Response(JSON.stringify({ status: 'payment_unpaid' }), { status: 200 })
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch)
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: 'paymentSession_native_test', source: { chainId: '1', tokenSymbol: 'ETH' },
+    }, env)
+    expect(json.error?.code).not.toBe('LEGACY_PRICING_ORDER_PENDING')
+    expect(status).toBe(200)
+    expect(json).toMatchObject({ reused: true, rozoPaymentId: 'rozo-pay-existing', nativeAmount: '0.00388' })
+  })
+})
+
 describe('nativeQuoteFields', () => {
   it('flags an expired price lock on a reused order', () => {
     const past = nativeQuoteFields({ quoteExpiresAt: '2000-01-01T00:00:00.000Z', source: { amount: '0.1' } })
