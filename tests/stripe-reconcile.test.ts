@@ -667,6 +667,21 @@ describe('stuck-order Intercom tickets (S3, Stripe)', () => {
     expect(tickets).toHaveLength(0)
   })
 
+  it('in flight and Stripe read fails → no ticket (unpaid is not proven)', async () => {
+    const env = makeEnv(TICKET_ENV)
+    await seedStuck(env, 'provider_submitted', 20)
+    const { tickets } = mockWithIntercom('processing')
+    const inner = (globalThis.fetch as any).getMockImplementation()
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('stripe.com')) return new Response('down', { status: 500 })
+      return inner(input, init)
+    })
+    await sweepInFlightStripeRecords(env, NOW)
+    expect((await loadRec(env)).events.some((e: any) => e.kind === 'stripe_reconcile_error')).toBe(true)
+    expect(tickets).toHaveLength(0)
+  })
+
   it('a record the provider confirms paid in this sweep is not ticketed', async () => {
     const env = makeEnv(TICKET_ENV)
     await seedStuck(env, 'provider_submitted', 20)

@@ -1128,12 +1128,14 @@ function isStripeStuck(rec: StripeFulfillmentRecord, now: number, candidateOnly 
   return true
 }
 
-// Latest reconciler outcome (a successful Stripe read that left the record in
-// flight, or a failed read). Throttle claims alone do not count.
+// Latest SUCCESSFUL Stripe read that left the record in flight (i.e. Stripe
+// itself says not paid yet). Failed reads and throttle claims do not count:
+// an unreadable provider is not evidence of "unpaid". Records Stripe keeps
+// refusing escalate to manual_review, which is ticketed on its own.
 function lastReconcileAtMs(rec: StripeFulfillmentRecord): number | null {
   let max: number | null = null
   for (const e of rec.events ?? []) {
-    if (e.kind !== 'stripe_reconcile_checked' && e.kind !== 'stripe_reconcile_error') continue
+    if (e.kind !== 'stripe_reconcile_checked') continue
     const t = Date.parse(e.at)
     if (Number.isFinite(t) && (max === null || t > max)) max = t
   }

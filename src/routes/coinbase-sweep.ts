@@ -167,8 +167,8 @@ function payinAtIso(rec: FulfillmentRecord, rozo: any | null): string | null {
 
 // The KV one-shot flag (alertedStuck / alertedManualReview) is not atomic:
 // two overlapping sweeps could both pass it. The ticket is therefore claimed
-// once more in the Durable Object (linearizable CAS) under a per-order,
-// per-kind key before the call. Any DO failure skips the ticket: a missing
+// once more in the Durable Object (linearizable CAS) under a per-order key
+// before the call. Any DO failure skips the ticket: a missing
 // ticket is covered by the DingTalk alert, a duplicate is not undoable.
 async function claimTicketOnce(env: Env, key: string, nowIso: string): Promise<boolean> {
   try {
@@ -183,8 +183,10 @@ async function claimTicketOnce(env: Env, key: string, nowIso: string): Promise<b
   }
 }
 
-export function coinbaseTicketClaimKey(kind: 'stuck' | 'manual_review', plId: string): string {
-  return `stuck-ticket:coinbase:${kind}:${plId}`
+// One key per order, not per alert kind: an order that is first "stuck" and
+// later lands in manual_review still gets a single ticket.
+export function coinbaseTicketClaimKey(plId: string): string {
+  return `stuck-ticket:coinbase:${plId}`
 }
 
 // Best effort, never throws (openStuckOrderTicket's contract). The caller has
@@ -196,13 +198,12 @@ async function openTicket(
   rozo: any | null,
   status: string,
   reason: string,
-  kind: 'stuck' | 'manual_review',
 ): Promise<void> {
   if (!env.INTERCOM_TICKET_TOKEN) {
     console.warn(`[intercom-ticket] coinbase SKIPPED (INTERCOM_TICKET_TOKEN not set)`)
     return
   }
-  if (!(await claimTicketOnce(env, coinbaseTicketClaimKey(kind, plId), new Date().toISOString()))) return
+  if (!(await claimTicketOnce(env, coinbaseTicketClaimKey(plId), new Date().toISOString()))) return
   const chain = rozo?.source?.chainId
   await openStuckOrderTicket(env, {
     orderId: rec.rozoPaymentId || plId,
@@ -272,7 +273,6 @@ async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecor
         null,
         `manual_review (was ${from}); Coinbase ${safe?.status ?? 'unknown'}`,
         'Pay request sent but Coinbase did not capture the invoice. Never retried automatically; re-pay or refund by hand.',
-        'manual_review',
       )
     }
     return
@@ -313,7 +313,6 @@ async function checkStuck(env: Env, plId: string, rec: FulfillmentRecord, now: n
     rozo,
     `${rec.status}; Rozo ${rozo.status}; Coinbase ${safe?.status ?? 'unknown'}`,
     'Rozo payout completed but the Coinbase invoice is unpaid (payout webhook likely never delivered). Resend the payout webhook or pay by hand.',
-    'stuck',
   )
 }
 

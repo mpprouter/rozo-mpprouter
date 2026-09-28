@@ -594,6 +594,37 @@ describe('stuck-order Intercom tickets (S3)', () => {
     expect(calls.intercom).toHaveLength(1)
   })
 
+  it('stuck then manual_review on the same order → still one ticket', async () => {
+    const { calls, up } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.intercom).toHaveLength(1)
+    up.coinbase = { paymentSessionId: PL, status: 'PAYMENT_SESSION_STATUS_CAPTURE_PENDING', expiresAt: new Date(Date.now() + 86400_000).toISOString() }
+    seedRec(kv, { ...readRec(kv), status: 'capture_pending', payingAt: ago(31) })
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('manual_review')
+    expect(calls.dingtalk).toHaveLength(2)
+    expect(calls.intercom).toHaveLength(1)
+  })
+
+  it('free text in an Intercom error code is never logged', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    stubFetch({ rozo: stuckRozo })
+    const inner = (globalThis.fetch as any).getMockImplementation()
+    vi.stubGlobal('fetch', vi.fn(async (input: any, init?: any) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (url.includes('api.intercom.io/tickets')) return Response.json({ errors: [{ code: 'Bearer leaked-value here' }] }, { status: 400 })
+      return inner(input, init)
+    }))
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    const logged = warn.mock.calls.flat().join(' ')
+    expect(logged).toContain('HTTP 400')
+    expect(logged).not.toContain('leaked-value')
+  })
+
   it('DO claim failure → ticket skipped, alert still sent', async () => {
     const { calls } = stubFetch({ rozo: stuckRozo })
     const { env, kv } = makeEnv({ ...TICKET_ENV, ATOMIC_STORE: { idFromName: () => ({}), get: () => ({ fetch: async () => new Response('boom', { status: 500 }) }) } })

@@ -91,9 +91,10 @@ export function buildTicketBody(env: Env, t: StuckOrderTicket): Record<string, u
 function errorCode(body: unknown): string | null {
   const errs = (body as { errors?: Array<{ code?: unknown }> } | null)?.errors
   const code = Array.isArray(errs) ? errs[0]?.code : null
-  // Machine codes only ("unauthorized", "parameter_invalid"); cap the length so
-  // an unexpected body can never smuggle free text into the log.
-  return typeof code === 'string' ? code.slice(0, 64) : null
+  // Machine codes only ("unauthorized", "parameter_invalid"). Anything that
+  // is not a short snake_case token is dropped, so an unexpected body can
+  // never put free text into the log.
+  return typeof code === 'string' && /^[a-z0-9_]{1,64}$/.test(code) ? code : null
 }
 
 /** Open one stuck-order ticket. Never throws; never retries. */
