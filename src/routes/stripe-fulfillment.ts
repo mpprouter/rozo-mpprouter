@@ -1088,12 +1088,16 @@ export async function sweepInFlightStripeRecords(
 // Rule (growth design v3 §4.1 S3): the customer's payment was received more
 // than 15 minutes ago and the merchant invoice is still not paid → stuck.
 // "Received" is the first payin/payout webhook event on the record. Only
-// orders whose payin landed within the last 24 h are watched, so historical
-// records never flood Intercom on deploy. One ticket per order, claimed under
-// CAS before the call, never retried; at most STUCK_TICKETS_PER_RUN per sweep.
+// orders whose payin landed within the last 2 h are watched, so historical
+// records never flood Intercom on deploy. An in-flight record is ticketed only
+// right after the reconciler actually asked Stripe about it (a reconcile event
+// within the last 5 min, and the record is still not paid), never on a stale
+// local status. One ticket per order, claimed under CAS before the call, never
+// retried; at most STUCK_TICKETS_PER_RUN per sweep.
 
 export const STRIPE_STUCK_AFTER_MS = 15 * 60 * 1000
-const STRIPE_STUCK_WATCH_MS = 24 * 60 * 60 * 1000
+const STRIPE_STUCK_WATCH_MS = 2 * 60 * 60 * 1000
+const PROVIDER_CHECK_FRESH_MS = 5 * 60 * 1000
 export const STUCK_TICKETS_PER_RUN = 5
 const PAYIN_EVENT_KINDS = new Set(['payment_payin_completed', 'payment_payout_completed'])
 
@@ -1107,13 +1111,33 @@ function stripePayinAtMs(rec: StripeFulfillmentRecord): number | null {
   return min
 }
 
-function isStripeStuck(rec: StripeFulfillmentRecord, now: number): boolean {
+// `candidateOnly` skips the provider-freshness test: the sweep picks
+// candidates from its pre-reconcile snapshot, and the live re-read inside the
+// claim applies the full rule.
+function isStripeStuck(rec: StripeFulfillmentRecord, now: number, candidateOnly = false): boolean {
   if (rec.stuckTicketAt || rec.manualResolution) return false
   if (rec.status === 'paid' || rec.status === 'rozo_payment_created') return false
   const payin = stripePayinAtMs(rec)
   if (payin === null) return false
   const age = now - payin
-  return age > STRIPE_STUCK_AFTER_MS && age <= STRIPE_STUCK_WATCH_MS
+  if (age <= STRIPE_STUCK_AFTER_MS || age > STRIPE_STUCK_WATCH_MS) return false
+  if (RECONCILE_IN_FLIGHT.has(rec.status) && !candidateOnly) {
+    const checked = lastReconcileAtMs(rec)
+    return checked !== null && now - checked <= PROVIDER_CHECK_FRESH_MS
+  }
+  return true
+}
+
+// Latest reconciler outcome (a successful Stripe read that left the record in
+// flight, or a failed read). Throttle claims alone do not count.
+function lastReconcileAtMs(rec: StripeFulfillmentRecord): number | null {
+  let max: number | null = null
+  for (const e of rec.events ?? []) {
+    if (e.kind !== 'stripe_reconcile_checked' && e.kind !== 'stripe_reconcile_error') continue
+    const t = Date.parse(e.at)
+    if (Number.isFinite(t) && (max === null || t > max)) max = t
+  }
+  return max
 }
 
 function fmtAtomicUsd(atomic: string | null): string | null {
@@ -1159,7 +1183,7 @@ async function sweepStripeStuckTickets(env: Env, values: string[], now: Date): P
   let opened = 0
   for (const rec of values.map(parseRecord)) {
     if (opened >= STUCK_TICKETS_PER_RUN) break
-    if (!rec || !isStripeStuck(rec, now.getTime())) continue
+    if (!rec || !isStripeStuck(rec, now.getTime(), true)) continue
     try {
       if (await maybeOpenStripeStuckTicket(env, rec.invoiceKey, now)) opened++
     } catch {

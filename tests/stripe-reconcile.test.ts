@@ -619,7 +619,7 @@ describe('stuck-order Intercom tickets (S3, Stripe)', () => {
     await seed(env)
     await forceStatus(env, status, {
       events: [{ kind: 'payment_payin_completed', at: minsBefore(payinMinsAgo), event_id: 'e1' }],
-      lastProviderCheckAt: NOW.toISOString(),
+      lastProviderCheckAt: null,
       ...patch,
     })
   }
@@ -640,8 +640,8 @@ describe('stuck-order Intercom tickets (S3, Stripe)', () => {
     expect((await loadRec(env)).stuckTicketAt).toBe(NOW.toISOString())
   })
 
-  it('under 15 min, paid, or payin older than 24 h → no ticket', async () => {
-    for (const [status, mins] of [['provider_submitted', 10], ['paid', 30], ['manual_review', 60 * 25]] as const) {
+  it('under 15 min, paid, or payin older than 2 h → no ticket', async () => {
+    for (const [status, mins] of [['provider_submitted', 10], ['paid', 30], ['manual_review', 60 * 3]] as const) {
       const env = makeEnv(TICKET_ENV)
       await seedStuck(env, status, mins)
       const { tickets } = mockWithIntercom('processing')
@@ -651,9 +651,25 @@ describe('stuck-order Intercom tickets (S3, Stripe)', () => {
     }
   })
 
+  it('in flight but not freshly checked against Stripe (throttled) → no ticket on a stale local status', async () => {
+    const env = makeEnv(TICKET_ENV)
+    // Checked just now by someone else (throttles this sweep's reconcile), but
+    // the only reconcile outcome on record is 30 minutes old.
+    await seedStuck(env, 'provider_submitted', 40, {
+      lastProviderCheckAt: NOW.toISOString(),
+      events: [
+        { kind: 'payment_payin_completed', at: minsBefore(40), event_id: 'e1' },
+        { kind: 'stripe_reconcile_checked', at: minsBefore(30), detail: { state: 'processing' } },
+      ],
+    })
+    const { tickets } = mockWithIntercom('processing')
+    await sweepInFlightStripeRecords(env, NOW)
+    expect(tickets).toHaveLength(0)
+  })
+
   it('a record the provider confirms paid in this sweep is not ticketed', async () => {
     const env = makeEnv(TICKET_ENV)
-    await seedStuck(env, 'provider_submitted', 20, { lastProviderCheckAt: null })
+    await seedStuck(env, 'provider_submitted', 20)
     const { tickets } = mockWithIntercom('fulfillment_complete')
     await sweepInFlightStripeRecords(env, NOW)
     expect((await loadRec(env)).status).toBe('paid')

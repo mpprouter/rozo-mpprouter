@@ -581,6 +581,28 @@ describe('stuck-order Intercom tickets (S3)', () => {
     expect(calls.intercom[0].body.ticket_attributes._default_description_).toContain('manual_review')
   })
 
+  it('DO claim dedupes even if the KV one-shot flag is lost (overlapping sweeps)', async () => {
+    const { calls } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    const seedStuck = () => seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    seedStuck()
+    await sweepCoinbaseFulfillments(env)
+    // Simulate a racing sweep that read the record before alertedStuck landed.
+    seedStuck()
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.dingtalk).toHaveLength(2) // existing alert behaviour unchanged
+    expect(calls.intercom).toHaveLength(1)
+  })
+
+  it('DO claim failure → ticket skipped, alert still sent', async () => {
+    const { calls } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv({ ...TICKET_ENV, ATOMIC_STORE: { idFromName: () => ({}), get: () => ({ fetch: async () => new Response('boom', { status: 500 }) }) } })
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.intercom).toHaveLength(0)
+  })
+
   it('not stuck yet (payout < 10 min ago) → no alert, no ticket', async () => {
     const { calls } = stubFetch({ rozo: { ...stuckRozo, destination: { confirmedAt: ago(3) } } })
     const { env, kv } = makeEnv(TICKET_ENV)

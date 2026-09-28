@@ -24,6 +24,7 @@ import type { Env } from '../index'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { redactForAlert } from '../utils/alert-redaction'
 import { openStuckOrderTicket } from '../utils/intercom-ticket'
+import { casUpdate } from './stripe-atomic'
 import {
   type FulfillmentRecord,
   fetchCoinbasePayment,
@@ -164,8 +165,30 @@ function payinAtIso(rec: FulfillmentRecord, rozo: any | null): string | null {
   return first !== null ? new Date(first).toISOString() : null
 }
 
+// The KV one-shot flag (alertedStuck / alertedManualReview) is not atomic:
+// two overlapping sweeps could both pass it. The ticket is therefore claimed
+// once more in the Durable Object (linearizable CAS) under a per-order,
+// per-kind key before the call. Any DO failure skips the ticket: a missing
+// ticket is covered by the DingTalk alert, a duplicate is not undoable.
+async function claimTicketOnce(env: Env, key: string, nowIso: string): Promise<boolean> {
+  try {
+    return await casUpdate<boolean>(env, key, (cur) =>
+      cur ? { op: 'noop', result: false } : { op: 'set', value: nowIso, result: true },
+    )
+  } catch (err) {
+    console.warn(
+      `[coinbase-sweep] ticket claim failed, ticket skipped: ${err instanceof Error ? err.name : 'error'}`,
+    )
+    return false
+  }
+}
+
+export function coinbaseTicketClaimKey(kind: 'stuck' | 'manual_review', plId: string): string {
+  return `stuck-ticket:coinbase:${kind}:${plId}`
+}
+
 // Best effort, never throws (openStuckOrderTicket's contract). The caller has
-// already persisted its one-shot flag, so this runs at most once per record.
+// already persisted its one-shot flag; the DO claim makes it at most once.
 async function openTicket(
   env: Env,
   plId: string,
@@ -173,7 +196,13 @@ async function openTicket(
   rozo: any | null,
   status: string,
   reason: string,
+  kind: 'stuck' | 'manual_review',
 ): Promise<void> {
+  if (!env.INTERCOM_TICKET_TOKEN) {
+    console.warn(`[intercom-ticket] coinbase SKIPPED (INTERCOM_TICKET_TOKEN not set)`)
+    return
+  }
+  if (!(await claimTicketOnce(env, coinbaseTicketClaimKey(kind, plId), new Date().toISOString()))) return
   const chain = rozo?.source?.chainId
   await openStuckOrderTicket(env, {
     orderId: rec.rozoPaymentId || plId,
@@ -243,6 +272,7 @@ async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecor
         null,
         `manual_review (was ${from}); Coinbase ${safe?.status ?? 'unknown'}`,
         'Pay request sent but Coinbase did not capture the invoice. Never retried automatically; re-pay or refund by hand.',
+        'manual_review',
       )
     }
     return
@@ -283,6 +313,7 @@ async function checkStuck(env: Env, plId: string, rec: FulfillmentRecord, now: n
     rozo,
     `${rec.status}; Rozo ${rozo.status}; Coinbase ${safe?.status ?? 'unknown'}`,
     'Rozo payout completed but the Coinbase invoice is unpaid (payout webhook likely never delivered). Resend the payout webhook or pay by hand.',
+    'stuck',
   )
 }
 
