@@ -406,6 +406,14 @@ export interface Env {
   // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
   DINGTALK_ACCESS_TOKEN?: string
 
+  // Stuck-order Intercom tickets (utils/intercom-ticket.ts). The token is a
+  // private-app token with only "Write tickets"; set via
+  // `wrangler secret put INTERCOM_TICKET_TOKEN`. Unset → tickets are skipped,
+  // DingTalk alerts are unaffected. Type and contact ids are plain [vars].
+  INTERCOM_TICKET_TOKEN?: string
+  INTERCOM_TICKET_TYPE_ID?: string
+  INTERCOM_TICKET_CONTACT_ID?: string
+
   // Stripe Crypto fulfillment: URL of the pay-invoice edge function that owns
   // the (fail-closed, disabled-by-default) Stripe Permit signing branch.
   // Defaults to the same agentapi/pay-invoice endpoint the Coinbase path uses;

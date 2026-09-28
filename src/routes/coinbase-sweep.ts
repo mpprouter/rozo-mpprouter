@@ -14,12 +14,17 @@
 //      payment_payout_completed while the Coinbase link is unsettled and
 //      unexpired for > 10 min → one "stuck" alert (the payout webhook was
 //      probably never delivered). No payment.
+//   Both one-shot "NOT delivered" alerts (manual_review, stuck) also open one
+//   Intercom ticket under the same flag (utils/intercom-ticket.ts). Best
+//   effort: no retry, never affects the alert.
 //   3. paid and not yet reported as delivered, Coinbase settled → report to
 //      Rozo. Only HTTP 200 marks it reported; one alert after 5 failures.
 
 import type { Env } from '../index'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { redactForAlert } from '../utils/alert-redaction'
+import { openStuckOrderTicket, ticketsConfigured } from '../utils/intercom-ticket'
+import { casUpdate } from './stripe-atomic'
 import {
   type FulfillmentRecord,
   fetchCoinbasePayment,
@@ -153,6 +158,65 @@ function header(rec: FulfillmentRecord, plId: string): string {
   return `Invoice: ${plId} (${fmtUsdc(rec.invoiceAmountAtomic)} USDC), Rozo payment ${shortId(rec.rozoPaymentId)}`
 }
 
+function payinAtIso(rec: FulfillmentRecord, rozo: any | null): string | null {
+  const confirmed = rozo?.source?.confirmedAt
+  if (typeof confirmed === 'string' && ms(confirmed) !== null) return confirmed
+  const first = firstEventMs(rec)
+  return first !== null ? new Date(first).toISOString() : null
+}
+
+// The KV one-shot flag (alertedStuck / alertedManualReview) is not atomic:
+// two overlapping sweeps could both pass it. The ticket is therefore claimed
+// once more in the Durable Object (linearizable CAS) under a per-order key
+// before the call. Any DO failure skips the ticket: a missing
+// ticket is covered by the DingTalk alert, a duplicate is not undoable.
+async function claimTicketOnce(env: Env, key: string, nowIso: string): Promise<boolean> {
+  try {
+    return await casUpdate<boolean>(env, key, (cur) =>
+      cur ? { op: 'noop', result: false } : { op: 'set', value: nowIso, result: true },
+    )
+  } catch (err) {
+    console.warn(
+      `[coinbase-sweep] ticket claim failed, ticket skipped: ${err instanceof Error ? err.name : 'error'}`,
+    )
+    return false
+  }
+}
+
+// One key per order, not per alert kind: an order that is first "stuck" and
+// later lands in manual_review still gets a single ticket.
+export function coinbaseTicketClaimKey(plId: string): string {
+  return `stuck-ticket:coinbase:${plId}`
+}
+
+// Best effort, never throws (openStuckOrderTicket's contract). The caller has
+// already persisted its one-shot flag; the DO claim makes it at most once.
+async function openTicket(
+  env: Env,
+  plId: string,
+  rec: FulfillmentRecord,
+  rozo: any | null,
+  status: string,
+  reason: string,
+): Promise<void> {
+  if (!ticketsConfigured(env)) {
+    console.warn(`[intercom-ticket] coinbase SKIPPED (Intercom ticket settings incomplete)`)
+    return
+  }
+  if (!(await claimTicketOnce(env, coinbaseTicketClaimKey(plId), new Date().toISOString()))) return
+  const chain = rozo?.source?.chainId
+  await openStuckOrderTicket(env, {
+    orderId: rec.rozoPaymentId || plId,
+    providerRef: plId,
+    provider: 'coinbase',
+    status,
+    reason,
+    paymentReceivedAt: payinAtIso(rec, rozo),
+    amountUsd: rec.invoiceAmountAtomic ? fmtUsdc(rec.invoiceAmountAtomic) : null,
+    chain: chain !== undefined && chain !== null && chain !== '' ? String(chain) : null,
+  })
+}
+
 async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
   const nowIso = new Date(now).toISOString()
   const raw = await fetchCoinbasePayment(plId)
@@ -193,7 +257,7 @@ async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecor
     rec.events.push({ kind: 'sweep_manual_review', at: nowIso, detail: { from, reason, coinbase_status: safe?.status ?? null } })
     const alert = !rec.alertedManualReview
     rec.alertedManualReview = true
-    await saveRecordGuarded(env, plId, rec)
+    const saved = await saveRecordGuarded(env, plId, rec)
     if (alert) {
       await sendSweepAlert(env, [
         '[MPP Router] 🚨 Invoice NOT delivered: pay request sent but Coinbase did not capture',
@@ -202,6 +266,17 @@ async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecor
         `Reason: ${reason}`,
         'The pay request was already sent, so this is NEVER retried automatically. Decide re-pay or refund by hand (runbook: invoice-fulfillment techdoc §manual re-pay).',
       ])
+      // A concurrent webhook may have settled it meanwhile (the guarded save
+      // keeps the higher status); never ticket a paid order.
+      if (saved.status !== 'manual_review') return
+      await openTicket(
+        env,
+        plId,
+        rec,
+        null,
+        `manual_review (was ${from}); Coinbase ${safe?.status ?? 'unknown'}`,
+        'Pay request sent but Coinbase did not capture the invoice. Never retried automatically; re-pay or refund by hand.',
+      )
     }
     return
   }
@@ -227,13 +302,24 @@ async function checkStuck(env: Env, plId: string, rec: FulfillmentRecord, now: n
   }
   rec.alertedStuck = true
   rec.events.push({ kind: 'sweep_stuck_alert', at: nowIso, detail: { record_status: rec.status, coinbase_status: safe?.status ?? null } })
-  await saveRecordGuarded(env, plId, rec)
+  const saved = await saveRecordGuarded(env, plId, rec)
   await sendSweepAlert(env, [
     '[MPP Router] 🚨 Invoice NOT delivered: Rozo payout completed but the Coinbase invoice is unpaid',
     header(rec, plId),
     `Router state: ${rec.status}; Coinbase: ${safe?.status ?? 'unknown'}`,
     'The payout webhook was likely never delivered. No automatic payment is made; resend the payout webhook or pay by hand.',
   ])
+  // Only the pre-pay states are "stuck"; if a concurrent webhook moved the
+  // record on (paying / paid / manual_review), no ticket from this path.
+  if (saved.status !== 'payin_seen' && saved.status !== 'failed_insufficient_balance') return
+  await openTicket(
+    env,
+    plId,
+    rec,
+    rozo,
+    `${rec.status}; Rozo ${rozo.status}; Coinbase ${safe?.status ?? 'unknown'}`,
+    'Rozo payout completed but the Coinbase invoice is unpaid (payout webhook likely never delivered). Resend the payout webhook or pay by hand.',
+  )
 }
 
 async function reportDelivered(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {

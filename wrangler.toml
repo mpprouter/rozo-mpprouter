@@ -169,6 +169,13 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 # ETH@1 and SOL@900 stay closed until their own real payment. Remove an entry
 # (or the whole line) and redeploy to close a chain.
 NATIVE_SOURCES = "ETH@8453,BNB@56"
+# Stuck-order Intercom tickets (src/utils/intercom-ticket.ts). Ticket type 4 is
+# the workspace's built-in "Internal task" (Back-office) type; the contact is
+# an internal Rozo team contact, because router records hold no customer
+# email. Both verified via the Intercom API on 2026-09-28. The token is the
+# INTERCOM_TICKET_TOKEN secret; without it no ticket is opened.
+INTERCOM_TICKET_TYPE_ID = "4"
+INTERCOM_TICKET_CONTACT_ID = "6a9cac997c5b31a93e30847f"
 STELLAR_NETWORK = "stellar:pubnet"
 STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
 # Comma-separated POOL, round-robined per request (src/mpp/tempo-rpc.ts).

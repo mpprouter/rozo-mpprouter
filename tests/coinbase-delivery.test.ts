@@ -122,6 +122,8 @@ interface Upstream {
   coinbase: Record<string, unknown> | null
   rozo: Record<string, unknown> | null
   deliveredStatus: number
+  // Intercom POST /tickets: HTTP status, or 'throw' for a network error.
+  intercom: number | 'throw'
 }
 
 function stubFetch(cfg: Partial<Upstream> = {}) {
@@ -132,9 +134,10 @@ function stubFetch(cfg: Partial<Upstream> = {}) {
     coinbase: { id: PL, status: 'ACTIVE', usageCount: 0, maxUsage: 1, preApprovalExpiry: String(Math.floor(Date.now() / 1000) + 86400) },
     rozo: null,
     deliveredStatus: 200,
+    intercom: 200,
     ...cfg,
   }
-  const calls = { pay: 0, coinbase: 0, rozoGet: 0, delivered: [] as Array<{ url: string; body: any; key: string | null }>, dingtalk: [] as string[] }
+  const calls = { pay: 0, coinbase: 0, rozoGet: 0, delivered: [] as Array<{ url: string; body: any; key: string | null }>, dingtalk: [] as string[], intercom: [] as Array<{ body: any; auth: string | null; version: string | null }> }
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -142,6 +145,13 @@ function stubFetch(cfg: Partial<Upstream> = {}) {
       if (url.includes('oapi.dingtalk.com')) {
         calls.dingtalk.push(JSON.parse(String(init?.body)).text.content)
         return Response.json({ errcode: 0 })
+      }
+      if (url.includes('api.intercom.io/tickets')) {
+        const headers = new Headers(init?.headers)
+        calls.intercom.push({ body: JSON.parse(String(init?.body)), auth: headers.get('Authorization'), version: headers.get('Intercom-Version') })
+        if (up.intercom === 'throw') throw new TypeError('network down')
+        if (up.intercom !== 200) return Response.json({ type: 'error.list', errors: [{ code: 'server_error', message: 'boom' }] }, { status: up.intercom })
+        return Response.json({ type: 'ticket', id: '777', ticket_id: '12' })
       }
       if (url.includes('agentapi.rozo.ai/pay-invoice')) {
         calls.pay++
@@ -489,6 +499,166 @@ describe('sweepCoinbaseFulfillments', () => {
 })
 
 // ── Admin exec-gate clear (manual re-pay escape hatch) ─────────────────────
+
+describe('stuck-order Intercom tickets (S3)', () => {
+  const TICKET_ENV = {
+    INTERCOM_TICKET_TOKEN: 'ic-test-token',
+    INTERCOM_TICKET_TYPE_ID: '4',
+    INTERCOM_TICKET_CONTACT_ID: 'contact-internal',
+  }
+  const stuckRozo = {
+    id: ROZO_ID,
+    status: 'payment_payout_completed',
+    source: { chainId: '8453', confirmedAt: ago(18) },
+    destination: { confirmedAt: ago(15) },
+  }
+
+  it('stuck alert opens exactly one ticket with order data and the status link', async () => {
+    const { calls } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.intercom).toHaveLength(1)
+    const t = calls.intercom[0]
+    expect(t.auth).toBe('Bearer ic-test-token')
+    expect(t.version).toBeTruthy()
+    expect(t.body.ticket_type_id).toBe('4')
+    expect(t.body.contacts).toEqual([{ id: 'contact-internal' }])
+    expect(t.body.skip_notifications).toBe(true)
+    const desc: string = t.body.ticket_attributes._default_description_
+    expect(t.body.ticket_attributes._default_title_).toContain(ROZO_ID)
+    expect(desc).toContain(`https://checkout.rozo.ai/status?id=${ROZO_ID}`)
+    expect(desc).toContain(PL)
+    expect(desc).toContain('1.00 USD')
+    expect(desc).toContain('Chain: 8453')
+    expect(desc).toContain(stuckRozo.source.confirmedAt)
+    expect(desc).not.toMatch(/@/)
+    // Dedupe: later sweeps reuse alertedStuck, so no second ticket.
+    await sweepCoinbaseFulfillments(env)
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.intercom).toHaveLength(1)
+    expect(calls.dingtalk).toHaveLength(1)
+  })
+
+  it('no INTERCOM_TICKET_TOKEN → no ticket request, DingTalk alert still sent', async () => {
+    const { calls } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv({ ...TICKET_ENV, INTERCOM_TICKET_TOKEN: undefined })
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.intercom).toHaveLength(0)
+    expect(calls.dingtalk).toHaveLength(1)
+    expect(readRec(kv).alertedStuck).toBe(true)
+  })
+
+  it.each([500, 401, 'throw'] as const)('Intercom failure (%s) → alert unaffected, logged, never retried', async (mode) => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { calls } = stubFetch({ rozo: stuckRozo, intercom: mode })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.intercom).toHaveLength(1)
+    expect(readRec(kv).alertedStuck).toBe(true)
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.intercom).toHaveLength(1)
+    const logged = warn.mock.calls.map((c) => c.join(' ')).join('\n')
+    expect(logged).toContain('[intercom-ticket]')
+    expect(logged).not.toContain('ic-test-token')
+    expect(logged).not.toContain('boom')
+  })
+
+  it('manual_review alert also opens one ticket', async () => {
+    const { calls } = stubFetch({
+      coinbase: { paymentSessionId: PL, status: 'PAYMENT_SESSION_STATUS_CAPTURE_PENDING', expiresAt: new Date(Date.now() + 86400_000).toISOString() },
+    })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'capture_pending', payingAt: ago(31), events: [{ kind: 'payment_payin_completed', at: ago(40) }] })
+    await sweepCoinbaseFulfillments(env)
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.intercom).toHaveLength(1)
+    expect(calls.intercom[0].body.ticket_attributes._default_description_).toContain('manual_review')
+  })
+
+  it('DO claim dedupes even if the KV one-shot flag is lost (overlapping sweeps)', async () => {
+    const { calls } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    const seedStuck = () => seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    seedStuck()
+    await sweepCoinbaseFulfillments(env)
+    // Simulate a racing sweep that read the record before alertedStuck landed.
+    seedStuck()
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.dingtalk).toHaveLength(2) // existing alert behaviour unchanged
+    expect(calls.intercom).toHaveLength(1)
+  })
+
+  it('stuck then manual_review on the same order → still one ticket', async () => {
+    const { calls, up } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.intercom).toHaveLength(1)
+    up.coinbase = { paymentSessionId: PL, status: 'PAYMENT_SESSION_STATUS_CAPTURE_PENDING', expiresAt: new Date(Date.now() + 86400_000).toISOString() }
+    seedRec(kv, { ...readRec(kv), status: 'capture_pending', payingAt: ago(31) })
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('manual_review')
+    expect(calls.dingtalk).toHaveLength(2)
+    expect(calls.intercom).toHaveLength(1)
+  })
+
+  it('free text in an Intercom error code is never logged', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    stubFetch({ rozo: stuckRozo })
+    const inner = (globalThis.fetch as any).getMockImplementation()
+    vi.stubGlobal('fetch', vi.fn(async (input: any, init?: any) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (url.includes('api.intercom.io/tickets')) return Response.json({ errors: [{ code: 'Bearer leaked-value here' }] }, { status: 400 })
+      return inner(input, init)
+    }))
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    const logged = warn.mock.calls.flat().join(' ')
+    expect(logged).toContain('HTTP 400')
+    expect(logged).not.toContain('leaked-value')
+  })
+
+  it('order settled by a concurrent webhook during the stuck check → no ticket', async () => {
+    const { calls } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    const inner = (globalThis.fetch as any).getMockImplementation()
+    vi.stubGlobal('fetch', vi.fn(async (input: any, init?: any) => {
+      const url = String(input instanceof Request ? input.url : input)
+      // The webhook marks it paid while the sweep is reading Coinbase.
+      if (url.includes('payments.coinbase.com/next-api/')) seedRec(kv, { ...readRec(kv), status: 'paid', paidAt: ago(0) })
+      return inner(input, init)
+    }))
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('paid')
+    expect(calls.intercom).toHaveLength(0)
+  })
+
+  it('DO claim failure → ticket skipped, alert still sent', async () => {
+    const { calls } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv({ ...TICKET_ENV, ATOMIC_STORE: { idFromName: () => ({}), get: () => ({ fetch: async () => new Response('boom', { status: 500 }) }) } })
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.intercom).toHaveLength(0)
+  })
+
+  it('not stuck yet (payout < 10 min ago) → no alert, no ticket', async () => {
+    const { calls } = stubFetch({ rozo: { ...stuckRozo, destination: { confirmedAt: ago(3) } } })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(4) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(calls.dingtalk).toHaveLength(0)
+    expect(calls.intercom).toHaveLength(0)
+  })
+})
 
 describe('POST /admin/coinbase-exec-gate/clear', () => {
   const V3_CREATED = { paymentSessionId: PL, status: 'PAYMENT_SESSION_STATUS_CREATED', expiresAt: new Date(Date.now() + 86400_000).toISOString() }

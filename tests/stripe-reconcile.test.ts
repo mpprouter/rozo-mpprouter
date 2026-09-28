@@ -589,3 +589,154 @@ describe('sweepInFlightStripeRecords (cron)', () => {
     expect(await sweepInFlightStripeRecords(env)).toEqual({ scanned: 0, inFlight: 0, checked: 0, transitions: [] })
   })
 })
+
+describe('stuck-order Intercom tickets (S3, Stripe)', () => {
+  const TICKET_ENV = {
+    INTERCOM_TICKET_TOKEN: 'ic-test-token',
+    INTERCOM_TICKET_TYPE_ID: '4',
+    INTERCOM_TICKET_CONTACT_ID: 'contact-internal',
+  } as Partial<Env>
+  const NOW = new Date('2026-09-28T10:00:00Z')
+  const minsBefore = (m: number) => new Date(NOW.getTime() - m * 60_000).toISOString()
+
+  function mockWithIntercom(state: string, intercomStatus: number | 'throw' = 200) {
+    const tickets: any[] = []
+    const hits = mockStripe(state, null, (u) => null)
+    const inner = (globalThis.fetch as any).getMockImplementation()
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('api.intercom.io/tickets')) {
+        tickets.push({ body: JSON.parse(String(init?.body)), auth: new Headers(init?.headers).get('Authorization') })
+        if (intercomStatus === 'throw') throw new TypeError('down')
+        return Response.json({ id: '888' }, { status: intercomStatus })
+      }
+      return inner(input, init)
+    })
+    return { hits, tickets }
+  }
+
+  async function seedStuck(env: Env, status: string, payinMinsAgo: number, patch: Record<string, unknown> = {}) {
+    await seed(env)
+    await forceStatus(env, status, {
+      events: [{ kind: 'payment_payin_completed', at: minsBefore(payinMinsAgo), event_id: 'e1' }],
+      lastProviderCheckAt: null,
+      ...patch,
+    })
+  }
+
+  it('in flight 15+ min after payin → exactly one ticket, across repeated sweeps', async () => {
+    const env = makeEnv(TICKET_ENV)
+    await seedStuck(env, 'provider_submitted', 20)
+    const { tickets } = mockWithIntercom('processing')
+    await sweepInFlightStripeRecords(env, NOW)
+    await sweepInFlightStripeRecords(env, new Date(NOW.getTime() + 120_000))
+    expect(tickets).toHaveLength(1)
+    const desc: string = tickets[0].body.ticket_attributes._default_description_
+    expect(desc).toContain(`https://checkout.rozo.ai/status?id=${ROZO_ID}`)
+    expect(desc).toContain('1.36 USD')
+    expect(desc).toContain(minsBefore(20))
+    expect(desc).not.toContain(KEY) // session id masked
+    expect(desc).not.toContain('CDMQARoXBLOB')
+    expect((await loadRec(env)).stuckTicketAt).toBe(NOW.toISOString())
+  })
+
+  it('under 15 min, paid, or payin older than 2 h → no ticket', async () => {
+    for (const [status, mins] of [['provider_submitted', 10], ['paid', 30], ['manual_review', 60 * 3]] as const) {
+      const env = makeEnv(TICKET_ENV)
+      await seedStuck(env, status, mins)
+      const { tickets } = mockWithIntercom('processing')
+      await sweepInFlightStripeRecords(env, NOW)
+      expect(tickets).toHaveLength(0)
+      vi.restoreAllMocks()
+    }
+  })
+
+  it('in flight but not freshly checked against Stripe (throttled) → no ticket on a stale local status', async () => {
+    const env = makeEnv(TICKET_ENV)
+    // Checked just now by someone else (throttles this sweep's reconcile), but
+    // the only reconcile outcome on record is 30 minutes old.
+    await seedStuck(env, 'provider_submitted', 40, {
+      lastProviderCheckAt: NOW.toISOString(),
+      events: [
+        { kind: 'payment_payin_completed', at: minsBefore(40), event_id: 'e1' },
+        { kind: 'stripe_reconcile_checked', at: minsBefore(30), detail: { state: 'processing' } },
+      ],
+    })
+    const { tickets } = mockWithIntercom('processing')
+    await sweepInFlightStripeRecords(env, NOW)
+    expect(tickets).toHaveLength(0)
+  })
+
+  it('in flight and Stripe read fails → no ticket (unpaid is not proven)', async () => {
+    const env = makeEnv(TICKET_ENV)
+    await seedStuck(env, 'provider_submitted', 20)
+    const { tickets } = mockWithIntercom('processing')
+    const inner = (globalThis.fetch as any).getMockImplementation()
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('stripe.com')) return new Response('down', { status: 500 })
+      return inner(input, init)
+    })
+    await sweepInFlightStripeRecords(env, NOW)
+    expect((await loadRec(env)).events.some((e: any) => e.kind === 'stripe_reconcile_error')).toBe(true)
+    expect(tickets).toHaveLength(0)
+  })
+
+  it('a record the provider confirms paid in this sweep is not ticketed', async () => {
+    const env = makeEnv(TICKET_ENV)
+    await seedStuck(env, 'provider_submitted', 20)
+    const { tickets } = mockWithIntercom('fulfillment_complete')
+    await sweepInFlightStripeRecords(env, NOW)
+    expect((await loadRec(env)).status).toBe('paid')
+    expect(tickets).toHaveLength(0)
+  })
+
+  it('manual_review (terminal) after payin → one ticket with the failure reason', async () => {
+    const env = makeEnv(TICKET_ENV)
+    await seedStuck(env, 'manual_review', 40, { failureReason: 'stripe session no longer resumable' })
+    const { tickets } = mockWithIntercom('processing')
+    await sweepInFlightStripeRecords(env, NOW)
+    await sweepInFlightStripeRecords(env, NOW)
+    expect(tickets).toHaveLength(1)
+    expect(tickets[0].body.ticket_attributes._default_description_).toContain('no longer resumable')
+  })
+
+  it('no token → skipped and no marker claimed; Intercom failure → marker kept, no retry', async () => {
+    const env1 = makeEnv({ ...TICKET_ENV, INTERCOM_TICKET_TOKEN: undefined })
+    await seedStuck(env1, 'provider_submitted', 20)
+    const a = mockWithIntercom('processing')
+    await sweepInFlightStripeRecords(env1, NOW)
+    expect(a.tickets).toHaveLength(0)
+    expect((await casRead(env1, stripeKvKey(KEY))).value).not.toContain('stuckTicketAt')
+    vi.restoreAllMocks()
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const env2 = makeEnv(TICKET_ENV)
+    await seedStuck(env2, 'provider_submitted', 20)
+    const b = mockWithIntercom('processing', 500)
+    await sweepInFlightStripeRecords(env2, NOW)
+    await sweepInFlightStripeRecords(env2, NOW)
+    expect(b.tickets).toHaveLength(1)
+    expect(warn.mock.calls.flat().join(' ')).not.toContain('ic-test-token')
+  })
+
+  it('bounded: at most STUCK_TICKETS_PER_RUN tickets per sweep', async () => {
+    const env = makeEnv(TICKET_ENV)
+    for (let i = 0; i < 8; i++) {
+      const k = `cpis_stuck${String(i).padStart(4, '0')}`
+      await seedStripeRecord(env, { invoiceKey: k, merchantAccount: 'acct', invoiceAmountAtomic: '1000000', invoiceCurrency: 'usd', lockFingerprint: 'x', stripeUrl: `https://crypto.stripe.com/pay/${k}`, rozoPaymentId: null })
+      const { value, version } = await casRead(env, stripeKvKey(k))
+      const r = JSON.parse(value!)
+      r.status = 'manual_review'
+      r.events = [{ kind: 'payment_payout_completed', at: minsBefore(30) }]
+      await (env.ATOMIC_STORE as any).get(null).fetch(new Request('https://x/commit', { method: 'POST', body: JSON.stringify({ key: stripeKvKey(k), expectedVersion: version, op: 'set', value: JSON.stringify(r) }) }))
+    }
+    const { tickets } = mockWithIntercom('processing')
+    await sweepInFlightStripeRecords(env, NOW)
+    expect(tickets).toHaveLength(5)
+    await sweepInFlightStripeRecords(env, NOW)
+    expect(tickets).toHaveLength(8)
+    // No Rozo id → the status link falls back to the provider-qualified order id.
+    expect(tickets[0].body.ticket_attributes._default_description_).toMatch(/status\?id=stripe_crypto_cpis_stuck/)
+  })
+})

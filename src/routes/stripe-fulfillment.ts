@@ -25,6 +25,7 @@ import { encryptCapability, decryptCapability } from './invoice-capability-crypt
 import { claimInvoiceKey } from './invoice-claim'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { indexStripeSession } from './stripe-session-index'
+import { openStuckOrderTicket, ticketsConfigured } from '../utils/intercom-ticket'
 
 // Provider-qualified order id. Rozo orderIds are used verbatim as our KV key
 // discriminator, so we avoid ':' (design §6 fallback) and use underscores.
@@ -130,6 +131,10 @@ export interface StripeFulfillmentRecord {
     resolvedBy: string
     at: string
   } | null
+  // One-shot marker: set (under CAS) the moment the sweep claims the right to
+  // open the stuck-order Intercom ticket. Never cleared, so at most one
+  // ticket per order even if the Intercom call fails.
+  stuckTicketAt?: string | null
   webhookEventIds: string[]
   events: Array<{ kind: string; at: string; event_id?: string; detail?: unknown }>
 }
@@ -1067,7 +1072,128 @@ export async function sweepInFlightStripeRecords(
       // next record
     }
   }
+  // After reconciling, so an order the provider just confirmed paid is never
+  // ticketed. Uses the pre-reconcile snapshot only to pick candidates; the
+  // claim re-reads the live record.
+  try {
+    await sweepStripeStuckTickets(env, values, now)
+  } catch {
+    // tickets are best effort
+  }
   return out
+}
+
+// ── Stuck-order Intercom tickets (support automation S3) ────────────────────
+//
+// Rule (growth design v3 §4.1 S3): the customer's payment was received more
+// than 15 minutes ago and the merchant invoice is still not paid → stuck.
+// "Received" is the first payin/payout webhook event on the record. Only
+// orders whose payin landed within the last 2 h are watched, so historical
+// records never flood Intercom on deploy. An in-flight record is ticketed only
+// right after the reconciler actually asked Stripe about it (a reconcile event
+// within the last 5 min, and the record is still not paid), never on a stale
+// local status. One ticket per order, claimed under CAS before the call, never
+// retried; at most STUCK_TICKETS_PER_RUN per sweep.
+
+export const STRIPE_STUCK_AFTER_MS = 15 * 60 * 1000
+const STRIPE_STUCK_WATCH_MS = 2 * 60 * 60 * 1000
+const PROVIDER_CHECK_FRESH_MS = 5 * 60 * 1000
+export const STUCK_TICKETS_PER_RUN = 5
+const PAYIN_EVENT_KINDS = new Set(['payment_payin_completed', 'payment_payout_completed'])
+
+function stripePayinAtMs(rec: StripeFulfillmentRecord): number | null {
+  let min: number | null = null
+  for (const e of rec.events ?? []) {
+    if (!PAYIN_EVENT_KINDS.has(e.kind)) continue
+    const t = Date.parse(e.at)
+    if (Number.isFinite(t) && (min === null || t < min)) min = t
+  }
+  return min
+}
+
+// `candidateOnly` skips the provider-freshness test: the sweep picks
+// candidates from its pre-reconcile snapshot, and the live re-read inside the
+// claim applies the full rule.
+function isStripeStuck(rec: StripeFulfillmentRecord, now: number, candidateOnly = false): boolean {
+  if (rec.stuckTicketAt || rec.manualResolution) return false
+  if (rec.status === 'paid' || rec.status === 'rozo_payment_created') return false
+  const payin = stripePayinAtMs(rec)
+  if (payin === null) return false
+  const age = now - payin
+  if (age <= STRIPE_STUCK_AFTER_MS || age > STRIPE_STUCK_WATCH_MS) return false
+  if (RECONCILE_IN_FLIGHT.has(rec.status) && !candidateOnly) {
+    const checked = lastReconcileAtMs(rec)
+    return checked !== null && now - checked <= PROVIDER_CHECK_FRESH_MS
+  }
+  return true
+}
+
+// Latest SUCCESSFUL Stripe read that left the record in flight (i.e. Stripe
+// itself says not paid yet). Failed reads and throttle claims do not count:
+// an unreadable provider is not evidence of "unpaid". Records Stripe keeps
+// refusing escalate to manual_review, which is ticketed on its own.
+function lastReconcileAtMs(rec: StripeFulfillmentRecord): number | null {
+  let max: number | null = null
+  for (const e of rec.events ?? []) {
+    if (e.kind !== 'stripe_reconcile_checked') continue
+    const t = Date.parse(e.at)
+    if (Number.isFinite(t) && (max === null || t > max)) max = t
+  }
+  return max
+}
+
+function fmtAtomicUsd(atomic: string | null): string | null {
+  if (!atomic) return null
+  try {
+    return (Number(BigInt(atomic)) / 1e6).toFixed(2)
+  } catch {
+    return null
+  }
+}
+
+/** Never throws. Returns true when a ticket call was made for this record. */
+async function maybeOpenStripeStuckTicket(env: Env, invoiceKey: string, now: Date): Promise<boolean> {
+  const nowMs = now.getTime()
+  const current = await loadStripeRecord(env, invoiceKey)
+  if (!current || !isStripeStuck(current, nowMs)) return false
+  // Claim under CAS (re-checked on the live record) so two overlapping sweeps
+  // cannot both open a ticket for the same order.
+  const claimed = await updateStripeRecord<StripeFulfillmentRecord | null>(env, invoiceKey, current.orderId, (r) => {
+    if (!isStripeStuck(r, nowMs)) return { noop: null }
+    r.stuckTicketAt = now.toISOString()
+    r.events.push({ kind: 'stuck_ticket_claimed', at: now.toISOString(), detail: { status: r.status } })
+    return { rec: r, result: r }
+  })
+  if (!claimed) return false
+  const payin = stripePayinAtMs(claimed)
+  await openStuckOrderTicket(env, {
+    orderId: claimed.rozoPaymentId || claimed.orderId,
+    providerRef: `stripe_crypto_${maskInvoiceKey(claimed.invoiceKey)}`,
+    provider: 'stripe_crypto',
+    status: claimed.status,
+    reason: claimed.failureReason
+      ? `Merchant invoice not paid 15+ min after payin: ${claimed.failureReason}`
+      : 'Merchant invoice not paid 15+ min after payin. Check the Stripe session; never re-fire pay-invoice for an in-flight record.',
+    paymentReceivedAt: payin !== null ? new Date(payin).toISOString() : null,
+    amountUsd: fmtAtomicUsd(claimed.invoiceAmountAtomic),
+    chain: null,
+  })
+  return true
+}
+
+async function sweepStripeStuckTickets(env: Env, values: string[], now: Date): Promise<void> {
+  // Unconfigured → claim nothing, so orders are ticketed once it is set.
+  if (!ticketsConfigured(env)) return
+  let opened = 0
+  for (const rec of values.map(parseRecord)) {
+    if (opened >= STUCK_TICKETS_PER_RUN) break
+    if (!rec || !isStripeStuck(rec, now.getTime(), true)) continue
+    try {
+      if (await maybeOpenStripeStuckTicket(env, rec.invoiceKey, now)) opened++
+    } catch {
+      // next record
+    }
+  }
 }
 
 // ── Human resolution of manual_review (admin) ───────────────────────────────
