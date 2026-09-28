@@ -625,6 +625,22 @@ describe('stuck-order Intercom tickets (S3)', () => {
     expect(logged).not.toContain('leaked-value')
   })
 
+  it('order settled by a concurrent webhook during the stuck check → no ticket', async () => {
+    const { calls } = stubFetch({ rozo: stuckRozo })
+    const { env, kv } = makeEnv(TICKET_ENV)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    const inner = (globalThis.fetch as any).getMockImplementation()
+    vi.stubGlobal('fetch', vi.fn(async (input: any, init?: any) => {
+      const url = String(input instanceof Request ? input.url : input)
+      // The webhook marks it paid while the sweep is reading Coinbase.
+      if (url.includes('payments.coinbase.com/next-api/')) seedRec(kv, { ...readRec(kv), status: 'paid', paidAt: ago(0) })
+      return inner(input, init)
+    }))
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('paid')
+    expect(calls.intercom).toHaveLength(0)
+  })
+
   it('DO claim failure → ticket skipped, alert still sent', async () => {
     const { calls } = stubFetch({ rozo: stuckRozo })
     const { env, kv } = makeEnv({ ...TICKET_ENV, ATOMIC_STORE: { idFromName: () => ({}), get: () => ({ fetch: async () => new Response('boom', { status: 500 }) }) } })

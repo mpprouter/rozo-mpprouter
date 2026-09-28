@@ -257,7 +257,7 @@ async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecor
     rec.events.push({ kind: 'sweep_manual_review', at: nowIso, detail: { from, reason, coinbase_status: safe?.status ?? null } })
     const alert = !rec.alertedManualReview
     rec.alertedManualReview = true
-    await saveRecordGuarded(env, plId, rec)
+    const saved = await saveRecordGuarded(env, plId, rec)
     if (alert) {
       await sendSweepAlert(env, [
         '[MPP Router] 🚨 Invoice NOT delivered: pay request sent but Coinbase did not capture',
@@ -266,6 +266,9 @@ async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecor
         `Reason: ${reason}`,
         'The pay request was already sent, so this is NEVER retried automatically. Decide re-pay or refund by hand (runbook: invoice-fulfillment techdoc §manual re-pay).',
       ])
+      // A concurrent webhook may have settled it meanwhile (the guarded save
+      // keeps the higher status); never ticket a paid order.
+      if (saved.status !== 'manual_review') return
       await openTicket(
         env,
         plId,
@@ -299,13 +302,16 @@ async function checkStuck(env: Env, plId: string, rec: FulfillmentRecord, now: n
   }
   rec.alertedStuck = true
   rec.events.push({ kind: 'sweep_stuck_alert', at: nowIso, detail: { record_status: rec.status, coinbase_status: safe?.status ?? null } })
-  await saveRecordGuarded(env, plId, rec)
+  const saved = await saveRecordGuarded(env, plId, rec)
   await sendSweepAlert(env, [
     '[MPP Router] 🚨 Invoice NOT delivered: Rozo payout completed but the Coinbase invoice is unpaid',
     header(rec, plId),
     `Router state: ${rec.status}; Coinbase: ${safe?.status ?? 'unknown'}`,
     'The payout webhook was likely never delivered. No automatic payment is made; resend the payout webhook or pay by hand.',
   ])
+  // Only the pre-pay states are "stuck"; if a concurrent webhook moved the
+  // record on (paying / paid / manual_review), no ticket from this path.
+  if (saved.status !== 'payin_seen' && saved.status !== 'failed_insufficient_balance') return
   await openTicket(
     env,
     plId,
