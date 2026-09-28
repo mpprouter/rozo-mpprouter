@@ -58,6 +58,12 @@ function logRef(id: string): string {
   return id.length <= 12 ? id : `${id.slice(0, 8)}…${id.slice(-4)}`
 }
 
+/** True when a ticket can be sent. Callers check this BEFORE claiming their
+ * one-shot marker, so a missing setting never burns an order's ticket. */
+export function ticketsConfigured(env: Env): boolean {
+  return Boolean(env.INTERCOM_TICKET_TOKEN && env.INTERCOM_TICKET_TYPE_ID && env.INTERCOM_TICKET_CONTACT_ID)
+}
+
 export function statusPageUrl(orderId: string): string {
   return STATUS_PAGE_BASE + encodeURIComponent(orderId)
 }

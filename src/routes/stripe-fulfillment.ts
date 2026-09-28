@@ -25,7 +25,7 @@ import { encryptCapability, decryptCapability } from './invoice-capability-crypt
 import { claimInvoiceKey } from './invoice-claim'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { indexStripeSession } from './stripe-session-index'
-import { openStuckOrderTicket } from '../utils/intercom-ticket'
+import { openStuckOrderTicket, ticketsConfigured } from '../utils/intercom-ticket'
 
 // Provider-qualified order id. Rozo orderIds are used verbatim as our KV key
 // discriminator, so we avoid ':' (design §6 fallback) and use underscores.
@@ -1182,6 +1182,8 @@ async function maybeOpenStripeStuckTicket(env: Env, invoiceKey: string, now: Dat
 }
 
 async function sweepStripeStuckTickets(env: Env, values: string[], now: Date): Promise<void> {
+  // Unconfigured → claim nothing, so orders are ticketed once it is set.
+  if (!ticketsConfigured(env)) return
   let opened = 0
   for (const rec of values.map(parseRecord)) {
     if (opened >= STUCK_TICKETS_PER_RUN) break

@@ -23,7 +23,7 @@
 import type { Env } from '../index'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { redactForAlert } from '../utils/alert-redaction'
-import { openStuckOrderTicket } from '../utils/intercom-ticket'
+import { openStuckOrderTicket, ticketsConfigured } from '../utils/intercom-ticket'
 import { casUpdate } from './stripe-atomic'
 import {
   type FulfillmentRecord,
@@ -199,8 +199,8 @@ async function openTicket(
   status: string,
   reason: string,
 ): Promise<void> {
-  if (!env.INTERCOM_TICKET_TOKEN) {
-    console.warn(`[intercom-ticket] coinbase SKIPPED (INTERCOM_TICKET_TOKEN not set)`)
+  if (!ticketsConfigured(env)) {
+    console.warn(`[intercom-ticket] coinbase SKIPPED (Intercom ticket settings incomplete)`)
     return
   }
   if (!(await claimTicketOnce(env, coinbaseTicketClaimKey(plId), new Date().toISOString()))) return

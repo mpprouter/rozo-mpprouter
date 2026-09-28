@@ -701,12 +701,13 @@ describe('stuck-order Intercom tickets (S3, Stripe)', () => {
     expect(tickets[0].body.ticket_attributes._default_description_).toContain('no longer resumable')
   })
 
-  it('no token → skipped, marker not needed; Intercom failure → marker kept, no retry', async () => {
+  it('no token → skipped and no marker claimed; Intercom failure → marker kept, no retry', async () => {
     const env1 = makeEnv({ ...TICKET_ENV, INTERCOM_TICKET_TOKEN: undefined })
     await seedStuck(env1, 'provider_submitted', 20)
     const a = mockWithIntercom('processing')
     await sweepInFlightStripeRecords(env1, NOW)
     expect(a.tickets).toHaveLength(0)
+    expect((await casRead(env1, stripeKvKey(KEY))).value).not.toContain('stuckTicketAt')
     vi.restoreAllMocks()
 
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
