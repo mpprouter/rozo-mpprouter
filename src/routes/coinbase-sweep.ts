@@ -14,12 +14,16 @@
 //      payment_payout_completed while the Coinbase link is unsettled and
 //      unexpired for > 10 min → one "stuck" alert (the payout webhook was
 //      probably never delivered). No payment.
+//   Both one-shot "NOT delivered" alerts (manual_review, stuck) also open one
+//   Intercom ticket under the same flag (utils/intercom-ticket.ts). Best
+//   effort: no retry, never affects the alert.
 //   3. paid and not yet reported as delivered, Coinbase settled → report to
 //      Rozo. Only HTTP 200 marks it reported; one alert after 5 failures.
 
 import type { Env } from '../index'
 import { sendDingTalkAlert } from '../utils/dingtalk'
 import { redactForAlert } from '../utils/alert-redaction'
+import { openStuckOrderTicket } from '../utils/intercom-ticket'
 import {
   type FulfillmentRecord,
   fetchCoinbasePayment,
@@ -153,6 +157,36 @@ function header(rec: FulfillmentRecord, plId: string): string {
   return `Invoice: ${plId} (${fmtUsdc(rec.invoiceAmountAtomic)} USDC), Rozo payment ${shortId(rec.rozoPaymentId)}`
 }
 
+function payinAtIso(rec: FulfillmentRecord, rozo: any | null): string | null {
+  const confirmed = rozo?.source?.confirmedAt
+  if (typeof confirmed === 'string' && ms(confirmed) !== null) return confirmed
+  const first = firstEventMs(rec)
+  return first !== null ? new Date(first).toISOString() : null
+}
+
+// Best effort, never throws (openStuckOrderTicket's contract). The caller has
+// already persisted its one-shot flag, so this runs at most once per record.
+async function openTicket(
+  env: Env,
+  plId: string,
+  rec: FulfillmentRecord,
+  rozo: any | null,
+  status: string,
+  reason: string,
+): Promise<void> {
+  const chain = rozo?.source?.chainId
+  await openStuckOrderTicket(env, {
+    orderId: rec.rozoPaymentId || plId,
+    providerRef: plId,
+    provider: 'coinbase',
+    status,
+    reason,
+    paymentReceivedAt: payinAtIso(rec, rozo),
+    amountUsd: rec.invoiceAmountAtomic ? fmtUsdc(rec.invoiceAmountAtomic) : null,
+    chain: chain !== undefined && chain !== null && chain !== '' ? String(chain) : null,
+  })
+}
+
 async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
   const nowIso = new Date(now).toISOString()
   const raw = await fetchCoinbasePayment(plId)
@@ -202,6 +236,14 @@ async function confirmFromCoinbase(env: Env, plId: string, rec: FulfillmentRecor
         `Reason: ${reason}`,
         'The pay request was already sent, so this is NEVER retried automatically. Decide re-pay or refund by hand (runbook: invoice-fulfillment techdoc §manual re-pay).',
       ])
+      await openTicket(
+        env,
+        plId,
+        rec,
+        null,
+        `manual_review (was ${from}); Coinbase ${safe?.status ?? 'unknown'}`,
+        'Pay request sent but Coinbase did not capture the invoice. Never retried automatically; re-pay or refund by hand.',
+      )
     }
     return
   }
@@ -234,6 +276,14 @@ async function checkStuck(env: Env, plId: string, rec: FulfillmentRecord, now: n
     `Router state: ${rec.status}; Coinbase: ${safe?.status ?? 'unknown'}`,
     'The payout webhook was likely never delivered. No automatic payment is made; resend the payout webhook or pay by hand.',
   ])
+  await openTicket(
+    env,
+    plId,
+    rec,
+    rozo,
+    `${rec.status}; Rozo ${rozo.status}; Coinbase ${safe?.status ?? 'unknown'}`,
+    'Rozo payout completed but the Coinbase invoice is unpaid (payout webhook likely never delivered). Resend the payout webhook or pay by hand.',
+  )
 }
 
 async function reportDelivered(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
