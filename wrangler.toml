@@ -162,6 +162,13 @@ PROVIDER_HOSTED_SUFFIX = "-pay.mpprouter.dev"
 # Invalid/missing values resolve to 0 in code; set back to "0" to roll back.
 CHECKOUT_WEB_FEE_BPS = "100"
 CHECKOUT_AGENT_BETA_FEE_BPS = "0"
+# Native coin checkout (src/routes/native-sources.ts). Open coins, one per
+# chain, only after a real internal payment on that chain settled:
+#   ETH@8453  Base ETH, rozotest order ae707463, 2026-09-28
+#   BNB@56    BSC BNB,  rozotest order 25842287, 2026-09-28
+# ETH@1 and SOL@900 stay closed until their own real payment. Remove an entry
+# (or the whole line) and redeploy to close a chain.
+NATIVE_SOURCES = "ETH@8453,BNB@56"
 STELLAR_NETWORK = "stellar:pubnet"
 STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
 # Comma-separated POOL, round-robined per request (src/mpp/tempo-rpc.ts).
