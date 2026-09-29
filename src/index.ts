@@ -112,7 +112,7 @@ import { handlePreflight, withCors } from './utils/cors'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
 import { checkFunderBalance } from './utils/funder-balance-watch'
-import { sendDingTalkAlert } from './utils/dingtalk'
+import { sendDingTalkAlert, sendDingTalkAlertConfirmed } from './utils/dingtalk'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
 import { handleUsageActivity, handleUsageLogs } from './routes/usage-dashboard'
@@ -617,8 +617,10 @@ async function watchFunderBalance(env: Env): Promise<void> {
       rpcUrl: env.BASE_RPC_URL,
     })
     if (!result) return
+    // Commit only if every message was confirmed delivered; otherwise the
+    // next tick re-decides from the old state and sends again.
     for (const message of result.messages) {
-      await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, redactForAlert(message))
+      if (!(await sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN, redactForAlert(message)))) return
     }
     await result.commit()
   } catch (err) {

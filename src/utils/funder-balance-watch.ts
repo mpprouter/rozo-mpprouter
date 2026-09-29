@@ -151,13 +151,18 @@ export function decide(
     )
   }
 
-  if (previous.lastBalance !== null) {
+  // The drop rule only compares two consecutive readable samples taken about
+  // one interval apart. After an RPC outage or a cron gap the last good
+  // reading can be hours old, and ordinary spend over that span would look
+  // like a sudden drop.
+  const elapsed = now - previous.lastSampleAt
+  if (previous.lastBalance !== null && previous.unreadableStreak === 0 && elapsed <= 2 * SAMPLE_INTERVAL_MS) {
     const prev = BigInt(previous.lastBalance)
     const drop = prev - balance
     if (prev > 0n && drop >= DROP_MIN_ABS && drop * 100n > prev * DROP_MIN_RATIO_PCT) {
       messages.push(
         `[MPP Router] ⚠️ Funder balance dropped sharply: ${formatUsd(prev)} → ${current} ` +
-          `(-${formatUsd(drop)}, -${(drop * 100n) / prev}%) since the last check\n` +
+          `(-${formatUsd(drop)}, -${(drop * 100n) / prev}%) in ${Math.round(elapsed / 60_000)} min\n` +
           `Wallet: ${address} (Base USDC)\n` +
           `Check whether this is a normal large payment or an unexpected withdrawal.`,
       )

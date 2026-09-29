@@ -61,8 +61,8 @@ describe('decide', () => {
   })
 
   it('flags a >50% drop of at least $20, and not smaller ones', () => {
-    const big = decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, 1).messages
-    expect(big.some((m) => m.includes('dropped sharply'))).toBe(true)
+    const big = decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, SAMPLE_INTERVAL_MS).messages
+    expect(big.some((m) => m.includes('dropped sharply') && m.includes('in 15 min'))).toBe(true)
     expect(decide(st({ lastBalance: usd(400).toString() }), usd(250), ADDR, 1).messages).toEqual([])
     expect(decide(st({ band: 'p0', lastBalance: usd(30).toString() }), usd(12), ADDR, 1).messages).toEqual([])
   })
@@ -80,6 +80,17 @@ describe('decide', () => {
     expect(s.band).toBe('ok')
     // Recovery to the same band after an outage is silent.
     expect(decide(s, usd(399), ADDR, 99).messages).toEqual([])
+  })
+})
+
+describe('drop rule needs consecutive readable samples', () => {
+  it('does not call spend across an RPC outage a sudden drop', () => {
+    const d = decide(st({ lastBalance: usd(1000).toString(), unreadableStreak: 3 }), usd(400), ADDR, SAMPLE_INTERVAL_MS)
+    expect(d.messages).toEqual([])
+  })
+  it('does not compare across a long cron gap', () => {
+    const d = decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, 10 * SAMPLE_INTERVAL_MS)
+    expect(d.messages).toEqual([])
   })
 })
 
