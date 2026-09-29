@@ -672,7 +672,8 @@ async function watchGasSponsor(env: Env): Promise<void> {
     })
     if (!result) return
 
-    await sendAlert(env, redactForAlert(result.message))
+    // Only a confirmed delivery may be recorded; otherwise retry next tick.
+    if (!(await sendAlert(env, redactForAlert(result.message)))) return
 
     // Commit only after the alert has gone out. If the send throws we fall to
     // the catch below WITHOUT recording the new state, so the next tick sees
