@@ -25,8 +25,11 @@ const USDC = 1_000_000n
 
 /** P0: one OpenRouter top-up can exhaust it; redemptions may already fail. */
 export const FUNDER_P0_THRESHOLD = 50n * USDC
-/** P1: the payout refill is not keeping up with spend. */
-export const FUNDER_P1_THRESHOLD = 100n * USDC
+/**
+ * P1: time to top up. Founder rule 2026-09-29: while the balance is at or
+ * above $200, send nothing at all, including sudden-drop alerts.
+ */
+export const FUNDER_P1_THRESHOLD = 200n * USDC
 /** A drop between two samples counts as abnormal only if it is both >50% ... */
 export const DROP_MIN_RATIO_PCT = 50n
 /** ... and at least $20, so small balances wobbling do not page anyone. */
@@ -126,27 +129,20 @@ export function decide(
   const messages: string[] = []
   const current = formatUsd(balance)
 
-  if (previous.band === null) {
-    // First ever sample. Say we are live even when healthy: it is the one
-    // message that proves the delivery path works end to end.
-    messages.push(
-      `[MPP Router] ✅ Funder balance monitor online: ${current}\n` +
-        `Wallet: ${address} (Base USDC)\n` +
-        `Alerts: below ${formatUsd(FUNDER_P1_THRESHOLD)} (P1), below ${formatUsd(FUNDER_P0_THRESHOLD)} (P0), ` +
-        `or a drop of more than ${DROP_MIN_RATIO_PCT}% and at least ${formatUsd(DROP_MIN_ABS)} within ~15 min.` +
-        (band === 'ok' ? '' : `\nCurrently ${BAND_LABEL[band]}: top up the wallet above.`),
-    )
-  } else if (band !== previous.band) {
-    const worse = band === 'p0' || (band === 'p1' && previous.band === 'ok')
+  // Founder rule: nothing at all while the balance is $200+. So no "online"
+  // message on a healthy first sample and no "recovered" message on returning
+  // to OK; only moves into (or between) the low bands are announced.
+  if (band !== 'ok' && band !== previous.band) {
+    const worse = previous.band === null || previous.band === 'ok' || band === 'p0'
     messages.push(
       worse
         ? `[MPP Router] ${band === 'p0' ? '🚨' : '⚠️'} Funder balance ${BAND_LABEL[band]}: ${current}\n` +
             `Wallet: ${address} (Base USDC)\n` +
             (band === 'p0'
               ? `Impact: coupon / Coinbase / Stripe payments may already fail with insufficient funder balance.\n`
-              : `Impact: the payout refill is not keeping up with spend.\n`) +
+              : `Impact: top up soon; below ${formatUsd(FUNDER_P0_THRESHOLD)} payments start failing.\n`) +
             `Action needed: send Base USDC to the wallet above.`
-        : `[MPP Router] ✅ Funder balance back to ${BAND_LABEL[band]}: ${current}\n` +
+        : `[MPP Router] Funder balance improved to ${BAND_LABEL[band]}: ${current}\n` +
             `Wallet: ${address} (Base USDC)`,
     )
   }
@@ -159,7 +155,9 @@ export function decide(
   if (previous.lastBalance !== null && previous.unreadableStreak === 0 && elapsed <= 2 * SAMPLE_INTERVAL_MS) {
     const prev = BigInt(previous.lastBalance)
     const drop = prev - balance
-    if (prev > 0n && drop >= DROP_MIN_ABS && drop * 100n > prev * DROP_MIN_RATIO_PCT) {
+    // Quiet above the P1 line (founder rule): a big payment that still leaves
+    // $200+ on hand is not worth a message.
+    if (balance < FUNDER_P1_THRESHOLD && prev > 0n && drop >= DROP_MIN_ABS && drop * 100n > prev * DROP_MIN_RATIO_PCT) {
       messages.push(
         `[MPP Router] ⚠️ Funder balance dropped sharply: ${formatUsd(prev)} → ${current} ` +
           `(-${formatUsd(drop)}, -${(drop * 100n) / prev}%) in ${Math.round(elapsed / 60_000)} min\n` +

@@ -37,32 +37,33 @@ describe('formatting and bands', () => {
   it('classifies the P0/P1 bands', () => {
     expect(classifyBand(usd(49.99))).toBe('p0')
     expect(classifyBand(usd(50))).toBe('p1')
-    expect(classifyBand(usd(99.99))).toBe('p1')
-    expect(classifyBand(usd(100))).toBe('ok')
+    expect(classifyBand(usd(199.99))).toBe('p1')
+    expect(classifyBand(usd(200))).toBe('ok')
   })
 })
 
 describe('decide', () => {
-  it('announces itself once on the first sample', () => {
-    const d = decide({ ...st(), band: null, lastBalance: null }, usd(433.16), ADDR, 1)
-    expect(d.messages).toHaveLength(1)
-    expect(d.messages[0]).toContain('monitor online: $433.16')
+  it('is silent on a healthy first sample, alerts on a low one', () => {
+    expect(decide({ ...st(), band: null, lastBalance: null }, usd(433.16), ADDR, 1).messages).toEqual([])
+    expect(decide({ ...st(), band: null, lastBalance: null }, usd(150), ADDR, 1).messages[0]).toContain('P1')
   })
 
   it('is silent while the band is unchanged', () => {
     expect(decide(st(), usd(390), ADDR, 1).messages).toEqual([])
-    expect(decide(st({ band: 'p1', lastBalance: usd(90).toString() }), usd(85), ADDR, 1).messages).toEqual([])
+    expect(decide(st({ band: 'p1', lastBalance: usd(190).toString() }), usd(185), ADDR, 1).messages).toEqual([])
   })
 
   it('alerts on ok → p1 → p0 and on recovery', () => {
-    expect(decide(st({ lastBalance: usd(120).toString() }), usd(95), ADDR, 1).messages[0]).toContain('P1')
+    expect(decide(st({ lastBalance: usd(250).toString() }), usd(195), ADDR, 1).messages[0]).toContain('P1')
     expect(decide(st({ band: 'p1', lastBalance: usd(60).toString() }), usd(45), ADDR, 1).messages[0]).toContain('🚨')
-    expect(decide(st({ band: 'p0', lastBalance: usd(45).toString() }), usd(245), ADDR, 1).messages[0]).toContain('back to OK')
+    expect(decide(st({ band: 'p0', lastBalance: usd(45).toString() }), usd(245), ADDR, 1).messages[0]).toEqual(undefined)
   })
 
   it('flags a >50% drop of at least $20, and not smaller ones', () => {
-    const big = decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, SAMPLE_INTERVAL_MS).messages
+    const big = decide(st({ lastBalance: usd(1000).toString() }), usd(150), ADDR, SAMPLE_INTERVAL_MS).messages
     expect(big.some((m) => m.includes('dropped sharply') && m.includes('in 15 min'))).toBe(true)
+    // Founder rule: a drop that still leaves $200+ sends nothing.
+    expect(decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, SAMPLE_INTERVAL_MS).messages).toEqual([])
     expect(decide(st({ lastBalance: usd(400).toString() }), usd(250), ADDR, 1).messages).toEqual([])
     expect(decide(st({ band: 'p0', lastBalance: usd(30).toString() }), usd(12), ADDR, 1).messages).toEqual([])
   })
@@ -85,11 +86,11 @@ describe('decide', () => {
 
 describe('drop rule needs consecutive readable samples', () => {
   it('does not call spend across an RPC outage a sudden drop', () => {
-    const d = decide(st({ lastBalance: usd(1000).toString(), unreadableStreak: 3 }), usd(400), ADDR, SAMPLE_INTERVAL_MS)
+    const d = decide(st({ band: 'p1', lastBalance: usd(180).toString(), unreadableStreak: 3 }), usd(60), ADDR, SAMPLE_INTERVAL_MS)
     expect(d.messages).toEqual([])
   })
   it('does not compare across a long cron gap', () => {
-    const d = decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, 10 * SAMPLE_INTERVAL_MS)
+    const d = decide(st({ band: 'p1', lastBalance: usd(180).toString() }), usd(60), ADDR, 10 * SAMPLE_INTERVAL_MS)
     expect(d.messages).toEqual([])
   })
 })
@@ -97,8 +98,8 @@ describe('drop rule needs consecutive readable samples', () => {
 describe('checkFunderBalance', () => {
   it('samples at most once per interval and commits only when told to', async () => {
     const { kv, store } = fakeKv()
-    const first = await checkFunderBalance({ kv, address: ADDR, now: 1_000_000_000, readBalance: reader(usd(433)) })
-    expect(first?.messages[0]).toContain('online')
+    const first = await checkFunderBalance({ kv, address: ADDR, now: 1_000_000_000, readBalance: reader(usd(150)) })
+    expect(first?.messages[0]).toContain('P1')
     expect(store.size).toBe(0) // not committed yet
     await first!.commit()
 
@@ -106,13 +107,13 @@ describe('checkFunderBalance', () => {
     expect(tooSoon).toBeNull()
 
     const later = await checkFunderBalance({ kv, address: ADDR, now: 1_000_000_000 + SAMPLE_INTERVAL_MS, readBalance: reader(usd(430)) })
-    expect(later).toBeNull() // healthy, committed silently
+    expect(later).toBeNull() // recovered above $200: silent, committed
     expect(JSON.parse(store.get('funder-balance:watch-state')!).lastBalance).toBe(usd(430).toString())
   })
 
   it('an uncommitted alert is re-sent on the next sample', async () => {
     const { kv } = fakeKv()
-    await (await checkFunderBalance({ kv, address: ADDR, now: 1_000_000_000, readBalance: reader(usd(433)) }))!.commit()
+    expect(await checkFunderBalance({ kv, address: ADDR, now: 1_000_000_000, readBalance: reader(usd(433)) })).toBeNull()
     const a = await checkFunderBalance({ kv, address: ADDR, now: 1_000_000_000 + SAMPLE_INTERVAL_MS, readBalance: reader(usd(90)) })
     expect(a?.messages.length).toBeGreaterThan(0)
     const b = await checkFunderBalance({ kv, address: ADDR, now: 1_000_000_000 + 2 * SAMPLE_INTERVAL_MS, readBalance: reader(usd(90)) })
