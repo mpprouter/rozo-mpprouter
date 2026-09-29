@@ -21,7 +21,7 @@
 //      Rozo. Only HTTP 200 marks it reported; one alert after 5 failures.
 
 import type { Env } from '../index'
-import { alertChannelConfigured, sendAlert } from '../utils/alert'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 import { openStuckOrderTicket, ticketsConfigured } from '../utils/intercom-ticket'
 import { casUpdate } from './stripe-atomic'
@@ -142,7 +142,7 @@ function fmtUsdc(atomic: string | null | undefined): string {
 async function sendSweepAlert(env: Env, lines: string[]): Promise<void> {
   try {
     const text = maskAddresses([...lines, `At: ${new Date().toISOString()}`].join('\n'))
-    if (!alertChannelConfigured(env)) {
+    if (!alertSinkConfigured(env)) {
       console.warn(`[coinbase-sweep] alert SKIPPED (no alert channel configured): ${text}`)
       return
     }

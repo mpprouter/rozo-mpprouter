@@ -112,7 +112,7 @@ import { handlePreflight, withCors } from './utils/cors'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
 import { checkFunderBalance } from './utils/funder-balance-watch'
-import { alertChannelConfigured, sendAlert } from './utils/alert'
+import { alertSinkConfigured, sendAlert } from './utils/alert'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
 import { handleUsageActivity, handleUsageLogs } from './routes/usage-dashboard'
@@ -621,7 +621,7 @@ export default {
  */
 async function watchFunderBalance(env: Env): Promise<void> {
   try {
-    if (!alertChannelConfigured(env)) {
+    if (!alertSinkConfigured(env)) {
       console.warn('[funder-balance-watch] no alert channel configured — funder wallet is NOT being monitored')
       return
     }
@@ -656,7 +656,7 @@ async function watchFunderBalance(env: Env): Promise<void> {
  */
 async function watchGasSponsor(env: Env): Promise<void> {
   try {
-    if (!alertChannelConfigured(env)) {
+    if (!alertSinkConfigured(env)) {
       // No alert channel means this monitor cannot do its job. Say so in the
       // log rather than returning silently: a monitor that is quiet because it
       // is disabled looks identical to a monitor that is quiet because all is

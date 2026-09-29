@@ -24,7 +24,7 @@
 
 import type { Env } from '../index'
 import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
-import { alertChannelConfigured, sendAlert } from '../utils/alert'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ export async function checkCreateInvoiceGate(request: Request, env: Env): Promis
     const globalCount = await bumpCounter(env, `ci:global:${bucket}`, bucket)
     if (globalCount > GLOBAL_LIMIT_PER_HOUR) {
       // Fire the alert exactly once at the crossing to avoid alert spam.
-      if (globalCount === GLOBAL_LIMIT_PER_HOUR + 1 && alertChannelConfigured(env)) {
+      if (globalCount === GLOBAL_LIMIT_PER_HOUR + 1 && alertSinkConfigured(env)) {
         await sendAlert(env,
           redactForAlert(`[MPP Router] 🚨 create-invoice global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} invoice creations this hour. New invoice creation paused for the window.`),
         )

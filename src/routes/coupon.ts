@@ -71,7 +71,7 @@ import { callAgentApiPayInvoice, FUNDER_WALLET } from './webhook'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
-import { alertChannelConfigured, sendAlert } from '../utils/alert'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { identifierKeys } from '../utils/redact'
 import { verifyTurnstile } from './coupon-turnstile'
 import {
@@ -559,7 +559,7 @@ async function publicGate(request: Request, env: Env): Promise<Response | null> 
       // requires many distinct IPs (distributed brute-force). Alerting once
       // per window would need extra state; an extra alert is harmless, so
       // just fire best-effort on every tripped request.
-      if (alertChannelConfigured(env)) {
+      if (alertSinkConfigured(env)) {
         await sendAlert(env,
           redactForAlert(`[MPP Router] 🚨 Coupon redeem global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} attempts this hour. Redemption paused for the window.`),
         )
@@ -923,7 +923,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     return done(serviceUnavailable(), 'rejected', 'traffic_gate_error')
   }
   if (traffic.action === 'circuit_open') {
-    if (traffic.justOpened && alertChannelConfigured(env)) {
+    if (traffic.justOpened && alertSinkConfigured(env)) {
       // Alert carries only volume/window/time — never a code, payment id, or link.
       await sendAlert(env,
         redactForAlert(`[MPP Router] 🚨 Coupon redeem GLOBAL CIRCUIT OPEN at ${new Date(now).toISOString()}: >100 per-IP-allowed redeem POSTs in 10 min across many IPs. Automatic redemption STOPPED until an operator reopens it (POST /admin/coupon/circuit/reopen).`),
@@ -931,7 +931,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     }
     return done(serviceUnavailable(), 'rejected', 'circuit_open')
   }
-  if (traffic.warnFired && alertChannelConfigured(env)) {
+  if (traffic.warnFired && alertSinkConfigured(env)) {
     await sendAlert(env,
       redactForAlert(`[MPP Router] ⚠️ Coupon redeem traffic spike at ${new Date(now).toISOString()}: >20 per-IP-allowed redeem POSTs in 1 min. Throttling tightened; watching for the 10-min circuit threshold.`),
     )
@@ -1245,7 +1245,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       await rollbackToIssued(
         `insufficient funder balance: balance ${balance} < invoice ${invoiceAtomic}`,
       )
-      if (alertChannelConfigured(env)) {
+      if (alertSinkConfigured(env)) {
         await sendAlert(env,
           redactForAlert(`[MPP Router] 🚨 Coupon redeem BLOCKED: insufficient funder balance (${formatUsdc(balance)} USDC on hand) for invoice ${formatUsdc(invoiceAtomic)} USDC. Coupon ${code} rolled back to issued. Top up the funder wallet.`),
         )
@@ -1460,7 +1460,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       r.coinbaseResult = storedResult
       r.events.push({ kind: 'pay_invoice_succeeded', at: r.redeemedAt!, detail: { status: payStatus } })
     })
-    if (!finalRec && alertChannelConfigured(env)) {
+    if (!finalRec && alertSinkConfigured(env)) {
       await sendAlert(env,
         redactForAlert(`[MPP Router] ⚠️ Coupon ${code} paid successfully but its record was modified mid-payment (admin resolve?). Reconcile manually: invoice ${plId} IS settled.`),
       )
@@ -1490,12 +1490,12 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
       detail: failureDetail,
     })
   })
-  if (!parked && alertChannelConfigured(env)) {
+  if (!parked && alertSinkConfigured(env)) {
     await sendAlert(env,
       redactForAlert(`[MPP Router] ⚠️ Coupon ${code}: pay-invoice failed (${payStatus}) AND the record was modified mid-payment. Reconcile ${plId} manually.`),
     )
   }
-  if (alertChannelConfigured(env)) {
+  if (alertSinkConfigured(env)) {
     await sendAlert(env,
       redactForAlert(
         isStripe
@@ -1548,7 +1548,7 @@ export async function handleReopenCircuit(request: Request, env: Env): Promise<R
     })
   }
 
-  if (alertChannelConfigured(env)) {
+  if (alertSinkConfigured(env)) {
     await sendAlert(env,
       redactForAlert(`[MPP Router] ✅ Coupon redeem circuit REOPENED by admin at ${new Date(now).toISOString()} (was ${prior.open ? 'OPEN' : 'already closed'}). Automatic redemption resumed.`),
     )

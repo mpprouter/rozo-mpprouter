@@ -58,8 +58,15 @@ export async function idempotencyKey(title: string, body: string, now: Date): Pr
   return `${ALERT_SERVICE}|${now.toISOString().slice(0, 16)}|${(await sha256Hex(`${title}\n${body}`)).slice(0, 16)}`
 }
 
-export function alertChannelConfigured(env: AlertEnv): boolean {
-  return feishuConfigured(feishuOf(env)) || Boolean(env.DINGTALK_ACCESS_TOKEN)
+/**
+ * True when an alert would go anywhere: a delivery channel or the archive.
+ * Call sites guard on this (not on a channel alone) so a Feishu/DingTalk
+ * config outage still leaves the alert in ainative_cloud_alerts_log.
+ */
+export function alertSinkConfigured(env: AlertEnv): boolean {
+  return feishuConfigured(feishuOf(env))
+    || Boolean(env.DINGTALK_ACCESS_TOKEN)
+    || Boolean(env.ALERT_LOG_SUPABASE_URL && env.ALERT_LOG_SUPABASE_ANON_KEY && env.ALERTS_LOG_RPC_SECRET)
 }
 
 function feishuOf(env: AlertEnv) {
@@ -104,17 +111,23 @@ export async function logAlert(env: AlertEnv, content: RedactedAlert, now = new 
 }
 
 /**
- * Log, then deliver. Returns true only if a channel confirmed delivery, so
+ * Archive and deliver. Returns true only if a channel confirmed delivery, so
  * monitors that persist "already alerted" state can commit on it.
  */
 export async function sendAlert(env: AlertEnv, content: RedactedAlert): Promise<boolean> {
-  await logAlert(env, content)
+  // Archive and delivery run concurrently: a slow Supabase must never delay
+  // the operational alert (codex review). logAlert never rejects.
+  const [, delivered] = await Promise.all([logAlert(env, content), deliver(env, content)])
+  return delivered
+}
+
+async function deliver(env: AlertEnv, content: RedactedAlert): Promise<boolean> {
   const feishu = feishuOf(env)
   if (feishuConfigured(feishu)) return sendFeishuAlertConfirmed(feishu, content)
   if (env.DINGTALK_ACCESS_TOKEN) {
     console.warn('[alert] Feishu secrets unset, falling back to DingTalk')
     return sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN, content)
   }
-  console.warn('[alert] no alert channel configured, alert logged only')
+  console.warn('[alert] no delivery channel configured, alert archived only')
   return false
 }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { sendAlert, logAlert, severityOf, idempotencyKey, alertChannelConfigured } from './alert'
+import { sendAlert, logAlert, severityOf, idempotencyKey, alertSinkConfigured } from './alert'
 import { redactForAlert } from './alert-redaction'
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status })
@@ -23,25 +23,25 @@ describe('severity and idempotency', () => {
 })
 
 describe('sendAlert', () => {
-  it('logs first, then sends to Feishu, never DingTalk', async () => {
-    const f = vi.fn()
-      .mockResolvedValueOnce(json({ inserted: true }))
-      .mockResolvedValueOnce(json({ code: 0, tenant_access_token: 't' }))
-      .mockResolvedValueOnce(json({ code: 0 }))
+  it('archives and sends to Feishu, never DingTalk', async () => {
+    const f = vi.fn(async (url: string, _init?: RequestInit) =>
+      url.includes('alerts_log_insert') ? json({ inserted: true })
+        : url.includes('tenant_access_token') ? json({ code: 0, tenant_access_token: 't' })
+          : json({ code: 0 }))
     vi.stubGlobal('fetch', f)
     const ok = await sendAlert({ ...LOG, ...FEISHU, DINGTALK_ACCESS_TOKEN: 'd' }, redactForAlert('[MPP Router] ⚠️ low\nline two'))
     expect(ok).toBe(true)
-    expect(f.mock.calls[0][0]).toBe('https://x.supabase.co/rest/v1/rpc/alerts_log_insert')
-    const body = JSON.parse(f.mock.calls[0][1].body)
+    const logCall = f.mock.calls.find((c) => String(c[0]) === 'https://x.supabase.co/rest/v1/rpc/alerts_log_insert')!
+    const body = JSON.parse(logCall[1]!.body as string)
     expect(body).toMatchObject({ p_secret: 'sec', p_service: 'mpprouter', p_severity: 'warning', p_title: '[MPP Router] ⚠️ low', p_body: 'line two' })
     expect(f.mock.calls.map((c) => String(c[0])).some((u) => u.includes('dingtalk'))).toBe(false)
   })
 
   it('still delivers when the log write fails', async () => {
-    const f = vi.fn()
-      .mockRejectedValueOnce(new Error('supabase down'))
-      .mockResolvedValueOnce(json({ code: 0, tenant_access_token: 't' }))
-      .mockResolvedValueOnce(json({ code: 0 }))
+    const f = vi.fn(async (url: string, _init?: RequestInit) => {
+      if (url.includes('alerts_log_insert')) throw new Error('supabase down')
+      return url.includes('tenant_access_token') ? json({ code: 0, tenant_access_token: 't' }) : json({ code: 0 })
+    })
     vi.stubGlobal('fetch', f)
     expect(await sendAlert({ ...LOG, ...FEISHU }, redactForAlert('x'))).toBe(true)
   })
@@ -53,9 +53,22 @@ describe('sendAlert', () => {
     expect(String(f.mock.calls[0][0])).toContain('oapi.dingtalk.com')
   })
 
-  it('reports no channel', () => {
-    expect(alertChannelConfigured({})).toBe(false)
-    expect(alertChannelConfigured(FEISHU)).toBe(true)
+  it('counts the archive alone as a sink', () => {
+    expect(alertSinkConfigured({})).toBe(false)
+    expect(alertSinkConfigured(FEISHU)).toBe(true)
+    expect(alertSinkConfigured(LOG)).toBe(true)
+  })
+
+  it('does not wait for a slow archive before delivering', async () => {
+    let feishuStartedBeforeLogDone = false
+    let logDone = false
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => {
+      if (url.includes('alerts_log_insert')) { await new Promise((r) => setTimeout(r, 50)); logDone = true; return json({}) }
+      if (url.includes('tenant_access_token')) feishuStartedBeforeLogDone = !logDone
+      return json({ code: 0, tenant_access_token: 't' })
+    }))
+    expect(await sendAlert({ ...LOG, ...FEISHU }, redactForAlert('x'))).toBe(true)
+    expect(feishuStartedBeforeLogDone).toBe(true)
   })
 })
 

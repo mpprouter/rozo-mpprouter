@@ -55,7 +55,7 @@ import {
   settleStellarX402,
   verifyStellarX402WithFacilitator,
 } from '../mpp/stellar-x402-server'
-import { alertChannelConfigured, sendAlert } from '../utils/alert'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
 import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
@@ -1720,7 +1720,7 @@ export async function handleProxy(
     )
     if (tempoBalance !== null) {
       // Fire DingTalk alert if balance < 5 USDC (fire-and-forget)
-      if (tempoBalance < LOW_BALANCE_THRESHOLD && alertChannelConfigured(env)) {
+      if (tempoBalance < LOW_BALANCE_THRESHOLD && alertSinkConfigured(env)) {
         const balanceStr = (Number(tempoBalance) / 1_000_000).toFixed(2)
         ctx.waitUntil(
           sendAlert(env,

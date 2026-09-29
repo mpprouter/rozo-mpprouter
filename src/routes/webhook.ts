@@ -2,7 +2,7 @@ import type { Env } from '../index'
 import { isTestPaymentId } from './native-sources'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { baseLinkIdOf } from '../mpp/contract-variant'
-import { alertChannelConfigured, sendAlert } from '../utils/alert'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import {
   isStripeOrderId,
   handleStripeWebhookEvent,
@@ -360,7 +360,7 @@ export async function sendInvoiceFailureAlert(
   params: InvoiceFailureAlertParams,
 ): Promise<void> {
   try {
-    if (!alertChannelConfigured(env)) {
+    if (!alertSinkConfigured(env)) {
       console.warn(
         `[webhook] invoice failure alert SKIPPED (no alert channel configured): ` +
           JSON.stringify({
