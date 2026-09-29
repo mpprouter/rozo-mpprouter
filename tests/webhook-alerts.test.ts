@@ -299,7 +299,7 @@ describe('sendInvoiceFailureAlert', () => {
     expect(fetchSpy).not.toHaveBeenCalled()
     expect(warnSpy).toHaveBeenCalledTimes(1)
     const logged = String(warnSpy.mock.calls[0][0])
-    expect(logged).toContain('DINGTALK_ACCESS_TOKEN not set')
+    expect(logged).toContain('no alert channel configured')
     expect(logged).toContain('"kind":"failed_pay_invoice"')
     expect(logged).toContain('"pl_id":"pl_degrade"')
   })
@@ -421,7 +421,7 @@ describe('handleRozoWebhook failure alerts (state machine integration)', () => {
 
     expect(dingtalkCalls).toHaveLength(0)
     const warned = warnSpy.mock.calls.map((c) => String(c[0])).join('\n')
-    expect(warned).toContain('DINGTALK_ACCESS_TOKEN not set')
+    expect(warned).toContain('no alert channel configured')
     expect(warned).toContain('failed_insufficient_balance')
   })
 

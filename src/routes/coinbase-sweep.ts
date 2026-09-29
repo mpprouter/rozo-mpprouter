@@ -21,7 +21,7 @@
 //      Rozo. Only HTTP 200 marks it reported; one alert after 5 failures.
 
 import type { Env } from '../index'
-import { sendDingTalkAlert } from '../utils/dingtalk'
+import { alertChannelConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 import { openStuckOrderTicket, ticketsConfigured } from '../utils/intercom-ticket'
 import { casUpdate } from './stripe-atomic'
@@ -142,11 +142,11 @@ function fmtUsdc(atomic: string | null | undefined): string {
 async function sendSweepAlert(env: Env, lines: string[]): Promise<void> {
   try {
     const text = maskAddresses([...lines, `At: ${new Date().toISOString()}`].join('\n'))
-    if (!env.DINGTALK_ACCESS_TOKEN) {
-      console.warn(`[coinbase-sweep] alert SKIPPED (DINGTALK_ACCESS_TOKEN not set): ${text}`)
+    if (!alertChannelConfigured(env)) {
+      console.warn(`[coinbase-sweep] alert SKIPPED (no alert channel configured): ${text}`)
       return
     }
-    await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, redactForAlert(text))
+    await sendAlert(env, redactForAlert(text))
   } catch (err) {
     console.warn(
       `[coinbase-sweep] alert error (non-fatal): ${err instanceof Error ? err.message : String(err)}`,
