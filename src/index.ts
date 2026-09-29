@@ -101,7 +101,7 @@ import {
   handleChannelTxDecode,
 } from './routes/playground-channel'
 import { settlePlaygroundChannels } from './playground/channel-settle'
-import { handleRozoWebhook, handleInvoiceStatus } from './routes/webhook'
+import { handleRozoWebhook, handleInvoiceStatus, FUNDER_WALLET } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
 import {
   handleUpiResolve,
@@ -111,6 +111,7 @@ import {
 import { handlePreflight, withCors } from './utils/cors'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
+import { checkFunderBalance } from './utils/funder-balance-watch'
 import { sendDingTalkAlert } from './utils/dingtalk'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
@@ -587,6 +588,9 @@ export default {
     // state TRANSITION only — this cron runs every 2 minutes, so a level-based
     // check would re-send the same warning 720 times a day.
     ctx.waitUntil(watchGasSponsor(env))
+    // Base USDC funder low-balance / sudden-drop watch. Replaces the launchd
+    // job that ran on two laptops and double-sent every alert.
+    ctx.waitUntil(watchFunderBalance(env))
     // Free 402 probes only. Scheduled health monitoring never spends money.
     // Serialize these because both merge advisory fields into provider rows.
     ctx.waitUntil((async () => {
@@ -594,6 +598,32 @@ export default {
       await retryPartnerDiscoveries(env)
     })())
   },
+}
+
+/**
+ * Funder wallet watch. Samples every 15 minutes (gated in KV), alerts on band
+ * transitions and sudden drops. Swallows its own errors for the same reason as
+ * `watchGasSponsor`: it must never take the shared cron down with it.
+ */
+async function watchFunderBalance(env: Env): Promise<void> {
+  try {
+    if (!env.DINGTALK_ACCESS_TOKEN) {
+      console.warn('[funder-balance-watch] DINGTALK_ACCESS_TOKEN unset — funder wallet is NOT being monitored')
+      return
+    }
+    const result = await checkFunderBalance({
+      kv: env.MPP_STORE,
+      address: FUNDER_WALLET,
+      rpcUrl: env.BASE_RPC_URL,
+    })
+    if (!result) return
+    for (const message of result.messages) {
+      await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, redactForAlert(message))
+    }
+    await result.commit()
+  } catch (err) {
+    console.warn(`[funder-balance-watch] skipped: ${(err as Error).message}`)
+  }
 }
 
 /**
