@@ -219,6 +219,9 @@ details.adv[open] summary::before { content: '▾ '; }
  *  - never send a full coupon code. A code is a bearer token; a full code
  *    sitting in a third-party analytics system is a leak. Only the last 4
  *    digits and the partnerId ever leave the page.
+ *    The DOM itself holds full codes (table cells, data-void attributes), so
+ *    autocapture and session recording stay off: only explicit track() calls
+ *    are sent.
  *  - the page must work perfectly when this script is blocked. `track()` is a
  *    try/catch no-op if PostHog never loads, and nothing awaits it.
  */
@@ -247,7 +250,7 @@ function track(event, props) {
     s.src = PH_HOST + '/static/array.js';
     s.onload = function () {
       try {
-        window.posthog.init(PH_KEY, { api_host: PH_HOST, capture_pageview: false });
+        window.posthog.init(PH_KEY, { api_host: PH_HOST, capture_pageview: false, autocapture: false, disable_session_recording: true, mask_all_text: true, mask_all_element_attributes: true });
         var q = __phQueue; __phQueue = [];
         for (var i = 0; i < q.length; i++) window.posthog.capture(q[i][0], q[i][1]);
       } catch (e) {}

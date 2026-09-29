@@ -500,6 +500,9 @@ export interface Env {
   // Anything other than "true" makes every /partner* path 404, so the feature
   // can be pulled without a rollback deploy.
   PARTNER_ENDPOINT_ENABLED?: string
+  // Public PostHog project key (phc_) for the partner pages. Unset => the pages
+  // load no analytics script at all.
+  PARTNER_POSTHOG_KEY?: string
 
   // Cloudflare Turnstile secret key for server-side siteverify on /coupon/redeem.
   // When unset, Turnstile is skipped (staged rollout before the widget is wired
@@ -870,7 +873,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
               headers: { 'Content-Type': 'application/json' },
             })
           }
-          const uiOpts = {}
+          const uiOpts = { posthogKey: env.PARTNER_POSTHOG_KEY || undefined }
 
           // Pages
           if (url.pathname === '/partner' && request.method === 'GET') {

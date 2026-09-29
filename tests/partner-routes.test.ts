@@ -441,6 +441,20 @@ describe('partner identifier', () => {
 })
 
 describe('pages', () => {
+  it('pages carry the PostHog key only when PARTNER_POSTHOG_KEY is set', async () => {
+    for (const p of ['/partner', '/partner/app']) {
+      expect(await (await call(p)).text(), p).toContain('var PH_KEY = "";')
+    }
+    env = { ...env, PARTNER_POSTHOG_KEY: 'phc_testkey' } as Env
+    for (const p of ['/partner', '/partner/app']) {
+      const html = await (await call(p)).text()
+      expect(html, p).toContain('var PH_KEY = "phc_testkey";')
+      // Full coupon codes sit in the DOM, so nothing may be auto-collected.
+      expect(html, p).toContain('autocapture: false')
+      expect(html, p).toContain('disable_session_recording: true')
+    }
+  })
+
   it('the explainer states the fee is OpenRouter’s, not ours', async () => {
     const html = await (await call('/partner')).text()
     expect(html).toContain('OpenRouter 收取，非 Rozo')
