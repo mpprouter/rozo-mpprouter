@@ -2,7 +2,7 @@ import type { Env } from '../index'
 import { isTestPaymentId } from './native-sources'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { baseLinkIdOf } from '../mpp/contract-variant'
-import { sendDingTalkAlert } from '../utils/dingtalk'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import {
   isStripeOrderId,
   handleStripeWebhookEvent,
@@ -360,9 +360,9 @@ export async function sendInvoiceFailureAlert(
   params: InvoiceFailureAlertParams,
 ): Promise<void> {
   try {
-    if (!env.DINGTALK_ACCESS_TOKEN) {
+    if (!alertSinkConfigured(env)) {
       console.warn(
-        `[webhook] invoice failure alert SKIPPED (DINGTALK_ACCESS_TOKEN not set): ` +
+        `[webhook] invoice failure alert SKIPPED (no alert channel configured): ` +
           JSON.stringify({
             alert: 'invoice_failure',
             kind: params.kind,
@@ -372,7 +372,7 @@ export async function sendInvoiceFailureAlert(
       )
       return
     }
-    await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, redactForAlert(buildInvoiceFailureAlert(params)))
+    await sendAlert(env, redactForAlert(buildInvoiceFailureAlert(params)))
   } catch (err) {
     console.warn(
       `[webhook] invoice failure alert error (non-fatal): ${

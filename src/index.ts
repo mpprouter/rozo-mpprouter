@@ -112,8 +112,7 @@ import { handlePreflight, withCors } from './utils/cors'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
 import { checkFunderBalance } from './utils/funder-balance-watch'
-import { feishuConfigured, sendFeishuAlertConfirmed } from './utils/feishu'
-import { sendDingTalkAlert, sendDingTalkAlertConfirmed } from './utils/dingtalk'
+import { alertSinkConfigured, sendAlert } from './utils/alert'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
 import { handleUsageActivity, handleUsageLogs } from './routes/usage-dashboard'
@@ -415,6 +414,13 @@ export interface Env {
   FEISHU_APP_SECRET?: string
   FEISHU_ALERT_CHAT_ID?: string
 
+  // Alert archive: every alert is also written to ainative_cloud_alerts_log in
+  // the Rozo Intents Supabase project via the alerts_log_insert RPC. URL is a
+  // plain var; the anon key and the RPC secret are secrets. See utils/alert.ts.
+  ALERT_LOG_SUPABASE_URL?: string
+  ALERT_LOG_SUPABASE_ANON_KEY?: string
+  ALERTS_LOG_RPC_SECRET?: string
+
   // Stuck-order Intercom tickets (utils/intercom-ticket.ts). The token is a
   // private-app token with only "Write tickets"; set via
   // `wrangler secret put INTERCOM_TICKET_TOKEN`. Unset → tickets are skipped,
@@ -615,16 +621,10 @@ export default {
  */
 async function watchFunderBalance(env: Env): Promise<void> {
   try {
-    // Feishu is where the founder reads alerts. DingTalk is only a fallback so
-    // a missing Feishu secret degrades to "wrong channel" rather than silence.
-    const feishu = { appId: env.FEISHU_APP_ID, appSecret: env.FEISHU_APP_SECRET, chatId: env.FEISHU_ALERT_CHAT_ID }
-    const useFeishu = feishuConfigured(feishu)
-    if (!useFeishu && !env.DINGTALK_ACCESS_TOKEN) {
+    if (!alertSinkConfigured(env)) {
       console.warn('[funder-balance-watch] no alert channel configured — funder wallet is NOT being monitored')
       return
     }
-    if (!useFeishu) console.warn('[funder-balance-watch] Feishu secrets unset — falling back to DingTalk')
-
     const result = await checkFunderBalance({
       kv: env.MPP_STORE,
       address: FUNDER_WALLET,
@@ -634,11 +634,7 @@ async function watchFunderBalance(env: Env): Promise<void> {
     // Commit only if every message was confirmed delivered; otherwise the
     // next tick re-decides from the old state and sends again.
     for (const message of result.messages) {
-      const text = redactForAlert(message)
-      const sent = useFeishu
-        ? await sendFeishuAlertConfirmed(feishu, text)
-        : await sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN!, text)
-      if (!sent) return
+      if (!(await sendAlert(env, redactForAlert(message)))) return
     }
     await result.commit()
   } catch (err) {
@@ -660,12 +656,12 @@ async function watchFunderBalance(env: Env): Promise<void> {
  */
 async function watchGasSponsor(env: Env): Promise<void> {
   try {
-    if (!env.DINGTALK_ACCESS_TOKEN) {
+    if (!alertSinkConfigured(env)) {
       // No alert channel means this monitor cannot do its job. Say so in the
       // log rather than returning silently: a monitor that is quiet because it
       // is disabled looks identical to a monitor that is quiet because all is
       // well, and that is the failure this whole change exists to remove.
-      console.warn('[gas-sponsor-watch] DINGTALK_ACCESS_TOKEN unset — gas sponsor is NOT being monitored')
+      console.warn('[gas-sponsor-watch] no alert channel configured — gas sponsor is NOT being monitored')
       return
     }
 
@@ -676,7 +672,8 @@ async function watchGasSponsor(env: Env): Promise<void> {
     })
     if (!result) return
 
-    await sendDingTalkAlert(env.DINGTALK_ACCESS_TOKEN, redactForAlert(result.message))
+    // Only a confirmed delivery may be recorded; otherwise retry next tick.
+    if (!(await sendAlert(env, redactForAlert(result.message)))) return
 
     // Commit only after the alert has gone out. If the send throws we fall to
     // the catch below WITHOUT recording the new state, so the next tick sees
