@@ -129,27 +129,20 @@ export function decide(
   const messages: string[] = []
   const current = formatUsd(balance)
 
-  if (previous.band === null) {
-    // First ever sample. Say we are live even when healthy: it is the one
-    // message that proves the delivery path works end to end.
-    messages.push(
-      `[MPP Router] ✅ Funder balance monitor online: ${current}\n` +
-        `Wallet: ${address} (Base USDC)\n` +
-        `Alerts: below ${formatUsd(FUNDER_P1_THRESHOLD)} (P1), below ${formatUsd(FUNDER_P0_THRESHOLD)} (P0), ` +
-        `or a drop of more than ${DROP_MIN_RATIO_PCT}% and at least ${formatUsd(DROP_MIN_ABS)} within ~15 min that ends below ${formatUsd(FUNDER_P1_THRESHOLD)}.` +
-        (band === 'ok' ? '' : `\nCurrently ${BAND_LABEL[band]}: top up the wallet above.`),
-    )
-  } else if (band !== previous.band) {
-    const worse = band === 'p0' || (band === 'p1' && previous.band === 'ok')
+  // Founder rule: nothing at all while the balance is $200+. So no "online"
+  // message on a healthy first sample and no "recovered" message on returning
+  // to OK; only moves into (or between) the low bands are announced.
+  if (band !== 'ok' && band !== previous.band) {
+    const worse = previous.band === null || previous.band === 'ok' || band === 'p0'
     messages.push(
       worse
         ? `[MPP Router] ${band === 'p0' ? '🚨' : '⚠️'} Funder balance ${BAND_LABEL[band]}: ${current}\n` +
             `Wallet: ${address} (Base USDC)\n` +
             (band === 'p0'
               ? `Impact: coupon / Coinbase / Stripe payments may already fail with insufficient funder balance.\n`
-              : `Impact: the payout refill is not keeping up with spend.\n`) +
+              : `Impact: top up soon; below ${formatUsd(FUNDER_P0_THRESHOLD)} payments start failing.\n`) +
             `Action needed: send Base USDC to the wallet above.`
-        : `[MPP Router] ✅ Funder balance back to ${BAND_LABEL[band]}: ${current}\n` +
+        : `[MPP Router] Funder balance improved to ${BAND_LABEL[band]}: ${current}\n` +
             `Wallet: ${address} (Base USDC)`,
     )
   }
