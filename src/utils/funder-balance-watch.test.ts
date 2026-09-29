@@ -37,8 +37,8 @@ describe('formatting and bands', () => {
   it('classifies the P0/P1 bands', () => {
     expect(classifyBand(usd(49.99))).toBe('p0')
     expect(classifyBand(usd(50))).toBe('p1')
-    expect(classifyBand(usd(99.99))).toBe('p1')
-    expect(classifyBand(usd(100))).toBe('ok')
+    expect(classifyBand(usd(199.99))).toBe('p1')
+    expect(classifyBand(usd(200))).toBe('ok')
   })
 })
 
@@ -51,18 +51,20 @@ describe('decide', () => {
 
   it('is silent while the band is unchanged', () => {
     expect(decide(st(), usd(390), ADDR, 1).messages).toEqual([])
-    expect(decide(st({ band: 'p1', lastBalance: usd(90).toString() }), usd(85), ADDR, 1).messages).toEqual([])
+    expect(decide(st({ band: 'p1', lastBalance: usd(190).toString() }), usd(185), ADDR, 1).messages).toEqual([])
   })
 
   it('alerts on ok → p1 → p0 and on recovery', () => {
-    expect(decide(st({ lastBalance: usd(120).toString() }), usd(95), ADDR, 1).messages[0]).toContain('P1')
+    expect(decide(st({ lastBalance: usd(250).toString() }), usd(195), ADDR, 1).messages[0]).toContain('P1')
     expect(decide(st({ band: 'p1', lastBalance: usd(60).toString() }), usd(45), ADDR, 1).messages[0]).toContain('🚨')
     expect(decide(st({ band: 'p0', lastBalance: usd(45).toString() }), usd(245), ADDR, 1).messages[0]).toContain('back to OK')
   })
 
   it('flags a >50% drop of at least $20, and not smaller ones', () => {
-    const big = decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, SAMPLE_INTERVAL_MS).messages
+    const big = decide(st({ lastBalance: usd(1000).toString() }), usd(150), ADDR, SAMPLE_INTERVAL_MS).messages
     expect(big.some((m) => m.includes('dropped sharply') && m.includes('in 15 min'))).toBe(true)
+    // Founder rule: a drop that still leaves $200+ sends nothing.
+    expect(decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, SAMPLE_INTERVAL_MS).messages).toEqual([])
     expect(decide(st({ lastBalance: usd(400).toString() }), usd(250), ADDR, 1).messages).toEqual([])
     expect(decide(st({ band: 'p0', lastBalance: usd(30).toString() }), usd(12), ADDR, 1).messages).toEqual([])
   })
@@ -85,11 +87,11 @@ describe('decide', () => {
 
 describe('drop rule needs consecutive readable samples', () => {
   it('does not call spend across an RPC outage a sudden drop', () => {
-    const d = decide(st({ lastBalance: usd(1000).toString(), unreadableStreak: 3 }), usd(400), ADDR, SAMPLE_INTERVAL_MS)
+    const d = decide(st({ band: 'p1', lastBalance: usd(180).toString(), unreadableStreak: 3 }), usd(60), ADDR, SAMPLE_INTERVAL_MS)
     expect(d.messages).toEqual([])
   })
   it('does not compare across a long cron gap', () => {
-    const d = decide(st({ lastBalance: usd(1000).toString() }), usd(400), ADDR, 10 * SAMPLE_INTERVAL_MS)
+    const d = decide(st({ band: 'p1', lastBalance: usd(180).toString() }), usd(60), ADDR, 10 * SAMPLE_INTERVAL_MS)
     expect(d.messages).toEqual([])
   })
 })

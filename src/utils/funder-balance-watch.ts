@@ -25,8 +25,11 @@ const USDC = 1_000_000n
 
 /** P0: one OpenRouter top-up can exhaust it; redemptions may already fail. */
 export const FUNDER_P0_THRESHOLD = 50n * USDC
-/** P1: the payout refill is not keeping up with spend. */
-export const FUNDER_P1_THRESHOLD = 100n * USDC
+/**
+ * P1: time to top up. Founder rule 2026-09-29: while the balance is at or
+ * above $200, send nothing at all, including sudden-drop alerts.
+ */
+export const FUNDER_P1_THRESHOLD = 200n * USDC
 /** A drop between two samples counts as abnormal only if it is both >50% ... */
 export const DROP_MIN_RATIO_PCT = 50n
 /** ... and at least $20, so small balances wobbling do not page anyone. */
@@ -133,7 +136,7 @@ export function decide(
       `[MPP Router] ✅ Funder balance monitor online: ${current}\n` +
         `Wallet: ${address} (Base USDC)\n` +
         `Alerts: below ${formatUsd(FUNDER_P1_THRESHOLD)} (P1), below ${formatUsd(FUNDER_P0_THRESHOLD)} (P0), ` +
-        `or a drop of more than ${DROP_MIN_RATIO_PCT}% and at least ${formatUsd(DROP_MIN_ABS)} within ~15 min.` +
+        `or a drop of more than ${DROP_MIN_RATIO_PCT}% and at least ${formatUsd(DROP_MIN_ABS)} within ~15 min that ends below ${formatUsd(FUNDER_P1_THRESHOLD)}.` +
         (band === 'ok' ? '' : `\nCurrently ${BAND_LABEL[band]}: top up the wallet above.`),
     )
   } else if (band !== previous.band) {
@@ -159,7 +162,9 @@ export function decide(
   if (previous.lastBalance !== null && previous.unreadableStreak === 0 && elapsed <= 2 * SAMPLE_INTERVAL_MS) {
     const prev = BigInt(previous.lastBalance)
     const drop = prev - balance
-    if (prev > 0n && drop >= DROP_MIN_ABS && drop * 100n > prev * DROP_MIN_RATIO_PCT) {
+    // Quiet above the P1 line (founder rule): a big payment that still leaves
+    // $200+ on hand is not worth a message.
+    if (balance < FUNDER_P1_THRESHOLD && prev > 0n && drop >= DROP_MIN_ABS && drop * 100n > prev * DROP_MIN_RATIO_PCT) {
       messages.push(
         `[MPP Router] ⚠️ Funder balance dropped sharply: ${formatUsd(prev)} → ${current} ` +
           `(-${formatUsd(drop)}, -${(drop * 100n) / prev}%) in ${Math.round(elapsed / 60_000)} min\n` +
