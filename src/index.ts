@@ -112,6 +112,7 @@ import { handlePreflight, withCors } from './utils/cors'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
 import { checkFunderBalance } from './utils/funder-balance-watch'
+import { feishuConfigured, sendFeishuAlertConfirmed } from './utils/feishu'
 import { sendDingTalkAlert, sendDingTalkAlertConfirmed } from './utils/dingtalk'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
@@ -407,6 +408,13 @@ export interface Env {
   // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
   DINGTALK_ACCESS_TOKEN?: string
 
+  // Feishu app bot for alerts the founder must see (currently the funder
+  // balance watch). All three are secrets: wrangler secret put FEISHU_APP_ID /
+  // FEISHU_APP_SECRET / FEISHU_ALERT_CHAT_ID. See utils/feishu.ts.
+  FEISHU_APP_ID?: string
+  FEISHU_APP_SECRET?: string
+  FEISHU_ALERT_CHAT_ID?: string
+
   // Stuck-order Intercom tickets (utils/intercom-ticket.ts). The token is a
   // private-app token with only "Write tickets"; set via
   // `wrangler secret put INTERCOM_TICKET_TOKEN`. Unset → tickets are skipped,
@@ -607,10 +615,16 @@ export default {
  */
 async function watchFunderBalance(env: Env): Promise<void> {
   try {
-    if (!env.DINGTALK_ACCESS_TOKEN) {
-      console.warn('[funder-balance-watch] DINGTALK_ACCESS_TOKEN unset — funder wallet is NOT being monitored')
+    // Feishu is where the founder reads alerts. DingTalk is only a fallback so
+    // a missing Feishu secret degrades to "wrong channel" rather than silence.
+    const feishu = { appId: env.FEISHU_APP_ID, appSecret: env.FEISHU_APP_SECRET, chatId: env.FEISHU_ALERT_CHAT_ID }
+    const useFeishu = feishuConfigured(feishu)
+    if (!useFeishu && !env.DINGTALK_ACCESS_TOKEN) {
+      console.warn('[funder-balance-watch] no alert channel configured — funder wallet is NOT being monitored')
       return
     }
+    if (!useFeishu) console.warn('[funder-balance-watch] Feishu secrets unset — falling back to DingTalk')
+
     const result = await checkFunderBalance({
       kv: env.MPP_STORE,
       address: FUNDER_WALLET,
@@ -620,7 +634,11 @@ async function watchFunderBalance(env: Env): Promise<void> {
     // Commit only if every message was confirmed delivered; otherwise the
     // next tick re-decides from the old state and sends again.
     for (const message of result.messages) {
-      if (!(await sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN, redactForAlert(message)))) return
+      const text = redactForAlert(message)
+      const sent = useFeishu
+        ? await sendFeishuAlertConfirmed(feishu, text)
+        : await sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN!, text)
+      if (!sent) return
     }
     await result.commit()
   } catch (err) {
