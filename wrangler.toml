@@ -286,6 +286,10 @@ ROZO_DELIVERED_REPORT_ENABLED = "true"
 # half-open surface looks usable and then fails at the point where money moves.
 # Flip to "false" and redeploy to pull the feature without a code rollback.
 PARTNER_ENDPOINT_ENABLED = "true"
+# PostHog project key for the /partner pages (project 555409 "MPPRouter", the
+# same one www.mpprouter.dev reports to). A phc_ key is a public, write-only
+# ingest token, so it lives here rather than in a secret. Empty => no analytics.
+PARTNER_POSTHOG_KEY = "phc_DkNJZ4ftgYSRHjWdcMdV6ufkraEUz5neXSXZLdw5YYmn"
 # NOTE: PARTNER_CONTACT was removed on 2026-08-07. Every "contact us" route on
 # the partner pages is the Intercom launcher now, so a hostname-shaped contact
 # string here would only ever go stale and send someone to a dead channel.
