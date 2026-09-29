@@ -168,7 +168,11 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 #   BNB@56    BSC BNB,  rozotest order 25842287, 2026-09-28
 # ETH@1 and SOL@900 stay closed until their own real payment. Remove an entry
 # (or the whole line) and redeploy to close a chain.
-NATIVE_SOURCES = "ETH@8453,BNB@56"
+# 2026-09-29: all closed again. Native orders land on invoice.rozo.ai/checkout,
+# whose pay SDK cannot pay a native source, so payers were shown "0.014 BNB"
+# with no way to pay. Reopen after invoice.rozo.ai renders native orders.
+# Internal rozotest invoices still open every native coin for testing.
+NATIVE_SOURCES = ""
 # Stuck-order Intercom tickets (src/utils/intercom-ticket.ts). Ticket type 4 is
 # the workspace's built-in "Internal task" (Back-office) type; the contact is
 # an internal Rozo team contact, because router records hold no customer
