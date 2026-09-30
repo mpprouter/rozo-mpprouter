@@ -23,6 +23,13 @@
  *  - unknown keys and non-string values are dropped; control and format
  *    characters are stripped; over-length values are truncated
  *  - when `client` is absent it is derived from the User-Agent header
+ *  - `country` is server-owned: it comes only from Cloudflare's edge
+ *    (`request.cf.country`, else the `cf-ipcountry` header; ISO 3166-1
+ *    alpha-2, e.g. "US"), never from the body. A caller-supplied `country` is dropped with the other unknown keys.
+ *    Cloudflare's "XX" (unknown) and "T1" (Tor) are not countries and are
+ *    omitted. Added 2026-09-30 for the per-country D7 in the weekly report
+ *    (ainative growth-design-v3 §5). Country only, never the IP: metadata is
+ *    returned to anyone holding the order id.
  *
  * Telemetry rules, same as the rest of the money path: this never throws, and
  * it never influences pricing, routing, validation or error codes. Anything it
@@ -37,6 +44,8 @@ export interface OrderAttribution {
   utm_content?: string
   referrer?: string
   landing_path?: string
+  /** Server-derived from `cf-ipcountry`; never caller-supplied. */
+  country?: string
 }
 
 const CLIENT_MAX = 64
@@ -48,6 +57,11 @@ const UTM_KEYS = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_content'] as 
 // C0/C1 controls (Cc) and invisible format characters (Cf: zero-width, bidi
 // overrides, BOM). Stripped rather than enumerated glyph by glyph.
 const INVISIBLE = /[\p{Cc}\p{Cf}]/gu
+
+// Two uppercase letters. Cloudflare sends "XX" for unknown and "T1" for Tor;
+// neither is a country, so both are omitted rather than stored.
+const COUNTRY_RE = /^[A-Z]{2}$/
+const NOT_A_COUNTRY = new Set(['XX', 'T1'])
 
 const SKILL_UA = /^rozo-checkout-skill\/[A-Za-z0-9._+-]+/
 
@@ -104,6 +118,27 @@ export function clientFromUserAgent(ua: string | null | undefined): string {
 }
 
 /**
+ * ISO country of the caller from Cloudflare (`request.cf.country`, else the
+ * `cf-ipcountry` header), or null
+ * when absent, malformed, unknown ("XX") or Tor ("T1"). Never throws.
+ */
+export function countryFromRequest(request: Request): string | null {
+  try {
+    // request.cf is set by the Cloudflare edge and cannot be supplied by the
+    // caller; the cf-ipcountry header (also edge-set, needs IP Geolocation on
+    // the zone) is the fallback.
+    const cf = (request as unknown as { cf?: { country?: unknown } }).cf
+    const raw = typeof cf?.country === 'string' ? cf.country : request.headers.get('cf-ipcountry')
+    if (typeof raw !== 'string') return null
+    const value = raw.trim().toUpperCase()
+    if (!COUNTRY_RE.test(value) || NOT_A_COUNTRY.has(value)) return null
+    return value
+  } catch {
+    return null
+  }
+}
+
+/**
  * Sanitize the caller-supplied `attribution` object. Returns null when nothing
  * survives (including a missing or non-object value). Never throws.
  */
@@ -145,6 +180,9 @@ export function buildOrderAttribution(raw: unknown, request: Request): OrderAttr
       }
       sanitized.client = clientFromUserAgent(ua)
     }
+    // Server-owned: set after sanitizing so a body value can never win.
+    const country = countryFromRequest(request)
+    if (country) sanitized.country = country
     return sanitized
   } catch {
     return null

@@ -12,6 +12,7 @@ import { handleCreateInvoice } from '../src/routes/create-invoice'
 import {
   buildOrderAttribution,
   clientFromUserAgent,
+  countryFromRequest,
   sanitizeOrderAttribution,
 } from '../src/routes/order-attribution'
 import type { Env } from '../src/index'
@@ -136,6 +137,42 @@ describe('buildOrderAttribution', () => {
   })
 })
 
+describe('countryFromRequest', () => {
+  const req = (country?: string) =>
+    new Request('https://mpp.test/x', { headers: country !== undefined ? { 'cf-ipcountry': country } : {} })
+
+  it('reads the Cloudflare country header', () => {
+    expect(countryFromRequest(req('US'))).toBe('US')
+    expect(countryFromRequest(req(' in '))).toBe('IN')
+  })
+  it('prefers the edge-set request.cf.country over the header', () => {
+    const r = new Request('https://mpp.test/x', { headers: { 'cf-ipcountry': 'US' } })
+    Object.defineProperty(r, 'cf', { value: { country: 'JP' } })
+    expect(countryFromRequest(r)).toBe('JP')
+  })
+  it('omits unknown, Tor, malformed and missing values', () => {
+    expect(countryFromRequest(req('XX'))).toBeNull()
+    expect(countryFromRequest(req('T1'))).toBeNull()
+    expect(countryFromRequest(req('USA'))).toBeNull()
+    expect(countryFromRequest(req('1'))).toBeNull()
+    expect(countryFromRequest(req(''))).toBeNull()
+    expect(countryFromRequest(req())).toBeNull()
+  })
+})
+
+describe('buildOrderAttribution — country', () => {
+  it('adds the server-derived country', () => {
+    const r = new Request('https://mpp.test/x', { headers: { 'cf-ipcountry': 'BR', 'user-agent': 'Mozilla/5.0' } })
+    expect(buildOrderAttribution({ utm_source: 'x' }, r)).toEqual({ utm_source: 'x', client: 'browser', country: 'BR' })
+  })
+  it('never takes country from the body', () => {
+    const noHeader = new Request('https://mpp.test/x')
+    expect(buildOrderAttribution({ country: 'US' }, noHeader)).toEqual({ client: 'unknown' })
+    const withHeader = new Request('https://mpp.test/x', { headers: { 'cf-ipcountry': 'ID' } })
+    expect(buildOrderAttribution({ country: 'US' }, withHeader)).toEqual({ client: 'unknown', country: 'ID' })
+  })
+})
+
 // ── Integration: create-invoice (Coinbase line) ───────────────────────────────
 
 function makeEnv(): Env {
@@ -187,9 +224,10 @@ function installFetchMock() {
   }) as typeof fetch)
 }
 
-async function createInvoice(body: Record<string, unknown> | string, ua?: string) {
+async function createInvoice(body: Record<string, unknown> | string, ua?: string, country?: string) {
   const headers: Record<string, string> = { 'content-type': 'application/json' }
   if (ua) headers['user-agent'] = ua
+  if (country) headers['cf-ipcountry'] = country
   const res = await handleCreateInvoice(
     new Request('https://mpp.test/create-invoice', {
       method: 'POST',
@@ -240,6 +278,11 @@ describe('create-invoice — metadata.attribution', () => {
     expect(status).toBe(200)
     expect(createdIntent.type).toBe('exactOut')
     expect(createdIntent.metadata.attribution).toEqual({ utm_medium: 'email', client: 'browser' })
+  })
+
+  it('records the cf-ipcountry country on the created order', async () => {
+    await createInvoice({ payment_id: PAYMENT_ID, source: EVM_SOURCE }, 'Mozilla/5.0', 'IN')
+    expect(createdIntent.metadata.attribution).toEqual({ client: 'browser', country: 'IN' })
   })
 
   it('derives client from the User-Agent when no attribution is sent', async () => {
