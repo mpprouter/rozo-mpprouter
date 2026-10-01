@@ -11,6 +11,7 @@ function makeEnv(extra: Record<string, string> = {}): Env {
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     ROZO_INTENTS_API_KEY: 'test-key',
     BITREFILL_ENABLED: 'true',
+    ROZO_BITREFILL_API_KEY: 'bitrefill-key',
     MPP_STORE: {
       get: async (k: string) => store.get(k) ?? null,
       put: async (k: string, v: string) => void store.set(k, v),
@@ -22,12 +23,16 @@ function makeEnv(extra: Record<string, string> = {}): Env {
 let createdIntent: any = null
 let posts = 0
 let existingOrder: any = null
+let seenKeys: string[] = []
+const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 
 beforeEach(() => {
   createdIntent = null
   posts = 0
   existingOrder = null
+  seenKeys = []
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
+    seenKeys.push(new Headers(init?.headers).get('X-API-Key') ?? '')
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     if (u.includes('/payments/order/')) {
       return existingOrder
@@ -53,7 +58,7 @@ afterEach(() => vi.restoreAllMocks())
 function body(over: Record<string, unknown> = {}, br: Record<string, unknown> = {}) {
   return {
     provider: 'bitrefill',
-    bitrefill: { invoiceId: 'inv-abc123', address: ADDR, amount: '12.345678', ...br },
+    bitrefill: { invoiceId: 'inv-abc123', address: ADDR, amount: '12.345678', expiresAt: inMinutes(15), ...br },
     source: { chainId: '1500', tokenSymbol: 'USDC' },
     ...over,
   }
@@ -81,10 +86,9 @@ describe('create-invoice provider=bitrefill', () => {
       invoiceId: 'inv-abc123',
       rozoPaymentId: 'rozo-pay-bitrefill',
       destination: { chainId: '8453', tokenSymbol: 'USDC', address: ADDR, amount: '12.345678' },
-      expiresAt: '2999-01-01T12:00:00.000Z',
     })
     expect(createdIntent).toMatchObject({
-      appId: 'merchant_openrouter',
+      appId: 'merchant_bitrefill',
       orderId: 'bitrefill_inv-abc123',
       type: 'exactOut',
       source: { chainId: '1500', tokenSymbol: 'USDC' },
@@ -98,6 +102,8 @@ describe('create-invoice provider=bitrefill', () => {
       metadata: { source: 'mpprouter-create-invoice', provider: 'bitrefill', bitrefillInvoiceId: 'inv-abc123' },
     })
     expect(createdIntent.source.amount).toBeUndefined()
+    expect(seenKeys.length).toBeGreaterThan(0)
+    expect(seenKeys.every((k) => k === 'bitrefill-key')).toBe(true)
   })
 
   it('returns the earlier of Bitrefill and Rozo expiry', async () => {
@@ -127,7 +133,12 @@ describe('create-invoice provider=bitrefill', () => {
     [{ amount: '1.1234567' }, 'INVALID_AMOUNT'],
     [{ amount: 5 }, 'INVALID_AMOUNT'],
     [{ amount: String(BITREFILL_MAX_USDC + 0.01) }, 'AMOUNT_OUT_OF_RANGE'],
-    [{ expiresAt: new Date(Date.now() + 60_000).toISOString() }, 'INVOICE_EXPIRING'],
+    [{ address: '0x8fe7155119d2975780c9e19b07dd98393965bc2a' }, 'BLOCKED_ADDRESS'],
+    [{ address: '0xFD0E6FA2ABA8436E95F3FB3523AC14BA299C0E79' }, 'BLOCKED_ADDRESS'],
+    [{ expiresAt: inMinutes(1) }, 'INVOICE_EXPIRING'],
+    [{ expiresAt: inMinutes(45) }, 'INVALID_INPUT'],
+    [{ expiresAt: undefined }, 'INVALID_INPUT'],
+    [{ expiresAt: 'soon' }, 'INVALID_INPUT'],
     [{ invoiceId: '../etc' }, 'INVALID_INPUT'],
   ])('rejects %j with %s', async (br, code) => {
     const { status, json } = await post(body({}, br))
@@ -141,6 +152,36 @@ describe('create-invoice provider=bitrefill', () => {
     const { status } = await post(body({}, { address: mixed, amount: String(BITREFILL_MAX_USDC) }))
     expect(status).toBe(200)
     expect(createdIntent.destination.receiverAddress).toBe(mixed)
+  })
+
+  it('503 BITREFILL_NOT_CONFIGURED without its own key (no OpenRouter fallback)', async () => {
+    const { status, json } = await post(body(), makeEnv({ ROZO_BITREFILL_API_KEY: '' }))
+    expect(status).toBe(503)
+    expect(json.error).toBe('BITREFILL_NOT_CONFIGURED')
+    expect(seenKeys).toEqual([])
+  })
+
+  it('applies NATIVE_MAX_USD to native sources', async () => {
+    const env = makeEnv({ NATIVE_SOURCES: 'ETH@8453', NATIVE_MAX_USD: '50' })
+    const over = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '60' }), env)
+    expect(over.status).toBe(400)
+    expect(over.json.error).toBe('AMOUNT_OUT_OF_RANGE')
+    const under = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '40' }), env)
+    expect(under.status).toBe(200)
+  })
+
+  it('503 RETRY_LATER when the race winner has no id yet', async () => {
+    vi.mocked(globalThis.fetch).mockImplementation((async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input.url
+      if (u.includes('/payments/order/')) {
+        return posts ? new Response('{}', { status: 200 }) : new Response('nf', { status: 404 })
+      }
+      posts++
+      return new Response('{"error":"orderIdConflict"}', { status: 409 })
+    }) as typeof fetch)
+    const { status, json } = await post(body())
+    expect(status).toBe(503)
+    expect(json.error).toBe('RETRY_LATER')
   })
 
   it('rejects unsupported sources', async () => {

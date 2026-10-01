@@ -15,30 +15,42 @@
  */
 import type { Env } from '../index'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
-import { parseNativeSources } from './native-sources'
+import { isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
 import { normalizeCheckoutClient } from './checkout-web-pricing'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
-// Same merchant appId as the Coinbase/OpenRouter create-invoice line.
-export const BITREFILL_APP_ID = 'merchant_openrouter'
+// Dedicated merchant. payment-api overrides body.appId with the API key's
+// app_id, so the key (ROZO_BITREFILL_API_KEY) is what actually selects it.
+export const BITREFILL_APP_ID = 'merchant_bitrefill'
 const BASE_CHAIN_ID = '8453'
 const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 
 /** Max USDC a single Bitrefill invoice may route through us. */
-export const BITREFILL_MAX_USDC = 500
+export const BITREFILL_MAX_USDC = 200
 /** Minimum time left on the Bitrefill invoice before we open a deposit. */
 export const BITREFILL_MIN_REMAINING_MS = 5 * 60 * 1000
+/** Bitrefill invoices live ~15 min; anything further out is not one. */
+export const BITREFILL_MAX_REMAINING_MS = 30 * 60 * 1000
 /** orderId prefix; the webhook uses it to skip router-side settlement. */
 export const BITREFILL_ORDER_PREFIX = 'bitrefill_'
 
-// Known compromised / attacker addresses (lowercased). No shared blocklist
-// exists in this repo, so these are hard-coded here.
-const BLOCKED_ADDRESSES: ReadonlySet<string> = new Set([
-  '0x0000000000000000000000000000000000000000',
-  '0x5772fbe7a7817ef7f586215ca8b23b8dd22c8897',
-  '0xf621ee3bae3cbe924ec05f795d14e31384bd11b6',
-])
+// Known compromised / attacker EVM addresses. No shared blocklist exists in
+// this repo, so these are hard-coded here and compared lowercased.
+const BLOCKED_ADDRESSES: ReadonlySet<string> = new Set(
+  [
+    '0x0000000000000000000000000000000000000000',
+    '0x8FE7155119d2975780c9e19B07dD98393965Bc2a',
+    '0xa9E3Da13EF5eADFC6EcB2BB6BDddE95016B567dB',
+    '0x5772FBe7a7817ef7F586215CA8b23b8dD22C8897',
+    '0x44d6B5a11FFc5Ba1043734d88af5E5dea36a648A',
+    '0x467AeD16d024405116cF4Ba12976Bf63B404517b',
+    '0xF621Ee3BaE3cbE924Ec05f795d14E31384Bd11b6',
+    '0x49CD5655Cc9bf7c7C93fBb2DF36AA3020d11eEe0',
+    '0xa9BacE1614d6cFf8aa159A2A41eE8BaA9a91Cc7B',
+    '0xfD0e6fA2ABA8436e95f3Fb3523AC14Ba299c0e79',
+  ].map((a) => a.toLowerCase()),
+)
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
 const AMOUNT_RE = /^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/
@@ -80,6 +92,12 @@ export async function handleBitrefillCreateInvoice(
   if (String(env.BITREFILL_ENABLED ?? 'false').toLowerCase() !== 'true') {
     return fail(403, 'BITREFILL_DISABLED', 'Bitrefill invoice payment is not enabled.')
   }
+  // Never fall back to the OpenRouter key: payment-api derives the merchant
+  // from the key, so that would file these orders under merchant_openrouter.
+  const apiKey = env.ROZO_BITREFILL_API_KEY
+  if (!apiKey) {
+    return fail(503, 'BITREFILL_NOT_CONFIGURED', 'Bitrefill invoice payment is not configured.')
+  }
 
   const br = parsed.bitrefill
   if (!br || typeof br !== 'object' || Array.isArray(br)) {
@@ -102,17 +120,23 @@ export async function handleBitrefillCreateInvoice(
   if (Number(amount) > BITREFILL_MAX_USDC) {
     return fail(400, 'AMOUNT_OUT_OF_RANGE', `bitrefill.amount must be at most ${BITREFILL_MAX_USDC} USDC.`)
   }
-  let expiresAtIso: string | null = null
-  if (expiresAt !== undefined && expiresAt !== null) {
-    const t = typeof expiresAt === 'string' ? Date.parse(expiresAt) : NaN
-    if (!Number.isFinite(t)) {
-      return fail(400, 'INVALID_INPUT', 'bitrefill.expiresAt must be an ISO-8601 timestamp.')
-    }
-    if (t - Date.now() < BITREFILL_MIN_REMAINING_MS) {
-      return fail(400, 'INVOICE_EXPIRING', 'The Bitrefill invoice expires in under 5 minutes. Create a new invoice.')
-    }
-    expiresAtIso = new Date(t).toISOString()
+  // expiresAt is required. Rozo's deposit TTL is fixed at ~1h by payment-api
+  // and cannot be shortened by the caller, so the deposit stays payable after
+  // the Bitrefill invoice dies. The CLIENT must stop the payment at the
+  // returned expiresAt; funds sent later still reach the (dead) invoice
+  // address and need Bitrefill support to recover.
+  const t = typeof expiresAt === 'string' ? Date.parse(expiresAt) : NaN
+  if (!Number.isFinite(t)) {
+    return fail(400, 'INVALID_INPUT', 'bitrefill.expiresAt is required and must be an ISO-8601 timestamp.')
   }
+  const remaining = t - Date.now()
+  if (remaining < BITREFILL_MIN_REMAINING_MS) {
+    return fail(400, 'INVOICE_EXPIRING', 'The Bitrefill invoice expires in under 5 minutes. Create a new invoice.')
+  }
+  if (remaining > BITREFILL_MAX_REMAINING_MS) {
+    return fail(400, 'INVALID_INPUT', 'bitrefill.expiresAt is more than 30 minutes away; pass the Bitrefill invoice expiry.')
+  }
+  const expiresAtIso = new Date(t).toISOString()
 
   const src = resolveSource(parsed.source, parseNativeSources(env.NATIVE_SOURCES))
   if (!src.resolved) {
@@ -121,6 +145,9 @@ export async function handleBitrefillCreateInvoice(
     })
   }
   const source = src.resolved
+  if (isNativeSymbol(source.chainId, source.tokenSymbol) && Number(amount) > nativeMaxUsd(env.NATIVE_MAX_USD)) {
+    return fail(400, 'AMOUNT_OUT_OF_RANGE', `Native coin payment is limited to $${nativeMaxUsd(env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`)
+  }
 
   const orderId = bitrefillOrderId(invoiceId)
 
@@ -128,7 +155,7 @@ export async function handleBitrefillCreateInvoice(
     try {
       const r = await fetch(
         `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(BITREFILL_APP_ID)}/${encodeURIComponent(orderId)}`,
-        { method: 'GET', headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
+        { method: 'GET', headers: { 'X-API-Key': apiKey } },
       )
       if (r.status === 404) return { state: 'missing' }
       if (!r.ok) return { state: 'error' }
@@ -139,7 +166,9 @@ export async function handleBitrefillCreateInvoice(
     }
   }
   const duplicate = (row: any) =>
-    fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
+    !row?.id
+      ? fail(503, 'RETRY_LATER', 'A payment for this Bitrefill invoice is being created. Retry in a few seconds to get its id; do not pay yet.')
+      : fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
       invoiceId,
       rozoPaymentId: row?.id ?? null,
       expiresAt: row?.expiresAt ?? null,
@@ -188,7 +217,7 @@ export async function handleBitrefillCreateInvoice(
     resp = await fetch(ROZO_INTENTS_URL, {
       method: 'POST',
       headers: withForwardedClientHint(
-        { 'content-type': 'application/json', 'X-API-Key': env.ROZO_INTENTS_API_KEY },
+        { 'content-type': 'application/json', 'X-API-Key': apiKey },
         forwardedClientHintHeader(request, client),
       ),
       body: JSON.stringify(intentsBody),
@@ -213,7 +242,7 @@ export async function handleBitrefillCreateInvoice(
 
   // Effective expiry: the earlier of Bitrefill's and the Rozo deposit's.
   const rozoExp = typeof created?.expiresAt === 'string' ? Date.parse(created.expiresAt) : NaN
-  const bitrefillExp = expiresAtIso ? Date.parse(expiresAtIso) : NaN
+  const bitrefillExp = Date.parse(expiresAtIso)
   const candidates = [rozoExp, bitrefillExp].filter(Number.isFinite)
   const effectiveExpiresAt = candidates.length ? new Date(Math.min(...candidates)).toISOString() : null
 
