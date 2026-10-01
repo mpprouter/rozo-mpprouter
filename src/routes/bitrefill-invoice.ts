@@ -171,7 +171,9 @@ export async function handleBitrefillCreateInvoice(
       : fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
       invoiceId,
       rozoPaymentId: row?.id ?? null,
-      expiresAt: row?.expiresAt ?? null,
+      // Prefer the Bitrefill expiry stored at create time over Rozo's ~1h one.
+      expiresAt: row?.metadata?.bitrefillExpiresAt ?? row?.expiresAt ?? null,
+      ...(row?.source ? { source: row.source } : {}),
     })
 
   const existing = await lookupExisting()
@@ -208,6 +210,7 @@ export async function handleBitrefillCreateInvoice(
       source: 'mpprouter-create-invoice',
       provider: 'bitrefill',
       bitrefillInvoiceId: invoiceId,
+      bitrefillExpiresAt: expiresAtIso,
       ...(client ? { client } : {}),
     },
   }
@@ -252,7 +255,8 @@ export async function handleBitrefillCreateInvoice(
     rozoPaymentId: created?.id ?? null,
     destination: { chainId: BASE_CHAIN_ID, tokenSymbol: 'USDC', address, amount },
     expiresAt: effectiveExpiresAt,
-    ...(created?.paymentLink ? { paymentLink: created.paymentLink } : {}),
+    // Rozo's hosted paymentLink is intentionally withheld: that page stays
+    // payable ~1h, long after the Bitrefill invoice expires.
     ...(created?.source ? { source: created.source } : {}),
   })
 }

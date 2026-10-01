@@ -102,6 +102,10 @@ describe('create-invoice provider=bitrefill', () => {
       metadata: { source: 'mpprouter-create-invoice', provider: 'bitrefill', bitrefillInvoiceId: 'inv-abc123' },
     })
     expect(createdIntent.source.amount).toBeUndefined()
+    expect(json.paymentLink).toBeUndefined()
+    expect(JSON.stringify(json)).not.toContain('pay.rozo.ai')
+    expect(json.source).toMatchObject({ amount: '12.37', chainId: '1500' })
+    expect(typeof createdIntent.metadata.bitrefillExpiresAt).toBe('string')
     expect(seenKeys.length).toBeGreaterThan(0)
     expect(seenKeys.every((k) => k === 'bitrefill-key')).toBe(true)
   })
@@ -196,6 +200,7 @@ describe('create-invoice provider=bitrefill', () => {
     const { status, json } = await post(body())
     expect(status).toBe(409)
     expect(json).toMatchObject({ ok: false, error: 'DUPLICATE_INVOICE', rozoPaymentId: 'rozo-existing' })
+    expect(json.paymentLink).toBeUndefined()
     expect(posts).toBe(0)
   })
 
