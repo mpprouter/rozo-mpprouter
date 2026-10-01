@@ -155,6 +155,8 @@ migrations_dir = "migrations-metrics"
 # Public keys (not secrets, safe to commit)
 [vars]
 PROVIDERS_ENDPOINT_ENABLED = "true"
+# Bitrefill invoice payment via create-invoice provider "bitrefill".
+BITREFILL_ENABLED = "false"
 # Hostname suffix for router-hosted paywalls (services/provider-hosting.ts).
 PROVIDER_HOSTED_SUFFIX = "-pay.mpprouter.dev"
 # Default checkout fee. checkout.rozo.ai and the existing agent.rozo.ai use

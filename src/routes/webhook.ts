@@ -1,5 +1,6 @@
 import type { Env } from '../index'
 import { isTestPaymentId } from './native-sources'
+import { isBitrefillOrderId } from './bitrefill-invoice'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { baseLinkIdOf } from '../mpp/contract-variant'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
@@ -479,6 +480,13 @@ export async function handleRozoWebhook(
       eventType,
       plId,
     })
+  }
+
+  // 5a. Bitrefill orders settle directly (Rozo pays the Bitrefill address);
+  // there is nothing for the router to pay, so never fall into Coinbase
+  // settlement for them.
+  if (isBitrefillOrderId(plId)) {
+    return json(200, { ok: true, ignored: 'bitrefill order settles directly', eventId, eventType, plId })
   }
 
   // 5. Dedup by event_id. If we've seen this exact event before, return

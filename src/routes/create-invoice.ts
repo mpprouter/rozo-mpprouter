@@ -1,5 +1,6 @@
 import type { Env } from '../index'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
+import { handleBitrefillCreateInvoice } from './bitrefill-invoice'
 import {
   normalizePayInvoiceBody,
   type PayInvoiceErrorCode,
@@ -718,6 +719,14 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     parsed = await request.json()
   } catch {
     return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid JSON body' })
+  }
+
+  // Bitrefill: direct exactOut to the Bitrefill receiving address (no funder).
+  if (
+    parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
+    (parsed as Record<string, unknown>).provider === 'bitrefill'
+  ) {
+    return handleBitrefillCreateInvoice(request, env, parsed as Record<string, unknown>, resolveSource)
   }
 
   const { normalized, error, link_id_detected, provider_detected, raw_url } =
