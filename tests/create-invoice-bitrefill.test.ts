@@ -88,7 +88,7 @@ describe('create-invoice provider=bitrefill', () => {
       destination: { chainId: '8453', tokenSymbol: 'USDC', address: ADDR, amount: '12.345678' },
     })
     expect(createdIntent).toMatchObject({
-      appId: 'merchant_bitrefill',
+      appId: 'wallet_bitrefillpay',
       orderId: 'bitrefill_inv-abc123',
       type: 'exactOut',
       source: { chainId: '1500', tokenSymbol: 'USDC' },

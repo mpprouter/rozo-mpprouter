@@ -355,7 +355,7 @@ export interface Env {
   NATIVE_MAX_USD?: string
   // Bitrefill invoice payment (provider: "bitrefill"); "true" enables it.
   BITREFILL_ENABLED?: string
-  // Rozo Intents API key bound to merchant_bitrefill (payment-api takes the
+  // Rozo Intents API key bound to wallet account wallet_bitrefillpay (payment-api takes the
   // appId from the key). Secret, not in wrangler.toml:
   //   wrangler secret put ROZO_BITREFILL_API_KEY
   // Missing while BITREFILL_ENABLED=true => 503 BITREFILL_NOT_CONFIGURED.
