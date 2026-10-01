@@ -1,0 +1,165 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { handleCreateInvoice } from '../src/routes/create-invoice'
+import { BITREFILL_MAX_USDC, isBitrefillOrderId } from '../src/routes/bitrefill-invoice'
+import type { Env } from '../src/index'
+
+const ADDR = '0x1111111111111111111111111111111111111111'
+
+function makeEnv(extra: Record<string, string> = {}): Env {
+  const store = new Map<string, string>()
+  return {
+    PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
+    ROZO_INTENTS_API_KEY: 'test-key',
+    BITREFILL_ENABLED: 'true',
+    MPP_STORE: {
+      get: async (k: string) => store.get(k) ?? null,
+      put: async (k: string, v: string) => void store.set(k, v),
+    },
+    ...extra,
+  } as unknown as Env
+}
+
+let createdIntent: any = null
+let posts = 0
+let existingOrder: any = null
+
+beforeEach(() => {
+  createdIntent = null
+  posts = 0
+  existingOrder = null
+  vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
+    const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+    if (u.includes('/payments/order/')) {
+      return existingOrder
+        ? new Response(JSON.stringify(existingOrder), { status: 200 })
+        : new Response('not found', { status: 404 })
+    }
+    if (u.includes('/payment-api') && init?.method === 'POST') {
+      posts++
+      createdIntent = JSON.parse(String(init?.body ?? '{}'))
+      return new Response(JSON.stringify({
+        id: 'rozo-pay-bitrefill',
+        paymentLink: 'https://pay.rozo.ai/b',
+        expiresAt: '2999-01-01T12:00:00.000Z',
+        source: { amount: '12.37', chainId: '1500' },
+      }), { status: 200 })
+    }
+    return new Response('{}', { status: 200 })
+  }) as typeof fetch)
+})
+
+afterEach(() => vi.restoreAllMocks())
+
+function body(over: Record<string, unknown> = {}, br: Record<string, unknown> = {}) {
+  return {
+    provider: 'bitrefill',
+    bitrefill: { invoiceId: 'inv-abc123', address: ADDR, amount: '12.345678', ...br },
+    source: { chainId: '1500', tokenSymbol: 'USDC' },
+    ...over,
+  }
+}
+
+async function post(b: unknown, env = makeEnv()) {
+  const res = await handleCreateInvoice(
+    new Request('https://mpp.test/v1/services/rozo-agent-api/create-invoice', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(b),
+    }),
+    env,
+  )
+  return { status: res.status, json: (await res.json()) as any }
+}
+
+describe('create-invoice provider=bitrefill', () => {
+  it('creates an exactOut intent straight to the Bitrefill address', async () => {
+    const { status, json } = await post(body({ client: 'rozo-checkout' }))
+    expect(status).toBe(200)
+    expect(json).toMatchObject({
+      ok: true,
+      provider: 'bitrefill',
+      invoiceId: 'inv-abc123',
+      rozoPaymentId: 'rozo-pay-bitrefill',
+      destination: { chainId: '8453', tokenSymbol: 'USDC', address: ADDR, amount: '12.345678' },
+      expiresAt: '2999-01-01T12:00:00.000Z',
+    })
+    expect(createdIntent).toMatchObject({
+      appId: 'merchant_openrouter',
+      orderId: 'bitrefill_inv-abc123',
+      type: 'exactOut',
+      source: { chainId: '1500', tokenSymbol: 'USDC' },
+      destination: {
+        chainId: '8453',
+        receiverAddress: ADDR,
+        tokenSymbol: 'USDC',
+        tokenAddress: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+        amount: '12.345678',
+      },
+      metadata: { source: 'mpprouter-create-invoice', provider: 'bitrefill', bitrefillInvoiceId: 'inv-abc123' },
+    })
+    expect(createdIntent.source.amount).toBeUndefined()
+  })
+
+  it('returns the earlier of Bitrefill and Rozo expiry', async () => {
+    const exp = new Date(Date.now() + 15 * 60 * 1000).toISOString()
+    const { status, json } = await post(body({}, { expiresAt: exp }))
+    expect(status).toBe(200)
+    expect(json.expiresAt).toBe(exp)
+  })
+
+  it('is off by default (flag unset or false)', async () => {
+    for (const env of [makeEnv({ BITREFILL_ENABLED: 'false' }), makeEnv({ BITREFILL_ENABLED: undefined as any })]) {
+      const { status, json } = await post(body(), env)
+      expect(status).toBe(403)
+      expect(json).toMatchObject({ ok: false, error: 'BITREFILL_DISABLED' })
+    }
+    expect(posts).toBe(0)
+  })
+
+  it.each([
+    [{ address: '0x123' }, 'INVALID_ADDRESS'],
+    [{ address: 'not-an-address' }, 'INVALID_ADDRESS'],
+    [{ address: '0x0000000000000000000000000000000000000000' }, 'BLOCKED_ADDRESS'],
+    [{ address: '0x5772FBe7a7817ef7F586215CA8b23b8dD22C8897' }, 'BLOCKED_ADDRESS'],
+    [{ address: '0xf621ee3bae3cbe924ec05f795d14e31384bd11b6' }, 'BLOCKED_ADDRESS'],
+    [{ amount: '0' }, 'INVALID_AMOUNT'],
+    [{ amount: '-1' }, 'INVALID_AMOUNT'],
+    [{ amount: '1.1234567' }, 'INVALID_AMOUNT'],
+    [{ amount: 5 }, 'INVALID_AMOUNT'],
+    [{ amount: String(BITREFILL_MAX_USDC + 0.01) }, 'AMOUNT_OUT_OF_RANGE'],
+    [{ expiresAt: new Date(Date.now() + 60_000).toISOString() }, 'INVOICE_EXPIRING'],
+    [{ invoiceId: '../etc' }, 'INVALID_INPUT'],
+  ])('rejects %j with %s', async (br, code) => {
+    const { status, json } = await post(body({}, br))
+    expect(status).toBe(400)
+    expect(json).toMatchObject({ ok: false, error: code })
+    expect(posts).toBe(0)
+  })
+
+  it('accepts a mixed-case (checksum-insensitive) address and the max amount', async () => {
+    const mixed = '0xAbCdEf0123456789aBcDeF0123456789AbCdEf01'
+    const { status } = await post(body({}, { address: mixed, amount: String(BITREFILL_MAX_USDC) }))
+    expect(status).toBe(200)
+    expect(createdIntent.destination.receiverAddress).toBe(mixed)
+  })
+
+  it('rejects unsupported sources', async () => {
+    const { status, json } = await post(body({ source: { chainId: '1500', tokenSymbol: 'DOGE' } }))
+    expect(status).toBe(400)
+    expect(json.error).toBe('UNSUPPORTED_SOURCE')
+    expect(posts).toBe(0)
+  })
+
+  it('returns 409 DUPLICATE_INVOICE with the existing payment id', async () => {
+    existingOrder = { id: 'rozo-existing', expiresAt: '2999-01-01T00:00:00.000Z' }
+    const { status, json } = await post(body())
+    expect(status).toBe(409)
+    expect(json).toMatchObject({ ok: false, error: 'DUPLICATE_INVOICE', rozoPaymentId: 'rozo-existing' })
+    expect(posts).toBe(0)
+  })
+
+  it('tags orderIds so the webhook skips router settlement', () => {
+    expect(isBitrefillOrderId('bitrefill_inv-abc123')).toBe(true)
+    expect(isBitrefillOrderId('pl_abc')).toBe(false)
+  })
+})

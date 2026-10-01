@@ -353,6 +353,8 @@ export interface Env {
   // rozotest_ invoices (unset = test invoices rejected).
   NATIVE_SOURCES?: string
   NATIVE_MAX_USD?: string
+  // Bitrefill invoice payment (provider: "bitrefill"); "true" enables it.
+  BITREFILL_ENABLED?: string
   ROZO_TEST_LINK_SECRET?: string
 
   // Default fee for browser checkout endpoints. Plain integer basis points;
