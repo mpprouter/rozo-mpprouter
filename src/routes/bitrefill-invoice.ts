@@ -20,9 +20,13 @@ import { normalizeCheckoutClient } from './checkout-web-pricing'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
-// Dedicated merchant. payment-api overrides body.appId with the API key's
-// app_id, so the key (ROZO_BITREFILL_API_KEY) is what actually selects it.
-export const BITREFILL_APP_ID = 'merchant_bitrefill'
+// Dedicated WALLET-type account. It must not be a merchant account: payment-api
+// rewrites destination to the merchant's own to_address for any appId with a
+// merchants row (index.ts merchant config override), which would send the USDC
+// to Rozo custody instead of the Bitrefill invoice. Wallet accounts keep the
+// caller's destination. payment-api also overrides body.appId with the API
+// key's app_id, so the key (ROZO_BITREFILL_API_KEY) is what actually selects it.
+export const BITREFILL_APP_ID = 'wallet_bitrefillpay'
 const BASE_CHAIN_ID = '8453'
 const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 
