@@ -16,6 +16,19 @@ import { listThirdPartyDirectory } from '../services/third-party-directory'
 import { getDegradedRoutes } from '../services/route-health'
 import type { Env } from '../index'
 
+/**
+ * The `services[]` array of GET /v1/services/catalog: snapshot plus
+ * self-serve overlay, with `live_status` merged on top. Shared with the
+ * per-provider index below so the two can never disagree about a route.
+ */
+export async function buildCatalogServices(env: Env) {
+  const degraded = await getDegradedRoutes(env)
+  return (await listCatalogWithOverlay(env)).map(s => ({
+    ...s,
+    ...(degraded[s.id] ?? { live_status: 'ok' as const }),
+  }))
+}
+
 export async function handleServices(env: Env): Promise<Response> {
   // Top-level "what can this router accept from agents" — lets a
   // client tell at a glance which inbound flavor it can build,
@@ -37,8 +50,6 @@ export async function handleServices(env: Env): Promise<Response> {
   // months), `live_status` says "is it working right now" (observed, resets
   // itself). Collapsing them would have hidden the very incident this
   // field was added for — see services/route-health.ts.
-  const degraded = await getDegradedRoutes(env)
-
   // Third-party providers who gave written permission to be listed and
   // whom a buyer pays at their OWN endpoint. Deliberately a separate array
   // rather than extra `services[]` rows: every existing client reads
@@ -50,10 +61,7 @@ export async function handleServices(env: Env): Promise<Response> {
   // Provider entries carry `settlement: 'direct'` and an `operator` block
   // naming the addresses the buyer pays; snapshot entries are byte-identical
   // to what they have always been.
-  const services = (await listCatalogWithOverlay(env)).map(s => ({
-    ...s,
-    ...(degraded[s.id] ?? { live_status: 'ok' as const }),
-  }))
+  const services = await buildCatalogServices(env)
 
   // Top-level payment summary so a client (and operators) can see fleet
   // health at a glance without walking every entry: how many routes the
@@ -92,6 +100,87 @@ export async function handleServices(env: Env): Promise<Response> {
         'pay the operator at resource_url.',
       services: thirdParty,
     },
+  }, null, 2), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+}
+
+/** `/v1/services/<provider>` (optional trailing slash). Anything deeper is an operation path. */
+const PROVIDER_INDEX_PATH = /^\/v1\/services\/([A-Za-z0-9._-]+)\/?$/
+
+/** The provider segment of a catalog `public_path` (`/v1/services/<provider>/...`). */
+function providerOf(publicPath: string): string | undefined {
+  return publicPath.split('/')[3] || undefined
+}
+
+/**
+ * GET /v1/services/<provider> — a read-only index of one provider's public
+ * routes, so a client that types the provider URL gets a map instead of
+ * "Unknown public service route".
+ *
+ * Every field is copied from (or counted over) the same `services[]` rows
+ * GET /v1/services/catalog returns, so this endpoint cannot expose anything
+ * the catalog does not. It is free and never issues a payment challenge.
+ *
+ * Called ONLY from the proxy's unknown-route fallback, i.e. after route
+ * resolution found no paid route at this exact path and method: a paid
+ * route with a single-segment public path always wins over this index.
+ *
+ * Returns null when the path is not a provider index or the provider is
+ * unknown, so the caller keeps its existing 400.
+ */
+export async function handleProviderIndex(env: Env, pathname: string): Promise<Response | null> {
+  const match = pathname.match(PROVIDER_INDEX_PATH)
+  if (!match) return null
+  const providerId = match[1]
+
+  const entries = (await buildCatalogServices(env)).filter(
+    s => providerOf(s.public_path) === providerId,
+  )
+  if (entries.length === 0) return null
+
+  // Catalog names read "Exa – Search the web"; the provider name is the
+  // part before the dash. Most common prefix wins, falling back to the id.
+  const prefixCounts = new Map<string, number>()
+  for (const e of entries) {
+    const prefix = e.name.split(' – ')[0]?.trim()
+    if (prefix) prefixCounts.set(prefix, (prefixCounts.get(prefix) ?? 0) + 1)
+  }
+  const name = [...prefixCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? providerId
+
+  // Upstream docs links: union of the per-route `docs` objects, first wins.
+  const docs: Record<string, string> = {}
+  for (const e of entries) {
+    for (const [k, v] of Object.entries(e.docs ?? {})) {
+      if (typeof v === 'string' && v && !(k in docs)) docs[k] = v
+    }
+  }
+
+  const description = entries.length === 1
+    ? entries[0].description
+    : `${name}: ${entries.length} public routes on MPP Router. Each route is called and paid separately; see routes[] below.`
+
+  const routes = entries.map(e => ({
+    id: e.id,
+    name: e.name,
+    method: e.method,
+    public_path: e.public_path,
+    price: e.price,
+    payment_enabled: e.payment_enabled,
+    status: e.status,
+    payment_status: e.payment_status,
+    live_status: e.live_status,
+    docs_url: e.docs_url,
+  }))
+
+  return new Response(JSON.stringify({
+    id: providerId,
+    name,
+    description,
+    docs,
+    catalog_url: 'https://apiserver.mpprouter.dev/v1/services/catalog',
+    route_count: routes.length,
+    routes,
   }, null, 2), {
     headers: { 'Content-Type': 'application/json' },
   })
