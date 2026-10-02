@@ -11,6 +11,7 @@
  *   GET      /services                      — Public service catalog
  *   GET      /v1/services/catalog           — Versioned public service catalog
  *   GET      /v1/services/search            — Search/filter catalog
+ *   GET      /v1/services/<service>         — Per-provider index of catalog routes (free)
  *   GET      /v1/ledger                     — Public settlement ledger
  *   GET      /llms.txt                      — LLM-readable router description
  *   GET      /openapi.json                  — OpenAPI 3.1 spec
@@ -1157,6 +1158,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         '  GET /services                        - Public service catalog\n' +
         '  GET /v1/services/catalog             - Versioned service catalog\n' +
         '  GET /v1/services/search              - Search/filter catalog\n' +
+        '  GET /v1/services/<service>           - One provider\'s routes (from the catalog)\n' +
         '  GET /v1/services/select              - Quality-ranked provider for a capability\n' +
         '  GET /v1/services/capabilities        - Declarable capability contracts\n' +
         '  GET /v1/ledger                       - Public settlement ledger\n' +

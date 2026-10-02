@@ -68,6 +68,7 @@ import type { Env } from '../index'
 import { isDirectSettlementRoute, relayDirectSettlementRoute } from './provider-relay'
 import { hostedOriginHeaders, resolveHostedRoute, hostedProviderIdFor } from '../services/provider-hosting'
 import { redactForAlert } from '../utils/alert-redaction'
+import { handleProviderIndex } from './services'
 
 /**
  * Resolve a public Router URL to an internal upstream route.
@@ -1322,6 +1323,14 @@ export async function handleProxy(
           'Allow': allowedMethods.join(', '),
         },
       })
+    }
+    // GET /v1/services/<provider>: a free, read-only index of that
+    // provider's catalog routes. Reached only here, after route resolution
+    // found no paid route for this path+method, so a paid route at the same
+    // path always wins and nothing below (payment) is skipped for one.
+    if (request.method === 'GET' && !hostedProviderIdFor(env, url.hostname)) {
+      const index = await handleProviderIndex(env, url.pathname)
+      if (index) return index
     }
     return new Response(JSON.stringify({
       error: 'Unknown public service route',
