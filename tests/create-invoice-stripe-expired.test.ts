@@ -14,7 +14,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { handleCreateInvoice } from '../src/routes/create-invoice'
-import { STRIPE_PAYMENT_EXPIRED_MESSAGE } from '../src/routes/create-invoice'
+import {
+  STRIPE_PAYMENT_EXPIRED_MESSAGE,
+  STRIPE_PAYMENT_EXPIRED_UNCONFIRMED_MESSAGE,
+} from '../src/routes/create-invoice'
 import type { Env } from '../src/index'
 
 const STRIPE_URL = 'https://crypto.stripe.com/pay/CDMTestBlob_EXPIRED123'
@@ -198,13 +201,15 @@ async function createInvoice(env: Env) {
 beforeEach(() => installFetchMock())
 afterEach(() => vi.restoreAllMocks())
 
-function expectExpired(status: number, json: any) {
+function expectExpired(status: number, json: any, confirmed = true) {
+  const msg = confirmed ? STRIPE_PAYMENT_EXPIRED_MESSAGE : STRIPE_PAYMENT_EXPIRED_UNCONFIRMED_MESSAGE
   expect(status).toBe(409)
   expect(json.ok).toBe(false)
   expect(json.code).toBe('PAYMENT_EXPIRED')
   expect(json.error.code).toBe('PAYMENT_EXPIRED')
-  expect(json.message).toBe(STRIPE_PAYMENT_EXPIRED_MESSAGE)
-  expect(json.error.message).toBe(STRIPE_PAYMENT_EXPIRED_MESSAGE)
+  expect(json.confirmed).toBe(confirmed)
+  expect(json.message).toBe(msg)
+  expect(json.error.message).toBe(msg)
   expect(json.message).not.toMatch(/[–—]/)
   expect(json.paymentLink).toBeUndefined()
 }
@@ -221,10 +226,18 @@ describe('Stripe invoice whose Rozo order already exists', () => {
     },
   )
 
-  it('unpaid but past expiresAt (not yet swept upstream) -> PAYMENT_EXPIRED, no new order', async () => {
+  it('unpaid but past expiresAt (not yet closed upstream) -> PAYMENT_EXPIRED unconfirmed: do not pay again if already sent', async () => {
     seedOrder(BASE_ORDER_ID, 'payment_unpaid', PAST)
     const { status, json } = await createInvoice(makeEnv())
-    expectExpired(status, json)
+    expectExpired(status, json, false)
+    expect(json.message).toMatch(/do not pay again/)
+    expect(createCalls).toEqual([])
+  })
+
+  it.each([null, 'not-a-date'])('unpaid with unusable expiresAt (%s) -> unconfirmed, never reused', async (exp) => {
+    seedOrder(BASE_ORDER_ID, 'payment_unpaid', exp as any)
+    const { status, json } = await createInvoice(makeEnv())
+    expectExpired(status, json, false)
     expect(createCalls).toEqual([])
   })
 

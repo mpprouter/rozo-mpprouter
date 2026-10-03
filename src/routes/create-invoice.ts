@@ -361,7 +361,7 @@ const REUSABLE_PAYMENT_STATUS = 'payment_unpaid'
 // unpaid, or bounced / refunded back to the payer.
 const STRIPE_ENDED_UNPAID_STATUSES = new Set(['payment_expired', 'payment_refunded', 'payment_bounced'])
 
-type StripeOrderKind = 'reusable' | 'expired' | 'active'
+type StripeOrderKind = 'reusable' | 'expired' | 'expired_unconfirmed' | 'active'
 interface StripeEndedOrder {
   kind: Exclude<StripeOrderKind, 'reusable'>
   row: any
@@ -369,8 +369,12 @@ interface StripeEndedOrder {
 
 /**
  * reusable: awaiting payment and unexpired, safe to hand back.
- * expired:  past expiresAt while unpaid, or ended unpaid upstream. The payer
+ * expired:  ended unpaid upstream (expired / refunded / bounced). The payer
  *           needs a new payment link from the merchant.
+ * expired_unconfirmed: still payment_unpaid upstream but past expiresAt (or
+ *           no usable expiresAt). Upstream has not closed it yet, so a payment
+ *           already broadcast can still land: the payer must not be told to
+ *           simply pay again.
  * active:   anything else (funded, settling, settled). Never hand back, never
  *           tell the payer to pay again.
  */
@@ -378,7 +382,7 @@ function classifyStripeOrderRow(row: any): StripeOrderKind {
   const status = readPaymentStatus(row)
   if (status === REUSABLE_PAYMENT_STATUS) {
     const exp = Date.parse(row?.expiresAt ?? '')
-    return Number.isFinite(exp) && exp > Date.now() ? 'reusable' : 'expired'
+    return Number.isFinite(exp) && exp > Date.now() ? 'reusable' : 'expired_unconfirmed'
   }
   if (status !== null && STRIPE_ENDED_UNPAID_STATUSES.has(status)) return 'expired'
   return 'active'
@@ -411,6 +415,14 @@ function stripeConflict(code: string, message: string, extra: Record<string, unk
 export const STRIPE_PAYMENT_EXPIRED_MESSAGE =
   'This payment link has expired. Please create a new payment on the merchant site and paste the new link.'
 
+// Upstream closes an unpaid order in an hourly sweep once expiresAt + 60 min
+// has passed (rozo-intents-api expire-stale-unpaid-orders), so a late payment
+// can still be recognized for up to about 2 hours.
+export const STRIPE_PAYMENT_EXPIRED_UNCONFIRMED_MESSAGE =
+  'This payment link has expired. If you already sent a payment, do not pay again: ' +
+  'it can take up to 2 hours to be confirmed, and you can check its status. ' +
+  'If you did not pay, please create a new payment on the merchant site and paste the new link.'
+
 function stripeEndedOrderResponse(invoiceKey: string, ended: StripeEndedOrder): Response {
   const status = readPaymentStatus(ended.row)
   const base = {
@@ -420,7 +432,13 @@ function stripeEndedOrderResponse(invoiceKey: string, ended: StripeEndedOrder): 
     expiresAt: ended.row?.expiresAt ?? null,
   }
   if (ended.kind === 'expired') {
-    return stripeConflict('PAYMENT_EXPIRED', STRIPE_PAYMENT_EXPIRED_MESSAGE, base)
+    return stripeConflict('PAYMENT_EXPIRED', STRIPE_PAYMENT_EXPIRED_MESSAGE, { ...base, confirmed: true })
+  }
+  if (ended.kind === 'expired_unconfirmed') {
+    return stripeConflict('PAYMENT_EXPIRED', STRIPE_PAYMENT_EXPIRED_UNCONFIRMED_MESSAGE, {
+      ...base,
+      confirmed: false,
+    })
   }
   return stripeConflict(
     'ORDER_ALREADY_ACTIVE',
