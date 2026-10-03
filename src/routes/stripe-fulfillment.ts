@@ -41,10 +41,34 @@ export function stripeOrderId(invoiceKey: string): string {
   return `${STRIPE_ORDER_PREFIX}${invoiceKey}`
 }
 
-/** Recover the Stripe session id (cpis_*) from a provider-qualified orderId. */
+// Reopen variants. Upstream keeps an orderId taken forever, even by an expired
+// order, so when the Rozo order for a still-valid Stripe session expires,
+// create-invoice opens the next order under a numbered variant slot:
+// `stripe_crypto_<cpis>__r2` ... `__r<STRIPE_ORDER_MAX_SLOTS>`. Every slot maps
+// back to the SAME invoiceKey, so all orders for one Stripe session share one
+// fulfillment record and one settlement guard. Stripe session ids (cpis_*) are
+// alphanumeric after the prefix, so the `__r<n>` suffix cannot collide.
+export const STRIPE_ORDER_MAX_SLOTS = 8
+const STRIPE_ORDER_VARIANT_RE = /__r\d+$/
+
+/**
+ * All orderId slots for a Stripe session, in allocation order: the base id
+ * first, then `__r2` ... `__r<STRIPE_ORDER_MAX_SLOTS>`.
+ */
+export function stripeOrderSlotIds(invoiceKey: string): string[] {
+  const base = stripeOrderId(invoiceKey)
+  const ids = [base]
+  for (let n = 2; n <= STRIPE_ORDER_MAX_SLOTS; n++) ids.push(`${base}__r${n}`)
+  return ids
+}
+
+/**
+ * Recover the Stripe session id (cpis_*) from a provider-qualified orderId,
+ * including a reopen variant (`..__r<n>`).
+ */
 export function invoiceKeyFromOrderId(orderId: string): string {
   return orderId.startsWith(STRIPE_ORDER_PREFIX)
-    ? orderId.slice(STRIPE_ORDER_PREFIX.length)
+    ? orderId.slice(STRIPE_ORDER_PREFIX.length).replace(STRIPE_ORDER_VARIANT_RE, '')
     : orderId
 }
 
@@ -159,6 +183,19 @@ async function loadStripeRecord(
 ): Promise<StripeFulfillmentRecord | null> {
   const { value } = await casRead(env, stripeKvKey(invoiceKey))
   return parseRecord(value)
+}
+
+/**
+ * Router-side status of the fulfillment record for a Stripe session, or null
+ * when no record exists. create-invoice uses it to refuse opening a new order
+ * once money for this invoice has been seen or a settlement is under way.
+ */
+export async function loadStripeRecordStatus(
+  env: Env,
+  invoiceKey: string,
+): Promise<StripeRouterStatus | null> {
+  const rec = await loadStripeRecord(env, invoiceKey)
+  return rec?.status ?? null
 }
 
 // Monotonic rank of the fulfillment lifecycle. Used so a concurrent/replayed
@@ -278,6 +315,17 @@ export async function seedStripeRecord(
     // the record for the cron backfill (codex P1, #185).
     if (indexed) rec.sessionIndexed = true
     if (!rec.rozoPaymentId && args.rozoPaymentId) rec.rozoPaymentId = args.rozoPaymentId
+    // A reopen (new order under a variant slot, or reuse of one) must point
+    // the record at the order the caller now pays, or invoice-status keeps
+    // reporting the expired one. Only while no money has been seen: once the
+    // record reached payout_seen or later it names the order that is settling.
+    if (
+      args.rozoPaymentId &&
+      rec.rozoPaymentId !== args.rozoPaymentId &&
+      STATUS_RANK[rec.status] <= STATUS_RANK['payin_seen']
+    ) {
+      rec.rozoPaymentId = args.rozoPaymentId
+    }
     // Monotonic: only set the initial state when the record is brand new
     // (still at rank 0). Never roll an advanced record back.
     if (STATUS_RANK[rec.status] < STATUS_RANK['rozo_payment_created'] ||
@@ -547,6 +595,10 @@ export async function handleStripeWebhookEvent(
       if (rec.status === 'rozo_payment_created') rec.status = 'payin_seen'
       return { rec, result: { kind: 'ignored', eventType: input.eventType } }
     }
+    // Bind the record to the order whose funds actually arrived. With reopen
+    // variants an invoice can have several orders; a late payment on an older
+    // one must not be reported under the newer (unpaid) order's id.
+    if (input.rozoPaymentId) rec.rozoPaymentId = input.rozoPaymentId
     if (input.eventType === 'payment_payin_completed' && rec.status === 'rozo_payment_created') {
       rec.status = 'payin_seen'
     }
