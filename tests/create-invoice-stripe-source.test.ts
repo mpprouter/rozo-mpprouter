@@ -208,6 +208,31 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
     expect(json.source).toEqual({ chainId: '900', tokenSymbol: 'USDT' })
   })
 
+  it('sends the Stripe payee as the per-order merchant display (not the OpenRouter row)', async () => {
+    stripeMerchantTitle = 'Alchemy Insights, Inc'
+    const { status } = await createInvoice({ url: STRIPE_URL })
+
+    expect(status).toBe(200)
+    expect(createdIntent.display).toMatchObject({
+      merchantName: 'Alchemy Insights, Inc',
+      merchantDescription: 'Alchemy Insights, Inc via ROZO Checkout',
+      currency: 'USD',
+    })
+    expect(createdIntent.display.title).toContain('Alchemy Insights, Inc')
+  })
+
+  it('sends the Stripe payee display on the Lightning (exactOut) body too', async () => {
+    stripeMerchantTitle = 'Alchemy Insights, Inc'
+    const { status } = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+    })
+
+    expect(status).toBe(200)
+    expect(createdIntent.type).toBe('exactOut')
+    expect(createdIntent.display.merchantName).toBe('Alchemy Insights, Inc')
+  })
+
   it('writes sanitized metadata.attribution into the Stripe locked metadata', async () => {
     const { status } = await createInvoice({
       url: STRIPE_URL,
