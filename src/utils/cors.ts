@@ -11,6 +11,7 @@
  *     - payment-signature    (x402 V2 credential)
  *     - content-type
  *     - x-request-id
+ *     - x-rozo-checkout-channel-proof (agent checkout channel fee proof)
  *
  *   Response headers we expose to JS:
  *     - www-authenticate     (mppx 402 challenge)
@@ -35,6 +36,12 @@ const ALLOWED_REQUEST_HEADERS = [
   'accept-payment',
   'x-payment',
   'payment',
+  // Short-lived proof the agent checkout (agent-beta.rozo.ai) attaches to
+  // quote-invoice / invoice-details to get its channel fee (see
+  // CHECKOUT_CHANNEL_PROOF_HEADER in routes/checkout-web-pricing.ts). Without it
+  // here the browser preflight rejects every agent quote and the page shows
+  // "Network error" (2026-10-03).
+  'x-rozo-checkout-channel-proof',
 ].join(', ')
 
 const EXPOSED_RESPONSE_HEADERS = [
