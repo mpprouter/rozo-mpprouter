@@ -367,4 +367,19 @@ describe('variant orderIds keep the per-invoice settlement guard', () => {
     expect(second.status).not.toBe('provider_submitted')
     expect(payInvoiceCalls).toBe(1)
   })
+
+  it('a late payment on the old order rebinds the record to that order', async () => {
+    const env = makeEnv()
+    seedOrder(BASE_ORDER_ID, 'payment_expired', PAST)
+    await createInvoice(env)
+    let { value } = await casRead(env, stripeKvKey(INVOICE_KEY))
+    expect(JSON.parse(value!).rozoPaymentId).toBe('rozo-pay-1')
+    await handleStripeWebhookEvent(
+      env,
+      { eventId: 'late', eventType: 'payment_payout_completed', orderId: BASE_ORDER_ID, rozoPaymentId: 'old-base', invoiceAmountStr: '10.00' },
+      new Date(Date.UTC(2026, 9, 3)),
+    )
+    ;({ value } = await casRead(env, stripeKvKey(INVOICE_KEY)))
+    expect(JSON.parse(value!).rozoPaymentId).toBe('old-base')
+  })
 })

@@ -595,6 +595,10 @@ export async function handleStripeWebhookEvent(
       if (rec.status === 'rozo_payment_created') rec.status = 'payin_seen'
       return { rec, result: { kind: 'ignored', eventType: input.eventType } }
     }
+    // Bind the record to the order whose funds actually arrived. With reopen
+    // variants an invoice can have several orders; a late payment on an older
+    // one must not be reported under the newer (unpaid) order's id.
+    if (input.rozoPaymentId) rec.rozoPaymentId = input.rozoPaymentId
     if (input.eventType === 'payment_payin_completed' && rec.status === 'rozo_payment_created') {
       rec.status = 'payin_seen'
     }
