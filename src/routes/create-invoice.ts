@@ -1872,6 +1872,15 @@ export async function handleStripeCreateInvoice(
   const originalStr = priced.original
   const discountStr = '0'
   const title = buildCheckoutTitle(invoice.merchantTitle, pricing)
+  // Per-order merchant identity, same as the Coinbase branch: without it the
+  // Rozo payment response falls back to the merchant_openrouter row and the
+  // invoice page shows "Pay OpenRouter" + the OpenRouter logo for a Stripe
+  // invoice to someone else (e.g. Alchemy Insights, Inc, 2026-10-03).
+  // Presentation only -- appId, settlement, fees and webhooks are unchanged.
+  const merchantDisplay = {
+    merchantName: invoice.merchantTitle,
+    merchantDescription: `${invoice.merchantTitle} via ROZO Checkout`,
+  }
 
   // 4. Provider-qualified orderId (design §6): stripe_crypto_<cpis_*>.
   const orderId = stripeOrderId(invoice.invoiceKey)
@@ -2053,7 +2062,7 @@ export async function handleStripeCreateInvoice(
           appId: ROZO_APP_ID,
           orderId,
           type: 'exactOut',
-          display: { title, currency: 'USD' },
+          display: { title, currency: 'USD', ...merchantDisplay },
           source: {
             chainId: 'lightning',
             tokenSymbol: 'BTC',
@@ -2071,7 +2080,7 @@ export async function handleStripeCreateInvoice(
           appId: ROZO_APP_ID,
           orderId,
           type: 'exactIn',
-          display: { title, currency: 'USD' },
+          display: { title, currency: 'USD', ...merchantDisplay },
           source: {
             chainId: source.chainId,
             tokenSymbol: source.tokenSymbol,
