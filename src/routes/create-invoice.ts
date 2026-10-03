@@ -12,12 +12,7 @@ import {
   StripeResolveError,
   type NormalizedInvoice,
 } from './invoice-provider'
-import {
-  loadStripeRecordStatus,
-  seedStripeRecord,
-  stripeOrderSlotIds,
-  type StripeRouterStatus,
-} from './stripe-fulfillment'
+import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { contractVariantIds } from '../mpp/contract-variant'
@@ -362,26 +357,103 @@ function errorResponse(status: number, err: CreateInvoiceError): Response {
 // invites a double payment.
 const REUSABLE_PAYMENT_STATUS = 'payment_unpaid'
 
-// Upstream statuses meaning the payer's funds arrived (Stripe reopen guard).
-const STRIPE_PAID_STATUSES = new Set(['payment_payin_completed', 'payment_payout_completed'])
+// Upstream statuses that end an order with the money not kept by us: expired
+// unpaid, or bounced / refunded back to the payer.
+const STRIPE_ENDED_UNPAID_STATUSES = new Set(['payment_expired', 'payment_refunded', 'payment_bounced'])
 
-// Router-side fulfillment states that forbid opening another order for the
-// same Stripe invoice: a payout was seen, a settlement is in flight, or the
-// record is terminal.
-const STRIPE_ROUTER_BLOCKS_REOPEN = new Set<StripeRouterStatus>([
-  'payout_seen',
-  'provider_paying',
-  'provider_submitted',
-  'provider_submitted_ambiguous',
-  'provider_disabled',
-  'paid',
-  'failed_invoice_changed',
-  'failed_invoice_expired',
-  'failed_insufficient_balance',
-  'failed_provider',
-  'manual_review',
-  'claimed_by_other_channel',
-])
+type StripeOrderKind = 'reusable' | 'expired' | 'expired_unconfirmed' | 'active'
+interface StripeEndedOrder {
+  kind: Exclude<StripeOrderKind, 'reusable'>
+  row: any
+}
+
+/**
+ * reusable: awaiting payment and unexpired, safe to hand back.
+ * expired:  ended unpaid upstream (expired / refunded / bounced). The payer
+ *           needs a new payment link from the merchant.
+ * expired_unconfirmed: still payment_unpaid upstream but past expiresAt (or
+ *           no usable expiresAt). Upstream has not closed it yet, so a payment
+ *           already broadcast can still land: the payer must not be told to
+ *           simply pay again.
+ * active:   anything else (funded, settling, settled). Never hand back, never
+ *           tell the payer to pay again.
+ */
+function classifyStripeOrderRow(row: any): StripeOrderKind {
+  const status = readPaymentStatus(row)
+  if (status === REUSABLE_PAYMENT_STATUS) {
+    const exp = Date.parse(row?.expiresAt ?? '')
+    return Number.isFinite(exp) && exp > Date.now() ? 'reusable' : 'expired_unconfirmed'
+  }
+  if (status !== null && STRIPE_ENDED_UNPAID_STATUSES.has(status)) return 'expired'
+  return 'active'
+}
+
+/** The existing Rozo order for a Stripe orderId, or null (missing or lookup failed). */
+async function lookupStripeOrderRow(env: Env, orderId: string): Promise<any | null> {
+  try {
+    const lookup = await fetch(
+      `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(ROZO_APP_ID)}/${encodeURIComponent(orderId)}`,
+      { method: 'GET', headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
+    )
+    if (!lookup.ok) return null
+    const row = await lookup.json().catch(() => null)
+    return row && typeof row === 'object' ? row : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Stripe-branch 409 envelope: code and message at the top level (what the
+ * checkout frontends read) and as `error: { code, message }` (the established
+ * ORDER_ALREADY_ACTIVE shape).
+ */
+function stripeConflict(code: string, message: string, extra: Record<string, unknown>): Response {
+  return json(409, { ok: false, provider: 'stripe_crypto', code, message, error: { code, message }, ...extra })
+}
+
+export const STRIPE_PAYMENT_EXPIRED_MESSAGE =
+  'This payment link has expired. Please create a new payment on the merchant site and paste the new link.'
+
+// Upstream closes an unpaid order in an hourly sweep once expiresAt + 60 min
+// has passed (rozo-intents-api expire-stale-unpaid-orders), so a late payment
+// can still be recognized for up to about 2 hours.
+export const STRIPE_PAYMENT_EXPIRED_UNCONFIRMED_MESSAGE =
+  'This payment link has expired. If you already sent a payment, do not pay again: ' +
+  'it can take up to 2 hours to be confirmed, and you can check its status. ' +
+  'If you did not pay, please create a new payment on the merchant site and paste the new link.'
+
+function stripeEndedOrderResponse(invoiceKey: string, ended: StripeEndedOrder): Response {
+  const status = readPaymentStatus(ended.row)
+  const base = {
+    invoiceKey,
+    rozoPaymentId: ended.row?.id ?? null,
+    status,
+    expiresAt: ended.row?.expiresAt ?? null,
+  }
+  if (ended.kind === 'expired') {
+    return stripeConflict('PAYMENT_EXPIRED', STRIPE_PAYMENT_EXPIRED_MESSAGE, { ...base, confirmed: true })
+  }
+  if (ended.kind === 'expired_unconfirmed') {
+    return stripeConflict('PAYMENT_EXPIRED', STRIPE_PAYMENT_EXPIRED_UNCONFIRMED_MESSAGE, {
+      ...base,
+      confirmed: false,
+    })
+  }
+  return stripeConflict(
+    'ORDER_ALREADY_ACTIVE',
+    `An order already exists for this invoice and is no longer awaiting ` +
+      `payment (status: ${status ?? 'unknown'}). Do not pay again. ` +
+      `Poll the payment status instead.`,
+    {
+      ...(status && STRIPE_PAID_STATUSES.has(status) ? { alreadyPaid: true } : {}),
+      ...base,
+    },
+  )
+}
+
+// Upstream statuses meaning the payer's funds arrived.
+const STRIPE_PAID_STATUSES = new Set(['payment_payin_completed', 'payment_payout_completed'])
 
 /** Status of an intents_payments row, whichever casing the API returned. */
 function readPaymentStatus(row: any): string | null {
@@ -1908,112 +1980,24 @@ export async function handleStripeCreateInvoice(
     merchantDescription: `${invoice.merchantTitle} via ROZO Checkout`,
   }
 
-  // 4. Provider-qualified orderId (design §6): stripe_crypto_<cpis_*>, plus
-  // the reopen variant slots (`__r2` ...). Upstream keeps an orderId taken
-  // forever, even by an expired order, so when the Rozo order for a Stripe
-  // session that is still payable expires, the next order goes to the first
-  // free variant slot. Before this, re-creating under the base id earned a
-  // 409 orderIdConflict upstream, surfaced as a generic 502, and the invoice
-  // could never get a new order. Every slot maps back to the same invoiceKey
-  // (invoiceKeyFromOrderId), so all of them share one fulfillment record and
-  // one settlement guard.
-  const slotIds = stripeOrderSlotIds(invoice.invoiceKey)
-  const orderId = slotIds[0]
-  let createOrderId = orderId
+  // 4. Provider-qualified orderId (design §6): stripe_crypto_<cpis_*>.
+  const orderId = stripeOrderId(invoice.invoiceKey)
 
-  // 5. Idempotency over every slot. Tri-state lookup as in the Coinbase
-  // branch: only an explicit 404 means a slot is free. Any other failure
-  // fails closed, because creating a sibling without seeing every existing
-  // order could hand out a second payable order for an invoice that is
-  // already being paid.
-  type StripeOrderLookup =
-    | { state: 'found'; row: any }
-    | { state: 'missing' }
-    | { state: 'error'; status: number | null }
-  const lookupStripeOrder = async (id: string): Promise<StripeOrderLookup> => {
-    let lookup: Response
-    try {
-      lookup = await fetch(
-        `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(ROZO_APP_ID)}/${encodeURIComponent(id)}`,
-        { method: 'GET', headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
-      )
-    } catch {
-      return { state: 'error', status: null }
-    }
-    if (lookup.status === 404) return { state: 'missing' }
-    if (!lookup.ok) return { state: 'error', status: lookup.status }
-    const row = await lookup.json().catch(() => undefined)
-    if (row === undefined || row === null) return { state: 'error', status: lookup.status }
-    return { state: 'found', row }
+  // 5. Idempotency. One Stripe invoice maps to exactly one Rozo order
+  // (founder, 2026-10-03): upstream keeps an orderId taken forever, and a
+  // second order for the same invoice would invite a second payment that can
+  // never be settled twice. So an existing order is either reused (still
+  // awaiting payment and unexpired), reported as already paid / in progress,
+  // or reported as expired, telling the payer to get a new payment link from
+  // the merchant. It is never replaced by a new order.
+  let existing: any = null
+  let ended: StripeEndedOrder | null = null
+  const found = await lookupStripeOrderRow(env, orderId)
+  if (found) {
+    const kind = classifyStripeOrderRow(found)
+    if (kind === 'reusable') existing = found
+    else ended = { kind, row: found }
   }
-  // The base slot first: a missing base means no order was ever opened, which
-  // is the common path and costs one lookup. Variants are only scanned once
-  // the base slot is taken.
-  const baseLookup = await lookupStripeOrder(orderId)
-  const scanned: StripeOrderLookup[] =
-    baseLookup.state === 'found'
-      ? [baseLookup, ...(await Promise.all(slotIds.slice(1).map((id) => lookupStripeOrder(id))))]
-      : [baseLookup]
-  const failedLookup = scanned.find(
-    (r): r is { state: 'error'; status: number | null } => r.state === 'error',
-  )
-  if (failedLookup) {
-    return json(502, {
-      ok: false,
-      provider: 'stripe_crypto',
-      code: 'INTENTS_API_FAILED',
-      error:
-        'Could not verify the existing orders for this invoice. Retry shortly; ' +
-        'creating a new order without that check could invite a double payment.',
-      upstream_status: failedLookup.status,
-      invoiceKey: invoice.invoiceKey,
-    })
-  }
-  const slots = scanned.map((r, i) => {
-    const row = r.state === 'found' ? r.row : null
-    const rowExpiresAt: string | null = row?.expiresAt ?? null
-    return {
-      id: slotIds[i],
-      row,
-      status: row ? readPaymentStatus(row) : null,
-      live: Boolean(rowExpiresAt && Date.parse(rowExpiresAt) > Date.now()),
-    }
-  })
-
-  // An order that is funded, settling or settled blocks every new order for
-  // this invoice, whether or not its expiresAt has passed: a payment can still
-  // land after expiresAt, and only upstream's own terminal 'payment_expired'
-  // frees a slot. Handing out a second payable order here would invite a
-  // second payment that can never be settled twice.
-  const activeConflict = slots.find(
-    (e) =>
-      e.row &&
-      e.status !== REUSABLE_PAYMENT_STATUS &&
-      e.status !== 'payment_expired',
-  )
-  if (activeConflict) {
-    const conflictStatus = activeConflict.status
-    return json(409, {
-      ok: false,
-      provider: 'stripe_crypto',
-      error: {
-        code: 'ORDER_ALREADY_ACTIVE',
-        message:
-          `An order already exists for this invoice and is no longer awaiting ` +
-          `payment (status: ${conflictStatus ?? 'unknown'}). Do not pay again — ` +
-          `poll the payment status instead.`,
-      },
-      ...(conflictStatus && STRIPE_PAID_STATUSES.has(conflictStatus) ? { alreadyPaid: true } : {}),
-      invoiceKey: invoice.invoiceKey,
-      rozoPaymentId: activeConflict.row?.id ?? null,
-      status: conflictStatus,
-      expiresAt: activeConflict.row?.expiresAt ?? null,
-    })
-  }
-
-  // Reuse the newest still-valid unpaid order (later slots are newer).
-  const liveUnpaid = [...slots].reverse().find((e) => e.row && e.live && e.status === REUSABLE_PAYMENT_STATUS)
-  const existing: any = liveUnpaid?.row ?? null
 
   if (existing && !pendingPricingMatches(existing, pricing)) {
     return pricingMismatchResponse(
@@ -2022,61 +2006,9 @@ export async function handleStripeCreateInvoice(
     )
   }
 
-  if (!existing) {
-    // Past expiresAt but upstream has not marked it payment_expired yet: a
-    // late payment could still land on it, so do not open a sibling. This is
-    // a short window; the caller retries.
-    const expiring = slots.find((e) => e.row && !e.live && e.status === REUSABLE_PAYMENT_STATUS)
-    if (expiring) {
-      return json(409, {
-        ok: false,
-        provider: 'stripe_crypto',
-        code: 'ORDER_EXPIRING',
-        error:
-          'The previous order for this invoice has just expired and is still ' +
-          'being closed. Retry in a minute to get a new order. Do not pay the ' +
-          'expired order.',
-        invoiceKey: invoice.invoiceKey,
-        rozoPaymentId: expiring.row?.id ?? null,
-        expiresAt: expiring.row?.expiresAt ?? null,
-      })
-    }
-    // When the base slot is free only it was scanned, so this is the base id.
-    const free = slots.find((e) => !e.row)?.id ?? null
-    if (!free) {
-      return json(409, {
-        ok: false,
-        provider: 'stripe_crypto',
-        code: 'STRIPE_ORDER_ATTEMPTS_EXHAUSTED',
-        error:
-          'This invoice has been reopened too many times and every previous ' +
-          'order expired unpaid. Request a new invoice from the merchant.',
-        invoiceKey: invoice.invoiceKey,
-      })
-    }
-    createOrderId = free
-    if (createOrderId !== orderId) {
-      // Belt and braces for a reopen: the fulfillment record is the
-      // settlement guard. If it already saw a payout or is settling / settled,
-      // never open another payable order for this invoice.
-      const routerStatus = await loadStripeRecordStatus(env, invoice.invoiceKey)
-      if (routerStatus && STRIPE_ROUTER_BLOCKS_REOPEN.has(routerStatus)) {
-        return json(409, {
-          ok: false,
-          provider: 'stripe_crypto',
-          error: {
-            code: 'ORDER_ALREADY_ACTIVE',
-            message:
-              `This invoice is already being settled (router status: ${routerStatus}). ` +
-              `Do not pay again — poll the payment status instead.`,
-          },
-          ...(routerStatus === 'paid' ? { alreadyPaid: true } : {}),
-          invoiceKey: invoice.invoiceKey,
-          routerStatus,
-        })
-      }
-    }
-  }
+  // Creating again under the same orderId would just 409 orderIdConflict
+  // upstream, so answer from the existing order instead.
+  if (ended) return stripeEndedOrderResponse(invoice.invoiceKey, ended)
 
   // 6. Locked metadata (design §6). NO url / session hash / secrets.
   const lockedMetadata = {
@@ -2203,7 +2135,7 @@ export async function handleStripeCreateInvoice(
     const intentsBody = isLightning
       ? {
           appId: ROZO_APP_ID,
-          orderId: createOrderId,
+          orderId,
           type: 'exactOut',
           display: { title, currency: 'USD', ...merchantDisplay },
           source: {
@@ -2221,7 +2153,7 @@ export async function handleStripeCreateInvoice(
         }
       : {
           appId: ROZO_APP_ID,
-          orderId: createOrderId,
+          orderId,
           type: 'exactIn',
           display: { title, currency: 'USD', ...merchantDisplay },
           source: {
@@ -2260,23 +2192,24 @@ export async function handleStripeCreateInvoice(
     }
     const intentsText = await intentsResp.text()
     if (!intentsResp.ok) {
-      // orderIdConflict: a concurrent create took this slot between our scan
-      // and this call. Not an outage; a retry rescans and reuses (or moves
-      // past) the winner.
+      // 409 orderIdConflict: an order for this invoice exists after all (the
+      // lookup above failed or raced a concurrent create). Re-read it and
+      // answer from it instead of a generic 502.
       if (intentsResp.status === 409) {
-        return json(409, {
-          ok: false,
-          provider: 'stripe_crypto',
-          code: 'ORDER_CREATE_CONFLICT',
-          error:
-            'Another order for this invoice was just created. Retry to load it.',
-          invoiceKey: invoice.invoiceKey,
-        })
+        const row = await lookupStripeOrderRow(env, orderId)
+        const kind = row ? classifyStripeOrderRow(row) : null
+        if (row && kind && kind !== 'reusable') {
+          return stripeEndedOrderResponse(invoice.invoiceKey, { kind, row })
+        }
+        return stripeConflict(
+          'ORDER_CREATE_CONFLICT',
+          'An order for this invoice was just created. Retry to load it.',
+          { invoiceKey: invoice.invoiceKey },
+        )
       }
       return json(502, {
         ok: false,
         provider: 'stripe_crypto',
-        code: 'INTENTS_API_FAILED',
         error: `Rozo intents API returned ${intentsResp.status}.`,
         hint: intentsText.substring(0, 300),
       })

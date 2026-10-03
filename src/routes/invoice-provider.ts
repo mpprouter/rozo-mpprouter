@@ -316,6 +316,11 @@ export function maskAddress(addr: string | null | undefined): string | null {
  */
 export async function normalizeStripeSession(session: StripePayinSession): Promise<NormalizedInvoice> {
   const invoiceKey = session.id
+  // The session id becomes the Rozo orderId (stripe_crypto_<cpis>) and the
+  // fulfillment record key. Accept only the documented shape.
+  if (typeof invoiceKey !== 'string' || !/^cpis_[A-Za-z0-9]+$/.test(invoiceKey)) {
+    throw new StripeResolveError('upstream', 'session id is not a Stripe Payin Session id (cpis_<alphanumeric>)')
+  }
   const merchantTitle = session.business_name ?? 'Unknown merchant'
   const merchantAccount = typeof session.merchant === 'string' ? session.merchant : null
 
