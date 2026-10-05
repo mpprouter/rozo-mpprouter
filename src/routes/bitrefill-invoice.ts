@@ -270,8 +270,8 @@ export async function handleBitrefillCreateInvoice(
     // (merchant_native_tokens; wallet_bitrefillpay is not). Those get a 4xx the
     // caller can act on. Operational 400s (insufficientLiquidity,
     // priceCheckUnavailable, providerError, configError, ...) stay 502.
+    const upstream = upstreamError(text)
     if (resp.status === 400 || resp.status === 422) {
-      const upstream = upstreamError(text)
       if (upstream && CALLER_ERROR_CODES.has(upstream.code)) {
         const extra = { upstream_code: upstream.code, upstream_message: upstream.message }
         if (
@@ -292,7 +292,12 @@ export async function handleBitrefillCreateInvoice(
         return fail(400, 'INTENTS_API_REJECTED', upstream.message || `Rozo intents API rejected the request (${resp.status}).`, extra)
       }
     }
-    return fail(502, 'INTENTS_API_FAILED', `Rozo intents API returned ${resp.status}.`)
+    // Name the upstream code (not the message) so a 502 is diagnosable from
+    // the response alone.
+    return fail(502, 'INTENTS_API_FAILED', `Rozo intents API returned ${resp.status}.`, {
+      upstream_status: resp.status,
+      ...(upstream ? { upstream_code: upstream.code } : {}),
+    })
   }
   let created: any
   try {
