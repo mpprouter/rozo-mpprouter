@@ -243,6 +243,29 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
     expect(createdIntent.metadata.invoiceProvider).toBe('stripe_crypto')
   })
 
+  it('forwards an optional contact email on both Stripe bodies, never in metadata', async () => {
+    const exactIn = await createInvoice({ url: STRIPE_URL, email: 'Stripe.Payer@Example.com' })
+    expect(exactIn.status).toBe(200)
+    expect(createdIntent.email).toBe('stripe.payer@example.com')
+    expect(JSON.stringify(createdIntent.metadata)).not.toContain('stripe.payer')
+
+    createdIntent = null
+    const ln = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+      email: 'ln@example.com',
+    })
+    expect(ln.status).toBe(200)
+    expect(createdIntent.type).toBe('exactOut')
+    expect(createdIntent.email).toBe('ln@example.com')
+  })
+
+  it('omits email from the Stripe body when none is given', async () => {
+    const { status } = await createInvoice({ url: STRIPE_URL })
+    expect(status).toBe(200)
+    expect('email' in createdIntent).toBe(false)
+  })
+
   it('still defaults to Base USDC when no source is given', async () => {
     const { status, json } = await createInvoice({ url: STRIPE_URL })
     expect(status).toBe(200)
