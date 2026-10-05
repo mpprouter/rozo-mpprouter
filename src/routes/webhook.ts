@@ -1226,3 +1226,58 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
     rozoPayment: callerRozo,
   })
 }
+
+// ── Merchant settlement proof (checkout feedback eligibility) ───────────────
+//
+// "Settled" here means the merchant's own invoice was paid, not that Rozo
+// received the payin. Rules (ainative todos/20261003-checkout-post-success-
+// feedback.zh.md):
+//   - Coinbase v3 payment session: ONLY PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED.
+//     Authorization accepted/pending is not settlement, and a router `paid`
+//     record does not override a live v3 status that says otherwise.
+//   - Coinbase v1 payment link (legacy): the link's usage reached maxUsage, or
+//     the router's own fulfillment record is terminal `paid`.
+//   - Stripe Crypto: the router's Stripe fulfillment record is `paid`.
+//   - Internal test ids and unknown shapes: never settled (fail closed).
+export interface MerchantSettlement {
+  found: boolean
+  settled: boolean
+  // Machine label of the proof that was checked, e.g.
+  // coinbase_v3:PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED or router:paid.
+  status: string
+  merchant: string | null
+}
+
+export async function resolveMerchantSettlement(env: Env, rozoId: string): Promise<MerchantSettlement> {
+  const rozo = await fetchRozoPaymentById(env, rozoId)
+  if (!rozo) return { found: false, settled: false, status: 'rozo:not_found', merchant: null }
+  const orderId = typeof rozo.orderId === 'string' ? rozo.orderId : null
+  if (!orderId) return { found: true, settled: false, status: 'rozo:no_order', merchant: null }
+
+  if (isStripeOrderId(orderId)) {
+    const rec = await loadStripeRecordForStatus(env, invoiceKeyFromOrderId(orderId))
+    const status = rec?.status ?? 'missing'
+    return { found: true, settled: status === 'paid', status: `stripe_router:${status}`, merchant: null }
+  }
+
+  const plId = baseLinkIdOf(orderId)
+  if (typeof plId !== 'string' || !isCoinbasePaymentId(plId) || isTestPaymentId(plId)) {
+    return { found: true, settled: false, status: 'unsupported_order', merchant: null }
+  }
+  const cb = pickCoinbaseCallerSafe(await fetchCoinbasePayment(plId))
+  const merchant = cb?.merchant?.name ?? null
+  if (isPaymentSessionId(plId)) {
+    // v3: the live Coinbase status is the only acceptable proof.
+    const status = typeof cb?.status === 'string' ? cb.status : 'unknown'
+    return {
+      found: true,
+      settled: status === 'PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED',
+      status: `coinbase_v3:${status}`,
+      merchant,
+    }
+  }
+  if (cb?.settled === true) return { found: true, settled: true, status: 'coinbase_v1:settled', merchant }
+  const rec = await loadRecord(env, plId)
+  if (rec?.status === 'paid') return { found: true, settled: true, status: 'router:paid', merchant }
+  return { found: true, settled: false, status: `router:${rec?.status ?? 'missing'}`, merchant }
+}

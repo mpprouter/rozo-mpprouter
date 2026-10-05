@@ -24,7 +24,18 @@ export function feishuConfigured(cfg: FeishuConfig): boolean {
   return Boolean(cfg.appId && cfg.appSecret && cfg.chatId)
 }
 
-export async function sendFeishuAlertConfirmed(cfg: FeishuConfig, content: RedactedAlert): Promise<boolean> {
+export interface FeishuSendOptions {
+  // Feishu request de-duplication key (im/v1/messages `uuid`, max 50 chars):
+  // the same uuid within one hour is delivered once. Callers that retry a
+  // logical message pass a stable id so a lost response cannot double-post.
+  uuid?: string
+}
+
+export async function sendFeishuAlertConfirmed(
+  cfg: FeishuConfig,
+  content: RedactedAlert,
+  opts: FeishuSendOptions = {},
+): Promise<boolean> {
   if (!feishuConfigured(cfg)) return false
   try {
     const tokenRes = await fetch(`${FEISHU_API}/auth/v3/tenant_access_token/internal`, {
@@ -49,6 +60,7 @@ export async function sendFeishuAlertConfirmed(cfg: FeishuConfig, content: Redac
         receive_id: cfg.chatId,
         msg_type: 'text',
         content: JSON.stringify({ text: content }),
+        ...(opts.uuid ? { uuid: opts.uuid.slice(0, 50) } : {}),
       }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     })

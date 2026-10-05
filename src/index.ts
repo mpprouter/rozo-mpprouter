@@ -57,6 +57,7 @@ import { handleAdminSeedStore } from './routes/admin-seed-store'
 import { handleStripeFulfillmentResolve } from './routes/stripe-fulfillment-admin'
 import { handleCoinbaseExecGateClear } from './routes/coinbase-exec-gate-admin'
 import { handleCreateInvoice } from './routes/create-invoice'
+import { FEEDBACK_PATH, handleCheckoutFeedback, withFeedbackToken, drainCheckoutFeedbackNotifications } from './routes/checkout-feedback'
 import {
   handleIssueCoupon,
   handleRedeemCoupon,
@@ -491,6 +492,12 @@ export interface Env {
   // can deploy the code before provisioning the DB (audit becomes a no-op).
   COUPON_SECURITY_DB?: D1Database
 
+  // HMAC key for checkout post-payment feedback submission tokens
+  // (routes/checkout-feedback.ts). create-invoice returns feedbackToken =
+  // HMAC(key, rozoPaymentId); the feedback endpoint requires it. Unset = the
+  // feature is off (no token issued, endpoint answers 503).
+  CHECKOUT_FEEDBACK_TOKEN_SECRET?: string
+
   // Per-provider service-quality metrics: one row per paid upstream call
   // (src/services/route-metrics.ts). Separate database from
   // COUPON_SECURITY_DB because that one carries a strict redaction
@@ -613,6 +620,8 @@ export default {
     // Base USDC funder low-balance / sudden-drop watch. Replaces the launchd
     // job that ran on two laptops and double-sent every alert.
     ctx.waitUntil(watchFunderBalance(env))
+    // Checkout feedback → Feishu queue (retries, quiet hours, dedup by id).
+    ctx.waitUntil(drainCheckoutFeedbackNotifications(env))
     // Free 402 probes only. Scheduled health monitoring never spends money.
     // Serialize these because both merge advisory fields into provider rows.
     ctx.waitUntil((async () => {
@@ -1036,7 +1045,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // applies the router's discount (max $5 off, capped at ~4.76%), and
       // creates a Rozo intent so the caller can pay the discounted amount.
       if (url.pathname === '/v1/services/rozo-agent-api/create-invoice') {
-        return handleCreateInvoice(request, env)
+        return withFeedbackToken(await handleCreateInvoice(request, env), env)
+      }
+
+      // Optional post-payment feedback from checkout.rozo.ai: one free-text
+      // answer per settled order, saved to D1 and queued for Feishu.
+      if (url.pathname === FEEDBACK_PATH) {
+        return handleCheckoutFeedback(request, env, ctx)
       }
 
       // Rozo webhook receiver — verifies HMAC, dedupes by event_id,
