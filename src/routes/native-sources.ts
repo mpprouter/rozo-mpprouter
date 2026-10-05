@@ -111,6 +111,30 @@ export function isTestPaymentId(id: string | null | undefined): boolean {
   return typeof id === 'string' && id.startsWith(TEST_PAYMENT_ID_PREFIX)
 }
 
+/**
+ * Fund-safety tripwire. Broader than isTestPaymentId on purpose: any id that
+ * carries the test prefix anywhere (any case, behind a contract-variant
+ * suffix, URL-encoded) is treated as a test id by the money paths, which
+ * refuse it outright. A test order must never reach the funder or Coinbase.
+ */
+export function containsTestPaymentId(id: string | null | undefined): boolean {
+  if (typeof id !== 'string') return false
+  let decoded = id
+  try {
+    decoded = decodeURIComponent(id)
+  } catch {
+    // keep the raw form
+  }
+  return /rozotest_/i.test(id) || /rozotest_/i.test(decoded)
+}
+
+export class TestInvoiceFundGuardError extends Error {
+  constructor(where: string) {
+    super(`refused: test payment id reached ${where}; test orders are never paid on the merchant side`)
+    this.name = 'TestInvoiceFundGuardError'
+  }
+}
+
 export async function signTestPaymentId(secret: string, cents: number, nonce: string): Promise<string> {
   if (!Number.isInteger(cents) || cents < 1 || cents > TEST_MAX_CENTS) throw new Error('cents out of range')
   if (!/^[a-z0-9]{6,32}$/.test(nonce)) throw new Error('bad nonce')

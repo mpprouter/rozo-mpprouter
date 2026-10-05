@@ -13,6 +13,9 @@
 //      is both the durable feedback record and its pending notification job,
 //      so saving and queueing are a single atomic write. One row per order:
 //      repeats return the existing feedback_id and never queue a second job.
+//      Test orders (rozotest_, see native-sources.ts) are stored with
+//      is_test=1, never sent to Feishu, and answered with
+//      `test_notification: {order_id, status, text}` plus one log line.
 //   3. The cron drains pending rows to Feishu, claiming each row first and
 //      passing feedback_id as Feishu's dedup uuid. Failures stay queued with
 //      backoff. Quiet hours (23:00-06:00 Asia/Singapore, ceo-alert-policy)
@@ -151,6 +154,7 @@ export interface FeedbackRow {
   settlement_checked_at: number
   notification_status: string
   notification_attempts: number
+  is_test?: number
 }
 
 export function buildFeedbackNotification(row: FeedbackRow) {
@@ -178,7 +182,20 @@ export function inQuietHours(nowMs: number): boolean {
 // ── persistence ──────────────────────────────────────────────────────────────
 
 const SELECT_COLS =
-  'feedback_id, payment_id, merchant, text, locale, created_at, settlement_status, settlement_checked_at, notification_status, notification_attempts'
+  'feedback_id, payment_id, merchant, text, locale, created_at, settlement_status, settlement_checked_at, notification_status, notification_attempts, is_test'
+
+// Test rows are parked as `abandoned` at insert so no drain can ever claim
+// them; this marker says why.
+export const TEST_ROW_NOTIFICATION_NOTE = 'test_order_printed_not_sent'
+
+/** The printed stand-in for a Feishu alert on a test order. */
+export function testNotificationFor(row: FeedbackRow) {
+  return { order_id: row.payment_id, status: row.settlement_status, text: buildFeedbackNotification(row) as string }
+}
+
+function logTestNotification(n: { order_id: string; status: string }) {
+  console.log(`[test-order] checkout-feedback order_id=${n.order_id} status=${n.status} (printed, not sent to Feishu)`)
+}
 
 async function findByPayment(db: D1Database, paymentId: string): Promise<FeedbackRow | null> {
   return (await db.prepare(`SELECT ${SELECT_COLS} FROM checkout_feedback WHERE payment_id = ?`).bind(paymentId).first()) as FeedbackRow | null
@@ -250,7 +267,14 @@ export async function handleCheckoutFeedback(
   // Idempotent: a repeat (double click, reload, timeout retry) gets the saved
   // result and never a second notification job, whatever text it carries.
   const existing = await findByPayment(db, paymentId)
-  if (existing) return json(200, { ok: true, feedback_id: existing.feedback_id, duplicate: true })
+  if (existing) {
+    return json(200, {
+      ok: true,
+      feedback_id: existing.feedback_id,
+      duplicate: true,
+      ...(existing.is_test ? { test_notification: testNotificationFor(existing) } : {}),
+    })
+  }
 
   const verdict = validateFeedbackText(body?.text)
   if (!verdict.ok) return json(422, { ok: false, error: verdict.code, max_chars: FEEDBACK_MAX_CHARS })
@@ -267,20 +291,30 @@ export async function handleCheckoutFeedback(
 
   const ts = now()
   const feedbackId = newFeedbackId()
+  const isTest = settlement.isTest === true
   await db
     .prepare(
       `INSERT INTO checkout_feedback (feedback_id, payment_id, merchant, text, locale, created_at,
-         settlement_status, settlement_checked_at, notification_status, notification_attempts, notification_next_attempt_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0)
+         settlement_status, settlement_checked_at, notification_status, notification_attempts, notification_next_attempt_at,
+         notification_last_error, is_test)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)
        ON CONFLICT(payment_id) DO NOTHING`,
     )
-    .bind(feedbackId, paymentId, settlement.merchant, verdict.text, locale, ts, settlement.status, ts)
+    .bind(
+      feedbackId, paymentId, settlement.merchant, verdict.text, locale, ts, settlement.status, ts,
+      isTest ? 'abandoned' : 'pending', isTest ? TEST_ROW_NOTIFICATION_NOTE : null, isTest ? 1 : 0,
+    )
     .run()
   // Read back: a concurrent submit may have won the UNIQUE(payment_id) race.
   const saved = await findByPayment(db, paymentId)
   if (!saved) return json(500, { ok: false, error: 'SAVE_FAILED' })
   const duplicate = saved.feedback_id !== feedbackId
 
+  if (saved.is_test) {
+    const n = testNotificationFor(saved)
+    logTestNotification(n)
+    return json(200, { ok: true, feedback_id: saved.feedback_id, duplicate, test_notification: n })
+  }
   if (!duplicate && ctx) {
     ctx.waitUntil(drainCheckoutFeedbackNotifications(env, { now, send: deps.send, onlyFeedbackId: saved.feedback_id }))
   }
@@ -311,7 +345,7 @@ export async function drainCheckoutFeedbackNotifications(
     const due = await db
       .prepare(
         `SELECT feedback_id FROM checkout_feedback
-          WHERE notification_attempts < ?
+          WHERE notification_attempts < ? AND is_test = 0
             AND ((notification_status IN ('pending', 'failed') AND notification_next_attempt_at <= ?)
               OR (notification_status = 'sending' AND notification_claimed_at < ?))
             ${opts.onlyFeedbackId ? 'AND feedback_id = ?' : ''}
@@ -331,7 +365,7 @@ export async function drainCheckoutFeedbackNotifications(
         .prepare(
           `UPDATE checkout_feedback
               SET notification_status = 'sending', notification_claimed_at = ?, notification_attempts = notification_attempts + 1
-            WHERE feedback_id = ? AND notification_attempts < ?
+            WHERE feedback_id = ? AND notification_attempts < ? AND is_test = 0
               AND ((notification_status IN ('pending', 'failed') AND notification_next_attempt_at <= ?)
                 OR (notification_status = 'sending' AND notification_claimed_at < ?))`,
         )
@@ -340,6 +374,11 @@ export async function drainCheckoutFeedbackNotifications(
       if (!claim.meta || claim.meta.changes !== 1) continue
       const row = (await db.prepare(`SELECT ${SELECT_COLS} FROM checkout_feedback WHERE feedback_id = ?`).bind(feedback_id).first()) as FeedbackRow | null
       if (!row) continue
+      if (row.is_test) {
+        // Unreachable (the claim filters is_test = 0); kept as a last line.
+        logTestNotification(testNotificationFor(row))
+        continue
+      }
 
       let ok = false
       try {
