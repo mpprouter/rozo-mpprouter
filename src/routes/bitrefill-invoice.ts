@@ -75,6 +75,16 @@ function fail(status: number, error: string, message: string, extra: Record<stri
   })
 }
 
+/** payment-api errors are { error: { code, message } }; keep only a short message. */
+function upstreamErrorMessage(text: string): string | null {
+  try {
+    const m = JSON.parse(text)?.error?.message
+    return typeof m === 'string' && m ? m.substring(0, 200) : null
+  } catch {
+    return null
+  }
+}
+
 function ok(payload: Record<string, unknown>): Response {
   return new Response(JSON.stringify({ ok: true, ...payload }), {
     status: 200,
@@ -240,6 +250,28 @@ export async function handleBitrefillCreateInvoice(
     if (resp.status === 409 && /orderIdConflict/i.test(text)) {
       const raced = await lookupExisting()
       return duplicate(raced.state === 'found' ? raced.row : null)
+    }
+    // A 400/422 is payment-api rejecting this request, not an outage. The
+    // common case: NATIVE_SOURCES opens native coins for the Coinbase line,
+    // but payment-api decides per app (merchant_native_tokens) and
+    // wallet_bitrefillpay may not be enabled. Answer with a 4xx the caller can
+    // act on instead of a 502 that reads as "retry later".
+    if (resp.status === 400 || resp.status === 422) {
+      const upstreamMessage = upstreamErrorMessage(text)
+      if (isNativeSymbol(source.chainId, source.tokenSymbol)) {
+        return fail(
+          400,
+          'UNSUPPORTED_SOURCE',
+          `Native ${source.tokenSymbol} on chainId ${source.chainId} is not available for Bitrefill invoices. Pay with USDC or USDT.`,
+          upstreamMessage ? { upstream_message: upstreamMessage } : {},
+        )
+      }
+      return fail(
+        400,
+        'INTENTS_API_REJECTED',
+        upstreamMessage ?? `Rozo intents API rejected the request (${resp.status}).`,
+        { upstream_status: resp.status },
+      )
     }
     return fail(502, 'INTENTS_API_FAILED', `Rozo intents API returned ${resp.status}.`)
   }

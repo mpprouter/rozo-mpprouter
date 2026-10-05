@@ -191,6 +191,40 @@ describe('create-invoice provider=bitrefill', () => {
     expect(under.status).toBe(200)
   })
 
+  it('400 UNSUPPORTED_SOURCE (not 502) when payment-api has native disabled for Bitrefill', async () => {
+    vi.mocked(globalThis.fetch).mockImplementation((async (input: any) => {
+      const u = typeof input === 'string' ? input : input.url
+      if (u.includes('/payments/order/')) return new Response('nf', { status: 404 })
+      posts++
+      return new Response(JSON.stringify({
+        error: { code: 'invalidRequest', message: 'Native ETH payin on chain 8453 is not enabled for this app' },
+      }), { status: 400 })
+    }) as typeof fetch)
+    const env = makeEnv({ NATIVE_SOURCES: 'ETH@8453' })
+    const { status, json } = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '10' }), env)
+    expect(status).toBe(400)
+    expect(json.error).toBe('UNSUPPORTED_SOURCE')
+    expect(json.message).toMatch(/Native ETH on chainId 8453 is not available for Bitrefill/)
+    expect(json.upstream_message).toBe('Native ETH payin on chain 8453 is not enabled for this app')
+  })
+
+  it('maps any other payment-api 400 to 400 INTENTS_API_REJECTED, keeps 5xx as 502', async () => {
+    let upstreamStatus = 400
+    vi.mocked(globalThis.fetch).mockImplementation((async (input: any) => {
+      const u = typeof input === 'string' ? input : input.url
+      if (u.includes('/payments/order/')) return new Response('nf', { status: 404 })
+      return new Response(JSON.stringify({ error: { code: 'invalidRequest', message: 'bad amount' } }), { status: upstreamStatus })
+    }) as typeof fetch)
+    const rejected = await post(body())
+    expect(rejected.status).toBe(400)
+    expect(rejected.json.error).toBe('INTENTS_API_REJECTED')
+    expect(rejected.json.message).toBe('bad amount')
+    upstreamStatus = 500
+    const down = await post(body())
+    expect(down.status).toBe(502)
+    expect(down.json.error).toBe('INTENTS_API_FAILED')
+  })
+
   it('503 RETRY_LATER when the race winner has no id yet', async () => {
     vi.mocked(globalThis.fetch).mockImplementation((async (input: any, init?: any) => {
       const u = typeof input === 'string' ? input : input.url
