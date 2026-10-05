@@ -192,6 +192,30 @@ function newFeedbackId(): string {
 
 // ── submit handler ───────────────────────────────────────────────────────────
 
+/** Reads at most `maxBytes` of the body; null (and the stream cancelled) past it. */
+export async function readBodyCapped(request: Request, maxBytes: number): Promise<string | null> {
+  const declared = Number(request.headers.get('Content-Length') || '0')
+  if (declared > maxBytes) return null
+  if (!request.body) return ''
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.byteLength
+    if (total > maxBytes) {
+      await reader.cancel().catch(() => {})
+      return null
+    }
+    chunks.push(value)
+  }
+  const buf = new Uint8Array(total)
+  let off = 0
+  for (const c of chunks) { buf.set(c, off); off += c.byteLength }
+  return new TextDecoder().decode(buf)
+}
+
 export interface FeedbackDeps {
   now?: () => number
   resolveSettlement?: (env: Env, rozoId: string) => Promise<MerchantSettlement>
@@ -211,8 +235,8 @@ export async function handleCheckoutFeedback(
 
   let body: any
   try {
-    const raw = await request.text()
-    if (raw.length > MAX_BODY_BYTES) return json(413, { ok: false, error: 'TOO_LARGE' })
+    const raw = await readBodyCapped(request, MAX_BODY_BYTES)
+    if (raw === null) return json(413, { ok: false, error: 'TOO_LARGE' })
     body = JSON.parse(raw)
   } catch {
     return json(400, { ok: false, error: 'INVALID_JSON' })

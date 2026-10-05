@@ -203,6 +203,15 @@ describe('POST checkout-feedback', () => {
     expect(count()).toBe(0)
   })
 
+  it('oversized bodies get 413 before any parsing (bytes, not UTF-16 units)', async () => {
+    const big = await post(env(d.db), { rozo_payment_id: RPID, feedback_token: token, text: 'a'.repeat(17 * 1024) })
+    expect(big.status).toBe(413)
+    // 6000 CJK chars = 18 KB of UTF-8 but only 6000 UTF-16 units.
+    const cjk = await post(env(d.db), { rozo_payment_id: RPID, feedback_token: token, text: '好'.repeat(6000) })
+    expect(cjk.status).toBe(413)
+    expect(count()).toBe(0)
+  })
+
   it('is off (503) without DB or secret', async () => {
     expect((await post(env(undefined), { rozo_payment_id: RPID, feedback_token: token, text: 'x' })).status).toBe(503)
     expect((await post(env(d.db, { CHECKOUT_FEEDBACK_TOKEN_SECRET: undefined }), { rozo_payment_id: RPID, feedback_token: token, text: 'x' })).status).toBe(503)
