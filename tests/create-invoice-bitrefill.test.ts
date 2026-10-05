@@ -235,6 +235,9 @@ describe('create-invoice provider=bitrefill', () => {
     const outage = await post(body())
     expect(outage.status).toBe(502)
     expect(outage.json.error).toBe('INTENTS_API_FAILED')
+    expect(outage.json.upstream_status).toBe(400)
+    expect(outage.json.upstream_code).toBe('insufficientLiquidity')
+    expect(outage.json.message).not.toContain('Liquidity check unavailable')
     reply = { code: 'providerError', message: 'quote failed' }
     expect((await post(body())).status).toBe(502)
     // Non-JSON 400 body: no classification possible, stays 502.
