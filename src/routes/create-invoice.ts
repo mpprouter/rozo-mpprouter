@@ -89,9 +89,17 @@ const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
     USDC: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
     USDT: '0xdAC17F958D2ee523a2206206994597C13D831ec7',
   },
+  // Polygon: native Circle USDC, not bridged USDC.e (0x2791…4174). rozo-intents
+  // pins source token addresses to its canonical registry (canonical-token.ts)
+  // and rejects USDC.e with a 400, so the old address broke every Polygon USDC order.
   '137':  {
-    USDC: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+    USDC: '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359',
     USDT: '0xc2132D05D31c914a87C6611C10748AEb04B58e8F',
+  },
+  // Arbitrum One: native Circle USDC and USDT0, matching rozo-intents canonical-token.ts.
+  '42161': {
+    USDC: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831',
+    USDT: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9',
   },
   // BNB Smart Chain (BSC). Addresses match downstream rozo-intents
   // rozo-address-service.ts / alchemy-client.ts. NOTE: BSC USDT/USDC are 18-decimals

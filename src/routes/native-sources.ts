@@ -16,6 +16,7 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
   '56':   ['USDC', 'USDT'],   // BNB Smart Chain (BSC) — downstream sol/evm monitors live
   '137':  ['USDC', 'USDT'],   // Polygon
   '8453': ['USDC'],           // Base
+  '42161': ['USDC', 'USDT'],  // Arbitrum One
   '900':  ['USDC', 'USDT'],   // Solana — USDT payin supported (sol-pool-monitor)
   '1500': ['USDC'],           // Stellar
 }
