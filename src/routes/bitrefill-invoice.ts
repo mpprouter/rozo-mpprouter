@@ -75,6 +75,29 @@ function fail(status: number, error: string, message: string, extra: Record<stri
   })
 }
 
+// payment-api error codes that mean "this request cannot be served as asked"
+// rather than "we are down". Anything not listed keeps the 502 path.
+const CALLER_ERROR_CODES: ReadonlySet<string> = new Set([
+  'invalidRequest',
+  'amountTooLow',
+  'amountTooHigh',
+  'invalidAmount',
+  'invalidTokenSymbol',
+  'unsupportedCurrency',
+  'unsupported',
+])
+
+/** payment-api errors are { error: { code, message } }; keep a short message. */
+function upstreamError(text: string): { code: string; message: string } | null {
+  try {
+    const e = JSON.parse(text)?.error
+    if (!e || typeof e.code !== 'string') return null
+    return { code: e.code, message: typeof e.message === 'string' ? e.message.substring(0, 200) : '' }
+  } catch {
+    return null
+  }
+}
+
 function ok(payload: Record<string, unknown>): Response {
   return new Response(JSON.stringify({ ok: true, ...payload }), {
     status: 200,
@@ -240,6 +263,34 @@ export async function handleBitrefillCreateInvoice(
     if (resp.status === 409 && /orderIdConflict/i.test(text)) {
       const raced = await lookupExisting()
       return duplicate(raced.state === 'found' ? raced.row : null)
+    }
+    // payment-api answers some caller mistakes with 400. Since NATIVE_SOURCES
+    // opened native coins for the Coinbase line (#224), the common one is a
+    // native source for an app that payment-api has not enabled
+    // (merchant_native_tokens; wallet_bitrefillpay is not). Those get a 4xx the
+    // caller can act on. Operational 400s (insufficientLiquidity,
+    // priceCheckUnavailable, providerError, configError, ...) stay 502.
+    if (resp.status === 400 || resp.status === 422) {
+      const upstream = upstreamError(text)
+      if (upstream && CALLER_ERROR_CODES.has(upstream.code)) {
+        const extra = { upstream_code: upstream.code, upstream_message: upstream.message }
+        if (
+          isNativeSymbol(source.chainId, source.tokenSymbol) &&
+          upstream.code === 'invalidRequest' &&
+          /^Native .*not (enabled|available)/i.test(upstream.message)
+        ) {
+          return fail(
+            400,
+            'UNSUPPORTED_SOURCE',
+            `Native ${source.tokenSymbol} on chainId ${source.chainId} is not available for Bitrefill invoices. Pay with USDC or USDT.`,
+            extra,
+          )
+        }
+        if (upstream.code === 'amountTooLow' || upstream.code === 'amountTooHigh') {
+          return fail(400, 'AMOUNT_OUT_OF_RANGE', upstream.message || 'Amount is out of range for this source.', extra)
+        }
+        return fail(400, 'INTENTS_API_REJECTED', upstream.message || `Rozo intents API rejected the request (${resp.status}).`, extra)
+      }
     }
     return fail(502, 'INTENTS_API_FAILED', `Rozo intents API returned ${resp.status}.`)
   }

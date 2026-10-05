@@ -182,3 +182,37 @@ describe('server-confirmed payin signal', () => {
     expect(body.payin).toMatchObject({ confirmed: true, via: 'coinbase_settlement' })
   })
 })
+
+describe('invoice-status current pay-in route', () => {
+  it('exposes the current source chain, token and deposit address (stale-tab check)', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: ROZO_ID,
+        status: 'payment_unpaid',
+        orderId: SESSION_ID,
+        source: {
+          chainId: '1',
+          tokenSymbol: 'USDC',
+          receiverAddress: '0xAbC0000000000000000000000000000000000001',
+          amount: '1.06',
+          tokenAddress: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+        },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response('nf', { status: 404 }))
+
+    const response = await handleInvoiceStatus(
+      new Request(`https://example.com/invoice-status?rozo_payment_id=${ROZO_ID}`),
+      env(),
+    )
+    const body = await response.json() as any
+    expect(response.status).toBe(200)
+    expect(body.rozoPayment.source).toMatchObject({
+      chainId: '1',
+      tokenSymbol: 'USDC',
+      receiverAddress: '0xAbC0000000000000000000000000000000000001',
+      amount: '1.06',
+    })
+    // Still an allow-list: unrelated upstream fields do not leak through.
+    expect(body.rozoPayment.source.tokenAddress).toBeUndefined()
+  })
+})

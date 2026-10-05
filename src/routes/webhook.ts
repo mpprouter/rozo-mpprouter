@@ -1053,6 +1053,14 @@ function pickRozoCallerSafe(rp: any) {
     paymentLink: rp.paymentLink,
     source: rp.source
       ? {
+          // Current pay-in chain and deposit address. An unpaid Coinbase order
+          // is rotated in place when the payer picks another chain in another
+          // tab; the checkout compares these with what it shows and asks for a
+          // refresh instead of leaving a stale address on screen. Both are
+          // already public on the Rozo payment page for this id.
+          chainId: rp.source.chainId ?? null,
+          tokenSymbol: rp.source.tokenSymbol ?? null,
+          receiverAddress: rp.source.receiverAddress ?? null,
           amount: rp.source.amount,
           amountReceived: rp.source.amountReceived,
           txHash: rp.source.txHash,
