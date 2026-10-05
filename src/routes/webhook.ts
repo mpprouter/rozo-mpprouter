@@ -662,7 +662,27 @@ async function settleCoinbaseEvent(
       rec.status = 'test_settled'
       rec.events.push({ kind: 'test_settled', at: new Date().toISOString() })
     }
-    const saved = await saveRecordGuarded(env, plId, rec)
+    let saved = await saveRecordGuarded(env, plId, rec)
+    // Acknowledge the test order to Rozo exactly like a real paid invoice, so
+    // rozo-intents-api's "Merchant has not confirmed delivery" reconciliation
+    // alert does not fire for it. Single best-effort attempt: the Coinbase
+    // sweep never scans test ids, and a miss only costs one labelled alert.
+    if (
+      saved.status === 'test_settled' &&
+      !saved.deliveredReported &&
+      saved.rozoPaymentId &&
+      deliveredReportEnabled(env)
+    ) {
+      const rep = await reportDeliveredToRozo(env, saved.rozoPaymentId, plId)
+      if (rep.ok) saved.deliveredReported = true
+      else saved.deliveredReportAttempts = (saved.deliveredReportAttempts ?? 0) + 1
+      saved.events.push({
+        kind: rep.ok ? 'delivered_reported' : 'delivered_report_failed',
+        at: new Date().toISOString(),
+        detail: { status: rep.status, test: true },
+      })
+      saved = await saveRecordGuarded(env, plId, saved)
+    }
     console.log(
       `[test-order] order_id=${plId} rozo_payment_id=${rozoPaymentId ?? 'unknown'} event=${eventType} status=${saved.status}`,
     )
