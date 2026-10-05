@@ -20,6 +20,7 @@ import type { MerchantSettlement } from '../src/routes/webhook'
 function makeD1() {
   const sql = new DatabaseSync(':memory:')
   sql.exec(readFileSync(new URL('../migrations/0003_checkout_feedback.sql', import.meta.url), 'utf8'))
+  sql.exec(readFileSync(new URL('../migrations/0004_checkout_feedback_is_test.sql', import.meta.url), 'utf8'))
   const db: any = {
     prepare(q: string) {
       let args: any[] = []

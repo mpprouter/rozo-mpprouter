@@ -1,0 +1,11 @@
+-- Checkout test mode (ainative todos/20261005-checkout-test-mode.zh.md,
+-- founder decisions 2026-10-05).
+--
+-- Feedback submitted for an internal rozotest_ order is stored like any other
+-- row but flagged is_test = 1. Such rows are never sent to Feishu: the submit
+-- response and the worker log carry {order_id, status, text} instead, and the
+-- notification drain skips them. Analytics over this table must filter
+-- is_test = 0.
+--
+-- Must be applied BEFORE deploying the worker version that writes is_test.
+ALTER TABLE checkout_feedback ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0;

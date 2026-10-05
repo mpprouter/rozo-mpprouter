@@ -261,3 +261,27 @@ describe('nativeQuoteFields', () => {
     expect(nativeQuoteFields({ expiresAt: 'x' })).toEqual({})
   })
 })
+
+describe('checkout test mode: $0.10 test order on BNB Chain USDC', () => {
+  it('keeps the standard settlement destination and tags metadata.testMode', async () => {
+    const id = await signTestPaymentId(SECRET, 10, 'tenccent1')
+    const { status, json } = await post(handleCreateInvoice, { payment_id: id, source: { chainId: '56', tokenSymbol: 'USDC' } })
+    expect(status).toBe(200)
+    expect(json.testInvoice).toBe(true)
+    expect(quoteCalls).toBe(0)
+    expect(createdIntent).toMatchObject({
+      appId: 'merchant_openrouter',
+      orderId: id,
+      type: 'exactIn',
+      source: { chainId: '56', tokenSymbol: 'USDC', amount: '0.1' },
+      // Unchanged by test mode: Base USDC to the funder/settlement wallet.
+      destination: { chainId: '8453', receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739', tokenSymbol: 'USDC' },
+      metadata: { testMode: true },
+    })
+  })
+
+  it('real orders carry no testMode tag', async () => {
+    await post(handleCreateInvoice, { payment_id: 'paymentSession_native_test' })
+    expect(createdIntent.metadata.testMode).toBeUndefined()
+  })
+})

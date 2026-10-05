@@ -1559,6 +1559,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           ...provenance,
           ...orderAttribution,
           ...priced,
+          // Lets downstream analytics (GMV) drop internal test orders.
+          ...(testInvoiceCents !== null ? { testMode: true } : {}),
         },
       }
     : {
@@ -1592,6 +1594,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           ...provenance,
           ...orderAttribution,
           ...priced,
+          // Lets downstream analytics (GMV) drop internal test orders.
+          ...(testInvoiceCents !== null ? { testMode: true } : {}),
         },
   }
 

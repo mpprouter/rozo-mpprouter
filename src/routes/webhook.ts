@@ -1,5 +1,5 @@
 import type { Env } from '../index'
-import { isTestPaymentId } from './native-sources'
+import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, isTestPaymentId } from './native-sources'
 import { isBitrefillOrderId } from './bitrefill-invoice'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { baseLinkIdOf } from '../mpp/contract-variant'
@@ -389,6 +389,9 @@ export async function callAgentApiPayInvoice(
   env: Env,
   plId: string,
 ): Promise<{ ok: boolean; status: number; body: any }> {
+  // Hard fund-safety guard: a test order is paid by nobody. Thrown (not a
+  // soft failure) so no caller can mistake it for a retryable error.
+  if (containsTestPaymentId(plId)) throw new TestInvoiceFundGuardError('callAgentApiPayInvoice')
   const resp = await fetch(AGENTAPI_PAY_INVOICE_URL, {
     method: 'POST',
     headers: {
@@ -653,13 +656,17 @@ async function settleCoinbaseEvent(
 
   // Internal test invoice: nothing to pay on Coinbase. Close it once the
   // payout landed (the same point a real invoice is paid for certain).
-  if (isTestPaymentId(plId)) {
+  // Test orders never alert: they print one order id + status line instead.
+  if (containsTestPaymentId(plId)) {
     if (eventType === 'payment_payout_completed') {
       rec.status = 'test_settled'
       rec.events.push({ kind: 'test_settled', at: new Date().toISOString() })
     }
-    await saveRecordGuarded(env, plId, rec)
-    return { ok: true, test_invoice: true, status: rec.status, plId }
+    const saved = await saveRecordGuarded(env, plId, rec)
+    console.log(
+      `[test-order] order_id=${plId} rozo_payment_id=${rozoPaymentId ?? 'unknown'} event=${eventType} status=${saved.status}`,
+    )
+    return { ok: true, test_invoice: true, status: saved.status, plId }
   }
 
   // Already in-flight? Don't double-fire. (Advisory only: KV is not atomic.
@@ -1238,7 +1245,9 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
 //   - Coinbase v1 payment link (legacy): the link's usage reached maxUsage, or
 //     the router's own fulfillment record is terminal `paid`.
 //   - Stripe Crypto: the router's Stripe fulfillment record is `paid`.
-//   - Internal test ids and unknown shapes: never settled (fail closed).
+//   - Internal rozotest_ ids: settled only once the router record is
+//     `test_settled` (the real bridge payout landed; the merchant invoice is
+//     never paid). Unknown shapes: never settled (fail closed).
 export interface MerchantSettlement {
   found: boolean
   settled: boolean
@@ -1246,6 +1255,9 @@ export interface MerchantSettlement {
   // coinbase_v3:PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED or router:paid.
   status: string
   merchant: string | null
+  // True for an internal rozotest_ order. Feedback for it is stored with
+  // is_test=1 and printed instead of being sent to Feishu.
+  isTest?: boolean
 }
 
 export async function resolveMerchantSettlement(env: Env, rozoId: string): Promise<MerchantSettlement> {
@@ -1261,7 +1273,14 @@ export async function resolveMerchantSettlement(env: Env, rozoId: string): Promi
   }
 
   const plId = baseLinkIdOf(orderId)
-  if (typeof plId !== 'string' || !isCoinbasePaymentId(plId) || isTestPaymentId(plId)) {
+  // Test orders (real payin + real bridge payout, merchant side skipped): the
+  // router's own terminal `test_settled` record is the settlement proof.
+  if (typeof plId === 'string' && isTestPaymentId(plId)) {
+    const rec = await loadRecord(env, plId)
+    const status = rec?.status ?? 'missing'
+    return { found: true, settled: status === 'test_settled', status: `test:${status}`, merchant: TEST_MERCHANT_NAME, isTest: true }
+  }
+  if (typeof plId !== 'string' || !isCoinbasePaymentId(plId) || containsTestPaymentId(plId)) {
     return { found: true, settled: false, status: 'unsupported_order', merchant: null }
   }
   const cb = pickCoinbaseCallerSafe(await fetchCoinbasePayment(plId))
