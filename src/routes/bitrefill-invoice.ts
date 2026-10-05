@@ -92,6 +92,8 @@ export async function handleBitrefillCreateInvoice(
   env: Env,
   parsed: Record<string, unknown>,
   resolveSource: ResolveSource,
+  // Optional payer contact email, already normalized by handleCreateInvoice.
+  contactEmail: string | null = null,
 ): Promise<Response> {
   if (String(env.BITREFILL_ENABLED ?? 'false').toLowerCase() !== 'true') {
     return fail(403, 'BITREFILL_DISABLED', 'Bitrefill invoice payment is not enabled.')
@@ -210,6 +212,7 @@ export async function handleBitrefillCreateInvoice(
       amount,
     },
     ...attributionField,
+    ...(contactEmail ? { email: contactEmail } : {}),
     metadata: {
       source: 'mpprouter-create-invoice',
       provider: 'bitrefill',

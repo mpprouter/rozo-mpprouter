@@ -31,6 +31,7 @@ import {
   verifyTestPaymentId,
   type NativeSymbol,
 } from './native-sources'
+import { normalizeContactEmail } from './contact-email'
 import {
   attributionMetadata,
   buildOrderAttribution,
@@ -321,6 +322,7 @@ export type CreateInvoiceErrorCode =
   | 'LEGACY_PRICING_ORDER_PENDING'
   | 'QUOTE_RECEIPT_INVALID_OR_EXPIRED'
   | 'QUOTE_RECEIPT_REQUIRED'
+  | 'INVALID_EMAIL'
 
 // Resolver failure kind -> the error code a checkout UI keys its friendly copy
 // off. Without a code the UI renders the raw upstream string, so an expired
@@ -827,12 +829,31 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid JSON body' })
   }
 
+  // Optional payer contact email (see contact-email.ts). Validated before any
+  // provider branch so a bad address is a clear 400 everywhere, never a silent
+  // drop. Forwarded on create only as the payment-api `email` field.
+  const emailResult = normalizeContactEmail(
+    parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>).email
+      : undefined,
+  )
+  if (!emailResult.ok) {
+    return errorResponse(400, { code: 'INVALID_EMAIL', message: emailResult.message })
+  }
+  const emailField = emailResult.email ? { email: emailResult.email } : {}
+
   // Bitrefill: direct exactOut to the Bitrefill receiving address (no funder).
   if (
     parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
     (parsed as Record<string, unknown>).provider === 'bitrefill'
   ) {
-    return handleBitrefillCreateInvoice(request, env, parsed as Record<string, unknown>, resolveSource)
+    return handleBitrefillCreateInvoice(
+      request,
+      env,
+      parsed as Record<string, unknown>,
+      resolveSource,
+      emailResult.email,
+    )
   }
 
   const { normalized, error, link_id_detected, provider_detected, raw_url } =
@@ -991,6 +1012,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       forwardedHint,
       payinIntent,
       orderAttribution,
+      emailResult.email,
     )
   }
 
@@ -1561,6 +1583,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           amount: callerPays,
         },
         ...attributionField,
+        ...emailField,
         metadata: {
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
@@ -1596,6 +1619,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
         },
         ...attributionField,
+        ...emailField,
         metadata: {
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
@@ -1879,6 +1903,9 @@ export async function handleStripeCreateInvoice(
   // Order-level attribution for metadata.attribution (see order-attribution.ts).
   // Written on create only; a reused order keeps whatever it was created with.
   orderAttribution: { attribution?: OrderAttribution } = {},
+  // Optional payer contact email, already normalized by handleCreateInvoice.
+  // Written on create only, like orderAttribution.
+  contactEmail: string | null = null,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -2161,6 +2188,7 @@ export async function handleStripeCreateInvoice(
             tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
             amount: callerPays,
           },
+          ...(contactEmail ? { email: contactEmail } : {}),
           metadata: lockedMetadata,
         }
       : {
@@ -2180,6 +2208,7 @@ export async function handleStripeCreateInvoice(
             tokenSymbol: 'USDC',
             tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
           },
+          ...(contactEmail ? { email: contactEmail } : {}),
           metadata: lockedMetadata,
           // Optional Stellar contract pay-in — validated by handleCreateInvoice
           // (Stellar source only). Same field the Coinbase branch sends.

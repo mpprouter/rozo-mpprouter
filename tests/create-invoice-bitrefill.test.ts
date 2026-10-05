@@ -77,6 +77,23 @@ async function post(b: unknown, env = makeEnv()) {
 }
 
 describe('create-invoice provider=bitrefill', () => {
+  it('forwards an optional contact email and rejects an invalid one', async () => {
+    const ok = await post(body({ email: 'Buyer@Example.com' }))
+    expect(ok.status).toBe(200)
+    expect(createdIntent.email).toBe('buyer@example.com')
+
+    createdIntent = null
+    const none = await post(body())
+    expect(none.status).toBe(200)
+    expect('email' in createdIntent).toBe(false)
+
+    createdIntent = null
+    const bad = await post(body({ email: 'buyer-at-example' }))
+    expect(bad.status).toBe(400)
+    expect(bad.json.code).toBe('INVALID_EMAIL')
+    expect(createdIntent).toBeNull()
+  })
+
   it('creates an exactOut intent straight to the Bitrefill address', async () => {
     const { status, json } = await post(body({ client: 'rozo-checkout' }))
     expect(status).toBe(200)
