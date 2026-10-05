@@ -168,13 +168,14 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 # chain, only after a real internal payment on that chain settled:
 #   ETH@8453  Base ETH, rozotest order ae707463, 2026-09-28
 #   BNB@56    BSC BNB,  rozotest order 25842287, 2026-09-28
-# ETH@1 and SOL@900 stay closed until their own real payment. Remove an entry
-# (or the whole line) and redeploy to close a chain.
-# 2026-09-29: all closed again. Native orders land on invoice.rozo.ai/checkout,
-# whose pay SDK cannot pay a native source, so payers were shown "0.014 BNB"
-# with no way to pay. Reopen after invoice.rozo.ai renders native orders.
+# Remove an entry (or the whole line) and redeploy to close a chain.
+# 2026-09-29: all closed again (invoice.rozo.ai could not render native
+# orders). 2026-10-06: all four reopened for OpenRouter checkout after
+# rozo-invoice#98 and a real Base ETH payment on production invoice.rozo.ai.
+# Backend caps: $2,000/day native in total (NATIVE_DAILY_CAP_USD_GLOBAL).
+# Rollback: set NATIVE_SOURCES = "" and redeploy.
 # Internal rozotest invoices still open every native coin for testing.
-NATIVE_SOURCES = ""
+NATIVE_SOURCES = "ETH@8453,ETH@1,BNB@56,SOL@900"
 # Stuck-order Intercom tickets (src/utils/intercom-ticket.ts). Ticket type 4 is
 # the workspace's built-in "Internal task" (Back-office) type; the contact is
 # an internal Rozo team contact, because router records hold no customer
