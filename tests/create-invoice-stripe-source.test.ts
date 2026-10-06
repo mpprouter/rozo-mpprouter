@@ -726,6 +726,31 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
     expect(json.warnings ?? []).toEqual([])
   })
 
+  it('refuses to switch with PAYMENT_DETECTED when money already sits on the current address', async () => {
+    existingIntent = {
+      id: 'rozo-existing-1',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
+    }
+    checkoutResponse = () =>
+      new Response(
+        JSON.stringify({
+          error: { code: 'paymentDetected', message: 'We received your payment of 10 USDC on BNB Chain. It is being processed, please do not pay again.' },
+          data: { detected: { chainId: '56', chainName: 'BNB Chain', tokenSymbol: 'USDC', amount: '10' } },
+        }),
+        { status: 409 },
+      )
+    const { status, json } = await createInvoice({ url: STRIPE_URL, source: { chainId: '900', tokenSymbol: 'USDT' } })
+    expect(status).toBe(409)
+    expect(json.code).toBe('PAYMENT_DETECTED')
+    expect(json.provider).toBe('stripe_crypto')
+    expect(json.detected.chainName).toBe('BNB Chain')
+    expect(json.paymentLink).toBeUndefined()
+    expect(createdIntent).toBeNull()
+  })
+
   it('falls back to the existing source with a warning when rotation fails', async () => {
     existingIntent = {
       id: 'rozo-existing-1b',

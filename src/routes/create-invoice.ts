@@ -512,7 +512,7 @@ async function rotateExistingSource(
   env: Env,
   paymentId: string,
   source: ResolvedSource,
-): Promise<{ ok: true; row: any } | { ok: false; code: string }> {
+): Promise<{ ok: true; row: any } | { ok: false; code: string; detected?: PaymentDetected }> {
   let resp: Response
   try {
     resp = await fetch(
@@ -535,14 +535,16 @@ async function rotateExistingSource(
   const text = await resp.text()
   if (!resp.ok) {
     let code = `HTTP ${resp.status}`
+    let detected: PaymentDetected | undefined
     try {
       const parsed: any = JSON.parse(text)
       const upstream = parsed?.error?.code ?? parsed?.code ?? parsed?.error
       if (typeof upstream === 'string' && upstream) code = upstream
+      if (code === UPSTREAM_PAYMENT_DETECTED) detected = readPaymentDetected(parsed)
     } catch {
       // Non-JSON error body — the HTTP status is the best code we have.
     }
-    return { ok: false, code }
+    return detected ? { ok: false, code, detected } : { ok: false, code }
   }
 
   let row: any
@@ -553,6 +555,58 @@ async function rotateExistingSource(
   }
   if (!row) return { ok: false, code: 'empty_response' }
   return { ok: true, row }
+}
+
+/**
+ * Rozo payment-api refused a coin/chain switch because money already sits on
+ * the order's current deposit address (pre-switch check, rozo-intents-api
+ * checkout-prescan.ts, behind app_config CHECKOUT_SWITCH_PRESCAN). The order
+ * is NOT rotated; the money is being credited by the existing recovery. The
+ * caller must show "payment received, processing" and never a new address.
+ */
+export const UPSTREAM_PAYMENT_DETECTED = 'paymentDetected'
+
+export interface PaymentDetected {
+  message: string
+  chainId: string | null
+  chainName: string | null
+  tokenSymbol: string | null
+  amount: string | null
+}
+
+export function readPaymentDetected(parsed: any): PaymentDetected {
+  const d = parsed?.data?.detected ?? {}
+  const str = (v: unknown) => (typeof v === 'string' && v ? v : null)
+  return {
+    message:
+      str(parsed?.error?.message) ??
+      'We received a payment on this order. It is being processed, please do not pay again.',
+    chainId: str(d.chainId),
+    chainName: str(d.chainName),
+    tokenSymbol: str(d.tokenSymbol),
+    amount: str(d.amount),
+  }
+}
+
+/** 409 body for a refused switch. Same shape on the Coinbase and Stripe lines. */
+export function paymentDetectedBody(
+  detected: PaymentDetected,
+  ids: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ok: false,
+    code: 'PAYMENT_DETECTED',
+    error: { code: 'PAYMENT_DETECTED', message: detected.message },
+    ...ids,
+    status: 'payment_unpaid',
+    detected,
+  }
+}
+
+/** Upstream flag on a rotated row: the previous address could not be checked. */
+function previousAddressFields(row: any): Record<string, unknown> {
+  const v = row?.previousAddressCheck
+  return v === 'clear' || v === 'unavailable' ? { previousAddressCheck: v } : {}
 }
 
 /**
@@ -1583,6 +1637,13 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
             row = rotated.row
             rowSource = readRowSource(rotated.row)
             sourceRotated = true
+          } else if (rotated.detected) {
+            // Money already on the current address: never hand out a new one.
+            return json(409, paymentDetectedBody(rotated.detected, {
+              linkId,
+              rozoPaymentId: existing?.id ?? null,
+              expiresAt: existingExpiresAt,
+            }))
           } else {
             rotationFailure = rotated.code
           }
@@ -1671,7 +1732,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           chainId: rowSource.chainId,
           tokenSymbol: rowSource.tokenSymbol,
         },
-        ...(sourceRotated ? { sourceRotated: true } : {}),
+        ...(sourceRotated ? { sourceRotated: true, ...previousAddressFields(row) } : {}),
         ...(rotationFailure ? { sourceMismatch: true } : {}),
         ...(intentMismatch ? { intentMismatch: true } : {}),
         ...(warnings.length ? { warnings } : {}),
@@ -2243,6 +2304,7 @@ export async function handleStripeCreateInvoice(
     tokenSymbol: null,
   }
   let sourceRotated = false
+  let previousAddress: Record<string, unknown> = {}
   let rotationFailure: string | null = null
   // Requested pay-in mode vs the frozen mode of a reused order (see the
   // Coinbase branch for the two-sided rationale).
@@ -2266,6 +2328,17 @@ export async function handleStripeCreateInvoice(
           row = rotated.row
           reusedSource = readRowSource(rotated.row)
           sourceRotated = true
+          previousAddress = previousAddressFields(rotated.row)
+        } else if (rotated.detected) {
+          // Money already on the current address: never hand out a new one.
+          return json(409, {
+            provider: 'stripe_crypto',
+            ...paymentDetectedBody(rotated.detected, {
+              invoiceKey: invoice.invoiceKey,
+              rozoPaymentId: existing?.id ?? null,
+              expiresAt: existing?.expiresAt ?? null,
+            }),
+          })
         } else {
           rotationFailure = rotated.code
         }
@@ -2493,7 +2566,7 @@ export async function handleStripeCreateInvoice(
     source: reused
       ? { chainId: reusedSource.chainId, tokenSymbol: reusedSource.tokenSymbol }
       : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
-    ...(sourceRotated ? { sourceRotated: true } : {}),
+    ...(sourceRotated ? { sourceRotated: true, ...previousAddress } : {}),
     ...(rotationFailure ? { sourceMismatch: true } : {}),
     ...(intentMismatch ? { intentMismatch: true } : {}),
     ...(warnings.length ? { warnings } : {}),
