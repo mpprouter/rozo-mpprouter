@@ -25,6 +25,8 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
 export const NATIVE_SOURCE_DEFS: Record<string, { symbol: NativeSymbol; tokenAddress: string }> = {
   '8453': { symbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' },
   '1': { symbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' },
+  // Arbitrum ETH (founder 2026-10-06). Live gate: rozotest order ae7a060d.
+  '42161': { symbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' },
   '56': { symbol: 'BNB', tokenAddress: '0x0000000000000000000000000000000000000000' },
   '900': { symbol: 'SOL', tokenAddress: 'native' },
 }
