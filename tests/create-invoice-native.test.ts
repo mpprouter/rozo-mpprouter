@@ -85,8 +85,8 @@ async function post(handler: typeof handleCreateInvoice, body: Record<string, un
 
 describe('native source table', () => {
   it('parses only the four supported native coins', () => {
-    expect([...parseNativeSources('eth@8453, BNB@56,SOL@900,ETH@42161,POL@137,garbage')].sort())
-      .toEqual(['BNB@56', 'ETH@8453', 'SOL@900'])
+    expect([...parseNativeSources('eth@8453, BNB@56,SOL@900,ETH@42161,POL@137,ETH@137,garbage')].sort())
+      .toEqual(['BNB@56', 'ETH@42161', 'ETH@8453', 'SOL@900'])
     expect(parseNativeSources(undefined).size).toBe(0)
   })
 
@@ -283,5 +283,15 @@ describe('checkout test mode: $0.10 test order on BNB Chain USDC', () => {
   it('real orders carry no testMode tag', async () => {
     await post(handleCreateInvoice, { payment_id: 'paymentSession_native_test' })
     expect(createdIntent.metadata.testMode).toBeUndefined()
+  })
+})
+
+describe('Arbitrum ETH native source (founder 2026-10-06)', () => {
+  it('is offered only when ETH@42161 is open, with the zero token address', () => {
+    expect(supportedSources(STABLE_SOURCES, parseNativeSources('ETH@8453'))['42161']).toEqual(['USDC', 'USDT'])
+    expect(supportedSources(STABLE_SOURCES, parseNativeSources('ETH@8453,ETH@42161'))['42161']).toEqual(['USDC', 'USDT', 'ETH'])
+    const arb = resolveSource({ chainId: '42161', tokenSymbol: 'ETH' }, parseNativeSources('ETH@42161'))
+    expect(arb.resolved).toMatchObject({ chainId: '42161', tokenSymbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' })
+    expect(resolveSource({ chainId: '42161', tokenSymbol: 'ETH' }, parseNativeSources('ETH@8453')).error?.code).toBe('UNSUPPORTED_SOURCE')
   })
 })
