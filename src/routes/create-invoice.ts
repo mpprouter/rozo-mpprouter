@@ -15,7 +15,13 @@ import {
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
-import { contractVariantIds } from '../mpp/contract-variant'
+import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
+import {
+  checkPreviousOrdersUnfunded,
+  PREVIOUS_ORDER_FUNDED_MESSAGE,
+  PREVIOUS_ORDER_PENDING_MESSAGE,
+  type RelinkCheck,
+} from './relink-guard'
 import { verifyQuoteReceipt, type QuoteReceiptPayload } from './quote-receipt'
 import {
   ALL_NATIVE_SOURCES,
@@ -1316,10 +1322,66 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     return { state: 'found', row }
   }
 
+  // Earlier orders (all expired, none live) the fresh create in step 3b
+  // replaces. Re-checked after the create so a late payment that lands on one
+  // of them mid-request cannot leave two payable orders behind.
+  let replacedRows: any[] = []
+  // Before handing out a fresh order that replaced expired ones, re-read
+  // them: a late payment may have revived one meanwhile (recovery paths). An
+  // unreadable status fails closed: the next call rescans every slot and its
+  // in-flight check answers from the real state.
+  const replacedRowsBlock = async (): Promise<Response | null> => {
+    if (replacedRows.length === 0) return null
+    const nowStatuses = await Promise.all(
+      replacedRows.map((r) => refetchPaymentStatus(env, String(r?.id ?? ''))),
+    )
+    if (nowStatuses.some((st) => st === null)) {
+      return errorResponse(502, {
+        code: 'INTENTS_API_FAILED',
+        stage: 'order_lookup',
+        upstream_status: null,
+        message:
+          'Could not re-check the earlier orders for this payment link. Retry shortly.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    const revivedIdx = nowStatuses.findIndex((st) => st !== 'payment_expired')
+    if (revivedIdx < 0) return null
+    const revived = replacedRows[revivedIdx]
+    return json(409, {
+      ok: false,
+      error: {
+        code: 'ORDER_ALREADY_ACTIVE',
+        message:
+          `An earlier order for this invoice is no longer expired ` +
+          `(status: ${nowStatuses[revivedIdx]}). Do not pay again. ` +
+          `Poll the payment status instead.`,
+      },
+      linkId,
+      rozoPaymentId: revived?.id ?? null,
+      status: nowStatuses[revivedIdx],
+      expiresAt: revived?.expiresAt ?? null,
+    })
+  }
+
   if (orderId) {
-    // Scan the base orderId and every contract-variant slot in parallel.
-    const allIds = [orderId, ...contractVariantIds(orderId)]
-    const scanned = await Promise.all(allIds.map((id) => lookupOrder(id)))
+    // Scan the base orderId and every contract-variant slot in parallel. The
+    // `__retryN` re-order slots can only be taken once the base order has
+    // expired, so they are read only then (a new link costs no extra calls).
+    const firstIds = [orderId, ...contractVariantIds(orderId)]
+    let allIds = firstIds
+    let scanned = await Promise.all(firstIds.map((id) => lookupOrder(id)))
+    const baseScan = scanned[0]
+    const baseLive =
+      baseScan.state === 'found' &&
+      Boolean(baseScan.row?.expiresAt && Date.parse(baseScan.row.expiresAt) > Date.now())
+    if (baseScan.state === 'found' && !baseLive) {
+      const retryIds = retryOrderIds(orderId)
+      const more = await Promise.all(retryIds.map((id) => lookupOrder(id)))
+      allIds = [...firstIds, ...retryIds]
+      scanned = [...scanned, ...more]
+    }
     const failedLookup = scanned.find(
       (r): r is { state: 'error'; status: number | null } => r.state === 'error',
     )
@@ -1341,7 +1403,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       const row = r.state === 'found' ? r.row : null
       const expiresAt: string | null = row?.expiresAt ?? null
       const live = Boolean(expiresAt && Date.parse(expiresAt) > Date.now())
-      return { id, row, live, status: row ? readPaymentStatus(row) : null }
+      const slot: 'base' | 'contract' | 'retry' =
+        i === 0 ? 'base' : i < firstIds.length ? 'contract' : 'retry'
+      return { id, row, live, slot, status: row ? readPaymentStatus(row) : null }
     })
 
     // Every order for this link settles the SAME Coinbase invoice (the
@@ -1376,7 +1440,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     }
 
     const isContractRow = (r: any) => Boolean(r?.source?.receiverAddressContract)
-    const base = entries[0]
     const linkSpentResponse = () =>
       errorResponse(409, {
         code: 'LINK_USED_OR_EXPIRED',
@@ -1385,39 +1448,107 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         normalized_input: normalized,
         link_id_detected,
       })
+    // Later slots of one family are always newer (a slot is only allocated
+    // once the earlier ones are taken), so "newest live" is the last match.
+    const newestLive = (pred: (e: (typeof entries)[number]) => boolean) =>
+      [...entries].reverse().find((e) => e.row && e.live && pred(e)) ?? null
+    const liveContract = newestLive((e) => isContractRow(e.row))
+    const liveClassic = newestLive((e) => !isContractRow(e.row) && e.slot !== 'contract')
+
+    // Fresh create with no live order: pick the first free slot and, when the
+    // link already has (expired) orders, require every one of them to be
+    // provably unfunded (relink-guard.ts). Never two live orders per link.
+    const freshCreate = async (
+      candidates: ReadonlyArray<(typeof entries)[number]>,
+    ): Promise<Response | null> => {
+      const free = candidates.find((e) => !e.row) ?? null
+      if (!free) {
+        // Every re-order slot used: the link really is spent for us.
+        return previousRows().length > 0 ? paymentExpiredResponse(true) : linkSpentResponse()
+      }
+      const previous = previousRows()
+      if (previous.length > 0) {
+        const guard = await checkPreviousOrdersUnfunded(env, previous)
+        if (!guard.ok) {
+          if (guard.reason === 'previous_order_funded' || guard.reason === 'previous_order_funds_found') {
+            return json(409, {
+              ok: false,
+              code: 'ORDER_ALREADY_ACTIVE',
+              message: PREVIOUS_ORDER_FUNDED_MESSAGE,
+              error: { code: 'ORDER_ALREADY_ACTIVE', message: PREVIOUS_ORDER_FUNDED_MESSAGE },
+              reason: guard.reason,
+              linkId,
+              rozoPaymentId: guard.rozoPaymentId,
+              status: guard.status,
+              expiresAt: guard.expiresAt,
+            })
+          }
+          return paymentExpiredResponse(false, guard)
+        }
+        replacedRows = previous
+      }
+      createOrderId = free.id
+      return null
+    }
+    const previousRows = () => entries.filter((e) => e.row && !e.live).map((e) => e.row)
+    const paymentExpiredResponse = (
+      confirmed: boolean,
+      guard?: Extract<RelinkCheck, { ok: false }>,
+    ) => {
+      const message = confirmed
+        ? 'This payment link has expired for Rozo checkout. Please create a new payment on the merchant site and paste the new link.'
+        : PREVIOUS_ORDER_PENDING_MESSAGE
+      const newest = [...entries].reverse().find((e) => e.row)?.row ?? null
+      return json(409, {
+        ok: false,
+        code: 'PAYMENT_EXPIRED',
+        message,
+        error: { code: 'PAYMENT_EXPIRED', message },
+        confirmed,
+        ...(guard ? { reason: guard.reason, retryable: true } : {}),
+        linkId,
+        rozoPaymentId: guard?.rozoPaymentId ?? newest?.id ?? null,
+        status: guard?.status ?? (newest ? readPaymentStatus(newest) : null),
+        expiresAt: guard?.expiresAt ?? newest?.expiresAt ?? null,
+      })
+    }
 
     let existing: any = null
     if (payinIntent) {
-      // Newest live contract-mode order wins (later variant slots are newer).
-      const contractEntry = [...entries]
-        .reverse()
-        .find((e) => e.row && e.live && isContractRow(e.row))
-      if (contractEntry) {
-        existing = contractEntry.row
-      } else if (base.row && base.live) {
+      if (liveContract) {
+        existing = liveContract.row
+      } else if (liveClassic) {
         // Live classic order + explicit intent → supersede at the first free
-        // variant slot. All slots consumed means the contract rail for this
-        // link is spent. The classic row skips the pricing check — it is not
-        // returned; the new order is priced fresh below.
-        const firstFreeVariant = entries.slice(1).find((e) => !e.row) ?? null
+        // contract-variant slot. All slots consumed means the contract rail
+        // for this link is spent. The classic row skips the pricing check —
+        // it is not returned; the new order is priced fresh below.
+        const firstFreeVariant = entries.find((e) => e.slot === 'contract' && !e.row) ?? null
         if (!firstFreeVariant) return linkSpentResponse()
-        supersededClassic = base.row
+        supersededClassic = liveClassic.row
         createOrderId = firstFreeVariant.id
       } else {
-        // No live order at all. Create fresh — under the base id when it is
-        // still free, else the first free variant slot (an expired order
-        // keeps its orderId forever upstream, so re-creating under a taken
-        // id would only earn orderIdConflict).
-        const free = entries.find((e) => !e.row) ?? null
-        if (!free) return linkSpentResponse()
-        createOrderId = free.id
+        // No live order at all: the SAME slot sequence a no-intent caller
+        // uses (base, then re-order slots), so two concurrent fresh creates
+        // of either mode always collide on one slot instead of each minting
+        // a live order. Contract variants are the last resort.
+        const order = [
+          ...entries.filter((e) => e.slot === 'base'),
+          ...entries.filter((e) => e.slot === 'retry'),
+          ...entries.filter((e) => e.slot === 'contract'),
+        ]
+        const refused = await freshCreate(order)
+        if (refused) return refused
       }
-    } else if (base.row && base.live) {
-      existing = base.row
+    } else if (liveClassic || liveContract) {
+      // Reuse the live order (a contract-mode one is reported via
+      // intentMismatch below) — never mint a second live order.
+      existing = (liveClassic ?? liveContract)!.row
+    } else {
+      // No live order: base slot when free, else the next re-order slot once
+      // every earlier order is provably unfunded.
+      const refused = await freshCreate(entries.filter((e) => e.slot !== 'contract'))
+      if (refused) return refused
     }
-    // No-intent callers with no live base order fall through to create under
-    // the base id — unchanged semantics (an expired-but-taken base id yields
-    // orderIdConflict upstream, mapped to LINK_USED_OR_EXPIRED).
 
     if (existing) {
       const existingExpiresAt: string | null = existing?.expiresAt ?? null
@@ -1665,10 +1796,12 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       intentsResp.status === 409 &&
       /orderIdConflict/i.test(intentsText)
     ) {
-      // Variant race: a concurrent intent caller claimed our variant slot
-      // between the scan and this create. Re-read that slot — if the winner
-      // is reusable, hand it back instead of declaring the link dead.
-      if (createOrderId && orderId && createOrderId !== orderId) {
+      // Slot race: a concurrent caller claimed our slot (base, contract
+      // variant or re-order slot) between the scan and this create. Re-read
+      // that slot — if the winner is reusable, hand it back instead of
+      // declaring the link dead. The (appId, orderId) unique key upstream is
+      // what guarantees only one of the racing creates produced an order.
+      if (createOrderId && orderId) {
         // Same guard as the main supersede path (codex round-2 P1): the
         // classic payer may have raced funds in — never hand out a second
         // payable rail while the classic order is no longer awaiting payment.
@@ -1705,6 +1838,24 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           winnerValid &&
           readPaymentStatus(winner) === REUSABLE_PAYMENT_STATUS
         ) {
+          // Same re-order race check as the successful-create path.
+          const blocked = await replacedRowsBlock()
+          if (blocked) return blocked
+          // A contract-intent caller lost the slot to a classic order: do not
+          // hand a smart wallet a classic rail. A retry finds the live classic
+          // order and supersedes it with a contract-mode sibling as designed.
+          if (payinIntent && !winner?.source?.receiverAddressContract) {
+            return json(409, {
+              ok: false,
+              code: 'ORDER_CREATE_CONFLICT',
+              message: 'An order for this invoice was just created. Retry to load it.',
+              error: {
+                code: 'ORDER_CREATE_CONFLICT',
+                message: 'An order for this invoice was just created. Retry to load it.',
+              },
+              linkId,
+            })
+          }
           if (!pendingPricingMatches(winner, pricing)) {
             return pricingMismatchResponse({ linkId }, winner)
           }
@@ -1768,6 +1919,14 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       normalized_input: normalized,
       link_id_detected,
     })
+  }
+
+  // Close the re-order race: a late payment can land on one of the expired
+  // orders this create replaced between the guard and the create. Then the
+  // new order is NOT handed out; it is abandoned and expires unpaid.
+  {
+    const blocked = await replacedRowsBlock()
+    if (blocked) return blocked
   }
 
   // Close the supersede race (codex P1): the classic payer can send funds
@@ -1849,6 +2008,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           superseded: true,
           supersededPaymentId: supersededClassic?.id ?? null,
         }
+      : {}),
+    // A fresh order for a link whose earlier order(s) expired unfunded.
+    ...(replacedRows.length > 0
+      ? { replacesExpiredPaymentIds: replacedRows.map((r) => r?.id ?? null) }
       : {}),
     ...(createWarnings.length ? { warnings: createWarnings } : {}),
     raw: intentsJson,
