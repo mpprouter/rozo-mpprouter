@@ -1573,6 +1573,74 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     expect(json.warnings.join(' ')).toContain('was not applied')
   })
 
+  it('refuses to switch when money already sits on the current address (paymentDetected)', async () => {
+    const { status, json, createBody } = await runReuse(
+      unpaidStellar,
+      { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+      () =>
+        new Response(
+          JSON.stringify({
+            error: {
+              code: 'paymentDetected',
+              message: 'We received your payment of 10.5 USDC on BNB Chain. It is being processed, please do not pay again.',
+            },
+            data: {
+              paymentId: 'rozo-existing',
+              status: 'payment_unpaid',
+              detected: { chainId: '56', chainName: 'BNB Chain', tokenSymbol: 'USDC', amount: '10.5', handling: 'cross_chain' },
+            },
+          }),
+          { status: 409 },
+        ),
+    )
+    expect(status).toBe(409)
+    expect(json.code).toBe('PAYMENT_DETECTED')
+    expect(json.error.code).toBe('PAYMENT_DETECTED')
+    expect(json.error.message).toContain('do not pay again')
+    expect(json.detected).toMatchObject({ chainId: '56', chainName: 'BNB Chain', tokenSymbol: 'USDC', amount: '10.5' })
+    expect(json.rozoPaymentId).toBe('rozo-existing')
+    // No address, no payment link, no new order.
+    expect(json.paymentLink).toBeUndefined()
+    expect(json.raw).toBeUndefined()
+    expect(createBody).toBeNull()
+  })
+
+  it('passes previousAddressCheck through after a rotation the backend could not fully check', async () => {
+    const { status, json } = await runReuse(
+      unpaidStellar,
+      { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+      () =>
+        new Response(
+          JSON.stringify({
+            id: 'rozo-existing',
+            status: 'payment_unpaid',
+            paymentLink: 'https://pay.rozo.ai/rotated',
+            expiresAt: '2999-03-01T00:00:00.000Z',
+            source: { chainId: '900', tokenSymbol: 'USDT' },
+            previousAddressCheck: 'unavailable',
+          }),
+          { status: 200 },
+        ),
+    )
+    expect(status).toBe(200)
+    expect(json.sourceRotated).toBe(true)
+    expect(json.previousAddressCheck).toBe('unavailable')
+  })
+
+  it('old backend (no pre-switch check): rotation response has no previousAddressCheck', async () => {
+    const { json } = await runReuse(
+      unpaidStellar,
+      { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+      () =>
+        new Response(
+          JSON.stringify({ id: 'rozo-existing', status: 'payment_unpaid', source: { chainId: '900', tokenSymbol: 'USDT' } }),
+          { status: 200 },
+        ),
+    )
+    expect(json.sourceRotated).toBe(true)
+    expect(json.previousAddressCheck).toBeUndefined()
+  })
+
   it('does not rotate when the requested source already matches', async () => {
     const { json, checkoutBody } = await runReuse(unpaidStellar, {
       payment_id: 'pl_test123',
