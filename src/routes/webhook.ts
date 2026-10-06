@@ -1098,7 +1098,7 @@ function derivePayinTruth(
   return { confirmed: false, confirmedAt: null, via: null }
 }
 
-function pickRozoCallerSafe(rp: any) {
+export function pickRozoCallerSafe(rp: any) {
   if (!rp) return null
   return {
     id: rp.id,
@@ -1107,6 +1107,19 @@ function pickRozoCallerSafe(rp: any) {
     createdAt: rp.createdAt,
     expiresAt: rp.expiresAt,
     paymentLink: rp.paymentLink,
+    // Rozo's sweep found money on one of this unpaid order's addresses (e.g.
+    // the address a coin switch retired, paid on another chain). Booleans and
+    // a chain name only; the checkout says "earlier payment received, do not
+    // pay again". Absent on older Rozo deploys.
+    ...(rp.earlierPayment && rp.earlierPayment.detected === true
+      ? {
+          earlierPayment: {
+            detected: true,
+            chainId: typeof rp.earlierPayment.chainId === 'string' ? rp.earlierPayment.chainId : null,
+            chainName: typeof rp.earlierPayment.chainName === 'string' ? rp.earlierPayment.chainName : null,
+          },
+        }
+      : {}),
     source: rp.source
       ? {
           // Current pay-in chain and deposit address. An unpaid Coinbase order
