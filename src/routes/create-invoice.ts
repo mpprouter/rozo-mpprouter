@@ -1430,7 +1430,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           message:
             `An order already exists for this invoice and is no longer awaiting ` +
             `payment (status: ${inFlight.status ?? 'unknown'}). Do not pay again — ` +
-            `Poll the payment status instead.`,
+            `poll the payment status instead.`,
         },
         linkId,
         rozoPaymentId: inFlight.row?.id ?? null,
@@ -1606,7 +1606,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
             message:
               `An order already exists for this invoice and is no longer awaiting ` +
               `payment (status: ${postRotationStatus}). Do not pay again — ` +
-              `Poll the payment status instead.`,
+              `poll the payment status instead.`,
           },
           linkId,
           rozoPaymentId: row?.id ?? existing?.id ?? null,
@@ -1818,7 +1818,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
                 message:
                   `An order already exists for this invoice and is no longer awaiting ` +
                   `payment (status: ${classicNow}). Do not pay again — ` +
-                  `Poll the payment status instead.`,
+                  `poll the payment status instead.`,
               },
               linkId,
               rozoPaymentId: supersededClassic.id,
@@ -1949,7 +1949,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           message:
             `An order already exists for this invoice and is no longer awaiting ` +
             `payment (status: ${classicNow}). Do not pay again — ` +
-            `Poll the payment status instead.`,
+            `poll the payment status instead.`,
         },
         linkId,
         rozoPaymentId: supersededClassic.id,
@@ -2288,7 +2288,7 @@ export async function handleStripeCreateInvoice(
           message:
             `An order already exists for this invoice and is no longer awaiting ` +
             `payment (status: ${postRotationStatus}). Do not pay again — ` +
-            `Poll the payment status instead.`,
+            `poll the payment status instead.`,
         },
         invoiceKey: invoice.invoiceKey,
         rozoPaymentId: row?.id ?? existing?.id ?? null,
