@@ -3,6 +3,7 @@ import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, i
 import { isBitrefillOrderId } from './bitrefill-invoice'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { baseLinkIdOf } from '../mpp/contract-variant'
+import { mergeSettlingTrack, sendDuplicatePaymentAlert, trackSettlingOrder } from './settling-order'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import {
   isStripeOrderId,
@@ -130,6 +131,11 @@ export interface FulfillmentRecord {
   }>
   // Delivery confirmation reported to Rozo (POST /payments/<id>/delivered).
   // Only an HTTP 200 sets it; it never goes back to false.
+  // Rozo order whose payin / payout drove settlement, and any OTHER Rozo
+  // order for the same link that also paid (refund needed). See
+  // settling-order.ts.
+  settlingRozoPaymentId?: string | null
+  duplicateRozoPaymentIds?: string[]
   deliveredReported?: boolean
   deliveredReportAttempts?: number
   // One-shot alert / bookkeeping flags written by the cron sweep.
@@ -254,6 +260,7 @@ export async function saveRecordGuarded(
       alertedManualReview: Boolean(stored.alertedManualReview || rec.alertedManualReview),
       alertedDeliveredGiveUp: Boolean(stored.alertedDeliveredGiveUp || rec.alertedDeliveredGiveUp),
       alertedQueryFailing: Boolean(stored.alertedQueryFailing || rec.alertedQueryFailing),
+      ...mergeSettlingTrack(stored, rec),
     }
     if (keepStored) {
       console.warn(
@@ -262,6 +269,24 @@ export async function saveRecordGuarded(
     }
   }
   await saveRecord(env, plId, out)
+  // Two sibling orders adopted as the settling order concurrently (KV is not
+  // atomic): the merge kept the stored one and recorded the other as a
+  // duplicate. Report it the same way as a sequential double payment.
+  if (
+    stored?.settlingRozoPaymentId &&
+    rec.settlingRozoPaymentId &&
+    stored.settlingRozoPaymentId !== rec.settlingRozoPaymentId &&
+    !(stored.duplicateRozoPaymentIds ?? []).includes(rec.settlingRozoPaymentId)
+  ) {
+    await sendDuplicatePaymentAlert(env, {
+      provider: 'coinbase',
+      invoiceRef: plId,
+      settlingRozoPaymentId: stored.settlingRozoPaymentId,
+      duplicateRozoPaymentId: rec.settlingRozoPaymentId,
+      eventType: 'concurrent_settlement',
+      amount: null,
+    })
+  }
   return out
 }
 
@@ -621,7 +646,38 @@ async function settleCoinbaseEvent(
   // Load or create fulfillment record.
   let rec = await loadRecord(env, plId)
   if (!rec) rec = emptyRecord(plId)
-  if (!rec.rozoPaymentId) rec.rozoPaymentId = rozoPaymentId
+  // Follow the Rozo order that actually pays (siblings share this record).
+  const settlesEvent =
+    eventType === 'payment_payin_completed' || eventType === 'payment_payout_completed'
+  const settling = trackSettlingOrder(
+    rec,
+    rozoPaymentId,
+    settlesEvent,
+    TERMINAL_STATUSES.has(rec.status) || rec.status === 'paying',
+  )
+  if (settling === 'duplicate') {
+    rec.events.push({
+      kind: 'duplicate_payment',
+      at: new Date(now).toISOString(),
+      event_id: eventId,
+      detail: { settling: rec.settlingRozoPaymentId ?? null, extra: rozoPaymentId, eventType },
+    })
+    await sendDuplicatePaymentAlert(env, {
+      provider: 'coinbase',
+      invoiceRef: plId,
+      settlingRozoPaymentId: rec.settlingRozoPaymentId ?? null,
+      duplicateRozoPaymentId: rozoPaymentId as string,
+      eventType,
+      amount: evt.data?.destination?.amount ?? evt.data?.source?.amount ?? null,
+    })
+  }
+  // Only the settling order may drive settlement: a second paying order is
+  // recorded (and alerted once) but never pays the invoice or changes which
+  // order the record reports as delivered.
+  if (settling === 'duplicate' || settling === 'duplicate_seen') {
+    await saveRecordGuarded(env, plId, rec)
+    return { ok: true, duplicate_payment: true, plId }
+  }
   if (!rec.webhookEventIds.includes(eventId)) rec.webhookEventIds.push(eventId)
   rec.events.push({
     kind: eventType,
