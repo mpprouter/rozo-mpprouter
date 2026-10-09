@@ -30,6 +30,11 @@
  *    omitted. Added 2026-09-30 for the per-country D7 in the weekly report
  *    (ainative growth-design-v3 §5). Country only, never the IP: metadata is
  *    returned to anyone holding the order id.
+ *  - `install_id` (lowercase UUID v4, one per CLI / skill install) and
+ *    `account_hash` (lowercase hex sha256 of "rozo-acct-v1:" + OpenRouter
+ *    account id or API key; the raw value is never sent) were added
+ *    2026-10-09 for payer-entity grouping. They must match the contract regex
+ *    exactly or they are dropped silently; they are never normalized.
  *
  * Telemetry rules, same as the rest of the money path: this never throws, and
  * it never influences pricing, routing, validation or error codes. Anything it
@@ -46,6 +51,10 @@ export interface OrderAttribution {
   landing_path?: string
   /** Server-derived from `cf-ipcountry`; never caller-supplied. */
   country?: string
+  /** Per-install UUID v4 from the CLI / skill config. Lowercase only. */
+  install_id?: string
+  /** sha256("rozo-acct-v1:" + account id or API key), lowercase hex. */
+  account_hash?: string
 }
 
 const CLIENT_MAX = 64
@@ -62,6 +71,16 @@ const INVISIBLE = /[\p{Cc}\p{Cf}]/gu
 // neither is a country, so both are omitted rather than stored.
 const COUNTRY_RE = /^[A-Z]{2}$/
 const NOT_A_COUNTRY = new Set(['XX', 'T1'])
+
+// Identity fields (contract 2026-10-09). Exact-match only: a value that is not
+// already canonical (wrong case, braces, whitespace, wrong length) is dropped,
+// never repaired, so a raw API key can never be stored by accident.
+const INSTALL_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const ACCOUNT_HASH_RE = /^[0-9a-f]{64}$/
+
+function exactMatch(raw: unknown, re: RegExp): string | null {
+  return typeof raw === 'string' && re.test(raw) ? raw : null
+}
 
 const SKILL_UA = /^rozo-checkout-skill\/[A-Za-z0-9._+-]+/
 
@@ -157,6 +176,10 @@ export function sanitizeOrderAttribution(raw: unknown): OrderAttribution | null 
     if (referrer) out.referrer = referrer
     const landing = cleanLandingPath(src.landing_path)
     if (landing) out.landing_path = landing
+    const installId = exactMatch(src.install_id, INSTALL_ID_RE)
+    if (installId) out.install_id = installId
+    const accountHash = exactMatch(src.account_hash, ACCOUNT_HASH_RE)
+    if (accountHash) out.account_hash = accountHash
     return Object.keys(out).length ? out : null
   } catch {
     return null
