@@ -8,6 +8,8 @@ import {
   UPSTREAM_OUR_FAULT_4XX,
 } from './pay-invoice-admin'
 import {
+  fetchCoinbasePayment,
+  normalizeCoinbasePayment,
   resolveStripeInvoice,
   StripeResolveError,
   type NormalizedInvoice,
@@ -169,6 +171,33 @@ export interface SourceError {
  */
 export interface CallerProvenance {
   client?: string
+}
+
+// Budget for the read-only Coinbase lookup that fills `linkExpiresAt`. It runs
+// in parallel with the order lookup/create, so it only adds latency when the
+// provider is slower than our own upstream calls, and never more than this.
+export const LINK_EXPIRY_TIMEOUT_MS = 4_000
+
+/**
+ * The external Coinbase link's own deadline (v3 `expiresAt` / v1
+ * `preApprovalExpiry`), via the same read-only resolver invoice-details uses.
+ * Never throws: any failure, timeout, non-Coinbase id or missing value is
+ * null. Purely informational for the checkout page; it does not gate the order.
+ */
+export async function resolveCoinbaseLinkExpiry(
+  paymentId: string | null | undefined,
+  timeoutMs: number = LINK_EXPIRY_TIMEOUT_MS,
+): Promise<string | null> {
+  if (typeof paymentId !== 'string' || !/^(pl_|paymentSession_)[A-Za-z0-9_-]+$/.test(paymentId)) {
+    return null
+  }
+  try {
+    const payment = await fetchCoinbasePayment(paymentId, AbortSignal.timeout(timeoutMs))
+    const invoice = await normalizeCoinbasePayment(payment)
+    return invoice.validBefore ?? null
+  } catch {
+    return null
+  }
 }
 
 export function resolveClient(raw: unknown): string | null {
@@ -1258,6 +1287,14 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     })
   }
 
+  // External link deadline for the checkout page (`linkExpiresAt`). Started
+  // only after the quote succeeded, so a bad link fails exactly as before, and
+  // run in parallel with the rest of the flow. Never rejects.
+  const linkExpiresAtPromise: Promise<string | null> =
+    testInvoiceCents !== null
+      ? Promise.resolve(null)
+      : resolveCoinbaseLinkExpiry(linkId ?? normalizedPaymentId)
+
   // Step 2: compute the browser-only fee (default off), or honor the exact
   // signed v3 quote snapshot when the same client submits it within its TTL.
   let invoiceAtomic: bigint
@@ -1725,6 +1762,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           row?.paymentLink ?? row?.url ?? row?.payment_link ?? null,
         rozoPaymentId: row?.id ?? existing?.id ?? null,
         expiresAt: row?.expiresAt ?? existingExpiresAt,
+        linkExpiresAt: await linkExpiresAtPromise,
         ...nativeQuoteFields(row),
         // The source the order actually pays from now — rotated to the
         // requested one when that worked, otherwise the pre-existing one.
@@ -1938,6 +1976,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
               winner?.paymentLink ?? winner?.url ?? winner?.payment_link ?? null,
             rozoPaymentId: winner?.id ?? null,
             expiresAt: winnerExpiresAt,
+            linkExpiresAt: await linkExpiresAtPromise,
             ...nativeQuoteFields(winner),
             source: {
               chainId: winnerSource.chainId,
@@ -2057,6 +2096,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     paymentLink,
     rozoPaymentId,
     expiresAt,
+    linkExpiresAt: await linkExpiresAtPromise,
     ...(nativeSource ? nativeQuoteFields(intentsJson) : {}),
     ...(testInvoiceCents !== null ? { testInvoice: true } : {}),
     source: {
@@ -2583,6 +2623,9 @@ export async function handleStripeCreateInvoice(
     paymentLink,
     rozoPaymentId,
     expiresAt,
+    // The Stripe session's own deadline (valid_before), so the checkout can
+    // show the earlier of the two.
+    linkExpiresAt: invoice.validBefore ?? null,
     invoice,
     raw: rawIntent,
   })
