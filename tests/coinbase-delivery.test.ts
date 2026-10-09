@@ -457,7 +457,8 @@ describe('sweepCoinbaseFulfillments', () => {
       deliveredStatus: 409,
     })
     const { env, kv } = makeEnv()
-    seedRec(kv, { status: 'paid', paidAt: ago(5) })
+    // 409 after the 2h pending window counts as a real failure.
+    seedRec(kv, { status: 'paid', paidAt: ago(180) })
     await sweepCoinbaseFulfillments(env)
     expect(readRec(kv).deliveredReported).toBeFalsy()
     expect(readRec(kv).deliveredReportAttempts).toBe(1)
@@ -475,6 +476,39 @@ describe('sweepCoinbaseFulfillments', () => {
     const r2 = readRec(kv, 'invoice-fulfillment:pl_testDelivery2')
     expect(r2.deliveredReportAttempts).toBe(5)
     expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('a 409 shortly after paid is waiting for the Rozo payout: not counted, never alerted', async () => {
+    const { up, calls } = stubFetch({
+      coinbase: { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1 },
+      deliveredStatus: 409,
+    })
+    const { env, kv } = makeEnv()
+    seedRec(kv, { status: 'paid', paidAt: ago(5), deliveredReportAttempts: 4 })
+    for (let i = 0; i < 8; i++) await sweepCoinbaseFulfillments(env)
+    expect(calls.delivered).toHaveLength(8)
+    expect(readRec(kv).deliveredReportAttempts).toBe(4)
+    expect(readRec(kv).alertedDeliveredGiveUp).toBeFalsy()
+    expect(calls.dingtalk).toHaveLength(0)
+
+    // Rozo payout completes → next tick's report is accepted.
+    up.deliveredStatus = 200
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).deliveredReported).toBe(true)
+    expect(calls.dingtalk).toHaveLength(0)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('a non-409 failure inside the window still counts', async () => {
+    const { calls } = stubFetch({
+      coinbase: { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1 },
+      deliveredStatus: 500,
+    })
+    const { env, kv } = makeEnv()
+    seedRec(kv, { status: 'paid', paidAt: ago(5) })
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).deliveredReportAttempts).toBe(1)
     expect(calls.pay).toBe(0)
   })
 

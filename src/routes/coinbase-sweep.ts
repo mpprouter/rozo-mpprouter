@@ -19,6 +19,8 @@
 //   effort: no retry, never affects the alert.
 //   3. paid and not yet reported as delivered, Coinbase settled → report to
 //      Rozo. Only HTTP 200 marks it reported; one alert after 5 failures.
+//      A 409 within 2h of paidAt means Rozo's payout has not completed yet:
+//      treated as waiting (not counted, not alerted), retried next tick.
 
 import type { Env } from '../index'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
@@ -30,6 +32,7 @@ import {
   fetchCoinbasePayment,
   fetchRozoPaymentById,
   deliveredReportEnabled,
+  deliveredReportStillPending,
   isCoinbasePaymentId,
   loadRecord,
   maskAddresses,
@@ -330,6 +333,14 @@ async function reportDelivered(env: Env, plId: string, rec: FulfillmentRecord, n
     rec.deliveredReported = true
     rec.events.push({ kind: 'delivered_reported', at: nowIso, detail: { status: rep.status } })
     await saveRecordGuarded(env, plId, rec)
+    return
+  }
+  if (deliveredReportStillPending(rep, rec, now)) {
+    // Rozo's 409 = its payout to us has not completed yet. Waiting, not a
+    // failure: no attempt counted, no alert, no event (the sweep runs every
+    // tick and would flood the record). Retried next tick; after
+    // DELIVERED_PENDING_WINDOW_MS a 409 counts as a failure again.
+    console.log(`[coinbase-sweep] delivered report pending (409, payout not done) for ${plId}`)
     return
   }
   rec.deliveredReportAttempts = (rec.deliveredReportAttempts ?? 0) + 1
