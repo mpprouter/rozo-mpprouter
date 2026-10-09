@@ -1001,10 +1001,17 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // checkout has been sending it since launch and this route dropped it, so
   // every order was stored unattributed. payment-api owns the whitelist.
   const attributionRaw = (parsed as Record<string, unknown> | null)?.attribution
-  const attributionField =
-    attributionRaw && typeof attributionRaw === 'object' && !Array.isArray(attributionRaw)
-      ? { attribution: attributionRaw }
-      : {}
+  // Identity fields (install_id, account_hash) are stripped from the forwarded
+  // copy: only the regex-validated values in orderAttribution below may reach
+  // upstream, so an unvalidated value never travels. Clients must send ONLY
+  // the sha256 hash as account_hash, never a raw OpenRouter account id or API
+  // key; a non-hash value is dropped here, never stored.
+  let attributionField: { attribution?: Record<string, unknown> } = {}
+  if (attributionRaw && typeof attributionRaw === 'object' && !Array.isArray(attributionRaw)) {
+    const { install_id: _installId, account_hash: _accountHash, ...forwarded } =
+      attributionRaw as Record<string, unknown>
+    if (Object.keys(forwarded).length) attributionField = { attribution: forwarded }
+  }
   // Order-level attribution (surface + campaign), written to
   // metadata.attribution on creation only. Separate from the passthrough above
   // and from pricing: it is computed here and only ever spread into metadata.

@@ -381,6 +381,29 @@ describe('create-invoice — metadata.attribution', () => {
     })
   })
 
+  it('strips identity fields from the forwarded top-level attribution', async () => {
+    await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: EVM_SOURCE,
+      attribution: { utm_source: 'x', install_id: 'not-a-uuid', account_hash: 'sk-or-v1-raw-key' },
+    })
+    expect(createdIntent.attribution).toEqual({ utm_source: 'x' })
+    expect(createdIntent.attribution).not.toHaveProperty('install_id')
+    expect(createdIntent.attribution).not.toHaveProperty('account_hash')
+    expect(JSON.stringify(createdIntent)).not.toContain('sk-or-v1-raw-key')
+
+    // Valid values travel only inside metadata.attribution.
+    installFetchMock()
+    await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: EVM_SOURCE,
+      attribution: { install_id: INSTALL_ID, account_hash: ACCOUNT_HASH },
+    })
+    expect(createdIntent).not.toHaveProperty('attribution')
+    expect(createdIntent.metadata.attribution.install_id).toBe(INSTALL_ID)
+    expect(createdIntent.metadata.attribution.account_hash).toBe(ACCOUNT_HASH)
+  })
+
   it('drops invalid identity fields without failing the create', async () => {
     const baseline = await createInvoice({ payment_id: PAYMENT_ID, source: EVM_SOURCE }, 'rozo-checkout-skill/0.2.0')
     installFetchMock()
