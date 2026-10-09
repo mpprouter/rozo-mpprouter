@@ -99,6 +99,53 @@ describe('sanitizeOrderAttribution', () => {
   })
 })
 
+// ── Unit: identity fields (install_id / account_hash, contract 2026-10-09) ───
+
+const INSTALL_ID = '3f2b8c1e-9a4d-4b7e-8c21-0d5e6f7a8b9c'
+const ACCOUNT_HASH = 'a'.repeat(32) + '0123456789abcdef'.repeat(2)
+
+describe('sanitizeOrderAttribution — identity fields', () => {
+  it('passes through a valid install_id and account_hash', () => {
+    expect(sanitizeOrderAttribution({ install_id: INSTALL_ID, account_hash: ACCOUNT_HASH })).toEqual({
+      install_id: INSTALL_ID,
+      account_hash: ACCOUNT_HASH,
+    })
+  })
+
+  it('drops invalid install_id values silently and keeps the rest', () => {
+    const bad: unknown[] = [
+      INSTALL_ID.toUpperCase(), // uppercase is not canonical
+      ` ${INSTALL_ID}`, // whitespace is not trimmed into validity
+      `{${INSTALL_ID}}`,
+      '3f2b8c1e-9a4d-1b7e-8c21-0d5e6f7a8b9c', // version 1
+      '3f2b8c1e-9a4d-4b7e-cc21-0d5e6f7a8b9c', // bad variant
+      '3f2b8c1e9a4d4b7e8c210d5e6f7a8b9c', // no dashes
+      INSTALL_ID + '\n',
+      123,
+      null,
+      { id: INSTALL_ID },
+    ]
+    for (const install_id of bad) {
+      expect(sanitizeOrderAttribution({ install_id, utm_source: 'x' })).toEqual({ utm_source: 'x' })
+    }
+  })
+
+  it('drops invalid account_hash values silently (incl. a raw key)', () => {
+    const bad: unknown[] = [
+      ACCOUNT_HASH.toUpperCase(),
+      ACCOUNT_HASH.slice(1),
+      ACCOUNT_HASH + '0',
+      'g'.repeat(64),
+      'sk-or-v1-' + 'a'.repeat(64), // raw OpenRouter key must never be stored
+      ['x'],
+      64,
+    ]
+    for (const account_hash of bad) {
+      expect(sanitizeOrderAttribution({ account_hash })).toBeNull()
+    }
+  })
+})
+
 describe('clientFromUserAgent', () => {
   it('recognizes the checkout skill', () => {
     expect(clientFromUserAgent('rozo-checkout-skill/0.1.12 node/22')).toBe('rozo-checkout-skill/0.1.12')
@@ -315,6 +362,59 @@ describe('create-invoice — metadata.attribution', () => {
       expect(md1).toEqual(md0)
       vi.restoreAllMocks()
     }
+  })
+
+  it('writes install_id and account_hash on create', async () => {
+    const { status } = await createInvoice(
+      {
+        payment_id: PAYMENT_ID,
+        source: EVM_SOURCE,
+        attribution: { install_id: INSTALL_ID, account_hash: ACCOUNT_HASH },
+      },
+      'rozo-checkout-skill/0.2.0',
+    )
+    expect(status).toBe(200)
+    expect(createdIntent.metadata.attribution).toEqual({
+      client: 'rozo-checkout-skill/0.2.0',
+      install_id: INSTALL_ID,
+      account_hash: ACCOUNT_HASH,
+    })
+  })
+
+  it('drops invalid identity fields without failing the create', async () => {
+    const baseline = await createInvoice({ payment_id: PAYMENT_ID, source: EVM_SOURCE }, 'rozo-checkout-skill/0.2.0')
+    installFetchMock()
+    const run = await createInvoice(
+      {
+        payment_id: PAYMENT_ID,
+        source: EVM_SOURCE,
+        attribution: { install_id: 'not-a-uuid', account_hash: 'sk-or-v1-raw-key' },
+      },
+      'rozo-checkout-skill/0.2.0',
+    )
+    expect(run.status).toBe(baseline.status)
+    expect(run.json).toEqual(baseline.json)
+    expect(createdIntent.metadata.attribution).toEqual({ client: 'rozo-checkout-skill/0.2.0' })
+    expect(JSON.stringify(createdIntent.metadata)).not.toContain('sk-or-v1-raw-key')
+  })
+
+  it('does not write identity fields when an existing unpaid order is reused', async () => {
+    existingIntent = {
+      id: 'rozo-existing',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
+    }
+    const { status, json } = await createInvoice({
+      payment_id: PAYMENT_ID,
+      source: EVM_SOURCE,
+      attribution: { install_id: INSTALL_ID, account_hash: ACCOUNT_HASH },
+    })
+    expect(status).toBe(200)
+    expect(json.reused).toBe(true)
+    expect(createdIntent).toBeNull()
+    expect(nonGetCalls.filter((c) => c.includes('payment-api'))).toEqual([])
   })
 
   it('does not write attribution when an existing unpaid order is reused', async () => {
