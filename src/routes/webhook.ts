@@ -138,6 +138,11 @@ export interface FulfillmentRecord {
   duplicateRozoPaymentIds?: string[]
   deliveredReported?: boolean
   deliveredReportAttempts?: number
+  // Last time Rozo answered the delivered report with the "payout not done
+  // yet" 409 (see deliveredReportStillPending). The sweep waits a few ticks
+  // before re-asking and rotates through pending records oldest-first, so
+  // pending records cannot hold the per-run budget.
+  deliveredPendingAt?: string | null
   // One-shot alert / bookkeeping flags written by the cron sweep.
   alertedStuck?: boolean
   alertedManualReview?: boolean

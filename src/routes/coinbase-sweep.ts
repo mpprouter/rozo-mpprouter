@@ -56,6 +56,8 @@ const STUCK_ALERT_MS = 10 * MIN
 // resolved, alerted, or not ours to chase.
 const STUCK_WATCH_WINDOW_MS = 24 * 60 * MIN
 export const DELIVERED_MAX_ATTEMPTS = 5
+// After a "payout not done yet" 409, wait this long before asking Rozo again.
+const DELIVERED_PENDING_RECHECK_MS = 6 * MIN
 
 type Action = 'confirm' | 'stuck' | 'deliver'
 
@@ -104,6 +106,8 @@ function classify(env: Env, rec: FulfillmentRecord, now: number): Action | null 
   if (rec.status === 'paid') {
     if (!deliveredReportEnabled(env) || rec.deliveredReported || !rec.rozoPaymentId) return null
     if ((rec.deliveredReportAttempts ?? 0) >= DELIVERED_MAX_ATTEMPTS) return null
+    const pendingAt = ms(rec.deliveredPendingAt ?? null)
+    if (pendingAt !== null && now - pendingAt < DELIVERED_PENDING_RECHECK_MS) return null
     return 'deliver'
   }
   return null
@@ -340,7 +344,11 @@ async function reportDelivered(env: Env, plId: string, rec: FulfillmentRecord, n
     // failure: no attempt counted, no alert, no event (the sweep runs every
     // tick and would flood the record). Retried next tick; after
     // DELIVERED_PENDING_WINDOW_MS a 409 counts as a failure again.
+    // deliveredPendingAt spaces the re-asks (DELIVERED_PENDING_RECHECK_MS) and
+    // orders them oldest-first so they never monopolize SWEEP_MAX_RECORDS.
     console.log(`[coinbase-sweep] delivered report pending (409, payout not done) for ${plId}`)
+    rec.deliveredPendingAt = nowIso
+    await saveRecordGuarded(env, plId, rec)
     return
   }
   rec.deliveredReportAttempts = (rec.deliveredReportAttempts ?? 0) + 1
@@ -397,7 +405,12 @@ export async function sweepCoinbaseFulfillments(
       if (!cursor) break
     }
     const rank: Record<Action, number> = { confirm: 0, deliver: 1, stuck: 2 }
-    candidates.sort((x, y) => rank[x.action] - rank[y.action])
+    // Within one action, never-pending records first, then the longest-waiting
+    // pending ones, so a burst of pending delivered reports rotates fairly.
+    const pendingOrder = (r: FulfillmentRecord) => ms(r.deliveredPendingAt ?? null) ?? -1
+    candidates.sort(
+      (x, y) => rank[x.action] - rank[y.action] || pendingOrder(x.rec) - pendingOrder(y.rec),
+    )
     for (const { plId, rec, action } of candidates.slice(0, SWEEP_MAX_RECORDS)) {
       acted++
       try {
