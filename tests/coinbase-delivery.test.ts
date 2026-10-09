@@ -457,7 +457,8 @@ describe('sweepCoinbaseFulfillments', () => {
       deliveredStatus: 409,
     })
     const { env, kv } = makeEnv()
-    seedRec(kv, { status: 'paid', paidAt: ago(5) })
+    // 409 after the 2h pending window counts as a real failure.
+    seedRec(kv, { status: 'paid', paidAt: ago(180) })
     await sweepCoinbaseFulfillments(env)
     expect(readRec(kv).deliveredReported).toBeFalsy()
     expect(readRec(kv).deliveredReportAttempts).toBe(1)
@@ -475,6 +476,60 @@ describe('sweepCoinbaseFulfillments', () => {
     const r2 = readRec(kv, 'invoice-fulfillment:pl_testDelivery2')
     expect(r2.deliveredReportAttempts).toBe(5)
     expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('a 409 shortly after paid is waiting for the Rozo payout: not counted, never alerted', async () => {
+    const { up, calls } = stubFetch({
+      coinbase: { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1 },
+      deliveredStatus: 409,
+    })
+    const { env, kv } = makeEnv()
+    seedRec(kv, { status: 'paid', paidAt: ago(30), deliveredReportAttempts: 4 })
+    // Simulate 2-minute cron ticks over 24 minutes.
+    const t0 = Date.now()
+    for (let i = 0; i < 12; i++) await sweepCoinbaseFulfillments(env, t0 + i * 2 * 60_000)
+    // Re-asked every 6 min (ticks 0, 3, 6, 9), never counted.
+    expect(calls.delivered).toHaveLength(4)
+    expect(readRec(kv).deliveredReportAttempts).toBe(4)
+    expect(readRec(kv).alertedDeliveredGiveUp).toBeFalsy()
+    expect(calls.dingtalk).toHaveLength(0)
+
+    // Rozo payout completes → next due tick's report is accepted.
+    up.deliveredStatus = 200
+    await sweepCoinbaseFulfillments(env, t0 + 30 * 60_000)
+    expect(readRec(kv).deliveredReported).toBe(true)
+    expect(calls.dingtalk).toHaveLength(0)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('pending delivered reports rotate instead of holding the per-run budget', async () => {
+    stubFetch({
+      coinbase: { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1 },
+      deliveredStatus: 409,
+    })
+    const { env, kv } = makeEnv()
+    const ids = Array.from({ length: 30 }, (_, i) => `pl_testPending${String(i).padStart(2, '0')}`)
+    for (const id of ids) seedRec(kv, { status: 'paid', paidAt: ago(10) }, id)
+    const t0 = Date.now()
+    await sweepCoinbaseFulfillments(env, t0)
+    await sweepCoinbaseFulfillments(env, t0 + 2 * 60_000)
+    // Two ticks cover all 30 records (20 + 10): the first 20 wait their recheck.
+    for (const id of ids) {
+      expect(readRec(kv, `invoice-fulfillment:${id}`).deliveredPendingAt).toBeTruthy()
+      expect(readRec(kv, `invoice-fulfillment:${id}`).deliveredReportAttempts ?? 0).toBe(0)
+    }
+  })
+
+  it('a non-409 failure inside the window still counts', async () => {
+    const { calls } = stubFetch({
+      coinbase: { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1 },
+      deliveredStatus: 500,
+    })
+    const { env, kv } = makeEnv()
+    seedRec(kv, { status: 'paid', paidAt: ago(5) })
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).deliveredReportAttempts).toBe(1)
     expect(calls.pay).toBe(0)
   })
 

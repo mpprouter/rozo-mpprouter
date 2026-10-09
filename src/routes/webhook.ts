@@ -138,6 +138,11 @@ export interface FulfillmentRecord {
   duplicateRozoPaymentIds?: string[]
   deliveredReported?: boolean
   deliveredReportAttempts?: number
+  // Last time Rozo answered the delivered report with the "payout not done
+  // yet" 409 (see deliveredReportStillPending). The sweep waits a few ticks
+  // before re-asking and rotates through pending records oldest-first, so
+  // pending records cannot hold the per-run budget.
+  deliveredPendingAt?: string | null
   // One-shot alert / bookkeeping flags written by the cron sweep.
   alertedStuck?: boolean
   alertedManualReview?: boolean
@@ -604,11 +609,17 @@ export function deliveredReportEnabled(env: Env): boolean {
 
 // Tell Rozo the merchant side is delivered (Coinbase captured). Only HTTP 200
 // counts. Never throws; returns whether the report was accepted.
+//
+// `pending` marks an HTTP 409: rozo-intents-api (payment-api
+// merchant-delivered.ts) answers 409 invalidStatus until ITS payout to us has
+// completed. The router often pays Coinbase first (from the funder float), so
+// a 409 right after `paid` is ordinary timing, not a failure: callers must
+// not count it toward DELIVERED_MAX_ATTEMPTS while inside the pending window.
 export async function reportDeliveredToRozo(
   env: Env,
   rozoPaymentId: string,
   plId: string,
-): Promise<{ ok: boolean; status: number }> {
+): Promise<{ ok: boolean; status: number; pending?: boolean }> {
   if (!deliveredReportEnabled(env)) return { ok: false, status: 0 }
   try {
     const r = await fetch(
@@ -622,10 +633,27 @@ export async function reportDeliveredToRozo(
         body: JSON.stringify({ reference: plId }),
       },
     )
-    return { ok: r.status === 200, status: r.status }
+    return { ok: r.status === 200, status: r.status, pending: r.status === 409 }
   } catch {
     return { ok: false, status: 0 }
   }
+}
+
+// How long after `paid` a 409 from Rozo counts as "payout not finished yet".
+// Payouts normally complete within minutes; after this window a 409 is a real
+// failure again (counted, and alerted after DELIVERED_MAX_ATTEMPTS).
+export const DELIVERED_PENDING_WINDOW_MS = 2 * 60 * 60 * 1000
+
+/** True when a failed delivered report is the benign "payout not done yet" 409. */
+export function deliveredReportStillPending(
+  rep: { ok: boolean; pending?: boolean },
+  rec: Pick<FulfillmentRecord, 'paidAt'>,
+  now: number = Date.now(),
+): boolean {
+  if (rep.ok || !rep.pending) return false
+  const paid = rec.paidAt ? Date.parse(rec.paidAt) : NaN
+  if (!Number.isFinite(paid)) return false
+  return now - paid <= DELIVERED_PENDING_WINDOW_MS
 }
 
 interface CoinbaseEventInput {
@@ -730,10 +758,11 @@ async function settleCoinbaseEvent(
       deliveredReportEnabled(env)
     ) {
       const rep = await reportDeliveredToRozo(env, saved.rozoPaymentId, plId)
+      const pending = deliveredReportStillPending(rep, saved)
       if (rep.ok) saved.deliveredReported = true
-      else saved.deliveredReportAttempts = (saved.deliveredReportAttempts ?? 0) + 1
+      else if (!pending) saved.deliveredReportAttempts = (saved.deliveredReportAttempts ?? 0) + 1
       saved.events.push({
-        kind: rep.ok ? 'delivered_reported' : 'delivered_report_failed',
+        kind: rep.ok ? 'delivered_reported' : pending ? 'delivered_report_pending' : 'delivered_report_failed',
         at: new Date().toISOString(),
         detail: { status: rep.status, test: true },
       })
@@ -945,10 +974,11 @@ async function settleCoinbaseEvent(
   if (rec.status === 'paid' && !rec.deliveredReported && rec.rozoPaymentId && deliveredReportEnabled(env)) {
     try {
       const rep = await reportDeliveredToRozo(env, rec.rozoPaymentId, plId)
+      const pending = deliveredReportStillPending(rep, rec)
       if (rep.ok) rec.deliveredReported = true
-      else rec.deliveredReportAttempts = (rec.deliveredReportAttempts ?? 0) + 1
+      else if (!pending) rec.deliveredReportAttempts = (rec.deliveredReportAttempts ?? 0) + 1
       rec.events.push({
-        kind: rep.ok ? 'delivered_reported' : 'delivered_report_failed',
+        kind: rep.ok ? 'delivered_reported' : pending ? 'delivered_report_pending' : 'delivered_report_failed',
         at: new Date().toISOString(),
         detail: { status: rep.status },
       })
