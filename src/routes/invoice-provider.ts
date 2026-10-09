@@ -839,7 +839,10 @@ export async function normalizeCoinbasePayment(
  * checkout page itself. No credentials are involved — the Origin/Referer pair
  * is what the browser sends. Mirrors `fetchCoinbasePayment` in webhook.ts.
  */
-export async function fetchCoinbasePayment(paymentId: string): Promise<CoinbasePayment> {
+export async function fetchCoinbasePayment(
+  paymentId: string,
+  signal?: AbortSignal,
+): Promise<CoinbasePayment> {
   const resource = isCoinbasePaymentSessionId(paymentId) ? 'payment-sessions' : 'payment-links'
   const path = `${resource}/${encodeURIComponent(paymentId)}`
   let res: Response
@@ -850,6 +853,7 @@ export async function fetchCoinbasePayment(paymentId: string): Promise<CoinbaseP
         Origin: COINBASE_PAYMENTS_BASE,
         Referer: `${COINBASE_PAYMENTS_BASE}/${path}`,
       },
+      ...(signal ? { signal } : {}),
     })
   } catch {
     throw new CoinbaseResolveError('upstream', 'Coinbase checkout API is unreachable')
