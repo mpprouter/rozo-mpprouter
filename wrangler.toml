@@ -178,6 +178,14 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 # Rollback: set NATIVE_SOURCES = "" and redeploy.
 # Internal rozotest invoices still open every native coin for testing.
 NATIVE_SOURCES = "ETH@8453,ETH@1,BNB@56,SOL@900,ETH@42161"
+# create-invoice abuse backstop (src/routes/create-invoice-gate.ts), per UTC
+# clock hour. Since 2026-10-10 the buyer-facing limit is rozo-intents-api's
+# tiered limiter (PR #643: 10 or 30 per IP per 10 min, 300 per IP per day,
+# 120 per app per 10 min), so these stay looser than it: per-IP above its
+# tier1 (180/hour). Absent or malformed values fall back to the same defaults
+# in code. Rollback to the old caps: "30" and "600".
+CREATE_INVOICE_IP_LIMIT_PER_HOUR = "200"
+CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR = "1500"
 # Stuck-order Intercom tickets (src/utils/intercom-ticket.ts). Ticket type 4 is
 # the workspace's built-in "Internal task" (Back-office) type; the contact is
 # an internal Rozo team contact, because router records hold no customer

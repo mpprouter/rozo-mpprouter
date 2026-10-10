@@ -75,6 +75,14 @@ const EXPOSED_RESPONSE_HEADERS = [
   'refund-status-url',
   'refund-id',
   'refund-mode',
+  // create-invoice 429s (own backstop or relayed from rozo-intents-api) tell
+  // the browser checkout how long to wait and which tier it is on.
+  'retry-after',
+  'x-ratelimit-limit',
+  'x-ratelimit-remaining',
+  'x-ratelimit-tier',
+  'x-ratelimit-window',
+  'x-ratelimit-scope',
 ].join(', ')
 
 const ALLOWED_METHODS = 'GET, POST, OPTIONS'

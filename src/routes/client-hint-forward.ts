@@ -47,7 +47,12 @@ function header(request: Request, name: string, max: number): string | null {
 export function buildForwardedClientHint(request: Request, client: string | null): ForwardedClientHint {
   return {
     ua: header(request, 'user-agent', MAX_UA),
-    ip: header(request, 'cf-connecting-ip', MAX_IP) ?? header(request, 'x-real-ip', MAX_IP),
+    // Only Cloudflare's own value: the edge sets cf-connecting-ip on every
+    // request and overwrites a client-supplied one, while x-real-ip /
+    // x-forwarded-for pass through from the client. rozo-intents-api keys its
+    // per-buyer creation limit on this IP (PR #643), so it must not be
+    // client-controlled.
+    ip: header(request, 'cf-connecting-ip', MAX_IP),
     referer: header(request, 'referer', MAX_URL),
     origin: header(request, 'origin', MAX_URL),
     client,
@@ -63,7 +68,13 @@ export function forwardedClientHintHeader(request: Request, client: string | nul
     const hint = buildForwardedClientHint(request, client)
     if (!hint.ua && !hint.ip && !hint.referer && !hint.origin && !hint.client) return null
     const encoded = JSON.stringify(hint)
-    return encoded.length > MAX_HEADER ? null : encoded
+    if (encoded.length <= MAX_HEADER) return encoded
+    // Oversized only through JSON escaping of caller-controlled text (each
+    // control character becomes six bytes). Drop the free-text fields but keep
+    // the IP: without it upstream skips its per-IP limit, so a junk
+    // User-Agent must not be a way around that limit.
+    const slim = JSON.stringify({ ...hint, ua: null, referer: null, origin: null })
+    return slim.length <= MAX_HEADER ? slim : null
   } catch {
     return null
   }

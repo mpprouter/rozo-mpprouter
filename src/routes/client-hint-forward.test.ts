@@ -42,6 +42,34 @@ describe('client-hint-forward', () => {
     expect(JSON.parse(encoded!).ua.length).toBe(200)
   })
 
+  it('takes the IP only from cf-connecting-ip, never from client-settable headers', () => {
+    const spoofed = buildForwardedClientHint(
+      req({ 'x-real-ip': '198.51.100.7', 'x-forwarded-for': '198.51.100.8' }),
+      null,
+    )
+    expect(spoofed.ip).toBeNull()
+    const both = buildForwardedClientHint(
+      req({ 'cf-connecting-ip': '203.0.113.9', 'x-real-ip': '198.51.100.7' }),
+      null,
+    )
+    expect(both.ip).toBe('203.0.113.9')
+  })
+
+  it('keeps the IP when escaping pushes the hint over the cap', () => {
+    // Each `"` escapes to two bytes, so these truncated fields alone exceed 1024.
+    const quotes = '"'.repeat(5000)
+    const encoded = forwardedClientHintHeader(
+      req({ 'cf-connecting-ip': '203.0.113.9', 'user-agent': quotes, referer: quotes, origin: quotes }),
+      'rozo-checkout-cli',
+    )
+    expect(encoded).not.toBeNull()
+    expect(encoded!.length).toBeLessThanOrEqual(1024)
+    const parsed = JSON.parse(encoded!)
+    expect(parsed.ip).toBe('203.0.113.9')
+    expect(parsed.client).toBe('rozo-checkout-cli')
+    expect(parsed.ua).toBeNull()
+  })
+
   it('adds the header only when there is a value, without touching other headers', () => {
     const base = { 'content-type': 'application/json', 'X-API-Key': 'k' }
     expect(withForwardedClientHint(base, null)).toBe(base)
