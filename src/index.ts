@@ -45,6 +45,9 @@ import { handleCapabilities, handleServiceSelect } from './routes/service-select
 import { hostedProviderIdFor } from './services/provider-hosting'
 import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
+import { X402_PATHS, handleX402Payer } from './x402payer/routes'
+import { supabaseLedger } from './x402payer/ledger'
+import { reconcileX402Payer } from './x402payer/reconcile'
 import { handleX402Supported } from './routes/x402-supported'
 import { handleX402WellKnown } from './routes/x402-well-known'
 import { monitorPublishedProviders } from './services/provider-monitor'
@@ -437,6 +440,32 @@ export interface Env {
   ALERT_LOG_SUPABASE_ANON_KEY?: string
   ALERTS_LOG_RPC_SECRET?: string
 
+  // ---- x402 payer (src/x402payer/, /v1/x402/*) ----------------------------
+  // The on/off switch is NOT here: it is app_config.X402_PAYER (off | shadow |
+  // on, default off) in the Rozo Intents DB, read by every ledger RPC.
+  // Ledger RPC access: anon key + shared secret (Vault x402_ledger_rpc_secret
+  // on the Intents side). URL / anon key fall back to ALERT_LOG_SUPABASE_*.
+  //   wrangler secret put X402_LEDGER_RPC_SECRET
+  X402_LEDGER_RPC_SECRET?: string
+  X402_LEDGER_SUPABASE_URL?: string
+  X402_LEDGER_SUPABASE_ANON_KEY?: string
+  // Signer for (exact, eip155:8453). Must derive to FUNDER_WALLET or /sign
+  // answers 503 X402_SIGNER_NOT_CONFIGURED. Unset = Base signing off.
+  //   wrangler secret put X402_BASE_FUNDER_PRIVATE_KEY
+  X402_BASE_FUNDER_PRIVATE_KEY?: string
+  // Signer for (exact, solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp): base58
+  // 64-byte keypair; must derive to X402_SOLANA_FUNDER_ADDRESS (public var).
+  //   wrangler secret put X402_SOLANA_FUNDER_SECRET_KEY
+  X402_SOLANA_FUNDER_SECRET_KEY?: string
+  X402_SOLANA_FUNDER_ADDRESS?: string
+  // Optional keyed Solana RPC (mint + blockhash). Default: public mainnet.
+  X402_SOLANA_RPC_URL?: string
+  // Intents API key bound to app merchant_x402_topup (top-up orders).
+  //   wrangler secret put ROZO_X402_TOPUP_API_KEY
+  ROZO_X402_TOPUP_API_KEY?: string
+  // Base USDC receiver for top-ups. Default: FUNDER_WALLET.
+  X402_TOPUP_RECEIVER?: string
+
   // Stuck-order Intercom tickets (utils/intercom-ticket.ts). The token is a
   // private-app token with only "Write tickets"; set via
   // `wrangler secret put INTERCOM_TICKET_TOKEN`. Unset → tickets are skipped,
@@ -627,6 +656,11 @@ export default {
     // Base USDC funder low-balance / sudden-drop watch. Replaces the launchd
     // job that ran on two laptops and double-sent every alert.
     ctx.waitUntil(watchFunderBalance(env))
+    // x402 payer hourly reconciliation (skeleton: logs ledger totals, no alert
+    // yet). Swallows its own errors like the watches above.
+    ctx.waitUntil(reconcileX402Payer(env.MPP_STORE, supabaseLedger(env)).then(() => undefined, (err) => {
+      console.warn(`[x402-reconcile] skipped: ${(err as Error).message}`)
+    }))
     // Checkout feedback → Feishu queue (retries, quiet hours, dedup by id).
     ctx.waitUntil(drainCheckoutFeedbackNotifications(env))
     // Free 402 probes only. Scheduled health monitoring never spends money.
@@ -831,6 +865,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
       if (url.pathname === '/x402/supported') {
         return handleX402Supported(env)
+      }
+
+      // x402 PAYER (we sign x402 payments for agents from a prepaid balance).
+      // Not the x402 SERVER branch above. Switch: app_config.X402_PAYER.
+      if (X402_PATHS.has(url.pathname)) {
+        const res = await handleX402Payer(request, env)
+        if (res) return res
       }
 
       // ---- Playground: self-serve prepaid demo sessions ------------------
