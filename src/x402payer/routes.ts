@@ -270,12 +270,15 @@ async function topup(request: Request, env: X402PayerEnv, deps: X402PayerDeps): 
     return fail(400, 'X402_TOPUP_AMOUNT_OUT_OF_RANGE', `Top-up must be between $${TOPUP_MIN_USD} and $${TOPUP_MAX_USD}.`)
   }
 
+  // Which coin the agent pays with. Never defaulted: a caller that meant
+  // Solana USDT and got a Base USDC address would send to the wrong chain.
+  const pick = parseTopupSource(body)
+  if ('error' in pick) return fail(400, pick.error.code, pick.error.message, pick.error.extra ?? {})
   // Stablecoin sources only in v1 (same table as checkout). Native coins and
   // Lightning settle exactOut through separate gates; added later.
-  const src = resolveSource(body.source ?? undefined, new Set())
-  if (src.error) return fail(400, src.error.code, src.error.message)
-  if (src.resolved.chainId === 'lightning') {
-    return fail(400, 'UNSUPPORTED_SOURCE', 'Lightning top-ups are not available yet. Use USDC or USDT.')
+  const src = resolveSource({ chainId: pick.chainId, tokenSymbol: pick.token }, new Set())
+  if (src.error) {
+    return fail(400, 'X402_TOPUP_SOURCE_UNSUPPORTED', src.error.message, src.error.supported ? { supported: src.error.supported } : {})
   }
 
   const receiver = (env.X402_TOPUP_RECEIVER || FUNDER_WALLET).trim()
@@ -339,6 +342,17 @@ async function topup(request: Request, env: X402PayerEnv, deps: X402PayerDeps): 
     return fail(503, 'X402_TOPUP_MISCONFIGURED', 'Top-up destination mismatch. Nothing was charged; try again later.')
   }
 
+  // The order must take the coin the caller asked for; otherwise refuse
+  // rather than show an address on another chain.
+  const orderChain = order?.source?.chainId !== undefined ? String(order.source.chainId) : src.resolved.chainId
+  const orderToken = order?.source?.tokenSymbol !== undefined ? String(order.source.tokenSymbol).toUpperCase() : src.resolved.tokenSymbol
+  if (orderChain !== src.resolved.chainId || orderToken !== src.resolved.tokenSymbol) {
+    console.error('[x402-payer] top-up order source differs from the requested chain/token')
+    return fail(503, 'X402_TOPUP_MISCONFIGURED', 'Top-up source mismatch. Nothing was charged; try again later.')
+  }
+  const depositAddress = typeof order?.source?.receiverAddress === 'string' ? order.source.receiverAddress : null
+  if (!depositAddress) return fail(502, 'INTENTS_API_FAILED', 'Rozo intents API returned no deposit address.')
+
   const reg = await deps.ledger!.registerTopup({
     key_digest: digest,
     payment_id: paymentId,
@@ -352,22 +366,94 @@ async function topup(request: Request, env: X402PayerEnv, deps: X402PayerDeps): 
       : fail(503, 'X402_TOPUP_NOT_REGISTERED', 'Could not register the top-up. Nothing was charged; try again.')
   }
 
+  const expiresAt = order?.expiresAt ?? null
   return json(200, {
     ok: true,
     paymentId,
-    paymentLink: order?.paymentLink ?? order?.url ?? null,
-    expiresAt: order?.expiresAt ?? null,
+    // Echo of what was asked, so the client can check it got the right coin.
+    chain: pick.chain,
+    token: src.resolved.tokenSymbol,
+    amount: amountRaw,
     deposit: {
-      chainId: order?.source?.chainId ?? src.resolved.chainId,
-      tokenSymbol: order?.source?.tokenSymbol ?? src.resolved.tokenSymbol,
-      address: order?.source?.receiverAddress ?? null,
+      address: depositAddress,
       memo: order?.source?.receiverMemo ?? null,
+      chain: pick.chain,
+      chainId: src.resolved.chainId,
+      token: src.resolved.tokenSymbol,
       amount: order?.source?.amount ?? amountRaw,
+      expiresAt,
     },
+    paymentLink: order?.paymentLink ?? order?.url ?? null,
+    expiresAt,
     creditUsd: order?.destination?.amount ?? null,
     note: 'Send exactly deposit.amount to deposit.address (with memo if present). The balance is credited with creditUsd when the deposit is confirmed.',
     ...(src.resolved.warnings.length ? { warnings: src.resolved.warnings } : {}),
   })
+}
+
+/**
+ * Top-up chain names. CAIP-2 ids (canonical, echoed back) plus the plain
+ * names the design and CLI use. Mapped to the payment-api chainId.
+ */
+export const TOPUP_CHAINS: Record<string, { chainId: string; caip2: string }> = (() => {
+  const defs: Array<[string, string, string[]]> = [
+    ['1', 'eip155:1', ['ethereum']],
+    ['56', 'eip155:56', ['bsc', 'bnb']],
+    ['137', 'eip155:137', ['polygon']],
+    ['8453', 'eip155:8453', ['base']],
+    ['42161', 'eip155:42161', ['arbitrum']],
+    ['900', 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', ['solana']],
+    ['1500', 'stellar:pubnet', ['stellar']],
+  ]
+  const out: Record<string, { chainId: string; caip2: string }> = {}
+  for (const [chainId, caip2, names] of defs) {
+    for (const n of [caip2, ...names]) out[n.toLowerCase()] = { chainId, caip2 }
+  }
+  return out
+})()
+
+const NATIVE_OR_BTC = new Set(['ETH', 'BNB', 'SOL', 'POL', 'MATIC', 'XLM', 'BTC'])
+
+/** Read {chain, token} (or the alias source:{chainId, tokenSymbol}); both required. */
+export function parseTopupSource(body: Record<string, unknown>):
+  | { chain: string; chainId: string; token: string }
+  | { error: { code: string; message: string; extra?: Record<string, unknown> } } {
+  const source = body.source && typeof body.source === 'object' && !Array.isArray(body.source)
+    ? (body.source as Record<string, unknown>)
+    : null
+  const chainRaw = body.chain ?? source?.chainId
+  const tokenRaw = body.token ?? source?.tokenSymbol
+  if (chainRaw === undefined || chainRaw === null || chainRaw === '' || typeof tokenRaw !== 'string' || !tokenRaw) {
+    return {
+      error: {
+        code: 'X402_TOPUP_SOURCE_REQUIRED',
+        message: 'Say which coin you pay with: {"chain": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp" or "solana", "token": "USDT"}.',
+        extra: { chains: [...new Set(Object.values(TOPUP_CHAINS).map((c) => c.caip2))] },
+      },
+    }
+  }
+  const token = tokenRaw.trim().toUpperCase()
+  const chainStr = String(chainRaw).trim()
+  if (chainStr.toLowerCase() === 'lightning' || NATIVE_OR_BTC.has(token)) {
+    return {
+      error: {
+        code: 'X402_TOPUP_SOURCE_UNSUPPORTED',
+        message: 'Native coin and Lightning top-ups are not available yet. Top up with USDC or USDT.',
+      },
+    }
+  }
+  // Legacy numeric chainId (alias form) or a known name / CAIP-2 id.
+  const byNumeric = Object.values(TOPUP_CHAINS).find((c) => c.chainId === chainStr)
+  const hit = TOPUP_CHAINS[chainStr.toLowerCase()] ?? byNumeric
+  if (!hit) {
+    return {
+      error: {
+        code: 'X402_UNSUPPORTED_CHAIN',
+        message: `Chain "${chainStr}" is not supported for top-ups. Use a CAIP-2 id such as solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp, or a name such as solana.`,
+      },
+    }
+  }
+  return { chain: hit.caip2, chainId: hit.chainId, token }
 }
 
 function storedPaymentResponse(p: LedgerPayment, replay: boolean, balanceUsd?: string): Response {
@@ -411,11 +497,13 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
   const req: ValidatedRequirement = selected.ok
   const amountUsd = atomicToUsd(req.amountAtomic)
 
-  if (body.maxAmountUsd !== undefined) {
-    const budget = Number(body.maxAmountUsd)
-    if (!Number.isFinite(budget) || budget <= 0) return fail(400, 'X402_INVALID_REQUEST', 'maxAmountUsd must be a positive number.')
+  // budget (design 5.1); maxAmountUsd accepted as an alias.
+  const budgetRaw = body.budget ?? body.maxAmountUsd
+  if (budgetRaw !== undefined && budgetRaw !== null) {
+    const budget = Number(budgetRaw)
+    if (!Number.isFinite(budget) || budget <= 0) return fail(400, 'X402_INVALID_REQUEST', 'budget must be a positive USD amount.')
     if (Number(amountUsd) > budget) {
-      return fail(402, 'X402_BUDGET_EXCEEDED', `The challenge asks $${amountUsd}, above maxAmountUsd $${budget}.`)
+      return fail(402, 'X402_BUDGET_EXCEEDED', `The challenge asks $${amountUsd}, above budget $${budget}.`)
     }
   }
 

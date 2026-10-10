@@ -338,13 +338,23 @@ describe('balance and limits', () => {
     expect(r.body.code).toBe('X402_GLOBAL_DAILY_CAP_REACHED')
   })
 
-  it('maxAmountUsd budget guard', async () => {
+  it('budget guard (maxAmountUsd alias too)', async () => {
     const key = await newKey(10)
-    const r = await call('/v1/x402/sign', {
-      method: 'POST', key, body: JSON.stringify({ idempotencyKey: 'idem-lim-0006', accepts: baseReq({ amount: '2000000' }), maxAmountUsd: 1 }),
-    })
-    expect(r.status).toBe(402)
-    expect(r.body.code).toBe('X402_BUDGET_EXCEEDED')
+    for (const field of ['budget', 'maxAmountUsd']) {
+      const r = await call('/v1/x402/sign', {
+        method: 'POST', key, body: JSON.stringify({ idempotencyKey: `idem-budget-${field}`, accepts: baseReq({ amount: '2000000' }), [field]: '1' }),
+      })
+      expect(r.status).toBe(402)
+      expect(r.body.code).toBe('X402_BUDGET_EXCEEDED')
+    }
+    expect(evmSigns).toBe(0)
+  })
+
+  it('x402Version 1 is refused with X402_UNSUPPORTED_VERSION', async () => {
+    const key = await newKey(10)
+    const r = await call('/v1/x402/sign', { method: 'POST', key, body: JSON.stringify({ idempotencyKey: 'idem-v1-00001', x402Version: 1, accepts: baseReq() }) })
+    expect(r.status).toBe(400)
+    expect(r.body.code).toBe('X402_UNSUPPORTED_VERSION')
   })
 
   it('unknown or malformed key -> 401', async () => {
@@ -550,18 +560,72 @@ describe('topup', () => {
       source: { receiverAddress: 'DepositAddr111' },
       destination: { receiverAddress: '0x9999999999999999999999999999999999999999' },
     }), { status: 200 })) as any
-    const r = await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20' }) })
+    const r = await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', chain: 'base', token: 'USDC' }) })
     expect(r.status).toBe(503)
     expect(r.body.code).toBe('X402_TOPUP_MISCONFIGURED')
     expect(r.body.deposit).toBeUndefined()
     expect(ledger.topups).toHaveLength(0)
   })
 
-  it('enforces min/max and stablecoin-only sources', async () => {
+  it('enforces min/max and stablecoin-only sources with explicit codes', async () => {
     const key = await newKey(0)
-    expect((await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '4.99' }) })).body.code).toBe('X402_TOPUP_AMOUNT_OUT_OF_RANGE')
-    expect((await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', source: { chainId: '8453', tokenSymbol: 'ETH' } }) })).status).toBe(400)
-    expect((await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', source: { chainId: 'lightning', tokenSymbol: 'BTC' } }) })).status).toBe(400)
+    const topup = async (b: Record<string, unknown>) => (await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify(b) })).body
+    expect((await topup({ amount: '4.99', chain: 'base', token: 'USDC' })).code).toBe('X402_TOPUP_AMOUNT_OUT_OF_RANGE')
+    expect((await topup({ amount: '20', chain: 'base', token: 'ETH' })).code).toBe('X402_TOPUP_SOURCE_UNSUPPORTED')
+    expect((await topup({ amount: '20', source: { chainId: '8453', tokenSymbol: 'ETH' } })).code).toBe('X402_TOPUP_SOURCE_UNSUPPORTED')
+    expect((await topup({ amount: '20', chain: 'lightning', token: 'BTC' })).code).toBe('X402_TOPUP_SOURCE_UNSUPPORTED')
+    expect((await topup({ amount: '20', chain: 'solana', token: 'SOL' })).code).toBe('X402_TOPUP_SOURCE_UNSUPPORTED')
+    expect((await topup({ amount: '20', chain: 'base', token: 'USDT' })).code).toBe('X402_TOPUP_SOURCE_UNSUPPORTED')
+    expect((await topup({ amount: '20', chain: 'solana:mainnet', token: 'USDC' })).code).toBe('X402_UNSUPPORTED_CHAIN')
+  })
+
+  it('never defaults the coin: missing chain or token is 400, no order created', async () => {
+    const key = await newKey(0)
+    let posts = 0
+    deps.fetchImpl = (async () => { posts++; return new Response('{}') }) as any
+    for (const b of [{ amount: '20' }, { amount: '20', token: 'USDT' }, { amount: '20', chain: 'solana' }, { amount: '20', source: {} }]) {
+      const r = await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify(b) })
+      expect(r.status).toBe(400)
+      expect(r.body.code).toBe('X402_TOPUP_SOURCE_REQUIRED')
+    }
+    expect(posts).toBe(0)
+  })
+
+  it('accepts {amount, token, chain} with CAIP-2 or a chain name and echoes chain/token', async () => {
+    const key = await newKey(0)
+    let sent: any = null
+    deps.fetchImpl = (async (_u: any, init: any) => {
+      sent = JSON.parse(init.body)
+      return new Response(JSON.stringify({
+        id: '6f1c6c7e-1111-4222-8333-944455556667',
+        source: { chainId: '900', tokenSymbol: 'USDT', receiverAddress: 'DepositAddr222', amount: '20' },
+        destination: { receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739', amount: '19.80' },
+        expiresAt: '2999-01-01T00:00:00Z',
+      }), { status: 200 })
+    }) as any
+    for (const chain of ['solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', 'solana']) {
+      const r = await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', token: 'usdt', chain }) })
+      expect(r.status).toBe(200)
+      expect(sent.source).toMatchObject({ chainId: '900', tokenSymbol: 'USDT' })
+      expect(r.body).toMatchObject({
+        chain: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp',
+        token: 'USDT',
+        deposit: { address: 'DepositAddr222', chain: 'solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp', token: 'USDT', amount: '20', expiresAt: '2999-01-01T00:00:00Z' },
+      })
+    }
+  })
+
+  it('refuses when payment-api answers with a different source coin', async () => {
+    const key = await newKey(0)
+    deps.fetchImpl = (async () => new Response(JSON.stringify({
+      id: '6f1c6c7e-1111-4222-8333-944455556668',
+      source: { chainId: '8453', tokenSymbol: 'USDC', receiverAddress: '0xabc' },
+      destination: { receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739' },
+    }), { status: 200 })) as any
+    const r = await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', token: 'USDT', chain: 'solana' }) })
+    expect(r.body.code).toBe('X402_TOPUP_MISCONFIGURED')
+    expect(r.body.deposit).toBeUndefined()
+    expect(ledger.topups).toHaveLength(0)
   })
 
   it('503 when the top-up API key is not configured', async () => {
