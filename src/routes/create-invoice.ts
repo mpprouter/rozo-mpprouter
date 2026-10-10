@@ -401,6 +401,7 @@ export type CreateInvoiceErrorCode =
   | 'ZEC_NOT_ENABLED'
   | 'QUOTE_DRIFT'
   | 'ZEC_REQUIRES_EXACT_OUT'
+  | 'REFUND_ADDRESS_MISMATCH'
   | 'EXCEEDS_LIMIT'
 
 // Resolver failure kind -> the error code a checkout UI keys its friendly copy
@@ -562,6 +563,84 @@ export function zecUpstreamError(
     code: code as CreateInvoiceErrorCode,
     message: typeof rawMessage === 'string' && rawMessage ? rawMessage.substring(0, 300) : code,
   }
+}
+
+/**
+ * Metadata key holding the SHA-256 (hex) of the ZEC refund address an order
+ * was created with. rozo-intents-api keeps the address itself only in
+ * metadata.internal.zec_refund_address, which every API response strips, so
+ * without this echo a reused order's refund target could never be read back.
+ * A digest, not the address, because GET /payments/{id} is public.
+ */
+export const ZEC_REFUND_DIGEST_KEY = 'zec_refund_address_sha256'
+
+export async function refundAddressDigest(address: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(address))
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * The refund address an existing ZEC order is bound to, as either the plain
+ * address (metadata.internal.zec_refund_address, only present if a response
+ * ever carries the internal namespace) or the digest mpprouter wrote at
+ * create (metadata.zec_refund_address_sha256). Null when neither is readable.
+ */
+function boundRefundAddress(row: any): { address: string } | { digest: string } | null {
+  const metadata = readMetadataObject(row)
+  const internal = metadata?.internal
+  const plain =
+    internal && typeof internal === 'object' ? (internal as Record<string, unknown>).zec_refund_address : undefined
+  if (typeof plain === 'string' && plain.trim()) return { address: plain.trim() }
+  const digest = metadata?.[ZEC_REFUND_DIGEST_KEY]
+  if (typeof digest === 'string' && /^[0-9a-f]{64}$/.test(digest)) return { digest }
+  return null
+}
+
+/**
+ * Guard for reusing an existing order when this caller pays with a coin that
+ * needs a refund address (ZEC). 1Click binds refundTo at quote time, so a
+ * reused order refunds to the address it was created with: hand it back only
+ * when that address is provably the one submitted now. Orders whose source is
+ * not a refund-address coin are unaffected (null = proceed).
+ */
+export async function refundAddressReuseBlock(
+  row: any,
+  submitted: string | null,
+  extra: Record<string, unknown>,
+): Promise<Response | null> {
+  const rowSource = readRowSource(row)
+  if (
+    rowSource.chainId !== null &&
+    !nativeRequiresRefundAddress(rowSource.chainId, String(rowSource.tokenSymbol ?? ''))
+  ) {
+    return null
+  }
+  const bound = boundRefundAddress(row)
+  let matches = false
+  if (bound && submitted) {
+    matches =
+      'address' in bound
+        ? bound.address === submitted
+        : bound.digest === (await refundAddressDigest(submitted))
+  }
+  if (matches) return null
+  const expiresAt: string | null = row?.expiresAt ?? null
+  const message =
+    'An unpaid ZEC order already exists for this payment link with a refund address ' +
+    (bound ? 'different from the one submitted' : 'that cannot be verified') +
+    '. Its refund address cannot be changed. Pay that order only if you control its ' +
+    'refund address, otherwise wait for it to expire' +
+    (expiresAt ? ` (${expiresAt})` : '') +
+    ' and create a new order.'
+  return json(409, {
+    ok: false,
+    code: 'REFUND_ADDRESS_MISMATCH',
+    message,
+    error: { code: 'REFUND_ADDRESS_MISMATCH', message },
+    ...extra,
+    rozoPaymentId: row?.id ?? null,
+    expiresAt,
+  })
 }
 
 // ── Reuse of an existing Rozo intent ────────────────────────────────────────
@@ -1854,6 +1933,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       if (!pendingPricingMatches(existing, pricing)) {
         return pricingMismatchResponse({ linkId }, existing)
       }
+      if (refundAddressRequired) {
+        const refundBlock = await refundAddressReuseBlock(existing, refundAddress, { linkId })
+        if (refundBlock) return refundBlock
+      }
 
       // Unpaid and unexpired → reusable. If this caller asked for a different
       // chain/token than the order currently pays from, try to rotate the
@@ -2002,7 +2085,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // window, and hand its expiry to rozo-intents-api, which re-checks it
   // (metadata.merchant_link_expires_at, top-level because metadata.client is
   // already a string label). Fresh creates only: a live ZEC order is reused
-  // above as is, and never rotated to another coin (native_not_rotatable).
+  // above only when its bound refund address matches (refundAddressReuseBlock),
+  // and never rotated to another coin (native_not_rotatable).
   let merchantLinkExpiresAt: string | null = null
   if (refundAddressRequired) {
     const linkExpiry =
@@ -2057,6 +2141,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           ...orderAttribution,
           ...priced,
           ...(merchantLinkExpiresAt ? { merchant_link_expires_at: merchantLinkExpiresAt } : {}),
+          // Read back on reuse (refundAddressReuseBlock); upstream strips the
+          // plain address it stores under metadata.internal from responses.
+          ...(refundAddress ? { [ZEC_REFUND_DIGEST_KEY]: await refundAddressDigest(refundAddress) } : {}),
           // Lets downstream analytics (GMV) drop internal test orders.
           ...(testInvoiceCents !== null ? { testMode: true } : {}),
         },
@@ -2198,6 +2285,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           }
           if (!pendingPricingMatches(winner, pricing)) {
             return pricingMismatchResponse({ linkId }, winner)
+          }
+          if (refundAddressRequired) {
+            const refundBlock = await refundAddressReuseBlock(winner, refundAddress, { linkId })
+            if (refundBlock) return refundBlock
           }
           const winnerSource = readRowSource(winner)
           return json(200, {
