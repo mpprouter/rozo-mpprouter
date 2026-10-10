@@ -48,7 +48,8 @@ export interface OpsPending {
 }
 
 export interface OpsReport {
-  authorizations?: Array<{ payment_id: string; used: boolean }>
+  /** block_* identify the finalized Base block the read was pinned to. */
+  authorizations?: Array<{ payment_id: string; used: boolean; block_number: number; block_timestamp: number }>
   reversals_alerted?: string[]
 }
 

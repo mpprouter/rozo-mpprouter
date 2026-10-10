@@ -24,7 +24,7 @@ import { encodeFunctionData, decodeFunctionResult, type Hex } from 'viem'
 import { alertSinkConfigured, sendAlert, type AlertEnv } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 import { FALLBACK_BASE_RPCS, getBaseUsdcBalance, redactRpcUrl } from '../utils/base-usdc-balance'
-import type { X402Ledger } from './ledger'
+import type { OpsReport, X402Ledger } from './ledger'
 import { BASE_USDC } from './requirements'
 
 const OPS_LAST_RUN_KEY = 'x402payer:ops:last-slot'
@@ -55,17 +55,52 @@ export interface X402JobsDeps {
   send?: (env: AlertEnv, content: ReturnType<typeof redactForAlert>) => Promise<boolean>
 }
 
+export const RPC_TIMEOUT_MS = 5_000
+
+export interface AuthorizationObservation {
+  used: boolean
+  blockNumber: number
+  blockTimestamp: number
+}
+
+/** One JSON-RPC call with a hard deadline (request and body). */
+async function rpcCall(fetchImpl: typeof fetch, url: string, method: string, params: unknown[], timeoutMs: number): Promise<any> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: controller.signal,
+    })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const json = (await res.json()) as { result?: unknown; error?: unknown }
+    if (json.result === undefined || json.result === null) throw new Error('no result')
+    return json.result
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
- * USDC.authorizationState(authorizer, nonce) on Base. true = used, false =
- * unused, null = no RPC answered (never treat as unused).
+ * USDC.authorizationState(authorizer, nonce) read AT Base's FINALIZED block,
+ * and only when that block is later than validBefore. Such a read is final:
+ * no later block can execute the authorization and a finalized block cannot
+ * be reorged. Returns null whenever that cannot be established (finalized
+ * block not yet past expiry, RPC failure, bad input): null is never reported,
+ * so an unknown state can never become a refund.
  */
 export async function readAuthorizationState(
   authorizer: string,
   nonce: string,
+  validBeforeUnix: number,
   primaryRpcUrl?: string,
   fetchImpl: typeof fetch = fetch,
-): Promise<boolean | null> {
+  timeoutMs = RPC_TIMEOUT_MS,
+): Promise<AuthorizationObservation | null> {
   if (!/^0x[0-9a-fA-F]{40}$/.test(authorizer) || !/^0x[0-9a-fA-F]{64}$/.test(nonce)) return null
+  if (!Number.isFinite(validBeforeUnix) || validBeforeUnix <= 0) return null
   const data = encodeFunctionData({
     abi: AUTHORIZATION_STATE_ABI,
     functionName: 'authorizationState',
@@ -74,15 +109,16 @@ export async function readAuthorizationState(
   const candidates = primaryRpcUrl ? [primaryRpcUrl, ...FALLBACK_BASE_RPCS] : FALLBACK_BASE_RPCS
   for (const rpcUrl of candidates) {
     try {
-      const res = await fetchImpl(rpcUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: BASE_USDC, data }, 'latest'] }),
-      })
-      if (!res.ok) continue
-      const json = (await res.json()) as { result?: string }
-      if (!json.result || json.result === '0x') continue
-      return decodeFunctionResult({ abi: AUTHORIZATION_STATE_ABI, functionName: 'authorizationState', data: json.result as Hex })
+      // Block and state from the same endpoint, state pinned to that block.
+      const block = await rpcCall(fetchImpl, rpcUrl, 'eth_getBlockByNumber', ['finalized', false], timeoutMs)
+      const blockNumber = Number(BigInt(block?.number))
+      const blockTimestamp = Number(BigInt(block?.timestamp))
+      if (!Number.isFinite(blockNumber) || !Number.isFinite(blockTimestamp)) continue
+      if (blockTimestamp <= validBeforeUnix) return null // not final yet; ask again next run
+      const result = await rpcCall(fetchImpl, rpcUrl, 'eth_call', [{ to: BASE_USDC, data }, `0x${blockNumber.toString(16)}`], timeoutMs)
+      if (typeof result !== 'string' || result === '0x') continue
+      const used = decodeFunctionResult({ abi: AUTHORIZATION_STATE_ABI, functionName: 'authorizationState', data: result as Hex })
+      return { used, blockNumber, blockTimestamp }
     } catch (err) {
       console.warn(`[x402-ops] authorizationState via ${redactRpcUrl(rpcUrl)} failed: ${(err as Error).message}`)
     }
@@ -99,10 +135,18 @@ export async function runX402Ops(deps: X402JobsDeps): Promise<{ ran: boolean; ch
   await deps.kv.put(OPS_LAST_RUN_KEY, slot, { expirationTtl: 3600 })
 
   const pending = await deps.ledger.opsPending(50)
-  const authorizations: Array<{ payment_id: string; used: boolean }> = []
+  const authorizations: NonNullable<OpsReport['authorizations']> = []
   for (const item of pending.authorization_checks ?? []) {
-    const used = await readAuthorizationState(item.funder, item.nonce, deps.baseRpcUrl, deps.fetchImpl)
-    if (used !== null) authorizations.push({ payment_id: item.payment_id, used })
+    const validBefore = Math.floor(Date.parse(item.valid_before) / 1000)
+    const seen = await readAuthorizationState(item.funder, item.nonce, validBefore, deps.baseRpcUrl, deps.fetchImpl)
+    if (seen) {
+      authorizations.push({
+        payment_id: item.payment_id,
+        used: seen.used,
+        block_number: seen.blockNumber,
+        block_timestamp: seen.blockTimestamp,
+      })
+    }
   }
 
   const send = deps.send ?? sendAlert

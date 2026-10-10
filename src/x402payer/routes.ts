@@ -32,7 +32,7 @@ import { encodePaymentSignatureHeader } from '@x402/core/http'
 import { resolveSource } from '../routes/create-invoice'
 import { FUNDER_WALLET } from '../routes/webhook'
 import { clientIp } from '../routes/create-invoice-gate'
-import { randomEvmNonce, remoteSignEvmExact, remoteSignerFromEnv, type RemoteSignerConfig } from './evm'
+import { SIGN_SERVICE_TIMEOUT_MS, randomEvmNonce, remoteSignEvmExact, remoteSignerFromEnv, type RemoteSignerConfig } from './evm'
 import { LedgerUnavailableError, supabaseLedger, type LedgerEnv, type LedgerPayment, type LedgerResult, type X402Ledger } from './ledger'
 import {
   BASE_MAINNET_CAIP2,
@@ -576,8 +576,11 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
       // first attempt is still valid, the same nonce and validBefore, so a
       // retry after a timeout asks the signing service for the identical
       // authorization (it answers idempotently) instead of a second one.
-      const remoteKey = await sha256Hex(`x402:${a.id}:${idempotencyKey}`)
-      const attempt = await loadOrCreateAttempt(deps, remoteKey, hash, req.maxTimeoutSeconds)
+      const attemptKey = await sha256Hex(`x402:${a.id}:${idempotencyKey}`)
+      const attempt = await loadOrCreateAttempt(deps, attemptKey, hash, req.maxTimeoutSeconds)
+      // The remote idempotency key also covers the nonce: a fresh attempt
+      // (expired or uncached parameters) is a new remote request, never a 409.
+      const remoteKey = await sha256Hex(`x402:${a.id}:${idempotencyKey}:${attempt.nonce}`)
       const signed = await remoteSignEvmExact(deps.evmRemote, req, {
         nonce: attempt.nonce,
         validBeforeUnix: attempt.validBefore,
@@ -586,6 +589,10 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
       })
       // Nothing is debited on any error: the ledger commit below never ran.
       if ('error' in signed) return fail(signed.error.status, signed.error.code, signed.error.message)
+      // Never debit for a credential that is (nearly) dead on arrival.
+      if (deps.nowSeconds() > signed.ok.validBeforeUnix - FRESHNESS_MARGIN_S) {
+        return fail(503, 'X402_RETRY', 'The signature arrived too close to its expiry. Retry with the same idempotencyKey.')
+      }
       funder = signed.ok.funder
       nonce = signed.ok.nonce
       validBeforeUnix = signed.ok.validBeforeUnix
@@ -642,12 +649,14 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
 }
 
 const ATTEMPT_PREFIX = 'x402payer:attempt:'
+/** A signed credential must have at least this long left when we commit it. */
+const FRESHNESS_MARGIN_S = 5
 
 /**
  * Signing parameters of the first attempt for one remote key, reused by
  * retries while still valid. KV is eventually consistent across colos: a
- * retry that misses the cache draws new parameters and the signing service
- * answers 409, surfaced as X402_IDEMPOTENCY_CONFLICT (use a new key).
+ * retry that misses the cache draws new parameters, which is a new remote
+ * idempotency key (it includes the nonce), so it simply signs again.
  */
 async function loadOrCreateAttempt(
   deps: X402PayerDeps,
@@ -661,7 +670,9 @@ async function loadOrCreateAttempt(
     const raw = await deps.kv?.get(kvKey)
     if (raw) {
       const prev = JSON.parse(raw) as { nonce: `0x${string}`; validBefore: number; hash: string }
-      if (prev.hash === hash && prev.validBefore > now + 5 && /^0x[0-9a-f]{64}$/.test(prev.nonce)) {
+      // Reuse only if the parameters still outlive a full signing timeout.
+      const minLeft = Math.ceil(SIGN_SERVICE_TIMEOUT_MS / 1000) + FRESHNESS_MARGIN_S
+      if (prev.hash === hash && prev.validBefore > now + minLeft && /^0x[0-9a-f]{64}$/.test(prev.nonce)) {
         return { nonce: prev.nonce, validBefore: prev.validBefore }
       }
     }

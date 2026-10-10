@@ -889,6 +889,26 @@ describe('remote Base signer (pay-invoice sign-x402)', () => {
     expect(signerCalls).toHaveLength(3)
   })
 
+  it('a credential that comes back too close to expiry is not committed', async () => {
+    const key = await newKey(10)
+    let t = 1_800_000_000
+    deps.nowSeconds = () => t
+    const slow = deps.evmRemote!.fetchImpl
+    deps.evmRemote = { ...deps.evmRemote!, fetchImpl: (async (u: any, i: any) => { t += 58; return slow(u, i) }) as any }
+    const r = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-late') })
+    expect(r.status).toBe(503)
+    expect(r.body.code).toBe('X402_RETRY')
+    expect(ledger.commits).toBe(0)
+    // The next attempt cannot reuse parameters that no longer outlive a signing
+    // timeout: fresh nonce, fresh remote key, signed and committed.
+    deps.evmRemote = { ...deps.evmRemote!, fetchImpl: slow }
+    const r2 = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-late') })
+    expect(r2.status).toBe(200)
+    expect(signerCalls[1].body.nonce).not.toBe(signerCalls[0].body.nonce)
+    expect(signerCalls[1].body.idempotencyKey).not.toBe(signerCalls[0].body.idempotencyKey)
+    expect(ledger.commits).toBe(1)
+  })
+
   it('the remote idempotency key is scoped to the agent key', async () => {
     const k1 = await newKey(10)
     const k2 = await newKey(10)
@@ -918,27 +938,49 @@ describe('balance flags', () => {
   })
 })
 
-describe('authorizationState read', () => {
+describe('authorizationState read (finalized block past expiry)', () => {
   const NONCE = `0x${'cd'.repeat(32)}`
-  function rpcAnswer(result: string | null, status = 200) {
-    return (async (_u: any, init: any) => {
+  const VB = 1_800_000_000
+  function rpc(opts: { blockTs: number; result?: string | null; status?: number; hang?: boolean }) {
+    const calls: any[] = []
+    const f = (async (_u: any, init: any) => {
       const req = JSON.parse(init.body)
+      calls.push(req)
+      if (opts.hang) {
+        return new Promise((_res, rej) => init.signal?.addEventListener('abort', () => rej(Object.assign(new Error('aborted'), { name: 'AbortError' }))))
+      }
+      if (req.method === 'eth_getBlockByNumber') {
+        expect(req.params[0]).toBe('finalized')
+        return new Response(JSON.stringify({ result: { number: '0x1e240', timestamp: `0x${opts.blockTs.toString(16)}` } }))
+      }
       expect(req.method).toBe('eth_call')
       expect(req.params[0].to).toBe(BASE_USDC)
-      // authorizationState(address,bytes32) selector, then the two words.
-      expect(req.params[0].data.slice(0, 10)).toBe('0xe94a0102')
+      expect(req.params[0].data.slice(0, 10)).toBe('0xe94a0102') // authorizationState(address,bytes32)
       expect(req.params[0].data.endsWith('cd'.repeat(32))).toBe(true)
-      return new Response(JSON.stringify(result === null ? { error: { code: -1 } } : { result }), { status })
+      expect(req.params[1]).toBe('0x1e240') // pinned to the finalized block, not 'latest'
+      return new Response(JSON.stringify(opts.result === null ? { error: { code: -1 } } : { result: opts.result }), { status: opts.status ?? 200 })
     }) as any
+    return { f, calls }
   }
-  it('true / false from the chain', async () => {
-    expect(await readAuthorizationState(FUNDER.address, NONCE, 'https://rpc.test', rpcAnswer(`0x${'0'.repeat(63)}1`))).toBe(true)
-    expect(await readAuthorizationState(FUNDER.address, NONCE, 'https://rpc.test', rpcAnswer(`0x${'0'.repeat(64)}`))).toBe(false)
+  it('true / false at a finalized block later than validBefore, with block evidence', async () => {
+    const used = await readAuthorizationState(FUNDER.address, NONCE, VB, 'https://rpc.test', rpc({ blockTs: VB + 60, result: `0x${'0'.repeat(63)}1` }).f)
+    expect(used).toEqual({ used: true, blockNumber: 123456, blockTimestamp: VB + 60 })
+    const unused = await readAuthorizationState(FUNDER.address, NONCE, VB, 'https://rpc.test', rpc({ blockTs: VB + 60, result: `0x${'0'.repeat(64)}` }).f)
+    expect(unused?.used).toBe(false)
   })
-  it('null when no RPC answers or input is malformed (never read as unused)', async () => {
-    expect(await readAuthorizationState(FUNDER.address, NONCE, 'https://rpc.test', rpcAnswer(null))).toBeNull()
-    expect(await readAuthorizationState(FUNDER.address, NONCE, undefined, (async () => { throw new Error('down') }) as any)).toBeNull()
-    expect(await readAuthorizationState(FUNDER.address, '0x1234', 'https://rpc.test', rpcAnswer('0x'))).toBeNull()
+  it('null while the finalized block is not past expiry (lagging RPC / stalled chain), no state read', async () => {
+    const r = rpc({ blockTs: VB, result: `0x${'0'.repeat(64)}` })
+    expect(await readAuthorizationState(FUNDER.address, NONCE, VB, 'https://rpc.test', r.f)).toBeNull()
+    expect(r.calls.map((c) => c.method)).toEqual(['eth_getBlockByNumber'])
+  })
+  it('null when no RPC answers, a stalled RPC times out, or input is malformed', async () => {
+    expect(await readAuthorizationState(FUNDER.address, NONCE, VB, 'https://rpc.test', rpc({ blockTs: VB + 60, result: null }).f)).toBeNull()
+    expect(await readAuthorizationState(FUNDER.address, NONCE, VB, undefined, (async () => { throw new Error('down') }) as any)).toBeNull()
+    const hung = rpc({ blockTs: 0, hang: true })
+    const t0 = Date.now()
+    expect(await readAuthorizationState(FUNDER.address, NONCE, VB, 'https://rpc.test', hung.f, 20)).toBeNull()
+    expect(Date.now() - t0).toBeLessThan(2000) // every endpoint gave up on its deadline
+    expect(await readAuthorizationState(FUNDER.address, '0x1234', VB, 'https://rpc.test', rpc({ blockTs: VB + 60 }).f)).toBeNull()
   })
 })
 
@@ -948,7 +990,9 @@ describe('x402 ops job (every 10 min)', () => {
   const NONCE_C = `0x${'cc'.repeat(32)}`
   function chain(states: Record<string, boolean | 'fail'>) {
     return (async (_u: any, init: any) => {
-      const data: string = JSON.parse(init.body).params[0].data
+      const req = JSON.parse(init.body)
+      if (req.method === 'eth_getBlockByNumber') return new Response(JSON.stringify({ result: { number: '0x10', timestamp: '0x7fffffff' } }))
+      const data: string = req.params[0].data
       const st = states[`0x${data.slice(-64)}`]
       if (st === 'fail') return new Response('boom', { status: 500 })
       return new Response(JSON.stringify({ result: `0x${'0'.repeat(63)}${st ? 1 : 0}` }))
@@ -958,9 +1002,9 @@ describe('x402 ops job (every 10 min)', () => {
   it('reports used / unused, skips unreadable, acks only delivered reversal alerts', async () => {
     ledger.pending = {
       authorization_checks: [
-        { payment_id: 'p-used', funder: FUNDER.address, nonce: NONCE_A, valid_before: 'x' },
-        { payment_id: 'p-unused', funder: FUNDER.address, nonce: NONCE_B, valid_before: 'x' },
-        { payment_id: 'p-unknown', funder: FUNDER.address, nonce: NONCE_C, valid_before: 'x' },
+        { payment_id: 'p-used', funder: FUNDER.address, nonce: NONCE_A, valid_before: '2026-10-10T08:00:00Z' },
+        { payment_id: 'p-unused', funder: FUNDER.address, nonce: NONCE_B, valid_before: '2026-10-10T08:00:00Z' },
+        { payment_id: 'p-unknown', funder: FUNDER.address, nonce: NONCE_C, valid_before: '2026-10-10T08:00:00Z' },
       ],
       reversals: [
         { payment_id: 'top-1', account_id: 'acct-1', credited_usd: '19.80', review_reason: 'order moved to payment_refunded after binding', updated_at: 'x' },
@@ -976,8 +1020,8 @@ describe('x402 ops job (every 10 min)', () => {
     expect(r.ran).toBe(true)
     expect(ledger.reports).toHaveLength(1)
     expect(ledger.reports[0].authorizations).toEqual([
-      { payment_id: 'p-used', used: true },
-      { payment_id: 'p-unused', used: false },
+      { payment_id: 'p-used', used: true, block_number: 16, block_timestamp: 0x7fffffff },
+      { payment_id: 'p-unused', used: false, block_number: 16, block_timestamp: 0x7fffffff },
     ])
     expect(ledger.reports[0].reversals_alerted).toEqual(['top-1'])
     expect(sent).toHaveLength(2)
