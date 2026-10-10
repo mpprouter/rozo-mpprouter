@@ -268,6 +268,13 @@ export interface Env {
   OPTIMISTIC_THRESHOLD: string
   RATE_LIMIT_MAX: string
 
+  // create-invoice coarse abuse backstop (src/routes/create-invoice-gate.ts).
+  // Optional; code defaults 200 per IP and 1500 global per UTC clock hour. The
+  // buyer-facing limit is rozo-intents-api's tiered limiter, so keep these
+  // above its per-IP tier1 (180/hour).
+  CREATE_INVOICE_IP_LIMIT_PER_HOUR?: string
+  CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR?: string
+
   // Fixed XLM/USD rate used to convert merchant USDC amounts into XLM
   // for XLM-denominated Stellar channels. See wrangler.toml for the
   // operator update policy and internaldocs/v2-todo.md#c for context.

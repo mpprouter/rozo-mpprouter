@@ -17,6 +17,7 @@ import {
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
+import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import {
   checkPreviousOrdersUnfunded,
@@ -899,16 +900,22 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // idempotency lookup; this caps raw creation volume from a spray/botnet.
   const gate = await checkCreateInvoiceGate(request, env)
   if (!gate.ok) {
-    if (gate.reason === 'global_circuit_open') {
-      return errorResponse(503, {
-        code: 'SERVICE_UNAVAILABLE',
-        message: 'Invoice creation is temporarily paused. Please try again shortly.',
-      })
-    }
-    return errorResponse(429, {
-      code: 'RATE_LIMITED',
-      message: 'Too many invoice creation requests. Please try again later.',
-    })
+    const res =
+      gate.reason === 'global_circuit_open'
+        ? errorResponse(503, {
+            code: 'SERVICE_UNAVAILABLE',
+            message: 'Invoice creation is temporarily paused. Please try again shortly.',
+          })
+        : json(429, {
+            error: 'Too many invoice creation requests. Please try again later.',
+            code: 'RATE_LIMITED',
+            message: 'Too many invoice creation requests. Please try again later.',
+            scope: 'router_ip_hour',
+            limit: gate.limit,
+            retryAfterSeconds: gate.retryAfterSeconds,
+          })
+    res.headers.set('Retry-After', String(gate.retryAfterSeconds))
+    return res
   }
 
   let parsed: unknown
@@ -1894,6 +1901,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
 
   const intentsText = await intentsResp.text()
   if (!intentsResp.ok) {
+    // rozo-intents-api owns the buyer-facing creation limit: pass its 429
+    // (status, Retry-After, X-RateLimit-*, errorCode/tier) through.
+    const rateLimited = relayUpstreamRateLimit(intentsResp, intentsText)
+    if (rateLimited) return rateLimited
     // A 409 orderIdConflict means this orderId (derived from the payment link)
     // was already used to create an intent. The link is spent, not our outage —
     // classify it as such so the FE can tell the user to get a fresh link
@@ -2516,6 +2527,8 @@ export async function handleStripeCreateInvoice(
     }
     const intentsText = await intentsResp.text()
     if (!intentsResp.ok) {
+      const rateLimited = relayUpstreamRateLimit(intentsResp, intentsText, { provider: 'stripe_crypto' })
+      if (rateLimited) return rateLimited
       // 409 orderIdConflict: an order for this invoice exists after all (the
       // lookup above failed or raced a concurrent create). Re-read it and
       // answer from it instead of a generic 502.

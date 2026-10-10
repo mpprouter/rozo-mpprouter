@@ -15,6 +15,7 @@
  */
 import type { Env } from '../index'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
+import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
 import { normalizeCheckoutClient } from './checkout-web-pricing'
 
@@ -260,6 +261,8 @@ export async function handleBitrefillCreateInvoice(
   }
   const text = await resp.text()
   if (!resp.ok) {
+    const rateLimited = relayUpstreamRateLimit(resp, text, { error: 'RATE_LIMITED' })
+    if (rateLimited) return rateLimited
     if (resp.status === 409 && /orderIdConflict/i.test(text)) {
       const raced = await lookupExisting()
       return duplicate(raced.state === 'found' ? raced.row : null)

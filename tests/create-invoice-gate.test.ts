@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { checkCreateInvoiceGate, clientIp } from '../src/routes/create-invoice-gate'
+import {
+  checkCreateInvoiceGate,
+  clientIp,
+  resolveGateLimits,
+  DEFAULT_IP_LIMIT_PER_HOUR,
+  DEFAULT_GLOBAL_LIMIT_PER_HOUR,
+} from '../src/routes/create-invoice-gate'
 import type { Env } from '../src/index'
 
 // Minimal AtomicStoreDO stub speaking the /read + /commit CAS protocol, matching
@@ -43,17 +49,42 @@ function reqFromIp(ip: string): Request {
 }
 
 describe('create-invoice anti-abuse gate', () => {
-  it('allows requests under the per-IP limit', async () => {
-    const env = makeEnv()
-    for (let i = 0; i < 30; i++) {
-      const d = await checkCreateInvoiceGate(reqFromIp('1.2.3.4'), env)
-      expect(d.ok).toBe(true)
+  it('defaults to 200 per IP and 1500 global per hour, above the upstream tier1 (180/hour)', () => {
+    expect(DEFAULT_IP_LIMIT_PER_HOUR).toBe(200)
+    expect(DEFAULT_GLOBAL_LIMIT_PER_HOUR).toBe(1500)
+    expect(resolveGateLimits({})).toEqual({ ipPerHour: 200, globalPerHour: 1500 })
+  })
+
+  it('reads limits from env and falls back per key on malformed values', () => {
+    expect(
+      resolveGateLimits({ CREATE_INVOICE_IP_LIMIT_PER_HOUR: '250', CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR: ' 2000 ' }),
+    ).toEqual({ ipPerHour: 250, globalPerHour: 2000 })
+    for (const bad of ['', '0', '-5', '1.5', 'abc', '1e3']) {
+      expect(
+        resolveGateLimits({ CREATE_INVOICE_IP_LIMIT_PER_HOUR: bad, CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR: bad }),
+      ).toEqual({ ipPerHour: 200, globalPerHour: 1500 })
     }
   })
 
-  it('rate-limits a single IP once it exceeds 30/hour', async () => {
+  it('allows a single IP up to the default per-IP limit (old cap of 30 no longer applies)', async () => {
     const env = makeEnv()
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < DEFAULT_IP_LIMIT_PER_HOUR; i++) {
+      const d = await checkCreateInvoiceGate(reqFromIp('1.2.3.4'), env)
+      expect(d.ok).toBe(true)
+    }
+    const d = await checkCreateInvoiceGate(reqFromIp('1.2.3.4'), env)
+    expect(d.ok).toBe(false)
+    if (!d.ok) {
+      expect(d.reason).toBe('ip_rate_limited')
+      expect(d.limit).toBe(DEFAULT_IP_LIMIT_PER_HOUR)
+      expect(d.retryAfterSeconds).toBeGreaterThan(0)
+      expect(d.retryAfterSeconds).toBeLessThanOrEqual(3600)
+    }
+  })
+
+  it('applies the per-IP limit from env', async () => {
+    const env = makeEnv({ CREATE_INVOICE_IP_LIMIT_PER_HOUR: '3' })
+    for (let i = 0; i < 3; i++) {
       expect((await checkCreateInvoiceGate(reqFromIp('9.9.9.9'), env)).ok).toBe(true)
     }
     const d = await checkCreateInvoiceGate(reqFromIp('9.9.9.9'), env)
@@ -62,29 +93,36 @@ describe('create-invoice anti-abuse gate', () => {
   })
 
   it('does not penalize a second IP when the first is limited', async () => {
-    const env = makeEnv()
-    for (let i = 0; i < 35; i++) await checkCreateInvoiceGate(reqFromIp('5.5.5.5'), env)
+    const env = makeEnv({ CREATE_INVOICE_IP_LIMIT_PER_HOUR: '3' })
+    for (let i = 0; i < 5; i++) await checkCreateInvoiceGate(reqFromIp('5.5.5.5'), env)
     // A distinct IP still gets through (separate per-IP counter).
     const d = await checkCreateInvoiceGate(reqFromIp('6.6.6.6'), env)
     expect(d.ok).toBe(true)
   })
 
-  it('trips the global circuit breaker across many IPs and fires one alert', async () => {
-    let alerts = 0
-    const env = makeEnv()
-    // Override dingtalk by injecting the token; capture sends via a fetch spy is
-    // overkill — instead assert the decision flips. We spread 601 requests over
-    // many IPs so no single IP hits its own 30-cap first.
-    let tripped = false
-    for (let i = 0; i < 700; i++) {
+  it('trips the global circuit breaker at the env limit across many IPs', async () => {
+    const env = makeEnv({ CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR: '50' })
+    let trippedAt = -1
+    for (let i = 0; i < 100; i++) {
       const d = await checkCreateInvoiceGate(reqFromIp(`10.0.${Math.floor(i / 25)}.${i % 25}`), env)
       if (!d.ok && d.reason === 'global_circuit_open') {
-        tripped = true
+        trippedAt = i
+        expect(d.limit).toBe(50)
         break
       }
     }
-    expect(tripped).toBe(true)
-    void alerts
+    expect(trippedAt).toBe(50)
+  })
+
+  it('global default is 1500: 1500 creations across IPs pass, the 1501st trips', async () => {
+    const env = makeEnv()
+    for (let i = 0; i < 1500; i++) {
+      const d = await checkCreateInvoiceGate(reqFromIp(`10.${Math.floor(i / 250)}.${Math.floor(i / 25) % 10}.${i % 25}`), env)
+      expect(d.ok).toBe(true)
+    }
+    const d = await checkCreateInvoiceGate(reqFromIp('172.16.0.1'), env)
+    expect(d.ok).toBe(false)
+    if (!d.ok) expect(d.reason).toBe('global_circuit_open')
   })
 
   it('fails OPEN when the Durable Object is unreachable', async () => {
@@ -98,10 +136,12 @@ describe('create-invoice anti-abuse gate', () => {
     expect(d.ok).toBe(true) // gate never blocks create-invoice on infra error
   })
 
-  it('extracts client IP from CF header, falling back to X-Forwarded-For', () => {
+  it('trusts only CF-Connecting-IP, never client-settable forwarding headers', () => {
     expect(clientIp(reqFromIp('4.4.4.4'))).toBe('4.4.4.4')
-    const xff = new Request('https://x/', { headers: { 'X-Forwarded-For': '8.8.8.8, 9.9.9.9' } })
-    expect(clientIp(xff)).toBe('8.8.8.8')
+    const xff = new Request('https://x/', { headers: { 'X-Forwarded-For': '8.8.8.8, 9.9.9.9', 'X-Real-IP': '7.7.7.7' } })
+    expect(clientIp(xff)).toBe('unknown')
+    const both = new Request('https://x/', { headers: { 'CF-Connecting-IP': '4.4.4.4', 'X-Forwarded-For': '8.8.8.8' } })
+    expect(clientIp(both)).toBe('4.4.4.4')
     expect(clientIp(new Request('https://x/'))).toBe('unknown')
   })
 })

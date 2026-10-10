@@ -28,20 +28,58 @@ import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
-// Per-IP invoice creations per hour. A real payer creates one (occasionally a
-// few on retries); 30/hr is generous for humans, tight for a spray script.
-const IP_LIMIT_PER_HOUR = 30
-// Global creations per hour across ALL IPs — circuit breaker against a botnet
-// spread over many IPs (each of which stays under the per-IP cap).
-const GLOBAL_LIMIT_PER_HOUR = 600
+// Since 2026-10-10 the per-buyer limit lives in rozo-intents-api (PR #643:
+// tier0 10 / tier1 30 per IP per 10 min, 300 per IP per day, 120 per app per
+// 10 min), keyed on the IP this Worker forwards in `x-rozo-client-hint`. This
+// gate is only a coarse abuse backstop and must stay LOOSER than upstream so a
+// buyer always meets the upstream tiers (and their 429 + Retry-After) first.
+// Tier1 upstream is 180/hour, so the per-IP default sits above it.
+// Tunable without a code change via wrangler [vars]:
+//   CREATE_INVOICE_IP_LIMIT_PER_HOUR      per-IP creations per UTC clock hour
+//   CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR  all-IP creations per UTC clock hour
+//                                         (botnet circuit breaker + alert)
+export const DEFAULT_IP_LIMIT_PER_HOUR = 200
+export const DEFAULT_GLOBAL_LIMIT_PER_HOUR = 1500
 const WINDOW_SECONDS = 60 * 60
+
+export interface GateLimits {
+  ipPerHour: number
+  globalPerHour: number
+}
+
+function positiveInt(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw === null) return fallback
+  const trimmed = String(raw).trim()
+  if (!/^[0-9]+$/.test(trimmed)) return fallback
+  const n = Number(trimmed)
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback
+}
+
+/** Limits from env, falling back to the code defaults on absent/malformed values. */
+export function resolveGateLimits(env: Pick<Env, 'CREATE_INVOICE_IP_LIMIT_PER_HOUR' | 'CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR'>): GateLimits {
+  return {
+    ipPerHour: positiveInt(env.CREATE_INVOICE_IP_LIMIT_PER_HOUR, DEFAULT_IP_LIMIT_PER_HOUR),
+    globalPerHour: positiveInt(env.CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR, DEFAULT_GLOBAL_LIMIT_PER_HOUR),
+  }
+}
+
+/** Seconds until the current hour bucket rolls over (>= 1). */
+export function secondsUntilWindowReset(now = Date.now()): number {
+  const windowMs = WINDOW_SECONDS * 1000
+  return Math.max(1, Math.ceil((windowMs - (now % windowMs)) / 1000))
+}
 
 const DO_ORIGIN = 'https://atomic-store.internal'
 const MAX_CAS_RETRIES = 25 // hot shared counters see burst contention; keep loose
 
 export type GateDecision =
   | { ok: true }
-  | { ok: false; reason: 'ip_rate_limited' | 'global_circuit_open' }
+  | {
+      ok: false
+      reason: 'ip_rate_limited' | 'global_circuit_open'
+      limit: number
+      retryAfterSeconds: number
+    }
 
 function couponStub(env: Env) {
   return env.ATOMIC_STORE.get(env.ATOMIC_STORE.idFromName('coupon'))
@@ -106,13 +144,15 @@ async function bumpCounter(env: Env, key: string, bucket: string): Promise<numbe
   throw new Error(`create-invoice gate bumpCounter(${key}): exhausted ${MAX_CAS_RETRIES} retries`)
 }
 
-/** Best-effort client IP from Cloudflare headers. */
+/**
+ * Client IP as Cloudflare reports it. Only `CF-Connecting-IP` is trusted: the
+ * Cloudflare edge sets it on every request that reaches this Worker and
+ * overwrites any client-supplied value, whereas `X-Forwarded-For` / `X-Real-IP`
+ * pass through from the client untouched and would let one host rotate
+ * "IPs" at will. Absent only outside Cloudflare (local dev, tests).
+ */
 export function clientIp(request: Request): string {
-  return (
-    request.headers.get('CF-Connecting-IP') ||
-    request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() ||
-    'unknown'
-  )
+  return request.headers.get('CF-Connecting-IP')?.trim() || 'unknown'
 }
 
 /**
@@ -123,23 +163,35 @@ export function clientIp(request: Request): string {
  * everyone (its own per-IP cap stops it first).
  */
 export async function checkCreateInvoiceGate(request: Request, env: Env): Promise<GateDecision> {
-  const bucket = hourBucket()
+  const now = Date.now()
+  const bucket = hourBucket(now)
+  const limits = resolveGateLimits(env)
   try {
     const globalCount = await bumpCounter(env, `ci:global:${bucket}`, bucket)
-    if (globalCount > GLOBAL_LIMIT_PER_HOUR) {
+    if (globalCount > limits.globalPerHour) {
       // Fire the alert exactly once at the crossing to avoid alert spam.
-      if (globalCount === GLOBAL_LIMIT_PER_HOUR + 1 && alertSinkConfigured(env)) {
+      if (globalCount === limits.globalPerHour + 1 && alertSinkConfigured(env)) {
         await sendAlert(env,
-          redactForAlert(`[MPP Router] 🚨 create-invoice global circuit breaker OPEN: >${GLOBAL_LIMIT_PER_HOUR} invoice creations this hour. New invoice creation paused for the window.`),
+          redactForAlert(`[MPP Router] 🚨 create-invoice global circuit breaker OPEN: >${limits.globalPerHour} invoice creations this hour. New invoice creation paused for the window.`),
         )
       }
-      return { ok: false, reason: 'global_circuit_open' }
+      return {
+        ok: false,
+        reason: 'global_circuit_open',
+        limit: limits.globalPerHour,
+        retryAfterSeconds: secondsUntilWindowReset(now),
+      }
     }
 
     const ip = clientIp(request)
     const ipCount = await bumpCounter(env, `ci:ip:${ip}:${bucket}`, bucket)
-    if (ipCount > IP_LIMIT_PER_HOUR) {
-      return { ok: false, reason: 'ip_rate_limited' }
+    if (ipCount > limits.ipPerHour) {
+      return {
+        ok: false,
+        reason: 'ip_rate_limited',
+        limit: limits.ipPerHour,
+        retryAfterSeconds: secondsUntilWindowReset(now),
+      }
     }
 
     return { ok: true }
