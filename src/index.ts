@@ -47,7 +47,7 @@ import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
 import { X402_PATHS, handleX402Payer } from './x402payer/routes'
 import { supabaseLedger } from './x402payer/ledger'
-import { reconcileX402Payer } from './x402payer/reconcile'
+import { reconcileX402Payer, runX402Ops } from './x402payer/reconcile'
 import { handleX402Supported } from './routes/x402-supported'
 import { handleX402WellKnown } from './routes/x402-well-known'
 import { monitorPublishedProviders } from './services/provider-monitor'
@@ -449,10 +449,14 @@ export interface Env {
   X402_LEDGER_RPC_SECRET?: string
   X402_LEDGER_SUPABASE_URL?: string
   X402_LEDGER_SUPABASE_ANON_KEY?: string
-  // Signer for (exact, eip155:8453). Must derive to FUNDER_WALLET or /sign
-  // answers 503 X402_SIGNER_NOT_CONFIGURED. Unset = Base signing off.
-  //   wrangler secret put X402_BASE_FUNDER_PRIVATE_KEY
-  X402_BASE_FUNDER_PRIVATE_KEY?: string
+  // Signer for (exact, eip155:8453): a REMOTE service on the pay-invoice
+  // side holds the funder key; this Worker never does (founder decision,
+  // option A). Responses must come from FUNDER_WALLET or /sign answers 503
+  // X402_SIGNER_NOT_CONFIGURED. Secret unset = Base signing off.
+  //   X402_SIGN_SERVICE_URL (var, default https://agentapi.rozo.ai/sign-x402)
+  //   wrangler secret put X402_SIGN_SHARED_SECRET
+  X402_SIGN_SERVICE_URL?: string
+  X402_SIGN_SHARED_SECRET?: string
   // Signer for (exact, solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp): base58
   // 64-byte keypair; must derive to X402_SOLANA_FUNDER_ADDRESS (public var).
   //   wrangler secret put X402_SOLANA_FUNDER_SECRET_KEY
@@ -656,11 +660,25 @@ export default {
     // Base USDC funder low-balance / sudden-drop watch. Replaces the launchd
     // job that ran on two laptops and double-sent every alert.
     ctx.waitUntil(watchFunderBalance(env))
-    // x402 payer hourly reconciliation (skeleton: logs ledger totals, no alert
-    // yet). Swallows its own errors like the watches above.
-    ctx.waitUntil(reconcileX402Payer(env.MPP_STORE, supabaseLedger(env)).then(() => undefined, (err) => {
-      console.warn(`[x402-reconcile] skipped: ${(err as Error).message}`)
-    }))
+    // x402 payer jobs (src/x402payer/reconcile.ts): every 10 min, check
+    // expired Base credentials on chain (the refund itself is pg_cron in the
+    // Intents DB) and alert reversed top-ups; hourly, funder vs ledger
+    // liability. Each swallows its own errors like the watches above.
+    {
+      const x402Jobs = {
+        kv: env.MPP_STORE,
+        ledger: supabaseLedger(env),
+        alertEnv: env,
+        baseRpcUrl: env.BASE_RPC_URL,
+        funder: FUNDER_WALLET,
+      }
+      ctx.waitUntil(runX402Ops(x402Jobs).then(() => undefined, (err) => {
+        console.warn(`[x402-ops] skipped: ${(err as Error).message}`)
+      }))
+      ctx.waitUntil(reconcileX402Payer(x402Jobs).then(() => undefined, (err) => {
+        console.warn(`[x402-reconcile] skipped: ${(err as Error).message}`)
+      }))
+    }
     // Checkout feedback → Feishu queue (retries, quiet hours, dedup by id).
     ctx.waitUntil(drainCheckoutFeedbackNotifications(env))
     // Free 402 probes only. Scheduled health monitoring never spends money.

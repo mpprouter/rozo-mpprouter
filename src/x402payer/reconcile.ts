@@ -1,44 +1,183 @@
 /**
- * Hourly x402 payer reconciliation. SKELETON ONLY (v1): it reads the ledger
- * totals and logs them. No alert is sent yet.
+ * x402 payer background jobs (Base leg), run from the Worker cron:
  *
- * TODO(x402 v1.1), design 5.2 "余额总额对 funder 余额每小时对账":
- *   1. Read the Base funder USDC balance (utils/base-usdc-balance.ts) and the
- *      Solana funder USDC balance (getTokenAccountBalance on its USDC ATA).
- *   2. Compare against balance_usd_total + signed_unsettled_usd per network
- *      (signed credentials not yet settled are still a claim on the funder).
- *      Reuse brain.db hub_balance_snapshot history if the comparison needs a
- *      trend rather than one point.
- *   3. Expired credentials: for each 'signed' row past valid_before, check
- *      USDC authorizationState(funder, nonce) on Base (or the tx signature on
- *      Solana). Unused -> mark 'expired' and credit the balance back; used ->
- *      mark 'settled' with tx_hash. Needs a new secret-gated ledger RPC.
- *   4. Alert through utils/alert.ts sendAlert on a shortfall, state-transition
- *      only (same pattern as watchFunderBalance), never per tick.
+ * 1. Authorization checks (every 10 min). For each Base credential the ledger
+ *    lists as past valid_before, read USDC.authorizationState(funder, nonce)
+ *    and report it. used -> the ledger marks it settled; unused -> the ledger
+ *    stamps the check, and pg_cron 'x402-refund-expired' (Intents DB) returns
+ *    the debit. Nothing here refunds. A failed RPC read reports nothing, so an
+ *    unknown state can never turn into a refund.
+ * 2. Reversed top-ups (every 10 min). Each reversal_needed binding is alerted
+ *    once through utils/alert.ts and then acknowledged in the ledger. Only a
+ *    confirmed delivery is acknowledged; otherwise the next tick retries.
+ * 3. Liability reconciliation (hourly). Base funder USDC on chain vs the
+ *    ledger's base_liability_usd (all balances + signed, unsettled Base
+ *    credentials). The funder is shared with checkout, so only a SHORTFALL
+ *    (liability above the funder balance) by more than
+ *    app_config X402_RECON_TOLERANCE_USD is alerted, on the transition into
+ *    shortfall and again at most once a day while it persists.
+ *
+ * Every job swallows its own errors: it must not take the shared cron down.
  */
 
+import { encodeFunctionData, decodeFunctionResult, type Hex } from 'viem'
+import { alertSinkConfigured, sendAlert, type AlertEnv } from '../utils/alert'
+import { redactForAlert } from '../utils/alert-redaction'
+import { FALLBACK_BASE_RPCS, getBaseUsdcBalance, redactRpcUrl } from '../utils/base-usdc-balance'
 import type { X402Ledger } from './ledger'
+import { BASE_USDC } from './requirements'
 
-const LAST_RUN_KEY = 'x402payer:reconcile:last-hour'
+const OPS_LAST_RUN_KEY = 'x402payer:ops:last-slot'
+const RECON_LAST_RUN_KEY = 'x402payer:reconcile:last-hour'
+const RECON_STATE_KEY = 'x402payer:reconcile:state'
+const OPS_SLOT_MS = 10 * 60_000
+const RECON_REALERT_MS = 24 * 3_600_000
 
+const AUTHORIZATION_STATE_ABI = [{
+  type: 'function',
+  name: 'authorizationState',
+  stateMutability: 'view',
+  inputs: [{ name: 'authorizer', type: 'address' }, { name: 'nonce', type: 'bytes32' }],
+  outputs: [{ name: '', type: 'bool' }],
+}] as const
+
+export interface X402JobsDeps {
+  kv: KVNamespace
+  ledger: X402Ledger | null
+  alertEnv: AlertEnv
+  /** Paid Base RPC (BASE_RPC_URL), tried before the public fallbacks. */
+  baseRpcUrl?: string
+  /** Base funder address (FUNDER_WALLET). */
+  funder: string
+  nowMs?: number
+  fetchImpl?: typeof fetch
+  readFunderBalance?: typeof getBaseUsdcBalance
+  send?: (env: AlertEnv, content: ReturnType<typeof redactForAlert>) => Promise<boolean>
+}
+
+/**
+ * USDC.authorizationState(authorizer, nonce) on Base. true = used, false =
+ * unused, null = no RPC answered (never treat as unused).
+ */
+export async function readAuthorizationState(
+  authorizer: string,
+  nonce: string,
+  primaryRpcUrl?: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<boolean | null> {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(authorizer) || !/^0x[0-9a-fA-F]{64}$/.test(nonce)) return null
+  const data = encodeFunctionData({
+    abi: AUTHORIZATION_STATE_ABI,
+    functionName: 'authorizationState',
+    args: [authorizer as Hex, nonce as Hex],
+  })
+  const candidates = primaryRpcUrl ? [primaryRpcUrl, ...FALLBACK_BASE_RPCS] : FALLBACK_BASE_RPCS
+  for (const rpcUrl of candidates) {
+    try {
+      const res = await fetchImpl(rpcUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: BASE_USDC, data }, 'latest'] }),
+      })
+      if (!res.ok) continue
+      const json = (await res.json()) as { result?: string }
+      if (!json.result || json.result === '0x') continue
+      return decodeFunctionResult({ abi: AUTHORIZATION_STATE_ABI, functionName: 'authorizationState', data: json.result as Hex })
+    } catch (err) {
+      console.warn(`[x402-ops] authorizationState via ${redactRpcUrl(rpcUrl)} failed: ${(err as Error).message}`)
+    }
+  }
+  return null
+}
+
+/** Jobs 1 and 2. Gated to one run per 10-minute slot. */
+export async function runX402Ops(deps: X402JobsDeps): Promise<{ ran: boolean; checked?: number; reversalsAlerted?: number }> {
+  if (!deps.ledger) return { ran: false }
+  const now = deps.nowMs ?? Date.now()
+  const slot = String(Math.floor(now / OPS_SLOT_MS))
+  if ((await deps.kv.get(OPS_LAST_RUN_KEY)) === slot) return { ran: false }
+  await deps.kv.put(OPS_LAST_RUN_KEY, slot, { expirationTtl: 3600 })
+
+  const pending = await deps.ledger.opsPending(50)
+  const authorizations: Array<{ payment_id: string; used: boolean }> = []
+  for (const item of pending.authorization_checks ?? []) {
+    const used = await readAuthorizationState(item.funder, item.nonce, deps.baseRpcUrl, deps.fetchImpl)
+    if (used !== null) authorizations.push({ payment_id: item.payment_id, used })
+  }
+
+  const send = deps.send ?? sendAlert
+  const reversalsAlerted: string[] = []
+  if ((pending.reversals ?? []).length > 0) {
+    if (!alertSinkConfigured(deps.alertEnv)) {
+      console.warn('[x402-ops] reversed top-ups pending but no alert channel configured')
+    } else {
+      for (const r of pending.reversals) {
+        const message =
+          `[MPP Router] 🚨 x402 top-up reversed after credit: needs manual review\n` +
+          `Top-up order: ${r.payment_id}\n` +
+          `x402 account: ${r.account_id}\n` +
+          `Credited: $${r.credited_usd ?? '?'} (balance NOT debited automatically)\n` +
+          `Reason: ${r.review_reason ?? 'order bounced or refunded'}\n` +
+          `Action: check whether the balance was spent, then resolve the x402_topups row.`
+        if (await send(deps.alertEnv, redactForAlert(message))) reversalsAlerted.push(r.payment_id)
+      }
+    }
+  }
+
+  if (authorizations.length > 0 || reversalsAlerted.length > 0) {
+    await deps.ledger.opsReport({ authorizations, reversals_alerted: reversalsAlerted })
+  }
+  return { ran: true, checked: authorizations.length, reversalsAlerted: reversalsAlerted.length }
+}
+
+/** Job 3. Gated to one run per UTC hour. */
 export async function reconcileX402Payer(
-  kv: KVNamespace,
-  ledger: X402Ledger | null,
-  nowMs: number = Date.now(),
-): Promise<{ ran: boolean; snapshot?: Record<string, unknown> }> {
-  if (!ledger) return { ran: false }
-  // The Worker cron fires every 2 minutes; run once per UTC hour.
-  const hour = String(Math.floor(nowMs / 3_600_000))
-  if ((await kv.get(LAST_RUN_KEY)) === hour) return { ran: false }
-  await kv.put(LAST_RUN_KEY, hour, { expirationTtl: 7200 })
+  deps: X402JobsDeps,
+): Promise<{ ran: boolean; snapshot?: Record<string, unknown>; shortfallUsd?: number; alerted?: boolean }> {
+  if (!deps.ledger) return { ran: false }
+  const now = deps.nowMs ?? Date.now()
+  const hour = String(Math.floor(now / 3_600_000))
+  if ((await deps.kv.get(RECON_LAST_RUN_KEY)) === hour) return { ran: false }
+  await deps.kv.put(RECON_LAST_RUN_KEY, hour, { expirationTtl: 7200 })
 
-  const snapshot = await ledger.liabilitySnapshot()
+  const snapshot = await deps.ledger.liabilitySnapshot()
   if (snapshot.mode === 'off') return { ran: true, snapshot }
-  console.log(
-    `[x402-reconcile] mode=${String(snapshot.mode)} accounts=${String(snapshot.accounts)} ` +
-      `balance_usd_total=${String(snapshot.balance_usd_total)} signed_unsettled_usd=${String(snapshot.signed_unsettled_usd)} ` +
-      `topups_review=${String(snapshot.topups_review)}`,
-  )
-  // TODO(x402 v1.1): steps 1 to 4 above.
-  return { ran: true, snapshot }
+
+  const liability = Number(snapshot.base_liability_usd ?? NaN)
+  const tolerance = Number(snapshot.recon_tolerance_usd ?? 20)
+  const read = await (deps.readFunderBalance ?? getBaseUsdcBalance)(deps.funder, deps.baseRpcUrl)
+  if (read.balance === null || !Number.isFinite(liability)) {
+    // The funder watch (watchFunderBalance) already alerts on unreadable
+    // balances; one more page here would be noise.
+    console.warn('[x402-reconcile] skipped: funder balance or liability unreadable')
+    return { ran: true, snapshot }
+  }
+  const funderUsd = Number(read.balance) / 1e6
+  const shortfall = liability - funderUsd
+  const short = shortfall > (Number.isFinite(tolerance) ? tolerance : 20)
+  console.log(`[x402-reconcile] liability=${liability.toFixed(2)} funder=${funderUsd.toFixed(2)} shortfall=${shortfall.toFixed(2)} tolerance=${tolerance}`)
+
+  const prevRaw = await deps.kv.get(RECON_STATE_KEY)
+  const prev = prevRaw ? (JSON.parse(prevRaw) as { short: boolean; alertedAt?: number }) : { short: false }
+  if (!short) {
+    if (prev.short) await deps.kv.put(RECON_STATE_KEY, JSON.stringify({ short: false }))
+    return { ran: true, snapshot, shortfallUsd: shortfall, alerted: false }
+  }
+  if (prev.short && prev.alertedAt && now - prev.alertedAt < RECON_REALERT_MS) {
+    return { ran: true, snapshot, shortfallUsd: shortfall, alerted: false }
+  }
+  if (!alertSinkConfigured(deps.alertEnv)) {
+    console.warn('[x402-reconcile] shortfall detected but no alert channel configured')
+    return { ran: true, snapshot, shortfallUsd: shortfall, alerted: false }
+  }
+  const message =
+    `[MPP Router] 🚨 x402 payer liability mismatch: funder short by $${shortfall.toFixed(2)}\n` +
+    `Ledger Base liability (balances + unsettled signed credentials): $${liability.toFixed(2)}\n` +
+    `Funder ${deps.funder} Base USDC on chain: $${funderUsd.toFixed(2)}\n` +
+    `Tolerance (app_config X402_RECON_TOLERANCE_USD): $${tolerance}\n` +
+    `Impact: signed x402 credentials may fail to settle. Top up the funder or switch X402_PAYER to off.`
+  const send = deps.send ?? sendAlert
+  const delivered = await send(deps.alertEnv, redactForAlert(message))
+  if (delivered) await deps.kv.put(RECON_STATE_KEY, JSON.stringify({ short: true, alertedAt: now }))
+  return { ran: true, snapshot, shortfallUsd: shortfall, alerted: delivered }
 }

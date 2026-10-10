@@ -20,17 +20,17 @@ import {
   selectRequirement,
   validateRequirement,
 } from '../src/x402payer/requirements'
-import { TRANSFER_WITH_AUTHORIZATION_TYPES, buildTransferWithAuthorizationTypedData, signEvmExact } from '../src/x402payer/evm'
+import { TRANSFER_WITH_AUTHORIZATION_TYPES, buildTransferWithAuthorizationTypedData, remoteSignEvmExact, type RemoteSignerConfig } from '../src/x402payer/evm'
 import { signSolanaExact, x402SvmPayloadBuilder } from '../src/x402payer/svm'
-import type { CommitArgs, LedgerResult, PayerMode, X402Ledger } from '../src/x402payer/ledger'
-import { reconcileX402Payer } from '../src/x402payer/reconcile'
+import type { CommitArgs, LedgerResult, OpsPending, OpsReport, PayerMode, X402Ledger } from '../src/x402payer/ledger'
+import { readAuthorizationState, reconcileX402Payer, runX402Ops } from '../src/x402payer/reconcile'
 
 // ---------------------------------------------------------------------------
 // Fake ledger with the same rules as x402_payment_commit (the SQL itself is
 // covered by rozo-intents-api supabase/tests/x402_payer_ledger_test.sql).
 // ---------------------------------------------------------------------------
 interface Acct { id: string; digest: string; balance: number; perTx: number; daily: number; status: string }
-interface Pay { id: string; account: string; key: string; hash: string; mode: 'shadow' | 'on'; credential: any; nonce: string; funder: string; network: string; asset: string; amount_usd: number; created: number }
+interface Pay { refunded_at?: string | null; id: string; account: string; key: string; hash: string; mode: 'shadow' | 'on'; credential: any; nonce: string; funder: string; network: string; asset: string; amount_usd: number; created: number }
 
 class FakeLedger implements X402Ledger {
   mode: PayerMode = 'on'
@@ -39,20 +39,27 @@ class FakeLedger implements X402Ledger {
   commits = 0
   globalCap = 500
   topups: any[] = []
+  reversalAccounts = new Set<string>()
+  snapshot: Record<string, unknown> = { mode: 'on', base_liability_usd: '0', recon_tolerance_usd: '20' }
+  pending: OpsPending = { authorization_checks: [], reversals: [] }
+  reports: OpsReport[] = []
 
   private acctJson(a: Acct) {
     const spent = this.payments.filter((p) => p.account === a.id && p.mode === (this.mode === 'shadow' ? 'shadow' : 'on'))
       .reduce((s, p) => s + p.amount_usd, 0)
     return {
       id: a.id, status: a.status as any, balance_usd: a.balance.toFixed(6), per_tx_limit_usd: a.perTx.toFixed(6),
-      daily_limit_usd: a.daily.toFixed(6), spent_today_usd: spent.toFixed(6), pay_to_allowlist: null, created_at: 'now',
+      daily_limit_usd: a.daily.toFixed(6), spent_today_usd: spent.toFixed(6), pay_to_allowlist: null,
+      flags: this.reversalAccounts.has(a.id) ? ['reversal_pending'] : [], created_at: 'now',
     }
   }
   private payJson(p: Pay) {
     return {
       id: p.id, idempotency_key: p.key, accepts_hash: p.hash, network: p.network, asset: p.asset, amount_atomic: '0',
       amount_usd: p.amount_usd.toFixed(6), pay_to: 'x', funder: p.funder, nonce: p.nonce, credential: p.credential,
-      valid_before: null, mode: p.mode, status: p.mode === 'on' ? 'signed' : 'would_sign', created_at: 'now',
+      valid_before: null, mode: p.mode,
+      status: p.refunded_at ? 'expired' : p.mode === 'on' ? 'signed' : 'would_sign',
+      refunded_at: p.refunded_at ?? null, refund_reason: p.refunded_at ? 'expired_unused' : null, created_at: 'now',
     }
   }
   async createAccount(digest: string): Promise<LedgerResult> {
@@ -105,7 +112,14 @@ class FakeLedger implements X402Ledger {
     return { mode: this.mode, outcome: 'registered', credit: { outcome: 'pending' } }
   }
   async liabilitySnapshot() {
-    return { mode: this.mode, accounts: this.accounts.size, balance_usd_total: '0', signed_unsettled_usd: '0', topups_review: 0 }
+    return this.snapshot
+  }
+  async opsPending() {
+    return this.pending
+  }
+  async opsReport(r: OpsReport) {
+    this.reports.push(r)
+    return { outcome: 'ok' }
   }
 }
 
@@ -139,19 +153,66 @@ let env: any
 let deps: X402PayerDeps
 let evmSigns = 0
 
+/**
+ * Mock of the pay-invoice signing service (POST /sign-x402). Signs with a
+ * throwaway test key standing in for the funder; idempotent per
+ * idempotencyKey (same body -> same answer, different body -> 409).
+ * `behaviour` lets a test force errors / timeouts / a wrong funder.
+ */
+type MockBehaviour = { status?: number; code?: string; timeout?: boolean; wrongFunder?: boolean; badSignature?: boolean } | null
+let signerCalls: any[] = []
+let nextBehaviours: MockBehaviour[] = []
+function mockSignService(): typeof fetch {
+  const seen = new Map<string, { body: string; res: any }>()
+  return (async (url: any, init: any) => {
+    const body = JSON.parse(init.body)
+    signerCalls.push({ url: String(url), auth: new Headers(init.headers).get('authorization'), body })
+    const b = nextBehaviours.shift() ?? null
+    if (b?.timeout) throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
+    if (b?.status) return new Response(JSON.stringify({ ok: false, code: b.code, error: { code: b.code } }), { status: b.status })
+    if (new Headers(init.headers).get('authorization') !== 'Bearer test-shared-secret') {
+      return new Response(JSON.stringify({ ok: false, code: 'UNAUTHORIZED' }), { status: 401 })
+    }
+    const prev = seen.get(body.idempotencyKey)
+    if (prev) {
+      if (prev.body !== init.body) return new Response(JSON.stringify({ ok: false, code: 'X402_SIGN_IDEMPOTENCY_CONFLICT' }), { status: 409 })
+      return new Response(JSON.stringify(prev.res), { status: 200 })
+    }
+    const signerAccount = b?.wrongFunder ? privateKeyToAccount(generatePrivateKey()) : FUNDER
+    const authorization = {
+      from: signerAccount.address, to: body.payTo, value: body.amountAtomic,
+      validAfter: String(body.validAfter), validBefore: String(body.validBefore), nonce: body.nonce,
+    }
+    evmSigns++
+    const signature = await signerAccount.signTypedData({
+      domain: { name: 'USD Coin', version: '2', chainId: 8453, verifyingContract: body.asset },
+      types: TRANSFER_WITH_AUTHORIZATION_TYPES,
+      primaryType: 'TransferWithAuthorization',
+      message: { ...authorization, value: BigInt(authorization.value), validAfter: BigInt(authorization.validAfter), validBefore: BigInt(authorization.validBefore) },
+    } as any)
+    const res = {
+      ok: true, funder: signerAccount.address,
+      signature: b?.badSignature ? `0x${'11'.repeat(65)}` : signature,
+      authorization,
+    }
+    seen.set(body.idempotencyKey, { body: init.body, res })
+    return new Response(JSON.stringify(res), { status: 200 })
+  }) as any
+}
+function remoteCfg(): RemoteSignerConfig {
+  return { url: 'https://sign.test/sign-x402', secret: 'test-shared-secret', expectedFunder: FUNDER.address, fetchImpl: mockSignService(), timeoutMs: 50 }
+}
+
 beforeEach(() => {
   ledger = new FakeLedger()
   env = { MPP_STORE: kv(), ROZO_X402_TOPUP_API_KEY: 'topup-key' }
   evmSigns = 0
+  signerCalls = []
+  nextBehaviours = []
   deps = {
     ledger,
-    evmSigner: async () => ({
-      address: FUNDER.address,
-      signTypedData: async (args: any) => {
-        evmSigns++
-        return FUNDER.signTypedData(args)
-      },
-    }),
+    evmRemote: remoteCfg(),
+    kv: kv(),
     svmSigner: async () => null,
     svmBuild: async () => { throw new Error('not used') },
     fetchImpl: (async () => { throw new Error('no network in tests') }) as any,
@@ -448,14 +509,25 @@ describe('EVM typed data (EIP-3009 TransferWithAuthorization)', () => {
     const r = validateRequirement(baseReq())
     if (!('ok' in r)) throw new Error('invalid')
     const nonce = `0x${'ab'.repeat(32)}` as const
-    const signed = await signEvmExact(FUNDER as any, r.ok, { nowSeconds: 1_800_000_000, nonce })
+    const out = await remoteSignEvmExact(remoteCfg(), r.ok, {
+      nonce, validBeforeUnix: 1_800_000_060, idempotencyKey: 'k'.repeat(64), paymentReference: 'x402req_test',
+    })
+    if (!('ok' in out)) throw new Error(JSON.stringify(out))
+    const signed = out.ok
+    // Request sent to the signing service follows the agreed contract.
+    expect(signerCalls[0].auth).toBe('Bearer test-shared-secret')
+    expect(signerCalls[0].body).toEqual({
+      network: 'eip155:8453', asset: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', payTo: getAddress(PAY_TO),
+      amountAtomic: '10000', validAfter: 0, validBefore: 1_800_000_060, nonce,
+      idempotencyKey: 'k'.repeat(64), reference: { paymentId: 'x402req_test' },
+    })
     const auth = signed.payload.authorization
     expect(auth).toEqual({
       from: FUNDER.address,
       to: getAddress(PAY_TO),
       value: '10000',
-      validAfter: String(1_800_000_000 - 600),
-      validBefore: String(1_800_000_000 + 60),
+      validAfter: '0',
+      validBefore: String(1_800_000_060),
       nonce,
     })
     const td = buildTransferWithAuthorizationTypedData(r.ok, auth)
@@ -664,7 +736,7 @@ describe('topup', () => {
 
   it('503 X402_SIGNER_NOT_CONFIGURED and no order when neither leg can sign', async () => {
     const key = await newKey(0)
-    deps.evmSigner = async () => null
+    deps.evmRemote = null
     deps.svmSigner = async () => null
     let posts = 0
     deps.fetchImpl = (async () => { posts++; return new Response('{}') }) as any
@@ -694,7 +766,7 @@ describe('configuration and reconciliation skeleton', () => {
 
   it('503 X402_SIGNER_NOT_CONFIGURED when the funder key is unset, nothing committed', async () => {
     const key = await newKey(10)
-    deps.evmSigner = async () => null
+    deps.evmRemote = null
     const r = await call('/v1/x402/sign', { method: 'POST', key, body: JSON.stringify({ idempotencyKey: 'idem-cfg-0001', accepts: baseReq() }) })
     expect(r.body.code).toBe('X402_SIGNER_NOT_CONFIGURED')
     expect(ledger.commits).toBe(0)
@@ -707,9 +779,257 @@ describe('configuration and reconciliation skeleton', () => {
 
   it('reconcile runs once per hour', async () => {
     const store = kv()
-    expect((await reconcileX402Payer(store, ledger, 3_600_000 * 10)).ran).toBe(true)
-    expect((await reconcileX402Payer(store, ledger, 3_600_000 * 10 + 120_000)).ran).toBe(false)
-    expect((await reconcileX402Payer(store, ledger, 3_600_000 * 11)).ran).toBe(true)
-    expect((await reconcileX402Payer(store, null)).ran).toBe(false)
+    const base = { kv: store, ledger, alertEnv: {}, funder: FUNDER.address, readFunderBalance: async () => ({ balance: 1_000_000_000n, rpcsTried: [] }), send: async () => true }
+    expect((await reconcileX402Payer({ ...base, nowMs: 3_600_000 * 10 })).ran).toBe(true)
+    expect((await reconcileX402Payer({ ...base, nowMs: 3_600_000 * 10 + 120_000 })).ran).toBe(false)
+    expect((await reconcileX402Payer({ ...base, nowMs: 3_600_000 * 11 })).ran).toBe(true)
+    expect((await reconcileX402Payer({ ...base, ledger: null })).ran).toBe(false)
+  })
+})
+
+describe('refunded credentials are not replayable', () => {
+  it('lookup replay of a refunded credential -> 410 X402_CREDENTIAL_REFUNDED, no signature', async () => {
+    const key = await newKey(10)
+    const body = JSON.stringify({ idempotencyKey: 'idem-refund-01', accepts: baseReq() })
+    expect((await call('/v1/x402/sign', { method: 'POST', key, body })).status).toBe(200)
+    ledger.payments[0].refunded_at = '2026-10-10T10:00:00Z'
+    const r = await call('/v1/x402/sign', { method: 'POST', key, body })
+    expect(r.status).toBe(410)
+    expect(r.body.code).toBe('X402_CREDENTIAL_REFUNDED')
+    expect(r.body.paymentSignature).toBeUndefined()
+    expect(evmSigns).toBe(1)
+  })
+
+  it('commit-time replay of a refunded credential is refused too', async () => {
+    const key = await newKey(10)
+    const body = JSON.stringify({ idempotencyKey: 'idem-refund-02', accepts: baseReq() })
+    await call('/v1/x402/sign', { method: 'POST', key, body })
+    ledger.payments[0].refunded_at = '2026-10-10T10:00:00Z'
+    const realGet = ledger.getAccount.bind(ledger)
+    ledger.getAccount = async (d, _k) => realGet(d) // lookup misses, commit finds it
+    const r = await call('/v1/x402/sign', { method: 'POST', key, body })
+    expect(r.status).toBe(410)
+    expect(r.body.code).toBe('X402_CREDENTIAL_REFUNDED')
+  })
+})
+
+describe('remote Base signer (pay-invoice sign-x402)', () => {
+  const body = (k: string) => JSON.stringify({ idempotencyKey: k, accepts: baseReq() })
+
+  it('success: verified credential, nonce generated here and stored, one debit', async () => {
+    const key = await newKey(10)
+    const r = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-01') })
+    expect(r.status).toBe(200)
+    expect(r.body.paymentPayload.payload.authorization.from).toBe(FUNDER.address)
+    expect(ledger.payments[0].nonce).toBe(signerCalls[0].body.nonce)
+    expect(ledger.payments[0].nonce).toMatch(/^0x[0-9a-f]{64}$/)
+    expect(ledger.payments[0].funder).toBe(FUNDER.address)
+    expect([...ledger.accounts.values()][0].balance).toBeCloseTo(9.99, 6)
+  })
+
+  it('funder mismatch -> 503 X402_SIGNER_NOT_CONFIGURED, nothing committed', async () => {
+    const key = await newKey(10)
+    nextBehaviours = [{ wrongFunder: true }]
+    const r = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-02') })
+    expect(r.status).toBe(503)
+    expect(r.body.code).toBe('X402_SIGNER_NOT_CONFIGURED')
+    expect(r.body.paymentSignature).toBeUndefined()
+    expect(ledger.commits).toBe(0)
+  })
+
+  it('a signature that does not recover to the funder is never released', async () => {
+    const key = await newKey(10)
+    nextBehaviours = [{ badSignature: true }]
+    const r = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-03') })
+    expect(r.status).toBe(503)
+    expect(r.body.code).toBe('X402_SIGNER_NOT_CONFIGURED')
+    expect(ledger.commits).toBe(0)
+  })
+
+  it('remote 429 / 403 / 503-disabled map to explicit codes, no debit', async () => {
+    const key = await newKey(10)
+    const cases: Array<[MockBehaviour, number, string]> = [
+      [{ status: 429, code: 'X402_SIGN_CAP' }, 429, 'X402_SIGNER_CAP_REACHED'],
+      [{ status: 429, code: 'X402_SIGN_DAILY_CAP' }, 429, 'X402_SIGNER_DAILY_CAP_REACHED'],
+      [{ status: 403, code: 'X402_SIGN_PAYTO_BLOCKED' }, 403, 'X402_PAYTO_BLOCKED'],
+      [{ status: 400, code: 'X402_SIGN_UNSUPPORTED' }, 400, 'X402_SIGN_UNSUPPORTED'],
+      [{ status: 503, code: 'X402_SIGN_DISABLED' }, 503, 'X402_SIGNER_DISABLED'],
+      [{ status: 401 }, 503, 'X402_SIGNER_NOT_CONFIGURED'],
+    ]
+    let i = 0
+    for (const [b, status, code] of cases) {
+      nextBehaviours = [b]
+      const r = await call('/v1/x402/sign', { method: 'POST', key, body: body(`idem-remote-map-${i++}`) })
+      expect(r.status, code).toBe(status)
+      expect(r.body.code).toBe(code)
+    }
+    expect(ledger.commits).toBe(0)
+    expect([...ledger.accounts.values()][0].balance).toBe(10)
+  })
+
+  it('timeout / 5xx -> 503 X402_RETRY; retry with the same key asks for the identical authorization', async () => {
+    const key = await newKey(10)
+    nextBehaviours = [{ timeout: true }, { status: 502 }]
+    const a = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-retry') })
+    expect(a.status).toBe(503)
+    expect(a.body.code).toBe('X402_RETRY')
+    const b = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-retry') })
+    expect(b.body.code).toBe('X402_RETRY')
+    expect(ledger.commits).toBe(0)
+    const c = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-retry') })
+    expect(c.status).toBe(200)
+    // Same nonce, validBefore and remote idempotency key on every attempt.
+    const sent = signerCalls.map((x) => JSON.stringify(x.body))
+    expect(new Set(sent).size).toBe(1)
+    expect(ledger.commits).toBe(1)
+    expect([...ledger.accounts.values()][0].balance).toBeCloseTo(9.99, 6)
+    // And a later replay returns the stored credential without calling out.
+    const d = await call('/v1/x402/sign', { method: 'POST', key, body: body('idem-remote-retry') })
+    expect(d.body.replay).toBe(true)
+    expect(signerCalls).toHaveLength(3)
+  })
+
+  it('the remote idempotency key is scoped to the agent key', async () => {
+    const k1 = await newKey(10)
+    const k2 = await newKey(10)
+    await call('/v1/x402/sign', { method: 'POST', key: k1, body: body('idem-remote-scope') })
+    // Second agent uses the same idempotencyKey string: different remote key,
+    // so no remote 409 (the ledger answers the cross-account conflict).
+    const r = await call('/v1/x402/sign', { method: 'POST', key: k2, body: body('idem-remote-scope') })
+    expect(r.status).toBe(409)
+    expect(r.body.code).toBe('X402_IDEMPOTENCY_CONFLICT')
+    expect(signerCalls[0].body.idempotencyKey).not.toBe(signerCalls[1]?.body.idempotencyKey)
+  })
+
+  it('remote signer from env: secret required, default URL, https only', async () => {
+    const { remoteSignerFromEnv } = await import('../src/x402payer/evm')
+    expect(remoteSignerFromEnv({}, FUNDER.address, fetch)).toBeNull()
+    expect(remoteSignerFromEnv({ X402_SIGN_SHARED_SECRET: 's' }, FUNDER.address, fetch)?.url).toBe('https://agentapi.rozo.ai/sign-x402')
+    expect(remoteSignerFromEnv({ X402_SIGN_SHARED_SECRET: 's', X402_SIGN_SERVICE_URL: 'http://x' }, FUNDER.address, fetch)).toBeNull()
+  })
+})
+
+describe('balance flags', () => {
+  it('reversal_pending while a reversed top-up awaits review', async () => {
+    const key = await newKey(5)
+    expect((await call('/v1/x402/balance', { method: 'GET', key })).body.flags).toEqual([])
+    ledger.reversalAccounts.add([...ledger.accounts.values()][0].id)
+    expect((await call('/v1/x402/balance', { method: 'GET', key })).body.flags).toEqual(['reversal_pending'])
+  })
+})
+
+describe('authorizationState read', () => {
+  const NONCE = `0x${'cd'.repeat(32)}`
+  function rpcAnswer(result: string | null, status = 200) {
+    return (async (_u: any, init: any) => {
+      const req = JSON.parse(init.body)
+      expect(req.method).toBe('eth_call')
+      expect(req.params[0].to).toBe(BASE_USDC)
+      // authorizationState(address,bytes32) selector, then the two words.
+      expect(req.params[0].data.slice(0, 10)).toBe('0xe94a0102')
+      expect(req.params[0].data.endsWith('cd'.repeat(32))).toBe(true)
+      return new Response(JSON.stringify(result === null ? { error: { code: -1 } } : { result }), { status })
+    }) as any
+  }
+  it('true / false from the chain', async () => {
+    expect(await readAuthorizationState(FUNDER.address, NONCE, 'https://rpc.test', rpcAnswer(`0x${'0'.repeat(63)}1`))).toBe(true)
+    expect(await readAuthorizationState(FUNDER.address, NONCE, 'https://rpc.test', rpcAnswer(`0x${'0'.repeat(64)}`))).toBe(false)
+  })
+  it('null when no RPC answers or input is malformed (never read as unused)', async () => {
+    expect(await readAuthorizationState(FUNDER.address, NONCE, 'https://rpc.test', rpcAnswer(null))).toBeNull()
+    expect(await readAuthorizationState(FUNDER.address, NONCE, undefined, (async () => { throw new Error('down') }) as any)).toBeNull()
+    expect(await readAuthorizationState(FUNDER.address, '0x1234', 'https://rpc.test', rpcAnswer('0x'))).toBeNull()
+  })
+})
+
+describe('x402 ops job (every 10 min)', () => {
+  const NONCE_A = `0x${'aa'.repeat(32)}`
+  const NONCE_B = `0x${'bb'.repeat(32)}`
+  const NONCE_C = `0x${'cc'.repeat(32)}`
+  function chain(states: Record<string, boolean | 'fail'>) {
+    return (async (_u: any, init: any) => {
+      const data: string = JSON.parse(init.body).params[0].data
+      const st = states[`0x${data.slice(-64)}`]
+      if (st === 'fail') return new Response('boom', { status: 500 })
+      return new Response(JSON.stringify({ result: `0x${'0'.repeat(63)}${st ? 1 : 0}` }))
+    }) as any
+  }
+
+  it('reports used / unused, skips unreadable, acks only delivered reversal alerts', async () => {
+    ledger.pending = {
+      authorization_checks: [
+        { payment_id: 'p-used', funder: FUNDER.address, nonce: NONCE_A, valid_before: 'x' },
+        { payment_id: 'p-unused', funder: FUNDER.address, nonce: NONCE_B, valid_before: 'x' },
+        { payment_id: 'p-unknown', funder: FUNDER.address, nonce: NONCE_C, valid_before: 'x' },
+      ],
+      reversals: [
+        { payment_id: 'top-1', account_id: 'acct-1', credited_usd: '19.80', review_reason: 'order moved to payment_refunded after binding', updated_at: 'x' },
+        { payment_id: 'top-2', account_id: 'acct-2', credited_usd: '5.00', review_reason: null, updated_at: 'x' },
+      ],
+    }
+    const sent: string[] = []
+    const r = await runX402Ops({
+      kv: kv(), ledger, alertEnv: { DINGTALK_ACCESS_TOKEN: 't' } as any, funder: FUNDER.address, nowMs: 1_000_000,
+      fetchImpl: chain({ [NONCE_A]: true, [NONCE_B]: false, [NONCE_C]: 'fail' }),
+      send: async (_e, msg) => { sent.push(String(msg)); return !String(msg).includes('top-2') },
+    })
+    expect(r.ran).toBe(true)
+    expect(ledger.reports).toHaveLength(1)
+    expect(ledger.reports[0].authorizations).toEqual([
+      { payment_id: 'p-used', used: true },
+      { payment_id: 'p-unused', used: false },
+    ])
+    expect(ledger.reports[0].reversals_alerted).toEqual(['top-1'])
+    expect(sent).toHaveLength(2)
+    expect(sent[0]).toMatch(/x402 top-up reversed/)
+  })
+
+  it('runs once per 10-minute slot and is a no-op without a ledger', async () => {
+    const store = kv()
+    const d = { kv: store, ledger, alertEnv: {}, funder: FUNDER.address }
+    expect((await runX402Ops({ ...d, nowMs: 600_000 })).ran).toBe(true)
+    expect((await runX402Ops({ ...d, nowMs: 600_000 + 120_000 })).ran).toBe(false)
+    expect((await runX402Ops({ ...d, nowMs: 1_200_000 })).ran).toBe(true)
+    expect((await runX402Ops({ ...d, ledger: null })).ran).toBe(false)
+    expect(ledger.reports).toHaveLength(0) // nothing pending -> nothing reported
+  })
+})
+
+describe('hourly reconciliation', () => {
+  function deps(store: KVNamespace, funderUsd: number | null, nowMs: number, sent: string[]) {
+    return {
+      kv: store, ledger, alertEnv: { DINGTALK_ACCESS_TOKEN: 't' } as any, funder: FUNDER.address, nowMs,
+      readFunderBalance: async () => ({ balance: funderUsd === null ? null : BigInt(Math.round(funderUsd * 1e6)), rpcsTried: [] }),
+      send: async (_e: any, m: any) => { sent.push(String(m)); return true },
+    }
+  }
+  it('alerts a shortfall above tolerance once, re-alerts after 24 h, clears when covered', async () => {
+    const store = kv()
+    const sent: string[] = []
+    ledger.snapshot = { mode: 'on', base_liability_usd: '150', recon_tolerance_usd: '20' }
+    const h = 3_600_000
+    let r = await reconcileX402Payer(deps(store, 100, 10 * h, sent))
+    expect(r.alerted).toBe(true)
+    expect(r.shortfallUsd).toBe(50)
+    expect(sent[0]).toMatch(/liability mismatch: funder short by \$50\.00/)
+    r = await reconcileX402Payer(deps(store, 100, 11 * h, sent))
+    expect(r.alerted).toBe(false)
+    r = await reconcileX402Payer(deps(store, 100, 35 * h, sent))
+    expect(r.alerted).toBe(true)
+    r = await reconcileX402Payer(deps(store, 500, 36 * h, sent))
+    expect(r.alerted).toBe(false)
+    r = await reconcileX402Payer(deps(store, 100, 37 * h, sent))
+    expect(r.alerted).toBe(true) // new transition into shortfall
+    expect(sent).toHaveLength(3)
+  })
+  it('no alert within tolerance, when off, or when the balance is unreadable', async () => {
+    const sent: string[] = []
+    ledger.snapshot = { mode: 'on', base_liability_usd: '115', recon_tolerance_usd: '20' }
+    expect((await reconcileX402Payer(deps(kv(), 100, 3_600_000, sent))).alerted).toBe(false)
+    ledger.snapshot = { mode: 'on', base_liability_usd: '1000', recon_tolerance_usd: '20' }
+    expect((await reconcileX402Payer(deps(kv(), null, 3_600_000, sent))).alerted).toBeUndefined()
+    ledger.snapshot = { mode: 'off', base_liability_usd: '1000', recon_tolerance_usd: '20' }
+    expect((await reconcileX402Payer(deps(kv(), 1, 3_600_000, sent))).alerted).toBeUndefined()
+    expect(sent).toHaveLength(0)
   })
 })

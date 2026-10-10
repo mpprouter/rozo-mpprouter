@@ -32,7 +32,7 @@ import { encodePaymentSignatureHeader } from '@x402/core/http'
 import { resolveSource } from '../routes/create-invoice'
 import { FUNDER_WALLET } from '../routes/webhook'
 import { clientIp } from '../routes/create-invoice-gate'
-import { evmSignerFromSecret, randomEvmNonce, signEvmExact, type EvmTypedDataSigner } from './evm'
+import { randomEvmNonce, remoteSignEvmExact, remoteSignerFromEnv, type RemoteSignerConfig } from './evm'
 import { LedgerUnavailableError, supabaseLedger, type LedgerEnv, type LedgerPayment, type LedgerResult, type X402Ledger } from './ledger'
 import {
   BASE_MAINNET_CAIP2,
@@ -57,8 +57,10 @@ const AGENT_KEY_RE = /^ak_[A-Za-z0-9_-]{43}$/
 
 export interface X402PayerEnv extends LedgerEnv {
   MPP_STORE: KVNamespace
-  /** EVM key of the shared Base funder (must derive to FUNDER_WALLET). */
-  X402_BASE_FUNDER_PRIVATE_KEY?: string
+  /** Remote Base signer (pay-invoice side). Default https://agentapi.rozo.ai/sign-x402. */
+  X402_SIGN_SERVICE_URL?: string
+  /** Bearer secret shared with the signing service. Unset = Base signing off. */
+  X402_SIGN_SHARED_SECRET?: string
   /** Solana funder keypair (base58 64 bytes or JSON array). */
   X402_SOLANA_FUNDER_SECRET_KEY?: string
   /** Public address the Solana secret must derive to. */
@@ -73,21 +75,25 @@ export interface X402PayerEnv extends LedgerEnv {
 
 export interface X402PayerDeps {
   ledger: X402Ledger | null
-  evmSigner: () => Promise<EvmTypedDataSigner | null>
+  /** Remote Base signer, or null when not configured. */
+  evmRemote: RemoteSignerConfig | null
   svmSigner: () => Promise<TransactionSigner | null>
   svmBuild: SolanaPayloadBuilder
   fetchImpl: typeof fetch
   nowSeconds: () => number
+  /** Attempt cache for remote signing retries (MPP_STORE). */
+  kv?: KVNamespace
 }
 
 export function depsFromEnv(env: X402PayerEnv): X402PayerDeps {
   return {
     ledger: supabaseLedger(env),
-    evmSigner: async () => evmSignerFromSecret(env.X402_BASE_FUNDER_PRIVATE_KEY, FUNDER_WALLET),
+    evmRemote: remoteSignerFromEnv(env, FUNDER_WALLET, (...args) => fetch(...args)),
     svmSigner: () => svmSignerFromSecret(env.X402_SOLANA_FUNDER_SECRET_KEY, env.X402_SOLANA_FUNDER_ADDRESS),
     svmBuild: x402SvmPayloadBuilder(env.X402_SOLANA_RPC_URL),
     fetchImpl: (...args) => fetch(...args),
     nowSeconds: () => Math.floor(Date.now() / 1000),
+    kv: env.MPP_STORE,
   }
 }
 
@@ -177,6 +183,7 @@ function publicAccount(r: LedgerResult) {
     dailyLimitUsd: a.daily_limit_usd,
     spentTodayUsd: a.spent_today_usd,
     payToAllowlist: a.pay_to_allowlist,
+    flags: a.flags ?? [],
   }
 }
 
@@ -258,12 +265,11 @@ async function topup(request: Request, env: X402PayerEnv, deps: X402PayerDeps): 
 
   const apiKey = env.ROZO_X402_TOPUP_API_KEY
   if (!apiKey) return fail(503, 'X402_TOPUP_NOT_CONFIGURED', 'Top-ups are not configured on this deployment.')
-  // A balance nobody can spend is a trap: refuse to take money in unless at
-  // least one payment leg can actually sign (key present and its address
-  // check passed). Checked before any order exists, so a refusal has no
-  // side effect.
-  if (!(await deps.evmSigner()) && !(await deps.svmSigner())) {
-    return fail(503, 'X402_SIGNER_NOT_CONFIGURED', 'No payment leg can sign on this deployment, so top-ups are closed.')
+  // A balance nobody can spend is a trap: refuse to take money in unless the
+  // remote Base signing service is configured (URL + shared secret). Checked
+  // before any order exists, so a refusal has no side effect.
+  if (!deps.evmRemote) {
+    return fail(503, 'X402_SIGNER_NOT_CONFIGURED', 'The signing service is not configured on this deployment, so top-ups are closed.')
   }
 
   const body = await readJson(request)
@@ -471,7 +477,19 @@ function shadowResponse(paymentId: string, replay: boolean): Response {
   })
 }
 
+/** An expired credential whose debit went back to the balance is dead. */
+function isRefunded(p: LedgerPayment): boolean {
+  return Boolean(p.refunded_at) || p.status === 'expired'
+}
+
+function refundedResponse(p: LedgerPayment): Response {
+  return fail(410, 'X402_CREDENTIAL_REFUNDED',
+    'This credential expired unused and its amount was returned to your balance. Fetch a new 402 challenge and sign it with a new idempotencyKey.',
+    { paymentId: p.id, refundedAt: p.refunded_at ?? null })
+}
+
 function storedPaymentResponse(p: LedgerPayment, replay: boolean, balanceUsd?: string): Response {
+  if (isRefunded(p)) return refundedResponse(p)
   if (p.mode === 'shadow' || !p.credential) return shadowResponse(p.id, replay)
   const paymentPayload = p.credential
   return json(200, {
@@ -553,13 +571,25 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
   const isEvm = req.network === BASE_MAINNET_CAIP2
   if (mode === 'on') {
     if (isEvm) {
-      const signer = await deps.evmSigner()
-      if (!signer) return fail(503, 'X402_SIGNER_NOT_CONFIGURED', 'Base signing is not configured on this deployment.')
-      const r = await signEvmExact(signer, req, { nowSeconds: deps.nowSeconds() })
-      funder = r.funder
-      nonce = r.nonce
-      validBeforeUnix = r.validBeforeUnix
-      credential = buildPaymentPayload(body, req, r.payload)
+      if (!deps.evmRemote) return fail(503, 'X402_SIGNER_NOT_CONFIGURED', 'Base signing is not configured on this deployment.')
+      // Same (agent key, idempotencyKey) -> same remote key and, while the
+      // first attempt is still valid, the same nonce and validBefore, so a
+      // retry after a timeout asks the signing service for the identical
+      // authorization (it answers idempotently) instead of a second one.
+      const remoteKey = await sha256Hex(`x402:${a.id}:${idempotencyKey}`)
+      const attempt = await loadOrCreateAttempt(deps, remoteKey, hash, req.maxTimeoutSeconds)
+      const signed = await remoteSignEvmExact(deps.evmRemote, req, {
+        nonce: attempt.nonce,
+        validBeforeUnix: attempt.validBefore,
+        idempotencyKey: remoteKey,
+        paymentReference: `x402req_${remoteKey.slice(0, 32)}`,
+      })
+      // Nothing is debited on any error: the ledger commit below never ran.
+      if ('error' in signed) return fail(signed.error.status, signed.error.code, signed.error.message)
+      funder = signed.ok.funder
+      nonce = signed.ok.nonce
+      validBeforeUnix = signed.ok.validBeforeUnix
+      credential = buildPaymentPayload(body, req, signed.ok.payload)
     } else {
       const signer = await deps.svmSigner()
       if (!signer) return fail(503, 'X402_SIGNER_NOT_CONFIGURED', 'Solana signing is not configured on this deployment.')
@@ -609,6 +639,38 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
   // ledger reports the switch as it is now.
   if (committed.outcome === 'replay' && committed.mode !== 'on') return shadowResponse(stored.id, true)
   return storedPaymentResponse(stored, committed.outcome === 'replay', committed.balance_usd)
+}
+
+const ATTEMPT_PREFIX = 'x402payer:attempt:'
+
+/**
+ * Signing parameters of the first attempt for one remote key, reused by
+ * retries while still valid. KV is eventually consistent across colos: a
+ * retry that misses the cache draws new parameters and the signing service
+ * answers 409, surfaced as X402_IDEMPOTENCY_CONFLICT (use a new key).
+ */
+async function loadOrCreateAttempt(
+  deps: X402PayerDeps,
+  remoteKey: string,
+  hash: string,
+  maxTimeoutSeconds: number,
+): Promise<{ nonce: `0x${string}`; validBefore: number }> {
+  const now = deps.nowSeconds()
+  const kvKey = ATTEMPT_PREFIX + remoteKey
+  try {
+    const raw = await deps.kv?.get(kvKey)
+    if (raw) {
+      const prev = JSON.parse(raw) as { nonce: `0x${string}`; validBefore: number; hash: string }
+      if (prev.hash === hash && prev.validBefore > now + 5 && /^0x[0-9a-f]{64}$/.test(prev.nonce)) {
+        return { nonce: prev.nonce, validBefore: prev.validBefore }
+      }
+    }
+  } catch {
+    // fall through to fresh parameters
+  }
+  const fresh = { nonce: randomEvmNonce(), validBefore: now + maxTimeoutSeconds }
+  await deps.kv?.put(kvKey, JSON.stringify({ ...fresh, hash }), { expirationTtl: Math.max(120, maxTimeoutSeconds + 120) })
+  return fresh
 }
 
 /** x402 v2 PaymentPayload: the requirement exactly as the server sent it. */
