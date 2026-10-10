@@ -170,6 +170,8 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 #   BNB@56    BSC BNB,  rozotest order 25842287, 2026-09-28
 #   ETH@42161 Arbitrum ETH, rozotest order ae7a060d, 2026-10-06 (payin, payout,
 #             and Near conversion to Base USDC all verified)
+#   POL@137   Polygon POL, 2026-10-10: rozo-intents-api accepts native POL
+#             for opted-in merchants (merchant_openrouter, rozoAgent)
 # Remove an entry (or the whole line) and redeploy to close a chain.
 # 2026-09-29: all closed again (invoice.rozo.ai could not render native
 # orders). 2026-10-06: all four reopened for OpenRouter checkout after
@@ -177,7 +179,7 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 # Backend caps: $2,000/day native in total (NATIVE_DAILY_CAP_USD_GLOBAL).
 # Rollback: set NATIVE_SOURCES = "" and redeploy.
 # Internal rozotest invoices still open every native coin for testing.
-NATIVE_SOURCES = "ETH@8453,ETH@1,BNB@56,SOL@900,ETH@42161"
+NATIVE_SOURCES = "ETH@8453,ETH@1,BNB@56,SOL@900,ETH@42161,POL@137"
 # create-invoice abuse backstop (src/routes/create-invoice-gate.ts), per UTC
 # clock hour. Since 2026-10-10 the buyer-facing limit is rozo-intents-api's
 # tiered limiter (PR #643: 10 or 30 per IP per 10 min, 300 per IP per day,

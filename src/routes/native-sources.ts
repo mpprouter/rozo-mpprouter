@@ -1,4 +1,4 @@
-// Native coin sources (ETH / BNB / SOL) for the Coinbase checkout line, and
+// Native coin sources (ETH / BNB / POL / SOL) for the Coinbase checkout line, and
 // the internal test payment id used to exercise it with small amounts.
 //
 // Founder 2026-09-27: native checkout is for merchant_openrouter (the appId
@@ -7,7 +7,7 @@
 // coins the checkout offers. Chains open one at a time through the
 // NATIVE_SOURCES var, e.g. "ETH@8453,ETH@1,BNB@56,SOL@900". Unset = none.
 
-export type NativeSymbol = 'ETH' | 'BNB' | 'SOL'
+export type NativeSymbol = 'ETH' | 'BNB' | 'POL' | 'SOL'
 
 /** Stablecoin sources every checkout accepts (moved from create-invoice so the
  * quote route can report the same table without an import cycle). */
@@ -28,6 +28,9 @@ export const NATIVE_SOURCE_DEFS: Record<string, { symbol: NativeSymbol; tokenAdd
   // Arbitrum ETH (founder 2026-10-06). Live gate: rozotest order ae7a060d.
   '42161': { symbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' },
   '56': { symbol: 'BNB', tokenAddress: '0x0000000000000000000000000000000000000000' },
+  // Polygon POL (18 decimals). rozo-intents-api accepts it for opted-in
+  // merchants (merchant_openrouter, rozoAgent) since 2026-10-10.
+  '137': { symbol: 'POL', tokenAddress: '0x0000000000000000000000000000000000000000' },
   '900': { symbol: 'SOL', tokenAddress: 'native' },
 }
 

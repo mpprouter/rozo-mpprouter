@@ -84,9 +84,9 @@ async function post(handler: typeof handleCreateInvoice, body: Record<string, un
 }
 
 describe('native source table', () => {
-  it('parses only the four supported native coins', () => {
-    expect([...parseNativeSources('eth@8453, BNB@56,SOL@900,ETH@42161,POL@137,ETH@137,garbage')].sort())
-      .toEqual(['BNB@56', 'ETH@42161', 'ETH@8453', 'SOL@900'])
+  it('parses only the supported native coins', () => {
+    expect([...parseNativeSources('eth@8453, BNB@56,SOL@900,ETH@42161,pol@137,ETH@137,POL@1,MATIC@137,garbage')].sort())
+      .toEqual(['BNB@56', 'ETH@42161', 'ETH@8453', 'POL@137', 'SOL@900'])
     expect(parseNativeSources(undefined).size).toBe(0)
   })
 
@@ -293,5 +293,47 @@ describe('Arbitrum ETH native source (founder 2026-10-06)', () => {
     const arb = resolveSource({ chainId: '42161', tokenSymbol: 'ETH' }, parseNativeSources('ETH@42161'))
     expect(arb.resolved).toMatchObject({ chainId: '42161', tokenSymbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' })
     expect(resolveSource({ chainId: '42161', tokenSymbol: 'ETH' }, parseNativeSources('ETH@8453')).error?.code).toBe('UNSUPPORTED_SOURCE')
+  })
+})
+
+describe('Polygon POL native source (2026-10-10)', () => {
+  it('parses POL@137 and resolves it with the zero token address only when open', () => {
+    expect([...parseNativeSources('POL@137')]).toEqual(['POL@137'])
+    expect(ALL_NATIVE_SOURCES.has('POL@137')).toBe(true)
+    const pol = resolveSource({ chainId: '137', tokenSymbol: 'pol' }, parseNativeSources('POL@137'))
+    expect(pol.resolved).toMatchObject({ chainId: '137', tokenSymbol: 'POL', tokenAddress: '0x0000000000000000000000000000000000000000' })
+    expect(resolveSource({ chainId: '137', tokenSymbol: 'POL' }, parseNativeSources('ETH@8453')).error?.code).toBe('UNSUPPORTED_SOURCE')
+    // Polygon stablecoins are unaffected.
+    expect(resolveSource({ chainId: '137', tokenSymbol: 'USDT' }).resolved?.tokenSymbol).toBe('USDT')
+  })
+
+  it('quote lists POL under 137 only when POL@137 is open', async () => {
+    const open = await post(handleQuoteInvoice as any, { payment_id: 'paymentSession_native_test' }, makeEnv({ NATIVE_SOURCES: 'ETH@8453,POL@137' }))
+    expect(open.json.supportedSources['137']).toEqual(['USDC', 'USDT', 'POL'])
+    const closed = await post(handleQuoteInvoice as any, { payment_id: 'paymentSession_native_test' }, makeEnv({ NATIVE_SOURCES: 'ETH@8453' }))
+    expect(closed.json.supportedSources['137']).toEqual(['USDC', 'USDT'])
+  })
+
+  it('create-invoice rejects POL when not configured', async () => {
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: 'paymentSession_native_test', source: { chainId: '137', tokenSymbol: 'POL' },
+    }, makeEnv({ NATIVE_SOURCES: 'ETH@8453,BNB@56' }))
+    expect(status).toBe(400)
+    expect(json.code).toBe('UNSUPPORTED_SOURCE')
+    expect(createdIntent).toBeNull()
+  })
+
+  it('create-invoice accepts POL when configured: exactOut merchant_openrouter order', async () => {
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: 'paymentSession_native_test', source: { chainId: 137, tokenSymbol: 'POL' },
+    }, makeEnv({ NATIVE_SOURCES: 'POL@137' }))
+    expect(status).toBe(200)
+    expect(createdIntent).toMatchObject({
+      appId: 'merchant_openrouter',
+      type: 'exactOut',
+      source: { chainId: '137', tokenSymbol: 'POL' },
+      destination: { chainId: '8453', tokenSymbol: 'USDC', amount: json.callerPays },
+    })
+    expect(createdIntent.source.amount).toBeUndefined()
   })
 })
