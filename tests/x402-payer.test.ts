@@ -303,6 +303,40 @@ describe('idempotency', () => {
   })
 })
 
+describe('replay is re-authorised', () => {
+  it('a stored credential is not returned once the switch is shadow/off or the key is suspended', async () => {
+    const key = await newKey(10)
+    const body = JSON.stringify({ idempotencyKey: 'idem-reauth-01', accepts: baseReq() })
+    const first = await call('/v1/x402/sign', { method: 'POST', key, body })
+    expect(first.status).toBe(200)
+
+    ledger.mode = 'shadow'
+    const s1 = await call('/v1/x402/sign', { method: 'POST', key, body })
+    expect(s1.status).toBe(503)
+    expect(s1.body.code).toBe('X402_PAYER_SHADOW')
+    expect(s1.body.paymentSignature).toBeUndefined()
+
+    ledger.mode = 'off'
+    const s2 = await call('/v1/x402/sign', { method: 'POST', key, body })
+    expect(s2.status).toBe(503)
+    expect(s2.body.code).toBe('X402_PAYER_DISABLED')
+    expect(s2.body.paymentSignature).toBeUndefined()
+
+    ledger.mode = 'on'
+    ;[...ledger.accounts.values()][0].status = 'suspended'
+    const s3 = await call('/v1/x402/sign', { method: 'POST', key, body })
+    expect(s3.status).toBe(403)
+    expect(s3.body.code).toBe('X402_KEY_SUSPENDED')
+    expect(s3.body.paymentSignature).toBeUndefined()
+
+    ;[...ledger.accounts.values()][0].status = 'active'
+    const s4 = await call('/v1/x402/sign', { method: 'POST', key, body })
+    expect(s4.status).toBe(200)
+    expect(s4.body.paymentSignature).toBe(first.body.paymentSignature)
+    expect(evmSigns).toBe(1)
+  })
+})
+
 describe('balance and limits', () => {
   it('per-tx limit -> 402 X402_PER_TX_LIMIT_EXCEEDED', async () => {
     const key = await newKey(100)
@@ -625,6 +659,20 @@ describe('topup', () => {
     const r = await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', token: 'USDT', chain: 'solana' }) })
     expect(r.body.code).toBe('X402_TOPUP_MISCONFIGURED')
     expect(r.body.deposit).toBeUndefined()
+    expect(ledger.topups).toHaveLength(0)
+  })
+
+  it('503 X402_SIGNER_NOT_CONFIGURED and no order when neither leg can sign', async () => {
+    const key = await newKey(0)
+    deps.evmSigner = async () => null
+    deps.svmSigner = async () => null
+    let posts = 0
+    deps.fetchImpl = (async () => { posts++; return new Response('{}') }) as any
+    const r = await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', token: 'USDT', chain: 'solana' }) })
+    expect(r.status).toBe(503)
+    expect(r.body.code).toBe('X402_SIGNER_NOT_CONFIGURED')
+    expect(r.body.deposit).toBeUndefined()
+    expect(posts).toBe(0)
     expect(ledger.topups).toHaveLength(0)
   })
 

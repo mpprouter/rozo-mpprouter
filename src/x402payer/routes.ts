@@ -258,6 +258,13 @@ async function topup(request: Request, env: X402PayerEnv, deps: X402PayerDeps): 
 
   const apiKey = env.ROZO_X402_TOPUP_API_KEY
   if (!apiKey) return fail(503, 'X402_TOPUP_NOT_CONFIGURED', 'Top-ups are not configured on this deployment.')
+  // A balance nobody can spend is a trap: refuse to take money in unless at
+  // least one payment leg can actually sign (key present and its address
+  // check passed). Checked before any order exists, so a refusal has no
+  // side effect.
+  if (!(await deps.evmSigner()) && !(await deps.svmSigner())) {
+    return fail(503, 'X402_SIGNER_NOT_CONFIGURED', 'No payment leg can sign on this deployment, so top-ups are closed.')
+  }
 
   const body = await readJson(request)
   if (!body) return fail(400, 'X402_INVALID_REQUEST', 'Body must be a JSON object.')
@@ -456,14 +463,16 @@ export function parseTopupSource(body: Record<string, unknown>):
   return { chain: hit.caip2, chainId: hit.chainId, token }
 }
 
+function shadowResponse(paymentId: string, replay: boolean): Response {
+  return fail(503, 'X402_PAYER_SHADOW', 'The payer is in shadow mode: the payment was checked and recorded, but not signed.', {
+    paymentId,
+    wouldSign: true,
+    replay,
+  })
+}
+
 function storedPaymentResponse(p: LedgerPayment, replay: boolean, balanceUsd?: string): Response {
-  if (p.mode === 'shadow' || !p.credential) {
-    return fail(503, 'X402_PAYER_SHADOW', 'The payer is in shadow mode: the payment was checked and recorded, but not signed.', {
-      paymentId: p.id,
-      wouldSign: true,
-      replay,
-    })
-  }
+  if (p.mode === 'shadow' || !p.credential) return shadowResponse(p.id, replay)
   const paymentPayload = p.credential
   return json(200, {
     ok: true,
@@ -513,16 +522,19 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
   // 1. Switch, account, and what this idempotency key already maps to.
   const acct = await deps.ledger!.getAccount(digest, idempotencyKey)
   if (acct.outcome !== 'ok') return outcomeResponse(acct)
-  if (acct.payment) {
-    if ('foreign' in acct.payment || acct.payment.accepts_hash !== hash) {
-      return outcomeResponse({ ...acct, outcome: 'conflict' })
-    }
-    return storedPaymentResponse(acct.payment, true, acct.account?.balance_usd)
-  }
+  // Authorisation first, replay second: a stored credential is handed out
+  // again only while the switch is still on and the key is still active.
   const mode = acct.mode
   if (mode === 'off') return outcomeResponse({ ...acct, outcome: 'disabled' })
   const a = acct.account!
   if (a.status !== 'active') return outcomeResponse({ ...acct, outcome: 'account_inactive', status: a.status })
+  if (acct.payment) {
+    if ('foreign' in acct.payment || acct.payment.accepts_hash !== hash) {
+      return outcomeResponse({ ...acct, outcome: 'conflict' })
+    }
+    if (mode !== 'on') return shadowResponse(acct.payment.id, true)
+    return storedPaymentResponse(acct.payment, true, acct.account?.balance_usd)
+  }
 
   // 2. Fast local pre-checks so a doomed request never reaches a signer. The
   //    ledger re-checks all of them inside the commit transaction.
@@ -593,6 +605,9 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
   })
   if (committed.outcome !== 'created' && committed.outcome !== 'replay') return outcomeResponse(committed)
   const stored = committed.payment as LedgerPayment
+  // A replay found at commit (lost race) is subject to the same rule: the
+  // ledger reports the switch as it is now.
+  if (committed.outcome === 'replay' && committed.mode !== 'on') return shadowResponse(stored.id, true)
   return storedPaymentResponse(stored, committed.outcome === 'replay', committed.balance_usd)
 }
 
