@@ -359,7 +359,7 @@ export interface Env {
   // Coinbase Payment Links via POST /v1/services/rozo-agent-api/create-invoice.
   // Set via: wrangler secret put ROZO_INTENTS_API_KEY
   ROZO_INTENTS_API_KEY: string
-  // Native coin checkout (ETH/BNB/SOL). NATIVE_SOURCES = open coins, e.g.
+  // Native coin checkout (ETH/BNB/POL/SOL). NATIVE_SOURCES = open coins, e.g.
   // "ETH@8453,ETH@1,BNB@56,SOL@900" (unset = none). NATIVE_MAX_USD caps
   // callerPays (default 2000). ROZO_TEST_LINK_SECRET signs internal
   // rozotest_ invoices (unset = test invoices rejected).

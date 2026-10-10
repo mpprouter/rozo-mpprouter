@@ -281,7 +281,7 @@ export function resolveSource(
     return { resolved: { chainId: 'lightning', tokenSymbol: 'BTC', tokenAddress: '', warnings } }
   }
 
-  // Native coin (ETH/BNB/SOL): exactOut like Lightning, token address is the
+  // Native coin (ETH/BNB/POL/SOL): exactOut like Lightning, token address is the
   // chain's native sentinel. Only coins open for this request are accepted.
   if (isNativeSymbol(chainId, tokenSymbol)) {
     const def = nativeSourceFor(chainId, tokenSymbol, nativeAllowed)
@@ -1803,7 +1803,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // Non-Lightning (existing EVM USDC/USDT) source → exactIn: the caller pays the
   // full invoice amount on source, destination carries no amount.
   const isLightning = source.chainId === 'lightning'
-  // Native coins (ETH/BNB/SOL) settle exactOut like Lightning: the merchant
+  // Native coins (ETH/BNB/POL/SOL) settle exactOut like Lightning: the merchant
   // receives exactly callerPays in Base USDC and rozo-intents-api quotes the
   // coin amount (locked price + buffer).
   const intentsBody = isLightning || nativeSource
