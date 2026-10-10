@@ -33,11 +33,13 @@ import {
   TEST_MERCHANT_NAME,
   isNativeSymbol,
   isTestPaymentId,
-  nativeMaxUsd,
+  nativeMaxUsdFor,
+  nativeRequiresRefundAddress,
   nativeSourceFor,
   parseNativeSources,
   supportedSources,
   verifyTestPaymentId,
+  withBetaSources,
   type NativeSymbol,
 } from './native-sources'
 import { normalizeContactEmail } from './contact-email'
@@ -391,6 +393,15 @@ export type CreateInvoiceErrorCode =
   | 'QUOTE_RECEIPT_INVALID_OR_EXPIRED'
   | 'QUOTE_RECEIPT_REQUIRED'
   | 'INVALID_EMAIL'
+  // Beta ZEC (near) source. The first two are raised here; all of them are
+  // also passed through unchanged from rozo-intents-api (ZEC_PASSTHROUGH_CODES).
+  | 'REFUND_ADDRESS_REQUIRED'
+  | 'MERCHANT_LINK_EXPIRES_TOO_SOON'
+  | 'ZEC_SHIELDED_ADDRESS_NOT_SUPPORTED'
+  | 'ZEC_NOT_ENABLED'
+  | 'QUOTE_DRIFT'
+  | 'ZEC_REQUIRES_EXACT_OUT'
+  | 'EXCEEDS_LIMIT'
 
 // Resolver failure kind -> the error code a checkout UI keys its friendly copy
 // off. Without a code the UI renders the raw upstream string, so an expired
@@ -427,6 +438,130 @@ function json(status: number, payload: unknown): Response {
 
 function errorResponse(status: number, err: CreateInvoiceError): Response {
   return json(status, { error: err.message, ...err })
+}
+
+// ── Beta ZEC (near) source ──────────────────────────────────────────────────
+
+/**
+ * Minimum life the merchant (Coinbase) link must have left when a ZEC order is
+ * created: the 1Click deposit deadline (~60 min) plus 15 min of settlement
+ * slack. rozo-intents-api enforces the same floor on
+ * metadata.merchant_link_expires_at; checking here first fails fast.
+ */
+export const ZEC_MIN_LINK_LIFE_MS = 75 * 60 * 1000
+
+/**
+ * rozotest_ invoices have no external link, so nothing can expire under a ZEC
+ * order. They send this synthetic horizon so the backend floor still applies.
+ */
+export const TEST_INVOICE_LINK_LIFE_MS = 24 * 60 * 60 * 1000
+
+const REFUND_ADDRESS_MAX_LEN = 128
+const SHIELDED_ZEC_PREFIX = /^(u1|zs|zc)/i
+
+/**
+ * The payer's ZEC refund address (body `refund_address`). Presence, length and
+ * charset only; rozo-intents-api owns the t1/t3 Base58Check validation. A
+ * shielded (u1/zs/zc) address is refused here with the backend's own code.
+ */
+export function resolveRefundAddress(
+  raw: unknown,
+):
+  | { ok: true; address: string }
+  | { ok: false; code: 'REFUND_ADDRESS_REQUIRED' | 'ZEC_SHIELDED_ADDRESS_NOT_SUPPORTED'; message: string } {
+  const address = typeof raw === 'string' ? raw.trim() : ''
+  if (!address) {
+    return {
+      ok: false,
+      code: 'REFUND_ADDRESS_REQUIRED',
+      message:
+        'refund_address is required for ZEC: a transparent Zcash address (t1... or t3...) ' +
+        'that receives the ZEC back if the swap cannot complete.',
+    }
+  }
+  if (SHIELDED_ZEC_PREFIX.test(address)) {
+    return {
+      ok: false,
+      code: 'ZEC_SHIELDED_ADDRESS_NOT_SUPPORTED',
+      message: 'Shielded Zcash addresses cannot receive refunds. Use a transparent address (t1... or t3...).',
+    }
+  }
+  if (address.length > REFUND_ADDRESS_MAX_LEN || !/^[A-Za-z0-9]+$/.test(address)) {
+    return {
+      ok: false,
+      code: 'REFUND_ADDRESS_REQUIRED',
+      message: 'refund_address must be a transparent Zcash address (t1... or t3...).',
+    }
+  }
+  return { ok: true, address }
+}
+
+/**
+ * Decide whether a ZEC order may be created against a merchant link that
+ * expires at `linkExpiresAt`. Unknown expiry fails closed: a ZEC deposit can
+ * take up to an hour to arrive, and paying a dead Coinbase link with it would
+ * strand the payer's money.
+ */
+export function checkZecLinkExpiry(
+  linkExpiresAt: string | null,
+  now: number = Date.now(),
+): { ok: true; iso: string } | { ok: false; message: string } {
+  const exp = linkExpiresAt ? Date.parse(linkExpiresAt) : NaN
+  if (!Number.isFinite(exp)) {
+    return {
+      ok: false,
+      message:
+        'ZEC needs the payment link\'s expiry time, which could not be read right now. ' +
+        'Retry shortly, or pay with another coin.',
+    }
+  }
+  if (exp < now + ZEC_MIN_LINK_LIFE_MS) {
+    return {
+      ok: false,
+      message:
+        'This payment link expires too soon for ZEC (a ZEC payment needs at least 75 minutes). ' +
+        'Pay with another coin, or create a new payment link.',
+    }
+  }
+  return { ok: true, iso: new Date(exp).toISOString() }
+}
+
+/** rozo-intents-api codes a ZEC create may answer with; passed through unchanged. */
+const ZEC_PASSTHROUGH_CODES: ReadonlySet<string> = new Set([
+  'ZEC_NOT_ENABLED',
+  'REFUND_ADDRESS_REQUIRED',
+  'ZEC_SHIELDED_ADDRESS_NOT_SUPPORTED',
+  'MERCHANT_LINK_EXPIRES_TOO_SOON',
+  'QUOTE_DRIFT',
+  'ZEC_REQUIRES_EXACT_OUT',
+  'EXCEEDS_LIMIT',
+])
+
+/**
+ * The upstream error code of a failed ZEC create, when it is one the checkout
+ * should see verbatim. rozo-intents-api puts it in `data.errorCode` (over the
+ * cap: error.code=amountTooHigh, data.errorCode=EXCEEDS_LIMIT) and usually in
+ * `error.code` too; `data.errorCode` wins.
+ */
+export function zecUpstreamError(
+  status: number,
+  text: string,
+): { code: CreateInvoiceErrorCode; message: string } | null {
+  if (status !== 400 && status !== 403) return null
+  let body: any
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return null
+  }
+  const candidates = [body?.data?.errorCode, body?.error?.code, body?.errorCode, body?.code]
+  const code = candidates.find((c) => typeof c === 'string' && ZEC_PASSTHROUGH_CODES.has(c))
+  if (!code) return null
+  const rawMessage = body?.error?.message ?? body?.message
+  return {
+    code: code as CreateInvoiceErrorCode,
+    message: typeof rawMessage === 'string' && rawMessage ? rawMessage.substring(0, 300) : code,
+  }
 }
 
 // ── Reuse of an existing Rozo intent ────────────────────────────────────────
@@ -1019,8 +1154,13 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       })
     }
   }
-  const nativeAllowed: ReadonlySet<string> =
-    testInvoiceCents !== null ? ALL_NATIVE_SOURCES : parseNativeSources(env.NATIVE_SOURCES)
+  // Beta coins (NATIVE_SOURCES_BETA, e.g. ZEC) join only when the request
+  // carries ?beta=<symbol>, for test invoices too.
+  const nativeAllowed: ReadonlySet<string> = withBetaSources(
+    testInvoiceCents !== null ? ALL_NATIVE_SOURCES : parseNativeSources(env.NATIVE_SOURCES),
+    env.NATIVE_SOURCES_BETA,
+    request.url,
+  )
 
   const sourceRaw = (parsed as Record<string, unknown> | null)?.source
   const sourceResult = resolveSource(sourceRaw, nativeAllowed)
@@ -1153,6 +1293,23 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       orderAttribution,
       emailResult.email,
     )
+  }
+
+  // Beta ZEC: the payer's transparent refund address is required up front
+  // (rozo-intents-api passes it to 1Click as refundTo; we hold no ZEC wallet).
+  const refundAddressRequired = nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
+  let refundAddress: string | null = null
+  if (refundAddressRequired) {
+    const r = resolveRefundAddress((parsed as Record<string, unknown> | null)?.refund_address)
+    if (!r.ok) {
+      return errorResponse(400, {
+        code: r.code,
+        message: r.message,
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    refundAddress = r.address
   }
 
   let quote: any
@@ -1382,10 +1539,11 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
-  if (nativeSource && Number(callerPays) > nativeMaxUsd(env.NATIVE_MAX_USD)) {
+  const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD)
+  if (nativeSource && Number(callerPays) > nativeCap) {
     return errorResponse(400, {
       code: 'UNSUPPORTED_SOURCE',
-      message: `Native coin payment is limited to $${nativeMaxUsd(env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`,
+      message: `Native coin payment is limited to $${nativeCap} per invoice. Pay with USDC/USDT instead.`,
       normalized_input: normalized,
       link_id_detected,
     })
@@ -1839,6 +1997,30 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // Non-Lightning (existing EVM USDC/USDT) source → exactIn: the caller pays the
   // full invoice amount on source, destination carries no amount.
   const isLightning = source.chainId === 'lightning'
+
+  // Beta ZEC: only create when the merchant link outlives the 1Click deposit
+  // window, and hand its expiry to rozo-intents-api, which re-checks it
+  // (metadata.merchant_link_expires_at, top-level because metadata.client is
+  // already a string label). Fresh creates only: a live ZEC order is reused
+  // above as is, and never rotated to another coin (native_not_rotatable).
+  let merchantLinkExpiresAt: string | null = null
+  if (refundAddressRequired) {
+    const linkExpiry =
+      testInvoiceCents !== null
+        ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
+        : await linkExpiresAtPromise
+    const check = checkZecLinkExpiry(linkExpiry)
+    if (!check.ok) {
+      return errorResponse(400, {
+        code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
+        message: check.message,
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    merchantLinkExpiresAt = check.iso
+  }
+
   // Native coins (ETH/BNB/POL/SOL) settle exactOut like Lightning: the merchant
   // receives exactly callerPays in Base USDC and rozo-intents-api quotes the
   // coin amount (locked price + buffer).
@@ -1854,7 +2036,11 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         },
         source: isLightning
           ? { chainId: 'lightning', tokenSymbol: 'BTC' }
-          : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
+          : {
+              chainId: source.chainId,
+              tokenSymbol: source.tokenSymbol,
+              ...(refundAddress ? { refundAddress } : {}),
+            },
         destination: {
           chainId: SETTLEMENT_CHAIN_ID,
           receiverAddress: SETTLEMENT_RECEIVER,
@@ -1870,6 +2056,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           ...provenance,
           ...orderAttribution,
           ...priced,
+          ...(merchantLinkExpiresAt ? { merchant_link_expires_at: merchantLinkExpiresAt } : {}),
           // Lets downstream analytics (GMV) drop internal test orders.
           ...(testInvoiceCents !== null ? { testMode: true } : {}),
         },
@@ -2048,6 +2235,21 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         normalized_input: normalized,
         link_id_detected,
       })
+    }
+    // Beta ZEC: rozo-intents-api's ZEC refusals (switch off, bad refund
+    // address, link too short, quote drift, over cap) are caller-actionable;
+    // pass status and code through unchanged instead of a generic 502.
+    if (refundAddressRequired) {
+      const zecErr = zecUpstreamError(intentsResp.status, intentsText)
+      if (zecErr) {
+        return errorResponse(intentsResp.status, {
+          code: zecErr.code,
+          message: zecErr.message,
+          upstream_status: intentsResp.status,
+          normalized_input: normalized,
+          link_id_detected,
+        })
+      }
     }
     return errorResponse(502, {
       code: 'INTENTS_API_FAILED',
