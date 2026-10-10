@@ -14,10 +14,12 @@
     "test": "vitest"
   },
   "dependencies": {
+    "@solana/kit": "5.5.1",
     "@stellar/mpp": "0.7.0",
     "@stellar/stellar-sdk": "^15.1.0",
     "@x402/core": "^2.9.0",
     "@x402/stellar": "^2.9.0",
+    "@x402/svm": "2.9.0",
     "mppx": "0.7.0",
     "tsx": "^4.21.0",
     "viem": "^2.51.0"
