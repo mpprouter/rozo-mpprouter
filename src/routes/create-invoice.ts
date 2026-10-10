@@ -172,6 +172,38 @@ export interface SourceError {
  */
 export interface CallerProvenance {
   client?: string
+  /**
+   * How the payer says they paid (checkout checkbox, e.g. "I pay with a Cashu
+   * wallet"). Lightning cannot tell a Cashu melt from any other LN payment at
+   * the protocol level, so this self-report is the only signal. Stored flat as
+   * metadata.pay_method next to `client`: `metadata.client` is already a string
+   * label read by payment-api's extractSelfLabel, so it cannot become an object.
+   */
+  pay_method?: PayMethod
+  /** Landing query marker the checkout saw, e.g. "via=cashu". Telemetry only. */
+  landing_param?: string
+}
+
+export const PAY_METHODS = ['cashu', 'lightning', 'unknown'] as const
+export type PayMethod = (typeof PAY_METHODS)[number]
+
+/** Enum whitelist. Anything else is dropped (never a 400): telemetry on a money path. */
+export function resolvePayMethod(raw: unknown): PayMethod | null {
+  if (typeof raw !== 'string') return null
+  return (PAY_METHODS as readonly string[]).includes(raw) ? (raw as PayMethod) : null
+}
+
+export const LANDING_PARAM_MAX_LEN = 64
+// Query-string-shaped and conservative: no quotes, angle brackets, spaces,
+// slashes or control chars, so the stored value cannot terminate a SQL string,
+// open a tag or look like a URL. Length is checked before the regex runs.
+const LANDING_PARAM_RE = /^[A-Za-z0-9._~=&-]+$/
+
+/** Dropped (null) when not a string, empty, over 64 chars or outside the charset. */
+export function resolveLandingParam(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  if (raw.length === 0 || raw.length > LANDING_PARAM_MAX_LEN) return null
+  return LANDING_PARAM_RE.test(raw) ? raw : null
 }
 
 // Budget for the read-only Coinbase lookup that fills `linkExpiresAt`. It runs
@@ -998,6 +1030,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const clientRaw = (parsed as Record<string, unknown> | null)?.client
   const clientLabel = resolveClient(clientRaw)
   if (clientLabel) provenance.client = clientLabel
+  const payMethod = resolvePayMethod((parsed as Record<string, unknown> | null)?.pay_method)
+  if (payMethod) provenance.pay_method = payMethod
+  const landingParam = resolveLandingParam((parsed as Record<string, unknown> | null)?.landing_param)
+  if (landingParam) provenance.landing_param = landingParam
   // Kept OUT of `provenance`: that object is spread into order metadata, which
   // GET /payments/{id} returns to anyone holding the id. The hint (UA, IP) goes
   // upstream as a header only; payment-api files it under its server-only
