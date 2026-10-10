@@ -364,6 +364,8 @@ export interface Env {
   // callerPays (default 2000). ROZO_TEST_LINK_SECRET signs internal
   // rozotest_ invoices (unset = test invoices rejected).
   NATIVE_SOURCES?: string
+  // Beta native coins ("ZEC@9133"), opened only for requests with ?beta=<symbol>.
+  NATIVE_SOURCES_BETA?: string
   NATIVE_MAX_USD?: string
   // Bitrefill invoice payment (provider: "bitrefill"); "true" enables it.
   BITREFILL_ENABLED?: string

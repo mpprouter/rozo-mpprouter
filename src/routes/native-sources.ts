@@ -1,4 +1,4 @@
-// Native coin sources (ETH / BNB / POL / SOL) for the Coinbase checkout line, and
+// Native coin sources (ETH / BNB / POL / SOL, ZEC in beta) for the Coinbase checkout line, and
 // the internal test payment id used to exercise it with small amounts.
 //
 // Founder 2026-09-27: native checkout is for merchant_openrouter (the appId
@@ -6,8 +6,14 @@
 // (NATIVE_PAYIN_MERCHANTS); this Worker only rejects early and decides which
 // coins the checkout offers. Chains open one at a time through the
 // NATIVE_SOURCES var, e.g. "ETH@8453,ETH@1,BNB@56,SOL@900". Unset = none.
+//
+// Beta coins (ZEC on Zcash, 2026-10-10) are never opened by NATIVE_SOURCES
+// alone: they are listed in NATIVE_SOURCES_BETA and only join the allowed set
+// for a request that carries `?beta=<symbol>` (quote-invoice and
+// create-invoice both read it). Without the param they are invisible and
+// rejected as UNSUPPORTED_SOURCE.
 
-export type NativeSymbol = 'ETH' | 'BNB' | 'POL' | 'SOL'
+export type NativeSymbol = 'ETH' | 'BNB' | 'POL' | 'SOL' | 'ZEC'
 
 /** Stablecoin sources every checkout accepts (moved from create-invoice so the
  * quote route can report the same table without an import cycle). */
@@ -22,7 +28,22 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
 }
 
 
-export const NATIVE_SOURCE_DEFS: Record<string, { symbol: NativeSymbol; tokenAddress: string }> = {
+export interface NativeSourceDef {
+  symbol: NativeSymbol
+  tokenAddress: string
+  /** Upstream route rozo-intents-api uses. Informational here (intents forces it). */
+  provider?: 'near'
+  /** Per-coin cap on callerPays in USD; the lower of this and NATIVE_MAX_USD applies. */
+  maxUsd?: number
+  /** Typical seconds from deposit to settlement, for the checkout copy. */
+  etaSeconds?: number
+  /** The payer must give a refund address at create time (body `refund_address`). */
+  refundAddressRequired?: boolean
+  /** Opened only through NATIVE_SOURCES_BETA + `?beta=<symbol>`. */
+  beta?: boolean
+}
+
+export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
   '8453': { symbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' },
   '1': { symbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' },
   // Arbitrum ETH (founder 2026-10-06). Live gate: rozotest order ae7a060d.
@@ -32,13 +53,43 @@ export const NATIVE_SOURCE_DEFS: Record<string, { symbol: NativeSymbol; tokenAdd
   // merchants (merchant_openrouter, rozoAgent) since 2026-10-10.
   '137': { symbol: 'POL', tokenAddress: '0x0000000000000000000000000000000000000000' },
   '900': { symbol: 'SOL', tokenAddress: 'native' },
+  // ZEC on Zcash (internal chain id 9133 = Zcash SLIP-44 coin type 133), routed
+  // by rozo-intents-api through NEAR 1Click EXACT_OUTPUT to Base USDC. Beta
+  // only; transparent (t1/t3) refund address required; no token address.
+  '9133': {
+    symbol: 'ZEC',
+    tokenAddress: '',
+    provider: 'near',
+    maxUsd: 2000,
+    etaSeconds: 480,
+    refundAddressRequired: true,
+    beta: true,
+  },
 }
 
+const nativeKey = (chainId: string, d: NativeSourceDef) => `${d.symbol}@${chainId}`
+
+/**
+ * Every generally available native coin (beta coins excluded). Internal
+ * rozotest_ invoices open this whole set; a beta coin still needs `?beta=`.
+ */
 export const ALL_NATIVE_SOURCES: ReadonlySet<string> = new Set(
-  Object.entries(NATIVE_SOURCE_DEFS).map(([chainId, d]) => `${d.symbol}@${chainId}`),
+  Object.entries(NATIVE_SOURCE_DEFS)
+    .filter(([, d]) => !d.beta)
+    .map(([chainId, d]) => nativeKey(chainId, d)),
 )
 
-/** Parse the NATIVE_SOURCES var into "SYMBOL@chainId" keys we actually support. */
+/** Beta native coins: only reachable through NATIVE_SOURCES_BETA + `?beta=`. */
+export const BETA_NATIVE_SOURCES: ReadonlySet<string> = new Set(
+  Object.entries(NATIVE_SOURCE_DEFS)
+    .filter(([, d]) => d.beta)
+    .map(([chainId, d]) => nativeKey(chainId, d)),
+)
+
+/**
+ * Parse the NATIVE_SOURCES var into "SYMBOL@chainId" keys we actually support.
+ * Beta coins are dropped here: they open only per request (withBetaSources).
+ */
 export function parseNativeSources(raw: string | undefined): Set<string> {
   const out = new Set<string>()
   for (const part of (raw ?? '').split(',')) {
@@ -48,11 +99,90 @@ export function parseNativeSources(raw: string | undefined): Set<string> {
   return out
 }
 
+/** Parse NATIVE_SOURCES_BETA ("ZEC@9133") into known beta keys. */
+export function parseBetaNativeSources(raw: string | undefined): Set<string> {
+  const out = new Set<string>()
+  for (const part of (raw ?? '').split(',')) {
+    const key = part.trim().toUpperCase()
+    if (BETA_NATIVE_SOURCES.has(key)) out.add(key)
+  }
+  return out
+}
+
+/** Lowercased symbols named by a `?beta=` query param ("zec", "zec,foo"). */
+export function betaParamSymbols(url: string | URL | null | undefined): Set<string> {
+  const out = new Set<string>()
+  if (!url) return out
+  let parsed: URL
+  try {
+    parsed = typeof url === 'string' ? new URL(url) : url
+  } catch {
+    return out
+  }
+  for (const value of parsed.searchParams.getAll('beta')) {
+    for (const part of value.split(',')) {
+      const sym = part.trim().toLowerCase()
+      if (sym) out.add(sym)
+    }
+  }
+  return out
+}
+
+/**
+ * The native set for one request: `base` plus each NATIVE_SOURCES_BETA coin
+ * whose symbol the request named in `?beta=`. No param (or an unset
+ * NATIVE_SOURCES_BETA) returns `base` unchanged.
+ */
+export function withBetaSources(
+  base: ReadonlySet<string>,
+  betaRaw: string | undefined,
+  requestUrl: string | URL | null | undefined,
+): ReadonlySet<string> {
+  const asked = betaParamSymbols(requestUrl)
+  if (asked.size === 0) return base
+  const out = new Set(base)
+  for (const key of parseBetaNativeSources(betaRaw)) {
+    if (asked.has(key.split('@')[0].toLowerCase())) out.add(key)
+  }
+  return out
+}
+
+/** Checkout metadata for an open native coin (see sourceMeta). */
+export interface NativeSourceMeta {
+  eta_seconds: number
+  refund_address_required: boolean
+  beta: boolean
+  /** The deposit address is valid for one payment only; never pay it twice. */
+  address_single_use: boolean
+}
+
+/**
+ * Per-coin checkout metadata for the native coins open on this request, keyed
+ * "SYMBOL@chainId". Only coins that carry metadata (today: near-routed ZEC)
+ * appear; supportedSources keeps its { chainId: string[] } shape.
+ */
+export function sourceMeta(nativeAllowed: ReadonlySet<string> = new Set()): Record<string, NativeSourceMeta> {
+  const out: Record<string, NativeSourceMeta> = {}
+  for (const [chainId, d] of Object.entries(NATIVE_SOURCE_DEFS)) {
+    const key = nativeKey(chainId, d)
+    if (!nativeAllowed.has(key)) continue
+    if (d.etaSeconds === undefined && !d.refundAddressRequired && !d.beta) continue
+    out[key] = {
+      eta_seconds: d.etaSeconds ?? 0,
+      refund_address_required: !!d.refundAddressRequired,
+      beta: !!d.beta,
+      // near 1Click deposit addresses are single-quote, single-use.
+      address_single_use: d.provider === 'near',
+    }
+  }
+  return out
+}
+
 export function nativeSourceFor(
   chainId: string,
   tokenSymbol: string,
   allowed: ReadonlySet<string>,
-): { symbol: NativeSymbol; tokenAddress: string } | null {
+): NativeSourceDef | null {
   const def = NATIVE_SOURCE_DEFS[chainId]
   if (!def || def.symbol !== tokenSymbol.toUpperCase()) return null
   return allowed.has(`${def.symbol}@${chainId}`) ? def : null
@@ -85,6 +215,19 @@ export function isNativeSymbol(chainId: string, tokenSymbol: string): boolean {
 export function nativeMaxUsd(raw: string | undefined): number {
   const n = Number(raw)
   return Number.isFinite(n) && n > 0 ? n : 2000
+}
+
+/** Cap for one native coin: the lower of its own maxUsd and NATIVE_MAX_USD. */
+export function nativeMaxUsdFor(chainId: string, raw: string | undefined): number {
+  const global = nativeMaxUsd(raw)
+  const own = NATIVE_SOURCE_DEFS[chainId]?.maxUsd
+  return typeof own === 'number' && own > 0 ? Math.min(own, global) : global
+}
+
+/** True for a native coin that needs a payer refund address (ZEC). */
+export function nativeRequiresRefundAddress(chainId: string, tokenSymbol: string): boolean {
+  const def = NATIVE_SOURCE_DEFS[chainId]
+  return !!def && def.symbol === tokenSymbol.toUpperCase() && !!def.refundAddressRequired
 }
 
 // ── Internal test payment id ────────────────────────────────────────────────

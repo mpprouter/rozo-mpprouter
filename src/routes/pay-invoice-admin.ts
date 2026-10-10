@@ -5,8 +5,10 @@ import {
   TEST_MERCHANT_NAME,
   isTestPaymentId,
   parseNativeSources,
+  sourceMeta,
   supportedSources,
   verifyTestPaymentId,
+  withBetaSources,
 } from './native-sources'
 import { createQuoteReceipt } from './quote-receipt'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
@@ -457,6 +459,8 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
   // native coin is offered.
   const testId = 'payment_id' in normalized ? normalized.payment_id : null
   if (isTestPaymentId(testId)) {
+    // Every GA native coin; beta coins (ZEC) still need ?beta=<symbol>.
+    const testNative = withBetaSources(ALL_NATIVE_SOURCES, env.NATIVE_SOURCES_BETA, request.url)
     const cents = await verifyTestPaymentId(env.ROZO_TEST_LINK_SECRET, testId as string)
     if (cents === null) {
       return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid test payment id.' })
@@ -486,7 +490,8 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       ...pricingFields,
       title: buildCheckoutTitle(TEST_MERCHANT_NAME, pricing),
       currency: 'USD',
-      supportedSources: supportedSources(STABLE_SOURCES, ALL_NATIVE_SOURCES),
+      supportedSources: supportedSources(STABLE_SOURCES, testNative),
+      sourceMeta: sourceMeta(testNative),
       quoteReceipt,
     })
   }
@@ -570,6 +575,13 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     pricingVersion: pricing.pricingVersion,
   }
 
+  // Open native coins for this request: NATIVE_SOURCES plus any
+  // NATIVE_SOURCES_BETA coin named by ?beta= (create-invoice reads the same).
+  const nativeAllowed = withBetaSources(
+    parseNativeSources(env.NATIVE_SOURCES),
+    env.NATIVE_SOURCES_BETA,
+    request.url,
+  )
   const quoteReceipt = await createQuoteReceipt(
     paymentId,
     amount,
@@ -599,7 +611,10 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     title: buildCheckoutTitle(merchant, pricing),
     currency: 'USD',
     // Coins this checkout may be paid with (stablecoins + open native coins).
-    supportedSources: supportedSources(STABLE_SOURCES, parseNativeSources(env.NATIVE_SOURCES)),
+    supportedSources: supportedSources(STABLE_SOURCES, nativeAllowed),
+    // Per-coin checkout metadata for open coins that carry it (beta ZEC:
+    // eta, refund address required, single-use deposit address).
+    sourceMeta: sourceMeta(nativeAllowed),
     quote: {
       ...(quote?.quote && typeof quote.quote === 'object' ? quote.quote : {}),
       originalAtomicUsdc: pricing.originalAtomic.toString(),

@@ -180,6 +180,13 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 # Rollback: set NATIVE_SOURCES = "" and redeploy.
 # Internal rozotest invoices still open every native coin for testing.
 NATIVE_SOURCES = "ETH@8453,ETH@1,BNB@56,SOL@900,ETH@42161,POL@137"
+# Beta native coins (src/routes/native-sources.ts). Never open from this list
+# alone: a coin here joins the allowed set only for a quote-invoice /
+# create-invoice request carrying ?beta=<symbol> (e.g. ?beta=zec). ZEC on
+# Zcash (9133) goes through NEAR 1Click on rozo-intents-api, which keeps its
+# own fail-closed switch (merchant_native_tokens ZEC@9133 enabled).
+# Rollback: set NATIVE_SOURCES_BETA = "" and redeploy.
+NATIVE_SOURCES_BETA = "ZEC@9133"
 # create-invoice abuse backstop (src/routes/create-invoice-gate.ts), per UTC
 # clock hour. Since 2026-10-10 the buyer-facing limit is rozo-intents-api's
 # tiered limiter (PR #643: 10 or 30 per IP per 10 min, 300 per IP per day,
