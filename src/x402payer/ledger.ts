@@ -16,6 +16,8 @@ export interface LedgerAccount {
   daily_limit_usd: string
   spent_today_usd: string
   pay_to_allowlist: string[] | null
+  /** e.g. ["reversal_pending"] while a reversed top-up awaits a human. */
+  flags?: string[]
   created_at: string
 }
 
@@ -34,7 +36,21 @@ export interface LedgerPayment {
   valid_before: string | null
   mode: 'shadow' | 'on'
   status: string
+  /** Set once the expired, unused credential was refunded to the balance. */
+  refunded_at?: string | null
+  refund_reason?: string | null
   created_at: string
+}
+
+export interface OpsPending {
+  authorization_checks: Array<{ payment_id: string; funder: string; nonce: string; valid_before: string }>
+  reversals: Array<{ payment_id: string; account_id: string; credited_usd: string | null; review_reason: string | null; updated_at: string }>
+}
+
+export interface OpsReport {
+  /** block_* identify the finalized Base block the read was pinned to. */
+  authorizations?: Array<{ payment_id: string; used: boolean; block_number: number; block_timestamp: number }>
+  reversals_alerted?: string[]
 }
 
 export interface LedgerResult {
@@ -81,6 +97,8 @@ export interface X402Ledger {
     expected_receiver: string
   }): Promise<LedgerResult>
   liabilitySnapshot(): Promise<Record<string, unknown>>
+  opsPending(limit?: number): Promise<OpsPending>
+  opsReport(report: OpsReport): Promise<Record<string, unknown>>
 }
 
 export class LedgerUnavailableError extends Error {}
@@ -131,5 +149,7 @@ export function supabaseLedger(env: LedgerEnv, fetchImpl: typeof fetch = fetch):
     commitPayment: (args) => rpc('x402_payment_commit', args as unknown as Record<string, unknown>),
     registerTopup: (args) => rpc('x402_topup_register', args),
     liabilitySnapshot: () => rpc('x402_liability_snapshot', {}),
+    opsPending: (limit = 50) => rpc('x402_ops_pending', { limit }),
+    opsReport: (report) => rpc('x402_ops_report', report as unknown as Record<string, unknown>),
   }
 }

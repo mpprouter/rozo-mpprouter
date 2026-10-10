@@ -10,7 +10,7 @@ const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 // `mainnet.base.org` reliably from their egress IPs (rate-limited or
 // blocked by Coinbase's own RPC), so we try several. Order matters —
 // fastest/most reliable first.
-const FALLBACK_BASE_RPCS = [
+export const FALLBACK_BASE_RPCS = [
   'https://base-rpc.publicnode.com',
   'https://base.llamarpc.com',
   'https://base.drpc.org',
@@ -25,7 +25,7 @@ export interface BaseUsdcBalanceResult {
 // `primaryRpcUrl` is the operator-provided (paid) Base RPC, typically
 // Alchemy. Tried first; on any failure we fall through to the public
 // list. `redactRpcUrl` keeps API keys out of logs.
-function redactRpcUrl(url: string): string {
+export function redactRpcUrl(url: string): string {
   try {
     const u = new URL(url)
     if (u.pathname.length > 1) {
