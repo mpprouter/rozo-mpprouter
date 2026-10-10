@@ -11,8 +11,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  ZEC_REFUND_DIGEST_KEY,
   checkZecLinkExpiry,
   handleCreateInvoice,
+  refundAddressDigest,
   resolveRefundAddress,
   zecUpstreamError,
 } from '../src/routes/create-invoice'
@@ -61,6 +63,10 @@ let createCalls = 0
 let linkExpiresAt: string | null = null
 /** Overrides the intents create answer. */
 let createAnswer: (() => Response) | null = null
+/** Row GET /payments/order/<app>/<SESSION_ID> returns (null = 404). */
+let existingOrder: any = null
+/** Row that order lookup returns only after a create was attempted (slot race). */
+let raceWinner: any = null
 
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 
@@ -69,6 +75,8 @@ beforeEach(() => {
   createCalls = 0
   linkExpiresAt = inMinutes(24 * 60)
   createAnswer = null
+  existingOrder = null
+  raceWinner = null
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     if (u.includes('payments.coinbase.com/next-api/')) {
@@ -95,7 +103,12 @@ beforeEach(() => {
         linkId: SESSION_ID,
       }), { status: 200 })
     }
-    if (u.includes('/payments/order/')) return new Response('not found', { status: 404 })
+    if (u.includes('/payments/order/')) {
+      const row = u.endsWith(`/${SESSION_ID}`)
+        ? existingOrder ?? (createCalls > 0 ? raceWinner : null)
+        : null
+      return row ? new Response(JSON.stringify(row), { status: 200 }) : new Response('not found', { status: 404 })
+    }
     if (u.includes('/payment-api') && init?.method === 'POST') {
       createCalls++
       createdIntent = JSON.parse(String(init?.body ?? '{}'))
@@ -335,6 +348,152 @@ describe('create-invoice with ZEC', () => {
     })
     expect(status).toBe(502)
     expect(json.code).toBe('INTENTS_API_FAILED')
+  })
+})
+
+const T1_OTHER = 't1XXSamplePayerRefundOtherAddr0000'
+
+/** An unpaid order shaped like a GET of the intent a fresh ZEC create sent. */
+function rowFrom(intent: any, overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'rozo-pay-existing',
+    status: 'payment_unpaid',
+    paymentLink: 'https://pay.rozo.ai/existing',
+    expiresAt: '2999-01-01T01:00:00.000Z',
+    source: { chainId: intent.source.chainId, tokenSymbol: intent.source.tokenSymbol, amount: '0.08143000' },
+    destination: { ...intent.destination },
+    metadata: { ...intent.metadata },
+    ...overrides,
+  }
+}
+
+/** Fresh ZEC create with `refund`, returning the intent body it sent. */
+async function freshZecIntent(refund = T1) {
+  const { status } = await post(handleCreateInvoice, {
+    payment_id: SESSION_ID, source: ZEC, refund_address: refund,
+  }, { query: '?beta=zec' })
+  expect(status).toBe(200)
+  const intent = createdIntent
+  createCalls = 0
+  createdIntent = null
+  return intent
+}
+
+describe('ZEC order reuse checks the bound refund address', () => {
+  it('a fresh ZEC create records the refund address digest in metadata', async () => {
+    const intent = await freshZecIntent()
+    expect(intent.metadata[ZEC_REFUND_DIGEST_KEY]).toBe(await refundAddressDigest(T1))
+    expect(JSON.stringify(intent.metadata)).not.toContain(T1)
+  })
+
+  it('same refund address: reuses the existing order', async () => {
+    existingOrder = rowFrom(await freshZecIntent())
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: ` ${T1} `,
+    }, { query: '?beta=zec' })
+    expect(status).toBe(200)
+    expect(json.reused).toBe(true)
+    expect(json.rozoPaymentId).toBe('rozo-pay-existing')
+    expect(createCalls).toBe(0)
+  })
+
+  it('different refund address: 409 REFUND_ADDRESS_MISMATCH with expiresAt, no payable order', async () => {
+    existingOrder = rowFrom(await freshZecIntent())
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: T1_OTHER,
+    }, { query: '?beta=zec' })
+    expect(status).toBe(409)
+    expect(json.ok).toBe(false)
+    expect(json.code).toBe('REFUND_ADDRESS_MISMATCH')
+    expect(json.error.code).toBe('REFUND_ADDRESS_MISMATCH')
+    expect(json.expiresAt).toBe('2999-01-01T01:00:00.000Z')
+    expect(json.message).toContain('2999-01-01T01:00:00.000Z')
+    expect(json.message).toContain('cannot be changed')
+    expect(json.paymentLink).toBeUndefined()
+    expect(json.rozoPaymentId).toBe('rozo-pay-existing')
+    expect(createCalls).toBe(0)
+  })
+
+  it('unknown bound refund address (order created before the digest existed): 409', async () => {
+    const intent = await freshZecIntent()
+    delete intent.metadata[ZEC_REFUND_DIGEST_KEY]
+    existingOrder = rowFrom(intent)
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: T1,
+    }, { query: '?beta=zec' })
+    expect(status).toBe(409)
+    expect(json.code).toBe('REFUND_ADDRESS_MISMATCH')
+    expect(json.message).toContain('cannot be verified')
+    expect(json.paymentLink).toBeUndefined()
+  })
+
+  it('a plain metadata.internal.zec_refund_address, when present, is compared directly', async () => {
+    const intent = await freshZecIntent()
+    delete intent.metadata[ZEC_REFUND_DIGEST_KEY]
+    existingOrder = rowFrom(intent)
+    existingOrder.metadata.internal = { zec_refund_address: T1 }
+    const same = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: T1,
+    }, { query: '?beta=zec' })
+    expect(same.status).toBe(200)
+    expect(same.json.reused).toBe(true)
+    const other = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: T1_OTHER,
+    }, { query: '?beta=zec' })
+    expect(other.status).toBe(409)
+    expect(other.json.code).toBe('REFUND_ADDRESS_MISMATCH')
+  })
+
+  it('create-conflict reuse path: same address reuses the winner, different address gets 409', async () => {
+    const intent = await freshZecIntent()
+    createAnswer = () => new Response(JSON.stringify({ error: { code: 'orderIdConflict' } }), { status: 409 })
+
+    raceWinner = rowFrom(intent, { id: 'rozo-pay-winner' })
+    const same = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: T1,
+    }, { query: '?beta=zec' })
+    expect(same.status).toBe(200)
+    expect(same.json.reused).toBe(true)
+    expect(same.json.rozoPaymentId).toBe('rozo-pay-winner')
+
+    createCalls = 0
+    const other = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: T1_OTHER,
+    }, { query: '?beta=zec' })
+    expect(other.status).toBe(409)
+    expect(other.json.code).toBe('REFUND_ADDRESS_MISMATCH')
+    expect(other.json.rozoPaymentId).toBe('rozo-pay-winner')
+    expect(other.json.expiresAt).toBe('2999-01-01T01:00:00.000Z')
+
+    createCalls = 0
+    const unknownWinner = rowFrom(intent, { id: 'rozo-pay-winner' })
+    delete (unknownWinner.metadata as any)[ZEC_REFUND_DIGEST_KEY]
+    raceWinner = unknownWinner
+    const unknown = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: T1,
+    }, { query: '?beta=zec' })
+    expect(unknown.status).toBe(409)
+    expect(unknown.json.code).toBe('REFUND_ADDRESS_MISMATCH')
+  })
+
+  it('non-ZEC orders are unaffected: an existing ETH order is reused without any refund check', async () => {
+    const { status } = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: { chainId: '8453', tokenSymbol: 'ETH' },
+    })
+    expect(status).toBe(200)
+    const intent = createdIntent
+    expect(intent.metadata[ZEC_REFUND_DIGEST_KEY]).toBeUndefined()
+    createCalls = 0
+    existingOrder = rowFrom(intent, {
+      source: { chainId: '8453', tokenSymbol: 'ETH', amount: '0.003' },
+    })
+    const reuse = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: { chainId: '8453', tokenSymbol: 'ETH' }, refund_address: T1_OTHER,
+    })
+    expect(reuse.status).toBe(200)
+    expect(reuse.json.reused).toBe(true)
+    expect(reuse.json.rozoPaymentId).toBe('rozo-pay-existing')
+    expect(createCalls).toBe(0)
   })
 })
 
