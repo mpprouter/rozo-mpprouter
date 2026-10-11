@@ -1128,6 +1128,57 @@ function derivePayinTruth(
   return { confirmed: false, confirmedAt: null, via: null }
 }
 
+const DECIMAL_RE = /^\d{1,18}(\.\d{1,18})?$/
+const CURRENCY_RE = /^[A-Za-z0-9.]{1,16}$/
+const SLUG_RE = /^[a-z0-9_]{1,64}$/
+
+function safeDecimal(v: unknown): string | null {
+  return typeof v === 'string' && DECIMAL_RE.test(v) ? v : null
+}
+
+function safeIso(v: unknown): string | null {
+  return typeof v === 'string' && v.length <= 40 && Number.isFinite(Date.parse(v)) ? v : null
+}
+
+/**
+ * Whitelist Rozo's public amountMismatch for the checkout. Returns null unless
+ * the direction and the amounts it needs are well-formed: the page builds a
+ * sentence from these values, so anything that is not a plain decimal or a
+ * short token symbol is dropped rather than passed on.
+ */
+export function pickAmountMismatch(m: any) {
+  if (!m || typeof m !== 'object') return null
+  if (m.direction !== 'underpay' && m.direction !== 'overpay') return null
+  const expectedAmount = safeDecimal(m.expectedAmount)
+  const receivedAmount = safeDecimal(m.receivedAmount)
+  const currency = typeof m.currency === 'string' && CURRENCY_RE.test(m.currency) ? m.currency : null
+  if (!expectedAmount || !receivedAmount || !currency) return null
+  return {
+    direction: m.direction as 'underpay' | 'overpay',
+    expectedAmount,
+    receivedAmount,
+    remainingAmount: safeDecimal(m.remainingAmount),
+    excessAmount: safeDecimal(m.excessAmount),
+    currency,
+    detectedAt: safeIso(m.detectedAt),
+    updatedAt: safeIso(m.updatedAt),
+    // Fail closed: anything but an explicit false counts as reviewed, so the
+    // checkout never shows a top-up instruction on an order a human owns.
+    reviewed: m.reviewed === false ? false : true,
+    ...(typeof m.canTopUp === 'boolean' ? { canTopUp: m.canTopUp } : {}),
+    ...(typeof m.topUpBlockedReason === 'string' && SLUG_RE.test(m.topUpBlockedReason)
+      ? { topUpBlockedReason: m.topUpBlockedReason }
+      : {}),
+  }
+}
+
+/** Whitelist Rozo's public paymentHold ({ kind }) for the checkout. */
+export function pickPaymentHold(h: any) {
+  if (!h || typeof h !== 'object') return null
+  if (typeof h.kind !== 'string' || !SLUG_RE.test(h.kind)) return null
+  return { kind: h.kind }
+}
+
 export function pickRozoCallerSafe(rp: any) {
   if (!rp) return null
   return {
@@ -1150,6 +1201,21 @@ export function pickRozoCallerSafe(rp: any) {
           },
         }
       : {}),
+    // Amount mismatch (underpay / overpay) on an unpaid order, already trimmed
+    // by Rozo's toPublicAmountMismatch(). Re-whitelisted here field by field so
+    // an unknown or malformed key never reaches the checkout. `canTopUp` is
+    // only relayed when it is a real boolean; the checkout treats an absent
+    // value as "no top-up instruction". Absent on older Rozo deploys.
+    ...(() => {
+      const m = pickAmountMismatch(rp.amountMismatch)
+      return m ? { amountMismatch: m } : {}
+    })(),
+    // Manual hold (e.g. two different tokens landed on one order). Only the
+    // kind is relayed; the checkout says "we are checking, do not send more".
+    ...(() => {
+      const h = pickPaymentHold(rp.paymentHold)
+      return h ? { paymentHold: h } : {}
+    })(),
     source: rp.source
       ? {
           // Current pay-in chain and deposit address. An unpaid Coinbase order
