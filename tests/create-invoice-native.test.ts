@@ -366,8 +366,12 @@ describe('rotating an unpaid order to or from a native coin', () => {
   }
 
   let checkoutCalls: any[] = []
-  function mockUpstream(existing: any, checkout: () => Response) {
+  let refetchCalls = 0
+  // refetch: the full row GET /payments/:id returns after a failed rotation
+  // (default: the unchanged existing row; a Response is returned as is).
+  function mockUpstream(existing: any, checkout: () => Response, refetch: () => any = () => existing) {
     checkoutCalls = []
+    refetchCalls = 0
     vi.restoreAllMocks()
     vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
       const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -378,6 +382,11 @@ describe('rotating an unpaid order to or from a native coin', () => {
       if (u.endsWith('/checkout') && init?.method === 'POST') {
         checkoutCalls.push(JSON.parse(String(init?.body ?? '{}')))
         return checkout()
+      }
+      if (init?.method === 'GET' && u.endsWith('/payments/rozo-pay-existing')) {
+        refetchCalls++
+        const r = refetch()
+        return r instanceof Response ? r : new Response(JSON.stringify(r), { status: 200 })
       }
       if (u.includes('/payment-api') && init?.method === 'POST') {
         throw new Error('must not create a new order when an unpaid one is reusable')
@@ -496,6 +505,60 @@ describe('rotating an unpaid order to or from a native coin', () => {
     })
     expect(json.paymentLink).toBeUndefined()
     expect(json.reused).toBeUndefined()
+  })
+
+  it('lost /checkout response: re-reads the order and serves the native row it committed', async () => {
+    const committed = {
+      ...nativeRow,
+      paymentLink: 'https://pay.rozo.ai/new',
+      source: { ...nativeRow.source, receiverAddress: '0xNEWDEPOSIT' },
+    }
+    mockUpstream(stableRow, () => { throw new TypeError('network connection lost') }, () => committed)
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(1)
+    expect(refetchCalls).toBe(1)
+    expect(json).toMatchObject({
+      ok: true,
+      reused: true,
+      sourceRotated: true,
+      paymentLink: 'https://pay.rozo.ai/new',
+      quoteExpiresAt: '2999-01-01T00:00:00.000Z',
+      nativeAmount: '0.0175',
+      source: { chainId: '56', tokenSymbol: 'BNB' },
+    })
+    expect(json.raw.source.receiverAddress).toBe('0xNEWDEPOSIT')
+    expect(json.sourceMismatch).toBeUndefined()
+    expect(json.warnings ?? []).toEqual([])
+  })
+
+  it('5xx from /checkout with the order unchanged: reports the mismatch from the re-read row', async () => {
+    mockUpstream(stableRow, () => new Response('upstream exploded', { status: 500 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(refetchCalls).toBe(1)
+    expect(json).toMatchObject({ sourceMismatch: true, source: { chainId: '8453', tokenSymbol: 'USDC' } })
+    expect(json.warnings.some((w: string) => w.includes('(HTTP 500)'))).toBe(true)
+  })
+
+  it('rotation fails AND the re-read fails: no payable response', async () => {
+    mockUpstream(
+      stableRow,
+      () => { throw new TypeError('network connection lost') },
+      () => new Response('down', { status: 503 }),
+    )
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(502)
+    expect(json.ok).not.toBe(true)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.paymentLink).toBeUndefined()
+    expect(json.raw).toBeUndefined()
   })
 
   it('Lightning still short-circuits without calling /checkout', async () => {

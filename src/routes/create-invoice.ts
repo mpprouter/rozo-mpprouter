@@ -917,6 +917,14 @@ function previousAddressFields(row: any): Record<string, unknown> {
  * determined (treated by callers as "unknown, keep the pre-fetched view").
  */
 async function refetchPaymentStatus(env: Env, paymentId: string): Promise<string | null> {
+  return readPaymentStatus(await refetchPaymentRow(env, paymentId))
+}
+
+/**
+ * Re-read the FULL payment row from the Rozo payment-api (GET /payments/:id).
+ * Returns null when it cannot be read (network error, non-2xx, non-JSON).
+ */
+async function refetchPaymentRow(env: Env, paymentId: string): Promise<any | null> {
   try {
     const resp = await fetch(
       `${ROZO_INTENTS_BASE}/payments/${encodeURIComponent(paymentId)}`,
@@ -924,7 +932,7 @@ async function refetchPaymentStatus(env: Env, paymentId: string): Promise<string
     )
     if (!resp.ok) return null
     const row: any = await resp.json().catch(() => null)
-    return readPaymentStatus(row)
+    return row && typeof row === 'object' ? row : null
   } catch {
     return null
   }
@@ -2010,15 +2018,42 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         }
       }
 
+      // After ANY rotation failure, re-read the full order: /checkout may have
+      // committed the switch even though its response was lost (network
+      // error, 5xx, non-JSON) or came back as an error, so the pre-fetched
+      // row can carry a retired address, coin and amount. The fresh row is
+      // what we report; if it now pays from the requested source, the
+      // rotation did land. If the order cannot be re-read, fail closed: never
+      // present the pre-fetched instructions as payable.
+      if (rotationFailure) {
+        const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
+        const freshSource = readRowSource(fresh)
+        if (!fresh || freshSource.chainId === null) {
+          return errorResponse(502, {
+            code: 'INTENTS_API_FAILED',
+            stage: 'order_lookup',
+            upstream_status: null,
+            message:
+              'Could not re-check the existing order for this payment link after a ' +
+              'failed source switch. Do not pay yet; retry shortly.',
+            normalized_input: normalized,
+            link_id_detected,
+          })
+        }
+        row = fresh
+        rowSource = freshSource
+        if (!sourceDiffers(rowSource, source)) {
+          sourceRotated = true
+          rotationFailure = null
+        }
+      }
+
       // Close the lookup→rotate race (codex P1): the row can leave
       // payment_unpaid while the /checkout call is in flight, in which case
       // returning the pre-fetched link as payable invites a double payment.
-      // The rotated row carries its own status; after a failure we re-read it.
-      const postRotationStatus = sourceRotated
-        ? readPaymentStatus(row)
-        : rotationFailure
-          ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
-          : REUSABLE_PAYMENT_STATUS
+      // Both a rotated row and a re-read row carry their own status.
+      const postRotationStatus =
+        sourceRotated || row !== existing ? readPaymentStatus(row) : REUSABLE_PAYMENT_STATUS
       if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
         return json(409, {
           ok: false,
