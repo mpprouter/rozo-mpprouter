@@ -853,6 +853,24 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
     expect(json.raw.source.lnInvoice).toBe('lnbc110u1ptest')
   })
 
+  it('refuses to rotate a Lightning order out locally (LIGHTNING_ROTATE_OUT_ENABLED unset), no /checkout', async () => {
+    existingIntent = {
+      id: 'rozo-existing-1h',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing-ln',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: 'lightning', tokenSymbol: 'BTC', amount: '11000' },
+      destination: { amount: '10' },
+    }
+    refetchFails = true // status-only re-read: a blip is not fatal
+    const { status, json } = await createInvoice({ url: STRIPE_URL, source: { chainId: '8453', tokenSymbol: 'USDC' } })
+    expect(checkoutBody).toBeNull()
+    expect(status).toBe(200)
+    expect(json.sourceMismatch).toBe(true)
+    expect(json.source).toEqual({ chainId: 'lightning', tokenSymbol: 'BTC' })
+    expect(json.warnings?.join(' ')).toContain('(lightning_not_rotatable)')
+  })
+
   it('LIGHTNING_ROTATION off (lightningRotationUnsupported): 200 + lightning_not_rotatable mismatch', async () => {
     existingIntent = {
       id: 'rozo-existing-1g',

@@ -856,7 +856,10 @@ async function rotateExistingSource(
  *
  * Lightning (app_config LIGHTNING_ROTATION): lightningRotationUnsupported for a
  * rotation into Lightning, checkoutNotAllowed for a rotation out of a
- * Lightning order, invalidRequest for older upstreams.
+ * Lightning order, invalidRequest / invalidChainId for upstreams without
+ * Lightning rotation (invalidChainId is what they answer for a rotation into
+ * Lightning). Mapped only when Lightning is involved, so a non-Lightning
+ * checkoutNotAllowed keeps its own label.
  * Native coins (app_config NATIVE_ROTATION): invalidRequest (switch off) or
  * nativeRotationUnsupported (coin/order not supported).
  */
@@ -864,7 +867,20 @@ const LIGHTNING_NOT_ROTATABLE_UPSTREAM = new Set([
   'lightningRotationUnsupported',
   'checkoutNotAllowed',
   'invalidRequest',
+  'invalidChainId',
 ])
+
+/**
+ * Rotating a Lightning order OUT to another source is only safe once
+ * rozo-intents-api retires the old BOLT11 on rotation (#672, #674). Upstreams
+ * without that would rotate the order and leave the old invoice payable
+ * (double pay), so until LIGHTNING_ROTATE_OUT_ENABLED is "true" a mismatch on
+ * a Lightning order is refused locally without calling /checkout. Rotation
+ * INTO Lightning always passes through: older upstreams refuse it themselves.
+ */
+function lightningRotateOutEnabled(env: Env): boolean {
+  return env.LIGHTNING_ROTATE_OUT_ENABLED === 'true'
+}
 const NATIVE_NOT_ROTATABLE_UPSTREAM = new Set(['invalidRequest', 'nativeRotationUnsupported'])
 
 export function rotationFailureCode(
@@ -2030,6 +2046,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       if (sourceDiffers(rowSource, source) && existing?.id) {
         if (refundAddressCoinInvolved) {
           rotationFailure = 'native_not_rotatable'
+        } else if (rowSource.chainId === 'lightning' && !lightningRotateOutEnabled(env)) {
+          rotationFailure = 'lightning_not_rotatable'
         } else {
           rotationAttempted = true
           const rotated = await rotateExistingSource(env, String(existing.id), source)
@@ -2061,7 +2079,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       // what we report; if it now pays from the requested source, the
       // rotation did land. If the order cannot be re-read, fail closed: never
       // present the pre-fetched instructions as payable. Local refusals
-      // (ZEC) never called /checkout, so the pre-fetched row is
+      // (ZEC, Lightning rotate-out while gated) never called /checkout, so the pre-fetched row is
       // still the order; they only re-read the status below.
       if (rotationFailure && rotationAttempted) {
         const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
@@ -2825,7 +2843,11 @@ export async function handleStripeCreateInvoice(
     reusedSource = readRowSource(existing)
     const lightningInvolved =
       source.chainId === 'lightning' || reusedSource.chainId === 'lightning'
-    if (sourceDiffers(reusedSource, source) && existing?.id) {
+    if (sourceDiffers(reusedSource, source) && existing?.id && reusedSource.chainId === 'lightning' &&
+      !lightningRotateOutEnabled(env)) {
+      // Rotating a Lightning order out is gated (see lightningRotateOutEnabled).
+      rotationFailure = 'lightning_not_rotatable'
+    } else if (sourceDiffers(reusedSource, source) && existing?.id) {
       // Lightning is rotated upstream like any other source (rozo-intents-api
       // LIGHTNING_ROTATION); switch-off refusals map to lightning_not_rotatable.
       rotationAttempted = true

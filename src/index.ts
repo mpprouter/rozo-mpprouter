@@ -367,6 +367,10 @@ export interface Env {
   // Beta native coins ("ZEC@9133"), opened only for requests with ?beta=<symbol>.
   NATIVE_SOURCES_BETA?: string
   NATIVE_MAX_USD?: string
+  // "true" lets create-invoice rotate an unpaid Lightning order out to another
+  // source via /checkout. Flip only after rozo-intents-api #672 and #674 are
+  // deployed (they retire the old BOLT11 on rotation). Anything else = refuse.
+  LIGHTNING_ROTATE_OUT_ENABLED?: string
   // Bitrefill invoice payment (provider: "bitrefill"); "true" enables it.
   BITREFILL_ENABLED?: string
   // Rozo Intents API key bound to wallet account wallet_bitrefillpay (payment-api takes the

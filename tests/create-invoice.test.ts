@@ -1464,11 +1464,12 @@ describe('handleCreateInvoice — already-paid vs expired', () => {
 // regardless of its status and regardless of the source the caller asked for.
 // A caller wanting Solana USDT got a Stellar USDC link with reused:true / 200.
 describe('handleCreateInvoice — Coinbase reuse gate', () => {
-  function makeEnv(feeBps?: string) {
+  function makeEnv(feeBps?: string, extra: Record<string, string> = {}) {
     return {
       PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
       ROZO_INTENTS_API_KEY: 'test-key',
       CHECKOUT_WEB_FEE_BPS: feeBps,
+      ...extra,
     } as unknown as import('../src/index').Env
   }
 
@@ -1478,6 +1479,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     body: Record<string, unknown>,
     checkout: () => Response = () => new Response('{}', { status: 200 }),
     feeBps?: string,
+    extraEnv: Record<string, string> = {},
   ) {
     const { handleCreateInvoice } = await import('../src/routes/create-invoice')
     let createBody: any = null
@@ -1521,7 +1523,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       })
-      const res = await handleCreateInvoice(req, makeEnv(feeBps))
+      const res = await handleCreateInvoice(req, makeEnv(feeBps, extraEnv))
       return { status: res.status, json: JSON.parse(await res.text()), createBody, checkoutBody }
     } finally {
       globalThis.fetch = originalFetch
@@ -1683,6 +1685,17 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     expect(createBody).toBeNull()
   })
 
+  it('refuses to rotate a lightning order out while LIGHTNING_ROTATE_OUT_ENABLED is off', async () => {
+    const { status, json, checkoutBody } = await runReuse(
+      { ...unpaidStellar, source: { chainId: 'lightning', tokenSymbol: 'BTC' }, destination: { amount: '105' } },
+      { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+    )
+    expect(status).toBe(200)
+    expect(checkoutBody).toBeNull()
+    expect(json.sourceMismatch).toBe(true)
+    expect(json.source).toEqual({ chainId: 'lightning', tokenSymbol: 'BTC' })
+  })
+
   it('rotates a lightning order out to the requested source via /checkout', async () => {
     const { status, json, checkoutBody } = await runReuse(
       {
@@ -1702,6 +1715,8 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
           }),
           { status: 200 },
         ),
+      undefined,
+      { LIGHTNING_ROTATE_OUT_ENABLED: 'true' },
     )
     expect(status).toBe(200)
     expect(checkoutBody).toEqual({ source: { chainId: '900', tokenSymbol: 'USDT' } })
