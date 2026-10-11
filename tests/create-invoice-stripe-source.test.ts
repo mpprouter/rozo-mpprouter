@@ -73,6 +73,8 @@ let checkoutBody: any = null
 let checkoutResponse: () => Response = () => new Response('{}', { status: 200 })
 /** When set, the post-rotation status refetch returns this instead of existingIntent. */
 let refetchedIntent: any = null
+/** When true, the post-rotation full-row refetch fails (503). */
+let refetchFails = false
 let stripeMerchantTitle = 'Test Merchant'
 
 function installFetchMock() {
@@ -80,6 +82,7 @@ function installFetchMock() {
   existingIntent = null
   checkoutBody = null
   refetchedIntent = null
+  refetchFails = false
   stripeMerchantTitle = 'Test Merchant'
   checkoutResponse = () => new Response('{}', { status: 200 })
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
@@ -132,6 +135,7 @@ function installFetchMock() {
     }
     // Status refetch after a failed rotation (GET /payments/:id).
     if (/\/payments\/[^/]+$/.test(u) && (!init?.method || init.method === 'GET')) {
+      if (refetchFails) return new Response('down', { status: 503 })
       const row = refetchedIntent ?? existingIntent
       return row
         ? new Response(JSON.stringify(row), { status: 200 })
@@ -775,6 +779,51 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
     expect(json.source).toEqual({ chainId: '8453', tokenSymbol: 'USDC' })
     expect(json.warnings?.join(' ')).toContain('was not applied')
     expect(json.warnings?.join(' ')).toContain('checkoutNotAllowed')
+  })
+
+  it('lost /checkout response: re-reads the order and serves the row the rotation committed', async () => {
+    existingIntent = {
+      id: 'rozo-existing-1d',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
+    }
+    checkoutResponse = () => { throw new TypeError('network connection lost') }
+    refetchedIntent = {
+      ...existingIntent,
+      paymentLink: 'https://pay.rozo.ai/existing-rotated',
+      source: { chainId: '900', tokenSymbol: 'USDT', amount: '10', receiverAddress: 'NEWDEPOSIT' },
+    }
+
+    const { status, json } = await createInvoice({ url: STRIPE_URL, source: { chainId: '900', tokenSymbol: 'USDT' } })
+
+    expect(status).toBe(200)
+    expect(json.sourceRotated).toBe(true)
+    expect(json.sourceMismatch).toBeUndefined()
+    expect(json.source).toEqual({ chainId: '900', tokenSymbol: 'USDT' })
+    expect(json.paymentLink).toBe('https://pay.rozo.ai/existing-rotated')
+    expect(json.warnings ?? []).toEqual([])
+  })
+
+  it('rotation fails AND the re-read fails: 502 INTENTS_API_FAILED, nothing payable', async () => {
+    existingIntent = {
+      id: 'rozo-existing-1e',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
+    }
+    checkoutResponse = () => new Response('upstream exploded', { status: 500 })
+    refetchFails = true
+
+    const { status, json } = await createInvoice({ url: STRIPE_URL, source: { chainId: '900', tokenSymbol: 'USDT' } })
+
+    expect(status).toBe(502)
+    expect(json.ok).toBe(false)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.paymentLink).toBeUndefined()
+    expect(createdIntent).toBeNull()
   })
 
   it('answers 409 when the order left payment_unpaid during a failed rotation (lookup→rotate race)', async () => {

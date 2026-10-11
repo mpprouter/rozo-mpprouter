@@ -2805,14 +2805,40 @@ export async function handleStripeCreateInvoice(
         }
       }
     }
+    // After ANY rotation failure, re-read the full order (same as the
+    // Coinbase branch): /checkout may have committed the switch even though
+    // its response was lost or came back as an error, so the pre-fetched row
+    // can carry a retired address. Report the fresh row; fail closed when it
+    // cannot be read.
+    if (rotationFailure) {
+      const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
+      const freshSource = readRowSource(fresh)
+      if (!fresh || freshSource.chainId === null) {
+        return json(502, {
+          ok: false,
+          provider: 'stripe_crypto',
+          code: 'INTENTS_API_FAILED',
+          error:
+            'Could not re-check the existing order for this invoice after a ' +
+            'failed source switch. Do not pay yet; retry shortly.',
+          invoiceKey: invoice.invoiceKey,
+          rozoPaymentId: existing?.id ?? null,
+        })
+      }
+      row = fresh
+      reusedSource = freshSource
+      if (!sourceDiffers(reusedSource, source)) {
+        sourceRotated = true
+        rotationFailure = null
+        previousAddress = previousAddressFields(fresh)
+      }
+    }
     // Close the lookup→rotate race (codex P1): the row can leave
     // payment_unpaid while the /checkout call is in flight, in which case
     // returning the pre-fetched link as payable invites a double payment.
-    const postRotationStatus = sourceRotated
-      ? readPaymentStatus(row)
-      : rotationFailure
-        ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
-        : REUSABLE_PAYMENT_STATUS
+    // Both a rotated row and a re-read row carry their own status.
+    const postRotationStatus =
+      sourceRotated || row !== existing ? readPaymentStatus(row) : REUSABLE_PAYMENT_STATUS
     if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
       return json(409, {
         ok: false,
