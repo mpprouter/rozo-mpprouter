@@ -834,6 +834,21 @@ async function rotateExistingSource(
 }
 
 /**
+ * Upstream codes that mean "this native rotation is not available" (switch off:
+ * invalidRequest, the pre-NATIVE_ROTATION answer; or a coin/order the native
+ * rotation does not support). They are reported as `native_not_rotatable`,
+ * exactly what this route said before native rotation existed, so callers see
+ * no difference while rozo-intents-api keeps the switch off.
+ */
+const NATIVE_NOT_ROTATABLE_UPSTREAM = new Set(['invalidRequest', 'nativeRotationUnsupported'])
+
+export function nativeRotationFailureCode(upstreamCode: string, nativeInvolved: boolean): string {
+  return nativeInvolved && NATIVE_NOT_ROTATABLE_UPSTREAM.has(upstreamCode)
+    ? 'native_not_rotatable'
+    : upstreamCode
+}
+
+/**
  * Rozo payment-api refused a coin/chain switch because money already sits on
  * the order's current deposit address (pre-switch check, rozo-intents-api
  * checkout-prescan.ts, behind app_config CHECKOUT_SWITCH_PRESCAN). The order
@@ -1950,14 +1965,24 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       // support, so a mismatch on either side is reported, never rotated.
       const lightningInvolved =
         source.chainId === 'lightning' || rowSource.chainId === 'lightning'
-      // Native orders are exactOut with a price-locked quote: like Lightning
-      // they cannot be rotated to or from another source.
-      const nativeInvolved =
-        nativeSource || isNativeSymbol(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
+      // Native coins (ETH/BNB/POL/SOL) are rotated upstream: rozo-intents-api
+      // re-prices the order and writes a fresh price lock when its
+      // NATIVE_ROTATION switch is on, and refuses (invalidRequest /
+      // nativeRotationUnsupported) when it is off. Coins that need a payer
+      // refund address (ZEC) stay local refusals: /checkout carries no refund
+      // address, so such an order can only be created fresh.
+      const rowIsNative = isNativeSymbol(
+        String(rowSource.chainId ?? ''),
+        String(rowSource.tokenSymbol ?? ''),
+      )
+      const nativeInvolved = nativeSource || rowIsNative
+      const refundAddressCoinInvolved =
+        refundAddressRequired ||
+        nativeRequiresRefundAddress(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
       if (sourceDiffers(rowSource, source) && existing?.id) {
         if (lightningInvolved) {
           rotationFailure = 'lightning_not_rotatable'
-        } else if (nativeInvolved) {
+        } else if (refundAddressCoinInvolved) {
           rotationFailure = 'native_not_rotatable'
         } else {
           const rotated = await rotateExistingSource(env, String(existing.id), source)
@@ -1973,7 +1998,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
               expiresAt: existingExpiresAt,
             }))
           } else {
-            rotationFailure = rotated.code
+            rotationFailure = nativeRotationFailureCode(rotated.code, nativeInvolved)
           }
         }
       }
@@ -2054,7 +2079,12 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         rozoPaymentId: row?.id ?? existing?.id ?? null,
         expiresAt: row?.expiresAt ?? existingExpiresAt,
         linkExpiresAt: await linkExpiresAtPromise,
-        ...nativeQuoteFields(row),
+        // Same native fields as a fresh native create (nativeAmount,
+        // quoteExpiresAt), read from the row the order pays from NOW: a
+        // rotation into a native coin gets them, a rotation out of one does not.
+        ...(isNativeSymbol(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
+          ? nativeQuoteFields(row)
+          : {}),
         // The source the order actually pays from now — rotated to the
         // requested one when that worked, otherwise the pre-existing one.
         source: {
@@ -2086,7 +2116,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // (metadata.merchant_link_expires_at, top-level because metadata.client is
   // already a string label). Fresh creates only: a live ZEC order is reused
   // above only when its bound refund address matches (refundAddressReuseBlock),
-  // and never rotated to another coin (native_not_rotatable).
+  // and never rotated to or from another coin (native_not_rotatable), since
+  // /checkout carries no refund address. Other native coins can be rotated
+  // upstream (rozo-intents-api NATIVE_ROTATION).
   let merchantLinkExpiresAt: string | null = null
   if (refundAddressRequired) {
     const linkExpiry =
