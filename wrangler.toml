@@ -184,7 +184,7 @@ NATIVE_SOURCES = "ETH@8453,ETH@1,BNB@56,SOL@900,ETH@42161,POL@137"
 # rozo-intents-api /checkout. Flip to "true" only after rozo-intents-api #672
 # and #674 are deployed: older upstreams rotate without retiring the old BOLT11
 # invoice, leaving it payable (double pay). "false" = refuse locally.
-LIGHTNING_ROTATE_OUT_ENABLED = "false"
+LIGHTNING_ROTATE_OUT_ENABLED = "true"
 # Beta native coins (src/routes/native-sources.ts). Never open from this list
 # alone: a coin here joins the allowed set only for a quote-invoice /
 # create-invoice request carrying ?beta=<symbol> (e.g. ?beta=zec). ZEC on
