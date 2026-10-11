@@ -474,6 +474,30 @@ describe('rotating an unpaid order to or from a native coin', () => {
     })
   })
 
+  it('upstream payinAlreadyDetected 409 returns the PAYMENT_DETECTED body with the default message', async () => {
+    mockUpstream(stableRow, () => new Response(JSON.stringify({
+      error: { code: 'payinAlreadyDetected', message: 'a payin was already received' },
+    }), { status: 409 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(409)
+    expect(json).toMatchObject({
+      ok: false,
+      code: 'PAYMENT_DETECTED',
+      error: {
+        code: 'PAYMENT_DETECTED',
+        message: 'We received a payment on this order. It is being processed, please do not pay again.',
+      },
+      linkId: LINK,
+      rozoPaymentId: 'rozo-pay-existing',
+      status: 'payment_unpaid',
+      detected: { chainId: null, tokenSymbol: null, amount: null },
+    })
+    expect(json.paymentLink).toBeUndefined()
+    expect(json.reused).toBeUndefined()
+  })
+
   it('Lightning still short-circuits without calling /checkout', async () => {
     mockUpstream(lightningRow, () => { throw new Error('/checkout must not be called for Lightning') })
     const { status, json } = await post(handleCreateInvoice, {

@@ -817,6 +817,11 @@ async function rotateExistingSource(
       const upstream = parsed?.error?.code ?? parsed?.code ?? parsed?.error
       if (typeof upstream === 'string' && upstream) code = upstream
       if (code === UPSTREAM_PAYMENT_DETECTED) detected = readPaymentDetected(parsed)
+      // Native rotation refusal: a payin already landed on the current
+      // address. Same meaning as paymentDetected, but upstream sends no
+      // detected block, so answer with the default message and never hand the
+      // old address back as payable.
+      else if (code === UPSTREAM_PAYIN_ALREADY_DETECTED) detected = readPaymentDetected({ data: parsed?.data })
     } catch {
       // Non-JSON error body — the HTTP status is the best code we have.
     }
@@ -856,6 +861,8 @@ export function nativeRotationFailureCode(upstreamCode: string, nativeInvolved: 
  * caller must show "payment received, processing" and never a new address.
  */
 export const UPSTREAM_PAYMENT_DETECTED = 'paymentDetected'
+/** Native rotation refusal (rozo-intents-api NATIVE_ROTATION): payin already seen. */
+export const UPSTREAM_PAYIN_ALREADY_DETECTED = 'payinAlreadyDetected'
 
 export interface PaymentDetected {
   message: string
