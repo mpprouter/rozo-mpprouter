@@ -849,22 +849,38 @@ async function rotateExistingSource(
 }
 
 /**
- * Upstream codes that mean "this native rotation is not available" (switch off:
- * invalidRequest, the pre-NATIVE_ROTATION answer; or a coin/order the native
- * rotation does not support). They are reported as `native_not_rotatable`,
- * exactly what this route said before native rotation existed, so callers see
- * no difference while rozo-intents-api keeps the switch off.
+ * Upstream codes that mean "this rotation is not available" for a source
+ * class that rozo-intents-api gates behind a switch. They are reported as the
+ * code this route used before the class could be rotated, so callers see no
+ * difference while the switch is off.
+ *
+ * Lightning (app_config LIGHTNING_ROTATION): lightningRotationUnsupported for a
+ * rotation into Lightning, checkoutNotAllowed for a rotation out of a
+ * Lightning order, invalidRequest for older upstreams.
+ * Native coins (app_config NATIVE_ROTATION): invalidRequest (switch off) or
+ * nativeRotationUnsupported (coin/order not supported).
  */
+const LIGHTNING_NOT_ROTATABLE_UPSTREAM = new Set([
+  'lightningRotationUnsupported',
+  'checkoutNotAllowed',
+  'invalidRequest',
+])
 const NATIVE_NOT_ROTATABLE_UPSTREAM = new Set(['invalidRequest', 'nativeRotationUnsupported'])
 
-export function nativeRotationFailureCode(
+export function rotationFailureCode(
   upstreamCode: string,
-  nativeInvolved: boolean,
+  involved: { lightning: boolean; native: boolean },
   upstreamMessage?: string,
 ): string {
-  if (!nativeInvolved || !NATIVE_NOT_ROTATABLE_UPSTREAM.has(upstreamCode)) return upstreamCode
+  let mapped: string | null = null
+  if (involved.lightning && LIGHTNING_NOT_ROTATABLE_UPSTREAM.has(upstreamCode)) {
+    mapped = 'lightning_not_rotatable'
+  } else if (involved.native && NATIVE_NOT_ROTATABLE_UPSTREAM.has(upstreamCode)) {
+    mapped = 'native_not_rotatable'
+  }
+  if (!mapped) return upstreamCode
   // Keep the upstream reason so the warning still says why.
-  return upstreamMessage ? `native_not_rotatable: ${upstreamMessage}` : 'native_not_rotatable'
+  return upstreamMessage ? `${mapped}: ${upstreamMessage}` : mapped
 }
 
 /**
@@ -1992,8 +2008,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       let rotationFailure: string | null = null
       // True once /checkout was actually called (it may have committed).
       let rotationAttempted = false
-      // Lightning has a BOLT11 invoice lifecycle that re-checkout does not
-      // support, so a mismatch on either side is reported, never rotated.
+      // Lightning is rotated upstream (rozo-intents-api LIGHTNING_ROTATION):
+      // into Lightning issues a fresh BOLT11, out of it a stablecoin address.
+      // With the switch off upstream refuses, reported as lightning_not_rotatable.
       const lightningInvolved =
         source.chainId === 'lightning' || rowSource.chainId === 'lightning'
       // Native coins (ETH/BNB/POL/SOL) are rotated upstream: rozo-intents-api
@@ -2011,9 +2028,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         refundAddressRequired ||
         nativeRequiresRefundAddress(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
       if (sourceDiffers(rowSource, source) && existing?.id) {
-        if (lightningInvolved) {
-          rotationFailure = 'lightning_not_rotatable'
-        } else if (refundAddressCoinInvolved) {
+        if (refundAddressCoinInvolved) {
           rotationFailure = 'native_not_rotatable'
         } else {
           rotationAttempted = true
@@ -2030,7 +2045,11 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
               expiresAt: existingExpiresAt,
             }))
           } else {
-            rotationFailure = nativeRotationFailureCode(rotated.code, nativeInvolved, rotated.message)
+            rotationFailure = rotationFailureCode(
+              rotated.code,
+              { lightning: lightningInvolved, native: nativeInvolved },
+              rotated.message,
+            )
           }
         }
       }
@@ -2042,7 +2061,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       // what we report; if it now pays from the requested source, the
       // rotation did land. If the order cannot be re-read, fail closed: never
       // present the pre-fetched instructions as payable. Local refusals
-      // (Lightning, ZEC) never called /checkout, so the pre-fetched row is
+      // (ZEC) never called /checkout, so the pre-fetched row is
       // still the order; they only re-read the status below.
       if (rotationFailure && rotationAttempted) {
         const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
@@ -2807,37 +2826,39 @@ export async function handleStripeCreateInvoice(
     const lightningInvolved =
       source.chainId === 'lightning' || reusedSource.chainId === 'lightning'
     if (sourceDiffers(reusedSource, source) && existing?.id) {
-      if (lightningInvolved) {
-        // BOLT11 lifecycle — re-checkout does not support it.
-        rotationFailure = 'lightning_not_rotatable'
+      // Lightning is rotated upstream like any other source (rozo-intents-api
+      // LIGHTNING_ROTATION); switch-off refusals map to lightning_not_rotatable.
+      rotationAttempted = true
+      const rotated = await rotateExistingSource(env, String(existing.id), source)
+      if (rotated.ok) {
+        row = rotated.row
+        reusedSource = readRowSource(rotated.row)
+        sourceRotated = true
+        previousAddress = previousAddressFields(rotated.row)
+      } else if (rotated.detected) {
+        // Money already on the current address: never hand out a new one.
+        return json(409, {
+          provider: 'stripe_crypto',
+          ...paymentDetectedBody(rotated.detected, {
+            invoiceKey: invoice.invoiceKey,
+            rozoPaymentId: existing?.id ?? null,
+            expiresAt: existing?.expiresAt ?? null,
+          }),
+        })
       } else {
-        rotationAttempted = true
-        const rotated = await rotateExistingSource(env, String(existing.id), source)
-        if (rotated.ok) {
-          row = rotated.row
-          reusedSource = readRowSource(rotated.row)
-          sourceRotated = true
-          previousAddress = previousAddressFields(rotated.row)
-        } else if (rotated.detected) {
-          // Money already on the current address: never hand out a new one.
-          return json(409, {
-            provider: 'stripe_crypto',
-            ...paymentDetectedBody(rotated.detected, {
-              invoiceKey: invoice.invoiceKey,
-              rozoPaymentId: existing?.id ?? null,
-              expiresAt: existing?.expiresAt ?? null,
-            }),
-          })
-        } else {
-          rotationFailure = rotated.code
-        }
+        // Stripe refuses native sources up front, so only Lightning maps.
+        rotationFailure = rotationFailureCode(
+          rotated.code,
+          { lightning: lightningInvolved, native: false },
+          rotated.message,
+        )
       }
     }
     // After a failed /checkout call, re-read the full order (same as the
     // Coinbase branch): /checkout may have committed the switch even though
     // its response was lost or came back as an error, so the pre-fetched row
     // can carry a retired address. Report the fresh row; fail closed when it
-    // cannot be read. A local refusal (Lightning) re-reads the status only.
+    // cannot be read.
     if (rotationFailure && rotationAttempted) {
       const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
       const freshSource = readRowSource(fresh)

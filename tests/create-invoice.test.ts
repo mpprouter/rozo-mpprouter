@@ -1683,18 +1683,30 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     expect(createBody).toBeNull()
   })
 
-  it('never rotates a lightning order — warns instead', async () => {
-    const { json, checkoutBody } = await runReuse(
+  it('rotates a lightning order out to the requested source via /checkout', async () => {
+    const { status, json, checkoutBody } = await runReuse(
       {
         ...unpaidStellar,
         source: { chainId: 'lightning', tokenSymbol: 'BTC' },
         destination: { amount: '105' },
       },
       { payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } },
+      () =>
+        new Response(
+          JSON.stringify({
+            id: 'rozo-existing',
+            status: 'payment_unpaid',
+            paymentLink: 'https://pay.rozo.ai/rotated',
+            expiresAt: '2999-03-01T00:00:00.000Z',
+            source: { chainId: '900', tokenSymbol: 'USDT' },
+          }),
+          { status: 200 },
+        ),
     )
-    expect(checkoutBody).toBeNull()
-    expect(json.sourceMismatch).toBe(true)
-    expect(json.source).toEqual({ chainId: 'lightning', tokenSymbol: 'BTC' })
+    expect(status).toBe(200)
+    expect(checkoutBody).toEqual({ source: { chainId: '900', tokenSymbol: 'USDT' } })
+    expect(json.sourceRotated).toBe(true)
+    expect(json.source).toEqual({ chainId: '900', tokenSymbol: 'USDT' })
   })
 
   it('rejects a zero-fee pending order when the browser canary price is now 1%', async () => {

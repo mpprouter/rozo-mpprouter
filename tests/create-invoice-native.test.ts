@@ -360,6 +360,7 @@ describe('rotating an unpaid order to or from a native coin', () => {
     destination: { amount: '10.5' },
     metadata: PRICING,
   }
+  const readSource = (r: any) => ({ chainId: r.source.chainId, tokenSymbol: r.source.tokenSymbol })
   const lightningRow = {
     ...stableRow,
     source: { chainId: 'lightning', tokenSymbol: 'BTC', amount: '0.00012' },
@@ -585,28 +586,97 @@ describe('rotating an unpaid order to or from a native coin', () => {
     expect(json.raw).toBeUndefined()
   })
 
-  it('Lightning local refusal does not re-read the full row: a GET blip still answers 200 + mismatch', async () => {
+  // Lightning rotation is passed through to /checkout (rozo-intents-api
+  // LIGHTNING_ROTATION). The rotated row is convertToResponseV2, the same shape
+  // the Lightning create path echoes (lnInvoice in raw.source).
+  const lightningRotatedRow = {
+    id: 'rozo-pay-existing',
+    status: 'payment_unpaid',
+    expiresAt: '2999-01-01T00:30:00.000Z',
+    paymentLink: 'https://pay.rozo.ai/ln',
+    provider: 'boltz',
+    source: { chainId: 'lightning', tokenSymbol: 'BTC', amount: '12000', amountUnit: 'sats', lnInvoice: 'lnbc120u1ptestinvoice' },
+    destination: { amount: '10.5' },
+    supportedTokens: [{ chainId: 'lightning', tokenSymbol: 'BTC' }],
+    metadata: PRICING,
+  }
+
+  it('stablecoin -> Lightning: rotates upstream and echoes the BOLT11 order like a Lightning create', async () => {
+    mockUpstream(stableRow, () => new Response(JSON.stringify(lightningRotatedRow), { status: 200 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toEqual([{ source: { chainId: 'lightning', tokenSymbol: 'BTC' } }])
+    expect(json).toMatchObject({
+      ok: true,
+      reused: true,
+      sourceRotated: true,
+      rozoPaymentId: 'rozo-pay-existing',
+      paymentLink: 'https://pay.rozo.ai/ln',
+      expiresAt: '2999-01-01T00:30:00.000Z',
+      source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+    })
+    expect(json.raw).toEqual(lightningRotatedRow)
+    expect(json.raw.source.lnInvoice).toBe('lnbc120u1ptestinvoice')
+    expect(json.nativeAmount).toBeUndefined()
+    expect(json.sourceMismatch).toBeUndefined()
+  })
+
+  it('Lightning -> stablecoin: rotates upstream and answers with the plain stablecoin shape', async () => {
+    mockUpstream(lightningRow, () => new Response(JSON.stringify({ ...stableRow, paymentLink: 'https://pay.rozo.ai/usdc' }), { status: 200 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '8453', tokenSymbol: 'USDC' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(1)
+    expect(json).toMatchObject({
+      reused: true,
+      sourceRotated: true,
+      paymentLink: 'https://pay.rozo.ai/usdc',
+      source: { chainId: '8453', tokenSymbol: 'USDC' },
+    })
+    expect(json.raw.source.lnInvoice).toBeUndefined()
+    expect(json.nativeAmount).toBeUndefined()
+  })
+
+  for (const [label, existing, requested, upstreamCode] of [
+    ['into Lightning', stableRow, { chainId: 'lightning', tokenSymbol: 'BTC' }, 'lightningRotationUnsupported'],
+    ['out of Lightning', lightningRow, { chainId: '8453', tokenSymbol: 'USDC' }, 'checkoutNotAllowed'],
+    ['into Lightning (older upstream)', stableRow, { chainId: 'lightning', tokenSymbol: 'BTC' }, 'invalidRequest'],
+  ] as const) {
+    it(`LIGHTNING_ROTATION off, ${label} (${upstreamCode}): lightning_not_rotatable mismatch`, async () => {
+      mockUpstream(existing, () => new Response(JSON.stringify({
+        error: { code: upstreamCode, message: 'Lightning rotation is not enabled' },
+      }), { status: 400 }))
+      const { status, json } = await post(handleCreateInvoice, { payment_id: LINK, source: requested }, env())
+      expect(status).toBe(200)
+      expect(checkoutCalls).toHaveLength(1)
+      expect(refetchCalls).toBe(1)
+      expect(json).toMatchObject({
+        ok: true,
+        reused: true,
+        sourceMismatch: true,
+        paymentLink: 'https://pay.rozo.ai/old',
+        source: readSource(existing),
+      })
+      expect(json.sourceRotated).toBeUndefined()
+      expect(json.warnings.some((w: string) =>
+        w.includes('(lightning_not_rotatable: Lightning rotation is not enabled)'))).toBe(true)
+    })
+  }
+
+  it('Lightning rotation refused and the re-read fails: 502, nothing payable (/checkout was called)', async () => {
     mockUpstream(
       lightningRow,
-      () => { throw new Error('/checkout must not be called for Lightning') },
+      () => new Response(JSON.stringify({ error: { code: 'checkoutNotAllowed', message: 'off' } }), { status: 400 }),
       () => new Response('down', { status: 503 }),
     )
     const { status, json } = await post(handleCreateInvoice, {
-      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+      payment_id: LINK, source: { chainId: '8453', tokenSymbol: 'USDC' },
     }, env())
-    expect(status).toBe(200)
-    expect(checkoutCalls).toHaveLength(0)
-    expect(json).toMatchObject({ reused: true, sourceMismatch: true, source: { chainId: 'lightning', tokenSymbol: 'BTC' } })
-  })
-
-  it('Lightning still short-circuits without calling /checkout', async () => {
-    mockUpstream(lightningRow, () => { throw new Error('/checkout must not be called for Lightning') })
-    const { status, json } = await post(handleCreateInvoice, {
-      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
-    }, env())
-    expect(status).toBe(200)
-    expect(checkoutCalls).toHaveLength(0)
-    expect(json.sourceMismatch).toBe(true)
-    expect(json.warnings.some((w: string) => w.includes('(lightning_not_rotatable)'))).toBe(true)
+    expect(status).toBe(502)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.paymentLink).toBeUndefined()
   })
 })
