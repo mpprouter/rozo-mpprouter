@@ -788,7 +788,9 @@ async function rotateExistingSource(
   env: Env,
   paymentId: string,
   source: ResolvedSource,
-): Promise<{ ok: true; row: any } | { ok: false; code: string; detected?: PaymentDetected }> {
+): Promise<
+  { ok: true; row: any } | { ok: false; code: string; message?: string; detected?: PaymentDetected }
+> {
   let resp: Response
   try {
     resp = await fetch(
@@ -811,16 +813,29 @@ async function rotateExistingSource(
   const text = await resp.text()
   if (!resp.ok) {
     let code = `HTTP ${resp.status}`
+    let message: string | undefined
     let detected: PaymentDetected | undefined
     try {
       const parsed: any = JSON.parse(text)
       const upstream = parsed?.error?.code ?? parsed?.code ?? parsed?.error
       if (typeof upstream === 'string' && upstream) code = upstream
+      const upstreamMessage = parsed?.error?.message ?? parsed?.message
+      if (typeof upstreamMessage === 'string' && upstreamMessage) message = upstreamMessage
       if (code === UPSTREAM_PAYMENT_DETECTED) detected = readPaymentDetected(parsed)
+      // Native rotation refusal: a payin already landed on the current
+      // address. Same meaning as paymentDetected, but upstream sends no
+      // detected block, so answer with the default message and never hand the
+      // old address back as payable.
+      else if (code === UPSTREAM_PAYIN_ALREADY_DETECTED) detected = readPaymentDetected({ data: parsed?.data })
     } catch {
       // Non-JSON error body — the HTTP status is the best code we have.
     }
-    return detected ? { ok: false, code, detected } : { ok: false, code }
+    return {
+      ok: false,
+      code,
+      ...(message ? { message } : {}),
+      ...(detected ? { detected } : {}),
+    }
   }
 
   let row: any
@@ -834,6 +849,25 @@ async function rotateExistingSource(
 }
 
 /**
+ * Upstream codes that mean "this native rotation is not available" (switch off:
+ * invalidRequest, the pre-NATIVE_ROTATION answer; or a coin/order the native
+ * rotation does not support). They are reported as `native_not_rotatable`,
+ * exactly what this route said before native rotation existed, so callers see
+ * no difference while rozo-intents-api keeps the switch off.
+ */
+const NATIVE_NOT_ROTATABLE_UPSTREAM = new Set(['invalidRequest', 'nativeRotationUnsupported'])
+
+export function nativeRotationFailureCode(
+  upstreamCode: string,
+  nativeInvolved: boolean,
+  upstreamMessage?: string,
+): string {
+  if (!nativeInvolved || !NATIVE_NOT_ROTATABLE_UPSTREAM.has(upstreamCode)) return upstreamCode
+  // Keep the upstream reason so the warning still says why.
+  return upstreamMessage ? `native_not_rotatable: ${upstreamMessage}` : 'native_not_rotatable'
+}
+
+/**
  * Rozo payment-api refused a coin/chain switch because money already sits on
  * the order's current deposit address (pre-switch check, rozo-intents-api
  * checkout-prescan.ts, behind app_config CHECKOUT_SWITCH_PRESCAN). The order
@@ -841,6 +875,8 @@ async function rotateExistingSource(
  * caller must show "payment received, processing" and never a new address.
  */
 export const UPSTREAM_PAYMENT_DETECTED = 'paymentDetected'
+/** Native rotation refusal (rozo-intents-api NATIVE_ROTATION): payin already seen. */
+export const UPSTREAM_PAYIN_ALREADY_DETECTED = 'payinAlreadyDetected'
 
 export interface PaymentDetected {
   message: string
@@ -895,6 +931,14 @@ function previousAddressFields(row: any): Record<string, unknown> {
  * determined (treated by callers as "unknown, keep the pre-fetched view").
  */
 async function refetchPaymentStatus(env: Env, paymentId: string): Promise<string | null> {
+  return readPaymentStatus(await refetchPaymentRow(env, paymentId))
+}
+
+/**
+ * Re-read the FULL payment row from the Rozo payment-api (GET /payments/:id).
+ * Returns null when it cannot be read (network error, non-2xx, non-JSON).
+ */
+async function refetchPaymentRow(env: Env, paymentId: string): Promise<any | null> {
   try {
     const resp = await fetch(
       `${ROZO_INTENTS_BASE}/payments/${encodeURIComponent(paymentId)}`,
@@ -902,7 +946,7 @@ async function refetchPaymentStatus(env: Env, paymentId: string): Promise<string
     )
     if (!resp.ok) return null
     const row: any = await resp.json().catch(() => null)
-    return readPaymentStatus(row)
+    return row && typeof row === 'object' ? row : null
   } catch {
     return null
   }
@@ -1946,20 +1990,33 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       let rowSource = readRowSource(existing)
       let sourceRotated = false
       let rotationFailure: string | null = null
+      // True once /checkout was actually called (it may have committed).
+      let rotationAttempted = false
       // Lightning has a BOLT11 invoice lifecycle that re-checkout does not
       // support, so a mismatch on either side is reported, never rotated.
       const lightningInvolved =
         source.chainId === 'lightning' || rowSource.chainId === 'lightning'
-      // Native orders are exactOut with a price-locked quote: like Lightning
-      // they cannot be rotated to or from another source.
-      const nativeInvolved =
-        nativeSource || isNativeSymbol(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
+      // Native coins (ETH/BNB/POL/SOL) are rotated upstream: rozo-intents-api
+      // re-prices the order and writes a fresh price lock when its
+      // NATIVE_ROTATION switch is on, and refuses (invalidRequest /
+      // nativeRotationUnsupported) when it is off. Coins that need a payer
+      // refund address (ZEC) stay local refusals: /checkout carries no refund
+      // address, so such an order can only be created fresh.
+      const rowIsNative = isNativeSymbol(
+        String(rowSource.chainId ?? ''),
+        String(rowSource.tokenSymbol ?? ''),
+      )
+      const nativeInvolved = nativeSource || rowIsNative
+      const refundAddressCoinInvolved =
+        refundAddressRequired ||
+        nativeRequiresRefundAddress(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
       if (sourceDiffers(rowSource, source) && existing?.id) {
         if (lightningInvolved) {
           rotationFailure = 'lightning_not_rotatable'
-        } else if (nativeInvolved) {
+        } else if (refundAddressCoinInvolved) {
           rotationFailure = 'native_not_rotatable'
         } else {
+          rotationAttempted = true
           const rotated = await rotateExistingSource(env, String(existing.id), source)
           if (rotated.ok) {
             row = rotated.row
@@ -1973,20 +2030,55 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
               expiresAt: existingExpiresAt,
             }))
           } else {
-            rotationFailure = rotated.code
+            rotationFailure = nativeRotationFailureCode(rotated.code, nativeInvolved, rotated.message)
           }
+        }
+      }
+
+      // After a failed /checkout call, re-read the full order: /checkout may
+      // have committed the switch even though its response was lost (network
+      // error, 5xx, non-JSON) or came back as an error, so the pre-fetched
+      // row can carry a retired address, coin and amount. The fresh row is
+      // what we report; if it now pays from the requested source, the
+      // rotation did land. If the order cannot be re-read, fail closed: never
+      // present the pre-fetched instructions as payable. Local refusals
+      // (Lightning, ZEC) never called /checkout, so the pre-fetched row is
+      // still the order; they only re-read the status below.
+      if (rotationFailure && rotationAttempted) {
+        const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
+        const freshSource = readRowSource(fresh)
+        if (!fresh || freshSource.chainId === null) {
+          return errorResponse(502, {
+            code: 'INTENTS_API_FAILED',
+            stage: 'order_lookup',
+            upstream_status: null,
+            message:
+              'Could not re-check the existing order for this payment link after a ' +
+              'failed source switch. Do not pay yet; retry shortly.',
+            normalized_input: normalized,
+            link_id_detected,
+          })
+        }
+        row = fresh
+        rowSource = freshSource
+        if (!sourceDiffers(rowSource, source)) {
+          sourceRotated = true
+          rotationFailure = null
         }
       }
 
       // Close the lookup→rotate race (codex P1): the row can leave
       // payment_unpaid while the /checkout call is in flight, in which case
       // returning the pre-fetched link as payable invites a double payment.
-      // The rotated row carries its own status; after a failure we re-read it.
-      const postRotationStatus = sourceRotated
-        ? readPaymentStatus(row)
-        : rotationFailure
-          ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
-          : REUSABLE_PAYMENT_STATUS
+      // Both a rotated row and a re-read row carry their own status; after a
+      // local refusal we re-read the status only (null = unknown, keep the
+      // pre-fetched view).
+      const postRotationStatus =
+        sourceRotated || row !== existing
+          ? readPaymentStatus(row)
+          : rotationFailure
+            ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
+            : REUSABLE_PAYMENT_STATUS
       if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
         return json(409, {
           ok: false,
@@ -2054,7 +2146,12 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         rozoPaymentId: row?.id ?? existing?.id ?? null,
         expiresAt: row?.expiresAt ?? existingExpiresAt,
         linkExpiresAt: await linkExpiresAtPromise,
-        ...nativeQuoteFields(row),
+        // Same native fields as a fresh native create (nativeAmount,
+        // quoteExpiresAt), read from the row the order pays from NOW: a
+        // rotation into a native coin gets them, a rotation out of one does not.
+        ...(isNativeSymbol(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
+          ? nativeQuoteFields(row)
+          : {}),
         // The source the order actually pays from now — rotated to the
         // requested one when that worked, otherwise the pre-existing one.
         source: {
@@ -2086,7 +2183,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // (metadata.merchant_link_expires_at, top-level because metadata.client is
   // already a string label). Fresh creates only: a live ZEC order is reused
   // above only when its bound refund address matches (refundAddressReuseBlock),
-  // and never rotated to another coin (native_not_rotatable).
+  // and never rotated to or from another coin (native_not_rotatable), since
+  // /checkout carries no refund address. Other native coins can be rotated
+  // upstream (rozo-intents-api NATIVE_ROTATION).
   let merchantLinkExpiresAt: string | null = null
   if (refundAddressRequired) {
     const linkExpiry =
@@ -2702,6 +2801,8 @@ export async function handleStripeCreateInvoice(
     // can try to move the order onto it instead of silently billing them on the
     // previous caller's chain.
     let row: any = existing
+    // True once /checkout was actually called (it may have committed).
+    let rotationAttempted = false
     reusedSource = readRowSource(existing)
     const lightningInvolved =
       source.chainId === 'lightning' || reusedSource.chainId === 'lightning'
@@ -2710,6 +2811,7 @@ export async function handleStripeCreateInvoice(
         // BOLT11 lifecycle — re-checkout does not support it.
         rotationFailure = 'lightning_not_rotatable'
       } else {
+        rotationAttempted = true
         const rotated = await rotateExistingSource(env, String(existing.id), source)
         if (rotated.ok) {
           row = rotated.row
@@ -2731,14 +2833,44 @@ export async function handleStripeCreateInvoice(
         }
       }
     }
+    // After a failed /checkout call, re-read the full order (same as the
+    // Coinbase branch): /checkout may have committed the switch even though
+    // its response was lost or came back as an error, so the pre-fetched row
+    // can carry a retired address. Report the fresh row; fail closed when it
+    // cannot be read. A local refusal (Lightning) re-reads the status only.
+    if (rotationFailure && rotationAttempted) {
+      const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
+      const freshSource = readRowSource(fresh)
+      if (!fresh || freshSource.chainId === null) {
+        return json(502, {
+          ok: false,
+          provider: 'stripe_crypto',
+          code: 'INTENTS_API_FAILED',
+          error:
+            'Could not re-check the existing order for this invoice after a ' +
+            'failed source switch. Do not pay yet; retry shortly.',
+          invoiceKey: invoice.invoiceKey,
+          rozoPaymentId: existing?.id ?? null,
+        })
+      }
+      row = fresh
+      reusedSource = freshSource
+      if (!sourceDiffers(reusedSource, source)) {
+        sourceRotated = true
+        rotationFailure = null
+        previousAddress = previousAddressFields(fresh)
+      }
+    }
     // Close the lookup→rotate race (codex P1): the row can leave
     // payment_unpaid while the /checkout call is in flight, in which case
     // returning the pre-fetched link as payable invites a double payment.
-    const postRotationStatus = sourceRotated
-      ? readPaymentStatus(row)
-      : rotationFailure
-        ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
-        : REUSABLE_PAYMENT_STATUS
+    // Both a rotated row and a re-read row carry their own status.
+    const postRotationStatus =
+      sourceRotated || row !== existing
+        ? readPaymentStatus(row)
+        : rotationFailure
+          ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
+          : REUSABLE_PAYMENT_STATUS
     if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
       return json(409, {
         ok: false,

@@ -1502,6 +1502,10 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
         checkoutBody = init?.body ? JSON.parse(init.body) : null
         return checkout()
       }
+      // Full-row re-read after a failed rotation: the order is unchanged.
+      if (init?.method === 'GET' && existing?.id && u.endsWith(`/payments/${existing.id}`)) {
+        return new Response(JSON.stringify(existing), { status: 200 })
+      }
       if (u.includes('/payment-api')) {
         createBody = init?.body ? JSON.parse(init.body) : null
         return new Response(

@@ -337,3 +337,276 @@ describe('Polygon POL native source (2026-10-10)', () => {
     expect(createdIntent.source.amount).toBeUndefined()
   })
 })
+
+describe('rotating an unpaid order to or from a native coin', () => {
+  const LINK = 'paymentSession_native_test'
+  const PRICING = { original: '10.5', serviceFee: '0', callerPays: '10.5', feeBps: 0, pricingVersion: 'checkout-web-fee-v3' }
+  const stableRow = {
+    id: 'rozo-pay-existing',
+    status: 'payment_unpaid',
+    expiresAt: '2999-01-01T12:00:00.000Z',
+    paymentLink: 'https://pay.rozo.ai/old',
+    source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10.5' },
+    destination: { amount: '10.5' },
+    metadata: PRICING,
+  }
+  const nativeRow = {
+    id: 'rozo-pay-existing',
+    status: 'payment_unpaid',
+    expiresAt: '2999-01-01T12:00:00.000Z',
+    quoteExpiresAt: '2999-01-01T00:00:00.000Z',
+    paymentLink: 'https://pay.rozo.ai/old',
+    source: { chainId: '56', tokenSymbol: 'BNB', amount: '0.0175', tokenAddress: '0x0000000000000000000000000000000000000000' },
+    destination: { amount: '10.5' },
+    metadata: PRICING,
+  }
+  const lightningRow = {
+    ...stableRow,
+    source: { chainId: 'lightning', tokenSymbol: 'BTC', amount: '0.00012' },
+  }
+
+  let checkoutCalls: any[] = []
+  let refetchCalls = 0
+  // refetch: the full row GET /payments/:id returns after a failed rotation
+  // (default: the unchanged existing row; a Response is returned as is).
+  function mockUpstream(existing: any, checkout: () => Response, refetch: () => any = () => existing) {
+    checkoutCalls = []
+    refetchCalls = 0
+    vi.restoreAllMocks()
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('/quote-invoice')) {
+        return new Response(JSON.stringify({ invoice: { amount: '10.5' }, merchant: 'OpenRouter, Inc', linkId: LINK }), { status: 200 })
+      }
+      if (u.includes('/payments/order/')) return new Response(JSON.stringify(existing), { status: 200 })
+      if (u.endsWith('/checkout') && init?.method === 'POST') {
+        checkoutCalls.push(JSON.parse(String(init?.body ?? '{}')))
+        return checkout()
+      }
+      if (init?.method === 'GET' && u.endsWith('/payments/rozo-pay-existing')) {
+        refetchCalls++
+        const r = refetch()
+        return r instanceof Response ? r : new Response(JSON.stringify(r), { status: 200 })
+      }
+      if (u.includes('/payment-api') && init?.method === 'POST') {
+        throw new Error('must not create a new order when an unpaid one is reusable')
+      }
+      if (u.includes('/payment-api')) return new Response(JSON.stringify({ status: 'payment_unpaid' }), { status: 200 })
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch)
+  }
+  const env = () => makeEnv({ NATIVE_SOURCES: 'BNB@56,ETH@8453' })
+
+  it('stablecoin -> native: rotates upstream and answers with the native response fields', async () => {
+    mockUpstream(stableRow, () => new Response(JSON.stringify({ ...nativeRow, paymentLink: 'https://pay.rozo.ai/new' }), { status: 200 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toEqual([{ source: { chainId: '56', tokenSymbol: 'BNB' } }])
+    expect(json).toMatchObject({
+      ok: true,
+      reused: true,
+      sourceRotated: true,
+      rozoPaymentId: 'rozo-pay-existing',
+      paymentLink: 'https://pay.rozo.ai/new',
+      expiresAt: '2999-01-01T12:00:00.000Z',
+      quoteExpiresAt: '2999-01-01T00:00:00.000Z',
+      nativeAmount: '0.0175',
+      source: { chainId: '56', tokenSymbol: 'BNB' },
+    })
+    expect(json.sourceMismatch).toBeUndefined()
+  })
+
+  it('native -> stablecoin: rotates upstream and answers with the stablecoin shape (no native fields)', async () => {
+    // Defensive: even if the rotated row still echoed a price lock, a
+    // stablecoin source must not be reported with a native amount.
+    mockUpstream(nativeRow, () => new Response(JSON.stringify({ ...stableRow, quoteExpiresAt: '2999-01-01T00:00:00.000Z' }), { status: 200 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '8453', tokenSymbol: 'USDC' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(1)
+    expect(json).toMatchObject({ reused: true, sourceRotated: true, source: { chainId: '8453', tokenSymbol: 'USDC' } })
+    expect(json.nativeAmount).toBeUndefined()
+    expect(json.quoteExpiresAt).toBeUndefined()
+  })
+
+  for (const upstreamCode of ['invalidRequest', 'nativeRotationUnsupported']) {
+    it(`upstream ${upstreamCode} reads exactly like the old native_not_rotatable outcome`, async () => {
+      mockUpstream(stableRow, () => new Response(JSON.stringify({ error: { code: upstreamCode, message: 'no' } }), { status: 400 }))
+      const { status, json } = await post(handleCreateInvoice, {
+        payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+      }, env())
+      expect(status).toBe(200)
+      expect(checkoutCalls).toHaveLength(1)
+      expect(json).toMatchObject({
+        ok: true,
+        reused: true,
+        sourceMismatch: true,
+        paymentLink: 'https://pay.rozo.ai/old',
+        source: { chainId: '8453', tokenSymbol: 'USDC' },
+      })
+      expect(json.sourceRotated).toBeUndefined()
+      expect(json.nativeAmount).toBeUndefined()
+      // The upstream reason is kept after the mapped code.
+      expect(json.warnings.some((w: string) => w.includes('(native_not_rotatable: no)'))).toBe(true)
+    })
+  }
+
+  it('native -> stablecoin with NATIVE_ROTATION off (upstream invalidRequest): native_not_rotatable mismatch', async () => {
+    mockUpstream(nativeRow, () => new Response(JSON.stringify({
+      error: { code: 'invalidRequest', message: 'Native coin rotation is not enabled' },
+    }), { status: 400 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '8453', tokenSymbol: 'USDC' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(1)
+    expect(json).toMatchObject({
+      reused: true,
+      sourceMismatch: true,
+      paymentLink: 'https://pay.rozo.ai/old',
+      source: { chainId: '56', tokenSymbol: 'BNB' },
+      // Still the native order: its native fields are kept.
+      nativeAmount: '0.0175',
+      quoteExpiresAt: '2999-01-01T00:00:00.000Z',
+    })
+    expect(json.sourceRotated).toBeUndefined()
+    expect(json.warnings.some((w: string) =>
+      w.includes('(native_not_rotatable: Native coin rotation is not enabled)'))).toBe(true)
+  })
+
+  it('other upstream refusals keep their own code in the mismatch warning', async () => {
+    mockUpstream(stableRow, () => new Response(JSON.stringify({ error: { code: 'priceUnavailable', message: 'no' } }), { status: 503 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(json.sourceMismatch).toBe(true)
+    expect(json.warnings.some((w: string) => w.includes('(priceUnavailable)'))).toBe(true)
+  })
+
+  it('upstream paymentDetected 409 still returns the PAYMENT_DETECTED body', async () => {
+    mockUpstream(stableRow, () => new Response(JSON.stringify({
+      error: { code: 'paymentDetected', message: 'We received a payment on this order.' },
+      data: { detected: { chainId: '8453', chainName: 'Base', tokenSymbol: 'USDC', amount: '10.5' } },
+    }), { status: 409 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(409)
+    expect(json).toMatchObject({
+      ok: false,
+      code: 'PAYMENT_DETECTED',
+      error: { code: 'PAYMENT_DETECTED' },
+      linkId: LINK,
+      rozoPaymentId: 'rozo-pay-existing',
+      status: 'payment_unpaid',
+      detected: { chainId: '8453', tokenSymbol: 'USDC', amount: '10.5' },
+    })
+  })
+
+  it('upstream payinAlreadyDetected 409 returns the PAYMENT_DETECTED body with the default message', async () => {
+    mockUpstream(stableRow, () => new Response(JSON.stringify({
+      error: { code: 'payinAlreadyDetected', message: 'a payin was already received' },
+    }), { status: 409 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(409)
+    expect(json).toMatchObject({
+      ok: false,
+      code: 'PAYMENT_DETECTED',
+      error: {
+        code: 'PAYMENT_DETECTED',
+        message: 'We received a payment on this order. It is being processed, please do not pay again.',
+      },
+      linkId: LINK,
+      rozoPaymentId: 'rozo-pay-existing',
+      status: 'payment_unpaid',
+      detected: { chainId: null, tokenSymbol: null, amount: null },
+    })
+    expect(json.paymentLink).toBeUndefined()
+    expect(json.reused).toBeUndefined()
+  })
+
+  it('lost /checkout response: re-reads the order and serves the native row it committed', async () => {
+    const committed = {
+      ...nativeRow,
+      paymentLink: 'https://pay.rozo.ai/new',
+      source: { ...nativeRow.source, receiverAddress: '0xNEWDEPOSIT' },
+    }
+    mockUpstream(stableRow, () => { throw new TypeError('network connection lost') }, () => committed)
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(1)
+    expect(refetchCalls).toBe(1)
+    expect(json).toMatchObject({
+      ok: true,
+      reused: true,
+      sourceRotated: true,
+      paymentLink: 'https://pay.rozo.ai/new',
+      quoteExpiresAt: '2999-01-01T00:00:00.000Z',
+      nativeAmount: '0.0175',
+      source: { chainId: '56', tokenSymbol: 'BNB' },
+    })
+    expect(json.raw.source.receiverAddress).toBe('0xNEWDEPOSIT')
+    expect(json.sourceMismatch).toBeUndefined()
+    expect(json.warnings ?? []).toEqual([])
+  })
+
+  it('5xx from /checkout with the order unchanged: reports the mismatch from the re-read row', async () => {
+    mockUpstream(stableRow, () => new Response('upstream exploded', { status: 500 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(refetchCalls).toBe(1)
+    expect(json).toMatchObject({ sourceMismatch: true, source: { chainId: '8453', tokenSymbol: 'USDC' } })
+    expect(json.warnings.some((w: string) => w.includes('(HTTP 500)'))).toBe(true)
+  })
+
+  it('rotation fails AND the re-read fails: no payable response', async () => {
+    mockUpstream(
+      stableRow,
+      () => { throw new TypeError('network connection lost') },
+      () => new Response('down', { status: 503 }),
+    )
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(502)
+    expect(json.ok).not.toBe(true)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.paymentLink).toBeUndefined()
+    expect(json.raw).toBeUndefined()
+  })
+
+  it('Lightning local refusal does not re-read the full row: a GET blip still answers 200 + mismatch', async () => {
+    mockUpstream(
+      lightningRow,
+      () => { throw new Error('/checkout must not be called for Lightning') },
+      () => new Response('down', { status: 503 }),
+    )
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(0)
+    expect(json).toMatchObject({ reused: true, sourceMismatch: true, source: { chainId: 'lightning', tokenSymbol: 'BTC' } })
+  })
+
+  it('Lightning still short-circuits without calling /checkout', async () => {
+    mockUpstream(lightningRow, () => { throw new Error('/checkout must not be called for Lightning') })
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(0)
+    expect(json.sourceMismatch).toBe(true)
+    expect(json.warnings.some((w: string) => w.includes('(lightning_not_rotatable)'))).toBe(true)
+  })
+})
