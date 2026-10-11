@@ -449,9 +449,33 @@ describe('rotating an unpaid order to or from a native coin', () => {
       })
       expect(json.sourceRotated).toBeUndefined()
       expect(json.nativeAmount).toBeUndefined()
-      expect(json.warnings.some((w: string) => w.includes('(native_not_rotatable)'))).toBe(true)
+      // The upstream reason is kept after the mapped code.
+      expect(json.warnings.some((w: string) => w.includes('(native_not_rotatable: no)'))).toBe(true)
     })
   }
+
+  it('native -> stablecoin with NATIVE_ROTATION off (upstream invalidRequest): native_not_rotatable mismatch', async () => {
+    mockUpstream(nativeRow, () => new Response(JSON.stringify({
+      error: { code: 'invalidRequest', message: 'Native coin rotation is not enabled' },
+    }), { status: 400 }))
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '8453', tokenSymbol: 'USDC' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(1)
+    expect(json).toMatchObject({
+      reused: true,
+      sourceMismatch: true,
+      paymentLink: 'https://pay.rozo.ai/old',
+      source: { chainId: '56', tokenSymbol: 'BNB' },
+      // Still the native order: its native fields are kept.
+      nativeAmount: '0.0175',
+      quoteExpiresAt: '2999-01-01T00:00:00.000Z',
+    })
+    expect(json.sourceRotated).toBeUndefined()
+    expect(json.warnings.some((w: string) =>
+      w.includes('(native_not_rotatable: Native coin rotation is not enabled)'))).toBe(true)
+  })
 
   it('other upstream refusals keep their own code in the mismatch warning', async () => {
     mockUpstream(stableRow, () => new Response(JSON.stringify({ error: { code: 'priceUnavailable', message: 'no' } }), { status: 503 }))
@@ -559,6 +583,20 @@ describe('rotating an unpaid order to or from a native coin', () => {
     expect(json.code).toBe('INTENTS_API_FAILED')
     expect(json.paymentLink).toBeUndefined()
     expect(json.raw).toBeUndefined()
+  })
+
+  it('Lightning local refusal does not re-read the full row: a GET blip still answers 200 + mismatch', async () => {
+    mockUpstream(
+      lightningRow,
+      () => { throw new Error('/checkout must not be called for Lightning') },
+      () => new Response('down', { status: 503 }),
+    )
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: LINK, source: { chainId: '56', tokenSymbol: 'BNB' },
+    }, env())
+    expect(status).toBe(200)
+    expect(checkoutCalls).toHaveLength(0)
+    expect(json).toMatchObject({ reused: true, sourceMismatch: true, source: { chainId: 'lightning', tokenSymbol: 'BTC' } })
   })
 
   it('Lightning still short-circuits without calling /checkout', async () => {

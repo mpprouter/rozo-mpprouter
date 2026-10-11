@@ -826,6 +826,21 @@ describe('Stripe create-invoice — reuse with a conflicting source', () => {
     expect(createdIntent).toBeNull()
   })
 
+  it('Lightning local refusal: a status re-read blip still answers 200 + mismatch, never 502', async () => {
+    existingIntent = {
+      id: 'rozo-existing-1f',
+      status: 'payment_unpaid',
+      paymentLink: 'https://pay.rozo.ai/existing',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
+    }
+    refetchFails = true
+    const { status, json } = await createInvoice({ url: STRIPE_URL, source: { chainId: 'lightning', tokenSymbol: 'BTC' } })
+    expect(checkoutBody).toBeNull()
+    expect(status).toBe(200)
+    expect(json.sourceMismatch).toBe(true)
+  })
+
   it('answers 409 when the order left payment_unpaid during a failed rotation (lookup→rotate race)', async () => {
     existingIntent = {
       id: 'rozo-existing-1c',
