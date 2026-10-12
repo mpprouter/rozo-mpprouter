@@ -20,6 +20,16 @@ import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import {
+  OPENROUTER_APP_ID,
+  REUSABLE_PAYMENT_STATUS,
+  ROZO_APP_ID,
+  ROZO_INTENTS_BASE,
+  lookupIntentsOrder,
+  readPaymentStatus,
+  readRowSource,
+  type OrderLookup,
+} from './existing-order'
+import {
   checkPreviousOrdersUnfunded,
   PREVIOUS_ORDER_FUNDED_MESSAGE,
   PREVIOUS_ORDER_PENDING_MESSAGE,
@@ -68,13 +78,10 @@ import {
 export { buildCheckoutTitle, buildFullAmountTitle, buildTitle, formatTitleAmount }
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
-const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
 const QUOTE_INVOICE_URL = 'https://agentapi.rozo.ai/quote-invoice'
 
-const ROZO_APP_ID = 'wallet_rozopay'
-// OpenRouter / Coinbase line runs under its own merchant appId (no discount,
-// exactOut for Lightning). Stripe line keeps ROZO_APP_ID unchanged.
-const OPENROUTER_APP_ID = 'merchant_openrouter'
+// ROZO_APP_ID (Stripe line) and OPENROUTER_APP_ID (Coinbase line, no discount,
+// exactOut for Lightning) live in existing-order.ts with the shared lookup.
 
 const BASE_CHAIN_ID = '8453'
 const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
@@ -647,7 +654,7 @@ export async function refundAddressReuseBlock(
 // A row is only safe to hand back when it is still awaiting payment. Any other
 // status means money is already in flight or settled, and re-serving the link
 // invites a double payment.
-const REUSABLE_PAYMENT_STATUS = 'payment_unpaid'
+// REUSABLE_PAYMENT_STATUS ('payment_unpaid') lives in existing-order.ts.
 
 // Upstream statuses that end an order with the money not kept by us: expired
 // unpaid, or bounced / refunded back to the payer.
@@ -682,17 +689,8 @@ function classifyStripeOrderRow(row: any): StripeOrderKind {
 
 /** The existing Rozo order for a Stripe orderId, or null (missing or lookup failed). */
 async function lookupStripeOrderRow(env: Env, orderId: string): Promise<any | null> {
-  try {
-    const lookup = await fetch(
-      `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(ROZO_APP_ID)}/${encodeURIComponent(orderId)}`,
-      { method: 'GET', headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
-    )
-    if (!lookup.ok) return null
-    const row = await lookup.json().catch(() => null)
-    return row && typeof row === 'object' ? row : null
-  } catch {
-    return null
-  }
+  const r = await lookupIntentsOrder(env, ROZO_APP_ID, orderId)
+  return r.state === 'found' && r.row && typeof r.row === 'object' ? r.row : null
 }
 
 /**
@@ -747,21 +745,8 @@ function stripeEndedOrderResponse(invoiceKey: string, ended: StripeEndedOrder): 
 // Upstream statuses meaning the payer's funds arrived.
 const STRIPE_PAID_STATUSES = new Set(['payment_payin_completed', 'payment_payout_completed'])
 
-/** Status of an intents_payments row, whichever casing the API returned. */
-function readPaymentStatus(row: any): string | null {
-  return row?.status ?? row?.payment_status ?? null
-}
-
-/** Source (chain/token) an intents_payments row currently pays from. */
-function readRowSource(row: any): { chainId: string | null; tokenSymbol: string | null } {
-  const chainId = row?.source?.chainId ?? row?.source_chain_id ?? null
-  const tokenSymbol = row?.source?.tokenSymbol ?? row?.source_token_symbol ?? null
-  return {
-    chainId: chainId === null || chainId === undefined ? null : String(chainId),
-    tokenSymbol:
-      tokenSymbol === null || tokenSymbol === undefined ? null : String(tokenSymbol).toUpperCase(),
-  }
-}
+// readPaymentStatus / readRowSource live in existing-order.ts (shared with
+// quote-invoice's read-only existingOrder summary).
 
 /**
  * True when the row's source is known AND differs from what this caller asked
@@ -1752,29 +1737,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // failure (network, 5xx, malformed body) is 'error' — treating it as a free
   // slot could hand out a payable sibling while the order that failed to read
   // is already settling the same invoice (codex round-2 P1).
-  type OrderLookup =
-    | { state: 'found'; row: any }
-    | { state: 'missing' }
-    | { state: 'error'; status: number | null }
-  const lookupOrder = async (id: string): Promise<OrderLookup> => {
-    let lookup: Response
-    try {
-      lookup = await fetch(
-        `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(OPENROUTER_APP_ID)}/${encodeURIComponent(id)}`,
-        {
-          method: 'GET',
-          headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY },
-        },
-      )
-    } catch {
-      return { state: 'error', status: null }
-    }
-    if (lookup.status === 404) return { state: 'missing' }
-    if (!lookup.ok) return { state: 'error', status: lookup.status }
-    const row = await lookup.json().catch(() => undefined)
-    if (row === undefined) return { state: 'error', status: lookup.status }
-    return { state: 'found', row }
-  }
+  const lookupOrder = (id: string): Promise<OrderLookup> =>
+    lookupIntentsOrder(env, OPENROUTER_APP_ID, id)
 
   // Earlier orders (all expired, none live) the fresh create in step 3b
   // replaces. Re-checked after the create so a late payment that lands on one

@@ -5,12 +5,14 @@ import {
   TEST_MERCHANT_NAME,
   isTestPaymentId,
   parseNativeSources,
+  nativeMinUsd,
   sourceMeta,
   supportedSources,
   verifyTestPaymentId,
   withBetaSources,
 } from './native-sources'
 import { createQuoteReceipt } from './quote-receipt'
+import { findExistingOrderSummary, type ExistingOrderSummary } from './existing-order'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { invoiceResolveRateLimit } from './invoice-details'
 import {
@@ -465,6 +467,8 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     if (cents === null) {
       return errorResponse(400, { code: 'INVALID_INPUT', message: 'Invalid test payment id.' })
     }
+    // Started now, awaited last: runs alongside the pricing and receipt work.
+    const existingOrderP = findExistingOrderSummary(env, { provider: 'coinbase', linkId: testId as string })
     const amount = (cents / 100).toFixed(2)
     const pricing = resolveCheckoutPricing(parseUsdcAtomic(amount), TEST_MERCHANT_NAME, env.CHECKOUT_WEB_FEE_BPS)
     const pricingFields = {
@@ -492,9 +496,20 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       currency: 'USD',
       supportedSources: supportedSources(STABLE_SOURCES, testNative),
       sourceMeta: sourceMeta(testNative),
+      nativeMinUsd: nativeMinUsd(testNative),
       quoteReceipt,
+      ...existingOrderField(await existingOrderP),
     })
   }
+
+  // Existing order lookup runs in parallel with the upstream quote. Keyed by
+  // the link id create-invoice would use (quote.linkId ?? link_id_detected);
+  // dropped below if the quote names a different link.
+  const lookupLinkId =
+    link_id_detected ?? ('payment_id' in normalized ? normalized.payment_id ?? null : null)
+  const existingOrderP: Promise<ExistingOrderSummary | null> = lookupLinkId
+    ? findExistingOrderSummary(env, { provider: 'coinbase', linkId: lookupLinkId })
+    : Promise.resolve(null)
 
   let upstream: Response
   try {
@@ -599,6 +614,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
   // Deliberately NOT included: merchantLogoUrl / merchantDescription. Those come
   // from the Rozo intents response and genuinely do not exist until an intent is
   // created, so a quote-time card must render without them.
+  const existingOrder = paymentId === lookupLinkId ? await existingOrderP : null
   return json(200, {
     ...quote,
     ...pricingFields,
@@ -615,6 +631,10 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     // Per-coin checkout metadata for open coins that carry it (beta ZEC:
     // eta, refund address required, single-use deposit address).
     sourceMeta: sourceMeta(nativeAllowed),
+    // Minimum order in USD per open native coin ({ chainId: { SYMBOL: usd } }).
+    // A client compares callerPays against it before offering the coin;
+    // supportedSources is unchanged.
+    nativeMinUsd: nativeMinUsd(nativeAllowed),
     quote: {
       ...(quote?.quote && typeof quote.quote === 'object' ? quote.quote : {}),
       originalAtomicUsdc: pricing.originalAtomic.toString(),
@@ -624,7 +644,18 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       pricingVersion: pricing.pricingVersion,
     },
     quoteReceipt,
+    ...existingOrderField(existingOrder),
   })
+}
+
+/**
+ * `existingOrder`: read-only summary of the order this link already has
+ * (findExistingOrderSummary: rozoPaymentId, status, source chain/token,
+ * expiresAt, paid). Omitted when there is none or the lookup failed or timed
+ * out, so the quote never fails or waits on it.
+ */
+function existingOrderField(summary: ExistingOrderSummary | null): { existingOrder?: ExistingOrderSummary } {
+  return summary ? { existingOrder: summary } : {}
 }
 
 // ── Upstream quote failure classification ────────────────────────────────────
@@ -763,6 +794,11 @@ async function quoteStripeInvoice(request: Request, env: Env, url: string): Prom
     })
   }
 
+  // Runs alongside the channel / receipt work below.
+  const existingOrderP = findExistingOrderSummary(env, {
+    provider: 'stripe_crypto',
+    invoiceKey: invoice.invoiceKey,
+  })
   // Same channel key as invoice-details so both quote surfaces price alike.
   const channel = await resolveTrustedCheckoutChannel(request, `stripe:${url}`, {
     agentBetaSecret: env.CHECKOUT_AGENT_BETA_CHANNEL_SECRET,
@@ -814,5 +850,6 @@ async function quoteStripeInvoice(request: Request, env: Env, url: string): Prom
       pricingVersion: pricing.pricingVersion,
     },
     quoteReceipt,
+    ...existingOrderField(await existingOrderP),
   })
 }
