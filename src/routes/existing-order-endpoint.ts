@@ -24,6 +24,7 @@ import { invoiceResolveRateLimit, rateLimitOk } from './invoice-details'
 import { resolveStripeInvoice } from './invoice-provider'
 import { isTestPaymentId, verifyTestPaymentId } from './native-sources'
 import {
+  EXISTING_ORDER_TIMEOUT_MS,
   findExistingOrder,
   isLookupTargetValid,
   type ExistingOrderResult,
@@ -32,7 +33,7 @@ import {
 
 export const EXISTING_ORDER_PATH = '/v1/services/rozo-agent-api/existing-order'
 
-// Budget for the lookup (up to 4 intents GETs per call), in its own buckets of
+// Budget for the lookup (up to 9 intents GETs per call), in its own buckets of
 // the invoice-details KV limiter: per IP and per link per IP. Stripe links are
 // additionally metered by invoiceResolveRateLimit before the session resolve.
 export const EXISTING_ORDER_PER_IP_LIMIT = 60
@@ -59,6 +60,30 @@ function result(r: ExistingOrderResult): Response {
 
 const UNKNOWN: ExistingOrderResult = { kind: 'unknown' }
 
+function rateLimited(retryAfterS: number): Response {
+  return json(
+    429,
+    { ok: false, code: 'RATE_LIMITED', existingOrder: null, unknown: true, retry_after_s: retryAfterS },
+    { 'Retry-After': String(retryAfterS) },
+  )
+}
+
+const TIMED_OUT = Symbol('timed-out')
+
+/** `p`, or TIMED_OUT once `ms` passes (p keeps running but is ignored). */
+async function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  if (ms <= 0) return TIMED_OUT
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms)
+  })
+  try {
+    return await Promise.race([p, timeout])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 async function lookupBudget(
   request: Request,
   env: Env,
@@ -80,6 +105,8 @@ async function lookupBudget(
 export async function handleExistingOrder(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'GET') return json(405, { error: 'Method not allowed' })
 
+  // One total deadline for the whole call: Stripe session resolve + lookup.
+  const deadline = Date.now() + EXISTING_ORDER_TIMEOUT_MS
   const params = new URL(request.url).searchParams
   const paymentId = params.get('payment_id')?.trim() || ''
   const link = params.get('link')?.trim() || ''
@@ -107,13 +134,18 @@ export async function handleExistingOrder(request: Request, env: Env): Promise<R
   } else if (provider_detected === 'stripe_crypto' && 'url' in normalized && normalized.url) {
     // Same per-IP / per-invoice budget as invoice-details and quote-invoice:
     // resolving resumes a live Stripe session.
+    // On a trip keep its 429 + Retry-After, in this endpoint's shape.
     const limited = await invoiceResolveRateLimit(request, env, normalized.url)
-    if (limited) return limited
+    if (limited) {
+      const retryAfterS = Number(limited.headers.get('Retry-After')) || 60
+      return rateLimited(retryAfterS)
+    }
     try {
-      const invoice = await resolveStripeInvoice(normalized.url)
+      const invoice = await withDeadline(resolveStripeInvoice(normalized.url), deadline - Date.now())
+      // Cannot tell which order this link maps to: unknown, not "none".
+      if (invoice === TIMED_OUT) return result(UNKNOWN)
       target = { provider: 'stripe_crypto', invoiceKey: invoice.invoiceKey }
     } catch {
-      // Cannot tell which order this link maps to: unknown, not "none".
       return result(UNKNOWN)
     }
   } else if (link_id_detected) {
@@ -127,12 +159,10 @@ export async function handleExistingOrder(request: Request, env: Env): Promise<R
   const key = target.provider === 'stripe_crypto' ? target.invoiceKey : target.linkId
   const budget = await lookupBudget(request, env, key)
   if (!budget.ok) {
-    return json(
-      429,
-      { ok: false, code: 'RATE_LIMITED', existingOrder: null, unknown: true, retry_after_s: budget.retryAfterS },
-      { 'Retry-After': String(budget.retryAfterS) },
-    )
+    return rateLimited(budget.retryAfterS)
   }
 
-  return result(await findExistingOrder(env, target))
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) return result(UNKNOWN)
+  return result(await findExistingOrder(env, target, { timeoutMs: remaining }))
 }

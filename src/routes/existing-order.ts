@@ -7,12 +7,12 @@
 // orderId rules (same for both callers):
 // - Coinbase payment-links / payment-sessions and internal rozotest_ invoices:
 //   appId merchant_openrouter, orderId = the link id, plus the contract-variant
-//   slots (create-invoice also scans the __retryN slots once the base order has
-//   expired; the existing-order endpoint does not).
+//   slots, plus the __retryN slots once the base order has expired (the
+//   endpoint scans exactly what create-invoice scans).
 // - Stripe Crypto: appId wallet_rozopay, orderId = stripe_crypto_<cpis_*>.
 
 import type { Env } from '../index'
-import { contractVariantIds } from '../mpp/contract-variant'
+import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import { stripeOrderId } from './stripe-fulfillment'
 import { rowFundingEvidence } from './relink-guard'
 
@@ -158,27 +158,88 @@ export function summarizeOrder(row: any): ExistingOrderSummary {
   }
 }
 
-async function scanOrderRows(
+/** One scanned orderId slot, in create-invoice's allocation order. */
+export interface OrderSlotEntry {
+  id: string
+  slot: 'base' | 'contract' | 'retry'
+  row: any | null
+  /** expiresAt in the future (create-invoice's "live"). */
+  live: boolean
+}
+
+/** A Stellar contract pay-in order (create-invoice's isContractRow). */
+export function isContractRow(row: any): boolean {
+  return Boolean(row?.source?.receiverAddressContract)
+}
+
+async function scanOrderSlots(
   env: Env,
   target: ExistingOrderTarget,
   signal: AbortSignal,
-): Promise<any[] | null> {
+): Promise<OrderSlotEntry[] | null> {
   if (target.provider === 'stripe_crypto') {
-    const r = await lookupIntentsOrder(env, ROZO_APP_ID, stripeOrderId(target.invoiceKey), signal)
+    const id = stripeOrderId(target.invoiceKey)
+    const r = await lookupIntentsOrder(env, ROZO_APP_ID, id, signal)
     if (r.state === 'error') return null
-    return r.state === 'found' ? [r.row] : []
+    const row = r.state === 'found' ? r.row : null
+    return [{ id, slot: 'base', row, live: row ? isLive(row) : false }]
   }
-  // Same base + contract-variant slots create-invoice scans first. The
-  // __retryN slots are skipped here on purpose (bounded fan-out per quote);
-  // create-invoice still scans them and remains the gate.
-  const ids = [target.linkId, ...contractVariantIds(target.linkId)]
-  const scanned = await Promise.all(
-    ids.map((id) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)),
+  // Exactly create-invoice's scan: base + contract variants in parallel, and
+  // the __retryN slots once the base order exists and is no longer live
+  // (create-invoice re-orders into them after the base order expired).
+  const firstIds = [target.linkId, ...contractVariantIds(target.linkId)]
+  let ids = firstIds
+  let scanned = await Promise.all(
+    firstIds.map((id) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)),
   )
+  const base = scanned[0]
+  if (base.state === 'found' && !isLive(base.row)) {
+    const retryIds = retryOrderIds(target.linkId)
+    const more = await Promise.all(
+      retryIds.map((id) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)),
+    )
+    ids = [...firstIds, ...retryIds]
+    scanned = [...scanned, ...more]
+  }
   // A partial view could show "payable" while a sibling is already settling:
   // any failed slot means no answer.
   if (scanned.some((r) => r.state === 'error')) return null
-  return scanned.filter((r): r is { state: 'found'; row: any } => r.state === 'found').map((r) => r.row)
+  return ids.map((id, i) => {
+    const r = scanned[i]
+    const row = r.state === 'found' ? r.row : null
+    const slot: OrderSlotEntry['slot'] = i === 0 ? 'base' : i < firstIds.length ? 'contract' : 'retry'
+    return { id, slot, row, live: row ? isLive(row) : false }
+  })
+}
+
+/**
+ * The order create-invoice (no pay-in intent) would block on or reuse, with
+ * the same precedence:
+ * 1. an order no longer awaiting payment (status past unpaid, not expired):
+ *    create-invoice answers ORDER_ALREADY_ACTIVE with it;
+ * 2. the newest live classic order, else the newest live contract order:
+ *    create-invoice reuses it;
+ * 3. no live order: an earlier order with funding evidence (the relink guard
+ *    blocks on it), else the newest order (ended; a new order would follow).
+ * Later slots of one family are always newer, so "newest" is the last match.
+ */
+export function pickCurrentOrder(entries: OrderSlotEntry[]): any | null {
+  const found = entries.filter((e) => e.row)
+  if (found.length === 0) return null
+  const inFlight = found.find((e) => {
+    const st = readPaymentStatus(e.row)
+    return st !== null && st !== REUSABLE_PAYMENT_STATUS && st !== 'payment_expired'
+  })
+  if (inFlight) return inFlight.row
+  const newest = (pred: (e: OrderSlotEntry) => boolean) =>
+    [...found].reverse().find(pred) ?? null
+  const live =
+    newest((e) => e.live && !isContractRow(e.row) && e.slot !== 'contract') ??
+    newest((e) => e.live && isContractRow(e.row))
+  if (live) return live.row
+  const funded = found.find((e) => rowFundingEvidence(e.row))
+  if (funded) return funded.row
+  return found[found.length - 1].row
 }
 
 export interface ExistingOrderOptions {
@@ -189,8 +250,7 @@ export interface ExistingOrderOptions {
  * The link's current order. Advisory only: create-invoice remains the gate.
  * Never throws and never takes longer than `timeoutMs`.
  *
- * Current order, in priority: a funded one, then a payable one, then the most
- * recently allocated slot.
+ * Which order: see pickCurrentOrder (same precedence as create-invoice).
  */
 export async function findExistingOrder(
   env: Env,
@@ -208,15 +268,10 @@ export async function findExistingOrder(
     }, opts.timeoutMs ?? EXISTING_ORDER_TIMEOUT_MS)
   })
   const work = (async (): Promise<ExistingOrderResult> => {
-    const rows = await scanOrderRows(env, target, controller.signal)
-    if (rows === null) return { kind: 'unknown' }
-    if (rows.length === 0) return { kind: 'none' }
-    const states = rows.map((r) => classifyOrderState(r))
-    const pick =
-      states.indexOf('funded') >= 0 ? states.indexOf('funded')
-      : states.indexOf('payable') >= 0 ? states.indexOf('payable')
-      : rows.length - 1
-    return { kind: 'found', summary: summarizeOrder(rows[pick]) }
+    const entries = await scanOrderSlots(env, target, controller.signal)
+    if (entries === null) return { kind: 'unknown' }
+    const current = pickCurrentOrder(entries)
+    return current ? { kind: 'found', summary: summarizeOrder(current) } : { kind: 'none' }
   })()
   try {
     return await Promise.race([work, timeout])

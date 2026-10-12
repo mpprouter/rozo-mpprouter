@@ -196,7 +196,7 @@ describe('GET existing-order', () => {
     expect(hits.some((h) => h.includes('pl_other_from_url'))).toBe(false)
   })
 
-  it('prefers a funded sibling and never scans retry slots', async () => {
+  it('prefers a funded sibling; retry slots are not read while the base order is live', async () => {
     const hits = mockFetch({
       [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_unpaid'),
       [`merchant_openrouter/${LINK}__contract`]: row('rozo-contract', 'payment_payin_completed'),
@@ -206,6 +206,69 @@ describe('GET existing-order', () => {
     expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-contract', state: 'funded', paid: true })
     expect(orderCalls(hits)).toHaveLength(4)
     expect(hits.some((h) => h.includes('__retry'))).toBe(false)
+  })
+
+  it('base expired + live retry slot: returns the retry-slot order (create-invoice reuses it)', async () => {
+    const hits = mockFetch({
+      [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_expired', PAST),
+      [`merchant_openrouter/${LINK}__retry2`]: row('rozo-retry2', 'payment_expired', PAST),
+      [`merchant_openrouter/${LINK}__retry3`]: row('rozo-retry3', 'payment_unpaid'),
+    })
+    const { json } = await existing({ payment_id: LINK })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-retry3', state: 'payable', paid: false })
+    expect(json.unknown).toBe(false)
+    expect(orderCalls(hits)).toHaveLength(9)
+  })
+
+  it('the production case: signed test id, expired base, live retry slot', async () => {
+    const id = await signTestPaymentId(SECRET, 10, 'b643b2c0139de4db')
+    mockFetch({
+      [`merchant_openrouter/${id}`]: row('5a552b2c', 'payment_expired', PAST),
+      [`merchant_openrouter/${id}__retry2`]: row('rozo-live', 'payment_unpaid'),
+    })
+    const { json } = await existing({ payment_id: id })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-live', state: 'payable' })
+  })
+
+  it('funded retry-slot order: funded, even next to an expired base', async () => {
+    mockFetch({
+      [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_expired', PAST),
+      [`merchant_openrouter/${LINK}__retry2`]: row('rozo-retry2', 'payment_payin_completed'),
+    })
+    const { json } = await existing({ payment_id: LINK })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-retry2', state: 'funded', paid: true })
+  })
+
+  it('no live order: an expired order with funding evidence wins over a newer ended one', async () => {
+    const late = { ...row('rozo-base', 'payment_expired', PAST) }
+    late.source = { ...late.source, txHash: '0xfeed' } as any
+    mockFetch({
+      [`merchant_openrouter/${LINK}`]: late,
+      [`merchant_openrouter/${LINK}__retry2`]: row('rozo-retry2', 'payment_expired', PAST),
+    })
+    const { json } = await existing({ payment_id: LINK })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-base', state: 'funded' })
+  })
+
+  it('no live order and no evidence: the newest order, ended', async () => {
+    mockFetch({
+      [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_expired', PAST),
+      [`merchant_openrouter/${LINK}__retry2`]: row('rozo-retry2', 'payment_expired', PAST),
+    })
+    const { json } = await existing({ payment_id: LINK })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-retry2', state: 'ended' })
+  })
+
+  it('a live classic order is preferred over a live contract sibling', async () => {
+    const contract = { ...row('rozo-contract', 'payment_unpaid') }
+    contract.source = { ...contract.source, receiverAddressContract: 'C_CONTRACT' } as any
+    mockFetch({
+      [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_unpaid'),
+      [`merchant_openrouter/${LINK}__contract`]: contract,
+    })
+    const { json } = await existing({ payment_id: LINK })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-base', state: 'payable' })
+    expect(JSON.stringify(json)).not.toContain('C_CONTRACT')
   })
 
   it('an expired row with funding evidence is funded', async () => {
@@ -284,6 +347,35 @@ describe('GET existing-order', () => {
     mockFetch({ [`wallet_rozopay/stripe_crypto_${STRIPE_KEY}`]: 'error' })
     const { json } = await existing({ link: STRIPE_URL })
     expect(json).toEqual({ existingOrder: null, unknown: true })
+  })
+
+  it('Stripe resolve shares the total deadline: a hanging resolve gives unknown', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.spyOn(globalThis, 'fetch').mockImplementation((() => new Promise<Response>(() => {})) as typeof fetch)
+      const p = existing({ link: STRIPE_URL })
+      await vi.advanceTimersByTimeAsync(5_100)
+      const { status, json } = await p
+      expect(status).toBe(200)
+      expect(json).toEqual({ existingOrder: null, unknown: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('Stripe resolve rate limit: 429 + Retry-After in the endpoint shape', async () => {
+    const hits = mockFetch({})
+    const env = makeEnv()
+    const ip = '203.0.113.9'
+    await (env as any).MPP_STORE.put(
+      `ratelimit:invoice-details:ip:${ip}`,
+      JSON.stringify({ n: 1000, w: Date.now() }),
+    )
+    const { status, json, res } = await existing({ link: STRIPE_URL }, env, ip)
+    expect(status).toBe(429)
+    expect(Number(res.headers.get('Retry-After'))).toBeGreaterThan(0)
+    expect(json).toMatchObject({ code: 'RATE_LIMITED', existingOrder: null, unknown: true })
+    expect(hits).toHaveLength(0)
   })
 
   it('over the per-link budget: 429 with unknown true and no intents call', async () => {
