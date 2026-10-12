@@ -94,11 +94,15 @@ export const ZEC_CUSTODY_QUOTE_LOCK_MIN = 10
 export const ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN = 10
 export const ZEC_BLOCK_TARGET_SECONDS = 75
 
-/** ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below $1100. */
+/**
+ * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below $1100.
+ * No arrival estimate: block times vary and the checkout must not promise one,
+ * so sourceMeta omits eta_seconds for this rail.
+ */
 const ZEC_CUSTODY_OVERRIDE: Partial<NativeSourceDef> = {
   provider: 'rozo',
   maxUsd: 1099.99,
-  etaSeconds: 90,
+  etaSeconds: undefined,
 }
 
 /** The effective def for a chain under the given ZEC rail (only ZEC changes). */
@@ -189,7 +193,8 @@ export function withBetaSources(
 
 /** Checkout metadata for an open native coin (see sourceMeta). */
 export interface NativeSourceMeta {
-  eta_seconds: number
+  /** Omitted for the custody ZEC rail (no arrival estimate). */
+  eta_seconds?: number
   refund_address_required: boolean
   beta: boolean
   /** The deposit address is valid for one payment only; never pay it twice. */
@@ -214,7 +219,7 @@ export function sourceMeta(
     if (!nativeAllowed.has(key)) continue
     if (d.etaSeconds === undefined && !d.refundAddressRequired && !d.beta) continue
     out[key] = {
-      eta_seconds: d.etaSeconds ?? 0,
+      ...(d.provider === 'rozo' ? {} : { eta_seconds: d.etaSeconds ?? 0 }),
       refund_address_required: !!d.refundAddressRequired,
       beta: !!d.beta,
       // near 1Click deposit addresses are single-quote, single-use; custody

@@ -195,7 +195,8 @@ NATIVE_SOURCES_BETA = "ZEC@9133"
 # Which rail rozo-intents-api is expected to use for NEW ZEC orders
 # (src/routes/native-sources.ts parseZecRail). "near" (default) = NEAR 1Click,
 # behaviour unchanged. "custody" = Rozo self-custody rail: provider rozo,
-# cap below $1100, 1 or 2 confirmations, shorter merchant-link pre-check.
+# cap below $1100, 1 or 2 confirmations, no arrival estimate, shorter
+# merchant-link pre-check.
 # Set to "custody" only together with intents app_config ZEC_CUSTODY_MODE=on.
 # Rollback: set ZEC_RAIL = "near" and redeploy.
 ZEC_RAIL = "near"

@@ -527,7 +527,6 @@ describe('ZEC helpers', () => {
 describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
   const custodyEnv = () => makeEnv({ ZEC_RAIL: 'custody' })
   const CUSTODY_META = {
-    eta_seconds: 90,
     refund_address_required: true,
     beta: true,
     address_single_use: true,
@@ -552,8 +551,9 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(zecMinLinkLifeMs('near')).toBe(ZEC_MIN_LINK_LIFE_MS)
   })
 
-  it('custody sourceMeta: 90 s eta, single-use address, 1/2 confirmation tiers', () => {
+  it('custody sourceMeta: no eta, single-use address, 1/2 confirmation tiers', () => {
     expect(sourceMeta(new Set(['ZEC@9133', 'ETH@8453']), 'custody')).toEqual({ 'ZEC@9133': CUSTODY_META })
+    expect('eta_seconds' in sourceMeta(new Set(['ZEC@9133']), 'custody')['ZEC@9133']).toBe(false)
     // GA coins never gain metadata from the rail switch.
     expect(sourceMeta(parseNativeSources(PROD_NATIVE), 'custody')).toEqual({})
   })
