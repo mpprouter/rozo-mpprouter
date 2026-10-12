@@ -1,12 +1,14 @@
 // Existing Rozo order for a payment link: the ONE lookup create-invoice uses
-// to find the order a link already has, shared with quote-invoice so the quote
-// can show it read-only.
+// to find the order a link already has, shared with the read-only
+// GET /v1/services/rozo-agent-api/existing-order endpoint. quote-invoice does
+// NOT call it: the intents lookup takes seconds in production (2026-10-12
+// rollback of 8e3e1633), and the quote must stay fast.
 //
 // orderId rules (same for both callers):
 // - Coinbase payment-links / payment-sessions and internal rozotest_ invoices:
 //   appId merchant_openrouter, orderId = the link id, plus the contract-variant
 //   slots (create-invoice also scans the __retryN slots once the base order has
-//   expired; the quote summary does not).
+//   expired; the existing-order endpoint does not).
 // - Stripe Crypto: appId wallet_rozopay, orderId = stripe_crypto_<cpis_*>.
 
 import type { Env } from '../index'
@@ -106,8 +108,8 @@ export type ExistingOrderResult =
   | { kind: 'none' }
   | { kind: 'unknown' }
 
-/** The quote never waits longer than this for the lookup. */
-export const EXISTING_ORDER_TIMEOUT_MS = 1500
+/** Cap on one lookup. Off the quote's critical path, so it can be generous. */
+export const EXISTING_ORDER_TIMEOUT_MS = 5000
 
 // Statuses that end an order with the money not kept (or never arrived).
 const ENDED_STATUSES = new Set(['payment_expired', 'payment_refunded', 'payment_bounced', 'payment_failed'])
@@ -181,8 +183,6 @@ async function scanOrderRows(
 
 export interface ExistingOrderOptions {
   timeoutMs?: number
-  /** Per-caller budget check run before any intents call; false = 'unknown'. */
-  allow?: () => Promise<boolean>
 }
 
 /**
@@ -197,7 +197,8 @@ export async function findExistingOrder(
   target: ExistingOrderTarget,
   opts: ExistingOrderOptions = {},
 ): Promise<ExistingOrderResult> {
-  if (!env.ROZO_INTENTS_API_KEY || !isLookupTargetValid(target)) return { kind: 'none' }
+  if (!isLookupTargetValid(target)) return { kind: 'none' }
+  if (!env.ROZO_INTENTS_API_KEY) return { kind: 'unknown' }
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
   const timeout = new Promise<ExistingOrderResult>((resolve) => {
@@ -207,7 +208,6 @@ export async function findExistingOrder(
     }, opts.timeoutMs ?? EXISTING_ORDER_TIMEOUT_MS)
   })
   const work = (async (): Promise<ExistingOrderResult> => {
-    if (opts.allow && !(await opts.allow())) return { kind: 'unknown' }
     const rows = await scanOrderRows(env, target, controller.signal)
     if (rows === null) return { kind: 'unknown' }
     if (rows.length === 0) return { kind: 'none' }
@@ -225,17 +225,4 @@ export async function findExistingOrder(
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
-}
-
-/**
- * Response fields: `existingOrder` when found, `existingOrderUnknown: true`
- * when the lookup could not answer in time (so a client does not auto-switch
- * coins on an order it cannot see), nothing when the link has no order.
- */
-export function existingOrderFields(
-  r: ExistingOrderResult,
-): { existingOrder?: ExistingOrderSummary; existingOrderUnknown?: true } {
-  if (r.kind === 'found') return { existingOrder: r.summary }
-  if (r.kind === 'unknown') return { existingOrderUnknown: true }
-  return {}
 }

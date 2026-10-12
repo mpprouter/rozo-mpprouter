@@ -1,14 +1,16 @@
 /**
- * quote-invoice additions:
- * - existingOrder: read-only summary of the order a link already has, found
- *   with the same lookup create-invoice uses (orderId = link id under
+ * - quote-invoice makes NO intents order lookup (2026-10-12: the lookup takes
+ *   ~2.5s in production and pushed every quote to 1.5-2.1s; deploy rolled back).
+ * - GET /existing-order: read-only summary of the order a link already has,
+ *   found with the same lookup create-invoice uses (orderId = link id under
  *   merchant_openrouter for Coinbase and rozotest_; stripe_crypto_<cpis_*>
- *   under wallet_rozopay for Stripe). Omitted when absent, failed or slow.
+ *   under wallet_rozopay for Stripe).
  * - nativeMinUsd: per open native coin USD minimum, supportedSources unchanged.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { handleQuoteInvoice } from '../src/routes/pay-invoice-admin'
 import { classifyOrderState, findExistingOrder } from '../src/routes/existing-order'
+import { handleExistingOrder } from '../src/routes/existing-order-endpoint'
 import { NATIVE_MIN_USD, nativeMinUsd, parseNativeSources, signTestPaymentId } from '../src/routes/native-sources'
 import type { Env } from '../src/index'
 
@@ -113,114 +115,125 @@ function expectNoSecrets(json: any) {
 
 afterEach(() => vi.restoreAllMocks())
 
-describe('quote-invoice existingOrder: Coinbase', () => {
-  it('includes the existing unpaid order with only safe fields', async () => {
-    mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
+const orderCalls = (hits: string[]) => hits.filter((h) => h.includes('/payments/order/'))
+
+async function existing(params: Record<string, string>, env = makeEnv(), ip = '198.51.100.1') {
+  const u = new URL('https://mpp.test/v1/services/rozo-agent-api/existing-order')
+  for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v)
+  const res = await handleExistingOrder(
+    new Request(u, { method: 'GET', headers: { 'CF-Connecting-IP': ip } }),
+    env,
+  )
+  return { status: res.status, json: (await res.json()) as any, res }
+}
+
+describe('quote-invoice makes no order lookup', () => {
+  const ORDERS = {
+    [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid'),
+    [`wallet_rozopay/stripe_crypto_${STRIPE_KEY}`]: row('rozo-s', 'payment_unpaid'),
+  }
+
+  it('Coinbase quote: zero intents calls, no existingOrder fields', async () => {
+    const hits = mockFetch(ORDERS)
     const { status, json } = await quote({ payment_id: LINK })
     expect(status).toBe(200)
-    expect(json.existingOrder).toEqual({
-      rozoPaymentId: 'rozo-1',
-      status: 'payment_unpaid',
-      source: { chainId: '900', tokenSymbol: 'SOL' },
-      expiresAt: FUTURE,
-      state: 'payable',
-      paid: false,
-    })
+    expect(orderCalls(hits)).toHaveLength(0)
+    expect(json).not.toHaveProperty('existingOrder')
     expect(json).not.toHaveProperty('existingOrderUnknown')
-    expectNoSecrets(json)
   })
 
-  it('marks paid for a status past unpaid, preferring it over a live unpaid sibling', async () => {
-    mockFetch({
-      [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_unpaid'),
-      [`merchant_openrouter/${LINK}__contract`]: row('rozo-contract', 'payment_payin_completed'),
-    })
-    const { json } = await quote({ payment_id: LINK })
-    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-contract', state: 'funded', paid: true })
-  })
-
-  it('does not scan retry slots (bounded fan-out): base + contract slots only', async () => {
-    const hits = mockFetch({
-      [`merchant_openrouter/${LINK}`]: row('rozo-old', 'payment_expired', PAST),
-      [`merchant_openrouter/${LINK}__retry2`]: row('rozo-retry', 'payment_unpaid'),
-    })
-    const { json } = await quote({ payment_id: LINK })
-    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-old', state: 'ended', paid: false })
-    expect(hits.filter((h) => h.includes('/payments/order/'))).toHaveLength(4)
-    expect(hits.some((h) => h.includes('__retry'))).toBe(false)
-  })
-
-  it('an expired row with funding evidence is funded, not ended', async () => {
-    const funded = { ...row('rozo-late', 'payment_expired', PAST) }
-    funded.source = { ...funded.source, confirmedAt: '2026-10-10T00:00:00Z' } as any
-    mockFetch({ [`merchant_openrouter/${LINK}`]: funded })
-    const { json } = await quote({ payment_id: LINK })
-    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-late', state: 'funded', paid: true })
-  })
-
-  it('prefers the explicit payment_id over the URL-derived id', async () => {
-    const hits = mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
-    const { json } = await quote({
-      payment_id: LINK,
-      url: 'https://payments.coinbase.com/payment-links/pl_other_from_url',
-    })
-    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-1' })
-    expect(hits.some((h) => h.includes('pl_other_from_url'))).toBe(false)
-  })
-
-  it('never sends a malformed id to the intents API', async () => {
-    const hits = mockFetch({})
-    const r = await findExistingOrder(makeEnv(), { provider: 'coinbase', linkId: 'not-a-link/../x' })
-    expect(r).toEqual({ kind: 'none' })
-    const s = await findExistingOrder(makeEnv(), { provider: 'stripe_crypto', invoiceKey: 'bogus' })
-    expect(s).toEqual({ kind: 'none' })
-    expect(hits).toHaveLength(0)
-  })
-
-  it('over the lookup budget: no intents call, existingOrderUnknown, quote still 200', async () => {
-    const env = makeEnv()
-    const hits = mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
-    const req = () => handleQuoteInvoice(
-      new Request('https://mpp.test/quote-invoice', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'CF-Connecting-IP': '203.0.113.7' },
-        body: JSON.stringify({ payment_id: LINK }),
-      }),
-      env,
-    )
-    for (let i = 0; i < 20; i++) {
-      const body = (await (await req()).json()) as any
-      expect(body.existingOrder?.rozoPaymentId).toBe('rozo-1')
-    }
-    const before = hits.filter((h) => h.includes('/payments/order/')).length
-    const res = await req()
-    const body = (await res.json()) as any
-    expect(res.status).toBe(200)
-    expect(body.existingOrderUnknown).toBe(true)
-    expect(body).not.toHaveProperty('existingOrder')
-    expect(hits.filter((h) => h.includes('/payments/order/')).length).toBe(before)
-  })
-
-  it('omits existingOrder when the link has no order', async () => {
-    mockFetch({})
-    const { status, json } = await quote({ payment_id: LINK })
+  it('test invoice quote: zero intents calls', async () => {
+    const id = await signTestPaymentId(SECRET, 11, 'noquote1')
+    const hits = mockFetch({ [`merchant_openrouter/${id}`]: row('rozo-t', 'payment_unpaid') })
+    const { status, json } = await quote({ payment_id: id })
     expect(status).toBe(200)
+    expect(orderCalls(hits)).toHaveLength(0)
     expect(json).not.toHaveProperty('existingOrder')
   })
 
-  it('any slot lookup failure gives existingOrderUnknown, and the quote still succeeds', async () => {
+  it('Stripe quote: zero intents calls', async () => {
+    const hits = mockFetch(ORDERS)
+    const { status, json } = await quote({ url: STRIPE_URL })
+    expect(status).toBe(200)
+    expect(orderCalls(hits)).toHaveLength(0)
+    expect(json).not.toHaveProperty('existingOrder')
+  })
+})
+
+describe('GET existing-order', () => {
+  it('returns the existing order with only safe fields', async () => {
+    mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
+    const { status, json, res } = await existing({ payment_id: LINK })
+    expect(status).toBe(200)
+    expect(res.headers.get('Cache-Control')).toBe('no-store')
+    expect(json).toEqual({
+      existingOrder: {
+        rozoPaymentId: 'rozo-1',
+        status: 'payment_unpaid',
+        source: { chainId: '900', tokenSymbol: 'SOL' },
+        expiresAt: FUTURE,
+        state: 'payable',
+        paid: false,
+      },
+      unknown: false,
+    })
+    expectNoSecrets(json)
+  })
+
+  it('accepts a Coinbase link URL', async () => {
+    mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
+    const { json } = await existing({ link: `https://payments.coinbase.com/payment-links/${LINK}` })
+    expect(json.existingOrder?.rozoPaymentId).toBe('rozo-1')
+  })
+
+  it('prefers payment_id over link', async () => {
+    const hits = mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
+    const { json } = await existing({
+      payment_id: LINK,
+      link: 'https://payments.coinbase.com/payment-links/pl_other_from_url',
+    })
+    expect(json.existingOrder?.rozoPaymentId).toBe('rozo-1')
+    expect(hits.some((h) => h.includes('pl_other_from_url'))).toBe(false)
+  })
+
+  it('prefers a funded sibling and never scans retry slots', async () => {
+    const hits = mockFetch({
+      [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_unpaid'),
+      [`merchant_openrouter/${LINK}__contract`]: row('rozo-contract', 'payment_payin_completed'),
+      [`merchant_openrouter/${LINK}__retry2`]: row('rozo-retry', 'payment_unpaid'),
+    })
+    const { json } = await existing({ payment_id: LINK })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-contract', state: 'funded', paid: true })
+    expect(orderCalls(hits)).toHaveLength(4)
+    expect(hits.some((h) => h.includes('__retry'))).toBe(false)
+  })
+
+  it('an expired row with funding evidence is funded', async () => {
+    const funded = { ...row('rozo-late', 'payment_expired', PAST) }
+    funded.source = { ...funded.source, confirmedAt: '2026-10-10T00:00:00Z' } as any
+    mockFetch({ [`merchant_openrouter/${LINK}`]: funded })
+    const { json } = await existing({ payment_id: LINK })
+    expect(json.existingOrder).toMatchObject({ state: 'funded', paid: true })
+  })
+
+  it('none: existingOrder null, unknown false', async () => {
+    mockFetch({})
+    const { status, json } = await existing({ payment_id: LINK })
+    expect(status).toBe(200)
+    expect(json).toEqual({ existingOrder: null, unknown: false })
+  })
+
+  it('any slot failure: unknown true', async () => {
     mockFetch({
       [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid'),
       [`merchant_openrouter/${LINK}__contract2`]: 'error',
     })
-    const { status, json } = await quote({ payment_id: LINK })
+    const { status, json } = await existing({ payment_id: LINK })
     expect(status).toBe(200)
-    expect(json.linkId).toBe(LINK)
-    expect(json).not.toHaveProperty('existingOrder')
-    expect(json.existingOrderUnknown).toBe(true)
+    expect(json).toEqual({ existingOrder: null, unknown: true })
   })
 
-  it('a lookup that hangs past the timeout is unknown, not none', async () => {
+  it('a hanging lookup is cut at the timeout and reported unknown', async () => {
     mockFetch({ [`merchant_openrouter/${LINK}`]: 'hang' })
     const started = Date.now()
     const r = await findExistingOrder(makeEnv(), { provider: 'coinbase', linkId: LINK }, { timeoutMs: 50 })
@@ -228,59 +241,69 @@ describe('quote-invoice existingOrder: Coinbase', () => {
     expect(Date.now() - started).toBeLessThan(1000)
   })
 
-  it('the quote waits at most ~1.5s for a hanging lookup and flags it unknown', async () => {
-    mockFetch({ [`merchant_openrouter/${LINK}`]: 'hang' })
-    const started = Date.now()
-    const { status, json } = await quote({ payment_id: LINK })
-    const took = Date.now() - started
-    expect(status).toBe(200)
-    expect(json.existingOrderUnknown).toBe(true)
-    expect(took).toBeGreaterThanOrEqual(1400)
-    expect(took).toBeLessThan(2500)
-  })
-})
-
-describe('quote-invoice existingOrder: test invoice and Stripe', () => {
-  it('looks up a rozotest_ invoice under merchant_openrouter with the test id', async () => {
+  it('signed test id is looked up under merchant_openrouter', async () => {
     const id = await signTestPaymentId(SECRET, 11, 'existing1')
-    const hits = mockFetch({ [`merchant_openrouter/${id}`]: row('rozo-test', 'payment_unpaid') })
-    const { status, json } = await quote({ payment_id: id })
-    expect(status).toBe(200)
-    expect(json.testInvoice).toBe(true)
-    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-test', state: 'payable', paid: false })
+    mockFetch({ [`merchant_openrouter/${id}`]: row('rozo-test', 'payment_unpaid') })
+    const { json } = await existing({ payment_id: id })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-test', state: 'payable' })
+  })
+
+  it('unsigned test id: 400, no intents call', async () => {
+    const hits = mockFetch({})
+    const { status } = await existing({ payment_id: 'rozotest_100_quoteq1_0000000000000000' })
+    expect(status).toBe(400)
+    expect(orderCalls(hits)).toHaveLength(0)
+  })
+
+  it('invalid id: 400, no intents call', async () => {
+    const hits = mockFetch({})
+    for (const bad of ['not-a-link', 'pl_bad/../x', 'cpis_bad-chars!']) {
+      const { status } = await existing({ payment_id: bad })
+      expect(status).toBe(400)
+    }
+    const missing = await existing({})
+    expect(missing.status).toBe(400)
+    expect(orderCalls(hits)).toHaveLength(0)
+  })
+
+  it('cpis_ payment_id is looked up directly as stripe_crypto_<cpis_*> under wallet_rozopay', async () => {
+    const hits = mockFetch({ [`wallet_rozopay/stripe_crypto_${STRIPE_KEY}`]: row('rozo-stripe', 'payment_payout_completed') })
+    const { json } = await existing({ payment_id: STRIPE_KEY })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-stripe', state: 'funded', paid: true })
     expectNoSecrets(json)
-    expect(hits.some((h) => h.includes('agentapi.rozo.ai'))).toBe(false)
+    expect(hits.some((h) => h.includes('payin_session'))).toBe(false)
   })
 
-  it('test invoice without an order has no existingOrder', async () => {
-    const id = await signTestPaymentId(SECRET, 11, 'existing2')
-    mockFetch({})
-    const { json } = await quote({ payment_id: id })
-    expect(json).not.toHaveProperty('existingOrder')
+  it('Stripe link is resolved to its cpis_ key, then looked up', async () => {
+    mockFetch({ [`wallet_rozopay/stripe_crypto_${STRIPE_KEY}`]: row('rozo-stripe', 'payment_unpaid') })
+    const { json } = await existing({ link: STRIPE_URL })
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-stripe', state: 'payable' })
   })
 
-  it('looks up a Stripe invoice as stripe_crypto_<cpis_*> under wallet_rozopay', async () => {
-    mockFetch({ [`wallet_rozopay/stripe_crypto_${STRIPE_KEY}`]: row('rozo-stripe', 'payment_payout_completed') })
-    const { status, json } = await quote({ url: STRIPE_URL })
-    expect(status).toBe(200)
-    expect(json.provider).toBe('stripe_crypto')
-    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-stripe', status: 'payment_payout_completed', state: 'funded', paid: true })
-    expectNoSecrets(json)
-  })
-
-  it('Stripe lookup failure gives existingOrderUnknown', async () => {
+  it('Stripe lookup failure: unknown true', async () => {
     mockFetch({ [`wallet_rozopay/stripe_crypto_${STRIPE_KEY}`]: 'error' })
-    const { status, json } = await quote({ url: STRIPE_URL })
-    expect(status).toBe(200)
-    expect(json).not.toHaveProperty('existingOrder')
-    expect(json.existingOrderUnknown).toBe(true)
+    const { json } = await existing({ link: STRIPE_URL })
+    expect(json).toEqual({ existingOrder: null, unknown: true })
   })
 
-  it('Stripe link without an order has neither field', async () => {
-    mockFetch({})
-    const { json } = await quote({ url: STRIPE_URL })
-    expect(json).not.toHaveProperty('existingOrder')
-    expect(json).not.toHaveProperty('existingOrderUnknown')
+  it('over the per-link budget: 429 with unknown true and no intents call', async () => {
+    const env = makeEnv()
+    const hits = mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
+    for (let i = 0; i < 20; i++) {
+      const { status } = await existing({ payment_id: LINK }, env, '203.0.113.7')
+      expect(status).toBe(200)
+    }
+    const before = orderCalls(hits).length
+    const { status, json, res } = await existing({ payment_id: LINK }, env, '203.0.113.7')
+    expect(status).toBe(429)
+    expect(res.headers.get('Retry-After')).toBeTruthy()
+    expect(json).toMatchObject({ code: 'RATE_LIMITED', existingOrder: null, unknown: true })
+    expect(orderCalls(hits).length).toBe(before)
+  })
+
+  it('rejects non-GET', async () => {
+    const res = await handleExistingOrder(new Request('https://mpp.test/x', { method: 'POST' }), makeEnv())
+    expect(res.status).toBe(405)
   })
 })
 
