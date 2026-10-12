@@ -108,6 +108,7 @@ import {
 import { settlePlaygroundChannels } from './playground/channel-settle'
 import { handleRozoWebhook, handleInvoiceStatus, FUNDER_WALLET } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
+import { EXISTING_ORDER_PATH, handleExistingOrder } from './routes/existing-order-endpoint'
 import {
   handleUpiResolve,
   handleUpiVerifiedPayIn,
@@ -1111,6 +1112,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // so clients can self-quote before committing to payment.
       if (url.pathname === '/v1/services/rozo-agent-api/quote-invoice') {
         return handleQuoteInvoice(request, env)
+      }
+
+      // Read-only existing order for a payment link (advisory; create-invoice
+      // remains the gate). Kept off quote-invoice so the quote stays fast.
+      if (url.pathname === EXISTING_ORDER_PATH) {
+        return handleExistingOrder(request, env)
       }
 
       // Public create-invoice endpoint — quotes a Coinbase Payment Link,
