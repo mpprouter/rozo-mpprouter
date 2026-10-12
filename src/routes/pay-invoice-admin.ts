@@ -6,6 +6,7 @@ import {
   isTestPaymentId,
   parseNativeSources,
   nativeMinUsd,
+  parseZecRail,
   sourceMeta,
   supportedSources,
   verifyTestPaymentId,
@@ -492,7 +493,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       title: buildCheckoutTitle(TEST_MERCHANT_NAME, pricing),
       currency: 'USD',
       supportedSources: supportedSources(STABLE_SOURCES, testNative),
-      sourceMeta: sourceMeta(testNative),
+      sourceMeta: sourceMeta(testNative, parseZecRail(env.ZEC_RAIL)),
       nativeMinUsd: nativeMinUsd(testNative),
       quoteReceipt,
     })
@@ -619,7 +620,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     supportedSources: supportedSources(STABLE_SOURCES, nativeAllowed),
     // Per-coin checkout metadata for open coins that carry it (beta ZEC:
     // eta, refund address required, single-use deposit address).
-    sourceMeta: sourceMeta(nativeAllowed),
+    sourceMeta: sourceMeta(nativeAllowed, parseZecRail(env.ZEC_RAIL)),
     // Minimum order in USD per open native coin ({ chainId: { SYMBOL: usd } }).
     // A client compares callerPays against it before offering the coin;
     // supportedSources is unchanged.

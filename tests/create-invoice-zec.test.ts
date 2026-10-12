@@ -16,6 +16,9 @@ import {
   handleCreateInvoice,
   refundAddressDigest,
   resolveRefundAddress,
+  ZEC_CUSTODY_MIN_LINK_LIFE_MS,
+  ZEC_MIN_LINK_LIFE_MS,
+  zecMinLinkLifeMs,
   zecUpstreamError,
 } from '../src/routes/create-invoice'
 import { handleQuoteInvoice } from '../src/routes/pay-invoice-admin'
@@ -25,6 +28,7 @@ import {
   betaParamSymbols,
   nativeMaxUsdFor,
   parseNativeSources,
+  parseZecRail,
   signTestPaymentId,
   sourceMeta,
   supportedSources,
@@ -517,5 +521,130 @@ describe('ZEC helpers', () => {
     expect(zecUpstreamError(500, JSON.stringify({ data: { errorCode: 'ZEC_NOT_ENABLED' } }))).toBeNull()
     expect(zecUpstreamError(400, 'not json')).toBeNull()
     expect(zecUpstreamError(400, JSON.stringify({ error: { code: 'invalidRequest' } }))).toBeNull()
+  })
+})
+
+describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
+  const custodyEnv = () => makeEnv({ ZEC_RAIL: 'custody' })
+  const CUSTODY_META = {
+    eta_seconds: 90,
+    refund_address_required: true,
+    beta: true,
+    address_single_use: true,
+    confirmations: { under110: 1, from110: 2 },
+  }
+
+  it('parseZecRail defaults to near for anything but an exact custody', () => {
+    expect(parseZecRail(undefined)).toBe('near')
+    expect(parseZecRail('')).toBe('near')
+    expect(parseZecRail('near')).toBe('near')
+    expect(parseZecRail('custodial')).toBe('near')
+    expect(parseZecRail(' Custody ')).toBe('custody')
+  })
+
+  it('near (default) keeps sourceMeta and the cap byte-for-byte', () => {
+    const open = new Set(['ZEC@9133'])
+    expect(sourceMeta(open, 'near')).toEqual(sourceMeta(open))
+    expect(JSON.stringify(sourceMeta(open, 'near'))).toBe(
+      '{"ZEC@9133":{"eta_seconds":480,"refund_address_required":true,"beta":true,"address_single_use":true}}',
+    )
+    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(2000)
+    expect(zecMinLinkLifeMs('near')).toBe(ZEC_MIN_LINK_LIFE_MS)
+  })
+
+  it('custody sourceMeta: 90 s eta, single-use address, 1/2 confirmation tiers', () => {
+    expect(sourceMeta(new Set(['ZEC@9133', 'ETH@8453']), 'custody')).toEqual({ 'ZEC@9133': CUSTODY_META })
+    // GA coins never gain metadata from the rail switch.
+    expect(sourceMeta(parseNativeSources(PROD_NATIVE), 'custody')).toEqual({})
+  })
+
+  it('custody caps ZEC below $1100 and leaves other coins alone', () => {
+    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(1099.99)
+    expect(nativeMaxUsdFor('9133', '5000', 'custody')).toBe(1099.99)
+    expect(nativeMaxUsdFor('9133', '100', 'custody')).toBe(100)
+    expect(nativeMaxUsdFor('8453', '5000', 'custody')).toBe(5000)
+  })
+
+  it('custody link margin = 10 min lock + 10 min margin + 2 x 75 s', () => {
+    expect(ZEC_CUSTODY_MIN_LINK_LIFE_MS).toBe(22.5 * 60_000)
+    expect(zecMinLinkLifeMs('custody')).toBe(ZEC_CUSTODY_MIN_LINK_LIFE_MS)
+    const now = Date.parse('2026-10-10T00:00:00.000Z')
+    expect(checkZecLinkExpiry('2026-10-10T00:22:30.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS).ok).toBe(true)
+    const short = checkZecLinkExpiry('2026-10-10T00:22:29.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS)
+    expect(short.ok).toBe(false)
+    expect((short as any).message).toContain('23 minutes')
+    expect(checkZecLinkExpiry(null, now, ZEC_CUSTODY_MIN_LINK_LIFE_MS).ok).toBe(false)
+  })
+
+  it('quote-invoice shows the custody sourceMeta with ?beta=zec', async () => {
+    const { json } = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(json.sourceMeta).toEqual({ 'ZEC@9133': CUSTODY_META })
+    const plain = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: custodyEnv() })
+    expect(plain.json.sourceMeta).toEqual({})
+  })
+
+  it('create accepts a 30 min link on custody that near refuses', async () => {
+    linkExpiresAt = inMinutes(30)
+    const near = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { query: '?beta=zec' })
+    expect(near.status).toBe(400)
+    expect(near.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+    expect(createCalls).toBe(0)
+    const custody = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(custody.status).toBe(200)
+    expect(createdIntent.source.refundAddress).toBe(T1)
+  })
+
+  it('custody still refuses a 20 min link and still requires a refund address', async () => {
+    linkExpiresAt = inMinutes(20)
+    const short = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(short.status).toBe(400)
+    expect(short.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+    linkExpiresAt = inMinutes(120)
+    const noRefund = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(noRefund.status).toBe(400)
+    expect(noRefund.json.code).toBe('REFUND_ADDRESS_REQUIRED')
+    expect(createCalls).toBe(0)
+  })
+
+  it('passes the custody refusal codes through with clear router messages', async () => {
+    const cases: Array<[number, string, RegExp]> = [
+      [409, 'ZEC_DAILY_CAP_REACHED', /today's limit/],
+      [409, 'ZEC_CAPACITY_BUSY', /at capacity/],
+      [503, 'ZEC_PAUSED', /paused/],
+      [503, 'ZEC_MONITOR_STALE', /catching up/],
+      [429, 'ZEC_CAPACITY_BUSY', /at capacity/],
+    ]
+    for (const [code, errorCode, msg] of cases) {
+      createAnswer = () => new Response(
+        JSON.stringify({ error: { code: errorCode, message: 'internal detail e=1180.2' }, data: { errorCode } }),
+        { status: code },
+      )
+      const { status, json } = await post(handleCreateInvoice, {
+        payment_id: SESSION_ID, source: ZEC, refund_address: T1,
+      }, { env: custodyEnv(), query: '?beta=zec' })
+      expect(status).toBe(code)
+      expect(json.code).toBe(errorCode)
+      expect(json.message).toMatch(msg)
+      expect(json.message).not.toContain('1180')
+    }
+  })
+
+  it('zecUpstreamError: custody codes on 4xx/503, never on other 5xx', () => {
+    const body = JSON.stringify({ data: { errorCode: 'ZEC_PAUSED' } })
+    expect(zecUpstreamError(503, body)?.code).toBe('ZEC_PAUSED')
+    expect(zecUpstreamError(409, body)?.code).toBe('ZEC_PAUSED')
+    expect(zecUpstreamError(500, body)).toBeNull()
+    expect(zecUpstreamError(502, body)).toBeNull()
+    // ZEC_NOT_ENABLED keeps the upstream wording, with a fallback when absent.
+    expect(zecUpstreamError(403, JSON.stringify({ data: { errorCode: 'ZEC_NOT_ENABLED' } }))?.message).toMatch(/not available/)
+  })
+
+  it('a 409 orderIdConflict is not mistaken for a custody refusal', async () => {
+    createAnswer = () => new Response(JSON.stringify({ error: { code: 'orderIdConflict' } }), { status: 409 })
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: SESSION_ID, source: ZEC, refund_address: T1,
+    }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(status).toBe(409)
+    expect(json.code).toBe('LINK_USED_OR_EXPIRED')
   })
 })

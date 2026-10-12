@@ -192,6 +192,13 @@ LIGHTNING_ROTATE_OUT_ENABLED = "true"
 # own fail-closed switch (merchant_native_tokens ZEC@9133 enabled).
 # Rollback: set NATIVE_SOURCES_BETA = "" and redeploy.
 NATIVE_SOURCES_BETA = "ZEC@9133"
+# Which rail rozo-intents-api is expected to use for NEW ZEC orders
+# (src/routes/native-sources.ts parseZecRail). "near" (default) = NEAR 1Click,
+# behaviour unchanged. "custody" = Rozo self-custody rail: provider rozo,
+# cap below $1100, 1 or 2 confirmations, shorter merchant-link pre-check.
+# Set to "custody" only together with intents app_config ZEC_CUSTODY_MODE=on.
+# Rollback: set ZEC_RAIL = "near" and redeploy.
+ZEC_RAIL = "near"
 # create-invoice abuse backstop (src/routes/create-invoice-gate.ts), per UTC
 # clock hour. Since 2026-10-10 the buyer-facing limit is rozo-intents-api's
 # tiered limiter (PR #643: 10 or 30 per IP per 10 min, 300 per IP per day,

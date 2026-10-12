@@ -367,6 +367,8 @@ export interface Env {
   NATIVE_SOURCES?: string
   // Beta native coins ("ZEC@9133"), opened only for requests with ?beta=<symbol>.
   NATIVE_SOURCES_BETA?: string
+  /** Expected rail for new ZEC orders: 'near' (default) | 'custody'. */
+  ZEC_RAIL?: string
   NATIVE_MAX_USD?: string
   // "true" lets create-invoice rotate an unpaid Lightning order out to another
   // source via /checkout. Flip only after rozo-intents-api #672 and #674 are

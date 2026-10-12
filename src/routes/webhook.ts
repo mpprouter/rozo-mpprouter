@@ -1179,6 +1179,49 @@ export function pickPaymentHold(h: any) {
   return { kind: h.kind }
 }
 
+const ZEC_PAYIN_STATES: ReadonlySet<string> = new Set([
+  'awaiting',
+  'seen',
+  'confirming',
+  'eligible',
+  'underpaid',
+  'late_review',
+  'reorged',
+  'expired',
+])
+const ZAT_RE = /^\d{1,20}$/
+const REFUND_STATUSES: ReadonlySet<string> = new Set(['none', 'pending', 'sent', 'confirmed'])
+const TX_HASH_RE = /^(0x)?[A-Za-z0-9]{32,128}$/
+const PROVIDER_RE = /^[a-z0-9_]{1,32}$/
+
+/**
+ * Whitelist the custody ZEC status block (rozo-intents-api source.zec,
+ * shared/zec-custody.ts ZecCustodyStatus). Exactly the contract keys, each
+ * type-checked; null unless the whole block is well-formed, so the checkout
+ * never renders progress from a partial or foreign shape. Confirmations may
+ * go down after a reorg; they are relayed as given.
+ */
+export function pickZecCustodyStatus(z: any) {
+  if (!z || typeof z !== 'object') return null
+  if (z.rail !== 'zec_custody') return null
+  if (z.requiredConfirmations !== 1 && z.requiredConfirmations !== 2) return null
+  if (!Number.isInteger(z.confirmations) || z.confirmations < 0 || z.confirmations > 1_000_000) return null
+  if (typeof z.requiredZat !== 'string' || !ZAT_RE.test(z.requiredZat)) return null
+  if (typeof z.receivedZat !== 'string' || !ZAT_RE.test(z.receivedZat)) return null
+  if (typeof z.payinState !== 'string' || !ZEC_PAYIN_STATES.has(z.payinState)) return null
+  const quoteExpiresAt = safeIso(z.quoteExpiresAt)
+  if (!quoteExpiresAt) return null
+  return {
+    rail: 'zec_custody' as const,
+    requiredConfirmations: z.requiredConfirmations as 1 | 2,
+    confirmations: z.confirmations as number,
+    requiredZat: z.requiredZat as string,
+    receivedZat: z.receivedZat as string,
+    payinState: z.payinState as string,
+    quoteExpiresAt,
+  }
+}
+
 export function pickRozoCallerSafe(rp: any) {
   if (!rp) return null
   return {
@@ -1188,6 +1231,19 @@ export function pickRozoCallerSafe(rp: any) {
     createdAt: rp.createdAt,
     expiresAt: rp.expiresAt,
     paymentLink: rp.paymentLink,
+    // Native orders: end of the price lock (expiresAt is when the order closes).
+    ...(safeIso(rp.quoteExpiresAt) ? { quoteExpiresAt: safeIso(rp.quoteExpiresAt) } : {}),
+    // Resolved rail ('near', 'rozo', ...). The checkout picks the ZEC card by it.
+    ...(typeof rp.provider === 'string' && PROVIDER_RE.test(rp.provider) ? { provider: rp.provider } : {}),
+    // Refund progress of a bounced / refunded order (rozo-intents-api
+    // refundStatusForPayment). The checkout already reads both; they were
+    // never relayed before, so refund progress never reached the page.
+    ...(typeof rp.refundStatus === 'string' && REFUND_STATUSES.has(rp.refundStatus)
+      ? { refundStatus: rp.refundStatus }
+      : {}),
+    ...(typeof rp.refundTxHash === 'string' && TX_HASH_RE.test(rp.refundTxHash)
+      ? { refundTxHash: rp.refundTxHash }
+      : {}),
     // Rozo's sweep found money on one of this unpaid order's addresses (e.g.
     // the address a coin switch retired, paid on another chain). Booleans and
     // a chain name only; the checkout says "earlier payment received, do not
@@ -1230,6 +1286,13 @@ export function pickRozoCallerSafe(rp: any) {
           amountReceived: rp.source.amountReceived,
           txHash: rp.source.txHash,
           confirmedAt: rp.source.confirmedAt,
+          ...(safeDecimal(rp.source.minAcceptedAmount)
+            ? { minAcceptedAmount: safeDecimal(rp.source.minAcceptedAmount) }
+            : {}),
+          ...(() => {
+            const zec = pickZecCustodyStatus(rp.source.zec)
+            return zec ? { zec } : {}
+          })(),
         }
       : null,
     destination: rp.destination

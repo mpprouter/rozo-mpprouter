@@ -48,10 +48,16 @@ import {
   nativeRequiresRefundAddress,
   nativeSourceFor,
   parseNativeSources,
+  parseZecRail,
   supportedSources,
   verifyTestPaymentId,
   withBetaSources,
+  ZEC_BLOCK_TARGET_SECONDS,
+  ZEC_CUSTODY_CONFIRMATIONS,
+  ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN,
+  ZEC_CUSTODY_QUOTE_LOCK_MIN,
   type NativeSymbol,
+  type ZecRailMode,
 } from './native-sources'
 import { normalizeContactEmail } from './contact-email'
 import {
@@ -411,6 +417,12 @@ export type CreateInvoiceErrorCode =
   | 'ZEC_REQUIRES_EXACT_OUT'
   | 'REFUND_ADDRESS_MISMATCH'
   | 'EXCEEDS_LIMIT'
+  // Custody ZEC rail (ZEC_RAIL=custody): capacity and safety refusals from
+  // rozo-intents-api, passed through with router-owned messages.
+  | 'ZEC_DAILY_CAP_REACHED'
+  | 'ZEC_CAPACITY_BUSY'
+  | 'ZEC_PAUSED'
+  | 'ZEC_MONITOR_STALE'
 
 // Resolver failure kind -> the error code a checkout UI keys its friendly copy
 // off. Without a code the UI renders the raw upstream string, so an expired
@@ -458,6 +470,22 @@ function errorResponse(status: number, err: CreateInvoiceError): Response {
  * metadata.merchant_link_expires_at; checking here first fails fast.
  */
 export const ZEC_MIN_LINK_LIFE_MS = 75 * 60 * 1000
+
+/**
+ * Custody rail (ZEC_RAIL=custody): the merchant link must outlive the 10 min
+ * price lock, a 10 min safety margin and the confirmations at the 75 s block
+ * target. The router does not know G's confirmation tier before create, so it
+ * assumes the larger one (2 confirmations): 20 min + 150 s = 22.5 min.
+ * rozo-intents-api re-checks with the real tier (custodyLinkMarginMs).
+ */
+export const ZEC_CUSTODY_MIN_LINK_LIFE_MS =
+  (ZEC_CUSTODY_QUOTE_LOCK_MIN + ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN) * 60_000 +
+  ZEC_CUSTODY_CONFIRMATIONS.from110 * ZEC_BLOCK_TARGET_SECONDS * 1000
+
+/** Minimum merchant-link life for a new ZEC order on the given rail. */
+export function zecMinLinkLifeMs(rail: ZecRailMode): number {
+  return rail === 'custody' ? ZEC_CUSTODY_MIN_LINK_LIFE_MS : ZEC_MIN_LINK_LIFE_MS
+}
 
 /**
  * rozotest_ invoices have no external link, so nothing can expire under a ZEC
@@ -514,6 +542,7 @@ export function resolveRefundAddress(
 export function checkZecLinkExpiry(
   linkExpiresAt: string | null,
   now: number = Date.now(),
+  minLifeMs: number = ZEC_MIN_LINK_LIFE_MS,
 ): { ok: true; iso: string } | { ok: false; message: string } {
   const exp = linkExpiresAt ? Date.parse(linkExpiresAt) : NaN
   if (!Number.isFinite(exp)) {
@@ -524,11 +553,11 @@ export function checkZecLinkExpiry(
         'Retry shortly, or pay with another coin.',
     }
   }
-  if (exp < now + ZEC_MIN_LINK_LIFE_MS) {
+  if (exp < now + minLifeMs) {
     return {
       ok: false,
       message:
-        'This payment link expires too soon for ZEC (a ZEC payment needs at least 75 minutes). ' +
+        `This payment link expires too soon for ZEC (a ZEC payment needs at least ${Math.ceil(minLifeMs / 60_000)} minutes). ` +
         'Pay with another coin, or create a new payment link.',
     }
   }
@@ -544,7 +573,33 @@ const ZEC_PASSTHROUGH_CODES: ReadonlySet<string> = new Set([
   'QUOTE_DRIFT',
   'ZEC_REQUIRES_EXACT_OUT',
   'EXCEEDS_LIMIT',
+  'ZEC_DAILY_CAP_REACHED',
+  'ZEC_CAPACITY_BUSY',
+  'ZEC_PAUSED',
+  'ZEC_MONITOR_STALE',
 ])
+
+/**
+ * Router-owned copy for the custody rail refusals, so the checkout and agents
+ * get a clear, stable sentence whatever the upstream wording is. No funds have
+ * moved for any of these: the order was refused before an address was issued.
+ */
+export const ZEC_CODE_MESSAGES: Readonly<Record<string, string>> = {
+  ZEC_DAILY_CAP_REACHED:
+    'ZEC payments have reached today\'s limit. Pay with another coin, or try ZEC again after 00:00 JST.',
+  ZEC_CAPACITY_BUSY:
+    'ZEC payments are at capacity right now. Try again in a few minutes, or pay with another coin.',
+  ZEC_PAUSED:
+    'ZEC payments are paused for a safety check. Pay with another coin, or try ZEC again later.',
+  ZEC_MONITOR_STALE:
+    'ZEC payment tracking is catching up. Try again in a few minutes, or pay with another coin.',
+  ZEC_NOT_ENABLED: 'ZEC payments are not available for this order. Pay with another coin.',
+}
+
+/** Upstream statuses a ZEC refusal may carry: any 4xx, and 503 for a temporary stop. */
+function isZecRefusalStatus(status: number): boolean {
+  return (status >= 400 && status < 500) || status === 503
+}
 
 /**
  * The upstream error code of a failed ZEC create, when it is one the checkout
@@ -556,7 +611,7 @@ export function zecUpstreamError(
   status: number,
   text: string,
 ): { code: CreateInvoiceErrorCode; message: string } | null {
-  if (status !== 400 && status !== 403) return null
+  if (!isZecRefusalStatus(status)) return null
   let body: any
   try {
     body = JSON.parse(text)
@@ -567,9 +622,11 @@ export function zecUpstreamError(
   const code = candidates.find((c) => typeof c === 'string' && ZEC_PASSTHROUGH_CODES.has(c))
   if (!code) return null
   const rawMessage = body?.error?.message ?? body?.message
+  const owned = code !== 'ZEC_NOT_ENABLED' ? ZEC_CODE_MESSAGES[code] : undefined
+  const upstream = typeof rawMessage === 'string' && rawMessage ? rawMessage.substring(0, 300) : null
   return {
     code: code as CreateInvoiceErrorCode,
-    message: typeof rawMessage === 'string' && rawMessage ? rawMessage.substring(0, 300) : code,
+    message: owned ?? upstream ?? ZEC_CODE_MESSAGES[code] ?? code,
   }
 }
 
@@ -1680,7 +1737,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
-  const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD)
+  const zecRail = parseZecRail(env.ZEC_RAIL)
+  const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail)
   if (nativeSource && Number(callerPays) > nativeCap) {
     return errorResponse(400, {
       code: 'UNSUPPORTED_SOURCE',
@@ -2193,7 +2251,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       testInvoiceCents !== null
         ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
         : await linkExpiresAtPromise
-    const check = checkZecLinkExpiry(linkExpiry)
+    const check = checkZecLinkExpiry(linkExpiry, Date.now(), zecMinLinkLifeMs(zecRail))
     if (!check.ok) {
       return errorResponse(400, {
         code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
@@ -2311,6 +2369,23 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
 
   const intentsText = await intentsResp.text()
   if (!intentsResp.ok) {
+    // Beta ZEC: rozo-intents-api's ZEC refusals (switch off, bad refund
+    // address, link too short, quote drift, over cap, custody daily cap /
+    // capacity / pause / stale monitor) are caller-actionable; pass status and
+    // code through unchanged instead of a generic 502. Checked before the 429
+    // relay so a custody refusal keeps its own code; anything else falls through.
+    if (refundAddressRequired) {
+      const zecErr = zecUpstreamError(intentsResp.status, intentsText)
+      if (zecErr) {
+        return errorResponse(intentsResp.status, {
+          code: zecErr.code,
+          message: zecErr.message,
+          upstream_status: intentsResp.status,
+          normalized_input: normalized,
+          link_id_detected,
+        })
+      }
+    }
     // rozo-intents-api owns the buyer-facing creation limit: pass its 429
     // (status, Retry-After, X-RateLimit-*, errorCode/tier) through.
     const rateLimited = relayUpstreamRateLimit(intentsResp, intentsText)
@@ -2426,21 +2501,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         normalized_input: normalized,
         link_id_detected,
       })
-    }
-    // Beta ZEC: rozo-intents-api's ZEC refusals (switch off, bad refund
-    // address, link too short, quote drift, over cap) are caller-actionable;
-    // pass status and code through unchanged instead of a generic 502.
-    if (refundAddressRequired) {
-      const zecErr = zecUpstreamError(intentsResp.status, intentsText)
-      if (zecErr) {
-        return errorResponse(intentsResp.status, {
-          code: zecErr.code,
-          message: zecErr.message,
-          upstream_status: intentsResp.status,
-          normalized_input: normalized,
-          link_id_detected,
-        })
-      }
     }
     return errorResponse(502, {
       code: 'INTENTS_API_FAILED',
