@@ -32,7 +32,7 @@ export interface NativeSourceDef {
   symbol: NativeSymbol
   tokenAddress: string
   /** Upstream route rozo-intents-api uses. Informational here (intents forces it). */
-  provider?: 'near'
+  provider?: 'near' | 'rozo'
   /** Per-coin cap on callerPays in USD; the lower of this and NATIVE_MAX_USD applies. */
   maxUsd?: number
   /** Typical seconds from deposit to settlement, for the checkout copy. */
@@ -68,6 +68,50 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
 }
 
 const nativeKey = (chainId: string, d: NativeSourceDef) => `${d.symbol}@${chainId}`
+
+// ── ZEC rail (ZEC_RAIL var) ─────────────────────────────────────────────────
+//
+// The router cannot see which rail rozo-intents-api will pick for a new ZEC
+// order (app_config ZEC_CUSTODY_MODE), so wrangler.toml carries the expected
+// one for the metadata and pre-checks shown before create:
+//   near    (default) NEAR 1Click deposit address; today's behaviour unchanged.
+//   custody Rozo self-custody rail: a per-order t1 address on our own HD
+//           wallet, 1 confirmation below $110 and 2 from $110, G < $1100.
+// rozo-intents-api stays the final gate either way.
+
+export type ZecRailMode = 'near' | 'custody'
+
+/** Parse ZEC_RAIL. Anything but an exact "custody" keeps the near rail. */
+export function parseZecRail(raw: string | undefined): ZecRailMode {
+  return (raw ?? '').trim().toLowerCase() === 'custody' ? 'custody' : 'near'
+}
+
+/** Confirmation tiers of the custody rail, by amount payable G in USD. */
+export const ZEC_CUSTODY_CONFIRMATIONS = { under110: 1, from110: 2 } as const
+
+/** Custody quote lock, link safety margin and block target (rozo-intents-api shared/zec-custody.ts). */
+export const ZEC_CUSTODY_QUOTE_LOCK_MIN = 10
+export const ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN = 10
+export const ZEC_BLOCK_TARGET_SECONDS = 75
+
+/**
+ * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below $1100.
+ * No arrival estimate: block times vary and the checkout must not promise one,
+ * so sourceMeta omits eta_seconds for this rail.
+ */
+const ZEC_CUSTODY_OVERRIDE: Partial<NativeSourceDef> = {
+  provider: 'rozo',
+  maxUsd: 1099.99,
+  etaSeconds: undefined,
+}
+
+/** The effective def for a chain under the given ZEC rail (only ZEC changes). */
+export function nativeSourceDef(chainId: string, rail: ZecRailMode = 'near'): NativeSourceDef | undefined {
+  const def = NATIVE_SOURCE_DEFS[chainId]
+  if (!def) return undefined
+  if (rail === 'custody' && def.symbol === 'ZEC') return { ...def, ...ZEC_CUSTODY_OVERRIDE }
+  return def
+}
 
 /**
  * Every generally available native coin (beta coins excluded). Internal
@@ -149,11 +193,14 @@ export function withBetaSources(
 
 /** Checkout metadata for an open native coin (see sourceMeta). */
 export interface NativeSourceMeta {
-  eta_seconds: number
+  /** Omitted for the custody ZEC rail (no arrival estimate). */
+  eta_seconds?: number
   refund_address_required: boolean
   beta: boolean
   /** The deposit address is valid for one payment only; never pay it twice. */
   address_single_use: boolean
+  /** Custody ZEC only: confirmations required below / from $110 payable. */
+  confirmations?: { under110: number; from110: number }
 }
 
 /**
@@ -161,18 +208,24 @@ export interface NativeSourceMeta {
  * "SYMBOL@chainId". Only coins that carry metadata (today: near-routed ZEC)
  * appear; supportedSources keeps its { chainId: string[] } shape.
  */
-export function sourceMeta(nativeAllowed: ReadonlySet<string> = new Set()): Record<string, NativeSourceMeta> {
+export function sourceMeta(
+  nativeAllowed: ReadonlySet<string> = new Set(),
+  zecRail: ZecRailMode = 'near',
+): Record<string, NativeSourceMeta> {
   const out: Record<string, NativeSourceMeta> = {}
-  for (const [chainId, d] of Object.entries(NATIVE_SOURCE_DEFS)) {
+  for (const chainId of Object.keys(NATIVE_SOURCE_DEFS)) {
+    const d = nativeSourceDef(chainId, zecRail) as NativeSourceDef
     const key = nativeKey(chainId, d)
     if (!nativeAllowed.has(key)) continue
     if (d.etaSeconds === undefined && !d.refundAddressRequired && !d.beta) continue
     out[key] = {
-      eta_seconds: d.etaSeconds ?? 0,
+      ...(d.provider === 'rozo' ? {} : { eta_seconds: d.etaSeconds ?? 0 }),
       refund_address_required: !!d.refundAddressRequired,
       beta: !!d.beta,
-      // near 1Click deposit addresses are single-quote, single-use.
-      address_single_use: d.provider === 'near',
+      // near 1Click deposit addresses are single-quote, single-use; custody
+      // addresses are derived per order and watched for that order only.
+      address_single_use: d.provider === 'near' || d.provider === 'rozo',
+      ...(d.provider === 'rozo' ? { confirmations: { ...ZEC_CUSTODY_CONFIRMATIONS } } : {}),
     }
   }
   return out
@@ -256,9 +309,9 @@ export function nativeMaxUsd(raw: string | undefined): number {
 }
 
 /** Cap for one native coin: the lower of its own maxUsd and NATIVE_MAX_USD. */
-export function nativeMaxUsdFor(chainId: string, raw: string | undefined): number {
+export function nativeMaxUsdFor(chainId: string, raw: string | undefined, zecRail: ZecRailMode = 'near'): number {
   const global = nativeMaxUsd(raw)
-  const own = NATIVE_SOURCE_DEFS[chainId]?.maxUsd
+  const own = nativeSourceDef(chainId, zecRail)?.maxUsd
   return typeof own === 'number' && own > 0 ? Math.min(own, global) : global
 }
 
