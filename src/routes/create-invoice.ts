@@ -24,6 +24,7 @@ import {
   REUSABLE_PAYMENT_STATUS,
   ROZO_APP_ID,
   ROZO_INTENTS_BASE,
+  isContractRow,
   lookupIntentsOrder,
   readPaymentStatus,
   readRowSource,
@@ -1857,7 +1858,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       })
     }
 
-    const isContractRow = (r: any) => Boolean(r?.source?.receiverAddressContract)
     const linkSpentResponse = () =>
       errorResponse(409, {
         code: 'LINK_USED_OR_EXPIRED',
