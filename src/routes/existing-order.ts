@@ -5,12 +5,14 @@
 // orderId rules (same for both callers):
 // - Coinbase payment-links / payment-sessions and internal rozotest_ invoices:
 //   appId merchant_openrouter, orderId = the link id, plus the contract-variant
-//   slots, plus the __retryN slots once the base order has expired.
+//   slots (create-invoice also scans the __retryN slots once the base order has
+//   expired; the quote summary does not).
 // - Stripe Crypto: appId wallet_rozopay, orderId = stripe_crypto_<cpis_*>.
 
 import type { Env } from '../index'
-import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
+import { contractVariantIds } from '../mpp/contract-variant'
 import { stripeOrderId } from './stripe-fulfillment'
+import { rowFundingEvidence } from './relink-guard'
 
 export const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
 // appId Stripe Crypto orders are filed under.
@@ -71,25 +73,55 @@ export async function lookupIntentsOrder(
   return { state: 'found', row }
 }
 
+/**
+ * Where a link's current order stands, for the checkout:
+ * - payable: awaiting payment, unexpired, no funding evidence.
+ * - funded:  any funding evidence on the row (rowFundingEvidence, the relink
+ *            guard's rules), or a status past unpaid that is not an unpaid end.
+ * - ended:   expired with no funding evidence, refunded, bounced or failed.
+ */
+export type ExistingOrderState = 'payable' | 'funded' | 'ended'
+
 /** Read-only view of a link's current order, safe to show any quote caller. */
 export interface ExistingOrderSummary {
   rozoPaymentId: string | null
   status: string | null
   source: { chainId: string | null; tokenSymbol: string | null }
   expiresAt: string | null
-  /** True for any status past unpaid (funded, settling, settled, refunded). */
+  state: ExistingOrderState
+  /** Compatibility alias: state === 'funded'. */
   paid: boolean
 }
 
 export type ExistingOrderTarget =
-  | { provider: 'coinbase'; linkId: string } // also rozotest_ ids
-  | { provider: 'stripe_crypto'; invoiceKey: string }
+  | { provider: 'coinbase'; linkId: string } // pl_*, paymentSession_*, signed rozotest_
+  | { provider: 'stripe_crypto'; invoiceKey: string } // cpis_*
 
-export const EXISTING_ORDER_TIMEOUT_MS = 2000
+/**
+ * Lookup outcome. 'unknown' = could not tell in time (failed, timed out,
+ * rate limited): the caller must not assume there is no order.
+ */
+export type ExistingOrderResult =
+  | { kind: 'found'; summary: ExistingOrderSummary }
+  | { kind: 'none' }
+  | { kind: 'unknown' }
 
-/** Same rule create-invoice uses for "no longer awaiting payment". */
-function isPastUnpaid(status: string | null): boolean {
-  return status !== null && status !== REUSABLE_PAYMENT_STATUS && status !== 'payment_expired'
+/** The quote never waits longer than this for the lookup. */
+export const EXISTING_ORDER_TIMEOUT_MS = 1500
+
+// Statuses that end an order with the money not kept (or never arrived).
+const ENDED_STATUSES = new Set(['payment_expired', 'payment_refunded', 'payment_bounced', 'payment_failed'])
+// Of those, the ones that end it after money moved and went back.
+const RETURNED_STATUSES = new Set(['payment_refunded', 'payment_bounced', 'payment_failed'])
+
+const COINBASE_ID_RE = /^(?:pl_|paymentSession_)[A-Za-z0-9_-]{1,128}$/
+const TEST_ID_RE = /^rozotest_\d{1,5}_[a-z0-9]{6,32}_[0-9a-f]{16}$/
+const STRIPE_KEY_RE = /^cpis_[A-Za-z0-9]{1,128}$/
+
+/** Only well-formed ids reach the intents API (no spray of arbitrary keys). */
+export function isLookupTargetValid(target: ExistingOrderTarget): boolean {
+  if (target.provider === 'stripe_crypto') return STRIPE_KEY_RE.test(target.invoiceKey)
+  return COINBASE_ID_RE.test(target.linkId) || TEST_ID_RE.test(target.linkId)
 }
 
 function isLive(row: any): boolean {
@@ -97,17 +129,30 @@ function isLive(row: any): boolean {
   return Number.isFinite(exp) && exp > Date.now()
 }
 
+export function classifyOrderState(row: any): ExistingOrderState {
+  const status = readPaymentStatus(row)
+  if (status !== null && RETURNED_STATUSES.has(status)) return 'ended'
+  if (rowFundingEvidence(row)) return 'funded'
+  if (status === REUSABLE_PAYMENT_STATUS) return isLive(row) ? 'payable' : 'ended'
+  if (status !== null && ENDED_STATUSES.has(status)) return 'ended'
+  // Past unpaid (payin / payout completed, in flight) or an unknown status:
+  // treat as money moving, never as payable.
+  return 'funded'
+}
+
 /** Only these fields leave the Worker. No addresses, amounts, BOLT11, tokens. */
 export function summarizeOrder(row: any): ExistingOrderSummary {
   const status = readPaymentStatus(row)
   const id = row?.id
   const expiresAt = row?.expiresAt
+  const state = classifyOrderState(row)
   return {
     rozoPaymentId: typeof id === 'string' ? id : null,
     status: typeof status === 'string' ? status : null,
     source: readRowSource(row),
     expiresAt: typeof expiresAt === 'string' ? expiresAt : null,
-    paid: isPastUnpaid(typeof status === 'string' ? status : null),
+    state,
+    paid: state === 'funded',
   }
 }
 
@@ -121,58 +166,76 @@ async function scanOrderRows(
     if (r.state === 'error') return null
     return r.state === 'found' ? [r.row] : []
   }
-  // Same slot scan as create-invoice: base + contract variants, then the
-  // __retryN slots only once the base order exists and is no longer live.
-  const firstIds = [target.linkId, ...contractVariantIds(target.linkId)]
-  let scanned = await Promise.all(
-    firstIds.map((id) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)),
+  // Same base + contract-variant slots create-invoice scans first. The
+  // __retryN slots are skipped here on purpose (bounded fan-out per quote);
+  // create-invoice still scans them and remains the gate.
+  const ids = [target.linkId, ...contractVariantIds(target.linkId)]
+  const scanned = await Promise.all(
+    ids.map((id) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)),
   )
-  const base = scanned[0]
-  if (base.state === 'found' && !isLive(base.row)) {
-    const more = await Promise.all(
-      retryOrderIds(target.linkId).map((id) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)),
-    )
-    scanned = [...scanned, ...more]
-  }
-  // A partial view could show "unpaid" while a sibling is already settling:
-  // any failed slot means no answer at all.
+  // A partial view could show "payable" while a sibling is already settling:
+  // any failed slot means no answer.
   if (scanned.some((r) => r.state === 'error')) return null
   return scanned.filter((r): r is { state: 'found'; row: any } => r.state === 'found').map((r) => r.row)
 }
 
+export interface ExistingOrderOptions {
+  timeoutMs?: number
+  /** Per-caller budget check run before any intents call; false = 'unknown'. */
+  allow?: () => Promise<boolean>
+}
+
 /**
- * The link's current order, or null when it has none, the lookup failed, or
- * it took longer than `timeoutMs`. Never throws: a quote must not fail or slow
- * down because of it.
+ * The link's current order. Advisory only: create-invoice remains the gate.
+ * Never throws and never takes longer than `timeoutMs`.
  *
- * Current order, in priority: one past unpaid (money moving or moved), then a
- * live unpaid one, then the most recently allocated slot.
+ * Current order, in priority: a funded one, then a payable one, then the most
+ * recently allocated slot.
  */
-export async function findExistingOrderSummary(
+export async function findExistingOrder(
   env: Env,
   target: ExistingOrderTarget,
-  timeoutMs = EXISTING_ORDER_TIMEOUT_MS,
-): Promise<ExistingOrderSummary | null> {
-  if (!env.ROZO_INTENTS_API_KEY) return null
+  opts: ExistingOrderOptions = {},
+): Promise<ExistingOrderResult> {
+  if (!env.ROZO_INTENTS_API_KEY || !isLookupTargetValid(target)) return { kind: 'none' }
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<null>((resolve) => {
+  const timeout = new Promise<ExistingOrderResult>((resolve) => {
     timer = setTimeout(() => {
       controller.abort()
-      resolve(null)
-    }, timeoutMs)
+      resolve({ kind: 'unknown' })
+    }, opts.timeoutMs ?? EXISTING_ORDER_TIMEOUT_MS)
   })
+  const work = (async (): Promise<ExistingOrderResult> => {
+    if (opts.allow && !(await opts.allow())) return { kind: 'unknown' }
+    const rows = await scanOrderRows(env, target, controller.signal)
+    if (rows === null) return { kind: 'unknown' }
+    if (rows.length === 0) return { kind: 'none' }
+    const states = rows.map((r) => classifyOrderState(r))
+    const pick =
+      states.indexOf('funded') >= 0 ? states.indexOf('funded')
+      : states.indexOf('payable') >= 0 ? states.indexOf('payable')
+      : rows.length - 1
+    return { kind: 'found', summary: summarizeOrder(rows[pick]) }
+  })()
   try {
-    const rows = await Promise.race([scanOrderRows(env, target, controller.signal), timeout])
-    if (!rows || rows.length === 0) return null
-    const current =
-      rows.find((r) => isPastUnpaid(readPaymentStatus(r))) ??
-      rows.find((r) => readPaymentStatus(r) === REUSABLE_PAYMENT_STATUS && isLive(r)) ??
-      rows[rows.length - 1]
-    return summarizeOrder(current)
+    return await Promise.race([work, timeout])
   } catch {
-    return null
+    return { kind: 'unknown' }
   } finally {
     if (timer !== undefined) clearTimeout(timer)
   }
+}
+
+/**
+ * Response fields: `existingOrder` when found, `existingOrderUnknown: true`
+ * when the lookup could not answer in time (so a client does not auto-switch
+ * coins on an order it cannot see), nothing when the link has no order.
+ */
+export function existingOrderFields(
+  r: ExistingOrderResult,
+): { existingOrder?: ExistingOrderSummary; existingOrderUnknown?: true } {
+  if (r.kind === 'found') return { existingOrder: r.summary }
+  if (r.kind === 'unknown') return { existingOrderUnknown: true }
+  return {}
 }

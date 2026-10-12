@@ -79,7 +79,7 @@ type RateLimitResult = { ok: true } | { ok: false; retryAfterS: number }
  * endpoint. Fails OPEN if KV is unavailable so a KV outage never takes down the
  * endpoint.
  */
-async function rateLimitOk(
+export async function rateLimitOk(
   env: Env,
   bucket: string,
   limit: number,
