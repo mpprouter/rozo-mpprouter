@@ -108,8 +108,12 @@ export type ExistingOrderResult =
   | { kind: 'none' }
   | { kind: 'unknown' }
 
-/** Cap on one lookup. Off the quote's critical path, so it can be generous. */
-export const EXISTING_ORDER_TIMEOUT_MS = 5000
+/**
+ * Total deadline for one existing-order call. Off the quote's critical path,
+ * so it can be generous: each intents order GET takes ~2.5s in production
+ * (2026-10-12), and an expired base order needs a second (retry) round.
+ */
+export const EXISTING_ORDER_TIMEOUT_MS = 9000
 
 // Statuses that end an order with the money not kept (or never arrived).
 const ENDED_STATUSES = new Set(['payment_expired', 'payment_refunded', 'payment_bounced', 'payment_failed'])
@@ -184,23 +188,26 @@ async function scanOrderSlots(
     const row = r.state === 'found' ? r.row : null
     return [{ id, slot: 'base', row, live: row ? isLive(row) : false }]
   }
-  // Exactly create-invoice's scan: base + contract variants in parallel, and
-  // the __retryN slots once the base order exists and is no longer live
+  // Exactly create-invoice's slot set: base + contract variants in parallel,
+  // and the __retryN slots once the base order exists and is no longer live
   // (create-invoice re-orders into them after the base order expired).
+  //
+  // The retry round starts as soon as the BASE slot answers, without waiting
+  // for the contract slots (each GET is ~2.5s in production). Safe for
+  // pickCurrentOrder: the condition depends on the base row alone, and the
+  // set of slots read (and their order in `entries`) is the same as a
+  // sequential scan; only the timing overlaps.
   const firstIds = [target.linkId, ...contractVariantIds(target.linkId)]
-  let ids = firstIds
-  let scanned = await Promise.all(
-    firstIds.map((id) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)),
+  const retryIds = retryOrderIds(target.linkId)
+  const lookup = (id: string) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)
+  const baseP = lookup(firstIds[0])
+  const contractP = Promise.all(firstIds.slice(1).map(lookup))
+  const retryP = baseP.then((base) =>
+    base.state === 'found' && !isLive(base.row) ? Promise.all(retryIds.map(lookup)) : null,
   )
-  const base = scanned[0]
-  if (base.state === 'found' && !isLive(base.row)) {
-    const retryIds = retryOrderIds(target.linkId)
-    const more = await Promise.all(
-      retryIds.map((id) => lookupIntentsOrder(env, OPENROUTER_APP_ID, id, signal)),
-    )
-    ids = [...firstIds, ...retryIds]
-    scanned = [...scanned, ...more]
-  }
+  const [base, contracts, retries] = await Promise.all([baseP, contractP, retryP])
+  const ids = retries ? [...firstIds, ...retryIds] : firstIds
+  const scanned = [base, ...contracts, ...(retries ?? [])]
   // A partial view could show "payable" while a sibling is already settling:
   // any failed slot means no answer.
   if (scanned.some((r) => r.state === 'error')) return null
