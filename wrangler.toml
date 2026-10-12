@@ -199,7 +199,7 @@ NATIVE_SOURCES_BETA = "ZEC@9133"
 # merchant-link pre-check.
 # Set to "custody" only together with intents app_config ZEC_CUSTODY_MODE=on.
 # Rollback: set ZEC_RAIL = "near" and redeploy.
-ZEC_RAIL = "near"
+ZEC_RAIL = "custody"
 # create-invoice abuse backstop (src/routes/create-invoice-gate.ts), per UTC
 # clock hour. Since 2026-10-10 the buyer-facing limit is rozo-intents-api's
 # tiered limiter (PR #643: 10 or 30 per IP per 10 min, 300 per IP per day,
