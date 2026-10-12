@@ -140,8 +140,15 @@ export async function handleExistingOrder(request: Request, env: Env): Promise<R
       const retryAfterS = Number(limited.headers.get('Retry-After')) || 60
       return rateLimited(retryAfterS)
     }
+    // Check the time budget BEFORE touching Stripe: no resolve is started
+    // that could not finish inside the deadline.
+    const resolveMs = deadline - Date.now()
+    if (resolveMs <= 0) return result(UNKNOWN)
+    const resolving = resolveStripeInvoice(normalized.url)
+    // Observed even if the deadline wins the race below.
+    resolving.catch(() => undefined)
     try {
-      const invoice = await withDeadline(resolveStripeInvoice(normalized.url), deadline - Date.now())
+      const invoice = await withDeadline(resolving, resolveMs)
       // Cannot tell which order this link maps to: unknown, not "none".
       if (invoice === TIMED_OUT) return result(UNKNOWN)
       target = { provider: 'stripe_crypto', invoiceKey: invoice.invoiceKey }

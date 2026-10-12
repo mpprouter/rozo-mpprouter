@@ -354,10 +354,24 @@ describe('GET existing-order', () => {
     try {
       vi.spyOn(globalThis, 'fetch').mockImplementation((() => new Promise<Response>(() => {})) as typeof fetch)
       const p = existing({ link: STRIPE_URL })
-      await vi.advanceTimersByTimeAsync(5_100)
+      await vi.advanceTimersByTimeAsync(9_100)
       const { status, json } = await p
       expect(status).toBe(200)
       expect(json).toEqual({ existingOrder: null, unknown: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a Stripe resolve that rejects after the deadline is observed (no unhandled rejection)', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.spyOn(globalThis, 'fetch').mockImplementation((() =>
+        new Promise<Response>((_, reject) => setTimeout(() => reject(new Error('late')), 9_500))) as typeof fetch)
+      const p = existing({ link: STRIPE_URL })
+      await vi.advanceTimersByTimeAsync(9_100)
+      expect((await p).json).toEqual({ existingOrder: null, unknown: true })
+      await vi.advanceTimersByTimeAsync(1_000) // the late rejection fires here
     } finally {
       vi.useRealTimers()
     }
@@ -396,6 +410,100 @@ describe('GET existing-order', () => {
   it('rejects non-GET', async () => {
     const res = await handleExistingOrder(new Request('https://mpp.test/x', { method: 'POST' }), makeEnv())
     expect(res.status).toBe(405)
+  })
+})
+
+describe('existing-order timing (intents GET ~2.5s in production)', () => {
+  const SLOW_MS = 2_500
+
+  /** Order lookups resolve after SLOW_MS; records when each one started. */
+  function mockSlowOrders(orders: OrderMap, delays: Record<string, number> = {}) {
+    const started: Array<{ key: string; at: number }> = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      const m = /\/payments\/order\/([^/]+)\/([^/?]+)$/.exec(u)
+      if (!m) return new Response('unexpected', { status: 500 })
+      const key = `${decodeURIComponent(m[1])}/${decodeURIComponent(m[2])}`
+      started.push({ key, at: Date.now() })
+      const hit = orders[key]
+      const delay = delays[key] ?? SLOW_MS
+      return new Promise<Response>((resolve, reject) => {
+        const t = setTimeout(() => {
+          if (hit === 'hang') return
+          resolve(hit ? Response.json(hit) : new Response('not found', { status: 404 }))
+        }, delay)
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(t)
+          reject(new Error('aborted'))
+        })
+      })
+    }) as typeof fetch)
+    return started
+  }
+
+  afterEach(() => vi.useRealTimers())
+
+  it('two sequential ~2.5s rounds (expired base, live retry) finish inside the 9s deadline', async () => {
+    vi.useFakeTimers()
+    const t0 = Date.now()
+    mockSlowOrders({
+      [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_expired', PAST),
+      [`merchant_openrouter/${LINK}__retry2`]: row('rozo-retry', 'payment_unpaid'),
+    })
+    const p = existing({ payment_id: LINK })
+    await vi.advanceTimersByTimeAsync(5_100)
+    const { json } = await p
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-retry', state: 'payable' })
+    expect(json.unknown).toBe(false)
+    expect(Date.now() - t0).toBeLessThan(9_000)
+  })
+
+  it('the retry round starts when the base slot answers, not after the contract slots', async () => {
+    vi.useFakeTimers()
+    const t0 = Date.now()
+    const started = mockSlowOrders(
+      {
+        [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_expired', PAST),
+        [`merchant_openrouter/${LINK}__retry2`]: row('rozo-retry', 'payment_unpaid'),
+      },
+      {
+        [`merchant_openrouter/${LINK}`]: 500, // base answers fast
+        [`merchant_openrouter/${LINK}__contract`]: 4_000,
+        [`merchant_openrouter/${LINK}__contract2`]: 4_000,
+        [`merchant_openrouter/${LINK}__contract3`]: 4_000,
+      },
+    )
+    let done = false
+    const p = existing({ payment_id: LINK }).then((r) => { done = true; return r })
+    await vi.advanceTimersByTimeAsync(600)
+    const retryStarts = started.filter((s) => s.key.includes('__retry'))
+    expect(retryStarts).toHaveLength(5)
+    for (const r of retryStarts) expect(r.at - t0).toBeLessThan(1_000)
+    // Done once the slowest slot (contract, 4s) answers: overlapped, not 4s + 2.5s.
+    await vi.advanceTimersByTimeAsync(3_500)
+    expect(done).toBe(true)
+    const { json } = await p
+    expect(json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-retry' })
+  })
+
+  it('no retry round while the base order is live', async () => {
+    vi.useFakeTimers()
+    const started = mockSlowOrders({ [`merchant_openrouter/${LINK}`]: row('rozo-base', 'payment_unpaid') })
+    const p = existing({ payment_id: LINK })
+    await vi.advanceTimersByTimeAsync(2_600)
+    expect((await p).json.existingOrder).toMatchObject({ rozoPaymentId: 'rozo-base' })
+    expect(started.some((s) => s.key.includes('__retry'))).toBe(false)
+  })
+
+  it('a lookup still running at 9s is cut and reported unknown', async () => {
+    vi.useFakeTimers()
+    mockSlowOrders({ [`merchant_openrouter/${LINK}`]: 'hang' })
+    let done = false
+    const p = existing({ payment_id: LINK }).then((r) => { done = true; return r })
+    await vi.advanceTimersByTimeAsync(8_900)
+    expect(done).toBe(false)
+    await vi.advanceTimersByTimeAsync(200)
+    expect((await p).json).toEqual({ existingOrder: null, unknown: true })
   })
 })
 
