@@ -178,6 +178,44 @@ export function sourceMeta(nativeAllowed: ReadonlySet<string> = new Set()): Reco
   return out
 }
 
+/**
+ * Per-chain USD order minimum for a native coin, mirrored from rozo-intents-api
+ * `supabase/functions/shared/native-quote.ts` NATIVE_MIN_USD_DEFAULTS (read by
+ * getNativeMinUsd, then nativeMinUsdFor in shared/native-payin-gates.ts).
+ * Below it upstream rejects the order with `amountTooLow`. Upstream can raise
+ * a chain through app_config NATIVE_MIN_USD_<chainId>; this Worker cannot see
+ * that, so these are the built-in floors, and upstream stays the final gate.
+ * Keep in sync when upstream changes. ZEC (near route) is priced by 1Click and
+ * has no entry here.
+ */
+export const NATIVE_MIN_USD: Readonly<Record<string, number>> = {
+  '1': 1, // Ethereum mainnet (gas-driven)
+  '8453': 0.1,
+  '42161': 0.1,
+  '56': 0.1,
+  '137': 0.1,
+  '900': 1, // Solana (founder 2026-07-10)
+}
+
+/**
+ * Minimum order in USD for each native coin open on this request, shaped like
+ * supportedSources: { "<chainId>": { "<SYMBOL>": minUsd } }. Additive, so
+ * supportedSources keeps its shape for existing consumers. Coins without a
+ * known minimum are left out.
+ */
+export function nativeMinUsd(
+  nativeAllowed: ReadonlySet<string> = new Set(),
+): Record<string, Record<string, number>> {
+  const out: Record<string, Record<string, number>> = {}
+  for (const [chainId, def] of Object.entries(NATIVE_SOURCE_DEFS)) {
+    if (!nativeAllowed.has(nativeKey(chainId, def))) continue
+    const min = NATIVE_MIN_USD[chainId]
+    if (typeof min !== 'number') continue
+    out[chainId] = { ...(out[chainId] ?? {}), [def.symbol]: min }
+  }
+  return out
+}
+
 export function nativeSourceFor(
   chainId: string,
   tokenSymbol: string,
