@@ -527,7 +527,7 @@ describe('ZEC helpers', () => {
 describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
   const custodyEnv = () => makeEnv({ ZEC_RAIL: 'custody' })
   const CUSTODY_META = {
-    refund_address_required: true,
+    refund_address_required: false,
     beta: true,
     address_single_use: true,
     confirmations: { under110: 1, from110: 2 },
@@ -594,16 +594,82 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(createdIntent.source.refundAddress).toBe(T1)
   })
 
-  it('custody still refuses a 20 min link and still requires a refund address', async () => {
+  it('custody still refuses a 20 min link', async () => {
     linkExpiresAt = inMinutes(20)
     const short = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { env: custodyEnv(), query: '?beta=zec' })
     expect(short.status).toBe(400)
     expect(short.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
-    linkExpiresAt = inMinutes(120)
-    const noRefund = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: '?beta=zec' })
-    expect(noRefund.status).toBe(400)
-    expect(noRefund.json.code).toBe('REFUND_ADDRESS_REQUIRED')
     expect(createCalls).toBe(0)
+  })
+
+  it('custody: refund address optional (none forwarded, no digest); near still requires it', async () => {
+    linkExpiresAt = inMinutes(120)
+    for (const body of [{}, { refund_address: '' }, { refund_address: '   ' }]) {
+      createCalls = 0
+      createdIntent = null
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, ...body }, { env: custodyEnv(), query: '?beta=zec' })
+      expect(r.status).toBe(200)
+      expect(createCalls).toBe(1)
+      expect('refundAddress' in createdIntent.source).toBe(false)
+      expect(createdIntent.metadata[ZEC_REFUND_DIGEST_KEY]).toBeUndefined()
+      expect(createdIntent.metadata.zec_refund_address_none).toBe(true)
+    }
+    // A provided non-string value is not "absent": it is refused.
+    const odd = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: 12345 }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(odd.status).toBe(400)
+    expect(odd.json.code).toBe('REFUND_ADDRESS_REQUIRED')
+    createCalls = 0
+    const near = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { query: '?beta=zec' })
+    expect(near.status).toBe(400)
+    expect(near.json.code).toBe('REFUND_ADDRESS_REQUIRED')
+    expect(createCalls).toBe(0)
+  })
+
+  it('custody: a provided refund address is still checked and forwarded', async () => {
+    linkExpiresAt = inMinutes(120)
+    const shielded = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: 'zs1abcdef' }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(shielded.status).toBe(400)
+    expect(shielded.json.code).toBe('ZEC_SHIELDED_ADDRESS_NOT_SUPPORTED')
+    const junk = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: 't1 bad!' }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(junk.status).toBe(400)
+    expect(junk.json.code).toBe('REFUND_ADDRESS_REQUIRED')
+    expect(createCalls).toBe(0)
+    const ok = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(ok.status).toBe(200)
+    expect(createdIntent.source.refundAddress).toBe(T1)
+    expect(createdIntent.metadata[ZEC_REFUND_DIGEST_KEY]).toBe(await refundAddressDigest(T1))
+    expect(createdIntent.metadata.zec_refund_address_none).toBeUndefined()
+  })
+
+  it('custody reuse: an order created without a refund address is reused; a bound one is still checked', async () => {
+    linkExpiresAt = inMinutes(120)
+    await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: '?beta=zec' })
+    existingOrder = rowFrom(createdIntent)
+    createCalls = 0
+    for (const body of [{}, { refund_address: T1 }]) {
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, ...body }, { env: custodyEnv(), query: '?beta=zec' })
+      expect(r.status).toBe(200)
+      expect(r.json.reused).toBe(true)
+    }
+    expect(createCalls).toBe(0)
+    // Near rail: the same unbound order cannot be verified, so it is not handed out.
+    const near = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { query: '?beta=zec' })
+    expect(near.status).toBe(409)
+    expect(near.json.code).toBe('REFUND_ADDRESS_MISMATCH')
+    // Without the marker an unbound order (e.g. an older near order whose
+    // digest is missing) is still "cannot be verified" on custody too.
+    const unmarked = rowFrom(createdIntent)
+    delete (unmarked.metadata as any).zec_refund_address_none
+    existingOrder = unmarked
+    const unverified = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(unverified.status).toBe(409)
+    expect(unverified.json.code).toBe('REFUND_ADDRESS_MISMATCH')
+    // A custody order that did bind an address keeps the mismatch check.
+    existingOrder = null
+    existingOrder = rowFrom(await freshZecIntent())
+    const other = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1_OTHER }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(other.status).toBe(409)
+    expect(other.json.code).toBe('REFUND_ADDRESS_MISMATCH')
   })
 
   it('passes the custody refusal codes through with clear router messages', async () => {

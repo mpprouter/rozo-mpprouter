@@ -103,6 +103,9 @@ const ZEC_CUSTODY_OVERRIDE: Partial<NativeSourceDef> = {
   provider: 'rozo',
   maxUsd: 1099.99,
   etaSeconds: undefined,
+  // Founder 2026-10-13: the deposit address is our own wallet, so the payer's
+  // refund address is optional (late or short payments handled manually).
+  refundAddressRequired: false,
 }
 
 /** The effective def for a chain under the given ZEC rail (only ZEC changes). */
@@ -319,6 +322,20 @@ export function nativeMaxUsdFor(chainId: string, raw: string | undefined, zecRai
 export function nativeRequiresRefundAddress(chainId: string, tokenSymbol: string): boolean {
   const def = NATIVE_SOURCE_DEFS[chainId]
   return !!def && def.symbol === tokenSymbol.toUpperCase() && !!def.refundAddressRequired
+}
+
+/**
+ * Whether the payer MUST send `refund_address` on this rail. A refund-address
+ * coin (nativeRequiresRefundAddress, i.e. ZEC) needs it on the near rail but
+ * not on the custody rail, where it is optional (still validated if given).
+ */
+export function nativeRefundAddressMandatory(
+  chainId: string,
+  tokenSymbol: string,
+  rail: ZecRailMode = 'near',
+): boolean {
+  if (!nativeRequiresRefundAddress(chainId, tokenSymbol)) return false
+  return !!nativeSourceDef(chainId, rail)?.refundAddressRequired
 }
 
 // ── Internal test payment id ────────────────────────────────────────────────

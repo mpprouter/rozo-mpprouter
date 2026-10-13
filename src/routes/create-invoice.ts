@@ -46,6 +46,7 @@ import {
   isTestPaymentId,
   nativeMaxUsdFor,
   nativeRequiresRefundAddress,
+  nativeRefundAddressMandatory,
   nativeSourceFor,
   parseNativeSources,
   parseZecRail,
@@ -639,6 +640,14 @@ export function zecUpstreamError(
  */
 export const ZEC_REFUND_DIGEST_KEY = 'zec_refund_address_sha256'
 
+/**
+ * Metadata marker written when a custody ZEC order is created WITHOUT a refund
+ * address (optional on that rail since 2026-10-13). It is the positive
+ * evidence refundAddressReuseBlock needs to hand such an order to another
+ * caller; a missing digest alone could also be an older, unreadable binding.
+ */
+export const ZEC_REFUND_NONE_KEY = 'zec_refund_address_none'
+
 export async function refundAddressDigest(address: string): Promise<string> {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(address))
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -672,6 +681,7 @@ export async function refundAddressReuseBlock(
   row: any,
   submitted: string | null,
   extra: Record<string, unknown>,
+  mandatory = true,
 ): Promise<Response | null> {
   const rowSource = readRowSource(row)
   if (
@@ -681,6 +691,11 @@ export async function refundAddressReuseBlock(
     return null
   }
   const bound = boundRefundAddress(row)
+  // Custody rail (refund address optional): an order provably created without
+  // a refund address (ZEC_REFUND_NONE_KEY marker) binds nothing, so any payer
+  // of this link may reuse it; late or short payments are resolved manually.
+  // A missing digest without the marker stays "cannot be verified".
+  if (!mandatory && bound === null && readMetadataObject(row)?.[ZEC_REFUND_NONE_KEY] === true) return null
   let matches = false
   if (bound && submitted) {
     matches =
@@ -1493,12 +1508,26 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     )
   }
 
-  // Beta ZEC: the payer's transparent refund address is required up front
-  // (rozo-intents-api passes it to 1Click as refundTo; we hold no ZEC wallet).
-  const refundAddressRequired = nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
+  // Beta ZEC (a coin that carries a payer refund address). Near rail: the
+  // transparent refund address is required up front (rozo-intents-api passes
+  // it to 1Click as refundTo; we hold no ZEC wallet). Custody rail (founder
+  // 2026-10-13): optional, since the deposit address is our own wallet and a
+  // late or short payment is handled manually; a provided one is still
+  // checked and forwarded.
+  const refundAddressCoin = nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
+  const zecRail = parseZecRail(env.ZEC_RAIL)
+  const refundAddressMandatory =
+    refundAddressCoin && nativeRefundAddressMandatory(source.chainId, source.tokenSymbol, zecRail)
   let refundAddress: string | null = null
-  if (refundAddressRequired) {
-    const r = resolveRefundAddress((parsed as Record<string, unknown> | null)?.refund_address)
+  const rawRefundAddress = (parsed as Record<string, unknown> | null)?.refund_address
+  // Any non-blank value counts as given (a number or object is then refused by
+  // resolveRefundAddress), so only a truly absent/blank field is optional.
+  const refundAddressGiven =
+    rawRefundAddress !== undefined &&
+    rawRefundAddress !== null &&
+    !(typeof rawRefundAddress === 'string' && rawRefundAddress.trim() === '')
+  if (refundAddressCoin && (refundAddressMandatory || refundAddressGiven)) {
+    const r = resolveRefundAddress(rawRefundAddress)
     if (!r.ok) {
       return errorResponse(400, {
         code: r.code,
@@ -1737,7 +1766,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
-  const zecRail = parseZecRail(env.ZEC_RAIL)
   const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail)
   if (nativeSource && Number(callerPays) > nativeCap) {
     return errorResponse(400, {
@@ -2031,8 +2059,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       if (!pendingPricingMatches(existing, pricing)) {
         return pricingMismatchResponse({ linkId }, existing)
       }
-      if (refundAddressRequired) {
-        const refundBlock = await refundAddressReuseBlock(existing, refundAddress, { linkId })
+      if (refundAddressCoin) {
+        const refundBlock = await refundAddressReuseBlock(existing, refundAddress, { linkId }, refundAddressMandatory)
         if (refundBlock) return refundBlock
       }
 
@@ -2063,7 +2091,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       )
       const nativeInvolved = nativeSource || rowIsNative
       const refundAddressCoinInvolved =
-        refundAddressRequired ||
+        refundAddressCoin ||
         nativeRequiresRefundAddress(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
       if (sourceDiffers(rowSource, source) && existing?.id) {
         if (refundAddressCoinInvolved) {
@@ -2241,12 +2269,13 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // window, and hand its expiry to rozo-intents-api, which re-checks it
   // (metadata.merchant_link_expires_at, top-level because metadata.client is
   // already a string label). Fresh creates only: a live ZEC order is reused
-  // above only when its bound refund address matches (refundAddressReuseBlock),
+  // above only when its bound refund address matches, or (custody rail) when
+  // it was created without one (refundAddressReuseBlock),
   // and never rotated to or from another coin (native_not_rotatable), since
   // /checkout carries no refund address. Other native coins can be rotated
   // upstream (rozo-intents-api NATIVE_ROTATION).
   let merchantLinkExpiresAt: string | null = null
-  if (refundAddressRequired) {
+  if (refundAddressCoin) {
     const linkExpiry =
       testInvoiceCents !== null
         ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
@@ -2302,6 +2331,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           // Read back on reuse (refundAddressReuseBlock); upstream strips the
           // plain address it stores under metadata.internal from responses.
           ...(refundAddress ? { [ZEC_REFUND_DIGEST_KEY]: await refundAddressDigest(refundAddress) } : {}),
+          ...(refundAddressCoin && !refundAddress ? { [ZEC_REFUND_NONE_KEY]: true } : {}),
           // Lets downstream analytics (GMV) drop internal test orders.
           ...(testInvoiceCents !== null ? { testMode: true } : {}),
         },
@@ -2374,7 +2404,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     // capacity / pause / stale monitor) are caller-actionable; pass status and
     // code through unchanged instead of a generic 502. Checked before the 429
     // relay so a custody refusal keeps its own code; anything else falls through.
-    if (refundAddressRequired) {
+    if (refundAddressCoin) {
       const zecErr = zecUpstreamError(intentsResp.status, intentsText)
       if (zecErr) {
         return errorResponse(intentsResp.status, {
@@ -2461,8 +2491,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           if (!pendingPricingMatches(winner, pricing)) {
             return pricingMismatchResponse({ linkId }, winner)
           }
-          if (refundAddressRequired) {
-            const refundBlock = await refundAddressReuseBlock(winner, refundAddress, { linkId })
+          if (refundAddressCoin) {
+            const refundBlock = await refundAddressReuseBlock(winner, refundAddress, { linkId }, refundAddressMandatory)
             if (refundBlock) return refundBlock
           }
           const winnerSource = readRowSource(winner)
