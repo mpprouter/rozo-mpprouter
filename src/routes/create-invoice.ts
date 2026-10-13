@@ -640,6 +640,14 @@ export function zecUpstreamError(
  */
 export const ZEC_REFUND_DIGEST_KEY = 'zec_refund_address_sha256'
 
+/**
+ * Metadata marker written when a custody ZEC order is created WITHOUT a refund
+ * address (optional on that rail since 2026-10-13). It is the positive
+ * evidence refundAddressReuseBlock needs to hand such an order to another
+ * caller; a missing digest alone could also be an older, unreadable binding.
+ */
+export const ZEC_REFUND_NONE_KEY = 'zec_refund_address_none'
+
 export async function refundAddressDigest(address: string): Promise<string> {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(address))
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
@@ -683,11 +691,11 @@ export async function refundAddressReuseBlock(
     return null
   }
   const bound = boundRefundAddress(row)
-  // Custody rail (refund address optional): an order created without a refund
-  // address binds nothing, so any payer of this link may reuse it; late or
-  // short payments are resolved manually. Near orders always bind one, so
-  // they never take this exit.
-  if (!mandatory && bound === null) return null
+  // Custody rail (refund address optional): an order provably created without
+  // a refund address (ZEC_REFUND_NONE_KEY marker) binds nothing, so any payer
+  // of this link may reuse it; late or short payments are resolved manually.
+  // A missing digest without the marker stays "cannot be verified".
+  if (!mandatory && bound === null && readMetadataObject(row)?.[ZEC_REFUND_NONE_KEY] === true) return null
   let matches = false
   if (bound && submitted) {
     matches =
@@ -1512,7 +1520,12 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     refundAddressCoin && nativeRefundAddressMandatory(source.chainId, source.tokenSymbol, zecRail)
   let refundAddress: string | null = null
   const rawRefundAddress = (parsed as Record<string, unknown> | null)?.refund_address
-  const refundAddressGiven = typeof rawRefundAddress === 'string' && rawRefundAddress.trim() !== ''
+  // Any non-blank value counts as given (a number or object is then refused by
+  // resolveRefundAddress), so only a truly absent/blank field is optional.
+  const refundAddressGiven =
+    rawRefundAddress !== undefined &&
+    rawRefundAddress !== null &&
+    !(typeof rawRefundAddress === 'string' && rawRefundAddress.trim() === '')
   if (refundAddressCoin && (refundAddressMandatory || refundAddressGiven)) {
     const r = resolveRefundAddress(rawRefundAddress)
     if (!r.ok) {
@@ -2318,6 +2331,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           // Read back on reuse (refundAddressReuseBlock); upstream strips the
           // plain address it stores under metadata.internal from responses.
           ...(refundAddress ? { [ZEC_REFUND_DIGEST_KEY]: await refundAddressDigest(refundAddress) } : {}),
+          ...(refundAddressCoin && !refundAddress ? { [ZEC_REFUND_NONE_KEY]: true } : {}),
           // Lets downstream analytics (GMV) drop internal test orders.
           ...(testInvoiceCents !== null ? { testMode: true } : {}),
         },

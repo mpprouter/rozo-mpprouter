@@ -612,7 +612,12 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
       expect(createCalls).toBe(1)
       expect('refundAddress' in createdIntent.source).toBe(false)
       expect(createdIntent.metadata[ZEC_REFUND_DIGEST_KEY]).toBeUndefined()
+      expect(createdIntent.metadata.zec_refund_address_none).toBe(true)
     }
+    // A provided non-string value is not "absent": it is refused.
+    const odd = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: 12345 }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(odd.status).toBe(400)
+    expect(odd.json.code).toBe('REFUND_ADDRESS_REQUIRED')
     createCalls = 0
     const near = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { query: '?beta=zec' })
     expect(near.status).toBe(400)
@@ -633,6 +638,7 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(ok.status).toBe(200)
     expect(createdIntent.source.refundAddress).toBe(T1)
     expect(createdIntent.metadata[ZEC_REFUND_DIGEST_KEY]).toBe(await refundAddressDigest(T1))
+    expect(createdIntent.metadata.zec_refund_address_none).toBeUndefined()
   })
 
   it('custody reuse: an order created without a refund address is reused; a bound one is still checked', async () => {
@@ -650,6 +656,14 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     const near = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { query: '?beta=zec' })
     expect(near.status).toBe(409)
     expect(near.json.code).toBe('REFUND_ADDRESS_MISMATCH')
+    // Without the marker an unbound order (e.g. an older near order whose
+    // digest is missing) is still "cannot be verified" on custody too.
+    const unmarked = rowFrom(createdIntent)
+    delete (unmarked.metadata as any).zec_refund_address_none
+    existingOrder = unmarked
+    const unverified = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: '?beta=zec' })
+    expect(unverified.status).toBe(409)
+    expect(unverified.json.code).toBe('REFUND_ADDRESS_MISMATCH')
     // A custody order that did bind an address keeps the mismatch check.
     existingOrder = null
     existingOrder = rowFrom(await freshZecIntent())
