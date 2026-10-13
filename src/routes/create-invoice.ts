@@ -46,6 +46,7 @@ import {
   isTestPaymentId,
   nativeMaxUsdFor,
   nativeRequiresRefundAddress,
+  nativeRefundAddressMandatory,
   nativeSourceFor,
   parseNativeSources,
   parseZecRail,
@@ -672,6 +673,7 @@ export async function refundAddressReuseBlock(
   row: any,
   submitted: string | null,
   extra: Record<string, unknown>,
+  mandatory = true,
 ): Promise<Response | null> {
   const rowSource = readRowSource(row)
   if (
@@ -681,6 +683,11 @@ export async function refundAddressReuseBlock(
     return null
   }
   const bound = boundRefundAddress(row)
+  // Custody rail (refund address optional): an order created without a refund
+  // address binds nothing, so any payer of this link may reuse it; late or
+  // short payments are resolved manually. Near orders always bind one, so
+  // they never take this exit.
+  if (!mandatory && bound === null) return null
   let matches = false
   if (bound && submitted) {
     matches =
@@ -1493,12 +1500,21 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     )
   }
 
-  // Beta ZEC: the payer's transparent refund address is required up front
-  // (rozo-intents-api passes it to 1Click as refundTo; we hold no ZEC wallet).
-  const refundAddressRequired = nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
+  // Beta ZEC (a coin that carries a payer refund address). Near rail: the
+  // transparent refund address is required up front (rozo-intents-api passes
+  // it to 1Click as refundTo; we hold no ZEC wallet). Custody rail (founder
+  // 2026-10-13): optional, since the deposit address is our own wallet and a
+  // late or short payment is handled manually; a provided one is still
+  // checked and forwarded.
+  const refundAddressCoin = nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
+  const zecRail = parseZecRail(env.ZEC_RAIL)
+  const refundAddressMandatory =
+    refundAddressCoin && nativeRefundAddressMandatory(source.chainId, source.tokenSymbol, zecRail)
   let refundAddress: string | null = null
-  if (refundAddressRequired) {
-    const r = resolveRefundAddress((parsed as Record<string, unknown> | null)?.refund_address)
+  const rawRefundAddress = (parsed as Record<string, unknown> | null)?.refund_address
+  const refundAddressGiven = typeof rawRefundAddress === 'string' && rawRefundAddress.trim() !== ''
+  if (refundAddressCoin && (refundAddressMandatory || refundAddressGiven)) {
+    const r = resolveRefundAddress(rawRefundAddress)
     if (!r.ok) {
       return errorResponse(400, {
         code: r.code,
@@ -1737,7 +1753,6 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
-  const zecRail = parseZecRail(env.ZEC_RAIL)
   const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail)
   if (nativeSource && Number(callerPays) > nativeCap) {
     return errorResponse(400, {
@@ -2031,8 +2046,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       if (!pendingPricingMatches(existing, pricing)) {
         return pricingMismatchResponse({ linkId }, existing)
       }
-      if (refundAddressRequired) {
-        const refundBlock = await refundAddressReuseBlock(existing, refundAddress, { linkId })
+      if (refundAddressCoin) {
+        const refundBlock = await refundAddressReuseBlock(existing, refundAddress, { linkId }, refundAddressMandatory)
         if (refundBlock) return refundBlock
       }
 
@@ -2063,7 +2078,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       )
       const nativeInvolved = nativeSource || rowIsNative
       const refundAddressCoinInvolved =
-        refundAddressRequired ||
+        refundAddressCoin ||
         nativeRequiresRefundAddress(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
       if (sourceDiffers(rowSource, source) && existing?.id) {
         if (refundAddressCoinInvolved) {
@@ -2241,12 +2256,13 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // window, and hand its expiry to rozo-intents-api, which re-checks it
   // (metadata.merchant_link_expires_at, top-level because metadata.client is
   // already a string label). Fresh creates only: a live ZEC order is reused
-  // above only when its bound refund address matches (refundAddressReuseBlock),
+  // above only when its bound refund address matches, or (custody rail) when
+  // it was created without one (refundAddressReuseBlock),
   // and never rotated to or from another coin (native_not_rotatable), since
   // /checkout carries no refund address. Other native coins can be rotated
   // upstream (rozo-intents-api NATIVE_ROTATION).
   let merchantLinkExpiresAt: string | null = null
-  if (refundAddressRequired) {
+  if (refundAddressCoin) {
     const linkExpiry =
       testInvoiceCents !== null
         ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
@@ -2374,7 +2390,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     // capacity / pause / stale monitor) are caller-actionable; pass status and
     // code through unchanged instead of a generic 502. Checked before the 429
     // relay so a custody refusal keeps its own code; anything else falls through.
-    if (refundAddressRequired) {
+    if (refundAddressCoin) {
       const zecErr = zecUpstreamError(intentsResp.status, intentsText)
       if (zecErr) {
         return errorResponse(intentsResp.status, {
@@ -2461,8 +2477,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           if (!pendingPricingMatches(winner, pricing)) {
             return pricingMismatchResponse({ linkId }, winner)
           }
-          if (refundAddressRequired) {
-            const refundBlock = await refundAddressReuseBlock(winner, refundAddress, { linkId })
+          if (refundAddressCoin) {
+            const refundBlock = await refundAddressReuseBlock(winner, refundAddress, { linkId }, refundAddressMandatory)
             if (refundBlock) return refundBlock
           }
           const winnerSource = readRowSource(winner)
