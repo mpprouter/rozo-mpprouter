@@ -565,14 +565,14 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(nativeMaxUsdFor('8453', '5000', 'custody')).toBe(5000)
   })
 
-  it('custody link margin = 10 min lock + 10 min margin + 2 x 75 s', () => {
-    expect(ZEC_CUSTODY_MIN_LINK_LIFE_MS).toBe(22.5 * 60_000)
+  it('custody link margin = 30 min lock + 10 min margin + 2 x 75 s', () => {
+    expect(ZEC_CUSTODY_MIN_LINK_LIFE_MS).toBe(42.5 * 60_000)
     expect(zecMinLinkLifeMs('custody')).toBe(ZEC_CUSTODY_MIN_LINK_LIFE_MS)
     const now = Date.parse('2026-10-10T00:00:00.000Z')
-    expect(checkZecLinkExpiry('2026-10-10T00:22:30.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS).ok).toBe(true)
-    const short = checkZecLinkExpiry('2026-10-10T00:22:29.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS)
+    expect(checkZecLinkExpiry('2026-10-10T00:42:30.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS).ok).toBe(true)
+    const short = checkZecLinkExpiry('2026-10-10T00:42:29.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS)
     expect(short.ok).toBe(false)
-    expect((short as any).message).toContain('23 minutes')
+    expect((short as any).message).toContain('43 minutes')
     expect(checkZecLinkExpiry(null, now, ZEC_CUSTODY_MIN_LINK_LIFE_MS).ok).toBe(false)
   })
 
@@ -583,8 +583,8 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(plain.json.sourceMeta).toEqual({})
   })
 
-  it('create accepts a 30 min link on custody that near refuses', async () => {
-    linkExpiresAt = inMinutes(30)
+  it('create accepts a 50 min link on custody that near refuses', async () => {
+    linkExpiresAt = inMinutes(50)
     const near = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { query: '?beta=zec' })
     expect(near.status).toBe(400)
     expect(near.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
@@ -594,8 +594,8 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(createdIntent.source.refundAddress).toBe(T1)
   })
 
-  it('custody still refuses a 20 min link', async () => {
-    linkExpiresAt = inMinutes(20)
+  it('custody still refuses a 40 min link (30 min lock since 2026-10-15)', async () => {
+    linkExpiresAt = inMinutes(40)
     const short = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { env: custodyEnv(), query: '?beta=zec' })
     expect(short.status).toBe(400)
     expect(short.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')

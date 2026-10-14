@@ -473,10 +473,10 @@ function errorResponse(status: number, err: CreateInvoiceError): Response {
 export const ZEC_MIN_LINK_LIFE_MS = 75 * 60 * 1000
 
 /**
- * Custody rail (ZEC_RAIL=custody): the merchant link must outlive the 10 min
+ * Custody rail (ZEC_RAIL=custody): the merchant link must outlive the 30 min
  * price lock, a 10 min safety margin and the confirmations at the 75 s block
  * target. The router does not know G's confirmation tier before create, so it
- * assumes the larger one (2 confirmations): 20 min + 150 s = 22.5 min.
+ * assumes the larger one (2 confirmations): 40 min + 150 s = 42.5 min.
  * rozo-intents-api re-checks with the real tier (custodyLinkMarginMs).
  */
 export const ZEC_CUSTODY_MIN_LINK_LIFE_MS =

@@ -90,7 +90,7 @@ export function parseZecRail(raw: string | undefined): ZecRailMode {
 export const ZEC_CUSTODY_CONFIRMATIONS = { under110: 1, from110: 2 } as const
 
 /** Custody quote lock, link safety margin and block target (rozo-intents-api shared/zec-custody.ts). */
-export const ZEC_CUSTODY_QUOTE_LOCK_MIN = 10
+export const ZEC_CUSTODY_QUOTE_LOCK_MIN = 30 // founder 2026-10-15 (was 10)
 export const ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN = 10
 export const ZEC_BLOCK_TARGET_SECONDS = 75
 
