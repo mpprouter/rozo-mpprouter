@@ -37,7 +37,7 @@ beforeEach(() => {
     if (u.includes('/payments/order/')) {
       return existingOrder
         ? new Response(JSON.stringify(existingOrder), { status: 200 })
-        : new Response('not found', { status: 404 })
+        : new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
     }
     if (u.includes('/payment-api') && init?.method === 'POST') {
       posts++
@@ -194,7 +194,7 @@ describe('create-invoice provider=bitrefill', () => {
   it('400 UNSUPPORTED_SOURCE (not 502) when payment-api has native disabled for Bitrefill', async () => {
     vi.mocked(globalThis.fetch).mockImplementation((async (input: any) => {
       const u = typeof input === 'string' ? input : input.url
-      if (u.includes('/payments/order/')) return new Response('nf', { status: 404 })
+      if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       posts++
       return new Response(JSON.stringify({
         error: { code: 'invalidRequest', message: 'Native ETH payin on chain 8453 is not enabled for this app' },
@@ -212,7 +212,7 @@ describe('create-invoice provider=bitrefill', () => {
     let upstreamStatus = 400
     vi.mocked(globalThis.fetch).mockImplementation((async (input: any) => {
       const u = typeof input === 'string' ? input : input.url
-      if (u.includes('/payments/order/')) return new Response('nf', { status: 404 })
+      if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       return new Response(JSON.stringify({ error: { code: 'invalidRequest', message: 'bad amount' } }), { status: upstreamStatus })
     }) as typeof fetch)
     const rejected = await post(body())
@@ -229,7 +229,7 @@ describe('create-invoice provider=bitrefill', () => {
     let reply = { code: 'insufficientLiquidity', message: 'Liquidity check unavailable' }
     vi.mocked(globalThis.fetch).mockImplementation((async (input: any) => {
       const u = typeof input === 'string' ? input : input.url
-      if (u.includes('/payments/order/')) return new Response('nf', { status: 404 })
+      if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       return new Response(JSON.stringify({ error: reply }), { status: 400 })
     }) as typeof fetch)
     const outage = await post(body())
@@ -243,13 +243,13 @@ describe('create-invoice provider=bitrefill', () => {
     // Non-JSON 400 body: no classification possible, stays 502.
     vi.mocked(globalThis.fetch).mockImplementation((async (input: any) => {
       const u = typeof input === 'string' ? input : input.url
-      if (u.includes('/payments/order/')) return new Response('nf', { status: 404 })
+      if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       return new Response('Bad Request', { status: 400 })
     }) as typeof fetch)
     expect((await post(body())).status).toBe(502)
     vi.mocked(globalThis.fetch).mockImplementation((async (input: any) => {
       const u = typeof input === 'string' ? input : input.url
-      if (u.includes('/payments/order/')) return new Response('nf', { status: 404 })
+      if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       return new Response(JSON.stringify({ error: { code: 'amountTooLow', message: 'Minimum is $1 for ETH' } }), { status: 400 })
     }) as typeof fetch)
     const low = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '0.5' }), makeEnv({ NATIVE_SOURCES: 'ETH@8453' }))
@@ -262,7 +262,7 @@ describe('create-invoice provider=bitrefill', () => {
     vi.mocked(globalThis.fetch).mockImplementation((async (input: any, init?: any) => {
       const u = typeof input === 'string' ? input : input.url
       if (u.includes('/payments/order/')) {
-        return posts ? new Response('{}', { status: 200 }) : new Response('nf', { status: 404 })
+        return posts ? new Response('{}', { status: 200 }) : new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       }
       posts++
       return new Response('{"error":"orderIdConflict"}', { status: 409 })

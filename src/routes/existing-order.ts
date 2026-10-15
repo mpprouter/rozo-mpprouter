@@ -16,7 +16,7 @@ import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import { stripeOrderId } from './stripe-fulfillment'
 import { rowFundingEvidence } from './relink-guard'
 
-import { ROZO_INTENTS_BASE, intentsReadBase } from './intents-base'
+import { ROZO_INTENTS_BASE, intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
 
 // Re-exported for existing importers; writes use it, reads use intentsReadBase.
 export { ROZO_INTENTS_BASE }
@@ -44,7 +44,7 @@ export function readRowSource(row: any): { chainId: string | null; tokenSymbol: 
   }
 }
 
-// Tri-state: only an explicit 404 means the orderId slot is free. Any other
+// Tri-state: only intents' explicit paymentNotFound 404 means the orderId slot is free. Any other
 // failure (network, 5xx, malformed body) is 'error'.
 export type OrderLookup =
   | { state: 'found'; row: any }
@@ -74,7 +74,13 @@ export async function lookupIntentsOrder(
   } catch {
     return { state: 'error', status: null }
   }
-  if (lookup.status === 404) return { state: 'missing' }
+  // Only intents' own paymentNotFound 404 frees the slot; any other 404
+  // (undeployed read function, proxy, non-JSON) is an error, like a 5xx.
+  if (lookup.status === 404) {
+    return (await isIntentsPaymentNotFound(lookup))
+      ? { state: 'missing' }
+      : { state: 'error', status: 404 }
+  }
   if (!lookup.ok) return { state: 'error', status: lookup.status }
   const row = await lookup.json().catch(() => undefined)
   if (row === undefined) return { state: 'error', status: lookup.status }

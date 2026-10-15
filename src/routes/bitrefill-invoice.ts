@@ -16,7 +16,7 @@
 import type { Env } from '../index'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
-import { intentsReadBase } from './intents-base'
+import { intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
 import { isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
 import { normalizeCheckoutClient } from './checkout-web-pricing'
 
@@ -187,7 +187,9 @@ export async function handleBitrefillCreateInvoice(
         `${intentsReadBase(env)}/payments/order/${encodeURIComponent(BITREFILL_APP_ID)}/${encodeURIComponent(orderId)}`,
         { method: 'GET', headers: { 'X-API-Key': apiKey } },
       )
-      if (r.status === 404) return { state: 'missing' }
+      // Only intents' own paymentNotFound 404 means "no order yet"; any
+      // other 404 (e.g. undeployed read function) is an error, never a create.
+      if (r.status === 404) return (await isIntentsPaymentNotFound(r)) ? { state: 'missing' } : { state: 'error' }
       if (!r.ok) return { state: 'error' }
       const row = await r.json().catch(() => undefined)
       return row === undefined ? { state: 'error' } : { state: 'found', row }

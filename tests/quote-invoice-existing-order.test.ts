@@ -88,7 +88,7 @@ function mockFetch(orders: OrderMap) {
         })
       }
       if (hit) return Response.json(hit)
-      return new Response('not found', { status: 404 })
+      return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
     }
     return new Response('unexpected ' + u, { status: 500 })
   }) as typeof fetch)
@@ -430,7 +430,7 @@ describe('existing-order timing (intents GET ~2.5s in production)', () => {
       return new Promise<Response>((resolve, reject) => {
         const t = setTimeout(() => {
           if (hit === 'hang') return
-          resolve(hit ? Response.json(hit) : new Response('not found', { status: 404 }))
+          resolve(hit ? Response.json(hit) : new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 }))
         }, delay)
         init?.signal?.addEventListener('abort', () => {
           clearTimeout(t)

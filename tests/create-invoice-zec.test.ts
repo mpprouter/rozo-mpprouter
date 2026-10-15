@@ -111,7 +111,7 @@ beforeEach(() => {
       const row = u.endsWith(`/${SESSION_ID}`)
         ? existingOrder ?? (createCalls > 0 ? raceWinner : null)
         : null
-      return row ? new Response(JSON.stringify(row), { status: 200 }) : new Response('not found', { status: 404 })
+      return row ? new Response(JSON.stringify(row), { status: 200 }) : new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
     }
     if (u.includes('/payment-api') && init?.method === 'POST') {
       createCalls++

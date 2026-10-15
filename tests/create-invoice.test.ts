@@ -651,7 +651,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
         )
       }
       if (u.includes('/payments/order/')) {
-        return new Response('not found', { status: 404 }) // idempotency miss
+        return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 }) // idempotency miss
       }
       // The create call is a POST to the payment-api root.
       if (u.includes('/payment-api')) {
@@ -1201,7 +1201,7 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
     // response must still be blob-free and provider-tagged.
     const originalFetch = globalThis.fetch
     globalThis.fetch = (async () =>
-      new Response('not found', { status: 404 })) as typeof fetch
+      new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })) as typeof fetch
     try {
       const { status, body } = await callWith(STRIPE_URL)
       // 410 expired (Stripe 404 maps to expired) — the exact code isn't the
@@ -1260,7 +1260,7 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
         )
       }
       if (u.includes('/payments/order/')) {
-        return new Response('not found', { status: 404 }) // idempotency miss
+        return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 }) // idempotency miss
       }
       if (u.includes('/payment-api')) {
         return new Response(
@@ -1328,7 +1328,7 @@ describe('handleCreateInvoice — Stripe URL never leaks the blob', () => {
           { status: 200 },
         )
       }
-      if (u.includes('/payments/order/')) return new Response('not found', { status: 404 })
+      if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       if (u.includes('/payment-api')) {
         return new Response(
           JSON.stringify({ id: 'rozo-pay-1', paymentLink: 'https://pay.rozo.ai/x', expiresAt: '2999-01-01T00:00:00.000Z' }),

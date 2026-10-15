@@ -80,7 +80,7 @@ function installFetchMock() {
     if (u.includes('/payments/order/')) {
       const oid = decodeURIComponent(u.split('/').pop() ?? '')
       const row = orders.get(oid)
-      return row ? Response.json(row) : new Response('not found', { status: 404 })
+      return row ? Response.json(row) : new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
     }
     if (u.includes('/payment-api') && init?.method === 'POST' && !u.includes('/checkout')) {
       const body = JSON.parse(String(init?.body ?? '{}'))
@@ -104,7 +104,7 @@ function installFetchMock() {
     if (/\/payments\/[^/]+$/.test(u)) {
       const id = decodeURIComponent(u.split('/').pop() ?? '')
       const row = [...orders.values()].find((r) => r.id === id)
-      if (!row) return new Response('not found', { status: 404 })
+      if (!row) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       return Response.json({ ...row, status: statusOverride.get(id) ?? row.status })
     }
     return new Response('{}', { status: 200 })
