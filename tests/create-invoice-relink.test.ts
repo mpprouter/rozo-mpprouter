@@ -274,7 +274,31 @@ describe('Coinbase link whose earlier order expired', () => {
     expect(json.code).toBe('PAYMENT_EXPIRED')
     expect(json.confirmed).toBe(false)
     expect(json.reason).toBe('previous_order_not_closed')
+    expect(json.continuation).toEqual({ state: 'checking_previous_payment', retryAfterSeconds: 30, sourcePaymentId: orders.get(LINK).id, source: { chainId: '900', tokenSymbol: 'USDC' } })
+    expect(json.message).not.toMatch(/few minutes|link has expired/)
     expect(scanCalls).toEqual([])
+    expect(createCalls).toEqual([])
+  })
+
+  it('continuation source identifies the latest preference separately from the blocking older order', async () => {
+    const first = seedOrder(LINK, { status: 'payment_unpaid' })
+    const latest = seedOrder(`${LINK}__retry2`, { source: { chainId: '56', tokenSymbol: 'USDT' } })
+    const { status, json } = await create()
+    expect(status).toBe(409)
+    expect(json.rozoPaymentId).toBe(first.id)
+    expect(json.continuation.sourcePaymentId).toBe(latest.id)
+    expect(json.continuation.source).toEqual({ chainId: '56', tokenSymbol: 'USDT' })
+    expect(createCalls).toEqual([])
+  })
+
+  it('late funds on an unclosed expired order block continuation, not just ask to retry', async () => {
+    const old = seedOrder(LINK, { status: 'payment_unpaid' })
+    old.source.amountReceived = '1'
+    const { status, json } = await create()
+    expect(status).toBe(409)
+    expect(json.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.reason).toBe('previous_order_funded')
+    expect(json.continuation).toBeUndefined()
     expect(createCalls).toEqual([])
   })
 
@@ -431,6 +455,8 @@ describe('Coinbase link whose earlier order expired', () => {
     const made = [...orders.keys()].filter((k) => k !== LINK)
     expect(made).toEqual([`${LINK}__retry2`])
     expect([a.json.reused, b.json.reused].sort()).toEqual([false, true])
+    expect(a.json.replacesExpiredPaymentIds).toEqual([orders.get(LINK).id])
+    expect(b.json.replacesExpiredPaymentIds).toEqual([orders.get(LINK).id])
   })
 
   it('a contract-intent and a classic create at once -> still one fresh order', async () => {

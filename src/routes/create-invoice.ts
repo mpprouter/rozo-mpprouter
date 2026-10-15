@@ -2051,7 +2051,20 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
         message,
         error: { code: 'PAYMENT_EXPIRED', message },
         confirmed,
-        ...(guard ? { reason: guard.reason, retryable: true } : {}),
+        ...(guard ? {
+          reason: guard.reason,
+          retryable: true,
+          // Advisory polling contract, NOT permission to skip the relink guard.
+          // Keep PAYMENT_EXPIRED for clients that already handle this envelope.
+          continuation: {
+            state: 'checking_previous_payment',
+            retryAfterSeconds: 30,
+            // Preserve the latest payment preference, which may belong to
+            // a different sibling than guard.rozoPaymentId (the blocker).
+            sourcePaymentId: newest?.id ?? null,
+            source: readRowSource(newest),
+          },
+        } : {}),
         linkId,
         rozoPaymentId: guard?.rozoPaymentId ?? newest?.id ?? null,
         status: guard?.status ?? (newest ? readPaymentStatus(newest) : null),
@@ -2569,6 +2582,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
               tokenSymbol: winnerSource.tokenSymbol,
             },
             ...(source.warnings.length ? { warnings: source.warnings } : {}),
+            ...(replacedRows.length > 0
+              ? { replacesExpiredPaymentIds: replacedRows.map((r) => r?.id ?? null) }
+              : {}),
             raw: winner,
           })
         }

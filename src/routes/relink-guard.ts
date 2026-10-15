@@ -128,8 +128,8 @@ async function scanVerdict(orderId: string): Promise<string | null> {
 export async function checkPreviousOrderUnfunded(_env: Env, row: any): Promise<RelinkCheck> {
   const status = row?.status ?? row?.payment_status ?? null
   const id = typeof row?.id === 'string' ? row.id : null
-  if (status !== 'payment_expired' || !id) return blocked(row, 'previous_order_not_closed')
   if (rowFundingEvidence(row)) return blocked(row, 'previous_order_funded')
+  if (status !== 'payment_expired' || !id) return blocked(row, 'previous_order_not_closed')
   const verdict = await scanVerdict(id)
   if (verdict === 'nothing_found') return { ok: true }
   if (verdict === null) return blocked(row, 'previous_order_unverifiable')
@@ -160,6 +160,6 @@ export const PREVIOUS_ORDER_FUNDED_MESSAGE =
   'check its status, or contact support with the order number.'
 
 export const PREVIOUS_ORDER_PENDING_MESSAGE =
-  'The previous order for this payment link has expired. If you already sent a payment, ' +
-  'do not pay again: it can take up to 2 hours to be confirmed, and you can check its status. ' +
-  'If you did not pay, try again in a few minutes.'
+  'We are checking the previous payment before this same link can be used again. ' +
+  'Do not send to the old payment details. If you already paid, do not pay again. ' +
+  'Check the order status. You can continue with this link only after the previous payment has been safely checked.'
