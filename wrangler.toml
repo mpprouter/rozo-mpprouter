@@ -316,6 +316,12 @@ COUPON_ENDPOINT_ENABLED = "true"
 # /delivered endpoint live: before that every paid record would 404 five times
 # and raise a give-up alert. Flip to "true" + redeploy afterwards.
 ROZO_DELIVERED_REPORT_ENABLED = "true"
+# Read-path switch for the Rozo Intents API (src/routes/intents-base.ts).
+# Unset = read-only GET /payments/:id and /payments/order/... stay on the big
+# payment-api function (current production). Deliberately NOT set here: it is
+# flipped by the founder only after the payment-read function is deployed and
+# verified. Example (keep commented):
+# ROZO_INTENTS_READ_BASE = "https://intentapiv4.rozo.ai/functions/v1/payment-read"
 
 # Partner platform kill switch. Covers the pages AND the API together: a
 # half-open surface looks usable and then fails at the point where money moves.

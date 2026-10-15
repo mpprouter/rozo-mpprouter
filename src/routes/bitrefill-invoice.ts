@@ -16,11 +16,11 @@
 import type { Env } from '../index'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
+import { intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
 import { isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
 import { normalizeCheckoutClient } from './checkout-web-pricing'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
-const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
 // Dedicated WALLET-type account. It must not be a merchant account: payment-api
 // rewrites destination to the merchant's own to_address for any appId with a
 // merchants row (index.ts merchant config override), which would send the USDC
@@ -184,10 +184,12 @@ export async function handleBitrefillCreateInvoice(
   const lookupExisting = async (): Promise<{ state: 'found'; row: any } | { state: 'missing' } | { state: 'error' }> => {
     try {
       const r = await fetch(
-        `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(BITREFILL_APP_ID)}/${encodeURIComponent(orderId)}`,
+        `${intentsReadBase(env)}/payments/order/${encodeURIComponent(BITREFILL_APP_ID)}/${encodeURIComponent(orderId)}`,
         { method: 'GET', headers: { 'X-API-Key': apiKey } },
       )
-      if (r.status === 404) return { state: 'missing' }
+      // Only intents' own paymentNotFound 404 means "no order yet"; any
+      // other 404 (e.g. undeployed read function) is an error, never a create.
+      if (r.status === 404) return (await isIntentsPaymentNotFound(r)) ? { state: 'missing' } : { state: 'error' }
       if (!r.ok) return { state: 'error' }
       const row = await r.json().catch(() => undefined)
       return row === undefined ? { state: 'error' } : { state: 'found', row }

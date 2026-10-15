@@ -1,6 +1,7 @@
 import type { Env } from '../index'
 import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, isTestPaymentId } from './native-sources'
 import { isBitrefillOrderId } from './bitrefill-invoice'
+import { ROZO_INTENTS_BASE, intentsReadBase } from './intents-base'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { baseLinkIdOf } from '../mpp/contract-variant'
 import { mergeSettlingTrack, sendDuplicatePaymentAlert, trackSettlingOrder } from './settling-order'
@@ -623,7 +624,7 @@ export async function reportDeliveredToRozo(
   if (!deliveredReportEnabled(env)) return { ok: false, status: 0 }
   try {
     const r = await fetch(
-      `${ROZO_PAYMENT_BY_ID}/${encodeURIComponent(rozoPaymentId)}/delivered`,
+      `${ROZO_INTENTS_BASE}/payments/${encodeURIComponent(rozoPaymentId)}/delivered`,
       {
         method: 'POST',
         headers: {
@@ -1017,8 +1018,6 @@ async function settleCoinbaseEvent(
 //
 // Either way we also return our own router KV state so the caller can
 // tell which step the end-to-end flow is on.
-const ROZO_PAYMENT_BY_ID =
-  'https://intentapiv4.rozo.ai/functions/v1/payment-api/payments'
 const COINBASE_PAYMENTS_BASE = 'https://payments.coinbase.com'
 
 function isPlId(s: string): boolean {
@@ -1059,7 +1058,7 @@ export async function fetchRozoPaymentById(env: Env, rozoId: string): Promise<an
   if (!env.ROZO_INTENTS_API_KEY) return null
   try {
     const r = await fetch(
-      `${ROZO_PAYMENT_BY_ID}/${encodeURIComponent(rozoId)}`,
+      `${intentsReadBase(env)}/payments/${encodeURIComponent(rozoId)}`,
       { headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
     )
     if (!r.ok) return null

@@ -56,7 +56,7 @@ function installFetchMock() {
       )
     }
     if (u.includes('/payments/order/')) {
-      return new Response('not found', { status: 404 })
+      return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
     }
     if (u.includes('/payment-api') && init?.method === 'POST') {
       createdIntent = JSON.parse(String(init?.body ?? '{}'))

@@ -77,7 +77,7 @@ beforeEach(() => {
         { status: 200 },
       )
     }
-    if (u.includes('/payments/order/')) return new Response('not found', { status: 404 })
+    if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
     if (u.includes('/payment-api') && init?.method === 'POST') {
       createHeaders.push(new Headers(init?.headers))
       return createResponse()

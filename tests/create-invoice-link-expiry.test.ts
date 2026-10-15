@@ -155,7 +155,7 @@ function installFetchMock() {
       const isBase = lookedUp === quoteLinkId || lookedUp.startsWith('stripe')
       return existingRow && isBase
         ? new Response(JSON.stringify(existingRow), { status: 200 })
-        : new Response('not found', { status: 404 })
+        : new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
     }
     if (u.includes('/payment-api') && init?.method === 'POST') {
       createdIntent = JSON.parse(String(init?.body ?? '{}'))
