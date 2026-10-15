@@ -1432,11 +1432,24 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
   let rozo: any = null
 
   // Internal test invoices have no Coinbase link behind them.
-  if (plId && !isTestPaymentId(plId)) {
-    coinbase = await fetchCoinbasePayment(plId)
+  const explicitCoinbaseId = plId && !isTestPaymentId(plId) ? plId : null
+  if (explicitCoinbaseId && rozoId) {
+    // Both ids are known and neither read depends on the other, so run them
+    // concurrently (each costs a full upstream round trip). Both helpers map
+    // every failure to null, so one side missing still yields the partial
+    // 200 below, exactly as the serial reads did.
+    ;[coinbase, rozo] = await Promise.all([
+      fetchCoinbasePayment(explicitCoinbaseId),
+      fetchRozoPaymentById(env, rozoId),
+    ])
+  } else if (explicitCoinbaseId) {
+    coinbase = await fetchCoinbasePayment(explicitCoinbaseId)
+  } else if (rozoId) {
+    // Only the Rozo id: the Coinbase id is derived from its orderId below,
+    // so these reads stay serial.
+    rozo = await fetchRozoPaymentById(env, rozoId)
   }
   if (rozoId) {
-    rozo = await fetchRozoPaymentById(env, rozoId)
     // A Rozo payment whose orderId is a Stripe order belongs to the Stripe
     // branch: the checkout UI polls by rozo_payment_id, and without this it
     // never saw routerState (nor triggered reconciliation) for Stripe orders.

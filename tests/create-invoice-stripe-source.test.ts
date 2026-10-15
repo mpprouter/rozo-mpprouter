@@ -75,6 +75,8 @@ let checkoutResponse: () => Response = () => new Response('{}', { status: 200 })
 let refetchedIntent: any = null
 /** When true, the post-rotation full-row refetch fails (503). */
 let refetchFails = false
+/** Number of GET /payments/:id re-reads (refetchPaymentRow / status re-read). */
+let refetchCount = 0
 let stripeMerchantTitle = 'Test Merchant'
 
 function installFetchMock() {
@@ -83,6 +85,7 @@ function installFetchMock() {
   checkoutBody = null
   refetchedIntent = null
   refetchFails = false
+  refetchCount = 0
   stripeMerchantTitle = 'Test Merchant'
   checkoutResponse = () => new Response('{}', { status: 200 })
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
@@ -135,6 +138,7 @@ function installFetchMock() {
     }
     // Status refetch after a failed rotation (GET /payments/:id).
     if (/\/payments\/[^/]+$/.test(u) && (!init?.method || init.method === 'GET')) {
+      refetchCount++
       if (refetchFails) return new Response('down', { status: 503 })
       const row = refetchedIntent ?? existingIntent
       return row
@@ -961,5 +965,68 @@ describe('Stripe create-invoice — an unexpired order that is no longer unpaid'
     // No duplicate order, no rotation attempt.
     expect(createdIntent).toBeNull()
     expect(checkoutBody).toBeNull()
+  })
+})
+
+// Plan 2 (§5.2): a /checkout refusal on intents' status gate proves nothing
+// was written and already names an in-flight/settled status, so it is refused
+// directly without the full-row re-read. Anything else keeps the re-read and
+// its 502-on-miss contract.
+describe('Stripe create-invoice — rotation refused on the status gate', () => {
+  const unpaid = () => ({
+    id: 'rozo-existing-sc',
+    status: 'payment_unpaid',
+    paymentLink: 'https://pay.rozo.ai/existing',
+    expiresAt: '2999-01-01T00:00:00.000Z',
+    source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10' },
+  })
+  const statusGate = (status: string) => () =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: 'checkoutNotAllowed',
+          message: `Payment status is "${status}". Only payment_unpaid can be re-targeted.`,
+        },
+        requestId: 'r1',
+      }),
+      { status: 400 },
+    )
+
+  it('terminal status in the error body: 409 ORDER_ALREADY_ACTIVE with no re-read', async () => {
+    existingIntent = unpaid()
+    checkoutResponse = statusGate('payment_payin_completed')
+    refetchFails = true // would be a 502 if the re-read ran
+
+    const { status, json } = await createInvoice({ url: STRIPE_URL, source: { chainId: '900', tokenSymbol: 'USDT' } })
+
+    expect(refetchCount).toBe(0)
+    expect(status).toBe(409)
+    expect(json.provider).toBe('stripe_crypto')
+    expect(json.error.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(json.status).toBe('payment_payin_completed')
+    expect(json.rozoPaymentId).toBe('rozo-existing-sc')
+    expect(json.paymentLink).toBeUndefined()
+    expect(createdIntent).toBeNull()
+  })
+
+  it.each([
+    ['non-terminal status (payment_expired)', statusGate('payment_expired')],
+    ['checkoutNotAllowed for a gate other than status', () =>
+      new Response(JSON.stringify({ error: { code: 'checkoutNotAllowed', message: 'Source rotation is not supported for EURC orders.' } }), { status: 400 })],
+    ['statusChanged (409)', () =>
+      new Response(JSON.stringify({ error: { code: 'statusChanged', message: 'Payment status changed during rotation. Reload the order.' } }), { status: 409 })],
+    ['5xx non-JSON', () => new Response('upstream exploded', { status: 500 })],
+  ])('%s: keeps the re-read, and a failed re-read is still 502 INTENTS_API_FAILED', async (_label, reply) => {
+    existingIntent = unpaid()
+    checkoutResponse = reply
+    refetchFails = true
+
+    const { status, json } = await createInvoice({ url: STRIPE_URL, source: { chainId: '900', tokenSymbol: 'USDT' } })
+
+    expect(refetchCount).toBe(1)
+    expect(status).toBe(502)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.paymentLink).toBeUndefined()
+    expect(createdIntent).toBeNull()
   })
 })

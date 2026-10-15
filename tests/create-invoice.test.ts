@@ -1858,3 +1858,109 @@ describe('caller provenance', () => {
     expect(Date.now() - started).toBeLessThan(1_000)
   })
 })
+
+// Plan 2 (§5.2), Coinbase branch: a /checkout refusal on intents' status gate
+// (checkoutNotAllowed + `Payment status is "<s>". Only payment_unpaid can be
+// re-targeted.`) proves nothing was written, so an in-flight/settled status is
+// refused directly without refetchPaymentRow. Everything else keeps the
+// re-read, and a failed re-read is still 502 INTENTS_API_FAILED/order_lookup.
+describe('handleCreateInvoice — Coinbase rotation refused on the status gate', () => {
+  const existing = {
+    id: 'rozo-existing-sc',
+    status: 'payment_unpaid',
+    paymentLink: 'https://pay.rozo.ai/existing',
+    expiresAt: '2999-01-01T00:00:00.000Z',
+    source: { chainId: '1500', tokenSymbol: 'USDC', amount: '105' },
+  }
+
+  async function run(checkout: () => Response) {
+    const { handleCreateInvoice } = await import('../src/routes/create-invoice')
+    let refetchCount = 0
+    let createCalled = false
+    const originalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('/quote-invoice')) {
+        return new Response(
+          JSON.stringify({ invoice: { amount: '105' }, merchant: 'OpenRouter, Inc.', linkId: 'pl_test123' }),
+          { status: 200 },
+        )
+      }
+      if (u.includes('/payments/order/')) {
+        return new Response(JSON.stringify(existing), { status: 200 })
+      }
+      if (u.includes('/checkout')) return checkout()
+      if ((!init?.method || init.method === 'GET') && u.endsWith(`/payments/${existing.id}`)) {
+        refetchCount++
+        // The re-read fails: if it runs, the contract is 502.
+        return new Response('down', { status: 503 })
+      }
+      if (u.includes('/payment-api')) {
+        createCalled = true
+        return new Response(JSON.stringify({ id: 'rozo-new' }), { status: 200 })
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch
+    try {
+      const res = await handleCreateInvoice(
+        new Request('https://mpp.test/create-invoice', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } }),
+        }),
+        {
+          PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
+          ROZO_INTENTS_API_KEY: 'test-key',
+        } as unknown as import('../src/index').Env,
+      )
+      return { status: res.status, json: JSON.parse(await res.text()), refetchCount, createCalled }
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  }
+
+  const statusGate = (status: string) => () =>
+    new Response(
+      JSON.stringify({
+        error: {
+          code: 'checkoutNotAllowed',
+          message: `Payment status is "${status}". Only payment_unpaid can be re-targeted.`,
+        },
+        requestId: 'r1',
+      }),
+      { status: 400 },
+    )
+
+  it.each(['payment_started', 'payment_payin_completed', 'payment_completed'])(
+    'terminal status %s in the error body: 409 ORDER_ALREADY_ACTIVE, refetchPaymentRow not called',
+    async (s) => {
+      const { status, json, refetchCount, createCalled } = await run(statusGate(s))
+      expect(refetchCount).toBe(0)
+      expect(status).toBe(409)
+      expect(json.error.code).toBe('ORDER_ALREADY_ACTIVE')
+      expect(json.status).toBe(s)
+      expect(json.rozoPaymentId).toBe('rozo-existing-sc')
+      expect(json.paymentLink).toBeUndefined()
+      expect(createCalled).toBe(false)
+    },
+  )
+
+  it.each([
+    ['non-terminal status (payment_expired)', statusGate('payment_expired')],
+    ['unknown status', statusGate('payment_something_new')],
+    ['checkoutNotAllowed for a gate other than status', () =>
+      new Response(JSON.stringify({ error: { code: 'checkoutNotAllowed', message: 'Source rotation is not supported for EURC orders.' } }), { status: 400 })],
+    ['statusChanged (409)', () =>
+      new Response(JSON.stringify({ error: { code: 'statusChanged', message: 'Payment status changed during rotation. Reload the order.' } }), { status: 409 })],
+    ['5xx non-JSON', () => new Response('upstream exploded', { status: 500 })],
+    ['network error', () => { throw new TypeError('network connection lost') }],
+  ])('%s: refetchPaymentRow runs; unreadable → 502 INTENTS_API_FAILED / order_lookup', async (_label, reply) => {
+    const { status, json, refetchCount, createCalled } = await run(reply)
+    expect(refetchCount).toBe(1)
+    expect(status).toBe(502)
+    expect(json.code).toBe('INTENTS_API_FAILED')
+    expect(json.stage).toBe('order_lookup')
+    expect(json.paymentLink).toBeUndefined()
+    expect(createCalled).toBe(false)
+  })
+})

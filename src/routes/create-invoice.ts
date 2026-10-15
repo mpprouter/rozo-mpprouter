@@ -968,6 +968,46 @@ export const UPSTREAM_PAYMENT_DETECTED = 'paymentDetected'
 /** Native rotation refusal (rozo-intents-api NATIVE_ROTATION): payin already seen. */
 export const UPSTREAM_PAYIN_ALREADY_DETECTED = 'payinAlreadyDetected'
 
+/**
+ * Order statuses that refuse any further payment: money is in flight or
+ * settled. Explicit allowlist, deliberately narrower than "not unpaid":
+ * payment_expired / payment_bounced / payment_refunded and anything unknown
+ * keep the full re-read after a failed rotation.
+ */
+export const TERMINAL_ROTATION_REFUSAL_STATUSES: ReadonlySet<string> = new Set([
+  'payment_started',
+  'payment_payin_completed',
+  'payment_bridging',
+  'payment_payout_started',
+  'payment_payout_review',
+  'payment_payout_completed',
+  'payment_completed',
+])
+
+// rozo-intents-api payment-api/checkout.ts status gate: the row is read and
+// refused BEFORE any write, so this refusal proves /checkout did not commit.
+const UPSTREAM_STATUS_REFUSAL =
+  /^Payment status is "([a-z_]+)"\. Only payment_unpaid can be re-targeted\.$/
+
+/**
+ * The order status a failed /checkout proves, or null.
+ *
+ * Only the status gate of rozo-intents-api's /checkout qualifies:
+ * code `checkoutNotAllowed` with the exact message
+ * `Payment status is "<status>". Only payment_unpaid can be re-targeted.`
+ * and a status in TERMINAL_ROTATION_REFUSAL_STATUSES. The same code is also
+ * used for EURC / Stellar Direct / NEAR / ZEC / app gates on an UNPAID order,
+ * so the code alone is never enough. Everything else (network error, 5xx,
+ * non-JSON, statusChanged, unknown code or message) returns null and keeps the
+ * full re-read contract.
+ */
+export function terminalRotationRefusalStatus(code: string, message?: string): string | null {
+  if (code !== 'checkoutNotAllowed' || typeof message !== 'string') return null
+  const m = UPSTREAM_STATUS_REFUSAL.exec(message)
+  if (!m) return null
+  return TERMINAL_ROTATION_REFUSAL_STATUSES.has(m[1]) ? m[1] : null
+}
+
 export interface PaymentDetected {
   message: string
   chainId: string | null
@@ -2074,6 +2114,9 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       let rotationFailure: string | null = null
       // True once /checkout was actually called (it may have committed).
       let rotationAttempted = false
+      // Set when /checkout refused on its status gate with an in-flight or
+      // settled status: nothing was written, so no re-read is needed.
+      let refusedStatus: string | null = null
       // Lightning is rotated upstream (rozo-intents-api LIGHTNING_ROTATION):
       // into Lightning issues a fresh BOLT11, out of it a stablecoin address.
       // With the switch off upstream refuses, reported as lightning_not_rotatable.
@@ -2113,6 +2156,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
               expiresAt: existingExpiresAt,
             }))
           } else {
+            refusedStatus = terminalRotationRefusalStatus(rotated.code, rotated.message)
             rotationFailure = rotationFailureCode(
               rotated.code,
               { lightning: lightningInvolved, native: nativeInvolved },
@@ -2130,8 +2174,10 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       // rotation did land. If the order cannot be re-read, fail closed: never
       // present the pre-fetched instructions as payable. Local refusals
       // (ZEC, Lightning rotate-out while gated) never called /checkout, so the pre-fetched row is
-      // still the order; they only re-read the status below.
-      if (rotationFailure && rotationAttempted) {
+      // still the order; they only re-read the status below. A status-gate
+      // refusal (refusedStatus) proves /checkout wrote nothing and already
+      // names the status, so it skips the re-read and refuses below.
+      if (rotationFailure && rotationAttempted && !refusedStatus) {
         const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
         const freshSource = readRowSource(fresh)
         if (!fresh || freshSource.chainId === null) {
@@ -2161,11 +2207,12 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       // local refusal we re-read the status only (null = unknown, keep the
       // pre-fetched view).
       const postRotationStatus =
-        sourceRotated || row !== existing
+        refusedStatus ??
+        (sourceRotated || row !== existing
           ? readPaymentStatus(row)
           : rotationFailure
             ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
-            : REUSABLE_PAYMENT_STATUS
+            : REUSABLE_PAYMENT_STATUS)
       if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
         return json(409, {
           ok: false,
@@ -2894,6 +2941,9 @@ export async function handleStripeCreateInvoice(
     let row: any = existing
     // True once /checkout was actually called (it may have committed).
     let rotationAttempted = false
+    // Status-gate refusal with an in-flight/settled status (see the Coinbase
+    // branch): nothing was written, skip the re-read and refuse below.
+    let refusedStatus: string | null = null
     reusedSource = readRowSource(existing)
     const lightningInvolved =
       source.chainId === 'lightning' || reusedSource.chainId === 'lightning'
@@ -2922,6 +2972,7 @@ export async function handleStripeCreateInvoice(
           }),
         })
       } else {
+        refusedStatus = terminalRotationRefusalStatus(rotated.code, rotated.message)
         // Stripe refuses native sources up front, so only Lightning maps.
         rotationFailure = rotationFailureCode(
           rotated.code,
@@ -2935,7 +2986,7 @@ export async function handleStripeCreateInvoice(
     // its response was lost or came back as an error, so the pre-fetched row
     // can carry a retired address. Report the fresh row; fail closed when it
     // cannot be read.
-    if (rotationFailure && rotationAttempted) {
+    if (rotationFailure && rotationAttempted && !refusedStatus) {
       const fresh = await refetchPaymentRow(env, String(existing?.id ?? ''))
       const freshSource = readRowSource(fresh)
       if (!fresh || freshSource.chainId === null) {
@@ -2963,11 +3014,12 @@ export async function handleStripeCreateInvoice(
     // returning the pre-fetched link as payable invites a double payment.
     // Both a rotated row and a re-read row carry their own status.
     const postRotationStatus =
-      sourceRotated || row !== existing
+      refusedStatus ??
+      (sourceRotated || row !== existing
         ? readPaymentStatus(row)
         : rotationFailure
           ? await refetchPaymentStatus(env, String(existing?.id ?? ''))
-          : REUSABLE_PAYMENT_STATUS
+          : REUSABLE_PAYMENT_STATUS)
     if (postRotationStatus !== null && postRotationStatus !== REUSABLE_PAYMENT_STATUS) {
       return json(409, {
         ok: false,

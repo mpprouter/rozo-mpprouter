@@ -216,3 +216,133 @@ describe('invoice-status current pay-in route', () => {
     expect(body.rozoPayment.source.tokenAddress).toBeUndefined()
   })
 })
+
+describe('invoice-status upstream read ordering (plan 2)', () => {
+  function deferred() {
+    let resolve!: (r: Response) => void
+    const promise = new Promise<Response>((r) => { resolve = r })
+    return { promise, resolve }
+  }
+  const rozoRow = {
+    id: ROZO_ID,
+    status: 'payment_unpaid',
+    orderId: SESSION_ID,
+  }
+  const sessionBody = {
+    paymentSessionId: SESSION_ID,
+    status: 'PAYMENT_SESSION_STATUS_AUTHORIZATION_PENDING',
+    amount: '1.05',
+    asset: 'USD',
+  }
+  const isCoinbase = (url: string) => url.includes('/next-api/')
+
+  it('starts the Coinbase and Rozo reads together when both ids are given', async () => {
+    const cb = deferred()
+    const rozo = deferred()
+    const started: string[] = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input: any) => {
+      const url = String(input instanceof Request ? input.url : input)
+      started.push(isCoinbase(url) ? 'coinbase' : 'rozo')
+      return isCoinbase(url) ? cb.promise : rozo.promise
+    })
+
+    const pending = handleInvoiceStatus(
+      new Request(`https://example.com/invoice-status?payment_id=${SESSION_ID}&rozo_payment_id=${ROZO_ID}`),
+      env(),
+    )
+    // Let the handler run up to its first await on the network.
+    await new Promise((r) => setTimeout(r, 0))
+    // Neither fetch has resolved, yet both have started.
+    expect(started.sort()).toEqual(['coinbase', 'rozo'])
+
+    rozo.resolve(new Response(JSON.stringify(rozoRow), { status: 200 }))
+    cb.resolve(new Response(JSON.stringify(sessionBody), { status: 200 }))
+    const response = await pending
+    const body = (await response.json()) as any
+    expect(response.status).toBe(200)
+    expect(body.pl_id).toBe(SESSION_ID)
+    expect(body.coinbase).toMatchObject({ protocolVersion: 'v3', id: SESSION_ID })
+    expect(body.rozoPayment).toBeTruthy()
+    // No extra Coinbase read: the explicit one already answered.
+    expect(started).toHaveLength(2)
+  })
+
+  it('still answers 200 with the Rozo side when the parallel Coinbase read fails', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (isCoinbase(url)) return new Response('boom', { status: 503 })
+      return new Response(JSON.stringify(rozoRow), { status: 200 })
+    })
+    const response = await handleInvoiceStatus(
+      new Request(`https://example.com/invoice-status?payment_id=${SESSION_ID}&rozo_payment_id=${ROZO_ID}`),
+      env(),
+    )
+    const body = (await response.json()) as any
+    expect(response.status).toBe(200)
+    expect(body.coinbase).toBeNull()
+    expect(body.rozoPayment).toBeTruthy()
+  })
+
+  it('keeps the rozo-only lookup serial: Rozo first, then the derived Coinbase id', async () => {
+    const rozo = deferred()
+    const started: string[] = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input: any) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (isCoinbase(url)) {
+        started.push('coinbase')
+        return Promise.resolve(new Response(JSON.stringify(sessionBody), { status: 200 }))
+      }
+      started.push('rozo')
+      return rozo.promise
+    })
+
+    const pending = handleInvoiceStatus(
+      new Request(`https://example.com/invoice-status?rozo_payment_id=${ROZO_ID}`),
+      env(),
+    )
+    await new Promise((r) => setTimeout(r, 0))
+    // The Coinbase id is not known until the Rozo row arrives.
+    expect(started).toEqual(['rozo'])
+
+    rozo.resolve(new Response(JSON.stringify(rozoRow), { status: 200 }))
+    const response = await pending
+    const body = (await response.json()) as any
+    expect(started).toEqual(['rozo', 'coinbase'])
+    expect(response.status).toBe(200)
+    expect(body.pl_id).toBe(SESSION_ID)
+  })
+
+  it('leaves the Stripe branch order unchanged: reconcile and record read before the Rozo GET', async () => {
+    const STRIPE_KEY = 'cpis_1UB2YMLGazr34H47Ku8lrOwc'
+    const events: string[] = []
+    const storeStub = {
+      async fetch(request: Request) {
+        events.push(`store:${new URL(request.url).pathname}`)
+        return new Response(JSON.stringify({ value: null, version: 0 }), { status: 200 })
+      },
+    }
+    const e = {
+      ...env(),
+      ATOMIC_STORE: { idFromName: () => ({}), get: () => storeStub },
+    } as unknown as Env
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const url = String(input instanceof Request ? input.url : input)
+      events.push(isCoinbase(url) ? 'coinbase' : 'rozo')
+      return new Response(
+        JSON.stringify({ ...rozoRow, orderId: `stripe_crypto_${STRIPE_KEY}` }),
+        { status: 200 },
+      )
+    })
+    const response = await handleInvoiceStatus(
+      new Request(`https://example.com/invoice-status?invoice_key=${STRIPE_KEY}&rozo_payment_id=${ROZO_ID}`),
+      e,
+    )
+    expect(response.status).toBe(200)
+    expect(events).not.toContain('coinbase')
+    const rozoAt = events.indexOf('rozo')
+    expect(rozoAt).toBeGreaterThan(0)
+    // Every store access (reconcile + record read) happened before the GET.
+    expect(events.slice(0, rozoAt).every((x) => x.startsWith('store:'))).toBe(true)
+    expect(events.slice(rozoAt + 1).filter((x) => x === 'rozo')).toHaveLength(0)
+  })
+})
