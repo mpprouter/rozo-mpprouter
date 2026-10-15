@@ -16,7 +16,10 @@ import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import { stripeOrderId } from './stripe-fulfillment'
 import { rowFundingEvidence } from './relink-guard'
 
-export const ROZO_INTENTS_BASE = 'https://intentapiv4.rozo.ai/functions/v1/payment-api'
+import { ROZO_INTENTS_BASE, intentsReadBase } from './intents-base'
+
+// Re-exported for existing importers; writes use it, reads use intentsReadBase.
+export { ROZO_INTENTS_BASE }
 // appId Stripe Crypto orders are filed under.
 export const ROZO_APP_ID = 'wallet_rozopay'
 // appId every Coinbase (and rozotest_) order is filed under.
@@ -48,7 +51,10 @@ export type OrderLookup =
   | { state: 'missing' }
   | { state: 'error'; status: number | null }
 
-/** GET /payments/order/<appId>/<orderId> on the Rozo payment-api. */
+/**
+ * GET /payments/order/<appId>/<orderId> on the Rozo Intents read base
+ * (payment-read when ROZO_INTENTS_READ_BASE is set, else payment-api).
+ */
 export async function lookupIntentsOrder(
   env: Env,
   appId: string,
@@ -58,7 +64,7 @@ export async function lookupIntentsOrder(
   let lookup: Response
   try {
     lookup = await fetch(
-      `${ROZO_INTENTS_BASE}/payments/order/${encodeURIComponent(appId)}/${encodeURIComponent(orderId)}`,
+      `${intentsReadBase(env)}/payments/order/${encodeURIComponent(appId)}/${encodeURIComponent(orderId)}`,
       {
         method: 'GET',
         headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY },

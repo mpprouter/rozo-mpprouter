@@ -360,6 +360,12 @@ export interface Env {
   // Coinbase Payment Links via POST /v1/services/rozo-agent-api/create-invoice.
   // Set via: wrangler secret put ROZO_INTENTS_API_KEY
   ROZO_INTENTS_API_KEY: string
+  // Optional; when set, read-only GET /payments/:id and
+  // GET /payments/order/... go here (e.g.
+  // https://intentapiv4.rozo.ai/functions/v1/payment-read); empty = payment-api.
+  // Writes (POST /payments, /payments/:id/checkout, payin, email) always stay on
+  // payment-api. See src/routes/intents-base.ts. Rollback = unset it.
+  ROZO_INTENTS_READ_BASE?: string
   // Native coin checkout (ETH/BNB/POL/SOL). NATIVE_SOURCES = open coins, e.g.
   // "ETH@8453,ETH@1,BNB@56,SOL@900" (unset = none). NATIVE_MAX_USD caps
   // callerPays (default 2000). ROZO_TEST_LINK_SECRET signs internal

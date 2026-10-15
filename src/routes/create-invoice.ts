@@ -18,6 +18,7 @@ import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
+import { intentsReadBase } from './intents-base'
 import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import {
   OPENROUTER_APP_ID,
@@ -1065,13 +1066,14 @@ async function refetchPaymentStatus(env: Env, paymentId: string): Promise<string
 }
 
 /**
- * Re-read the FULL payment row from the Rozo payment-api (GET /payments/:id).
+ * Re-read the FULL payment row (GET /payments/:id) from the Rozo Intents read
+ * base: payment-read when ROZO_INTENTS_READ_BASE is set, else payment-api.
  * Returns null when it cannot be read (network error, non-2xx, non-JSON).
  */
 async function refetchPaymentRow(env: Env, paymentId: string): Promise<any | null> {
   try {
     const resp = await fetch(
-      `${ROZO_INTENTS_BASE}/payments/${encodeURIComponent(paymentId)}`,
+      `${intentsReadBase(env)}/payments/${encodeURIComponent(paymentId)}`,
       { method: 'GET', headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY } },
     )
     if (!resp.ok) return null
