@@ -17,6 +17,8 @@ import {
 import { redactForAlert } from '../utils/alert-redaction'
 import { claimInvoiceKey } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
+import { findExistingOrder } from './existing-order'
+import { lookupBudget } from './existing-order-endpoint'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -1054,6 +1056,20 @@ export async function fetchCoinbasePayment(paymentId: string): Promise<any | nul
   }
 }
 
+// Deadline for the by-link order scan in invoice-status (the slot scan is
+// ~2.5 s per GET in production; one retry round at most).
+const STATUS_ORDER_LOOKUP_TIMEOUT_MS = 8000
+// Deadline for the follow-up read of the found order by id.
+const STATUS_ORDER_READ_TIMEOUT_MS = 4000
+
+/** Resolves null when `p` has not settled within `ms` (the read is dropped). */
+function withTimeout<T>(p: Promise<T | null>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => resolve(null), ms)
+    p.then((v) => { clearTimeout(t); resolve(v) }, () => { clearTimeout(t); resolve(null) })
+  })
+}
+
 export async function fetchRozoPaymentById(env: Env, rozoId: string): Promise<any | null> {
   if (!env.ROZO_INTENTS_API_KEY) return null
   try {
@@ -1221,6 +1237,9 @@ export function pickZecCustodyStatus(z: any) {
   }
 }
 
+// bech32 BOLT11: ln + network prefix + amount, up to a few KB.
+const LN_INVOICE_RE = /^ln[a-z0-9]{20,4096}$/i
+
 export function pickRozoCallerSafe(rp: any) {
   if (!rp) return null
   return {
@@ -1230,6 +1249,15 @@ export function pickRozoCallerSafe(rp: any) {
     createdAt: rp.createdAt,
     expiresAt: rp.expiresAt,
     paymentLink: rp.paymentLink,
+    // Lightning orders: the BOLT11 the payer must pay, so a reopened /btc/<id>
+    // page can show the same QR again. Public already (create-invoice echoes
+    // it in `raw`); relayed only for an unpaid Lightning order.
+    ...(rp.status === 'payment_unpaid' &&
+    rp.source?.chainId === 'lightning' &&
+    typeof rp.lnInvoice === 'string' &&
+    LN_INVOICE_RE.test(rp.lnInvoice)
+      ? { lnInvoice: rp.lnInvoice }
+      : {}),
     // Native orders: end of the price lock (expiresAt is when the order closes).
     ...(safeIso(rp.quoteExpiresAt) ? { quoteExpiresAt: safeIso(rp.quoteExpiresAt) } : {}),
     // Resolved rail ('near', 'rozo', ...). The checkout picks the ZEC card by it.
@@ -1442,7 +1470,33 @@ export async function handleInvoiceStatus(request: Request, env: Env): Promise<R
       fetchRozoPaymentById(env, rozoId),
     ])
   } else if (explicitCoinbaseId) {
-    coinbase = await fetchCoinbasePayment(explicitCoinbaseId)
+    // Only a Coinbase id: also find the Rozo order filed under this link
+    // (orderId = link id, the same slot scan existing-order and create-invoice
+    // use). The checkout's reopen path (/btc/<id>) asks exactly this, and
+    // before 2026-10-15 it got rozoPayment: null for a link whose Lightning
+    // order was still payable, so the page fell back to the chooser (no QR).
+    // Read only, concurrent with the Coinbase read, under existing-order's
+    // per-IP / per-link budget (this endpoint is public); over budget, a
+    // failed or a timed-out scan leaves the answer as it was.
+    const scan = (async () => {
+      const budget = await lookupBudget(request, env, explicitCoinbaseId)
+      if (!budget.ok) return null
+      const found = await findExistingOrder(
+        env,
+        { provider: 'coinbase', linkId: explicitCoinbaseId },
+        { timeoutMs: STATUS_ORDER_LOOKUP_TIMEOUT_MS },
+      )
+      return found.kind === 'found' && typeof found.summary.rozoPaymentId === 'string'
+        ? found.summary.rozoPaymentId
+        : null
+    })().catch(() => null)
+    let foundId: string | null
+    ;[coinbase, foundId] = await Promise.all([fetchCoinbasePayment(explicitCoinbaseId), scan])
+    if (foundId) {
+      rozo = await withTimeout(fetchRozoPaymentById(env, foundId), STATUS_ORDER_READ_TIMEOUT_MS)
+      if (rozo?.id === foundId) rozoId = foundId
+      else rozo = null
+    }
   } else if (rozoId) {
     // Only the Rozo id: the Coinbase id is derived from its orderId below,
     // so these reads stay serial.

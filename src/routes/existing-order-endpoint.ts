@@ -84,7 +84,8 @@ async function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | typeof TI
   }
 }
 
-async function lookupBudget(
+/** Shared with invoice-status's by-link scan: one budget per IP and per link. */
+export async function lookupBudget(
   request: Request,
   env: Env,
   key: string,

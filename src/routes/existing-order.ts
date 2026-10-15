@@ -158,7 +158,9 @@ export function classifyOrderState(row: any): ExistingOrderState {
   return 'funded'
 }
 
-/** Only these fields leave the Worker. No addresses, amounts, BOLT11, tokens. */
+/** Only these fields leave the Worker. No addresses, amounts, BOLT11, tokens.
+ * (invoice-status is the deliberate exception: it relays an unpaid Lightning
+ * order's BOLT11 by Coinbase id, see pickRozoCallerSafe in webhook.ts.) */
 export function summarizeOrder(row: any): ExistingOrderSummary {
   const status = readPaymentStatus(row)
   const id = row?.id

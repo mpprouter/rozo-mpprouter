@@ -78,6 +78,8 @@ describe('Coinbase v3 invoice status', () => {
       amount: '1.05',
       asset: 'USD',
     }), { status: 200 }))
+      // Only a Coinbase id: the by-link order scan runs next; no order here.
+      .mockImplementation(async () => new Response(JSON.stringify({ error: { code: 'paymentNotFound' } }), { status: 404 }))
 
     const response = await handleInvoiceStatus(
       new Request(`https://example.com/invoice-status?payment_id=${SESSION_ID}`),
