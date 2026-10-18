@@ -1724,22 +1724,22 @@
       "id": "exa",
       "name": "Exa",
       "url": "https://api.exa.ai",
-      "serviceUrl": "https://exa.mpp.tempo.xyz",
-      "description": "AI-powered web search, content retrieval, and answers.",
+      "serviceUrl": "https://api.exa.ai",
+      "description": "Neural web search and page-content retrieval for AI agents, paid per request with no API key.",
       "categories": [
         "search",
         "ai"
       ],
-      "integration": "third-party",
+      "integration": "first-party",
       "tags": [
         "search",
-        "web",
+        "web-search",
         "content",
         "ai-search"
       ],
       "status": "active",
       "docs": {
-        "homepage": "https://docs.exa.ai",
+        "homepage": "https://docs.exa.ai/reference/mpp-guide",
         "llmsTxt": "https://docs.exa.ai/llms.txt"
       },
       "methods": {
@@ -1752,7 +1752,7 @@
           ]
         }
       },
-      "realm": "mpp.tempo.xyz",
+      "realm": "api.exa.ai",
       "provider": {
         "name": "Exa",
         "url": "https://exa.ai"
@@ -1761,58 +1761,30 @@
         {
           "method": "POST",
           "path": "/search",
-          "description": "Search the web",
+          "description": "Neural web search across all search types (instant, auto, fast, deep, deep-reasoning)",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "Search the web",
-            "amount": "5000"
-          },
-          "docs": "https://context7.com/websites/exa_ai/llms.txt?topic=POST%20%2Fsearch"
+            "description": "Neural web search across all search types (instant, auto, fast, deep, deep-reasoning)",
+            "dynamic": true,
+            "amountHint": "$0.007 \u2013 $0.015 per request"
+          }
         },
         {
           "method": "POST",
           "path": "/contents",
-          "description": "Get page contents",
+          "description": "Retrieve page contents by URL or document ID",
           "payment": {
             "intent": "charge",
             "method": "tempo",
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
-            "description": "Get page contents",
-            "amount": "5000"
-          },
-          "docs": "https://context7.com/websites/exa_ai/llms.txt?topic=POST%20%2Fcontents"
-        },
-        {
-          "method": "POST",
-          "path": "/findSimilar",
-          "description": "Find similar pages",
-          "payment": {
-            "intent": "charge",
-            "method": "tempo",
-            "currency": "0x20c000000000000000000000b9537d11c60e8b50",
-            "decimals": 6,
-            "description": "Find similar pages",
-            "amount": "5000"
-          },
-          "docs": "https://context7.com/websites/exa_ai/llms.txt?topic=POST%20%2FfindSimilar"
-        },
-        {
-          "method": "POST",
-          "path": "/answer",
-          "description": "Get AI-powered answers",
-          "payment": {
-            "intent": "charge",
-            "method": "tempo",
-            "currency": "0x20c000000000000000000000b9537d11c60e8b50",
-            "decimals": 6,
-            "description": "Get AI-powered answers",
-            "amount": "10000"
-          },
-          "docs": "https://context7.com/websites/exa_ai/llms.txt?topic=POST%20%2Fanswer"
+            "description": "Retrieve page contents by URL or document ID",
+            "dynamic": true,
+            "amountHint": "$0.001 per content type per URL"
+          }
         }
       ]
     },
