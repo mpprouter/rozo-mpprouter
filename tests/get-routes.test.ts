@@ -96,7 +96,10 @@ describe('GET routes — build', () => {
     // 496 POST routes shipped before this change; the count is asserted
     // so that a future snapshot refresh that silently drops POST routes
     // fails here rather than in production.
-    expect(postRoutes).toHaveLength(496)
+    // 496 → 494 on 2026-10-18: exa moved off exa.mpp.tempo.xyz to its own
+    // first-party endpoint (api.exa.ai) and dropped /findSimilar and /answer
+    // upstream; mpp.dev now lists only /search and /contents.
+    expect(postRoutes).toHaveLength(494)
     // Spot-check identity of routes agents have bookmarked.
     expect(getRouteByPublicPath('/v1/services/firecrawl/scrape', 'POST')?.id).toBe('firecrawl_scrape')
     expect(getRouteByPublicPath('/v1/services/exa/search', 'POST')?.id).toBe('exa_search')
@@ -159,7 +162,10 @@ describe('GET routes — build', () => {
     // chat_completions sibling was re-verified the same day and DELIVERS,
     // which retires the 'refund demo' description above. Both anthropic
     // routes are listed and both deliver.
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(448)
+    //
+    // 448 → 446 on 2026-10-18: exa /findSimilar and /answer retired upstream
+    // when exa moved to api.exa.ai (see the POST count note above).
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(446)
     // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
     // events/by-ledger joined them at the beta launch (see the note above).
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
