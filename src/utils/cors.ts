@@ -83,6 +83,10 @@ const EXPOSED_RESPONSE_HEADERS = [
   'x-ratelimit-tier',
   'x-ratelimit-window',
   'x-ratelimit-scope',
+  // create-invoice stage timings (see stage-timer.ts) so the browser checkout
+  // can attribute a slow create to a stage.
+  'server-timing',
+  'x-upstream-server-timing',
 ].join(', ')
 
 const ALLOWED_METHODS = 'GET, POST, OPTIONS'

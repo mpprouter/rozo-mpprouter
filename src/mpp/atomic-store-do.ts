@@ -45,6 +45,11 @@
  * POST /scan — body: { prefix: string; limit?: number }
  *              response: { values: string[] }
  *
+ * POST /gate — body: { globalKey, ipKey, bucket: string;
+ *                      globalLimit, ipLimit: number }
+ *              response: { globalCount: number; ipCount: number | null }
+ *              (create-invoice abuse gate; see handleGate)
+ *
  * If `storedVersion === expectedVersion` the write is applied and `version`
  * is incremented to `expectedVersion + 1`. Otherwise the current (value,
  * version) is returned so the caller can retry without an extra /read.
@@ -97,6 +102,10 @@ export class AtomicStoreDO implements DurableObject {
 
     if (url.pathname === '/scan') {
       return this.handleScan(body)
+    }
+
+    if (url.pathname === '/gate') {
+      return this.handleGate(body)
     }
 
     return new Response('Not Found', { status: 404 })
@@ -198,6 +207,55 @@ export class AtomicStoreDO implements DurableObject {
   }
 
   // -------------------------------------------------------------------------
+  // /gate handler — create-invoice abuse gate in ONE round trip
+  // -------------------------------------------------------------------------
+  //
+  // Bumps the global hourly counter and, only if it is still within
+  // globalLimit, the per-IP hourly counter, inside one transaction. Values use
+  // the same `{ count, bucket }` JSON shape and the same `n:<key>` version bump
+  // as the Worker-side /read + /commit CAS loop (create-invoice-gate.ts), so
+  // counters written by either path are interchangeable within an hour bucket
+  // (deploy transition) and a concurrent CAS writer sees a version conflict:
+  // an in-flight /commit from a pre-deploy Worker carries the version it read
+  // before this bump, so it loses the CAS and cannot overwrite our increment.
+  // The bucket is the one the Worker captured; a stored counter from another
+  // bucket resets to 0, exactly like the Worker-side parseCounter.
+  //
+  // Because both bumps share one transaction, a storage failure during the IP
+  // stage rolls back the global increment too. That is acceptable: the caller
+  // fails open on any DO error, so the request proceeds uncounted either way.
+
+  private async handleGate(body: unknown): Promise<Response> {
+    if (!isGateBody(body)) {
+      return new Response(
+        'Bad Request: expected { globalKey, ipKey, bucket: non-empty string; globalLimit, ipLimit: positive integer }',
+        { status: 400 },
+      )
+    }
+    const { globalKey, ipKey, bucket, globalLimit } = body
+
+    let globalCount = 0
+    let ipCount: number | null = null
+
+    await this.storage.transaction(async (txn) => {
+      const bump = async (key: string): Promise<number> => {
+        const [raw, version] = await Promise.all([
+          txn.get<string>(`v:${key}`),
+          txn.get<number>(`n:${key}`),
+        ])
+        const next = { count: parseGateCount(raw ?? null, bucket) + 1, bucket }
+        await txn.put(`v:${key}`, JSON.stringify(next))
+        await txn.put(`n:${key}`, (version ?? 0) + 1)
+        return next.count
+      }
+      globalCount = await bump(globalKey)
+      if (globalCount <= globalLimit) ipCount = await bump(ipKey)
+    })
+
+    return Response.json({ globalCount, ipCount } satisfies GateResponse)
+  }
+
+  // -------------------------------------------------------------------------
   // /seed handler — one-time migration helper
   // -------------------------------------------------------------------------
   //
@@ -292,6 +350,42 @@ function isCommitBody(x: unknown): x is CommitBody {
   if (o.op !== 'set' && o.op !== 'delete') return false
   if (o.op === 'set' && typeof o.value !== 'string') return false
   return true
+}
+
+// /gate types
+
+export type GateResponse = {
+  globalCount: number
+  /** null when the global counter tripped and the IP counter was not bumped. */
+  ipCount: number | null
+}
+
+type GateBody = {
+  globalKey: string
+  ipKey: string
+  bucket: string
+  globalLimit: number
+  ipLimit: number
+}
+
+function isGateBody(x: unknown): x is GateBody {
+  if (typeof x !== 'object' || x === null) return false
+  const o = x as Record<string, unknown>
+  const str = (v: unknown) => typeof v === 'string' && v.length > 0
+  const posInt = (v: unknown) => typeof v === 'number' && Number.isSafeInteger(v) && v > 0
+  return str(o.globalKey) && str(o.ipKey) && str(o.bucket) && posInt(o.globalLimit) && posInt(o.ipLimit)
+}
+
+/** Count of a `{ count, bucket }` counter; 0 when absent, malformed, or from another bucket. */
+function parseGateCount(raw: string | null, bucket: string): number {
+  if (!raw) return 0
+  try {
+    const c = JSON.parse(raw) as { count?: unknown; bucket?: unknown }
+    if (c && typeof c.count === 'number' && c.bucket === bucket) return c.count
+  } catch {
+    // fall through to a fresh counter
+  }
+  return 0
 }
 
 // /seed types
