@@ -558,9 +558,9 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(sourceMeta(parseNativeSources(PROD_NATIVE), 'custody')).toEqual({})
   })
 
-  it('custody caps ZEC below $1100 and leaves other coins alone', () => {
-    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(1099.99)
-    expect(nativeMaxUsdFor('9133', '5000', 'custody')).toBe(1099.99)
+  it('custody caps ZEC below $3200 and leaves other coins alone', () => {
+    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(3199.99)
+    expect(nativeMaxUsdFor('9133', '5000', 'custody')).toBe(3199.99)
     expect(nativeMaxUsdFor('9133', '100', 'custody')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000', 'custody')).toBe(5000)
   })
