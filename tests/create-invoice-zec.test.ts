@@ -177,8 +177,8 @@ describe('ZEC source table', () => {
     })
   })
 
-  it('caps ZEC at $2000 even if NATIVE_MAX_USD is higher', () => {
-    expect(nativeMaxUsdFor('9133', '5000')).toBe(2000)
+  it('caps ZEC at $3200 even if NATIVE_MAX_USD is higher', () => {
+    expect(nativeMaxUsdFor('9133', '5000')).toBe(3200)
     expect(nativeMaxUsdFor('9133', '100')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000')).toBe(5000)
   })
@@ -547,7 +547,7 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(JSON.stringify(sourceMeta(open, 'near'))).toBe(
       '{"ZEC@9133":{"eta_seconds":480,"refund_address_required":true,"beta":true,"address_single_use":true}}',
     )
-    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(2000)
+    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(3200)
     expect(zecMinLinkLifeMs('near')).toBe(ZEC_MIN_LINK_LIFE_MS)
   })
 
