@@ -12,6 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { handleCreateInvoice, resolveCoinbaseLinkExpiry } from '../src/routes/create-invoice'
 import type { Env } from '../src/index'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 const STRIPE_URL = 'https://crypto.stripe.com/pay/CDMTestBlob_ABC123xyz'
@@ -30,26 +31,7 @@ function makeKvStub() {
 }
 
 function makeDoStub() {
-  const store = new Map<string, string>()
-  const versions = new Map<string, number>()
-  const stub = {
-    async fetch(req: Request) {
-      const url = new URL(req.url)
-      const b: any = await req.json()
-      if (url.pathname === '/read') {
-        return Response.json({ value: store.get(b.key) ?? null, version: versions.get(b.key) ?? 0 })
-      }
-      const cur = versions.get(b.key) ?? 0
-      if (cur !== b.expectedVersion) {
-        return Response.json({ ok: false, value: store.get(b.key) ?? null, version: cur })
-      }
-      if (b.op === 'set') store.set(b.key, b.value)
-      else store.delete(b.key)
-      versions.set(b.key, b.expectedVersion + 1)
-      return Response.json({ ok: true })
-    },
-  }
-  return { idFromName: (n: string) => ({ name: n }), get: () => stub }
+  return makeAtomicStoreMock()
 }
 
 function makeEnv(): Env {

@@ -10,6 +10,7 @@ import { relayUpstreamRateLimit } from '../src/routes/upstream-rate-limit'
 import { FORWARDED_HINT_HEADER } from '../src/routes/client-hint-forward'
 import { withCors } from '../src/utils/cors'
 import type { Env } from '../src/index'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 const UPSTREAM_429_BODY = {
   error: {
@@ -213,24 +214,8 @@ describe('create-invoice forwards the Cloudflare buyer IP on every create', () =
 
 describe('router backstop 429', () => {
   it('sets Retry-After and reports the env-configured limit', async () => {
-    const store = new Map<string, string>()
-    const versions = new Map<string, number>()
-    const stub = {
-      async fetch(req: Request) {
-        const url = new URL(req.url)
-        const b: any = await req.json()
-        if (url.pathname === '/read') {
-          return Response.json({ value: store.get(b.key) ?? null, version: versions.get(b.key) ?? 0 })
-        }
-        const cur = versions.get(b.key) ?? 0
-        if (cur !== b.expectedVersion) return Response.json({ ok: false, value: store.get(b.key) ?? null, version: cur })
-        store.set(b.key, b.value)
-        versions.set(b.key, cur + 1)
-        return Response.json({ ok: true })
-      },
-    }
     const env = makeEnv({
-      ATOMIC_STORE: { idFromName: (n: string) => ({ name: n }), get: () => stub },
+      ATOMIC_STORE: makeAtomicStoreMock(),
       CREATE_INVOICE_IP_LIMIT_PER_HOUR: '1',
     })
     expect((await handleCreateInvoice(createReq(COINBASE_BODY), env)).status).toBe(200)

@@ -12,8 +12,9 @@
  * breaker (botnet defence) that fires a DingTalk alert when it trips.
  *
  * Counters live on the SAME "coupon" ATOMIC_STORE Durable Object instance the
- * coupon abuse-protection uses, via its /read + /commit CAS protocol — one
- * strongly-consistent domain, no new binding. Keys are namespaced `ci:*` so they
+ * coupon abuse-protection uses, via its /gate endpoint (both counters bumped in
+ * one DO round trip and one storage transaction) — one strongly-consistent
+ * domain, no new binding. Keys are namespaced `ci:*` so they
  * never collide with coupon (`rl:*`) or payment state.
  *
  * FAIL-OPEN by design: the gate protects a create path, not money movement. If
@@ -23,7 +24,7 @@
  */
 
 import type { Env } from '../index'
-import type { ReadResponse, CommitResponse } from '../mpp/atomic-store-do'
+import type { GateResponse } from '../mpp/atomic-store-do'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 
@@ -70,7 +71,6 @@ export function secondsUntilWindowReset(now = Date.now()): number {
 }
 
 const DO_ORIGIN = 'https://atomic-store.internal'
-const MAX_CAS_RETRIES = 25 // hot shared counters see burst contention; keep loose
 
 export type GateDecision =
   | { ok: true }
@@ -105,45 +105,6 @@ function hourBucket(now = Date.now()): string {
   return String(Math.floor(now / (WINDOW_SECONDS * 1000)))
 }
 
-interface Counter {
-  count: number
-  /** Bucket this counter belongs to; a new hour resets to 0. */
-  bucket: string
-}
-
-function parseCounter(raw: string | null, bucket: string): Counter {
-  if (!raw) return { count: 0, bucket }
-  try {
-    const c = JSON.parse(raw) as Counter
-    if (c && typeof c.count === 'number' && c.bucket === bucket) return c
-  } catch {
-    // fall through to a fresh counter
-  }
-  return { count: 0, bucket }
-}
-
-/**
- * Atomically increment a bucketed counter and return the post-increment value.
- * CAS loop against the DO; on exhaustion throws (caller fails open).
- */
-async function bumpCounter(env: Env, key: string, bucket: string): Promise<number> {
-  let { value, version } = await doPost<ReadResponse>(env, '/read', { key })
-  for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
-    const cur = parseCounter(value, bucket)
-    const next: Counter = { count: cur.count + 1, bucket }
-    const result = await doPost<CommitResponse>(env, '/commit', {
-      key,
-      expectedVersion: version,
-      op: 'set',
-      value: JSON.stringify(next),
-    })
-    if (result.ok) return next.count
-    value = result.value
-    version = result.version
-  }
-  throw new Error(`create-invoice gate bumpCounter(${key}): exhausted ${MAX_CAS_RETRIES} retries`)
-}
-
 /**
  * Client IP as Cloudflare reports it. Only `CF-Connecting-IP` is trusted: the
  * Cloudflare edge sets it on every request that reaches this Worker and
@@ -157,17 +118,32 @@ export function clientIp(request: Request): string {
 
 /**
  * Gate a create-invoice request. Returns { ok:true } to proceed, or a rejection
- * reason. Fail-OPEN on any DO error (logged). Order: global breaker first (one
- * read+bump), then per-IP — an already-tripped global cap short-circuits before
- * spending per-IP work, and a single hot IP can't exhaust the global budget for
+ * reason. Fail-OPEN on any DO error (logged). One DO /gate call bumps the
+ * global breaker first, then per-IP — an already-tripped global cap skips the
+ * per-IP bump, and a single hot IP can't exhaust the global budget for
  * everyone (its own per-IP cap stops it first).
  */
 export async function checkCreateInvoiceGate(request: Request, env: Env): Promise<GateDecision> {
   const now = Date.now()
   const bucket = hourBucket(now)
   const limits = resolveGateLimits(env)
+  const ip = clientIp(request)
   try {
-    const globalCount = await bumpCounter(env, `ci:global:${bucket}`, bucket)
+    const res = await doPost<GateResponse>(env, '/gate', {
+      globalKey: `ci:global:${bucket}`,
+      ipKey: `ci:ip:${ip}:${bucket}`,
+      bucket,
+      globalLimit: limits.globalPerHour,
+      ipLimit: limits.ipPerHour,
+    })
+    const globalCount = res?.globalCount
+    const ipCount = res?.ipCount
+    if (
+      typeof globalCount !== 'number' ||
+      (globalCount <= limits.globalPerHour && typeof ipCount !== 'number')
+    ) {
+      throw new Error('create-invoice gate DO /gate returned a malformed body')
+    }
     if (globalCount > limits.globalPerHour) {
       // Fire the alert exactly once at the crossing to avoid alert spam.
       if (globalCount === limits.globalPerHour + 1 && alertSinkConfigured(env)) {
@@ -183,9 +159,7 @@ export async function checkCreateInvoiceGate(request: Request, env: Env): Promis
       }
     }
 
-    const ip = clientIp(request)
-    const ipCount = await bumpCounter(env, `ci:ip:${ip}:${bucket}`, bucket)
-    if (ipCount > limits.ipPerHour) {
+    if ((ipCount as number) > limits.ipPerHour) {
       return {
         ok: false,
         reason: 'ip_rate_limited',
