@@ -137,11 +137,7 @@ export async function checkCreateInvoiceGate(request: Request, env: Env): Promis
       ipLimit: limits.ipPerHour,
     })
     const globalCount = res?.globalCount
-    const ipCount = res?.ipCount
-    if (
-      typeof globalCount !== 'number' ||
-      (globalCount <= limits.globalPerHour && typeof ipCount !== 'number')
-    ) {
+    if (typeof globalCount !== 'number') {
       throw new Error('create-invoice gate DO /gate returned a malformed body')
     }
     if (globalCount > limits.globalPerHour) {
@@ -159,7 +155,12 @@ export async function checkCreateInvoiceGate(request: Request, env: Env): Promis
       }
     }
 
-    if ((ipCount as number) > limits.ipPerHour) {
+    // Global is within its limit, so the DO bumped the IP counter too.
+    const ipCount = res.ipCount
+    if (typeof ipCount !== 'number') {
+      throw new Error('create-invoice gate DO /gate returned a malformed body')
+    }
+    if (ipCount > limits.ipPerHour) {
       return {
         ok: false,
         reason: 'ip_rate_limited',

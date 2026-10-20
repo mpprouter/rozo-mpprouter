@@ -1325,8 +1325,27 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
     res = new Response(res.body, res)
     res.headers.set('Server-Timing', timer.header())
   }
-  if (timer.upstreamServerTiming) res.headers.set('X-Upstream-Server-Timing', timer.upstreamServerTiming)
+  const upstreamTiming = relayableUpstreamTiming(timer.upstreamServerTiming)
+  if (upstreamTiming) res.headers.set('X-Upstream-Server-Timing', upstreamTiming)
   return res
+}
+
+const UPSTREAM_TIMING_MAX_CHARS = 512
+
+/**
+ * Upstream `Server-Timing` as relayed in X-Upstream-Server-Timing: Cloudflare
+ * edge entries (cfL4, cfEdge, ...) are dropped, as they describe the hop to
+ * upstream rather than upstream's own work, and the result is capped at 512
+ * chars. Everything else is kept verbatim. Null when nothing is left.
+ */
+export function relayableUpstreamTiming(raw: string | null): string | null {
+  if (!raw) return null
+  const kept = raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry && !/^cf/i.test(entry))
+    .join(', ')
+  return kept ? kept.slice(0, UPSTREAM_TIMING_MAX_CHARS) : null
 }
 
 async function handleCreateInvoiceTimed(request: Request, env: Env, timer: StageTimer): Promise<Response> {
@@ -2818,6 +2837,7 @@ export async function handleStripeCreateInvoice(
   try {
     invoice = await resolveStripeInvoice(stripeUrl)
     await indexStripeSession(env, stripeUrl, invoice.invoiceKey)
+    timer?.mark('stripe_resolve')
   } catch (err) {
     if (err instanceof StripeResolveError) {
       const status =
@@ -2938,6 +2958,7 @@ export async function handleStripeCreateInvoice(
   let existing: any = null
   let ended: StripeEndedOrder | null = null
   const found = await lookupStripeOrderRow(env, orderId)
+  timer?.mark('stripe_lookup')
   if (found) {
     const kind = classifyStripeOrderRow(found)
     if (kind === 'reusable') existing = found
