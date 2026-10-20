@@ -17,6 +17,7 @@ import {
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
+import { StageTimer } from '../utils/stage-timer'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase } from './intents-base'
 import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
@@ -847,6 +848,7 @@ async function rotateExistingSource(
   env: Env,
   paymentId: string,
   source: ResolvedSource,
+  timer?: StageTimer,
 ): Promise<
   { ok: true; row: any } | { ok: false; code: string; message?: string; detected?: PaymentDetected }
 > {
@@ -866,10 +868,15 @@ async function rotateExistingSource(
       },
     )
   } catch (err: any) {
+    timer?.mark('upstream')
     return { ok: false, code: `network_error (${err?.message ?? 'unknown error'})` }
   }
 
   const text = await resp.text()
+  if (timer) {
+    timer.mark('upstream')
+    timer.upstreamServerTiming = resp.headers.get('Server-Timing')
+  }
   if (!resp.ok) {
     let code = `HTTP ${resp.status}`
     let message: string | undefined
@@ -1299,7 +1306,30 @@ function quoteReceiptRequiredResponse(
   })
 }
 
+/**
+ * Every create-invoice response, success or error, carries a `Server-Timing`
+ * header with the stage breakdown (StageTimer), plus the upstream intents
+ * `Server-Timing` as `X-Upstream-Server-Timing` when upstream sent one.
+ */
 export async function handleCreateInvoice(request: Request, env: Env): Promise<Response> {
+  const timer = new StageTimer()
+  let res = await handleCreateInvoiceTimed(request, env, timer)
+  const stages = timer.stages()
+  // Everything between the upstream call and the response is the post-create
+  // re-reads (status / slot re-checks) plus building the body.
+  if ('upstream' in stages && !('post' in stages)) timer.mark('post')
+  try {
+    res.headers.set('Server-Timing', timer.header())
+  } catch {
+    // Immutable headers (a Response passed through from fetch): copy it.
+    res = new Response(res.body, res)
+    res.headers.set('Server-Timing', timer.header())
+  }
+  if (timer.upstreamServerTiming) res.headers.set('X-Upstream-Server-Timing', timer.upstreamServerTiming)
+  return res
+}
+
+async function handleCreateInvoiceTimed(request: Request, env: Env, timer: StageTimer): Promise<Response> {
   if (request.method !== 'POST') {
     return json(405, { error: 'Method not allowed' })
   }
@@ -1321,6 +1351,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   // breaker (fail-open on DO error). Same-payment reuse is handled below via the
   // idempotency lookup; this caps raw creation volume from a spray/botnet.
   const gate = await checkCreateInvoiceGate(request, env)
+  timer.mark('gate')
   if (!gate.ok) {
     const res =
       gate.reason === 'global_circuit_open'
@@ -1547,6 +1578,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       payinIntent,
       orderAttribution,
       emailResult.email,
+      timer,
     )
   }
 
@@ -1749,6 +1781,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       })
     }
   }
+  timer.mark('quote')
 
   const invoiceAmount: string | undefined = quote?.invoice?.amount
   const merchantName: string | null = quote?.merchant ?? null
@@ -1929,6 +1962,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       allIds = [...firstIds, ...retryIds]
       scanned = [...scanned, ...more]
     }
+    timer.mark('slots')
     const failedLookup = scanned.find(
       (r): r is { state: 'error'; status: number | null } => r.state === 'error',
     )
@@ -2015,6 +2049,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       const previous = previousRows()
       if (previous.length > 0) {
         const guard = await checkPreviousOrdersUnfunded(env, previous)
+        timer.mark('relink')
         if (!guard.ok) {
           if (guard.reason === 'previous_order_funded' || guard.reason === 'previous_order_funds_found') {
             return json(409, {
@@ -2158,7 +2193,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
           rotationFailure = 'lightning_not_rotatable'
         } else {
           rotationAttempted = true
-          const rotated = await rotateExistingSource(env, String(existing.id), source)
+          const rotated = await rotateExistingSource(env, String(existing.id), source, timer)
           if (rotated.ok) {
             row = rotated.row
             rowSource = readRowSource(rotated.row)
@@ -2449,6 +2484,7 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
       body: JSON.stringify(intentsBody),
     })
   } catch (err: any) {
+    timer.mark('upstream')
     return errorResponse(502, {
       code: 'INTENTS_API_FAILED',
       stage: 'create_unreachable',
@@ -2460,6 +2496,8 @@ export async function handleCreateInvoice(request: Request, env: Env): Promise<R
   }
 
   const intentsText = await intentsResp.text()
+  timer.mark('upstream')
+  timer.upstreamServerTiming = intentsResp.headers.get('Server-Timing')
   if (!intentsResp.ok) {
     // Beta ZEC: rozo-intents-api's ZEC refusals (switch off, bad refund
     // address, link too short, quote drift, over cap, custody daily cap /
@@ -2772,6 +2810,8 @@ export async function handleStripeCreateInvoice(
   // Optional payer contact email, already normalized by handleCreateInvoice.
   // Written on create only, like orderAttribution.
   contactEmail: string | null = null,
+  // Stage timings for handleCreateInvoice's Server-Timing header.
+  timer?: StageTimer,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -2973,7 +3013,7 @@ export async function handleStripeCreateInvoice(
       // Lightning is rotated upstream like any other source (rozo-intents-api
       // LIGHTNING_ROTATION); switch-off refusals map to lightning_not_rotatable.
       rotationAttempted = true
-      const rotated = await rotateExistingSource(env, String(existing.id), source)
+      const rotated = await rotateExistingSource(env, String(existing.id), source, timer)
       if (rotated.ok) {
         row = rotated.row
         reusedSource = readRowSource(rotated.row)
@@ -3147,6 +3187,7 @@ export async function handleStripeCreateInvoice(
         body: JSON.stringify(intentsBody),
       })
     } catch (err: any) {
+      timer?.mark('upstream')
       return json(502, {
         ok: false,
         provider: 'stripe_crypto',
@@ -3154,6 +3195,10 @@ export async function handleStripeCreateInvoice(
       })
     }
     const intentsText = await intentsResp.text()
+    if (timer) {
+      timer.mark('upstream')
+      timer.upstreamServerTiming = intentsResp.headers.get('Server-Timing')
+    }
     if (!intentsResp.ok) {
       const rateLimited = relayUpstreamRateLimit(intentsResp, intentsText, { provider: 'stripe_crypto' })
       if (rateLimited) return rateLimited
