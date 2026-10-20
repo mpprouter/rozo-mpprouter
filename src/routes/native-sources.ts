@@ -305,10 +305,11 @@ export function isNativeSymbol(chainId: string, tokenSymbol: string): boolean {
   return !!def && def.symbol === tokenSymbol.toUpperCase()
 }
 
-/** Upper bound on callerPays for a native source (same as the backend cap). */
+/** Upper bound on callerPays for a native source (same as the backend cap,
+ *  rozo-intents-api MAX_NATIVE_PAYIN_USD: $3,200 since 2026-10-20, was $2,000). */
 export function nativeMaxUsd(raw: string | undefined): number {
   const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : 2000
+  return Number.isFinite(n) && n > 0 ? n : 3200
 }
 
 /** Cap for one native coin: the lower of its own maxUsd and NATIVE_MAX_USD. */
