@@ -368,7 +368,7 @@ export interface Env {
   ROZO_INTENTS_READ_BASE?: string
   // Native coin checkout (ETH/BNB/POL/SOL). NATIVE_SOURCES = open coins, e.g.
   // "ETH@8453,ETH@1,BNB@56,SOL@900" (unset = none). NATIVE_MAX_USD caps
-  // callerPays (default 2000). ROZO_TEST_LINK_SECRET signs internal
+  // callerPays (default 3200). ROZO_TEST_LINK_SECRET signs internal
   // rozotest_ invoices (unset = test invoices rejected).
   NATIVE_SOURCES?: string
   // Beta native coins ("ZEC@9133"), opened only for requests with ?beta=<symbol>.
