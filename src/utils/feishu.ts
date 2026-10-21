@@ -12,12 +12,29 @@
 import type { RedactedAlert } from './alert-redaction'
 
 const FEISHU_API = 'https://open.feishu.cn/open-apis'
+// Lark international (founder decision 2026-10-17/18): production alerts are
+// read in the Lark "Rozo Founder" / "Rozo Ops" groups, not legacy Feishu.
+// Same im/v1 API, different host and app.
+export const LARK_API = 'https://open.larksuite.com/open-apis'
 const TIMEOUT_MS = 10_000
 
 export interface FeishuConfig {
   appId?: string
   appSecret?: string
   chatId?: string
+  // API host; defaults to legacy Feishu (open.feishu.cn).
+  apiBase?: string
+}
+
+export interface LarkFounderEnv {
+  LARK_APP_ID?: string
+  LARK_APP_SECRET?: string
+  LARK_FOUNDER_CHAT_ID?: string
+}
+
+/** Lark international "Rozo Founder" group, via the same bot ainative's notify_feishu.py uses. */
+export function larkFounderConfig(env: LarkFounderEnv): FeishuConfig {
+  return { appId: env.LARK_APP_ID, appSecret: env.LARK_APP_SECRET, chatId: env.LARK_FOUNDER_CHAT_ID, apiBase: LARK_API }
 }
 
 export function feishuConfigured(cfg: FeishuConfig): boolean {
@@ -37,8 +54,9 @@ export async function sendFeishuAlertConfirmed(
   opts: FeishuSendOptions = {},
 ): Promise<boolean> {
   if (!feishuConfigured(cfg)) return false
+  const api = cfg.apiBase || FEISHU_API
   try {
-    const tokenRes = await fetch(`${FEISHU_API}/auth/v3/tenant_access_token/internal`, {
+    const tokenRes = await fetch(`${api}/auth/v3/tenant_access_token/internal`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ app_id: cfg.appId, app_secret: cfg.appSecret }),
@@ -50,7 +68,7 @@ export async function sendFeishuAlertConfirmed(
       return false
     }
 
-    const res = await fetch(`${FEISHU_API}/im/v1/messages?receive_id_type=chat_id`, {
+    const res = await fetch(`${api}/im/v1/messages?receive_id_type=chat_id`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

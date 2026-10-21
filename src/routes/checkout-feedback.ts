@@ -16,8 +16,9 @@
 //      Test orders (rozotest_, see native-sources.ts) are stored with
 //      is_test=1, never sent to Feishu, and answered with
 //      `test_notification: {order_id, status, text}` plus one log line.
-//   3. The cron drains pending rows to Feishu, claiming each row first and
-//      passing feedback_id as Feishu's dedup uuid. Failures stay queued with
+//   3. The cron drains pending rows to the Lark Rozo Founder group (legacy
+//      Feishu only if Lark is unconfigured), claiming each row first and
+//      passing feedback_id as the dedup uuid. Failures stay queued with
 //      backoff. Quiet hours (23:00-06:00 Asia/Singapore, ceo-alert-policy)
 //      hold delivery; the feedback itself is already saved.
 //
@@ -27,7 +28,7 @@
 import type { Env } from '../index'
 import { resolveMerchantSettlement, type MerchantSettlement } from './webhook'
 import { redactForAlert } from '../utils/alert-redaction'
-import { feishuConfigured, sendFeishuAlertConfirmed } from '../utils/feishu'
+import { feishuConfigured, larkFounderConfig, sendFeishuAlertConfirmed, type FeishuConfig } from '../utils/feishu'
 
 export const FEEDBACK_PATH = '/v1/services/rozo-agent-api/checkout-feedback'
 export const FEEDBACK_MAX_CHARS = 1000
@@ -41,8 +42,29 @@ const NOTIFY_CLAIM_STALE_MS = 5 * 60 * 1000
 
 type FeedbackEnv = Pick<
   Env,
-  'COUPON_SECURITY_DB' | 'CHECKOUT_FEEDBACK_TOKEN_SECRET' | 'FEISHU_APP_ID' | 'FEISHU_APP_SECRET' | 'FEISHU_ALERT_CHAT_ID'
+  | 'COUPON_SECURITY_DB'
+  | 'CHECKOUT_FEEDBACK_TOKEN_SECRET'
+  | 'FEISHU_APP_ID'
+  | 'FEISHU_APP_SECRET'
+  | 'FEISHU_ALERT_CHAT_ID'
+  | 'LARK_APP_ID'
+  | 'LARK_APP_SECRET'
+  | 'LARK_FOUNDER_CHAT_ID'
 >
+
+/**
+ * Where feedback notifications go. Founder 2026-10-21: every submission is a
+ * Lark alert in the Rozo Founder group (Lark international), so Lark wins
+ * whenever its three secrets are set; legacy Feishu is only the fallback for a
+ * Worker that has not been given them yet.
+ */
+export function feedbackNotifyTarget(env: FeedbackEnv): { channel: 'lark' | 'feishu'; cfg: FeishuConfig } | null {
+  const lark = larkFounderConfig(env)
+  if (feishuConfigured(lark)) return { channel: 'lark', cfg: lark }
+  const feishu = { appId: env.FEISHU_APP_ID, appSecret: env.FEISHU_APP_SECRET, chatId: env.FEISHU_ALERT_CHAT_ID }
+  if (feishuConfigured(feishu)) return { channel: 'feishu', cfg: feishu }
+  return null
+}
 
 function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -336,8 +358,9 @@ export async function drainCheckoutFeedbackNotifications(
     const db = env.COUPON_SECURITY_DB
     if (!db) return { ...out, skipped: 'no_db' }
     const now = opts.now ?? Date.now
-    const cfg = { appId: env.FEISHU_APP_ID, appSecret: env.FEISHU_APP_SECRET, chatId: env.FEISHU_ALERT_CHAT_ID }
-    if (!feishuConfigured(cfg)) return { ...out, skipped: 'feishu_unconfigured' }
+    const target = feedbackNotifyTarget(env)
+    if (!target) return { ...out, skipped: 'feishu_unconfigured' }
+    const cfg = target.cfg
     if (inQuietHours(now())) return { ...out, skipped: 'quiet_hours' }
     const send = opts.send ?? sendFeishuAlertConfirmed
 
