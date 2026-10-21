@@ -11,6 +11,7 @@ import {
   inQuietHours,
   handleCheckoutFeedback,
   drainCheckoutFeedbackNotifications,
+  feedbackNotifyTarget,
   NOTIFY_MAX_ATTEMPTS,
 } from '../src/routes/checkout-feedback'
 import type { MerchantSettlement } from '../src/routes/webhook'
@@ -308,5 +309,22 @@ describe('notification drain', () => {
     const send = vi.fn(async () => true)
     expect(await drainCheckoutFeedbackNotifications(env(d.db, { FEISHU_APP_ID: '' }), { now: () => DAY, send })).toMatchObject({ skipped: 'feishu_unconfigured' })
     expect(row().notification_status).toBe('pending')
+  })
+
+  const LARK = { LARK_APP_ID: 'cli_lark', LARK_APP_SECRET: 'ls', LARK_FOUNDER_CHAT_ID: 'oc_founder' }
+
+  it('sends to the Lark founder group when Lark is configured', async () => {
+    const send = vi.fn(async () => true)
+    expect(await drainCheckoutFeedbackNotifications(env(d.db, LARK), { now: () => DAY, send })).toMatchObject({ sent: 1 })
+    const [cfg] = send.mock.calls[0] as any[]
+    expect(cfg).toEqual({ appId: 'cli_lark', appSecret: 'ls', chatId: 'oc_founder', apiBase: 'https://open.larksuite.com/open-apis' })
+    expect(row().notification_status).toBe('sent')
+  })
+
+  it('works with Lark alone and falls back to legacy Feishu only when Lark is incomplete', async () => {
+    const noFeishu = { FEISHU_APP_ID: '', FEISHU_APP_SECRET: '', FEISHU_ALERT_CHAT_ID: '' }
+    expect(feedbackNotifyTarget(env(d.db, { ...noFeishu, ...LARK }))?.channel).toBe('lark')
+    expect(feedbackNotifyTarget(env(d.db, { ...LARK, LARK_FOUNDER_CHAT_ID: '' }))).toMatchObject({ channel: 'feishu', cfg: { chatId: 'c' } })
+    expect(feedbackNotifyTarget(env(d.db, { ...noFeishu, LARK_APP_ID: 'x' }))).toBeNull()
   })
 })

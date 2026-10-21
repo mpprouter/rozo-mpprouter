@@ -447,6 +447,12 @@ export interface Env {
   FEISHU_APP_ID?: string
   FEISHU_APP_SECRET?: string
   FEISHU_ALERT_CHAT_ID?: string
+  // Lark international "Rozo Founder" group (2026-10-21). When all three are
+  // set, checkout feedback notifications go here instead of legacy Feishu.
+  // Secrets: wrangler secret put LARK_APP_ID / LARK_APP_SECRET / LARK_FOUNDER_CHAT_ID.
+  LARK_APP_ID?: string
+  LARK_APP_SECRET?: string
+  LARK_FOUNDER_CHAT_ID?: string
 
   // Alert archive: every alert is also written to ainative_cloud_alerts_log in
   // the Rozo Intents Supabase project via the alerts_log_insert RPC. URL is a
