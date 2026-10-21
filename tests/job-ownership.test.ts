@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { Keypair } from '@stellar/stellar-base'
+import { Keypair } from '@stellar/stellar-sdk'
 import {
   handleJobChallenge,
   handleJobStatus,

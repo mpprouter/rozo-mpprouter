@@ -36,7 +36,7 @@
  * extractStellarAddress-only path yet, so no migration is needed.
  */
 
-import { Keypair } from '@stellar/stellar-base'
+import { Keypair } from '@stellar/stellar-sdk'
 import { Credential } from 'mppx'
 import { fetchWithSiwx } from '../mpp/siwx-signer'
 import type { Env } from '../index'

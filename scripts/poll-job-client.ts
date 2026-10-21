@@ -24,7 +24,7 @@
  * `Keypair.fromSecret(S).sign(bytes)`.
  */
 
-import { Keypair } from '@stellar/stellar-base'
+import { Keypair } from '@stellar/stellar-sdk'
 
 const ROUTER = process.env.MPP_ROUTER_URL || 'https://apiserver.mpprouter.dev'
 
