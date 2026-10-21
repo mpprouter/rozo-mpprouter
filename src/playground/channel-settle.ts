@@ -298,7 +298,13 @@ export async function settlePlaygroundChannels(
       if (!voucher) continue
       await settleOneChannel(env, state.channelContract, deps)
     } catch (e: any) {
-      console.error(`[channel-settle] settle failed for ${state.channelContract}: ${e?.message}`)
+      // Include the top of the stack so a tail shows WHERE it threw (e.g.
+      // getChannelState's simulation vs the close), not just the message.
+      const stack = String(e?.stack ?? '').split('\n').slice(1, 9).join(' | ')
+      console.error(
+        `[channel-settle] settle failed for ${state.channelContract}: ${e?.message}` +
+          (stack ? ` stack: ${stack}` : ''),
+      )
     }
   }
 }

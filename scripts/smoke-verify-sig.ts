@@ -4,7 +4,7 @@
  *
  *   npx tsx scripts/smoke-verify-sig.ts
  */
-import { Keypair } from '@stellar/stellar-base'
+import { Keypair } from '@stellar/stellar-sdk'
 
 const kp = Keypair.random()
 const nonce = Buffer.from(crypto.getRandomValues(new Uint8Array(32)))

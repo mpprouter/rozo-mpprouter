@@ -53,25 +53,15 @@ service = "mpprouter"
 enabled = true
 head_sampling_rate = 1
 
-# Force @stellar/stellar-sdk and @stellar/stellar-base to their CJS
-# entry points, NOT the minified browser bundles.
-#
-# Without these aliases, esbuild's `browser: true` resolution (default
-# for Workers) picks `dist/stellar-sdk.min.js` and `dist/
-# stellar-base.min.js` — both of which inline their OWN copy of the
-# Transaction/TransactionBuilder classes. Meanwhile any direct
-# `require('@stellar/stellar-base')` from a sub-file (e.g.
-# `stellar-sdk/lib/rpc/transaction.js`) ends up resolving to the
-# CJS `lib/index.js` of stellar-base. Result: TWO copies of the
-# `Transaction` class in the bundle, `instanceof` fails across
-# them, and `assembleTransaction → TransactionBuilder.cloneFrom`
-# throws `TypeError: expected a 'Transaction', got: [object Object]`.
-#
-# Aliasing both packages to their CJS entry forces every import to
-# share one module instance.
-[alias]
-"@stellar/stellar-sdk" = "./node_modules/@stellar/stellar-sdk/lib/index.js"
-"@stellar/stellar-base" = "./node_modules/@stellar/stellar-base/lib/index.js"
+# No [alias] for @stellar/stellar-sdk any more (removed with the v16 upgrade).
+# Up to v15 the SDK shipped a `browser` field that made esbuild pick the
+# minified UMD bundles, which inlined their own Transaction classes next to
+# the CJS stellar-base copy, so `instanceof` failed in
+# assembleTransaction -> TransactionBuilder.cloneFrom; the alias forced the
+# CJS entry. v16 merged stellar-base into the SDK and dropped the `browser`
+# field: every importer (our code, @stellar/mpp, @x402/stellar) resolves the
+# package `exports` "import" condition to the one ESM graph under lib/esm,
+# so there is a single module instance without an alias.
 
 [[kv_namespaces]]
 binding = "MPP_STORE"

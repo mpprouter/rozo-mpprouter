@@ -29,7 +29,6 @@
  */
 
 import {
-  Account,
   Asset,
   BASE_FEE,
   Horizon,
@@ -123,7 +122,7 @@ export async function sponsorStellarAccount(
     // Expected: a 404 from Horizon means the account is not yet created.
   }
 
-  let sponsorAccount: Account
+  let sponsorAccount: Horizon.AccountResponse
   try {
     sponsorAccount = await server.loadAccount(sponsor.publicKey())
   } catch (err: any) {
