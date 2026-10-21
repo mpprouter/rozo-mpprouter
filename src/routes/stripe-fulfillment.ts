@@ -18,7 +18,15 @@
 // separate provider-qualified namespace so the two never collide.
 
 import type { Env } from '../index'
-import { maskAddresses } from './webhook'
+import {
+  deliveredReportEnabled,
+  deliveredReportStillPending,
+  maskAddresses,
+  reportDeliveredToRozo,
+} from './webhook'
+import { DELIVERED_MAX_ATTEMPTS } from './coinbase-sweep'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
+import { redactForAlert } from '../utils/alert-redaction'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { casRead, casUpdate, casScan } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
@@ -135,6 +143,15 @@ export interface StripeFulfillmentRecord {
   // open the stuck-order Intercom ticket. Never cleared, so at most one
   // ticket per order even if the Intercom call fails.
   stuckTicketAt?: string | null
+  // Delivery confirmation reported to Rozo (POST /payments/<id>/delivered),
+  // same contract as the Coinbase record: only an HTTP 200 sets it and it
+  // never goes back to false. Without it rozo-intents-api pages "merchant has
+  // not confirmed delivery" for every paid Stripe order.
+  deliveredReported?: boolean
+  deliveredReportAttempts?: number
+  // Last "payout not done yet" 409 from Rozo; the sweep waits before re-asking.
+  deliveredPendingAt?: string | null
+  alertedDeliveredGiveUp?: boolean
   webhookEventIds: string[]
   events: Array<{ kind: string; at: string; event_id?: string; detail?: unknown }>
 }
@@ -1063,14 +1080,23 @@ export async function sweepInFlightStripeRecords(
   const checkedAt = (r: StripeFulfillmentRecord) =>
     r.lastProviderCheckAt ? Date.parse(r.lastProviderCheckAt) || 0 : 0
   inFlight.sort((a, b) => checkedAt(a) - checkedAt(b))
+  const justPaid = new Set<string>()
   for (const rec of inFlight.slice(0, RECONCILE_SWEEP_MAX)) {
     try {
       const r = await reconcileStripeRecordWithProvider(env, rec.invoiceKey, now)
       if (r.checked) out.checked++
+      if (r.checked && r.transition === 'paid') justPaid.add(rec.invoiceKey)
       if (r.checked && r.transition) out.transitions.push(`${maskInvoiceKey(rec.invoiceKey)}:${r.transition}`)
     } catch {
       // next record
     }
+  }
+  // Report delivery to Rozo for paid records (including ones the loop above
+  // just confirmed). Report-only: never touches settlement state.
+  try {
+    await sweepStripeDeliveredReports(env, values, justPaid, now)
+  } catch {
+    // best effort
   }
   // After reconciling, so an order the provider just confirmed paid is never
   // ticketed. Uses the pre-reconcile snapshot only to pick candidates; the
@@ -1081,6 +1107,139 @@ export async function sweepInFlightStripeRecords(
     // tickets are best effort
   }
   return out
+}
+
+// ── Delivered report to Rozo ────────────────────────────────────────────────
+//
+// rozo-intents-api pages "merchant has not confirmed delivery" (10 min) and
+// escalates (2 h) for every merchant payment whose payout completed but whose
+// merchant_delivered_at is still null. The Coinbase path reports delivery
+// (webhook.ts / coinbase-sweep.ts); this is the same report for Stripe Crypto
+// records once they reach `paid`. Report-only: it never calls pay-invoice and
+// never changes the settlement status. Same semantics as the Coinbase sweep:
+// only HTTP 200 sets deliveredReported (never cleared), a 409 inside the
+// pending window is "Rozo payout not done yet" and is not counted, any other
+// failure counts toward DELIVERED_MAX_ATTEMPTS and alerts once on give-up.
+
+export const STRIPE_DELIVERED_SWEEP_MAX = 20
+const STRIPE_DELIVERED_PENDING_RECHECK_MS = 6 * 60 * 1000
+
+function needsDeliveredReport(rec: StripeFulfillmentRecord, now: number): boolean {
+  if (rec.status !== 'paid' || rec.deliveredReported || !rec.rozoPaymentId) return false
+  if ((rec.deliveredReportAttempts ?? 0) >= DELIVERED_MAX_ATTEMPTS) return false
+  const pendingAt = rec.deliveredPendingAt ? Date.parse(rec.deliveredPendingAt) : NaN
+  if (Number.isFinite(pendingAt) && now - pendingAt < STRIPE_DELIVERED_PENDING_RECHECK_MS) return false
+  return true
+}
+
+export type StripeDeliveredOutcome = 'skipped' | 'reported' | 'pending' | 'failed'
+
+/** Never throws. Re-reads the live record before and after the Rozo call. */
+export async function reportStripeDelivered(
+  env: Env,
+  invoiceKey: string,
+  now: Date = new Date(),
+): Promise<StripeDeliveredOutcome> {
+  try {
+    if (!deliveredReportEnabled(env)) return 'skipped'
+    const nowMs = now.getTime()
+    const nowIso = now.toISOString()
+    const rec = await loadStripeRecord(env, invoiceKey)
+    if (!rec || !needsDeliveredReport(rec, nowMs)) return 'skipped'
+    const rep = await reportDeliveredToRozo(env, rec.rozoPaymentId!, rec.orderId)
+    if (rep.ok) {
+      await updateStripeRecord<true>(env, invoiceKey, rec.orderId, (r) => {
+        r.deliveredReported = true
+        r.events.push({ kind: 'delivered_reported', at: nowIso, detail: { status: rep.status } })
+        return { rec: r, result: true }
+      })
+      return 'reported'
+    }
+    if (deliveredReportStillPending(rep, rec, nowMs)) {
+      // Rozo's payout to us has not completed yet: waiting, not a failure. No
+      // attempt counted and no event (the sweep would flood the record).
+      await updateStripeRecord<true>(env, invoiceKey, rec.orderId, (r) => {
+        if (r.deliveredReported) return { noop: true }
+        r.deliveredPendingAt = nowIso
+        return { rec: r, result: true }
+      })
+      return 'pending'
+    }
+    const giveUp = await updateStripeRecord<number | null>(env, invoiceKey, rec.orderId, (r) => {
+      if (r.deliveredReported) return { noop: null }
+      r.deliveredReportAttempts = (r.deliveredReportAttempts ?? 0) + 1
+      r.events.push({ kind: 'delivered_report_failed', at: nowIso, detail: { status: rep.status } })
+      if (r.deliveredReportAttempts >= DELIVERED_MAX_ATTEMPTS && !r.alertedDeliveredGiveUp) {
+        r.alertedDeliveredGiveUp = true
+        return { rec: r, result: r.deliveredReportAttempts }
+      }
+      return { rec: r, result: null }
+    })
+    if (giveUp !== null) {
+      await sendStripeDeliveredGiveUpAlert(env, rec, giveUp, rep.status)
+    }
+    return 'failed'
+  } catch (err) {
+    console.warn(
+      `[stripe-delivered] ${maskInvoiceKey(invoiceKey)} error (non-fatal): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+    return 'failed'
+  }
+}
+
+async function sendStripeDeliveredGiveUpAlert(
+  env: Env,
+  rec: StripeFulfillmentRecord,
+  attempts: number,
+  status: number,
+): Promise<void> {
+  try {
+    const text = maskAddresses(
+      [
+        `[MPP Router] ⚠️ Delivery report to Rozo failed ${attempts} times (last HTTP ${status})`,
+        `Invoice: stripe_crypto ${maskInvoiceKey(rec.invoiceKey)} (${fmtAtomicUsd(rec.invoiceAmountAtomic) ?? '?'} USDC), Rozo payment ${(rec.rozoPaymentId ?? '?').slice(0, 8)}`,
+        'The invoice IS paid on Stripe; only the Rozo delivered marker is missing.',
+        `At: ${new Date().toISOString()}`,
+      ].join('\n'),
+    )
+    if (!alertSinkConfigured(env)) {
+      console.warn(`[stripe-delivered] alert SKIPPED (no alert channel configured): ${text}`)
+      return
+    }
+    await sendAlert(env, redactForAlert(text))
+  } catch {
+    // never throws
+  }
+}
+
+/**
+ * Cron part of sweepInFlightStripeRecords: report delivery for paid records
+ * not yet reported (backfills records paid before this existed). Candidates
+ * come from the pre-reconcile snapshot plus the records the reconcile loop
+ * just moved to paid; each report re-reads the live record. Bounded per run,
+ * never-pending first, then the longest-waiting pending ones.
+ */
+async function sweepStripeDeliveredReports(
+  env: Env,
+  values: string[],
+  justPaid: Set<string>,
+  now: Date,
+): Promise<void> {
+  if (!deliveredReportEnabled(env)) return
+  const nowMs = now.getTime()
+  const keys = new Map<string, number>()
+  for (const rec of values.map(parseRecord)) {
+    if (!rec) continue
+    if (justPaid.has(rec.invoiceKey) || needsDeliveredReport(rec, nowMs)) {
+      keys.set(rec.invoiceKey, rec.deliveredPendingAt ? Date.parse(rec.deliveredPendingAt) || 0 : -1)
+    }
+  }
+  const ordered = [...keys.entries()].sort((a, b) => a[1] - b[1]).map(([k]) => k)
+  for (const key of ordered.slice(0, STRIPE_DELIVERED_SWEEP_MAX)) {
+    await reportStripeDelivered(env, key, now)
+  }
 }
 
 // ── Stuck-order Intercom tickets (support automation S3) ────────────────────
