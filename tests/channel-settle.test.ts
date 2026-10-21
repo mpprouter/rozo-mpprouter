@@ -228,6 +228,45 @@ describe('settleOneChannel', () => {
     expect(wo!.reason).toContain('refunded')
   })
 
+  it('writes off without calling close when the closing channel is already empty on-chain', async () => {
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: 12345,
+      currentLedger: 12000,
+      balance: '0',
+    })
+    // Simulates a close that fails in an unrelated way (e.g. an SDK that cannot
+    // parse a newer protocol's simulation response): it must never be reached.
+    closeMock.mockRejectedValue(new Error('XDR Read Error: unknown SorobanCredentialsType member for value 2'))
+    expect(await settleOneChannel(e, CHANNEL, deps)).toBeNull()
+    expect(closeMock).not.toHaveBeenCalled()
+    expect((await getLatestVoucher(e, CHANNEL))!.lastSettledRaw).toBe('5000000')
+    const wo = await getVoucherWriteoff(e, CHANNEL)
+    expect(wo!.cumulativeRaw).toBe('5000000')
+    expect(wo!.reason).toContain('refunded')
+  })
+
+  it('still closes a closing channel that holds funds', async () => {
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: 12345,
+      currentLedger: 12000,
+      balance: 5_000_000n,
+    })
+    expect(await settleOneChannel(e, CHANNEL, deps)).toBe('tx-hash-abc')
+    expect(closeMock).toHaveBeenCalledOnce()
+    expect(await getVoucherWriteoff(e, CHANNEL)).toBeFalsy()
+  })
+
+  it('does not write off an empty channel that is not closing', async () => {
+    ;(deps.getChannelState as any).mockResolvedValue({
+      closeEffectiveAtLedger: null,
+      currentLedger: 12000,
+      balance: 0,
+    })
+    expect(await settleOneChannel(e, CHANNEL, deps)).toBe('tx-hash-abc')
+    expect(closeMock).toHaveBeenCalledOnce()
+    expect(await getVoucherWriteoff(e, CHANNEL)).toBeFalsy()
+  })
+
   it('does NOT write off on other close failures — retries next tick', async () => {
     ;(deps.getChannelState as any).mockResolvedValue({
       closeEffectiveAtLedger: 12345,

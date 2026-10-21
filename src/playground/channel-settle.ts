@@ -56,7 +56,12 @@ export interface SettleDeps {
     channel: string
     network?: string
     rpcUrl?: string
-  }) => Promise<{ closeEffectiveAtLedger: number | null; currentLedger: number }>
+  }) => Promise<{
+    closeEffectiveAtLedger: number | null
+    currentLedger: number
+    /** On-chain token balance held by the channel (raw units), when known. */
+    balance?: bigint | string | number | null
+  }>
   close: (p: {
     channel: string
     amount: bigint
@@ -100,6 +105,41 @@ export function collectorKeyMatches(env: Env): boolean {
   } catch {
     return false
   }
+}
+
+/** True only when the chain reports a balance and it is exactly zero. */
+export function channelBalanceIsZero(balance: bigint | string | number | null | undefined): boolean {
+  if (balance === null || balance === undefined) return false
+  try {
+    return BigInt(balance) === 0n
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The debt is unrecoverable ON-CHAIN (bounded loss by design: deposit cap).
+ * Terminal write-off record FIRST (reconciliation source of truth: forgiven
+ * debt, not collected funds), then advance the settled watermark only to stop
+ * the cron retrying a dead channel.
+ */
+async function writeOffRefundedChannel(
+  env: Env,
+  channelContract: string,
+  cumulativeRaw: bigint,
+  amountDecimal: string,
+): Promise<void> {
+  await markVoucherWrittenOff(
+    env,
+    channelContract,
+    cumulativeRaw.toString(),
+    'funder refunded before collection',
+  )
+  await markVoucherSettled(env, channelContract, cumulativeRaw.toString())
+  console.error(
+    `[channel-settle] WRITE-OFF ${amountDecimal} on ${channelContract}: ` +
+      'channel already refunded by the funder before collection (bounded loss)',
+  )
 }
 
 /**
@@ -164,6 +204,17 @@ export async function settleOneChannel(
     await markChannelClosed(env, channelContract)
     await fenceChannelPersistent(env, channelContract)
 
+    // The funder's unilateral refund already emptied the channel: nothing is
+    // left on-chain to collect, so write the debt off without building a close.
+    // Checked from chain state rather than the close's error text, which a
+    // network protocol upgrade can change (2026-10-21: the SDK failed to parse
+    // the simulation response instead of reporting "balance is not
+    // sufficient", so a dead channel was retried every 2 minutes).
+    if (closing && channelBalanceIsZero(state.balance)) {
+      await writeOffRefundedChannel(env, channelContract, cumulativeRaw, voucher.amountDecimal)
+      return null
+    }
+
     const signature = decodeVoucherSignature(voucher.signature)
     let txHash: string
     try {
@@ -193,20 +244,7 @@ export async function settleOneChannel(
       // it settled to stop the cron retrying a dead channel every 2 minutes,
       // and log the write-off amount for the operator ledger.
       if (String(err?.message ?? err).includes('balance is not sufficient')) {
-        // Terminal write-off record FIRST (reconciliation source of truth:
-        // forgiven debt, not collected funds), then advance the settled
-        // watermark only to stop the cron retrying a dead channel.
-        await markVoucherWrittenOff(
-          env,
-          channelContract,
-          cumulativeRaw.toString(),
-          'funder refunded before collection',
-        )
-        await markVoucherSettled(env, channelContract, cumulativeRaw.toString())
-        console.error(
-          `[channel-settle] WRITE-OFF ${voucher.amountDecimal} on ${channelContract}: ` +
-            'channel already refunded by the funder before collection (bounded loss)',
-        )
+        await writeOffRefundedChannel(env, channelContract, cumulativeRaw, voucher.amountDecimal)
         return null
       }
       throw err
