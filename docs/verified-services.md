@@ -186,6 +186,8 @@ weekly, per-round spend cap $1.
 
 Goal: take the count of **distinct verified services** from 15 to 20. Payer
 masked `GD5R4H...BB4U`, all calls through production `apiserver.mpprouter.dev`.
+
+> Note (2026-10-23): the E2E payer `GD5R4H...BB4U` recorded below was rotated and merged away on 2026-10-23 (key had leaked). Historical payer masks are kept as recorded; new runs use `GATR4H...3TQL`. Never fund the old address.
 Selection criteria, in order: a reviewer should recognise the name; a cheap
 deterministic endpoint must exist; spread across categories rather than depth
 on one provider.

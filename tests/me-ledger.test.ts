@@ -7,7 +7,7 @@ import { handleMeLedger, handleMeUsage, normalizeSettlementRef, toMeRow, verifyP
 import type { Env } from '../src/index'
 
 const SECRET = 'test-portal-session-secret-0123456789abcdef'
-const PAYER = 'GD5R4HTO5Y22ZNBD2ZZDJHFYN5JDYHDHG3VINLPM2ZU7HCIHUMI2BB4U'
+const PAYER = 'GATR4HD5YKWKR7TMXG6CTRXGFB54EB7SKVXOKJ355HBTDURSIN4X3TQL'
 
 function b64url(bytes: Uint8Array | string): string {
   const bin = typeof bytes === 'string' ? bytes : String.fromCharCode(...bytes)
