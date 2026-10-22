@@ -14,6 +14,7 @@ import { handleQuoteInvoice } from '../src/routes/pay-invoice-admin'
 import {
   ALL_NATIVE_SOURCES,
   STABLE_SOURCES,
+  nativeMaxUsd,
   parseNativeSources,
   signTestPaymentId,
   supportedSources,
@@ -43,16 +44,18 @@ function makeEnv(extra: Record<string, string> = {}): Env {
 
 let createdIntent: any = null
 let quoteCalls = 0
+let quoteAmount = '10.5'
 
 beforeEach(() => {
   createdIntent = null
   quoteCalls = 0
+  quoteAmount = '10.5'
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     if (u.includes('/quote-invoice')) {
       quoteCalls++
       return new Response(JSON.stringify({
-        invoice: { amount: '10.5' },
+        invoice: { amount: quoteAmount },
         merchant: 'OpenRouter, Inc',
         linkId: 'paymentSession_native_test',
       }), { status: 200 })
@@ -187,6 +190,36 @@ describe('create-invoice with a native source', () => {
     expect(status).toBe(400)
     expect(json.code).toBe('UNSUPPORTED_SOURCE')
     expect(createdIntent).toBeNull()
+  })
+
+  it('defaults the native cap to $3,500 (rozo-intents-api MAX_NATIVE_PAYIN_USD)', () => {
+    expect(nativeMaxUsd(undefined)).toBe(3500)
+    expect(nativeMaxUsd('')).toBe(3500)
+    expect(nativeMaxUsd('garbage')).toBe(3500)
+    expect(nativeMaxUsd('0')).toBe(3500)
+    expect(nativeMaxUsd('10')).toBe(10)
+  })
+
+  // Boundary at the default cap: callerPays > cap is rejected, == cap passes.
+  it.each([
+    ['3499.99', 200],
+    ['3500', 200],
+    ['3500.00', 200],
+    ['3500.01', 400],
+  ])('default cap: callerPays %s -> %i', async (amount, expected) => {
+    quoteAmount = amount
+    const { status, json } = await post(handleCreateInvoice, {
+      payment_id: 'paymentSession_native_test', source: { chainId: '8453', tokenSymbol: 'ETH' },
+    }, makeEnv({ NATIVE_SOURCES: 'ETH@8453' }))
+    expect(status).toBe(expected)
+    if (expected === 400) {
+      expect(json.code).toBe('UNSUPPORTED_SOURCE')
+      expect(json.message).toContain('$3500')
+      expect(createdIntent).toBeNull()
+    } else {
+      expect(Number(json.callerPays)).toBe(Number(amount))
+      expect(createdIntent?.destination?.amount).toBe(json.callerPays)
+    }
   })
 
   it('creates a test invoice order with any native coin and no Coinbase quote', async () => {

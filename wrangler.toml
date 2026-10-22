@@ -166,7 +166,9 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 # 2026-09-29: all closed again (invoice.rozo.ai could not render native
 # orders). 2026-10-06: all four reopened for OpenRouter checkout after
 # rozo-invoice#98 and a real Base ETH payment on production invoice.rozo.ai.
-# Backend caps: $2,000/day native in total (NATIVE_DAILY_CAP_USD_GLOBAL).
+# Backend daily caps (rozo-intents-api): $10,000/day native in total
+# (NATIVE_DAILY_CAP_USD_GLOBAL) and $10,000/day for OpenRouter
+# (NATIVE_DAILY_CAP_USD_merchant_openrouter). Per order: $3,500 (2026-10-23).
 # Rollback: set NATIVE_SOURCES = "" and redeploy.
 # Internal rozotest invoices still open every native coin for testing.
 NATIVE_SOURCES = "ETH@8453,ETH@1,BNB@56,SOL@900,ETH@42161,POL@137"
