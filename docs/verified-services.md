@@ -185,7 +185,9 @@ weekly, per-round spend cap $1.
 ### Run 2026-08-18 — SCF #44 Tranche 2 ("top 20 services verified payable")
 
 Goal: take the count of **distinct verified services** from 15 to 20. Payer
-masked `GATR4H...3TQL`, all calls through production `apiserver.mpprouter.dev`.
+masked `GD5R4H...BB4U`, all calls through production `apiserver.mpprouter.dev`.
+
+> Note (2026-10-23): the E2E payer `GD5R4H...BB4U` recorded below was rotated and merged away on 2026-10-23 (key had leaked). Historical payer masks are kept as recorded; new runs use `GATR4H...3TQL`. Never fund the old address.
 Selection criteria, in order: a reviewer should recognise the name; a cheap
 deterministic endpoint must exist; spread across categories rather than depth
 on one provider.
@@ -265,7 +267,7 @@ the Tranche 2 number. Cheap follow-ups whenever route coverage is the goal.
 > that Anthropic was unpayable.
 >
 > Re-confirmed 2026-09-02 with two fresh paid calls through the router
-> (payer `GATR4H...3TQL`, $0.001 each):
+> (payer `GD5R4H...BB4U`, $0.001 each):
 >
 > | Route | Model | Stellar tx | Ledger |
 > |---|---|---|---|
@@ -308,7 +310,7 @@ question: the failure is downstream of payment.
 
 **Step 2 — paid calls.** Two, on purpose. A single failure could be a
 model-specific rejection, so a second current-generation id was run to rule that
-out. Payer masked `GATR4H...3TQL`.
+out. Payer masked `GD5R4H...BB4U`.
 
 | # | Model id | UTC | Amount | Stellar tx | Result |
 |---|---|---|---|---|---|
@@ -402,7 +404,7 @@ code switch would block the calls even if the env switch were cleared.
 | 2026-04-10 | muggledev | First service catalog shipped with `parallel_search` as test service |
 
 ### Mercury (xycloo Labs) — first Stellar data service — 2026-08-11
-First real-money verify runs (payer masked `GATR4H...3TQL`, $0.0005/call):
+First real-money verify runs (payer masked `GD5R4H...BB4U`, $0.0005/call):
 - `mercury_events_by_contract` — tx `8b3a36f2b359328a37652b7f32e89e19b253487e9b28bc01a257161e1cf6b8c6` — 200, real USDC SAC transfer events
 - `mercury_txs_by_hash` — tx `871099bf7ed2f36605ed568aa927d811d43893afc70863fb8a3fdf4279c07cdb` — 200, full envelope+meta
 - `mercury_txs_by_contract` — tx `c82da0fc01501df246df43e5cbfb85d60bc5d9dd7df31a95addeb59af95f4b98` — 200
