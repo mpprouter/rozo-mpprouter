@@ -14,7 +14,7 @@ Router 的链路是:`客户付 Stellar USDC → Router pool → Router 用 Tempo
 
 ## 1. 前置(一次性)
 
-- **测试钱包**:`~/workspace/rozoai/rozoskilltest/.env.e2e-20260703` 里的 `E2E_STELLAR_ADDRESS` / `E2E_STELLAR_SECRET`(公钥 `GD5R4H...BB4U`)。需 Stellar 主网有 USDC 余额(查:`horizon.stellar.org/accounts/<G地址>`)。
+- **测试钱包**:`~/workspace/rozoai/rozoskilltest/.env.e2e-20260703` 里的 `E2E_STELLAR_ADDRESS` / `E2E_STELLAR_SECRET`(公钥 `GATR4H...3TQL`)。需 Stellar 主网有 USDC 余额(查:`horizon.stellar.org/accounts/<G地址>`)。
 
   > 🚨 **2026-08-14 更正**:本节此前指向 `~/workspace/rozo/rozocontracts/rozoskilltest/.env` 的 `STELLAR_PRIVATE_KEY`(公钥 `GAN3YS...4UYY`)。**那个钱包 2026-07-03 已被老板宣布泄露**,在根 `CLAUDE.md` 的黑名单表里标着 DO NOT USE,且该路径在本机已不存在。照旧文跑 = 使用已泄露钱包。变量名也变了(`STELLAR_PRIVATE_KEY` → `E2E_STELLAR_SECRET`),不是简单换路径。
 - **客户端**:`stellar-agent-wallet` skill 的 `pay-per-call`。仓库路径 `~/workspace/mpprouter/stellar-agent-wallet-skill/`(插件缓存 `~/.claude/plugins/cache/mpprouter/stellar-agent-wallet/<ver>/` 只在装了插件的机器上存在,别默认它在)。它自动处理 402→签名→重试,默认走 MPP charge dialect。
