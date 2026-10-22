@@ -60,7 +60,7 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
     symbol: 'ZEC',
     tokenAddress: '',
     provider: 'near',
-    maxUsd: 3200, // founder 2026-10-21 (was 2000)
+    maxUsd: 3500, // founder 2026-10-23 (was 3200 from 2026-10-21, 2000 before)
     etaSeconds: 480,
     refundAddressRequired: true,
     beta: true,
@@ -76,7 +76,7 @@ const nativeKey = (chainId: string, d: NativeSourceDef) => `${d.symbol}@${chainI
 // one for the metadata and pre-checks shown before create:
 //   near    (default) NEAR 1Click deposit address; today's behaviour unchanged.
 //   custody Rozo self-custody rail: a per-order t1 address on our own HD
-//           wallet, 1 confirmation below $110 and 2 from $110, G < $3200 (founder 2026-10-21, was $1100).
+//           wallet, 1 confirmation below $110 and 2 from $110, G < $3500 (founder 2026-10-23; was $3200 from 2026-10-21, $1100 before).
 // rozo-intents-api stays the final gate either way.
 
 export type ZecRailMode = 'near' | 'custody'
@@ -95,13 +95,13 @@ export const ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN = 10
 export const ZEC_BLOCK_TARGET_SECONDS = 75
 
 /**
- * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below $3200 (was $1100 until 2026-10-21).
+ * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below $3500 (founder 2026-10-23; was $3200 from 2026-10-21, $1100 before).
  * No arrival estimate: block times vary and the checkout must not promise one,
  * so sourceMeta omits eta_seconds for this rail.
  */
 const ZEC_CUSTODY_OVERRIDE: Partial<NativeSourceDef> = {
   provider: 'rozo',
-  maxUsd: 3199.99,
+  maxUsd: 3499.99,
   etaSeconds: undefined,
   // Founder 2026-10-13: the deposit address is our own wallet, so the payer's
   // refund address is optional (late or short payments handled manually).
@@ -306,10 +306,10 @@ export function isNativeSymbol(chainId: string, tokenSymbol: string): boolean {
 }
 
 /** Upper bound on callerPays for a native source (same as the backend cap,
- *  rozo-intents-api MAX_NATIVE_PAYIN_USD: $3,200 since 2026-10-20, was $2,000). */
+ *  rozo-intents-api MAX_NATIVE_PAYIN_USD: $3,500 since 2026-10-23; $3,200 from 2026-10-20, $2,000 before). */
 export function nativeMaxUsd(raw: string | undefined): number {
   const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : 3200
+  return Number.isFinite(n) && n > 0 ? n : 3500
 }
 
 /** Cap for one native coin: the lower of its own maxUsd and NATIVE_MAX_USD. */

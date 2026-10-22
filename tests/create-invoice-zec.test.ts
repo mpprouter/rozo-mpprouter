@@ -63,6 +63,7 @@ function makeEnv(extra: Record<string, string> = {}): Env {
 
 let createdIntent: any = null
 let createCalls = 0
+let quoteAmount = '10.5'
 /** Coinbase session expiresAt; null = lookup fails. */
 let linkExpiresAt: string | null = null
 /** Overrides the intents create answer. */
@@ -77,6 +78,7 @@ const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 beforeEach(() => {
   createdIntent = null
   createCalls = 0
+  quoteAmount = '10.5'
   linkExpiresAt = inMinutes(24 * 60)
   createAnswer = null
   existingOrder = null
@@ -88,7 +90,7 @@ beforeEach(() => {
       return new Response(JSON.stringify({
         paymentSessionId: SESSION_ID,
         status: 'PAYMENT_SESSION_STATUS_CREATED',
-        amount: '10.5',
+        amount: quoteAmount,
         asset: 'usdc',
         expiresAt: linkExpiresAt,
         customerDisplay: { merchantName: 'OpenRouter, Inc' },
@@ -102,7 +104,7 @@ beforeEach(() => {
     }
     if (u.includes('/quote-invoice')) {
       return new Response(JSON.stringify({
-        invoice: { amount: '10.5' },
+        invoice: { amount: quoteAmount },
         merchant: 'OpenRouter, Inc',
         linkId: SESSION_ID,
       }), { status: 200 })
@@ -177,8 +179,8 @@ describe('ZEC source table', () => {
     })
   })
 
-  it('caps ZEC at $3200 even if NATIVE_MAX_USD is higher', () => {
-    expect(nativeMaxUsdFor('9133', '5000')).toBe(3200)
+  it('caps ZEC at $3500 even if NATIVE_MAX_USD is higher', () => {
+    expect(nativeMaxUsdFor('9133', '5000')).toBe(3500)
     expect(nativeMaxUsdFor('9133', '100')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000')).toBe(5000)
   })
@@ -547,7 +549,7 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(JSON.stringify(sourceMeta(open, 'near'))).toBe(
       '{"ZEC@9133":{"eta_seconds":480,"refund_address_required":true,"beta":true,"address_single_use":true}}',
     )
-    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(3200)
+    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(3500)
     expect(zecMinLinkLifeMs('near')).toBe(ZEC_MIN_LINK_LIFE_MS)
   })
 
@@ -558,11 +560,33 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(sourceMeta(parseNativeSources(PROD_NATIVE), 'custody')).toEqual({})
   })
 
-  it('custody caps ZEC below $3200 and leaves other coins alone', () => {
-    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(3199.99)
-    expect(nativeMaxUsdFor('9133', '5000', 'custody')).toBe(3199.99)
+  it('custody caps ZEC below $3500 and leaves other coins alone', () => {
+    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(3499.99)
+    expect(nativeMaxUsdFor('9133', '5000', 'custody')).toBe(3499.99)
     expect(nativeMaxUsdFor('9133', '100', 'custody')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000', 'custody')).toBe(5000)
+  })
+
+  // Boundary at the ZEC caps through create-invoice: callerPays > cap is rejected.
+  it.each([
+    ['near', '3499.99', 200],
+    ['near', '3500', 200],
+    ['near', '3500.01', 400],
+    ['custody', '3499.98', 200],
+    ['custody', '3499.99', 200],
+    ['custody', '3500', 400],
+  ] as const)('ZEC %s rail: callerPays %s -> %i', async (rail, amount, expected) => {
+    quoteAmount = amount
+    const env = makeEnv({ ZEC_RAIL: rail })
+    const { status, json } = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { env, query: '?beta=zec' })
+    expect(status).toBe(expected)
+    if (expected === 400) {
+      expect(json.code).toBe('UNSUPPORTED_SOURCE')
+      expect(createCalls).toBe(0)
+    } else {
+      expect(Number(json.callerPays)).toBe(Number(amount))
+      expect(createCalls).toBe(1)
+    }
   })
 
   it('custody link margin = 30 min lock + 10 min margin + 2 x 75 s', () => {
