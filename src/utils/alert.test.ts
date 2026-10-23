@@ -119,6 +119,8 @@ describe('Lark routing (Feishu CN app retired 2026-10-24)', () => {
     expect(alertAudience('[MPP Router] ✅ Stellar gas sponsor recovered: 50 XLM')).toBe('ops')
     expect(alertAudience('[MPP Router] ⚠️ Tempo pool low balance: 1 USDC')).toBe('ops')
     expect(alertAudience('x\nFunder balance below $50')).toBe('ops')
+    expect(alertAudience('[MPP Router] 🚨 Coupon redeem BLOCKED: insufficient funder balance (1 USDC on hand)')).toBe('founder')
+    expect(alertAudience('[MPP Router] 🚨 x402 payer liability mismatch: funder short by $12.00')).toBe('founder')
   })
 
   it('falls back to legacy Feishu when the Lark chat for that audience is unset', async () => {
@@ -127,7 +129,18 @@ describe('Lark routing (Feishu CN app retired 2026-10-24)', () => {
     expect(sent(f).url.startsWith('https://open.feishu.cn/')).toBe(true)
   })
 
-  it('counts Lark alone as a sink', () => {
+  it('counts Lark as a sink only with the Ops chat', () => {
     expect(alertSinkConfigured(LARK)).toBe(true)
+    expect(alertSinkConfigured({ LARK_APP_ID: 'a', LARK_APP_SECRET: 'b', LARK_FOUNDER_CHAT_ID: 'f' })).toBe(false)
+  })
+
+  it('falls back to DingTalk when Lark delivery fails', async () => {
+    const f = vi.fn(async (url: string, _init?: RequestInit) =>
+      url.includes('larksuite') ? json({ code: 99991663, msg: 'bad token' })
+        : url.includes('dingtalk') ? json({ errcode: 0 })
+          : json({ inserted: true }))
+    vi.stubGlobal('fetch', f)
+    expect(await sendAlert({ ...LARK, DINGTALK_ACCESS_TOKEN: 'd' }, redactForAlert('[MPP Router] x'))).toBe(true)
+    expect(f.mock.calls.some((c) => String(c[0]).includes('oapi.dingtalk.com'))).toBe(true)
   })
 })

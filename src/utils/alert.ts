@@ -72,8 +72,9 @@ export async function idempotencyKey(title: string, body: string, now: Date): Pr
  * config outage still leaves the alert in ainative_cloud_alerts_log.
  */
 export function alertSinkConfigured(env: AlertEnv): boolean {
+  // Lark counts only with the Ops chat: Ops is the default audience, so a
+  // Founder-only Lark config would pass the guard yet drop most alerts.
   return feishuConfigured(larkOf(env, 'ops'))
-    || feishuConfigured(larkOf(env, 'founder'))
     || feishuConfigured(feishuOf(env))
     || Boolean(env.DINGTALK_ACCESS_TOKEN)
     || Boolean(env.ALERT_LOG_SUPABASE_URL && env.ALERT_LOG_SUPABASE_ANON_KEY && env.ALERTS_LOG_RPC_SECRET)
@@ -103,6 +104,10 @@ const FOUNDER_FIRST_LINE: readonly RegExp[] = [
   // funder-balance-watch: entering a low band, or a sharp drop below $200.
   // "improved" and "unreadable" are informational and stay in ops.
   /Funder balance (?!improved\b|unreadable\b)/i,
+  // coupon.ts: redemption blocked until the funder wallet is topped up.
+  /insufficient funder balance/i,
+  // x402payer/reconcile.ts: funder holds less than the x402 ledger liability.
+  /funder short by/i,
   // stellar-gas-balance: the sponsor needs an XLM top-up.
   /Stellar gas sponsor low balance/i,
 ]
@@ -161,18 +166,25 @@ export async function sendAlert(env: AlertEnv, content: RedactedAlert): Promise<
 }
 
 async function deliver(env: AlertEnv, content: RedactedAlert): Promise<boolean> {
+  // Each configured channel is tried in order until one confirms, so a Lark
+  // outage (or an unset chat) still reaches a fallback when one exists.
   const audience = alertAudience(String(content))
+  let tried = false
   const lark = larkOf(env, audience)
-  if (feishuConfigured(lark)) return sendFeishuAlertConfirmed(lark, content)
+  if (feishuConfigured(lark)) {
+    tried = true
+    if (await sendFeishuAlertConfirmed(lark, content)) return true
+    console.warn(`[alert] Lark ${audience} delivery failed, trying fallbacks`)
+  }
   const feishu = feishuOf(env)
   if (feishuConfigured(feishu)) {
-    console.warn(`[alert] Lark ${audience} chat unset, falling back to legacy Feishu`)
-    return sendFeishuAlertConfirmed(feishu, content)
+    tried = true
+    if (await sendFeishuAlertConfirmed(feishu, content)) return true
   }
   if (env.DINGTALK_ACCESS_TOKEN) {
-    console.warn('[alert] Lark and Feishu secrets unset, falling back to DingTalk')
-    return sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN, content)
+    tried = true
+    if (await sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN, content)) return true
   }
-  console.warn('[alert] no delivery channel configured, alert archived only')
+  if (!tried) console.warn('[alert] no delivery channel configured, alert archived only')
   return false
 }
