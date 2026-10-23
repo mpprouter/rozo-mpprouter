@@ -14,6 +14,7 @@ import {
   callStripePayInvoice,
 } from '../src/routes/stripe-fulfillment'
 import { casRead } from '../src/routes/stripe-atomic'
+import { checkoutBacklogKey, stopCheckout } from '../src/routes/checkout-control'
 import {
   encryptCapability,
   decryptCapability,
@@ -360,6 +361,20 @@ describe('handleStripeWebhookEvent', () => {
     expect(await kv.get('funder-reserved-atomic')).toBeNull()
     // no money moved → daily ledger back to 0 (reservation released).
     expect(await readDailySpentAtomic(env, now)).toBe(0n)
+  })
+
+  it('checkout emergency stop: no signing, claim stepped back to payout_seen, order indexed', async () => {
+    const env = makeEnv()
+    await seed(env)
+    await stopCheckout(env, { reason: 'drill', actor: 'test', requestId: 's1' })
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'evPaused' }), new Date(Date.UTC(2026, 6, 12)))
+    expect(summary.deferred).toBe('checkout_paused')
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect((await loadRec(env, 'cpis_wh')).status).toBe('payout_seen')
+    // This file's DO stub has no /scan; read the index key directly.
+    const entry = JSON.parse((await casRead(env, checkoutBacklogKey('stripe_crypto_cpis_wh'))).value!)
+    expect(entry).toMatchObject({ provider: 'stripe', ref: 'stripe_crypto_cpis_wh', rozoPaymentId: 'rp-wh' })
   })
 
   it('does not double-fire while a settlement is in flight (guard, P0-1)', async () => {

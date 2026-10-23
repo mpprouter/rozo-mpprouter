@@ -14,6 +14,7 @@ import { handleCoinbaseExecGateClear } from '../src/routes/coinbase-exec-gate-ad
 import { OPENROUTER_STRIPE_ACCOUNT, couponAmountAccepted, stripeToleranceAboveAtomic } from '../src/routes/coupon'
 import { claimInvoiceKey, readInvoiceClaim } from '../src/routes/invoice-claim'
 import { readDailySpentAtomic } from '../src/routes/stripe-fulfillment'
+import { readCheckoutControl, resumeCheckout, stopCheckout } from '../src/routes/checkout-control'
 
 /** In-memory stand-in for a Cloudflare D1Database (prepare/bind/run + all). */
 class FakeD1 {
@@ -344,6 +345,27 @@ describe('POST /coupon/redeem — Coinbase v3', () => {
     const response = await handleRedeemCoupon(redeemReq(code, V3_SESSION_URL), env)
     expect(response.status).toBe(200)
     expect(((await response.json()) as any).status).toBe('redeemed')
+  })
+})
+
+describe('POST /coupon/redeem — checkout emergency stop', () => {
+  it('answers 503, pays nothing and leaves the coupon redeemable', async () => {
+    const { env, calls, fetchMock } = makeEnv()
+    globalThis.fetch = fetchMock
+    const code = await issueCoupon(env)
+    await stopCheckout(env, { reason: 'drill', actor: 'test', requestId: 'c1' })
+
+    const paused = await handleRedeemCoupon(redeemReq(code), env)
+    expect(paused.status).toBe(503)
+    expect(((await paused.json()) as any).error).toBe('TEMPORARILY_UNAVAILABLE')
+    expect(calls.pay).toBe(0)
+
+    const seen = await readCheckoutControl(env)
+    await resumeCheckout(env, { reason: 'drill over', actor: 'test', requestId: 'c2' }, seen.version)
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp.status).toBe(200)
+    expect(((await resp.json()) as any).status).toBe('redeemed')
+    expect(calls.pay).toBe(1)
   })
 })
 

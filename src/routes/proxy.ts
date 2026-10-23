@@ -69,6 +69,7 @@ import { isDirectSettlementRoute, relayDirectSettlementRoute } from './provider-
 import { hostedOriginHeaders, resolveHostedRoute, hostedProviderIdFor } from '../services/provider-hosting'
 import { redactForAlert } from '../utils/alert-redaction'
 import { handleProviderIndex } from './services'
+import { checkoutDeliveryPaused, checkoutPausedResponse } from './checkout-control'
 
 /**
  * Resolve a public Router URL to an internal upstream route.
@@ -934,6 +935,12 @@ async function payMerchantAndGetBodyInner(
   // Special bridge: user still pays Router via Stellar/x402 API path,
   // but Router settles this merchant via admin-secret upstream call.
   if (isRozoPayInvoiceRoute(route) && env.PAYINVOICE_ADMIN_SECRET) {
+    // Checkout emergency stop (checkout-control.ts). The caller has already
+    // paid the router here, so fail without calling upstream and let the
+    // normal non-fulfillment refund give the money back.
+    if (await checkoutDeliveryPaused(env)) {
+      return { kind: 'error', refundReason: 'non_fulfillment', routerSideFailure: true, response: checkoutPausedResponse() }
+    }
     let merchantResponse: Response
     try {
       const headers = new Headers(forwardHeaders(request))
@@ -1637,6 +1644,9 @@ export async function handleProxy(
   if (wwwAuth) {
     parsed = parseTempoChallenge(wwwAuth)
   } else if (isRozoPayInvoiceRoute(route)) {
+    // Checkout emergency stop: refuse before issuing a challenge, so nobody
+    // pays the router for an invoice it will not settle.
+    if (await checkoutDeliveryPaused(env)) return checkoutPausedResponse()
     // rozo-agent-api emits x402 JSON 402 (no WWW-Authenticate).
     const rawBody = await probeResponse.text()
     const x402Amount = parseX402AmountFromBody(rawBody)

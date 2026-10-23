@@ -86,6 +86,7 @@ import {
   type CasClient,
 } from './coupon-security'
 import { redactForAlert } from '../utils/alert-redaction'
+import { checkoutDeliveryPaused } from './checkout-control'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -1224,6 +1225,20 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // collides with the Stripe webhook (ref stripe_crypto_cpis_*) and the UPI
   // channel, which both claim the bare cpis_ id.
   const execKey = isStripe ? stripeInv!.invoiceKey : plId
+
+  // Step 2b — checkout emergency stop (checkout-control.ts). Nothing reserved,
+  // claimed or sent yet: give the coupon back, the customer retries later.
+  if (await checkoutDeliveryPaused(env)) {
+    await rollbackToIssued('checkout delivery paused')
+    return done(
+      json(503, {
+        error: 'TEMPORARILY_UNAVAILABLE',
+        message: 'Redemption is temporarily unavailable. Your coupon is still valid — try again later.',
+      }),
+      'rejected',
+      'checkout_paused',
+    )
+  }
 
   // Step 3 — funder balance gate. The decision and the reservation commit in
   // ONE CAS (tryReserveFunds) so concurrent redemptions of different coupons

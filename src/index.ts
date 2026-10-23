@@ -59,6 +59,7 @@ import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-
 import { handleAdminSeedStore } from './routes/admin-seed-store'
 import { handleStripeFulfillmentResolve } from './routes/stripe-fulfillment-admin'
 import { handleCoinbaseExecGateClear } from './routes/coinbase-exec-gate-admin'
+import { handleCheckoutControl } from './routes/checkout-control-admin'
 import { handleCreateInvoice } from './routes/create-invoice'
 import { FEEDBACK_PATH, handleCheckoutFeedback, withFeedbackToken, drainCheckoutFeedbackNotifications } from './routes/checkout-feedback'
 import {
@@ -328,6 +329,12 @@ export interface Env {
   // that the grant floors are measured against.
   LEDGER_UNRESOLVED_PAYERS?: string
   ADMIN_ENDPOINT_ENABLED?: string
+  // /admin/checkout-control (routes/checkout-control-admin.ts): stop / resume
+  // checkout delivery and re-drive the paused backlog. Its own secret: it can
+  // never pay an invoice. Unset ⇒ the endpoint answers 500 (the switch itself
+  // still works and fails closed).
+  // Set via: wrangler secret put CHECKOUT_CONTROL_SECRET
+  CHECKOUT_CONTROL_SECRET?: string
 
   // Coupon issuance secret (routes/coupon.ts). Deliberately separate from
   // PAYINVOICE_ADMIN_SECRET: leaking the coupon-issuance key must not grant
@@ -1002,6 +1009,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // nothing. Gated by x-admin-secret. See routes/coinbase-exec-gate-admin.ts.
       if (url.pathname === '/admin/coinbase-exec-gate/clear') {
         return handleCoinbaseExecGateClear(request, env)
+      }
+
+      // Checkout emergency stop / resume / backlog replay. Gated by
+      // x-admin-secret = CHECKOUT_CONTROL_SECRET. See routes/checkout-control-admin.ts.
+      if (url.pathname === '/admin/checkout-control') {
+        return handleCheckoutControl(request, env)
       }
 
       // ── Partner platform ──────────────────────────────────────────────

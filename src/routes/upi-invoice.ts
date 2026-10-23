@@ -60,6 +60,7 @@ import {
 } from './stripe-fulfillment'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
+import { checkoutDeliveryPaused } from './checkout-control'
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -613,6 +614,12 @@ export async function handleUpiVerifiedPayIn(
     return json(202, { fulfillment_id: existing.orderId, state: existing.state })
   }
 
+  // 3b. Checkout emergency stop (checkout-control.ts): refuse before any record
+  //     or claim exists, so the caller can resubmit the same order later.
+  if (await checkoutDeliveryPaused(env)) {
+    return err(503, 'checkout_paused', 'checkout delivery is paused; nothing was recorded, resubmit later')
+  }
+
   // 4. Verify the quote against LIVE provider data (design §10-5: re-check
   //    amount and validity right before fulfilment).
   const nowMs = (opts.now ?? Date.now)()
@@ -762,6 +769,16 @@ async function executeFulfillment(
 ): Promise<void> {
   const invoiceAtomic = BigInt(inv.stablecoinAmountAtomic)
   const now = new Date()
+
+  // A stop that landed after the entry check: nothing was sent, so this is a
+  // definite refusal (the caller refunds the UPI capture), never `unknown`.
+  if (await checkoutDeliveryPaused(env)) {
+    await transition(env, orderId, 'failed', {
+      kind: 'checkout_paused',
+      failureReason: 'checkout_paused',
+    })
+    return
+  }
 
   // Wallet inventory gate — identical to the crypto webhook: the funder's real
   // on-chain balance (the shared reservation counter was removed 2026-09-26).

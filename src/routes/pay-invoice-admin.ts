@@ -22,6 +22,7 @@ import {
   resolveCheckoutPricing,
   resolveTrustedCheckoutChannel,
 } from './checkout-web-pricing'
+import { checkoutDeliveryPaused, checkoutPausedResponse } from './checkout-control'
 
 // ── Error code constants ─────────────────────────────────────────────────────
 
@@ -375,6 +376,9 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
       link_id_detected,
     })
   }
+
+  // Checkout emergency stop (checkout-control.ts): a manual pay is a delivery too.
+  if (await checkoutDeliveryPaused(env)) return checkoutPausedResponse()
 
   let upstream: Response
   try {
