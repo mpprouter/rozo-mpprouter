@@ -7,8 +7,12 @@
  *      the restricted `alerts_log_insert` RPC, the same sink rozo-intents-api,
  *      withdraw-loop and withdraw-v3 already use, BEFORE delivery, so an alert
  *      that fails to send is still on record; and
- *   2. sent to Feishu via the app bot. DingTalk is used only when the Feishu
- *      secrets are unset, so a config gap means "wrong channel", not silence.
+ *   2. sent to the Lark international "Rozo Alerts" bot (2026-10-24: the
+ *      Feishu CN app is retired). Chat by audience: alerts that need the
+ *      founder to act (top up the funder wallet, gas sponsor) go to Rozo
+ *      Founder, everything else to Rozo Ops. Legacy Feishu is used only when
+ *      the Lark secrets are unset, then DingTalk, so a config gap means
+ *      "wrong channel", not silence.
  *
  * Never throws. Logging is bounded by a short deadline and cannot block or
  * fail the delivery.
@@ -16,13 +20,17 @@
 
 import type { RedactedAlert } from './alert-redaction'
 import { sendDingTalkAlertConfirmed } from './dingtalk'
-import { feishuConfigured, sendFeishuAlertConfirmed } from './feishu'
+import { feishuConfigured, LARK_API, sendFeishuAlertConfirmed, type FeishuConfig } from './feishu'
 
 export interface AlertEnv {
   DINGTALK_ACCESS_TOKEN?: string
   FEISHU_APP_ID?: string
   FEISHU_APP_SECRET?: string
   FEISHU_ALERT_CHAT_ID?: string
+  LARK_APP_ID?: string
+  LARK_APP_SECRET?: string
+  LARK_OPS_CHAT_ID?: string
+  LARK_FOUNDER_CHAT_ID?: string
   /** Rozo Intents Supabase project URL, e.g. https://<ref>.supabase.co */
   ALERT_LOG_SUPABASE_URL?: string
   /** That project's anon key (the RPC is callable by anon, gated by the secret). */
@@ -64,13 +72,50 @@ export async function idempotencyKey(title: string, body: string, now: Date): Pr
  * config outage still leaves the alert in ainative_cloud_alerts_log.
  */
 export function alertSinkConfigured(env: AlertEnv): boolean {
-  return feishuConfigured(feishuOf(env))
+  // Lark counts only with the Ops chat: Ops is the default audience, so a
+  // Founder-only Lark config would pass the guard yet drop most alerts.
+  return feishuConfigured(larkOf(env, 'ops'))
+    || feishuConfigured(feishuOf(env))
     || Boolean(env.DINGTALK_ACCESS_TOKEN)
     || Boolean(env.ALERT_LOG_SUPABASE_URL && env.ALERT_LOG_SUPABASE_ANON_KEY && env.ALERTS_LOG_RPC_SECRET)
 }
 
-function feishuOf(env: AlertEnv) {
+function feishuOf(env: AlertEnv): FeishuConfig {
   return { appId: env.FEISHU_APP_ID, appSecret: env.FEISHU_APP_SECRET, chatId: env.FEISHU_ALERT_CHAT_ID }
+}
+
+export type AlertAudience = 'ops' | 'founder'
+
+function larkOf(env: AlertEnv, audience: AlertAudience): FeishuConfig {
+  return {
+    appId: env.LARK_APP_ID,
+    appSecret: env.LARK_APP_SECRET,
+    // A founder alert with no Founder chat set goes to Ops rather than nowhere.
+    chatId: audience === 'founder' ? (env.LARK_FOUNDER_CHAT_ID || env.LARK_OPS_CHAT_ID) : env.LARK_OPS_CHAT_ID,
+    apiBase: LARK_API,
+  }
+}
+
+/**
+ * First-line markers of alerts that ask the founder to act (moving money is
+ * founder-only, L3). Everything else is an ops alert. Founder rule 2026-10-24:
+ * "不重要的就是 ops，重要的就是 founder".
+ */
+const FOUNDER_FIRST_LINE: readonly RegExp[] = [
+  // funder-balance-watch: entering a low band, or a sharp drop below $200.
+  // "improved" and "unreadable" are informational and stay in ops.
+  /Funder balance (?!improved\b|unreadable\b)/i,
+  // coupon.ts: redemption blocked until the funder wallet is topped up.
+  /insufficient funder balance/i,
+  // x402payer/reconcile.ts: funder holds less than the x402 ledger liability.
+  /funder short by/i,
+  // stellar-gas-balance: the sponsor needs an XLM top-up.
+  /Stellar gas sponsor low balance/i,
+]
+
+export function alertAudience(content: string): AlertAudience {
+  const first = content.split('\n', 1)[0] ?? ''
+  return FOUNDER_FIRST_LINE.some((re) => re.test(first)) ? 'founder' : 'ops'
 }
 
 /** Write the alert to ainative_cloud_alerts_log. Never throws; false if not saved. */
@@ -122,12 +167,25 @@ export async function sendAlert(env: AlertEnv, content: RedactedAlert): Promise<
 }
 
 async function deliver(env: AlertEnv, content: RedactedAlert): Promise<boolean> {
-  const feishu = feishuOf(env)
-  if (feishuConfigured(feishu)) return sendFeishuAlertConfirmed(feishu, content)
-  if (env.DINGTALK_ACCESS_TOKEN) {
-    console.warn('[alert] Feishu secrets unset, falling back to DingTalk')
-    return sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN, content)
+  // Each configured channel is tried in order until one confirms, so a Lark
+  // outage (or an unset chat) still reaches a fallback when one exists.
+  const audience = alertAudience(String(content))
+  let tried = false
+  const lark = larkOf(env, audience)
+  if (feishuConfigured(lark)) {
+    tried = true
+    if (await sendFeishuAlertConfirmed(lark, content)) return true
+    console.warn(`[alert] Lark ${audience} delivery failed, trying fallbacks`)
   }
-  console.warn('[alert] no delivery channel configured, alert archived only')
+  const feishu = feishuOf(env)
+  if (feishuConfigured(feishu)) {
+    tried = true
+    if (await sendFeishuAlertConfirmed(feishu, content)) return true
+  }
+  if (env.DINGTALK_ACCESS_TOKEN) {
+    tried = true
+    if (await sendDingTalkAlertConfirmed(env.DINGTALK_ACCESS_TOKEN, content)) return true
+  }
+  if (!tried) console.warn('[alert] no delivery channel configured, alert archived only')
   return false
 }
