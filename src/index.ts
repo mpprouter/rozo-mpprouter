@@ -460,6 +460,11 @@ export interface Env {
   LARK_APP_ID?: string
   LARK_APP_SECRET?: string
   LARK_FOUNDER_CHAT_ID?: string
+  // Lark "Rozo Ops" group (2026-10-24). sendAlert (utils/alert.ts) sends every
+  // machine alert here, and founder-action alerts to LARK_FOUNDER_CHAT_ID,
+  // before falling back to the retired Feishu CN app.
+  // Secret: wrangler secret put LARK_OPS_CHAT_ID.
+  LARK_OPS_CHAT_ID?: string
 
   // Alert archive: every alert is also written to ainative_cloud_alerts_log in
   // the Rozo Intents Supabase project via the alerts_log_insert RPC. URL is a
