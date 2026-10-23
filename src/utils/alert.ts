@@ -90,7 +90,8 @@ function larkOf(env: AlertEnv, audience: AlertAudience): FeishuConfig {
   return {
     appId: env.LARK_APP_ID,
     appSecret: env.LARK_APP_SECRET,
-    chatId: audience === 'founder' ? env.LARK_FOUNDER_CHAT_ID : env.LARK_OPS_CHAT_ID,
+    // A founder alert with no Founder chat set goes to Ops rather than nowhere.
+    chatId: audience === 'founder' ? (env.LARK_FOUNDER_CHAT_ID || env.LARK_OPS_CHAT_ID) : env.LARK_OPS_CHAT_ID,
     apiBase: LARK_API,
   }
 }

@@ -134,6 +134,12 @@ describe('Lark routing (Feishu CN app retired 2026-10-24)', () => {
     expect(alertSinkConfigured({ LARK_APP_ID: 'a', LARK_APP_SECRET: 'b', LARK_FOUNDER_CHAT_ID: 'f' })).toBe(false)
   })
 
+  it('sends a founder alert to Ops when the Founder chat is unset', async () => {
+    const f = capture()
+    await sendAlert({ LARK_APP_ID: 'a', LARK_APP_SECRET: 'b', LARK_OPS_CHAT_ID: 'oc_ops' }, redactForAlert('[MPP Router] 🚨 Funder balance below $50: $1'))
+    expect(sent(f).chat).toBe('oc_ops')
+  })
+
   it('falls back to DingTalk when Lark delivery fails', async () => {
     const f = vi.fn(async (url: string, _init?: RequestInit) =>
       url.includes('larksuite') ? json({ code: 99991663, msg: 'bad token' })
