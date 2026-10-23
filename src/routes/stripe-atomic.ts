@@ -98,6 +98,16 @@ export async function casUpdate<R>(
   throw new Error(`stripe-atomic casUpdate exhausted ${MAX_CAS_RETRIES} retries for key ${key}`)
 }
 
+/**
+ * Single versioned commit: writes `value` only if the key is still at
+ * `expectedVersion`. No retry, so a write that landed in between wins and the
+ * caller sees `false` (used by checkout-control resume).
+ */
+export async function casCommit(env: Env, key: string, expectedVersion: number, value: string): Promise<boolean> {
+  const commit = await doPost<CommitResponse>(env, '/commit', { key, expectedVersion, op: 'set', value })
+  return commit.ok
+}
+
 /** List every raw value under `prefix` in the DO (values only, no keys). */
 export async function casScan(env: Env, prefix: string): Promise<string[]> {
   const r = await doPost<{ values: string[] }>(env, '/scan', { prefix })

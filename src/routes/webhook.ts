@@ -19,6 +19,7 @@ import { claimInvoiceKey } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { findExistingOrder } from './existing-order'
 import { lookupBudget } from './existing-order-endpoint'
+import { checkoutDeliveryPaused, recordPausedDelivery } from './checkout-control'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -659,7 +660,28 @@ export function deliveredReportStillPending(
   return now - paid <= DELIVERED_PENDING_WINDOW_MS
 }
 
-interface CoinbaseEventInput {
+// The checkout emergency stop refused this delivery: keep the record in its
+// pre-pay status (payin_seen / failed_insufficient_balance), note why, and
+// index it so `admin resume checkout` can re-drive it. Not a failure.
+async function deferForCheckoutPause(
+  env: Env,
+  plId: string,
+  rec: FulfillmentRecord,
+  eventType: string,
+  eventId: string,
+): Promise<Record<string, unknown>> {
+  rec.events.push({ kind: 'checkout_paused', at: new Date().toISOString(), event_id: eventId })
+  await saveRecordGuarded(env, plId, rec)
+  await recordPausedDelivery(env, {
+    provider: 'coinbase',
+    ref: plId,
+    rozoPaymentId: rec.settlingRozoPaymentId ?? rec.rozoPaymentId,
+    eventType,
+  })
+  return { ok: true, deferred: 'checkout_paused', plId }
+}
+
+export interface CoinbaseEventInput {
   eventId: string
   eventType: string
   plId: string
@@ -668,7 +690,7 @@ interface CoinbaseEventInput {
   now: number
 }
 
-async function settleCoinbaseEvent(
+export async function settleCoinbaseEvent(
   env: Env,
   input: CoinbaseEventInput,
 ): Promise<Record<string, unknown>> {
@@ -782,6 +804,13 @@ async function settleCoinbaseEvent(
   if (rec.status === 'paying') {
     await saveRecordGuarded(env, plId, rec)
     return { ok: true, already_paying: true, plId }
+  }
+
+  // 7b. Checkout emergency stop (checkout-control.ts). Checked before the
+  // balance check so a pause does not page "insufficient balance". The record
+  // keeps its pre-pay status and is indexed for `resume` to re-drive.
+  if (await checkoutDeliveryPaused(env)) {
+    return deferForCheckoutPause(env, plId, rec, eventType, eventId)
   }
 
   // 8. Balance check against the funder's real on-chain USDC balance.
@@ -898,6 +927,13 @@ async function settleCoinbaseEvent(
     })
     await saveRecordGuarded(env, plId, rec)
     return { ok: true, exec_gate_held: true, plId }
+  }
+
+  // 8d. Re-check the emergency stop now that we hold the gate, to narrow the
+  // window between a stop and the send. Nothing was sent: give the gate back.
+  if (await checkoutDeliveryPaused(env)) {
+    await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
+    return deferForCheckoutPause(env, plId, rec, eventType, eventId)
   }
 
   // 9. Transition to paying, persist BEFORE calling pay-invoice. If the

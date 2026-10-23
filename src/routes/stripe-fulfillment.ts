@@ -34,6 +34,7 @@ import { claimInvoiceKey } from './invoice-claim'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { indexStripeSession } from './stripe-session-index'
 import { openStuckOrderTicket, ticketsConfigured } from '../utils/intercom-ticket'
+import { checkoutDeliveryPaused, recordPausedDelivery } from './checkout-control'
 
 // Provider-qualified order id. Rozo orderIds are used verbatim as our KV key
 // discriminator, so we avoid ':' (design §6 fallback) and use underscores.
@@ -660,6 +661,19 @@ export async function handleStripeWebhookEvent(
   }
 
   async function settleClaimedStripeInvoice(): Promise<Record<string, unknown>> {
+  // Checkout emergency stop (checkout-control.ts): nothing signed yet, so step
+  // the claim back to payout_seen and index it for `resume` to re-drive.
+  if (await checkoutDeliveryPaused(env)) {
+    await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', null, { kind: 'checkout_paused' })
+    await recordPausedDelivery(env, {
+      provider: 'stripe',
+      ref: orderId,
+      rozoPaymentId: input.rozoPaymentId,
+      eventType: input.eventType,
+    })
+    return { ok: true, deferred: 'checkout_paused', provider: 'stripe_crypto' }
+  }
+
   // Cross-channel claim (invoice-claim.ts): the UPI fiat channel may already be
   // settling this session. The per-record CAS above serializes Stripe-vs-Stripe;
   // this one serializes crypto-vs-UPI. Held elsewhere → terminal, never sign.
