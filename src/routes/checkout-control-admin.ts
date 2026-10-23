@@ -174,13 +174,13 @@ async function replayOne(env: Env, entry: BacklogEntry, requestId: string): Prom
   if (entry.provider === 'coinbase') {
     const rec = await loadRecord(env, entry.ref)
     if (rec && !PRE_PAY.has(rec.status)) {
-      await clearPausedDelivery(env, entry.ref)
+      await clearPausedDelivery(env, entry.ref, entry)
       return { ...base, outcome: 'already_moved', detail: `record status ${rec.status}` }
     }
   } else {
     const stripe = await loadStripeStatus(env, entry.ref)
     if (stripe && !STRIPE_PRE_PAY.has(stripe)) {
-      await clearPausedDelivery(env, entry.ref)
+      await clearPausedDelivery(env, entry.ref, entry)
       return { ...base, outcome: 'already_moved', detail: `record status ${stripe}` }
     }
   }
@@ -246,7 +246,7 @@ async function replayOne(env: Env, entry: BacklogEntry, requestId: string): Prom
   // Any other answer means the normal path owns this order again (paid,
   // deferred for balance, in flight, terminal…); its own record, sweep and
   // alerts take it from here.
-  await clearPausedDelivery(env, entry.ref)
+  await clearPausedDelivery(env, entry.ref, entry)
   return { ...base, outcome: 'settled_path_ran', summary }
 }
 

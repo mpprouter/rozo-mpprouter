@@ -25,6 +25,8 @@
 
 import type { Env } from '../index'
 import { casCommit, casRead, casScan, casUpdate } from './stripe-atomic'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
+import { redactForAlert } from '../utils/alert-redaction'
 
 export const CHECKOUT_CONTROL_KEY = 'checkout-control:v1'
 export const CHECKOUT_BACKLOG_PREFIX = 'checkout-paused:v1:'
@@ -131,14 +133,15 @@ function parseBacklog(raw: string | null): BacklogEntry | null {
 }
 
 /**
- * Index a delivery the switch refused. Best effort: the order record itself
- * already stays in a resumable state, the index only lets `resume` find it.
+ * Index a delivery the switch refused. The order record itself already stays
+ * in a resumable state; the index is how `resume` finds it, so a failed write
+ * pages a human instead of passing silently (the sender will not retry).
  */
 export async function recordPausedDelivery(
   env: Env,
   entry: { provider: BacklogProvider; ref: string; rozoPaymentId: string | null; eventType: string },
   now: Date = new Date(),
-): Promise<void> {
+): Promise<boolean> {
   const at = now.toISOString()
   try {
     await casUpdate<true>(env, checkoutBacklogKey(entry.ref), (raw) => {
@@ -156,18 +159,40 @@ export async function recordPausedDelivery(
       }
       return { op: 'set', value: JSON.stringify(next), result: true }
     })
+    return true
   } catch (err) {
     console.error(
       `[checkout-control] backlog index write failed for ${entry.ref}: ${err instanceof Error ? err.message : String(err)}`,
     )
+    if (alertSinkConfigured(env)) {
+      await sendAlert(
+        env,
+        redactForAlert(
+          `[MPP Router] ⚠️ Checkout paused an order but could not index it: ${entry.provider} ${entry.ref} (Rozo ${entry.rozoPaymentId ?? 'unknown'}). ` +
+            'The order is safe in its pre-pay state, but `admin resume checkout` will not replay it. Re-drive it by hand after resume.',
+        ),
+      ).catch(() => false)
+    }
+    return false
   }
 }
 
-/** Remove a backlog entry (empty value reads as absent, same as the exec gate). */
-export async function clearPausedDelivery(env: Env, ref: string): Promise<void> {
-  await casUpdate<true>(env, checkoutBacklogKey(ref), (raw) =>
-    raw ? { op: 'set', value: '', result: true } : { op: 'noop', result: true },
-  )
+/**
+ * Remove a backlog entry (empty value reads as absent, same as the exec gate).
+ * With `seen`, only the exact entry that was read is removed: an order paused
+ * again while it was being replayed keeps its fresh entry.
+ */
+export async function clearPausedDelivery(env: Env, ref: string, seen?: BacklogEntry): Promise<boolean> {
+  return casUpdate<boolean>(env, checkoutBacklogKey(ref), (raw) => {
+    if (!raw) return { op: 'noop', result: true }
+    if (seen) {
+      const cur = parseBacklog(raw)
+      if (cur && (cur.lastPausedAt !== seen.lastPausedAt || cur.count !== seen.count)) {
+        return { op: 'noop', result: false }
+      }
+    }
+    return { op: 'set', value: '', result: true }
+  })
 }
 
 export async function listPausedDeliveries(env: Env): Promise<BacklogEntry[]> {

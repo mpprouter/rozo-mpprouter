@@ -10,7 +10,9 @@ import { handleRozoWebhook, type FulfillmentRecord } from '../src/routes/webhook
 import {
   CHECKOUT_CONTROL_KEY,
   checkoutBacklogKey,
+  clearPausedDelivery,
   listPausedDeliveries,
+  recordPausedDelivery,
   readCheckoutControl,
   resumeCheckout,
   stopCheckout,
@@ -184,6 +186,23 @@ describe('switch semantics', () => {
     const unreadable = await readCheckoutControl(broken)
     expect(unreadable.paused).toBe(true)
     expect(unreadable.error).toMatch(/unreadable/)
+  })
+})
+
+describe('backlog index', () => {
+  it('a clear for an entry that was re-paused meanwhile keeps the fresh entry', async () => {
+    const { env } = makeEnv()
+    const e = { provider: 'coinbase' as const, ref: PL, rozoPaymentId: ROZO_ID, eventType: 'payment_payin_completed' }
+    expect(await recordPausedDelivery(env, e, new Date(1_000))).toBe(true)
+    const [seen] = await listPausedDeliveries(env)
+    await recordPausedDelivery(env, { ...e, eventType: 'payment_payout_completed' }, new Date(2_000))
+
+    expect(await clearPausedDelivery(env, PL, seen)).toBe(false)
+    const [kept] = await listPausedDeliveries(env)
+    expect(kept).toMatchObject({ count: 2, eventType: 'payment_payout_completed', firstPausedAt: seen.firstPausedAt })
+
+    expect(await clearPausedDelivery(env, PL, kept)).toBe(true)
+    expect(await listPausedDeliveries(env)).toEqual([])
   })
 })
 

@@ -10,6 +10,7 @@ import {
   stripeTerminal,
 } from '../src/routes/upi-invoice'
 import { claimInvoiceKey, readInvoiceClaim } from '../src/routes/invoice-claim'
+import { readCheckoutControl, resumeCheckout, stopCheckout } from '../src/routes/checkout-control'
 import { handleStripeWebhookEvent, seedStripeRecord } from '../src/routes/stripe-fulfillment'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import type { Env } from '../src/index'
@@ -457,6 +458,25 @@ describe('POST /api/invoice/verified-pay-in — auth and idempotency', () => {
 })
 
 // ── verified-pay-in: execution and terminal mapping ─────────────────────────
+
+describe('POST /api/invoice/verified-pay-in — checkout emergency stop', () => {
+  it('answers 503 before any record exists, then the same order goes through after resume', async () => {
+    const env = makeEnv()
+    const { body: q } = await resolve(env, PS_URL)
+    await stopCheckout(env, { reason: 'drill', actor: 'test', requestId: 'u1' })
+    const paused = await payIn(env, payInBody(q))
+    expect(paused.status).toBe(503)
+    expect(paused.body.error).toBe('checkout_paused')
+    expect(world.payCalls.length).toBe(0)
+    expect((await status(env, ORDER)).status).toBe(404)
+
+    const seen = await readCheckoutControl(env)
+    await resumeCheckout(env, { reason: 'drill over', actor: 'test', requestId: 'u2' }, seen.version)
+    const r = await payIn(env, payInBody(q))
+    expect(r.status).toBe(202)
+    expect(world.payCalls.length).toBe(1)
+  })
+})
 
 describe('POST /api/invoice/verified-pay-in — execution', () => {
   it('Coinbase v3: executor accepted is `processing`, `paid` only on CAPTURE_SUCCEEDED', async () => {

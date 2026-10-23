@@ -660,10 +660,7 @@ export async function handleStripeWebhookEvent(
     return { ok: true, provider: 'stripe_crypto', deferred: 'settlement_error', retryable: true }
   }
 
-  async function settleClaimedStripeInvoice(): Promise<Record<string, unknown>> {
-  // Checkout emergency stop (checkout-control.ts): nothing signed yet, so step
-  // the claim back to payout_seen and index it for `resume` to re-drive.
-  if (await checkoutDeliveryPaused(env)) {
+  async function deferForCheckoutPause(): Promise<Record<string, unknown>> {
     await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', null, { kind: 'checkout_paused' })
     await recordPausedDelivery(env, {
       provider: 'stripe',
@@ -673,6 +670,11 @@ export async function handleStripeWebhookEvent(
     })
     return { ok: true, deferred: 'checkout_paused', provider: 'stripe_crypto' }
   }
+
+  async function settleClaimedStripeInvoice(): Promise<Record<string, unknown>> {
+  // Checkout emergency stop (checkout-control.ts): nothing signed yet, so step
+  // the claim back to payout_seen and index it for `resume` to re-drive.
+  if (await checkoutDeliveryPaused(env)) return deferForCheckoutPause()
 
   // Cross-channel claim (invoice-claim.ts): the UPI fiat channel may already be
   // settling this session. The per-record CAS above serializes Stripe-vs-Stripe;
@@ -764,6 +766,14 @@ export async function handleStripeWebhookEvent(
       event: { kind: 'stripe_capability_decrypt_failed' },
     })
     return { ok: true, provider: 'stripe_crypto', status: 'manual_review' }
+  }
+
+  // Re-check right before signing to narrow the stop/send window. Nothing
+  // signed yet: hand today's headroom back and step the claim down.
+  if (await checkoutDeliveryPaused(env)) {
+    await releaseDailySpend(env, now, invoiceAtomic)
+    dailyReserved = false
+    return deferForCheckoutPause()
   }
 
   let payResult: StripePayInvoiceResult
