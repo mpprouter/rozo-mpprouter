@@ -23,6 +23,7 @@
  */
 
 import type { Env } from '../index'
+import { serviceIdFromRouteId } from './route-metrics'
 
 /**
  * `none`     — nothing to refund (the call was delivered).
@@ -70,6 +71,66 @@ export function txIndexKey(tx: string): string {
   return `mercury_order_tx:${tx.toLowerCase()}`
 }
 
+const ORDER_TTL_SECONDS = 400 * 24 * 60 * 60
+
+/** Decimal USDC string -> integer micro-units (6 dp, extra digits truncated). */
+export function usdToMicros(s: string | null | undefined): number {
+  const [i, f = ''] = String(s || '0').split('.')
+  return Number(BigInt(i || '0') * 1000000n + BigInt((f + '000000').slice(0, 6)))
+}
+
+async function sha256Hex(s: string): Promise<string> {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s))
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('')
+}
+
+/** One `order_ledger_stats` row (migrations-metrics/0002). */
+export interface OrderStatsRow {
+  order_id: string
+  created_at: number
+  service_id: string
+  amount_micros: number
+  payer_digest: string | null
+  refunded: number
+}
+
+/** Null when the entry's timestamp is unusable; such rows were never countable. */
+export async function orderStatsRow(entry: OrderLedgerEntry): Promise<OrderStatsRow | null> {
+  const created = Date.parse(entry.ts)
+  if (Number.isNaN(created)) return null
+  return {
+    order_id: entry.order_id,
+    created_at: created,
+    service_id: serviceIdFromRouteId(entry.route_id),
+    amount_micros: usdToMicros(entry.amount_usd),
+    payer_digest: entry.payer ? await sha256Hex(entry.payer) : null,
+    refunded: entry.refund_status === 'refunded' ? 1 : 0,
+  }
+}
+
+export const UPSERT_ORDER_STATS_SQL =
+  'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded) ' +
+  'VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET refunded = MAX(order_ledger_stats.refunded, excluded.refunded)'
+
+/**
+ * Mirror one order into the D1 stats rollup. Best-effort and logged, like the
+ * KV write: stats must never fail a call the agent already paid for.
+ */
+export async function recordOrderStats(env: Env, entry: OrderLedgerEntry): Promise<void> {
+  const db = env.ROUTE_METRICS_DB
+  if (!db) return
+  try {
+    const r = await orderStatsRow(entry)
+    if (!r) return
+    await db
+      .prepare(UPSERT_ORDER_STATS_SQL)
+      .bind(r.order_id, r.created_at, r.service_id, r.amount_micros, r.payer_digest, r.refunded)
+      .run()
+  } catch (err: any) {
+    console.error(`[order-ledger] stats rollup write failed for ${entry.order_id}: ${err.message}`)
+  }
+}
+
 /** Best-effort id — collision risk is irrelevant for an append-only audit log keyed by its own id. */
 export function newOrderId(): string {
   return `ord_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
@@ -98,6 +159,7 @@ export async function recordOrder(env: Env, entry: OrderLedgerEntry): Promise<bo
         expirationTtl: 400 * 24 * 60 * 60,
       })
     }
+    await recordOrderStats(env, entry)
     return true
   } catch (err: any) {
     console.error(`[order-ledger] write failed for ${entry.order_id}: ${err.message}`)
@@ -132,11 +194,11 @@ export async function updateOrderRefundStatus(
     }
     const entry = JSON.parse(raw) as OrderLedgerEntry
     if (entry.refund_status === refundStatus) return true
-    await env.MPP_STORE.put(
-      orderKey(orderId),
-      JSON.stringify({ ...entry, refund_status: refundStatus }),
-      { expirationTtl: 400 * 24 * 60 * 60 },
-    )
+    const next: OrderLedgerEntry = { ...entry, refund_status: refundStatus }
+    await env.MPP_STORE.put(orderKey(orderId), JSON.stringify(next), {
+      expirationTtl: ORDER_TTL_SECONDS,
+    })
+    await recordOrderStats(env, next)
     return true
   } catch (err: any) {
     console.error(`[order-ledger] refund status update failed for ${orderId}: ${err.message}`)
