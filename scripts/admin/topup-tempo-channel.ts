@@ -95,7 +95,7 @@ async function main() {
   if (account.address.toLowerCase() !== String(stored.descriptor.payer).toLowerCase()) {
     throw new Error('router key is not the channel payer; refusing')
   }
-  const client = createClient({ chain: tempoChain, transport: http(loadDevVars().TEMPO_RPC_URL ?? 'https://rpc.tempo.xyz'), account })
+  const client = createClient({ chain: tempoChain, transport: http((loadDevVars().TEMPO_RPC_URL || 'https://rpc.tempo.xyz').split(',')[0].trim()), account })
 
   const before = await Session.Precompile.Chain.getChannelState(client as any, stored.channelId)
   const mask = (a: string) => `${a.slice(0, 6)}...${a.slice(-4)}`
@@ -122,8 +122,12 @@ async function main() {
   }
   if (BigInt(after.deposit) <= BigInt(before.deposit)) throw new Error('deposit did not increase on chain; KV left unchanged')
 
-  stored.depositRaw = BigInt(after.deposit).toString()
-  kvPut(kvKey, JSON.stringify(stored, null, 2))
+  // Re-read KV right before writing and change ONLY depositRaw, so a voucher
+  // the Worker signed while this ran (cumulativeRaw / lastVoucherAt) is kept.
+  const fresh = JSON.parse(kvGet(kvKey))
+  if (fresh.channelId !== stored.channelId) throw new Error(`${kvKey} now points at a different channel; KV left unchanged`)
+  fresh.depositRaw = BigInt(after.deposit).toString()
+  kvPut(kvKey, JSON.stringify(fresh, null, 2))
   console.log(`✅ on-chain deposit now ${fmt(BigInt(after.deposit))} USDC; KV depositRaw updated.`)
 }
 
