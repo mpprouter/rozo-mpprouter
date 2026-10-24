@@ -2,7 +2,7 @@
   "$schema_note": "Machine-readable audit trail of real paid verification runs against apiserver.mpprouter.dev. Each run is a real Stellar mainnet USDC payment; tx is the Stellar transaction hash (view at https://stellar.expert/explorer/public/tx/<tx>).",
   "updated": "2026-10-25",
   "cadence": "weekly",
-  "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1 (raised to $2 for the 2026-08-18 SCF #44 Tranche 2 round, of which $0.081 was spent). The 2026-10-25 round paid from the E2E test wallet GATR4H...3TQL; gross $0.3239, of which $0.0114 was auto-refunded for non-fulfilled calls (net $0.3125).",
+  "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1 (raised to $2 for the 2026-08-18 SCF #44 Tranche 2 round, of which $0.081 was spent). The 2026-10-25 round paid from the E2E test wallet GATR4H...3TQL; gross $0.3239, of which $0.0114 was auto-refunded for non-fulfilled calls (net $0.3125). A second 2026-10-25 round ran after the Tempo channel top-up and PR #271: $0.3145 spent, no refunds.",
   "services": [
     {
       "id": "alphavantage_alphavantage_company-overview",
@@ -10,7 +10,7 @@
       "category": "data",
       "price": "$0.008/request",
       "public_path": "/v1/services/alphavantage/alphavantage_company-overview",
-      "charge_verified_at": "2026-10-24T20:46:28Z",
+      "charge_verified_at": "2026-10-24T21:59:28Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -30,6 +30,16 @@
           "amount_usdc": "0.008",
           "tx": "06ac2c02a6f3011d5f15cebc581c5a8f607f1deaa6583ad9e99075025fccd9d1",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T21:59:28Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.008",
+          "amount_usdc": "0.008",
+          "tx": "277392b9c079f9691a0214c6bd3a75ff17561b3cb5722e79bef9f69a6ee25dfa",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -39,7 +49,7 @@
       "category": "ai",
       "price": "dynamic",
       "public_path": "/v1/services/anthropic/chat_completions",
-      "charge_verified_at": "2026-08-24T02:44:14Z",
+      "charge_verified_at": "2026-10-24T21:59:38Z",
       "session_verified_at": null,
       "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), with the router auto-refunding on chain each time. The 2026-08-09 charge verification no longer holds, so verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Re-verify with a paid call returning a completion before relisting.",
       "runs": [
@@ -59,6 +69,16 @@
           "amount_usdc": "0.001",
           "tx": "11ef025568c115c4670d6aa9aa41830e5abfac8a815dbc59574c92d35ffc1e4b",
           "note": "Paid, then router returned 503 \"Router session channel not installed\" (no Tempo channel for merchant anthropic_chat_completions). Router auto-refunded in full, refund tx af05a295d9ea566641b66bfac86931146e875eeb39c1c98ad9026c634cc13f32. Router-side: open a Tempo channel for this merchant or route it via charge."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T21:59:38Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "43c05b2b68d791154faac0b3e25df7e1bc9c385800ce457f90baa77bdffba876",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ],
       "relisted": "2026-08-20",
@@ -72,7 +92,7 @@
       "price": "dynamic",
       "public_path": "/v1/services/anthropic/messages",
       "charge_verified_at": null,
-      "session_verified_at": "2026-08-24T03:18:26Z",
+      "session_verified_at": "2026-10-24T22:08:13Z",
       "runs": [
         {
           "date": "2026-08-18",
@@ -106,6 +126,26 @@
           "amount_usdc": "0.001",
           "tx": "d905f5bf02377750ec3d6abd0a95ca7cda6a6d70e0a03c6335c46f99e694cc87",
           "note": "Paid, then merchant leg failed 402 \"amount-exceeds-deposit\" (router Tempo session channel deposit exhausted). Router auto-refunded in full, refund tx a64570c83f9b5172319041dd7c2e5884d1564889c8282e30f7ca83fe7f39e530. Router-side: channel needs a top-up."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T21:59:40Z",
+          "result": "fail",
+          "http": 402,
+          "amount_usd": "0",
+          "amount_usdc": "0",
+          "tx": null,
+          "note": "First attempt: router answered 402 verification-failed after signing; no payment settled (no tx). Immediate retry passed."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:08:13Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "da70a3b2637d278efc6aa7a2f81d3958765f176189d3244cd2dfa91d38576cab",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ],
       "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), identical to the chat_completions sibling delisted earlier the same day. Two current model ids were tried (claude-haiku-4-5, claude-sonnet-4-5) to rule out a stale id; both failed the same way, so the session dialect and separate upstream path did not make this route immune. verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Anthropic now has no listed route, taking the distinct-verified-service count from 21 to 20. Re-verify with a paid call returning a completion before relisting.",
@@ -118,7 +158,7 @@
       "category": "data",
       "price": "$0.060/request",
       "public_path": "/v1/services/coingecko/simple-price",
-      "charge_verified_at": "2026-10-24T20:47:03Z",
+      "charge_verified_at": "2026-10-24T22:01:23Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -130,6 +170,16 @@
           "amount_usdc": "0.06",
           "tx": "505495b3d5653c81dd06862b19338469875267cc5bf064fa306ce3f6d5f3a313",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:01:23Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.06",
+          "amount_usdc": "0.06",
+          "tx": "25600c777143b4dc470dcb87b4f19f7cf8af1817c782999733d938cfe2e86c5e",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -139,7 +189,7 @@
       "category": "data",
       "price": "$0.004/request",
       "public_path": "/v1/services/deepgram/deepgram_list-models",
-      "charge_verified_at": "2026-10-24T20:47:13Z",
+      "charge_verified_at": "2026-10-24T22:01:33Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -151,6 +201,16 @@
           "amount_usdc": "0.004",
           "tx": "417b3c1cd0d86a9f583ddc0ff57827327e12c0ff2d5f9a07e05e6667a8e52ae2",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:01:33Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.004",
+          "amount_usdc": "0.004",
+          "tx": "17ce154dfc4deba4c7f75a6385dee135b873cd610d4368b54158d2351a85828b",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -160,7 +220,7 @@
       "category": "data",
       "price": "$0.005/request",
       "public_path": "/v1/services/deepl/deepl_languages",
-      "charge_verified_at": "2026-10-24T20:47:23Z",
+      "charge_verified_at": "2026-10-24T22:01:48Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -180,6 +240,16 @@
           "amount_usdc": "0.005",
           "tx": "dd876b9e74262b1a4a723aa6503c3c17c57a73977d3b1144e90c6527eb622003",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:01:48Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.005",
+          "amount_usdc": "0.005",
+          "tx": "a041cbb45e109994bd0419e5befd22c2fbcd99fa957eeb383bcec01e7199e753",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -189,7 +259,7 @@
       "category": "ai",
       "price": "Model + token dependent (~$0.004–$0.025) (dynamic)",
       "public_path": "/v1/services/deepseek/chat",
-      "charge_verified_at": "2026-10-24T20:47:33Z",
+      "charge_verified_at": "2026-10-24T22:02:03Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -207,6 +277,16 @@
           "amount_usdc": "0.004",
           "tx": "7e3e6802446995dfcea3851c590598a99ff687fae2efb90551d9a28d460ad2cd",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:02:03Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.004",
+          "amount_usdc": "0.004",
+          "tx": "fa9ea09aaee343640ee2850f9b522cf302b8eae19dae200fbf08a2afc63fa48f",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -216,7 +296,7 @@
       "category": "search",
       "price": "$0.005/request",
       "public_path": "/v1/services/exa/search",
-      "charge_verified_at": "2026-10-24T20:47:43Z",
+      "charge_verified_at": "2026-10-24T22:02:13Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -228,6 +308,16 @@
           "amount_usdc": "0.007",
           "tx": "c9b94aef0d47cb2e47a0798c977881f4afd93b7f51d61755d370d92961da58ea",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:02:13Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.007",
+          "amount_usdc": "0.007",
+          "tx": "1586a0899953a08c4b4daf52906efd47a260b4c941eeb7fa0cf93be907fd2515",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -237,7 +327,7 @@
       "category": "ai",
       "price": "$0.003/request",
       "public_path": "/v1/services/fal/flux_schnell",
-      "charge_verified_at": "2026-10-24T20:47:53Z",
+      "charge_verified_at": "2026-10-24T22:02:23Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -257,6 +347,16 @@
           "amount_usdc": "0.003",
           "tx": "249cf8a8e3be4bbdae94a6f1b67b8d588454f4e5257993ad65400035eeab227e",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:02:23Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.003",
+          "amount_usdc": "0.003",
+          "tx": "0c836ef725072921a88a43ba9975a841f1c9460c90ce0e95a06200df63019be7",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -266,7 +366,7 @@
       "category": "web",
       "price": "$0.002/request",
       "public_path": "/v1/services/firecrawl/scrape",
-      "charge_verified_at": "2026-10-24T20:48:08Z",
+      "charge_verified_at": "2026-10-24T22:02:33Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -278,6 +378,16 @@
           "amount_usdc": "0.002",
           "tx": "0b4c9f1b4280a0ad95f8341e3ad9c0b99a2375cf6f500ff49443b56967685ded",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:02:33Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.002",
+          "amount_usdc": "0.002",
+          "tx": "0d920ff7b35855f1b63357adc4a9910bca6c39f0b2517af7f20ebc6c6068d342",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -287,7 +397,7 @@
       "category": "ai",
       "price": "Model-dependent (~$0.001–$0.02) (dynamic)",
       "public_path": "/v1/services/grok/grok_chat",
-      "charge_verified_at": "2026-10-24T20:48:23Z",
+      "charge_verified_at": "2026-10-24T22:02:43Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -299,6 +409,16 @@
           "amount_usdc": "0.026521",
           "tx": "694308082202fabee864b974fcfe811c9fe56afd4a12173495b408c674b883b6",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:02:43Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.026521",
+          "amount_usdc": "0.026521",
+          "tx": "1da5c28d8b793ead7232b43a85e74d497d5d72264e7ce713b6136848dde18986",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -308,7 +428,7 @@
       "category": "ai",
       "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
       "public_path": "/v1/services/groq/chat",
-      "charge_verified_at": "2026-10-24T20:48:33Z",
+      "charge_verified_at": "2026-10-24T22:02:53Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -336,6 +456,16 @@
           "amount_usdc": "0.008",
           "tx": "290e9dc4f94280d7e8fd3ade1a7648c15789bbf2c90fbff4bccd938ca9fc61f2",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:02:53Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.008",
+          "amount_usdc": "0.008",
+          "tx": "db6452acfd1f5b523d072b85fb33c34bf16d3e03f506b351bbe9100951f77ae4",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -345,7 +475,7 @@
       "category": "data",
       "price": "$0.00375/request",
       "public_path": "/v1/services/mapbox/mapbox_geocode-forward",
-      "charge_verified_at": "2026-10-24T20:48:43Z",
+      "charge_verified_at": "2026-10-24T22:03:03Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -365,6 +495,16 @@
           "amount_usdc": "0.00375",
           "tx": "2c4430fe323b98308006a8ec9530a3a1e5432171129b94e46149cd3e13088c81",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:03:03Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.00375",
+          "amount_usdc": "0.00375",
+          "tx": "74df62169e390da5427027ffc43a4c69caaf5e7b90536c508383024628cea10c",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -374,7 +514,7 @@
       "category": "ai",
       "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
       "public_path": "/v1/services/mistral/mistral_chat",
-      "charge_verified_at": "2026-10-24T20:48:53Z",
+      "charge_verified_at": "2026-10-24T22:03:13Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -386,6 +526,16 @@
           "amount_usdc": "0.008",
           "tx": "b709ebedcc37da4f56b90f659697f53d38314f2ab3bd77b02867bc5079263ef3",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:03:13Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.008",
+          "amount_usdc": "0.008",
+          "tx": "b83e5c3705f60a0a55bee76f4afe3a0da7d2ed6042f2b560ace7fdbaec673048",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -396,7 +546,7 @@
       "price": "dynamic",
       "public_path": "/v1/services/openai/chat",
       "charge_verified_at": null,
-      "session_verified_at": "2026-08-09T03:51:00Z",
+      "session_verified_at": "2026-10-24T22:03:23Z",
       "runs": [
         {
           "date": "2026-10-25",
@@ -407,6 +557,16 @@
           "amount_usdc": "0.000006",
           "tx": "125f6a4977529116b108df02e6cc7d6cb4086e1fc8750577b3baf0dcc235747b",
           "note": "Paid, then merchant leg failed 402 \"amount-exceeds-deposit\" (router Tempo session channel deposit exhausted). Router auto-refunded in full, refund tx 90f48f39a230d9fbdd9d8443491ef7be84c90650f66ef5cae190cfc1aed98ea8. Router-side: channel needs a top-up."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:03:23Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.000006",
+          "amount_usdc": "0.000006",
+          "tx": "36df96f8aee9ec1193f14b20bf82628a20fa80cc2ab5d432114e613ac6062b48",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -416,7 +576,7 @@
       "category": "data",
       "price": "$0.006/request",
       "public_path": "/v1/services/openweather/openweather_current-weather",
-      "charge_verified_at": "2026-10-24T20:49:13Z",
+      "charge_verified_at": "2026-10-24T22:03:33Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -436,6 +596,16 @@
           "amount_usdc": "0.006",
           "tx": "0a77ee588460bc9174b564ca02449e40734a97861df9a93c1230d81ace2e75c0",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:03:33Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.006",
+          "amount_usdc": "0.006",
+          "tx": "24eb8637af7794901ad2a989d6b7f43cfc5f171e45e5047657fdf2ee8dcb9ce7",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -445,7 +615,7 @@
       "category": "search",
       "price": "$0.010/request",
       "public_path": "/v1/services/parallel/search",
-      "charge_verified_at": "2026-10-24T20:49:28Z",
+      "charge_verified_at": "2026-10-24T22:03:48Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -457,6 +627,16 @@
           "amount_usdc": "0.01",
           "tx": "d45e809cd79b750049e5d2d58d084a88afa6497c2e6c39396938ca3db5075d08",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:03:48Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.01",
+          "amount_usdc": "0.01",
+          "tx": "379d35ca4656e5d1733a5b06e7f562b2050f41aade3304bcfa3a0c9822a82132",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -466,7 +646,7 @@
       "category": "ai",
       "price": "Model-dependent (~$0.005–$0.02) (dynamic)",
       "public_path": "/v1/services/perplexity/perplexity_chat",
-      "charge_verified_at": "2026-10-24T20:51:53Z",
+      "charge_verified_at": "2026-10-24T22:04:03Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -488,6 +668,16 @@
           "amount_usdc": "0.00922",
           "tx": "0c72c63ad585e87c9b4e3d38d5310fc6a5521342cefb7ec6f4ca140f203465c0",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:04:03Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.00922",
+          "amount_usdc": "0.00922",
+          "tx": "ea3bab4efa6d400e7fe1520e0f339a8fdca1dc5f4a5622651bf1fe09bdf50d3a",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -519,6 +709,16 @@
           "amount_usdc": "0.0001",
           "tx": "cd5d8d189ea9deaf20ffec56571ceff4971ecefc0d2481a56f43057801e21871",
           "note": "Paid, then merchant returned an empty response (502), with both {} and a filename/content body. Router auto-refunded in full, refund tx b54c0409a668d9b9087bd51b4733e09e49f6b4c8f10a6655648e28dd93217ad6."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T21:59:00Z",
+          "result": "skip",
+          "http": 403,
+          "amount_usd": "0",
+          "amount_usdc": "0",
+          "tx": null,
+          "note": "Not paid: route disabled for payment by PR #271 (verifiedMode false) after the 2026-10-25 empty-response failures; router returns 403 \"Route not enabled for payment\"."
         }
       ]
     },
@@ -528,7 +728,7 @@
       "category": "search",
       "price": "$0.09 (basic) / $0.16 (advanced) (dynamic)",
       "public_path": "/v1/services/tavily/tavily_search",
-      "charge_verified_at": "2026-10-24T20:49:58Z",
+      "charge_verified_at": "2026-10-24T22:04:18Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -546,6 +746,16 @@
           "amount_usdc": "0.09",
           "tx": "fab5573cadcdc0d48a8eda9ad64e5f670ce298bf296de0c98b6d869c5019f125",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:04:18Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.09",
+          "amount_usdc": "0.09",
+          "tx": "49106d309d4705ce790a8e8f327eeccaa71fcbcd6af2b64c8c12de047fd2b59c",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -555,7 +765,7 @@
       "category": "data",
       "price": "$0.055/request",
       "public_path": "/v1/services/wolframalpha/wolframalpha_short-answer",
-      "charge_verified_at": "2026-10-24T20:52:18Z",
+      "charge_verified_at": "2026-10-24T22:04:33Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -585,6 +795,16 @@
           "amount_usdc": "0.055",
           "tx": "00be835a91fefeb7db9cb65a98e40c0f999d50f99fe55468888d7bfd96cf8af0",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:04:33Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.055",
+          "amount_usdc": "0.055",
+          "tx": "3d3fe5d2bdcaafe9eb20413a0663530e28e12f881aaf389e104e642093142903",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -594,7 +814,7 @@
       "category": "data",
       "price": "$0.001/request",
       "public_path": "/v1/services/mercury/events/by-contract",
-      "charge_verified_at": "2026-10-24T20:54:08Z",
+      "charge_verified_at": "2026-10-24T22:04:43Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -606,6 +826,16 @@
           "amount_usdc": "0.001",
           "tx": "ea9afd81f40bf5a0ad3de5a50d04bde13b0a3be57a751d34ff489021fefa6d9e",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with real Mercury data; x402 paid directly to the Mercury settlement address."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:04:43Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "2e701127bcb56888e77817976aa9cb6fa0cf44186cf7fab35bf085a8483670b8",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -615,7 +845,7 @@
       "category": "data",
       "price": "$0.001/request",
       "public_path": "/v1/services/mercury/txs/by-contract",
-      "charge_verified_at": "2026-10-24T20:54:18Z",
+      "charge_verified_at": "2026-10-24T22:04:53Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -627,6 +857,16 @@
           "amount_usdc": "0.001",
           "tx": "0bdaca8888365c681cdff28174b0f8db9d48fc0885904ecc12db08409b197df2",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with real Mercury data; x402 paid directly to the Mercury settlement address."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:04:53Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "c6617244000dde8d331b4a3da29b1aee493217696f38150c0ac0606dc0e3224c",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     },
@@ -636,7 +876,7 @@
       "category": "data",
       "price": "$0.001/request",
       "public_path": "/v1/services/mercury/txs/by-hash",
-      "charge_verified_at": "2026-10-24T20:54:28Z",
+      "charge_verified_at": "2026-10-24T22:08:23Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -648,6 +888,26 @@
           "amount_usdc": "0.001",
           "tx": "7f43de62ee3adfb49e1605b92b79eb068b3fe5126316fc9051a570a734ae8e98",
           "note": "Weekly verification round 2026-10-25 (JST). 200 with real Mercury data; x402 paid directly to the Mercury settlement address."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:05:30Z",
+          "result": "fail",
+          "http": 0,
+          "amount_usd": "0",
+          "amount_usdc": "0",
+          "tx": null,
+          "note": "First attempt: client timed out after 180 s with no payment settled (no tx). Retry passed."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T22:08:23Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "1ddfdbf3abba71680c5e7a1e56a7606f066cec45965e0e9ea9ee212c812f0e33",
+          "note": "Re-verification round 2026-10-25 (JST) after the Tempo channel top-up and PR #271. 200 with a real response body through the router."
         }
       ]
     }
