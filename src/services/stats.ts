@@ -21,7 +21,6 @@
  * added a distinction nobody was reading and three counters to keep true.
  */
 
-import type { OrderLedgerEntry } from './order-ledger'
 import {
   getQualityServiceIds,
   getRouteQuality,
@@ -31,22 +30,6 @@ import {
 } from './route-metrics'
 import { listPublishedProviders } from './provider-registry'
 import type { Env } from '../index'
-
-/**
- * Hard ceiling on ledger keys scanned per request.
- *
- * Every key costs one KV read, and a Worker invocation has a hard subrequest
- * budget (1000 on the paid plan). The previous 5000 would not merely be slow
- * — it would throw partway through and take the endpoint down. 400 leaves
- * room for the list calls, the D1 queries and the rate limiter, and still
- * clears lifetime volume by an order of magnitude.
- *
- * An unbounded walk behind a public URL is also a denial-of-service
- * primitive, so the scan must terminate whatever the data does. `truncated`
- * tells the caller the page is a floor rather than a total. When volume
- * genuinely approaches this, the answer is a rollup table, not a bigger cap.
- */
-const MAX_LEDGER_KEYS = 400
 
 const WINDOW_MS: Record<Exclude<MetricsWindow, 'all'>, number> = {
   '24h': 24 * 60 * 60 * 1000,
@@ -146,102 +129,119 @@ export interface StatsPayload {
     refund_rate: number | null
   }
   services: ServiceStats[]
-  /** True when the ledger scan hit MAX_LEDGER_KEYS; figures are then a floor. */
+  /** True when the commerce rollup could not be read; commerce figures are then absent, not zero. */
   truncated: boolean
 }
 
-/** Sum decimal USDC strings without going through a float. */
-function addUsd(a: string, b: string): string {
-  const scale = (s: string) => {
-    const [i, f = ''] = s.split('.')
-    return BigInt(i || '0') * 1000000n + BigInt((f + '000000').slice(0, 6))
-  }
-  const total = scale(a) + scale(b)
+/** Integer micro-USDC -> decimal string, trailing zeros trimmed. */
+function microsToUsd(micros: number | bigint): string {
+  const total = BigInt(micros)
   const whole = total / 1000000n
   const frac = (total % 1000000n).toString().padStart(6, '0').replace(/0+$/, '')
   return frac ? `${whole}.${frac}` : whole.toString()
 }
 
-async function readLedger(env: Env): Promise<{ entries: OrderLedgerEntry[]; truncated: boolean }> {
-  const entries: OrderLedgerEntry[] = []
-  let cursor: string | undefined
-  let scanned = 0
-  // Reads that failed or would not parse. Any of them makes the result a
-  // floor rather than a total.
-  let lostReads = 0
-
-  while (scanned < MAX_LEDGER_KEYS) {
-    let listed: KVNamespaceListResult<unknown, string>
-    try {
-      // Page size is bounded by what is left of the budget, not a flat
-      // 1000: the very first page would otherwise issue 1000 KV reads and
-      // blow the Worker subrequest cap before MAX_LEDGER_KEYS was ever
-      // consulted.
-      const remaining = MAX_LEDGER_KEYS - scanned
-      listed = await env.MPP_STORE.list({
-        prefix: 'mercury_order:',
-        limit: Math.min(remaining, 1000),
-        cursor,
-      })
-    } catch {
-      // A stats page must degrade, not 500.
-      return { entries, truncated: true }
-    }
-    scanned += listed.keys.length
-    // Each get() is caught individually: a bare Promise.all would reject
-    // outside the try above on a single transient KV failure and turn the
-    // whole endpoint into a 500, when the contract here is to degrade and
-    // say so via `truncated`.
-    let raws: (string | null)[]
-    try {
-      raws = await Promise.all(
-        listed.keys.map((k) =>
-          env.MPP_STORE.get(k.name).catch(() => {
-            // Count it. Swallowing the failure into a null would let the
-            // endpoint undercount while still claiming a complete result —
-            // the same "confident zero from a broken read" this page exists
-            // to avoid.
-            lostReads += 1
-            return null
-          }),
-        ),
-      )
-    } catch {
-      return { entries, truncated: true }
-    }
-    for (const raw of raws) {
-      if (!raw) continue
-      try {
-        entries.push(JSON.parse(raw) as OrderLedgerEntry)
-      } catch {
-        // One unparseable record must not empty the whole page — but it is
-        // still data we failed to read, so the result is a floor, not a
-        // total, and must say so.
-        lostReads += 1
-      }
-    }
-    if (listed.list_complete) return { entries, truncated: lostReads > 0 }
-    cursor = (listed as { cursor?: string }).cursor
-    if (!cursor) return { entries, truncated: lostReads > 0 }
-  }
-  return { entries, truncated: true }
+interface CommerceRow {
+  service_id: string
+  calls: number
+  volume_micros: number
+  refunded: number
+  buyers: number
+  first_at: number
+  last_at: number
 }
 
-/** Per-day counts across the window, oldest first. */
-function activitySeries(timestamps: number[], window: MetricsWindow, now: number): number[] {
-  if (timestamps.length === 0) return []
-  const spanMs = window === 'all' ? now - Math.min(...timestamps) : WINDOW_MS[window]
+interface Commerce {
+  services: CommerceRow[]
+  /** Hourly call counts per service, for the activity sparkline. */
+  hourly: Map<string, { hour_start: number; n: number }[]>
+  total_buyers: number
+  ok: boolean
+}
+
+/**
+ * Commerce aggregates from the D1 rollup `order_ledger_stats`
+ * (migrations-metrics/0002), written alongside every order-ledger record.
+ * Three queries, no per-key KV reads, independent of order volume. Any
+ * failure degrades to empty figures with `ok: false`, which the payload
+ * reports as `truncated` rather than publishing a confident zero.
+ */
+async function readCommerce(env: Env, cutoff: number): Promise<Commerce> {
+  const empty: Commerce = { services: [], hourly: new Map(), total_buyers: 0, ok: false }
+  const db = env.ROUTE_METRICS_DB
+  if (!db) return empty
+  try {
+    const [perService, perHour, buyers] = await db.batch([
+      db
+        .prepare(
+          `SELECT service_id, COUNT(*) AS calls, COALESCE(SUM(amount_micros), 0) AS volume_micros,
+                  COALESCE(SUM(refunded), 0) AS refunded, COUNT(DISTINCT payer_digest) AS buyers,
+                  MIN(created_at) AS first_at, MAX(created_at) AS last_at
+             FROM order_ledger_stats WHERE created_at >= ? GROUP BY service_id`,
+        )
+        .bind(cutoff),
+      db
+        .prepare(
+          `SELECT service_id, (created_at / 3600000) * 3600000 AS hour_start, COUNT(*) AS n
+             FROM order_ledger_stats WHERE created_at >= ? GROUP BY service_id, hour_start`,
+        )
+        .bind(cutoff),
+      db
+        .prepare(
+          'SELECT COUNT(DISTINCT payer_digest) AS n FROM order_ledger_stats WHERE created_at >= ?',
+        )
+        .bind(cutoff),
+    ])
+    const hourly = new Map<string, { hour_start: number; n: number }[]>()
+    for (const r of (perHour.results ?? []) as any[]) {
+      const list = hourly.get(r.service_id) ?? []
+      list.push({ hour_start: Number(r.hour_start), n: Number(r.n) })
+      hourly.set(r.service_id, list)
+    }
+    return {
+      services: ((perService.results ?? []) as any[]).map((r) => ({
+        service_id: String(r.service_id),
+        calls: Number(r.calls),
+        volume_micros: Number(r.volume_micros),
+        refunded: Number(r.refunded),
+        buyers: Number(r.buyers),
+        first_at: Number(r.first_at),
+        last_at: Number(r.last_at),
+      })),
+      hourly,
+      total_buyers: Number(((buyers.results ?? [])[0] as any)?.n ?? 0),
+      ok: true,
+    }
+  } catch (err: any) {
+    console.error(`[stats] commerce rollup read failed: ${err.message}`)
+    return empty
+  }
+}
+
+/**
+ * Per-day counts across the window, oldest first, from hourly buckets. An
+ * hour is placed by its start (clamped to the window start), so a call can
+ * shift by under an hour across a bucket edge, invisible on a sparkline.
+ */
+function activitySeries(
+  hours: { hour_start: number; n: number }[],
+  firstAt: number,
+  window: MetricsWindow,
+  now: number,
+): number[] {
+  if (hours.length === 0) return []
+  const spanMs = window === 'all' ? now - firstAt : WINDOW_MS[window]
   const days = Math.max(1, Math.ceil(spanMs / 86400000))
   // Cap the series so an all-time view of a long-lived service still renders
   // as a sparkline rather than several hundred one-pixel bars.
   const buckets = Math.min(days, 90)
-  const bucketMs = spanMs / buckets
+  const bucketMs = Math.max(1, spanMs) / buckets
   const start = now - spanMs
   const out = new Array(buckets).fill(0)
-  for (const ts of timestamps) {
-    if (ts < start) continue
-    const i = Math.min(buckets - 1, Math.floor((ts - start) / bucketMs))
-    out[i] += 1
+  for (const h of hours) {
+    const ts = Math.max(h.hour_start, start)
+    const i = Math.min(buckets - 1, Math.max(0, Math.floor((ts - start) / bucketMs)))
+    out[i] += h.n
   }
   return out
 }
@@ -250,46 +250,34 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   const now = Date.now()
   const cutoff = window === 'all' ? 0 : now - WINDOW_MS[window]
 
-  const { entries, truncated } = await readLedger(env)
+  const commerce = await readCommerce(env, cutoff)
+  const truncated = !commerce.ok
 
   interface Acc {
     calls: number
     refunded: number
-    volume: string
-    buyers: Set<string>
+    volume_micros: number
+    buyers: number
+    first: number
     last: number | null
-    tss: number[]
   }
   const byService = new Map<string, Acc>()
   const acc = (id: string): Acc => {
     let a = byService.get(id)
     if (!a) {
-      a = {
-        calls: 0,
-        refunded: 0,
-        volume: '0',
-        buyers: new Set(),
-        last: null,
-        tss: [],
-      }
+      a = { calls: 0, refunded: 0, volume_micros: 0, buyers: 0, first: now, last: null }
       byService.set(id, a)
     }
     return a
   }
-
-  for (const e of entries) {
-    const ts = Date.parse(e.ts)
-    if (Number.isNaN(ts) || ts < cutoff) continue
-    const a = acc(serviceIdFromRouteId(e.route_id))
-
-    a.calls += 1
-    if (e.refund_status === 'refunded') a.refunded += 1
-    a.tss.push(ts)
-    a.volume = addUsd(a.volume, e.amount_usd || '0')
-    // Undecodable payers still count as calls; they simply cannot contribute
-    // a distinct buyer.
-    if (e.payer) a.buyers.add(e.payer)
-    a.last = a.last === null ? ts : Math.max(a.last, ts)
+  for (const r of commerce.services) {
+    const a = acc(r.service_id)
+    a.calls = r.calls
+    a.refunded = r.refunded
+    a.volume_micros = r.volume_micros
+    a.buyers = r.buyers
+    a.first = r.first_at
+    a.last = r.last_at
   }
 
   // Seed from the quality table as well as the ledger. A service whose calls
@@ -323,8 +311,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       service_id: serviceId,
       ...(operator ? { operator, settlement: 'direct' as const } : {}),
       calls: a.calls,
-      volume_usd: a.volume,
-      buyers: a.buyers.size,
+      volume_usd: microsToUsd(a.volume_micros),
+      buyers: a.buyers,
       last_call_at: a.last,
       // Absent data, not zero, when the store could not be read.
       provider_success_rate: qualityReadable ? w.provider_success_rate : null,
@@ -334,7 +322,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       latency_p50_ms: qualityReadable ? w.latency_p50_ms : null,
       refunded: a.refunded,
       refund_rate: a.calls === 0 ? null : Math.round((a.refunded / a.calls) * 10000) / 10000,
-      activity: activitySeries(a.tss, window, now),
+      activity: activitySeries(commerce.hourly.get(serviceId) ?? [], a.first, window, now),
     })
   }
   // Busiest first — the table's default sort in the reference layout.
@@ -342,19 +330,12 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
 
   const { stats: allQuality, availability: qualityAvailability } =
     await getRouteQualityWithAvailability(env)
-  const totalBuyers = new Set<string>()
-  for (const e of entries) {
-    const ts = Date.parse(e.ts)
-    if (Number.isNaN(ts) || ts < cutoff) continue
-    if (e.payer) totalBuyers.add(e.payer)
-  }
-
   return {
     window,
     generated_at: new Date(now).toISOString(),
     coverage: {
       commerce_source:
-        'Per-call order ledger (KV). Volume, buyers and calls are settled orders only.',
+        'Per-call order ledger, aggregated from its D1 rollup (order_ledger_stats). Volume, buyers and calls are settled orders only.',
       quality_source:
         'route_metric_calls (D1), written at the proxy chokepoint every paid call passes through.',
       quality_availability:
@@ -369,8 +350,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     },
     totals: {
       calls: services.reduce((n, s) => n + s.calls, 0),
-      volume_usd: services.reduce((v, s) => addUsd(v, s.volume_usd), '0'),
-      buyers: totalBuyers.size,
+      volume_usd: microsToUsd([...byService.values()].reduce((v, a) => v + BigInt(a.volume_micros), 0n)),
+      buyers: commerce.total_buyers,
       provider_success_rate:
         qualityAvailability === 'ok' ? allQuality[window].provider_success_rate : null,
       caller_error: qualityAvailability === 'ok' ? allQuality[window].caller_error : null,
