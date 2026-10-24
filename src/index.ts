@@ -118,6 +118,8 @@ import {
 import { handlePreflight, withCors } from './utils/cors'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
+import { checkTempoChannels, precompileStateReader } from './utils/tempo-channel-watch'
+import { getTempoClient } from './mpp/tempo-rpc'
 import { checkFunderBalance } from './utils/funder-balance-watch'
 import { alertSinkConfigured, sendAlert } from './utils/alert'
 import { redactForAlert } from './utils/alert-redaction'
@@ -693,6 +695,9 @@ export default {
     // Base USDC funder low-balance / sudden-drop watch. Replaces the launchd
     // job that ran on two laptops and double-sent every alert.
     ctx.waitUntil(watchFunderBalance(env))
+    // Tempo session channel low-deposit watch (router -> merchant). Reads the
+    // on-chain deposit, not the KV figure; see src/utils/tempo-channel-watch.ts.
+    ctx.waitUntil(watchTempoChannels(env))
     // x402 payer jobs (src/x402payer/reconcile.ts): every 10 min, check
     // expired Base credentials on chain (the refund itself is pg_cron in the
     // Intents DB) and alert reversed top-ups; hourly, funder vs ledger
@@ -748,6 +753,30 @@ async function watchFunderBalance(env: Env): Promise<void> {
     await result.commit()
   } catch (err) {
     console.warn(`[funder-balance-watch] skipped: ${(err as Error).message}`)
+  }
+}
+
+/**
+ * Tempo session channel low-deposit watch. Same contract as the watches
+ * around it: never throws, commits state only after confirmed delivery.
+ */
+async function watchTempoChannels(env: Env): Promise<void> {
+  try {
+    if (!alertSinkConfigured(env)) {
+      console.warn('[tempo-channel-watch] no alert channel configured — Tempo channels are NOT being monitored')
+      return
+    }
+    const result = await checkTempoChannels({
+      kv: env.MPP_STORE as any,
+      readStates: precompileStateReader(getTempoClient(env.TEMPO_RPC_URL, env.TEMPO_RPC_URL_PRIMARY)),
+    })
+    if (!result) return
+    for (const message of result.messages) {
+      if (!(await sendAlert(env, redactForAlert(message)))) return
+    }
+    await result.commit()
+  } catch (err) {
+    console.warn(`[tempo-channel-watch] skipped: ${(err as Error).message}`)
   }
 }
 

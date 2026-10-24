@@ -50,6 +50,13 @@ export interface PublicServiceRoute {
    * matters for documentation and for KV channel pre-provisioning.
    */
   upstreamPaymentMethod: 'tempo.charge' | 'tempo.session'
+  /**
+   * KV channel key (`tempoChannel:<key>`) this route pays through on the
+   * tempo.session path. Defaults to the route id. Set it when two routes on
+   * the same merchant (same realm, recipient and token) should share one
+   * funded channel instead of each needing its own deposit.
+   */
+  sessionChannelKey?: string
   network: 'stellar-mainnet'
   asset: 'USDC'
   publicPath: string
@@ -363,6 +370,8 @@ export interface PublicServiceRouteOverlay {
   verifiedNote?: string
   placeholderDefaults?: Record<string, string>
   upstreamPaymentMethod?: 'tempo.charge' | 'tempo.session'
+  /** See `PublicServiceRoute.sessionChannelKey`. */
+  sessionChannelKey?: string
   /** Per-mode real-money verification flags + timestamps. See
    * PublicServiceRoute.chargeVerified for semantics. */
   chargeVerified?: boolean | null

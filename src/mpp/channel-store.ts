@@ -223,3 +223,11 @@ export async function bumpCumulative(
   }
   await env.MPP_STORE.put(key(merchantId), JSON.stringify(next))
 }
+
+/**
+ * KV channel key a route pays through on the tempo.session path: the
+ * operator-set `sessionChannelKey` when present, else the route id.
+ */
+export function sessionChannelKeyFor(route: { id: string; sessionChannelKey?: string }): string {
+  return route.sessionChannelKey || route.id
+}

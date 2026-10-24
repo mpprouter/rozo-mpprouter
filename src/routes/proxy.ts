@@ -29,7 +29,7 @@ import {
   payMerchant,
   payMerchantSession,
 } from '../mpp/tempo-client'
-import { bumpCumulative } from '../mpp/channel-store'
+import { bumpCumulative, sessionChannelKeyFor } from '../mpp/channel-store'
 import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult, type X402CachedResult } from '../mpp/idempotency'
 import { isEnvelopeLiftedRoute, presentMerchantEnvelope } from './merchant-envelope'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
@@ -1001,7 +1001,7 @@ async function payMerchantAndGetBodyInner(
   let merchantResponse: Response
   try {
     if (merchantIntent === 'session') {
-      const sessionResult = await payMerchantSession(env, route.id, merchantUrl, {
+      const sessionResult = await payMerchantSession(env, sessionChannelKeyFor(route), merchantUrl, {
         method: request.method,
         headers: forwardHeaders(request),
         body: requestBody,
@@ -1013,7 +1013,7 @@ async function payMerchantAndGetBodyInner(
           BigInt(parsed.request.amount)
         ).toString()
         ctx.waitUntil(
-          bumpCumulative(env, route.id, newCumulativeRaw).catch((err: any) => {
+          bumpCumulative(env, sessionChannelKeyFor(route), newCumulativeRaw).catch((err: any) => {
             console.error(
               `[proxy] post-2xx bumpCumulative failed for ${route.id}: ${err.message}`,
             )

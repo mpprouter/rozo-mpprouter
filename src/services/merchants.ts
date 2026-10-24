@@ -250,7 +250,16 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
   'anthropic::/v1/chat/completions': {
     id: 'anthropic_chat_completions',
     publicPath: '/v1/services/anthropic/chat_completions',
-    upstreamPaymentMethod: 'tempo.charge',
+    // 2026-10-25: the merchant now answers this endpoint with a
+    // session-only 402 (intent="session", same realm, recipient
+    // 0xca4e...79Fe, token and TIP-1034 escrow as /v1/messages), so the
+    // charge pin no longer matches what the proxy actually pays with, and
+    // with no `tempoChannel:anthropic_chat_completions` entry every call
+    // 503'd "Router session channel not installed". Both endpoints belong to
+    // one merchant service, so this route pays through the anthropic_messages
+    // channel instead of needing a second funded deposit.
+    upstreamPaymentMethod: 'tempo.session',
+    sessionChannelKey: 'anthropic_messages',
     // Founder decision 2026-08-20: keep this route payable as the LIVE
     // REFUND DEMO. The merchant leg 403s on every call (confirmed with
     // paid re-probes 2026-08-18 and 2026-08-19), so each paid call
@@ -884,11 +893,22 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
       '(see docs/verified-services.md). $0.001/call, 1,000/day cap, router-held credential.',
   },
   // Object Storage Upload — actually charge mode for multipart-init
+  //
+  // 2026-10-25: DISABLED. The mpp.dev catalog no longer lists POST /:key
+  // (storage now lists only GET/PUT/DELETE /:key+ and GET /), and two paid
+  // calls through the router on 2026-10-24 settled and then got an empty
+  // response from the merchant (502, auto-refunded). The merchant still
+  // issues a 402 for POST, so the route would keep taking payments it cannot
+  // fulfil. Marked unpayable until a paid re-probe returns a real upload id.
   'storage::/{key}': {
     id: 'storage_upload',
     publicPath: '/v1/services/storage/upload',
-    verifiedMode: 'charge',
-    chargeVerified: true,
+    verifiedMode: false,
+    verifiedNote:
+      'Multipart upload endpoint (POST /:key) was removed from the mpp.dev ' +
+      'catalog; paid calls on 2026-10-24 settled, got an empty merchant ' +
+      'response and were auto-refunded. Re-probe before re-enabling.',
+    chargeVerified: false,
     chargeVerifiedAt: '2026-04-11T00:00:00Z',
     placeholderDefaults: { key: 'upload' },
   },

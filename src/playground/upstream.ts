@@ -67,6 +67,7 @@ import {
 } from '../mpp/tempo-client'
 import { toTempoRaw6 } from './amount'
 import { checkAndBumpDailyLimit, utcDateKey } from '../mpp/rate-limit-do'
+import { sessionChannelKeyFor } from '../mpp/channel-store'
 
 /**
  * Did the router incur a billable upstream cost for this call?
@@ -288,7 +289,7 @@ export async function callUpstream(
     // watermark is persisted by payMerchantSession's own onChannelUpdate hook
     // (see the module header for why we do not bump it a second time).
     try {
-      const { response } = await payMerchantSession(env, route.id, merchantUrl, init, {
+      const { response } = await payMerchantSession(env, sessionChannelKeyFor(route), merchantUrl, init, {
         maxAmountRaw,
         onCredentialSigned,
       })
