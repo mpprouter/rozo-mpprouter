@@ -1,8 +1,8 @@
 {
   "$schema_note": "Machine-readable audit trail of real paid verification runs against apiserver.mpprouter.dev. Each run is a real Stellar mainnet USDC payment; tx is the Stellar transaction hash (view at https://stellar.expert/explorer/public/tx/<tx>).",
-  "updated": "2026-09-02",
+  "updated": "2026-10-25",
   "cadence": "weekly",
-  "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1 (raised to $2 for the 2026-08-18 SCF #44 Tranche 2 round, of which $0.081 was spent).",
+  "payer_note": "Runs are paid from a Rozo-operated test wallet; per-round spend cap $1 (raised to $2 for the 2026-08-18 SCF #44 Tranche 2 round, of which $0.081 was spent). The 2026-10-25 round paid from the E2E test wallet GATR4H...3TQL; gross $0.3239, of which $0.0114 was auto-refunded for non-fulfilled calls (net $0.3125).",
   "services": [
     {
       "id": "alphavantage_alphavantage_company-overview",
@@ -10,7 +10,7 @@
       "category": "data",
       "price": "$0.008/request",
       "public_path": "/v1/services/alphavantage/alphavantage_company-overview",
-      "charge_verified_at": "2026-08-18T03:23:14Z",
+      "charge_verified_at": "2026-10-24T20:46:28Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -20,6 +20,16 @@
           "amount_usd": "0.008",
           "tx": "fc0296e6991beb22aee5923784df1de1e7971fb0c3f89d9db9a93ef6df1698f6",
           "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:46:28Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.008",
+          "amount_usdc": "0.008",
+          "tx": "06ac2c02a6f3011d5f15cebc581c5a8f607f1deaa6583ad9e99075025fccd9d1",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
         }
       ]
     },
@@ -39,6 +49,16 @@
           "http": 200,
           "amount_usd": "0.001",
           "note": "model claude-haiku-4-5 via /v1/chat/completions facade, served claude-haiku-4-5-20251001. 200 + completion, refund-status null. Run THROUGH THE ROUTER from the SG e2e box; two direct merchant probes the same day still returned 403 because they carry the operator IP (Hong Kong), which Anthropic does not serve — direct probes are not evidence about the production path."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:46:38Z",
+          "result": "fail",
+          "http": 503,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "11ef025568c115c4670d6aa9aa41830e5abfac8a815dbc59574c92d35ffc1e4b",
+          "note": "Paid, then router returned 503 \"Router session channel not installed\" (no Tempo channel for merchant anthropic_chat_completions). Router auto-refunded in full, refund tx af05a295d9ea566641b66bfac86931146e875eeb39c1c98ad9026c634cc13f32. Router-side: open a Tempo channel for this merchant or route it via charge."
         }
       ],
       "relisted": "2026-08-20",
@@ -76,6 +96,16 @@
           "http": 200,
           "amount_usd": "0.001",
           "note": "model claude-haiku-4-5 via /v1/services/anthropic/messages, served claude-haiku-4-5-20251001. 200 + native completion, refund-status null, signed receipt. Run THROUGH THE ROUTER from the SG e2e box."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:46:48Z",
+          "result": "fail",
+          "http": 502,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "d905f5bf02377750ec3d6abd0a95ca7cda6a6d70e0a03c6335c46f99e694cc87",
+          "note": "Paid, then merchant leg failed 402 \"amount-exceeds-deposit\" (router Tempo session channel deposit exhausted). Router auto-refunded in full, refund tx a64570c83f9b5172319041dd7c2e5884d1564889c8282e30f7ca83fe7f39e530. Router-side: channel needs a top-up."
         }
       ],
       "delisted_reason": "Paid re-probes on 2026-08-18 settled the payment and then failed on the merchant leg (403 forbidden), identical to the chat_completions sibling delisted earlier the same day. Two current model ids were tried (claude-haiku-4-5, claude-sonnet-4-5) to rule out a stale id; both failed the same way, so the session dialect and separate upstream path did not make this route immune. verifiedMode is false in OPERATOR_OVERLAY and the route is not advertised as payable. Anthropic now has no listed route, taking the distinct-verified-service count from 21 to 20. Re-verify with a paid call returning a completion before relisting.",
@@ -88,9 +118,20 @@
       "category": "data",
       "price": "$0.060/request",
       "public_path": "/v1/services/coingecko/simple-price",
-      "charge_verified_at": "2026-06-22T00:00:00Z",
+      "charge_verified_at": "2026-10-24T20:47:03Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:47:03Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.06",
+          "amount_usdc": "0.06",
+          "tx": "505495b3d5653c81dd06862b19338469875267cc5bf064fa306ce3f6d5f3a313",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
     },
     {
       "id": "deepgram_deepgram_list-models",
@@ -98,9 +139,20 @@
       "category": "data",
       "price": "$0.004/request",
       "public_path": "/v1/services/deepgram/deepgram_list-models",
-      "charge_verified_at": "2026-08-01T16:11:11Z",
+      "charge_verified_at": "2026-10-24T20:47:13Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:47:13Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.004",
+          "amount_usdc": "0.004",
+          "tx": "417b3c1cd0d86a9f583ddc0ff57827327e12c0ff2d5f9a07e05e6667a8e52ae2",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
     },
     {
       "id": "deepl_deepl_languages",
@@ -108,7 +160,7 @@
       "category": "data",
       "price": "$0.005/request",
       "public_path": "/v1/services/deepl/deepl_languages",
-      "charge_verified_at": "2026-08-18T03:24:29Z",
+      "charge_verified_at": "2026-10-24T20:47:23Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -118,6 +170,16 @@
           "amount_usd": "0.005",
           "tx": "1a47118ef2f625ef0571cbb1ce028aad867f0d278e34a51c0a949b0a93edafea",
           "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:47:23Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.005",
+          "amount_usdc": "0.005",
+          "tx": "dd876b9e74262b1a4a723aa6503c3c17c57a73977d3b1144e90c6527eb622003",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
         }
       ]
     },
@@ -127,7 +189,7 @@
       "category": "ai",
       "price": "Model + token dependent (~$0.004–$0.025) (dynamic)",
       "public_path": "/v1/services/deepseek/chat",
-      "charge_verified_at": "2026-06-22T00:00:00Z",
+      "charge_verified_at": "2026-10-24T20:47:33Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -135,6 +197,16 @@
           "utc": "2026-08-10T07:55:59Z",
           "tx": "d3a0a8d42fc40415a0c36e6519fd5e121df4c9154405cc8f45399446ac7edf0b",
           "amount_usdc": "0.004"
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:47:33Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.004",
+          "amount_usdc": "0.004",
+          "tx": "7e3e6802446995dfcea3851c590598a99ff687fae2efb90551d9a28d460ad2cd",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
         }
       ]
     },
@@ -144,9 +216,20 @@
       "category": "search",
       "price": "$0.005/request",
       "public_path": "/v1/services/exa/search",
-      "charge_verified_at": "2026-04-11T00:00:00Z",
+      "charge_verified_at": "2026-10-24T20:47:43Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:47:43Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.007",
+          "amount_usdc": "0.007",
+          "tx": "c9b94aef0d47cb2e47a0798c977881f4afd93b7f51d61755d370d92961da58ea",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
     },
     {
       "id": "fal_flux_schnell",
@@ -154,7 +237,7 @@
       "category": "ai",
       "price": "$0.003/request",
       "public_path": "/v1/services/fal/flux_schnell",
-      "charge_verified_at": "2026-08-18T03:22:45Z",
+      "charge_verified_at": "2026-10-24T20:47:53Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -164,6 +247,16 @@
           "amount_usd": "0.003",
           "tx": "7ee4ce8c359bebe4a4c94f94d9f815ff65b2faafe67a555a88d36f787ab6f9a1",
           "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:47:53Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.003",
+          "amount_usdc": "0.003",
+          "tx": "249cf8a8e3be4bbdae94a6f1b67b8d588454f4e5257993ad65400035eeab227e",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
         }
       ]
     },
@@ -173,9 +266,20 @@
       "category": "web",
       "price": "$0.002/request",
       "public_path": "/v1/services/firecrawl/scrape",
-      "charge_verified_at": "2026-04-11T00:00:00Z",
+      "charge_verified_at": "2026-10-24T20:48:08Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:48:08Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.002",
+          "amount_usdc": "0.002",
+          "tx": "0b4c9f1b4280a0ad95f8341e3ad9c0b99a2375cf6f500ff49443b56967685ded",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
     },
     {
       "id": "grok_grok_chat",
@@ -183,9 +287,20 @@
       "category": "ai",
       "price": "Model-dependent (~$0.001–$0.02) (dynamic)",
       "public_path": "/v1/services/grok/grok_chat",
-      "charge_verified_at": "2026-08-01T16:10:11Z",
+      "charge_verified_at": "2026-10-24T20:48:23Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:48:23Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.026521",
+          "amount_usdc": "0.026521",
+          "tx": "694308082202fabee864b974fcfe811c9fe56afd4a12173495b408c674b883b6",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
     },
     {
       "id": "groq_chat",
@@ -193,7 +308,7 @@
       "category": "ai",
       "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
       "public_path": "/v1/services/groq/chat",
-      "charge_verified_at": "2026-09-02T00:00:00Z",
+      "charge_verified_at": "2026-10-24T20:48:33Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -211,6 +326,16 @@
           "amount_usd": "0.008",
           "tx": "feb1c3fa7bbe536c7bfa7baedb46d99258898b5410473644fc9a0518a0c55b42",
           "note": "openai/gpt-oss-20b: 200 with a live completion through the router (charge). Also passes as the scheduled charge eval default; openai/gpt-oss-120b passed as fallback the same day."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:48:33Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.008",
+          "amount_usdc": "0.008",
+          "tx": "290e9dc4f94280d7e8fd3ade1a7648c15789bbf2c90fbff4bccd938ca9fc61f2",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
         }
       ]
     },
@@ -220,7 +345,7 @@
       "category": "data",
       "price": "$0.00375/request",
       "public_path": "/v1/services/mapbox/mapbox_geocode-forward",
-      "charge_verified_at": "2026-08-18T03:24:51Z",
+      "charge_verified_at": "2026-10-24T20:48:43Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -230,6 +355,16 @@
           "amount_usd": "0.00375",
           "tx": "9592b917d7d2e7ea90fccede90e873191ce16ba6a846a4a74b2338ad1f817e51",
           "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:48:43Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.00375",
+          "amount_usdc": "0.00375",
+          "tx": "2c4430fe323b98308006a8ec9530a3a1e5432171129b94e46149cd3e13088c81",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
         }
       ]
     },
@@ -239,9 +374,20 @@
       "category": "ai",
       "price": "$0.005 – $0.10 (varies by model and tokens) (dynamic)",
       "public_path": "/v1/services/mistral/mistral_chat",
-      "charge_verified_at": "2026-08-01T16:10:27Z",
+      "charge_verified_at": "2026-10-24T20:48:53Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:48:53Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.008",
+          "amount_usdc": "0.008",
+          "tx": "b709ebedcc37da4f56b90f659697f53d38314f2ab3bd77b02867bc5079263ef3",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
     },
     {
       "id": "openai_chat",
@@ -251,7 +397,18 @@
       "public_path": "/v1/services/openai/chat",
       "charge_verified_at": null,
       "session_verified_at": "2026-08-09T03:51:00Z",
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:49:03Z",
+          "result": "fail",
+          "http": 502,
+          "amount_usd": "0.000006",
+          "amount_usdc": "0.000006",
+          "tx": "125f6a4977529116b108df02e6cc7d6cb4086e1fc8750577b3baf0dcc235747b",
+          "note": "Paid, then merchant leg failed 402 \"amount-exceeds-deposit\" (router Tempo session channel deposit exhausted). Router auto-refunded in full, refund tx 90f48f39a230d9fbdd9d8443491ef7be84c90650f66ef5cae190cfc1aed98ea8. Router-side: channel needs a top-up."
+        }
+      ]
     },
     {
       "id": "openweather_openweather_current-weather",
@@ -259,7 +416,7 @@
       "category": "data",
       "price": "$0.006/request",
       "public_path": "/v1/services/openweather/openweather_current-weather",
-      "charge_verified_at": "2026-08-18T03:23:31Z",
+      "charge_verified_at": "2026-10-24T20:49:13Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -269,6 +426,16 @@
           "amount_usd": "0.006",
           "tx": "f5dfdc09cae3c3923769ada23bcc41f811f9e574157a8f90b3cabbeb11d761d9",
           "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:49:13Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.006",
+          "amount_usdc": "0.006",
+          "tx": "0a77ee588460bc9174b564ca02449e40734a97861df9a93c1230d81ace2e75c0",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
         }
       ]
     },
@@ -278,9 +445,20 @@
       "category": "search",
       "price": "$0.010/request",
       "public_path": "/v1/services/parallel/search",
-      "charge_verified_at": "2026-04-11T00:00:00Z",
+      "charge_verified_at": "2026-10-24T20:49:28Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:49:28Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.01",
+          "amount_usdc": "0.01",
+          "tx": "d45e809cd79b750049e5d2d58d084a88afa6497c2e6c39396938ca3db5075d08",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
     },
     {
       "id": "perplexity_perplexity_chat",
@@ -288,9 +466,30 @@
       "category": "ai",
       "price": "Model-dependent (~$0.005–$0.02) (dynamic)",
       "public_path": "/v1/services/perplexity/perplexity_chat",
-      "charge_verified_at": "2026-08-01T16:26:16Z",
+      "charge_verified_at": "2026-10-24T20:51:53Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:49:43Z",
+          "result": "fail",
+          "http": 502,
+          "amount_usd": "0.009211",
+          "amount_usdc": "0.009211",
+          "tx": "ed79ba2844d9809943720f2ff0019133748f13d86f87d1158a30dcecd4ea3592",
+          "note": "Our probe body error (max_tokens 8 < merchant minimum 16); merchant rejected, router auto-refunded, refund tx 8c9ba6bbe8eb6336bdf2c28f49e53d81fd39a838b0b03ca1289597cd023765c7. Retried below with max_tokens 16."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:51:53Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.00922",
+          "amount_usdc": "0.00922",
+          "tx": "0c72c63ad585e87c9b4e3d38d5310fc6a5521342cefb7ec6f4ca140f203465c0",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
     },
     {
       "id": "storage_upload",
@@ -300,7 +499,28 @@
       "public_path": "/v1/services/storage/upload",
       "charge_verified_at": "2026-04-11T00:00:00Z",
       "session_verified_at": null,
-      "runs": []
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:45:58Z",
+          "result": "fail",
+          "http": 502,
+          "amount_usd": "0.0001",
+          "amount_usdc": "0.0001",
+          "tx": "39c9973756d245b331fca0e720ff351ee66b06e5ab0841d20e7a0a2cb6ebff2d",
+          "note": "Paid, then merchant returned an empty response (502), with both {} and a filename/content body. Router auto-refunded in full, refund tx 56903a53b1547842a80c196b22cce0d538cf583b2fb544185a7411d6638caac6."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:52:03Z",
+          "result": "fail",
+          "http": 502,
+          "amount_usd": "0.0001",
+          "amount_usdc": "0.0001",
+          "tx": "cd5d8d189ea9deaf20ffec56571ceff4971ecefc0d2481a56f43057801e21871",
+          "note": "Paid, then merchant returned an empty response (502), with both {} and a filename/content body. Router auto-refunded in full, refund tx b54c0409a668d9b9087bd51b4733e09e49f6b4c8f10a6655648e28dd93217ad6."
+        }
+      ]
     },
     {
       "id": "tavily_tavily_search",
@@ -308,7 +528,7 @@
       "category": "search",
       "price": "$0.09 (basic) / $0.16 (advanced) (dynamic)",
       "public_path": "/v1/services/tavily/tavily_search",
-      "charge_verified_at": "2026-08-10T07:56:49Z",
+      "charge_verified_at": "2026-10-24T20:49:58Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -316,6 +536,16 @@
           "utc": "2026-08-10T07:56:49Z",
           "tx": "38eaecde40d6430654212bf59b32eb0e1275a6b5f8e3d958be8a56ec71649952",
           "amount_usdc": "0.090"
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:49:58Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.09",
+          "amount_usdc": "0.09",
+          "tx": "fab5573cadcdc0d48a8eda9ad64e5f670ce298bf296de0c98b6d869c5019f125",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
         }
       ]
     },
@@ -325,7 +555,7 @@
       "category": "data",
       "price": "$0.055/request",
       "public_path": "/v1/services/wolframalpha/wolframalpha_short-answer",
-      "charge_verified_at": "2026-08-18T03:25:29Z",
+      "charge_verified_at": "2026-10-24T20:52:18Z",
       "session_verified_at": null,
       "runs": [
         {
@@ -335,6 +565,89 @@
           "amount_usd": "0.055",
           "tx": "cffd0d499221037352a7db87aaf22e2f7449a6c09058ad4c80853e4dadc33722",
           "note": "SCF #44 Tranche 2 verification round; 200 with a real response body."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:50:10Z",
+          "result": "fail",
+          "http": 402,
+          "amount_usd": "0",
+          "amount_usdc": "0",
+          "tx": null,
+          "note": "First attempt: router answered 402 verification-failed after signing; no payment settled (no tx). Immediate retry passed."
+        },
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:52:18Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.055",
+          "amount_usdc": "0.055",
+          "tx": "00be835a91fefeb7db9cb65a98e40c0f999d50f99fe55468888d7bfd96cf8af0",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with a real response body through the router (charge)."
+        }
+      ]
+    },
+    {
+      "id": "mercury_events_by_contract",
+      "name": "Mercury – Events by Contract",
+      "category": "data",
+      "price": "$0.001/request",
+      "public_path": "/v1/services/mercury/events/by-contract",
+      "charge_verified_at": "2026-10-24T20:54:08Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:54:08Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "ea9afd81f40bf5a0ad3de5a50d04bde13b0a3be57a751d34ff489021fefa6d9e",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with real Mercury data; x402 paid directly to the Mercury settlement address."
+        }
+      ]
+    },
+    {
+      "id": "mercury_txs_by_contract",
+      "name": "Mercury – Transactions by Contract",
+      "category": "data",
+      "price": "$0.001/request",
+      "public_path": "/v1/services/mercury/txs/by-contract",
+      "charge_verified_at": "2026-10-24T20:54:18Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:54:18Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "0bdaca8888365c681cdff28174b0f8db9d48fc0885904ecc12db08409b197df2",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with real Mercury data; x402 paid directly to the Mercury settlement address."
+        }
+      ]
+    },
+    {
+      "id": "mercury_txs_by_hash",
+      "name": "Mercury – Transaction by Hash",
+      "category": "data",
+      "price": "$0.001/request",
+      "public_path": "/v1/services/mercury/txs/by-hash",
+      "charge_verified_at": "2026-10-24T20:54:28Z",
+      "session_verified_at": null,
+      "runs": [
+        {
+          "date": "2026-10-25",
+          "utc": "2026-10-24T20:54:28Z",
+          "result": "pass",
+          "http": 200,
+          "amount_usd": "0.001",
+          "amount_usdc": "0.001",
+          "tx": "7f43de62ee3adfb49e1605b92b79eb068b3fe5126316fc9051a570a734ae8e98",
+          "note": "Weekly verification round 2026-10-25 (JST). 200 with real Mercury data; x402 paid directly to the Mercury settlement address."
         }
       ]
     }
