@@ -491,6 +491,9 @@ export function buildRoutesFromMppSnapshot(
           // session dispatch.
           route.upstreamPaymentMethod = overlayEntry.upstreamPaymentMethod
         }
+        if (overlayEntry.sessionChannelKey !== undefined) {
+          route.sessionChannelKey = overlayEntry.sessionChannelKey
+        }
         // Per-mode real-money verification flags + timestamps (operator-only).
         if (overlayEntry.chargeVerified !== undefined) {
           route.chargeVerified = overlayEntry.chargeVerified

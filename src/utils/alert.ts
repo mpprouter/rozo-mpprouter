@@ -111,6 +111,8 @@ const FOUNDER_FIRST_LINE: readonly RegExp[] = [
   /funder short by/i,
   // stellar-gas-balance: the sponsor needs an XLM top-up.
   /Stellar gas sponsor low balance/i,
+  // tempo-channel-watch: a router -> merchant session channel needs a top-up.
+  /Tempo session channel low deposit/i,
 ]
 
 export function alertAudience(content: string): AlertAudience {

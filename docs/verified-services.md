@@ -48,7 +48,6 @@ accepts the charge settlement.
 | `firecrawl_scrape` | `/v1/services/firecrawl/scrape` | $0.002 | muggledev | 2026-04-11 | URL scraping |
 | `parallel_search` | `/v1/services/parallel/search` | $0.010 | muggledev | 2026-04-10 | Web search. Original test service from day 1 |
 | `alchemy_rpc` | `/v1/services/alchemy/rpc` | $0.000 | muggledev | 2026-04-11 | JSON-RPC. mpp.dev catalog says session, but merchant actually accepts charge. Overlay overrides `upstreamPaymentMethod: 'tempo.charge'` |
-| `storage_upload` | `/v1/services/storage/upload` | $0.000 | muggledev | 2026-04-11 | Multipart upload initiation |
 
 ### Session Mode (verified working)
 
@@ -74,6 +73,7 @@ money on them.
 
 | Service ID | Public Path | Verified By | Verified Date | Failure Reason |
 |---|---|---|---|---|
+| `storage_upload` | `/v1/services/storage/upload` | router paid probe | 2026-10-24 | `POST /:key` (multipart init/complete) dropped from the mpp.dev catalog; two paid calls settled and got an empty merchant response (502, auto-refunded). `verifiedMode: false` since 2026-10-25 |
 | `dune_execute` | `/v1/services/dune/execute` | muggledev | 2026-04-11 | Channel underfunded — Dune charged $4 initial probe but channel deposit was only $1. Needs topup or higher initial deposit |
 | `modal_exec` | `/v1/services/modal/exec` | muggledev | 2026-04-11 | Merchant returns `tempo.charge` despite mpp.dev catalog listing session. Router charge fallback fires, but modal rejects empty `{}` body with 500. Need correct body shape |
 

@@ -165,7 +165,9 @@ describe('GET routes — build', () => {
     //
     // 448 → 446 on 2026-10-18: exa /findSimilar and /answer retired upstream
     // when exa moved to api.exa.ai (see the POST count note above).
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(446)
+    // 446 → 445 on 2026-10-25: storage_upload disabled (POST /:key dropped
+    // from the mpp.dev catalog; paid calls returned an empty response).
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(445)
     // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
     // events/by-ledger joined them at the beta launch (see the note above).
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
@@ -228,7 +230,9 @@ describe('GET routes — build', () => {
         r => r.verifiedMode === 'charge' || r.verifiedMode === 'session',
       ).map(r => r.service),
     )
-    expect(verifiedServices.size).toBe(21)
+    // 21 → 20 on 2026-10-25: storage's only verified route (storage_upload)
+    // was disabled after the upstream dropped POST /:key.
+    expect(verifiedServices.size).toBe(20)
     // The commitment itself, stated independently of the exact figure above,
     // so a future delisting that drops us under 20 fails loudly.
     expect(verifiedServices.size).toBeGreaterThanOrEqual(20)

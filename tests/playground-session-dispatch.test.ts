@@ -201,15 +201,19 @@ describe('seam selection', () => {
     expect(merchantUrl).toContain(route.upstreamHost)
   })
 
-  it('resolves anthropic chat_completions on the charge seam — relisted as the refund demo', async () => {
-    // Delisted 2026-08-18 (merchant charges then 403s, every call refunded).
-    // Relisted 2026-08-20 by founder decision as the LIVE REFUND DEMO route:
-    // the pay-then-403-then-auto-refund behaviour is intentional and is what
-    // payers use to exercise the refund path. It stays pinned to tempo.charge
-    // (production KV holds no channel for it) and must not move to the
-    // session seam.
+  it('resolves anthropic chat_completions on the session seam, through the anthropic_messages channel', async () => {
+    // 2026-10-25: the merchant now answers /v1/chat/completions with a
+    // session-only 402. The route pays through the anthropic_messages channel
+    // (same realm, recipient and token) via `sessionChannelKey`.
+    const env = makeEnv()
+    payMerchantSession.mockImplementation(paidSession)
     const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
-    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
+    expect(route.upstreamPaymentMethod).toBe('tempo.session')
+
+    await callUpstream(env, { route, body: { model: 'claude-haiku-4-5' }, budgetAtomic: ANY_BUDGET })
+
+    expect(payMerchantSession).toHaveBeenCalledTimes(1)
+    expect(payMerchantSession.mock.calls[0][1]).toBe('anthropic_messages')
   })
 
   it('routes the openai chat route through the session seam too', async () => {
@@ -556,13 +560,12 @@ describe('model catalog after the 2026-08-18 anthropic delisting', () => {
     }
   })
 
-  it('keeps the relisted anthropic chat_completions pinned to tempo.charge', () => {
-    // Delisted 2026-08-18 (charges then 403s), relisted 2026-08-20 as the
-    // refund demo (founder decision — see OPERATOR_OVERLAY). The gate must let
-    // it through again, and it must stay on the charge seam: production KV
-    // holds no channel for it, so the session seam would fail differently.
+  it('keeps the relisted anthropic chat_completions on the session seam', () => {
+    // Was pinned to tempo.charge until 2026-10-25, when the merchant went
+    // session-only; it now shares the anthropic_messages channel.
     const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
-    expect(route.upstreamPaymentMethod).toBe('tempo.charge')
+    expect(route.upstreamPaymentMethod).toBe('tempo.session')
+    expect(route.sessionChannelKey).toBe('anthropic_messages')
   })
 
   it('carries no unverified Claude model ids', () => {

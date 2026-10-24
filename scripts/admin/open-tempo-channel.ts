@@ -42,6 +42,7 @@ import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
 
 import { tempo } from 'mppx/client'
+import { Session } from 'mppx/tempo'
 import { createClient, http } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { tempo as tempoChain } from 'viem/chains'
@@ -465,11 +466,24 @@ async function main() {
     )
     try {
       await sm.topUp(topUpRaw)
-      console.log(`  ✅ Top-up broadcast; on-chain deposit now covers cumulative + headroom`)
+      console.log(`  ✅ Top-up broadcast`)
     } catch (err: any) {
-      console.error(`  ⚠️ topUp failed: ${err.message} — voucher headroom may be insufficient`)
+      // 2026-10-25: this used to log and carry on, then write the INTENDED
+      // deposit to KV. anthropic_messages and openai_chat sat for months with
+      // KV saying 1.001 / 2.001 USDC while the chain held 0.001, and failed
+      // with "amount-exceeds-deposit" as soon as the merchant went
+      // session-only. Fall through to the on-chain read-back below, which
+      // records the real deposit and exits non-zero.
+      console.error(`  ❌ topUp failed: ${err.message}`)
     }
   }
+
+  // Read the deposit back from chain. KV must record what the escrow holds,
+  // never what we asked for.
+  const onChain = await Session.Precompile.Chain.getChannelState(client as any, sm.channelId as `0x${string}`)
+  const onChainDepositRaw = BigInt(onChain.deposit)
+  console.log(`  On-chain deposit:  ${onChainDepositRaw} base units (settled ${onChain.settled})`)
+  const depositShort = onChainDepositRaw < requiredDepositRaw
 
   // Extract what we need from the SessionManager state + the
   // probe challenge. SessionManager doesn't expose escrowContract
@@ -499,13 +513,10 @@ async function main() {
     // already authorized on this channel (0 for a truly fresh channel, or
     // the prior watermark when resuming an existing on-chain channel).
     cumulativeRaw: capturedStored?.cumulativeAmount ?? sm.cumulative.toString(),
-    // Deposit reflects the on-chain channel deposit AFTER the top-up above:
-    // cumulative + the requested `--deposit` headroom. We must NOT use the
-    // manager's sessionStore.set() echo (it can report a stale figure equal
-    // to the current cumulative, leaving ZERO voucher headroom → every
-    // voucher fails "amount exceeds deposit"). `requiredDepositRaw` is what
-    // the channel now holds on-chain after topUp().
-    depositRaw: requiredDepositRaw.toString(),
+    // Deposit is read back from the escrow precompile after the top-up
+    // attempt. Neither the requested figure nor the manager's
+    // sessionStore.set() echo is trustworthy here (see the topUp catch).
+    depositRaw: onChainDepositRaw.toString(),
     openedAt: new Date().toISOString(),
     // TIP-1034 descriptor captured via sessionStore.set() — required by
     // the Worker's TIP-1034 session method to produce manual vouchers.
@@ -537,6 +548,14 @@ async function main() {
   console.log('')
   kvPut(kvKey, kvValue)
   console.log(`✅ KV write complete.\n`)
+
+  if (depositShort) {
+    console.error(
+      `❌ On-chain deposit ${onChainDepositRaw} is below the required ${requiredDepositRaw}. ` +
+        `KV records the real figure. Top it up with scripts/admin/topup-tempo-channel.ts.`,
+    )
+    process.exit(1)
+  }
 
   console.log('Next step: run `npx tsx scripts/admin/inspect-channels.ts` to verify the new channel is visible.')
 }
