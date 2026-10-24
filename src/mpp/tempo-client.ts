@@ -115,6 +115,53 @@ function assertWithinBudget(
   }
 }
 
+/**
+ * Raised from the session `onChallenge` hook, BEFORE a voucher is signed, when
+ * the new cumulative would exceed the channel's recorded deposit.
+ *
+ * Why (2026-10-25): `tempoChannel:dune_execute` holds deposit 1 USDC on chain
+ * (settled 0) but KV cumulative 4 USDC. The router signed a 4 USDC voucher on a
+ * 1 USDC channel; the merchant can never redeem past the deposit, so it
+ * rejected the call, yet `onChannelUpdate` had already advanced the KV
+ * watermark. Every later call would sign an even larger unredeemable voucher.
+ * Refusing here costs nothing: no credential exists yet.
+ *
+ * `depositRaw` is kept equal to the on-chain deposit by open-tempo-channel.ts
+ * and topup-tempo-channel.ts. A KV entry without a valid `depositRaw` is not
+ * checked (unknown is not "exhausted").
+ */
+export class ChannelDepositExhaustedError extends Error {
+  constructor(
+    public readonly merchantId: string,
+    public readonly newCumulativeRaw: string,
+    public readonly depositRaw: string,
+  ) {
+    super(
+      `Tempo session channel for "${merchantId}" would reach cumulative ${newCumulativeRaw} ` +
+        `but its deposit is ${depositRaw} (base units). Refusing to sign a voucher; ` +
+        `top up with scripts/admin/topup-tempo-channel.ts.`,
+    )
+    this.name = 'ChannelDepositExhaustedError'
+  }
+}
+
+/**
+ * Cumulative after paying `deltaRaw` on `channel`, or throw
+ * ChannelDepositExhaustedError if it would exceed the recorded deposit.
+ */
+export function nextSessionCumulative(
+  merchantId: string,
+  channel: Pick<TempoChannelState, 'cumulativeRaw' | 'depositRaw'>,
+  deltaRaw: string,
+): string {
+  const next = addRaw(channel.cumulativeRaw, deltaRaw)
+  const deposit = channel.depositRaw
+  if (typeof deposit === 'string' && /^\d+$/.test(deposit) && BigInt(next) > BigInt(deposit)) {
+    throw new ChannelDepositExhaustedError(merchantId, next, deposit)
+  }
+  return next
+}
+
 export class ChannelNotInstalledError extends Error {
   constructor(public readonly merchantId: string) {
     super(
@@ -565,7 +612,8 @@ export async function payMerchantSession(
       }
       // Compute the new cumulative FIRST — if addRaw throws (malformed
       // stored/delta amount) nothing was signed and `paid` must stay false.
-      const newCumulativeRaw = addRaw(channel.cumulativeRaw, delta)
+      // Refuse (unsigned) if this voucher would exceed the deposit.
+      const newCumulativeRaw = nextSessionCumulative(merchantId, channel, delta)
       // Manual-mode context: tell mppx "sign a voucher action on
       // channel X at the new cumulative".
       //

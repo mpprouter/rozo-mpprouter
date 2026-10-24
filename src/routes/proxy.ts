@@ -597,6 +597,8 @@ const ROUTER_SIDE_ERROR_NAMES = new Set([
   'ChannelNotInstalledError',
   // src/mpp/tempo-client.ts — our own configured budget ceiling rejected it.
   'BudgetExceededError',
+  // src/mpp/tempo-client.ts — our session channel's deposit is used up.
+  'ChannelDepositExhaustedError',
 ])
 
 /**
@@ -1028,7 +1030,7 @@ async function payMerchantAndGetBodyInner(
       })
     }
   } catch (err: any) {
-    if (err instanceof ChannelNotInstalledError) {
+    if (err instanceof ChannelNotInstalledError || err?.name === 'ChannelDepositExhaustedError') {
       console.error(`[proxy] ${err.message}`)
       return {
         kind: 'error',
@@ -1036,9 +1038,13 @@ async function payMerchantAndGetBodyInner(
         routerSideFailure: true,
         response: new Response(
           JSON.stringify({
-            error: 'Router session channel not installed',
+            error: err instanceof ChannelNotInstalledError
+              ? 'Router session channel not installed'
+              : 'Router session channel deposit exhausted',
             detail: err.message,
-            hint: 'Operator must run scripts/open-channel.ts before this merchant accepts session traffic.',
+            hint: err instanceof ChannelNotInstalledError
+              ? 'Operator must run scripts/open-channel.ts before this merchant accepts session traffic.'
+              : 'Operator must top up the channel (scripts/admin/topup-tempo-channel.ts).',
           }),
           {
             status: 503,
