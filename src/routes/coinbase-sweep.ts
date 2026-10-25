@@ -27,8 +27,12 @@ import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 import { openStuckOrderTicket, ticketsConfigured } from '../utils/intercom-ticket'
 import { casUpdate } from './stripe-atomic'
+import { readCoinbaseExecGate } from './coinbase-exec-gate'
+import { funderTransferExists } from '../utils/funder-transfer'
+import { decimalToAtomic } from './invoice-provider'
 import {
   type FulfillmentRecord,
+  FUNDER_WALLET,
   fetchCoinbasePayment,
   fetchRozoPaymentById,
   deliveredReportEnabled,
@@ -298,7 +302,11 @@ async function checkStuck(env: Env, plId: string, rec: FulfillmentRecord, now: n
   const raw = await fetchCoinbasePayment(plId)
   if (!raw) return
   const safe = pickCoinbaseCallerSafe(raw)
-  if (safe?.settled || coinbaseFailedOrExpired(safe, now)) return
+  if (safe?.settled) {
+    await adoptLostSettlement(env, plId, rec, safe, now)
+    return
+  }
+  if (coinbaseFailedOrExpired(safe, now)) return
   const nowIso = new Date(now).toISOString()
   const payoutAt = ms(rozo.destination?.confirmedAt ?? null)
   if (!rec.stuckSince) rec.stuckSince = nowIso
@@ -327,6 +335,56 @@ async function checkStuck(env: Env, plId: string, rec: FulfillmentRecord, now: n
     `${rec.status}; Rozo ${rozo.status}; Coinbase ${safe?.status ?? 'unknown'}`,
     'Rozo payout completed but the Coinbase invoice is unpaid (payout webhook likely never delivered). Resend the payout webhook or pay by hand.',
   )
+}
+
+// A webhook took the exec gate and sent pay-invoice, Coinbase captured, but
+// that handler's record writes were lost (KV is not atomic; seen 2026-10-25 on
+// 0fa8021b: record stayed payin_seen, so delivery was never reported and Rozo
+// escalated a false "funds uncredited" page). Adopt it as paid and report
+// delivery only with proof that THIS order's pay request settled it:
+//   - the gate holder recorded this record's Rozo order (gates written before
+//     the order id was stored, and coupon gates, never qualify),
+//   - no sibling order settled the link and no duplicates are recorded,
+//   - the funder wallet sent a Base USDC transfer of exactly the Coinbase
+//     charge within GATE_TRANSFER_WINDOW_MS after the gate (a held gate alone
+//     is not proof: it is also held after a failed request, and the user may
+//     have paid Coinbase directly). The window is short because the pay
+//     request follows the gate within seconds (0fa8021b: 8 s) and same-amount
+//     invoices recur (another 10.50 went out 13 minutes earlier that day).
+// Never pays. Unknown on-chain answer → no change, retried next tick.
+const GATE_TRANSFER_WINDOW_MS = 5 * MIN
+
+async function adoptLostSettlement(env: Env, plId: string, rec: FulfillmentRecord, safe: any, now: number): Promise<void> {
+  if (!rec.rozoPaymentId) return
+  const gate = await readCoinbaseExecGate(env, plId)
+  if (!gate || gate.holder.startsWith('coupon:') || gate.rozoPaymentId !== rec.rozoPaymentId) return
+  if (rec.settlingRozoPaymentId && rec.settlingRozoPaymentId !== rec.rozoPaymentId) return
+  if ((rec.duplicateRozoPaymentIds ?? []).length > 0) return
+  const gateMs = ms(gate.at)
+  if (gateMs === null) return
+  // The Coinbase charge (v3 `amount`, v1 `maxAmount`), not the Rozo order
+  // total in invoiceAmountAtomic, which includes our fees (0fa8021b: order
+  // 10.61, funder paid Coinbase 10.50).
+  let amount: bigint
+  try {
+    amount = decimalToAtomic(String(safe.maxAmount ?? ''), 6, 'coinbase charge')
+  } catch {
+    return
+  }
+  if (amount <= 0n) return
+  const paid = await funderTransferExists(FUNDER_WALLET, amount, gateMs, GATE_TRANSFER_WINDOW_MS, env.BASE_RPC_URL)
+  if (paid !== true) return
+  const nowIso = new Date(now).toISOString()
+  const from = rec.status
+  rec.status = 'paid'
+  rec.paidAt = rec.paidAt ?? nowIso
+  rec.events.push({
+    kind: 'sweep_coinbase_settled',
+    at: nowIso,
+    detail: { from, coinbase_status: safe.status, gate_holder: gate.holder, funder_transfer_seen: true },
+  })
+  const saved = await saveRecordGuarded(env, plId, rec)
+  if (saved.status === 'paid') await reportDelivered(env, plId, saved, now)
 }
 
 async function reportDelivered(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {

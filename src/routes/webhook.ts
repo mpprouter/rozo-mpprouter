@@ -917,7 +917,7 @@ export async function settleCoinbaseEvent(
   // the same channel/ref, so a resent or racing payout event would pass it.
   // Held → someone already sent (or is sending) pay-invoice for this link:
   // record it and do NOT pay.
-  const gate = await acquireCoinbaseExecGate(env, plId, eventId)
+  const gate = await acquireCoinbaseExecGate(env, plId, eventId, new Date(), rozoPaymentId ?? undefined)
   if (!gate.ok) {
     rec.events.push({
       kind: 'exec_gate_held',
