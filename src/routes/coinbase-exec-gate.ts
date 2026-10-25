@@ -28,6 +28,10 @@ export interface ExecGateHolder {
   // Webhook event id, or `coupon:<code>` for the coupon redemption path.
   holder: string
   at: string
+  // Rozo order whose event took the gate (absent on gates written before
+  // 2026-10-26 and on coupon gates). The sweep only adopts a lost settlement
+  // for the order that held the gate.
+  rozoPaymentId?: string
 }
 
 export type ExecGateResult = { ok: true; gate: ExecGateHolder } | { ok: false; holder: ExecGateHolder }
@@ -53,11 +57,12 @@ export async function acquireCoinbaseExecGate(
   plId: string,
   holder: string,
   now: Date = new Date(),
+  rozoPaymentId?: string,
 ): Promise<ExecGateResult> {
   return casUpdate<ExecGateResult>(env, coinbaseExecGateKey(plId), (raw) => {
     const existing = parseGate(raw)
     if (existing) return { op: 'noop', result: { ok: false, holder: existing } }
-    const gate: ExecGateHolder = { holder, at: now.toISOString() }
+    const gate: ExecGateHolder = { holder, at: now.toISOString(), ...(rozoPaymentId ? { rozoPaymentId } : {}) }
     return { op: 'set', value: JSON.stringify(gate), result: { ok: true, gate } }
   })
 }

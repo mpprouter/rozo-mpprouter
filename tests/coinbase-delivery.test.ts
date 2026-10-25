@@ -124,6 +124,8 @@ interface Upstream {
   deliveredStatus: number
   // Intercom POST /tickets: HTTP status, or 'throw' for a network error.
   intercom: number | 'throw'
+  // eth_getLogs answer for funder USDC transfers (amounts, atomic), or 'fail'.
+  funderTransfers: bigint[] | 'fail'
 }
 
 function stubFetch(cfg: Partial<Upstream> = {}) {
@@ -135,9 +137,10 @@ function stubFetch(cfg: Partial<Upstream> = {}) {
     rozo: null,
     deliveredStatus: 200,
     intercom: 200,
+    funderTransfers: [],
     ...cfg,
   }
-  const calls = { pay: 0, coinbase: 0, rozoGet: 0, delivered: [] as Array<{ url: string; body: any; key: string | null }>, dingtalk: [] as string[], intercom: [] as Array<{ body: any; auth: string | null; version: string | null }> }
+  const calls = { getLogs: 0, pay: 0, coinbase: 0, rozoGet: 0, delivered: [] as Array<{ url: string; body: any; key: string | null }>, dingtalk: [] as string[], intercom: [] as Array<{ body: any; auth: string | null; version: string | null }> }
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -172,6 +175,15 @@ function stubFetch(cfg: Partial<Upstream> = {}) {
         calls.rozoGet++
         if (!up.rozo) return new Response('nf', { status: 404 })
         return Response.json(up.rozo)
+      }
+      const rpcBody = init?.body ? JSON.parse(String(init.body)) : {}
+      if (rpcBody.method === 'eth_getBlockByNumber') {
+        return Response.json({ jsonrpc: '2.0', id: 1, result: { number: '0x2000000', timestamp: '0x' + Math.floor(Date.now() / 1000).toString(16) } })
+      }
+      if (rpcBody.method === 'eth_getLogs') {
+        calls.getLogs++
+        if (up.funderTransfers === 'fail') return new Response('down', { status: 500 })
+        return Response.json({ jsonrpc: '2.0', id: 1, result: up.funderTransfers.map((a) => ({ data: '0x' + a.toString(16).padStart(64, '0'), blockNumber: '0x2000000' })) })
       }
       return Response.json({ jsonrpc: '2.0', id: 1, result: '0x' + up.balanceAtomic.toString(16) })
     }),
@@ -450,6 +462,56 @@ describe('sweepCoinbaseFulfillments', () => {
     expect(calls.dingtalk).toHaveLength(1)
     expect(calls.pay).toBe(0)
   })
+
+  const settledLink = { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1, maxAmount: '1.00' }
+  const payoutDone = { id: ROZO_ID, status: 'payment_payout_completed', destination: { confirmedAt: ago(15) } }
+
+  it('payin_seen + gate held by this order + funder transfer on-chain + Coinbase settled → paid, delivery reported, no alert, no pay', async () => {
+    const { calls } = stubFetch({ coinbase: settledLink, rozo: payoutDone, funderTransfers: [500n, 1_000_000n] })
+    const { env, kv } = makeEnv()
+    await acquireCoinbaseExecGate(env, PL, 'evt-lost-write', new Date(Date.now() - 2 * MIN), ROZO_ID)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    const rec = readRec(kv)
+    expect(rec.status).toBe('paid')
+    expect(rec.deliveredReported).toBe(true)
+    expect(calls.delivered).toHaveLength(1)
+    expect(calls.pay).toBe(0)
+    expect(calls.dingtalk).toHaveLength(0)
+  })
+
+  it('webhook stores the Rozo order id on the exec gate', async () => {
+    stubFetch()
+    const { env } = makeEnv()
+    await handleRozoWebhook(await signedWebhookRequest(payoutEvent()), env)
+    expect((await readCoinbaseExecGate(env, PL))?.rozoPaymentId).toBe(ROZO_ID)
+  })
+
+  for (const [name, gate, extra, transfers] of [
+    ['no exec gate (someone else paid)', null, {}, [1_000_000n]],
+    ['coupon holds the gate', { holder: 'coupon:ABC', order: ROZO_ID }, {}, [1_000_000n]],
+    ['gate has no order id (pre-fix gate)', { holder: 'evt-x', order: undefined }, {}, [1_000_000n]],
+    ['gate held by a sibling order (lost sibling write)', { holder: 'evt-x', order: 'sibling-order' }, {}, [1_000_000n]],
+    ['another Rozo order settled the link', { holder: 'evt-x', order: ROZO_ID }, { settlingRozoPaymentId: 'other-order' }, [1_000_000n]],
+    ['duplicate orders recorded', { holder: 'evt-x', order: ROZO_ID }, { duplicateRozoPaymentIds: ['dup-order'] }, [1_000_000n]],
+    ['no funder transfer on-chain (user paid Coinbase directly / request failed)', { holder: 'evt-x', order: ROZO_ID }, {}, []],
+    ['funder transfer of a different amount only', { holder: 'evt-x', order: ROZO_ID }, {}, [999_999n]],
+    ['funder transfer older than the window (gate 20 min before it)', { holder: 'evt-x', order: ROZO_ID, at: 20 }, {}, [1_000_000n]],
+    ['two same-amount funder transfers in the window (ambiguous)', { holder: 'evt-x', order: ROZO_ID }, {}, [1_000_000n, 1_000_000n]],
+    ['on-chain read fails (unknown)', { holder: 'evt-x', order: ROZO_ID }, {}, 'fail'],
+  ] as const) {
+    it(`payin_seen + Coinbase settled but ${name} → left alone`, async () => {
+      const { calls } = stubFetch({ coinbase: settledLink, rozo: payoutDone, funderTransfers: transfers as any })
+      const { env, kv } = makeEnv()
+      if (gate) await acquireCoinbaseExecGate(env, PL, gate.holder, new Date(Date.now() - ((gate as any).at ?? 2) * MIN), gate.order)
+      seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }], ...extra })
+      await sweepCoinbaseFulfillments(env)
+      expect(readRec(kv).status).toBe('payin_seen')
+      expect(calls.delivered).toHaveLength(0)
+      expect(calls.pay).toBe(0)
+      expect(calls.dingtalk).toHaveLength(0)
+    })
+  }
 
   it('delivery is marked reported only on HTTP 200; alerts once after 5 failures', async () => {
     const { up, calls } = stubFetch({
