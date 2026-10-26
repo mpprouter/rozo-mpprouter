@@ -153,6 +153,10 @@ export interface StripeFulfillmentRecord {
   // Last "payout not done yet" 409 from Rozo; the sweep waits before re-asking.
   deliveredPendingAt?: string | null
   alertedDeliveredGiveUp?: boolean
+  // Automatic re-drives of a `provider_submitted_ambiguous` record (see
+  // retryAmbiguousStripeRecord). Bounded by AMBIGUOUS_MAX_AUTO_RETRIES; an
+  // admin retry also counts here so the audit trail is one number.
+  ambiguousRetries?: number
   webhookEventIds: string[]
   events: Array<{ kind: string; at: string; event_id?: string; detail?: unknown }>
 }
@@ -801,7 +805,14 @@ export async function handleStripeWebhookEvent(
   if (payResult.ambiguous) {
     await finalizeClaim(env, invoiceKey, orderId, nowIso, 'provider_submitted_ambiguous', {
       failureReason: `pay-invoice ambiguous (status ${payResult.status}) — needs reconciliation`,
-      event: { kind: 'stripe_confirm_ambiguous', detail: { status: payResult.status } },
+      event: {
+        kind: 'stripe_confirm_ambiguous',
+        // `signed: false` is pay-invoice's explicit statement that it failed
+        // BEFORE producing a Permit (pre-sign step: Stripe read, RPC read,
+        // wallet registration). The retry sweep may then re-drive without the
+        // grace period; absent/unknown keeps the conservative path.
+        detail: { status: payResult.status, signed: payResultSignedFlag(payResult) },
+      },
     })
     return {
       ok: true,
@@ -849,6 +860,14 @@ export async function handleStripeWebhookEvent(
   })
   return { ok: true, provider: 'stripe_crypto', status: 'failed_provider' }
   }
+}
+
+// pay-invoice's `signed` flag on an error body: false = it failed before a
+// Permit was produced (nothing could have moved), true = a Permit was handed
+// to Stripe's relayer, null = the response did not say.
+function payResultSignedFlag(result: StripePayInvoiceResult): boolean | null {
+  const body = result.body as Record<string, unknown> | null
+  return body && typeof body === 'object' && typeof body.signed === 'boolean' ? body.signed : null
 }
 
 // Whitelist projection of a pay-invoice result for storage in the record. NEVER
@@ -1075,6 +1094,173 @@ export async function reconcileStripeRecordWithProvider(
   return { checked: true, providerState, transition }
 }
 
+// ── Ambiguous auto-retry (2026-10-26, cpis_1UUso…) ──────────────────────────
+//
+// `provider_submitted_ambiguous` used to be a dead end: the record held the
+// invoice forever ("never re-fire") and the only way out was a human. On
+// 2026-10-26 a 5xx from pay-invoice (its pre-sign step failed: public Base RPC /
+// Stripe read) parked a $5.80 order for good while Stripe still showed the
+// session untouched in `checkout`; the founder paid by hand. Founder decision
+// the same day: the router may retry on its own when it can prove nothing was
+// signed. Proof = Stripe's own live state is still pre-purchase (`initialized`
+// / `checkout`) with no blockchain tx; a submitted Permit moves the session
+// out of those states. Bounded: a grace period after the ambiguous answer
+// (skipped only when pay-invoice itself said `signed:false`) and a cap on
+// automatic attempts; beyond the cap the record waits for a human exactly as
+// before. The retry goes through the unchanged settlement path (same claim
+// holder, same balance / cap / pause checks), nothing is bypassed.
+
+export const AMBIGUOUS_RETRY_GRACE_MS = 3 * 60 * 1000
+export const AMBIGUOUS_MAX_AUTO_RETRIES = 2
+export const AMBIGUOUS_RETRY_SAFE_STATES = new Set(['initialized', 'checkout'])
+const AMBIGUOUS_EVENT_KINDS = new Set(['stripe_confirm_ambiguous', 'stripe_settlement_threw'])
+
+export type AmbiguousRetryOutcome =
+  | {
+      retried: false
+      reason:
+        | 'no_record'
+        | 'not_ambiguous'
+        | 'no_capability'
+        | 'provider_check_failed'
+        | 'live_state_unsafe'
+        | 'grace'
+        | 'retries_exhausted'
+        | 'lost_race'
+      liveState?: string
+    }
+  | { retried: true; attempt: number; liveState: string; summary: Record<string, unknown> }
+
+function lastAmbiguousEvent(rec: StripeFulfillmentRecord): { at: string; signed: boolean | null } | null {
+  for (let i = rec.events.length - 1; i >= 0; i--) {
+    const e = rec.events[i]
+    if (!AMBIGUOUS_EVENT_KINDS.has(e.kind)) continue
+    const d = e.detail as Record<string, unknown> | undefined
+    return { at: e.at, signed: d && typeof d.signed === 'boolean' ? d.signed : null }
+  }
+  return null
+}
+
+function lastReconcileCheck(rec: StripeFulfillmentRecord): { at: string; state: string; blockchainTxId: string | null } | null {
+  for (let i = rec.events.length - 1; i >= 0; i--) {
+    const e = rec.events[i]
+    if (e.kind !== 'stripe_reconcile_checked') continue
+    const d = e.detail as Record<string, unknown> | undefined
+    if (!d || typeof d.state !== 'string') return null
+    return { at: e.at, state: d.state, blockchainTxId: typeof d.blockchainTxId === 'string' ? d.blockchainTxId : null }
+  }
+  return null
+}
+
+/**
+ * Re-drive one `provider_submitted_ambiguous` record when Stripe proves the
+ * previous attempt never reached a purchase. `source: 'cron'` applies the
+ * grace period and the automatic cap; `source: 'admin'` (the retry endpoint)
+ * skips both but still requires the live-state proof, and is recorded with
+ * who/why. Never fires for any other status.
+ */
+export async function retryAmbiguousStripeRecord(
+  env: Env,
+  invoiceKey: string,
+  now: Date,
+  opts: { source: 'cron' | 'admin'; evidence?: string; retriedBy?: string },
+): Promise<AmbiguousRetryOutcome> {
+  const rec = await loadStripeRecord(env, invoiceKey)
+  if (!rec) return { retried: false, reason: 'no_record' }
+  if (rec.status !== 'provider_submitted_ambiguous') return { retried: false, reason: 'not_ambiguous' }
+  if (!rec.stripeUrlEncrypted) return { retried: false, reason: 'no_capability' }
+
+  // Live proof. The cron reuses the read the reconciler just made in this
+  // sweep: the SUCCESSFUL check event must be the reconciler's latest stamp
+  // (a failed lookup stamps lastProviderCheckAt without a checked event, so an
+  // older `checkout` can never pass as current). Anything older, or an admin
+  // call, reads Stripe again.
+  const checked = lastReconcileCheck(rec)
+  const stamp = rec.lastProviderCheckAt ? Date.parse(rec.lastProviderCheckAt) : NaN
+  const fresh =
+    !!checked &&
+    Number.isFinite(stamp) &&
+    Date.parse(checked.at) >= stamp &&
+    now.getTime() - Date.parse(checked.at) <= RECONCILE_MIN_INTERVAL_MS
+  let live: { state: string; blockchainTxId: string | null }
+  if (opts.source === 'cron' && fresh) {
+    live = { state: checked!.state, blockchainTxId: checked!.blockchainTxId }
+  } else {
+    try {
+      const stripeUrl = await decryptCapability(rec.stripeUrlEncrypted, env)
+      const inv = await resolveStripeInvoice(stripeUrl)
+      live = { state: inv.state, blockchainTxId: inv.transaction?.blockchainTxId ?? null }
+    } catch {
+      return { retried: false, reason: 'provider_check_failed' }
+    }
+  }
+  if (!AMBIGUOUS_RETRY_SAFE_STATES.has(live.state) || live.blockchainTxId) {
+    return { retried: false, reason: 'live_state_unsafe', liveState: live.state }
+  }
+
+  const attempts = rec.ambiguousRetries ?? 0
+  const last = lastAmbiguousEvent(rec)
+  if (opts.source === 'cron') {
+    if (attempts >= AMBIGUOUS_MAX_AUTO_RETRIES) return { retried: false, reason: 'retries_exhausted', liveState: live.state }
+    const grace = last?.signed === false ? 0 : AMBIGUOUS_RETRY_GRACE_MS
+    const since = last ? now.getTime() - (Date.parse(last.at) || 0) : Number.POSITIVE_INFINITY
+    if (since < grace) return { retried: false, reason: 'grace', liveState: live.state }
+  }
+
+  const nowIso = now.toISOString()
+  const attempt = attempts + 1
+  // The CAS is bound to the attempt we inspected: same generation and the
+  // same ambiguous answer. A concurrent retry that already re-fired (and went
+  // ambiguous again) changes both, so a caller holding older proof is refused
+  // instead of reopening settlement on stale evidence.
+  const stepped = await updateStripeRecord<boolean>(env, invoiceKey, rec.orderId, (r) => {
+    if (r.status !== 'provider_submitted_ambiguous') return { noop: false }
+    if ((r.ambiguousRetries ?? 0) !== attempts) return { noop: false }
+    const cur = lastAmbiguousEvent(r)
+    if ((cur?.at ?? null) !== (last?.at ?? null)) return { noop: false }
+    r.status = 'payout_seen'
+    r.failureReason = null
+    r.ambiguousRetries = attempt
+    r.events.push({
+      kind: 'stripe_ambiguous_retry',
+      at: nowIso,
+      detail: {
+        source: opts.source,
+        attempt,
+        liveState: live!.state,
+        ...(opts.retriedBy ? { retriedBy: opts.retriedBy } : {}),
+        ...(opts.evidence ? { evidence: opts.evidence } : {}),
+      },
+    })
+    return { rec: r, result: true }
+  })
+  if (!stepped) return { retried: false, reason: 'lost_race', liveState: live.state }
+
+  // The ambiguous attempt kept its daily-cap reservation (conservatively,
+  // "may have signed"). Stripe just proved it did not, so hand that headroom
+  // back before the settlement path reserves again for this attempt.
+  if (last && rec.invoiceAmountAtomic) {
+    try {
+      await releaseDailySpend(env, new Date(Date.parse(last.at) || now.getTime()), BigInt(rec.invoiceAmountAtomic))
+    } catch {
+      // Best effort: over-counting the cap only makes the router more cautious.
+    }
+  }
+
+  const summary = await handleStripeWebhookEvent(
+    env,
+    {
+      eventId: `ambiguous-retry:${invoiceKey}:${attempt}`,
+      eventType: 'payment_payout_completed',
+      orderId: rec.orderId,
+      rozoPaymentId: rec.rozoPaymentId,
+      invoiceAmountStr: null,
+    },
+    now,
+  )
+  return { retried: true, attempt, liveState: live.state, summary }
+}
+
 /**
  * Cron sweep: reconcile every in-flight Stripe record against the provider.
  * Runs on the 2-minute schedule so a settlement whose webhook request died
@@ -1111,6 +1297,13 @@ export async function sweepInFlightStripeRecords(
       if (r.checked) out.checked++
       if (r.checked && r.transition === 'paid') justPaid.add(rec.invoiceKey)
       if (r.checked && r.transition) out.transitions.push(`${maskInvoiceKey(rec.invoiceKey)}:${r.transition}`)
+      // An ambiguous record that Stripe still shows as untouched is re-driven
+      // (bounded, after a grace period). The live state comes from the check
+      // the reconciler just recorded, so Stripe is read once per sweep.
+      if (r.checked && 'providerState' in r && !r.transition && rec.status === 'provider_submitted_ambiguous') {
+        const retry = await retryAmbiguousStripeRecord(env, rec.invoiceKey, now, { source: 'cron' })
+        if (retry.retried) out.transitions.push(`${maskInvoiceKey(rec.invoiceKey)}:retry#${retry.attempt}`)
+      }
     } catch {
       // next record
     }
