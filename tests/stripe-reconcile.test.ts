@@ -909,6 +909,67 @@ describe('ambiguous auto-retry', () => {
     expect(await readDailySpentAtomic(env, new Date(t0))).toBe(1360000n)
   })
 
+  it('codex P1: a failed live lookup never lets an older checkout read authorize a retry', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    // An earlier successful check saw `checkout`…
+    await parkAmbiguous(env, new Date(t0 - 10 * AMBIGUOUS_RETRY_GRACE_MS), {
+      events: [
+        { kind: 'stripe_confirm_ambiguous', at: new Date(t0 - 10 * AMBIGUOUS_RETRY_GRACE_MS).toISOString(), detail: { status: 502 } },
+        { kind: 'stripe_reconcile_checked', at: new Date(t0 - 2 * RECONCILE_MIN_INTERVAL_MS).toISOString(), detail: { state: 'checkout', blockchainTxId: null } },
+      ],
+      lastProviderCheckAt: new Date(t0 - 2 * RECONCILE_MIN_INTERVAL_MS).toISOString(),
+    })
+    // … but now Stripe is unreachable.
+    let payInvoice = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('pay-invoice')) {
+        payInvoice++
+        return Response.json({ success: true })
+      }
+      if (u.includes('resume_payin_session')) return new Response('boom', { status: 500 })
+      return new Response('unexpected', { status: 500 })
+    })
+    await sweepInFlightStripeRecords(env, new Date(t0))
+    expect(payInvoice).toBe(0)
+    const rec = await loadRec(env)
+    expect(rec.status).toBe('provider_submitted_ambiguous')
+    expect(await retryAmbiguousStripeRecord(env, KEY, new Date(t0 + 1000), { source: 'cron' })).toMatchObject({ retried: false, reason: 'provider_check_failed' })
+  })
+
+  it('codex P1: a caller holding proof from an older attempt is refused at the CAS', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    await parkAmbiguous(env, new Date(t0 - 10 * AMBIGUOUS_RETRY_GRACE_MS))
+    // Between this caller's inspection and its CAS, another retry already
+    // re-fired and went ambiguous again (generation 1, newer ambiguous event).
+    let armed = false
+    const ns: any = env.ATOMIC_STORE
+    const stub = ns.get(null)
+    const realFetch = stub.fetch.bind(stub)
+    stub.fetch = async (req: Request) => {
+      const body = await req.clone().json()
+      if (!armed && body.key === stripeKvKey(KEY) && new URL(req.url).pathname === '/commit') {
+        armed = true
+        await forceStatus(env, 'provider_submitted_ambiguous', {
+          ambiguousRetries: 1,
+          events: [{ kind: 'stripe_confirm_ambiguous', at: new Date(t0 - 1000).toISOString(), detail: { status: 503 } }],
+        })
+      }
+      return realFetch(req)
+    }
+    const calls = mockPath('checkout')
+    const out = await retryAmbiguousStripeRecord(env, KEY, new Date(t0), { source: 'admin', evidence: 'operator verified session untouched', retriedBy: 'ops' })
+    expect(out).toMatchObject({ retried: false, reason: 'lost_race' })
+    expect(calls.payInvoice).toBe(0)
+    const rec = await loadRec(env)
+    expect(rec.status).toBe('provider_submitted_ambiguous')
+    expect(rec.ambiguousRetries).toBe(1)
+  })
+
   it('other statuses are untouched by the retry', async () => {
     const env = makeEnv()
     await seed(env)

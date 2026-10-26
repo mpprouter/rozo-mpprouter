@@ -1141,13 +1141,13 @@ function lastAmbiguousEvent(rec: StripeFulfillmentRecord): { at: string; signed:
   return null
 }
 
-function lastReconcileCheck(rec: StripeFulfillmentRecord): { state: string; blockchainTxId: string | null } | null {
+function lastReconcileCheck(rec: StripeFulfillmentRecord): { at: string; state: string; blockchainTxId: string | null } | null {
   for (let i = rec.events.length - 1; i >= 0; i--) {
     const e = rec.events[i]
     if (e.kind !== 'stripe_reconcile_checked') continue
     const d = e.detail as Record<string, unknown> | undefined
     if (!d || typeof d.state !== 'string') return null
-    return { state: d.state, blockchainTxId: typeof d.blockchainTxId === 'string' ? d.blockchainTxId : null }
+    return { at: e.at, state: d.state, blockchainTxId: typeof d.blockchainTxId === 'string' ? d.blockchainTxId : null }
   }
   return null
 }
@@ -1171,11 +1171,21 @@ export async function retryAmbiguousStripeRecord(
   if (!rec.stripeUrlEncrypted) return { retried: false, reason: 'no_capability' }
 
   // Live proof. The cron reuses the read the reconciler just made in this
-  // sweep (same `now`); anything older, or an admin call, reads Stripe again.
-  let live = lastReconcileCheck(rec)
-  const checkedAt = rec.lastProviderCheckAt ? Date.parse(rec.lastProviderCheckAt) : NaN
-  const fresh = Number.isFinite(checkedAt) && now.getTime() - checkedAt <= RECONCILE_MIN_INTERVAL_MS
-  if (opts.source === 'admin' || !live || !fresh) {
+  // sweep: the SUCCESSFUL check event must be the reconciler's latest stamp
+  // (a failed lookup stamps lastProviderCheckAt without a checked event, so an
+  // older `checkout` can never pass as current). Anything older, or an admin
+  // call, reads Stripe again.
+  const checked = lastReconcileCheck(rec)
+  const stamp = rec.lastProviderCheckAt ? Date.parse(rec.lastProviderCheckAt) : NaN
+  const fresh =
+    !!checked &&
+    Number.isFinite(stamp) &&
+    Date.parse(checked.at) >= stamp &&
+    now.getTime() - Date.parse(checked.at) <= RECONCILE_MIN_INTERVAL_MS
+  let live: { state: string; blockchainTxId: string | null }
+  if (opts.source === 'cron' && fresh) {
+    live = { state: checked!.state, blockchainTxId: checked!.blockchainTxId }
+  } else {
     try {
       const stripeUrl = await decryptCapability(rec.stripeUrlEncrypted, env)
       const inv = await resolveStripeInvoice(stripeUrl)
@@ -1199,8 +1209,15 @@ export async function retryAmbiguousStripeRecord(
 
   const nowIso = now.toISOString()
   const attempt = attempts + 1
+  // The CAS is bound to the attempt we inspected: same generation and the
+  // same ambiguous answer. A concurrent retry that already re-fired (and went
+  // ambiguous again) changes both, so a caller holding older proof is refused
+  // instead of reopening settlement on stale evidence.
   const stepped = await updateStripeRecord<boolean>(env, invoiceKey, rec.orderId, (r) => {
     if (r.status !== 'provider_submitted_ambiguous') return { noop: false }
+    if ((r.ambiguousRetries ?? 0) !== attempts) return { noop: false }
+    const cur = lastAmbiguousEvent(r)
+    if ((cur?.at ?? null) !== (last?.at ?? null)) return { noop: false }
     r.status = 'payout_seen'
     r.failureReason = null
     r.ambiguousRetries = attempt
@@ -1283,7 +1300,7 @@ export async function sweepInFlightStripeRecords(
       // An ambiguous record that Stripe still shows as untouched is re-driven
       // (bounded, after a grace period). The live state comes from the check
       // the reconciler just recorded, so Stripe is read once per sweep.
-      if (r.checked && !r.transition && rec.status === 'provider_submitted_ambiguous') {
+      if (r.checked && 'providerState' in r && !r.transition && rec.status === 'provider_submitted_ambiguous') {
         const retry = await retryAmbiguousStripeRecord(env, rec.invoiceKey, now, { source: 'cron' })
         if (retry.retried) out.transitions.push(`${maskInvoiceKey(rec.invoiceKey)}:retry#${retry.attempt}`)
       }
