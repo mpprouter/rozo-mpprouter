@@ -15,6 +15,7 @@ import {
   type NormalizedInvoice,
 } from './invoice-provider'
 import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
+import { saveOriginalPaymentLink, coinbaseLinkFromId } from './payment-link-store'
 import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { StageTimer } from '../utils/stage-timer'
@@ -2727,6 +2728,14 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   const rozoPaymentId =
     intentsJson?.id ?? intentsJson?.paymentId ?? intentsJson?.data?.id ?? null
   const expiresAt = intentsJson?.expiresAt ?? null
+  // Keep the original merchant link (founder 2026-10-26). Best effort, never
+  // on the response path's critical section; the Rozo order already exists.
+  if (rozoPaymentId && linkId) {
+    const originalUrl = raw_url ?? coinbaseLinkFromId(linkId)
+    if (originalUrl) {
+      await saveOriginalPaymentLink(env, { rozoPaymentId: String(rozoPaymentId), provider: 'coinbase', orderRef: linkId, url: originalUrl })
+    }
+  }
 
   const createWarnings = [...source.warnings]
   if (supersededClassic) {
@@ -3257,6 +3266,17 @@ export async function handleStripeCreateInvoice(
     expiresAt = intentsJson?.expiresAt ?? null
     reused = false
     rawIntent = intentsJson
+    // Keep the original crypto.stripe.com/pay/<blob> link (founder 2026-10-26):
+    // the only other copy is the encrypted capability in the settlement
+    // record, which no endpoint can hand back. Router-private D1, best effort.
+    if (rozoPaymentId) {
+      await saveOriginalPaymentLink(env, {
+        rozoPaymentId: String(rozoPaymentId),
+        provider: 'stripe_crypto',
+        orderRef: invoice.invoiceKey,
+        url: stripeUrl,
+      })
+    }
   }
 
   // 8. Seed the locked fulfillment record so the webhook has the binding fields
