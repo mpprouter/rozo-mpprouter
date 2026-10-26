@@ -57,7 +57,7 @@ import { handleOpenApi } from './routes/openapi'
 import { handleAiPlugin } from './routes/ai-plugin'
 import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-admin'
 import { handleAdminSeedStore } from './routes/admin-seed-store'
-import { handleStripeFulfillmentResolve } from './routes/stripe-fulfillment-admin'
+import { handleStripeFulfillmentResolve, handleStripeFulfillmentRetry } from './routes/stripe-fulfillment-admin'
 import { handleCoinbaseExecGateClear } from './routes/coinbase-exec-gate-admin'
 import { handleCheckoutControl } from './routes/checkout-control-admin'
 import { handleCreateInvoice } from './routes/create-invoice'
@@ -1036,6 +1036,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Gated by x-admin-secret. See routes/stripe-fulfillment-admin.ts.
       if (url.pathname === '/admin/stripe-fulfillment/resolve') {
         return handleStripeFulfillmentResolve(request, env)
+      }
+      // Re-drive a provider_submitted_ambiguous Stripe record now (live Stripe
+      // state must still prove nothing was purchased). Same gate; see
+      // routes/stripe-fulfillment-admin.ts.
+      if (url.pathname === '/admin/stripe-fulfillment/retry') {
+        return handleStripeFulfillmentRetry(request, env)
       }
 
       // Manual re-pay escape hatch for the Coinbase execution gate: verifies

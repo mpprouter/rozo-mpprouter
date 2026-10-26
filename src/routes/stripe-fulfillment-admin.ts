@@ -18,7 +18,7 @@
 //     record returns 200 with `changed:false`
 
 import type { Env } from '../index'
-import { resolveManualReview, maskInvoiceKey, invoiceKeyFromOrderId, isStripeOrderId } from './stripe-fulfillment'
+import { resolveManualReview, retryAmbiguousStripeRecord, maskInvoiceKey, invoiceKeyFromOrderId, isStripeOrderId } from './stripe-fulfillment'
 
 function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -113,4 +113,56 @@ export function evidenceCarriesCapability(evidence: string): boolean {
   }
   // Schemeless spellings ("crypto.stripe.com/pay/…") are still a capability.
   return /stripe\.com\.?(:\d+)?\/(pay|setup)\//i.test(evidence)
+}
+
+// POST /admin/stripe-fulfillment/retry — re-drive a record parked in
+// `provider_submitted_ambiguous` right now, without waiting for the cron's
+// grace period or automatic-attempt cap (2026-10-26 founder decision). The
+// live-state proof is NOT skippable: Stripe must still show the session in a
+// pre-purchase state with no blockchain tx, otherwise the call is refused and
+// nothing is sent. Same x-admin-secret gate as /resolve; who/why are recorded
+// on the record's event trail. Evidence must not carry a capability.
+export async function handleStripeFulfillmentRetry(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
+  if (!env.PAYINVOICE_ADMIN_SECRET) return json(500, { error: 'PAYINVOICE_ADMIN_SECRET is not configured' })
+  const callerSecret = request.headers.get('x-admin-secret')?.trim()
+  if (!callerSecret || callerSecret !== env.PAYINVOICE_ADMIN_SECRET) return json(401, { error: 'Unauthorized' })
+  let body: any
+  try {
+    body = await request.json()
+  } catch {
+    return json(400, { error: 'invalid JSON body' })
+  }
+  if (!body || typeof body !== 'object') return json(400, { error: 'expected a JSON object' })
+  const rawKey = typeof body.invoiceKey === 'string' ? body.invoiceKey.trim() : ''
+  const invoiceKey = isStripeOrderId(rawKey) ? invoiceKeyFromOrderId(rawKey) : rawKey
+  if (!invoiceKey.startsWith('cpis_')) return json(400, { error: 'invoiceKey must be a cpis_* session id (or stripe_crypto_cpis_* orderId)' })
+  const evidence = typeof body.evidence === 'string' ? body.evidence.trim() : ''
+  if (evidence.length < MIN_EVIDENCE_CHARS || evidence.length > MAX_EVIDENCE_CHARS) {
+    return json(400, { error: `evidence is required (${MIN_EVIDENCE_CHARS}–${MAX_EVIDENCE_CHARS} chars: what you verified)` })
+  }
+  if (evidenceCarriesCapability(evidence)) {
+    return json(400, { error: 'evidence must not contain a Stripe pay URL or client secret' })
+  }
+  const retriedBy = typeof body.retriedBy === 'string' ? body.retriedBy.trim() : ''
+  if (!retriedBy || retriedBy.length > 100) return json(400, { error: 'retriedBy is required (who verified)' })
+
+  const out = await retryAmbiguousStripeRecord(env, invoiceKey, new Date(), { source: 'admin', evidence, retriedBy })
+  const masked = maskInvoiceKey(invoiceKey)
+  if (out.retried) {
+    return json(200, { ok: true, invoiceKey: masked, attempt: out.attempt, liveState: out.liveState, summary: out.summary })
+  }
+  if (out.reason === 'no_record') return json(404, { error: 'no Stripe fulfillment record', invoiceKey: masked })
+  if (out.reason === 'not_ambiguous') return json(409, { error: 'record is not provider_submitted_ambiguous', invoiceKey: masked })
+  if (out.reason === 'live_state_unsafe') {
+    return json(409, {
+      error: `Stripe session is "${out.liveState}" (or has a tx): a Permit may have reached the relayer, refusing to re-fire`,
+      invoiceKey: masked,
+      liveState: out.liveState,
+    })
+  }
+  if (out.reason === 'provider_check_failed' || out.reason === 'no_capability') {
+    return json(502, { error: `could not read the live Stripe session (${out.reason})`, invoiceKey: masked })
+  }
+  return json(409, { error: `retry refused: ${out.reason}`, invoiceKey: masked })
 }

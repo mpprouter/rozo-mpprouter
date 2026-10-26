@@ -12,7 +12,11 @@ import {
   RECONCILE_GONE_ESCALATE_AFTER,
   readDailySpentAtomic,
   sweepInFlightStripeRecords,
+  retryAmbiguousStripeRecord,
+  AMBIGUOUS_RETRY_GRACE_MS,
+  AMBIGUOUS_MAX_AUTO_RETRIES,
 } from '../src/routes/stripe-fulfillment'
+import { handleStripeFulfillmentRetry } from '../src/routes/stripe-fulfillment-admin'
 import { casRead } from '../src/routes/stripe-atomic'
 import { handleInvoiceStatus, handleRozoWebhook } from '../src/routes/webhook'
 import type { Env } from '../src/index'
@@ -738,5 +742,225 @@ describe('stuck-order Intercom tickets (S3, Stripe)', () => {
     expect(tickets).toHaveLength(8)
     // No Rozo id → the status link falls back to the provider-qualified order id.
     expect(tickets[0].body.ticket_attributes._default_description_).toMatch(/status\?id=stripe_crypto_cpis_stuck/)
+  })
+})
+
+
+// ── Ambiguous auto-retry (2026-10-26, cpis_1UUso…) ──────────────────────────
+//
+// pay-invoice answered 5xx before any Permit existed (public Base RPC / Stripe
+// read failed). The router parked the record as provider_submitted_ambiguous
+// and, by design, never re-fired; Stripe meanwhile still showed the session
+// untouched in `checkout`. Founder 2026-10-26: retry on our own when Stripe
+// proves nothing was purchased.
+describe('ambiguous auto-retry', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  // Full settlement-path mock: Stripe reads answer `state`, the funder RPC
+  // balance is plenty, pay-invoice answers `payInvoice` (default: accepted).
+  function mockPath(state: string, payInvoice: () => Response = () => Response.json({ success: true })) {
+    const calls = { payInvoice: 0, resume: 0 }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('pay-invoice')) {
+        calls.payInvoice++
+        return payInvoice()
+      }
+      if (u.includes('resume_payin_session')) {
+        calls.resume++
+        return Response.json({ sessionId: KEY, clientSecret: 'cs_test', publishableKey: 'pk_test' })
+      }
+      if (u.includes('payin_session')) return Response.json(stripeSession(state))
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16).padStart(64, '0') }), { status: 200 })
+    })
+    return calls
+  }
+
+  async function parkAmbiguous(env: Env, at: Date, extra: Record<string, unknown> = {}, detail: Record<string, unknown> = { status: 502 }) {
+    await forceStatus(env, 'provider_submitted_ambiguous', {
+      failureReason: 'pay-invoice ambiguous (status 502) — needs reconciliation',
+      events: [{ kind: 'stripe_confirm_ambiguous', at: at.toISOString(), detail }],
+      ...extra,
+    })
+  }
+
+  it('cron: after the grace period, Stripe still in checkout → re-drives once through the normal path', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    await parkAmbiguous(env, new Date(t0 - AMBIGUOUS_RETRY_GRACE_MS - 1000))
+    const calls = mockPath('checkout')
+    const out = await sweepInFlightStripeRecords(env, new Date(t0))
+    expect(calls.payInvoice).toBe(1)
+    expect(out.transitions.some((t) => t.endsWith(':retry#1'))).toBe(true)
+    const rec = await loadRec(env)
+    expect(rec.status).toBe('provider_submitted')
+    expect(rec.ambiguousRetries).toBe(1)
+    const kinds = rec.events.map((e: any) => e.kind)
+    expect(kinds).toContain('stripe_ambiguous_retry')
+    expect(kinds.indexOf('stripe_ambiguous_retry')).toBeLessThan(kinds.indexOf('stripe_confirm_submitted'))
+    // The retry is the same claim holder: no LINK_CLAIMED, and the event id is deterministic.
+    expect(rec.webhookEventIds).toContain(`ambiguous-retry:${KEY}:1`)
+  })
+
+  it('cron: inside the grace period nothing is sent', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    await parkAmbiguous(env, new Date(t0 - 30_000))
+    const calls = mockPath('checkout')
+    await sweepInFlightStripeRecords(env, new Date(t0))
+    expect(calls.payInvoice).toBe(0)
+    expect((await loadRec(env)).status).toBe('provider_submitted_ambiguous')
+    const out = await retryAmbiguousStripeRecord(env, KEY, new Date(t0 + 1000), { source: 'cron' })
+    expect(out).toMatchObject({ retried: false, reason: 'grace' })
+  })
+
+  it('cron: pay-invoice said signed:false → no grace period', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    await parkAmbiguous(env, new Date(t0 - 5_000), {}, { status: 502, signed: false })
+    const calls = mockPath('checkout')
+    await sweepInFlightStripeRecords(env, new Date(t0))
+    expect(calls.payInvoice).toBe(1)
+    expect((await loadRec(env)).status).toBe('provider_submitted')
+  })
+
+  it.each(['processing', 'purchase_complete', 'fulfillment_initiated', 'requires_setup', 'unknown'])(
+    'never re-fires while Stripe shows "%s" (a Permit may be with the relayer)',
+    async (state) => {
+      const env = makeEnv()
+      await seed(env)
+      const t0 = Date.now()
+      await parkAmbiguous(env, new Date(t0 - 10 * AMBIGUOUS_RETRY_GRACE_MS))
+      const calls = mockPath(state)
+      await sweepInFlightStripeRecords(env, new Date(t0))
+      expect(calls.payInvoice).toBe(0)
+      expect((await loadRec(env)).status).toBe('provider_submitted_ambiguous')
+      const out = await retryAmbiguousStripeRecord(env, KEY, new Date(t0 + 60_000), { source: 'admin', evidence: 'x'.repeat(20), retriedBy: 'ops' })
+      expect(out).toMatchObject({ retried: false, reason: 'live_state_unsafe', liveState: state })
+      expect(calls.payInvoice).toBe(0)
+    },
+  )
+
+  it('a checkout session that already carries a blockchain tx is not retried', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    await parkAmbiguous(env, new Date(t0 - 10 * AMBIGUOUS_RETRY_GRACE_MS))
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('pay-invoice')) throw new Error('must not be called')
+      if (u.includes('resume_payin_session')) return Response.json({ sessionId: KEY, clientSecret: 'cs_test', publishableKey: 'pk_test' })
+      if (u.includes('payin_session')) return Response.json(stripeSession('checkout', '0x' + 'ab'.repeat(32)))
+      return new Response('unexpected', { status: 500 })
+    })
+    await sweepInFlightStripeRecords(env, new Date(t0))
+    expect((await loadRec(env)).status).toBe('provider_submitted_ambiguous')
+  })
+
+  it('cron: automatic attempts are capped; a second ambiguity after the cap waits for a human', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    await parkAmbiguous(env, new Date(t0 - 10 * AMBIGUOUS_RETRY_GRACE_MS), { ambiguousRetries: AMBIGUOUS_MAX_AUTO_RETRIES })
+    const calls = mockPath('checkout')
+    await sweepInFlightStripeRecords(env, new Date(t0))
+    expect(calls.payInvoice).toBe(0)
+    expect(await retryAmbiguousStripeRecord(env, KEY, new Date(t0 + 60_000), { source: 'cron' })).toMatchObject({ retried: false, reason: 'retries_exhausted' })
+    // Admin may still re-drive (live proof still required, and it was given).
+    const out = await retryAmbiguousStripeRecord(env, KEY, new Date(t0 + 120_000), { source: 'admin', evidence: 'verified stripe session untouched', retriedBy: 'founder' })
+    expect(out).toMatchObject({ retried: true, attempt: AMBIGUOUS_MAX_AUTO_RETRIES + 1 })
+    expect(calls.payInvoice).toBe(1)
+    const rec = await loadRec(env)
+    expect(rec.status).toBe('provider_submitted')
+    expect(rec.events.find((e: any) => e.kind === 'stripe_ambiguous_retry').detail).toMatchObject({ source: 'admin', retriedBy: 'founder' })
+  })
+
+  it('a retry that is ambiguous again is parked again (counted), never loops inside one sweep', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    await parkAmbiguous(env, new Date(t0 - 10 * AMBIGUOUS_RETRY_GRACE_MS))
+    const calls = mockPath('checkout', () => new Response('upstream down', { status: 503 }))
+    await sweepInFlightStripeRecords(env, new Date(t0))
+    expect(calls.payInvoice).toBe(1)
+    const rec = await loadRec(env)
+    expect(rec.status).toBe('provider_submitted_ambiguous')
+    expect(rec.ambiguousRetries).toBe(1)
+    // Next sweep right away: the new ambiguous answer restarts the grace period.
+    await sweepInFlightStripeRecords(env, new Date(t0 + RECONCILE_MIN_INTERVAL_MS + 1000))
+    expect(calls.payInvoice).toBe(1)
+  })
+
+  it('the daily-cap reservation of the ambiguous attempt is handed back before the retry reserves again', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const t0 = Date.now()
+    // Simulate what the ambiguous attempt left behind: one invoice reserved today.
+    const { reserveDailySpend } = await import('../src/routes/stripe-fulfillment')
+    await reserveDailySpend(env, new Date(t0), 1360000n)
+    await parkAmbiguous(env, new Date(t0 - 10 * AMBIGUOUS_RETRY_GRACE_MS))
+    mockPath('checkout')
+    await sweepInFlightStripeRecords(env, new Date(t0))
+    expect((await loadRec(env)).status).toBe('provider_submitted')
+    // Exactly one invoice counted, not two.
+    expect(await readDailySpentAtomic(env, new Date(t0))).toBe(1360000n)
+  })
+
+  it('other statuses are untouched by the retry', async () => {
+    const env = makeEnv()
+    await seed(env)
+    await forceStatus(env, 'provider_submitted')
+    mockPath('checkout')
+    expect(await retryAmbiguousStripeRecord(env, KEY, new Date(), { source: 'admin', evidence: 'x'.repeat(20), retriedBy: 'ops' })).toEqual({ retried: false, reason: 'not_ambiguous' })
+    expect(await retryAmbiguousStripeRecord(env, 'cpis_nope', new Date(), { source: 'cron' })).toEqual({ retried: false, reason: 'no_record' })
+  })
+
+  describe('POST /admin/stripe-fulfillment/retry', () => {
+    const post = (env: Env, body: unknown, secret = 'admin') =>
+      handleStripeFulfillmentRetry(
+        new Request('https://r/admin/stripe-fulfillment/retry', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-admin-secret': secret },
+          body: JSON.stringify(body),
+        }),
+        env,
+      )
+
+    it('gates on the admin secret and refuses capability-bearing evidence', async () => {
+      const env = makeEnv()
+      await seed(env)
+      expect((await post(env, { invoiceKey: KEY }, 'nope')).status).toBe(401)
+      const bad = await post(env, { invoiceKey: KEY, evidence: 'see https://crypto.stripe.com/pay/CDMQ_blob_blob', retriedBy: 'ops' })
+      expect(bad.status).toBe(400)
+      expect((await post(env, { invoiceKey: KEY, evidence: 'short', retriedBy: 'ops' })).status).toBe(400)
+    })
+
+    it('re-drives an ambiguous record and reports what was sent', async () => {
+      const env = makeEnv()
+      await seed(env)
+      await parkAmbiguous(env, new Date(Date.now() - 5_000))
+      const calls = mockPath('checkout')
+      const res = await post(env, { invoiceKey: ORDER, evidence: 'funder wallet shows no outgoing USDC since 18:41Z', retriedBy: 'founder' })
+      expect(res.status).toBe(200)
+      const body: any = await res.json()
+      expect(body).toMatchObject({ ok: true, attempt: 1, liveState: 'checkout' })
+      expect(JSON.stringify(body)).not.toContain(KEY) // masked
+      expect(calls.payInvoice).toBe(1)
+      // Idempotent against the state machine: the record is no longer ambiguous.
+      expect((await post(env, { invoiceKey: KEY, evidence: 'second try for no reason at all', retriedBy: 'founder' })).status).toBe(409)
+    })
+
+    it('refuses when Stripe shows the session past checkout', async () => {
+      const env = makeEnv()
+      await seed(env)
+      await parkAmbiguous(env, new Date(Date.now() - 5_000))
+      const calls = mockPath('processing')
+      const res = await post(env, { invoiceKey: KEY, evidence: 'operator believes nothing was signed', retriedBy: 'ops' })
+      expect(res.status).toBe(409)
+      expect(calls.payInvoice).toBe(0)
+    })
   })
 })
