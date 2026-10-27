@@ -509,14 +509,14 @@ describe('resolveSource', () => {
     expect(r.resolved?.warnings).toEqual([])
   })
 
-  it('resolves Celo USDC and Arc USDC to the canonical contracts (founder 2026-10-28)', () => {
-    expect(resolveSource({ chainId: 42220, tokenSymbol: 'USDC' }).resolved?.tokenAddress).toBe('0xcebA9300f2b948710d2653dD7B07f33A8B32118C')
+  it('resolves Arc USDC to the canonical ERC-20 view (founder 2026-10-28)', () => {
     // Arc: the 6-decimal ERC-20 view, never the native (18-decimal) balance.
     expect(resolveSource({ chainId: 5042, tokenSymbol: 'USDC' }).resolved?.tokenAddress).toBe('0x3600000000000000000000000000000000000000')
   })
 
-  it('refuses Celo / Arc USDT and native CELO / Arc coins', () => {
+  it('refuses Celo (not shipped yet), Arc USDT and native Arc coins', () => {
     expect(resolveSource({ chainId: 5042, tokenSymbol: 'USDT' }).error?.code).toBe('UNSUPPORTED_SOURCE')
+    expect(resolveSource({ chainId: 42220, tokenSymbol: 'USDC' }).error?.code).toBe('UNSUPPORTED_SOURCE')
     expect(resolveSource({ chainId: 42220, tokenSymbol: 'USDT' }).error?.code).toBe('UNSUPPORTED_SOURCE')
     expect(resolveSource({ chainId: 42220, tokenSymbol: 'CELO' }).error).toBeDefined()
     expect(resolveSource({ chainId: 5042, tokenSymbol: 'ETH' }).error).toBeDefined()

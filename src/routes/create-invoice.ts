@@ -147,9 +147,6 @@ const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
     USDT: 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
   },
   '1500': { USDC: 'USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN' },
-  // Celo: native Circle USDC, 6 decimals (USDC only, founder 2026-10-28).
-  // Matches rozo-intents canonical-token.ts EVM_CHAIN_TOKENS['42220'].
-  '42220': { USDC: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' },
   // Arc: USDC through its ERC-20 view (6 decimals). Never the 18-decimal native
   // balance. Matches canonical-token.ts EVM_CHAIN_TOKENS['5042'].
   '5042': { USDC: '0x3600000000000000000000000000000000000000' },
