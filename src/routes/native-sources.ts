@@ -25,6 +25,13 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
   '42161': ['USDC', 'USDT'],  // Arbitrum One
   '900':  ['USDC', 'USDT'],   // Solana — USDT payin supported (sol-pool-monitor)
   '1500': ['USDC'],           // Stellar
+  // Celo and Arc (founder 2026-10-28, /celo and /arc Beta pages). Upstream
+  // intake is gated by app_config celo_intake_enabled / arc_intake_enabled;
+  // when off, rozo-intents refuses the order and no deposit address exists.
+  // No native coin on either (no CELO; Arc's native USDC is the same balance
+  // as its ERC-20 view, so only the ERC-20 view is a source).
+  '42220': ['USDC'],          // Celo (USDC only, founder 2026-10-28)
+  '5042': ['USDC'],           // Arc
 }
 
 
