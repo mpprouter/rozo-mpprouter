@@ -30,7 +30,7 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
   // when off, rozo-intents refuses the order and no deposit address exists.
   // No native coin on either (no CELO; Arc's native USDC is the same balance
   // as its ERC-20 view, so only the ERC-20 view is a source).
-  '42220': ['USDC', 'USDT'],  // Celo
+  '42220': ['USDC'],          // Celo (USDC only, founder 2026-10-28)
   '5042': ['USDC'],           // Arc
 }
 
