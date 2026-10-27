@@ -77,9 +77,9 @@ function fakeAllocate(body: any): Response {
   return new Response(JSON.stringify({
     orderId: body.merchantOrderId, alpha: true, reused, orderState: 'open', expired: false,
     chainId: body.network === 'ton' ? '1600' : '728126428', network: body.network, tokenSymbol: body.token,
-    tokenIdentity: 'x', tokenDecimals: 6, displayDecimals: body.token === 'TRX' ? 1 : 2,
+    tokenIdentity: body.network === 'ton' ? '0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe' : (body.token === 'TRX' ? 'native' : 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'), tokenDecimals: 6, displayDecimals: body.token === 'TRX' ? 1 : 2,
     receivingAddress: body.network === 'ton' ? TON_RAW : TRON_ADDR,
-    expectedAmount: opt.expectedAmount, expectedAmountAtomic: '0', paymentReference: opt.ref,
+    expectedAmount: opt.expectedAmount, expectedAmountAtomic: String(Math.round(Number(opt.expectedAmount) * 1e6)), paymentReference: opt.ref,
     grossUsd: opt.gross.toFixed(6), expiresAt: '2026-10-27T11:00:00.000Z', serverTime: firstQuote,
     notice: 'Alpha: payment is recorded and verified; top-up delivery is not automatic yet.',
   }), { status: 200 })
@@ -211,6 +211,8 @@ describe('tron-ton-alpha option: one order per Coinbase invoice', () => {
     expect(r.fees).toEqual({ invoiceUsd: '20.00', serviceFeeUsd: '0.20', feeBps: 100, networkFeeUsd: '0.10', totalUsd: '20.30' })
     expect(r.receivingAddress).toBe(TON_RAW)
     expect(r.receivingAddressDisplay).toBe('UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI')
+    expect(r.expectedAmountAtomic).toBe('20300000')
+    expect(r.tokenIdentityDisplay).toBe('EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs')
   })
 })
 
@@ -262,7 +264,7 @@ describe('tron-ton-alpha option: refusals', () => {
   })
 
   it('rejects a TRX amount that is not one decimal', async () => {
-    up.reply = (body) => body.network ? new Response(JSON.stringify({ alpha: true, network: 'tron', tokenSymbol: 'TRX', receivingAddress: TRON_ADDR, expectedAmount: '61.50', paymentReference: null, expiresAt: '2026-10-27T11:00:00.000Z', grossUsd: '21.2' }), { status: 200 }) : null
+    up.reply = (body) => body.network ? new Response(JSON.stringify({ alpha: true, network: 'tron', tokenSymbol: 'TRX', receivingAddress: TRON_ADDR, expectedAmount: '61.50', expectedAmountAtomic: '61500000', paymentReference: null, expiresAt: '2026-10-27T11:00:00.000Z', grossUsd: '21.2' }), { status: 200 }) : null
     const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'TRX' }), makeEnv())
     expect(r.status).toBe(502)
   })
@@ -278,6 +280,15 @@ describe('tron-ton-alpha option: refusals', () => {
     expect(JSON.stringify(await again.json())).not.toContain('TQ6s')
     linkExpiresAt = '2026-10-27T12:00:00.000Z' // after the deadline: shown
     expect((await handleTronTonAlphaOption(optionReq({ payment_id: SESSION, network: 'tron', token: 'USDT' }), makeEnv())).status).toBe(200)
+  })
+})
+
+describe('tron-ton-alpha option: atomic amount', () => {
+  it('refuses an answer whose atomic amount does not match the displayed one', async () => {
+    const okRes = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), makeEnv())
+    expect(okRes.status).toBe(200)
+    up.reply = (body) => body.network ? new Response(JSON.stringify({ alpha: true, network: 'tron', tokenSymbol: 'USDT', receivingAddress: TRON_ADDR, receivingAddressDisplay: TRON_ADDR, expectedAmount: '21.20', expectedAmountAtomic: '21210000', paymentReference: null, expiresAt: '2026-10-27T11:00:00.000Z', grossUsd: '21.2' }), { status: 200 }) : null
+    expect((await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), makeEnv())).status).toBe(502)
   })
 })
 
