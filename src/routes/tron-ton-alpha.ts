@@ -43,6 +43,13 @@ const QUOTE_INVOICE_URL = 'https://agentapi.rozo.ai/quote-invoice'
 const UPSTREAM_TIMEOUT_MS = 8_000
 const CAPABILITY_TIMEOUT_MS = 3_000
 const CAPABILITY_TTL_MS = 60_000
+// One waiting tab re-reads 120 times an hour; the IP cap leaves room for a few
+// tabs behind one NAT. Global is a botnet backstop, not a business limit.
+export const TRON_TON_ALPHA_GATE = {
+  prefix: 'tta',
+  limits: { ipPerHour: 600, globalPerHour: 20_000 },
+  label: 'tron-ton-alpha option',
+} as const
 
 // Same settlement destination create-invoice uses for every Coinbase order.
 // Part of the upstream order digest: it must be byte-identical on every call.
@@ -229,9 +236,11 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     return fail(500, 'SERVER_MISCONFIGURED', 'Router is not configured for TRON / TON payments.')
   }
 
-  // Same coarse per-IP / global volume cap as create-invoice: a new option
-  // allocates an amount and spends daily alpha budget upstream.
-  const gate = await checkCreateInvoiceGate(request, env)
+  // Coarse per-IP / global volume cap with its OWN counters (codex P2): the
+  // pages re-read the option every 30 s while waiting, and those reads must
+  // never spend create-invoice's hourly budget. A new option still allocates
+  // upstream, where the per-chain daily alpha budget is the real money cap.
+  const gate = await checkCreateInvoiceGate(request, env, TRON_TON_ALPHA_GATE)
   if (!gate.ok) {
     const res = gate.reason === 'global_circuit_open'
       ? fail(503, 'SERVICE_UNAVAILABLE', 'Invoice creation is temporarily paused. Please try again shortly.')

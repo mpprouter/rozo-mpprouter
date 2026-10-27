@@ -123,15 +123,28 @@ export function clientIp(request: Request): string {
  * per-IP bump, and a single hot IP can't exhaust the global budget for
  * everyone (its own per-IP cap stops it first).
  */
-export async function checkCreateInvoiceGate(request: Request, env: Env): Promise<GateDecision> {
+/**
+ * A separate counter set for another public route (same DO, same logic, its
+ * own keys and limits), so its traffic never spends create-invoice's budget.
+ * `prefix` must not be `ci`; it names the keys `<prefix>:global|ip:*`.
+ */
+export interface GateScope {
+  prefix: string
+  limits: GateLimits
+  /** Label used in the breaker alert. */
+  label: string
+}
+
+export async function checkCreateInvoiceGate(request: Request, env: Env, scope?: GateScope): Promise<GateDecision> {
   const now = Date.now()
   const bucket = hourBucket(now)
-  const limits = resolveGateLimits(env)
+  const limits = scope?.limits ?? resolveGateLimits(env)
+  const prefix = scope?.prefix ?? 'ci'
   const ip = clientIp(request)
   try {
     const res = await doPost<GateResponse>(env, '/gate', {
-      globalKey: `ci:global:${bucket}`,
-      ipKey: `ci:ip:${ip}:${bucket}`,
+      globalKey: `${prefix}:global:${bucket}`,
+      ipKey: `${prefix}:ip:${ip}:${bucket}`,
       bucket,
       globalLimit: limits.globalPerHour,
       ipLimit: limits.ipPerHour,
@@ -144,7 +157,9 @@ export async function checkCreateInvoiceGate(request: Request, env: Env): Promis
       // Fire the alert exactly once at the crossing to avoid alert spam.
       if (globalCount === limits.globalPerHour + 1 && alertSinkConfigured(env)) {
         await sendAlert(env,
-          redactForAlert(`[MPP Router] 🚨 create-invoice global circuit breaker OPEN: >${limits.globalPerHour} invoice creations this hour. New invoice creation paused for the window.`),
+          redactForAlert(scope
+            ? `[MPP Router] 🚨 ${scope.label} global circuit breaker OPEN: >${limits.globalPerHour} requests this hour. Paused for the window.`
+            : `[MPP Router] 🚨 create-invoice global circuit breaker OPEN: >${limits.globalPerHour} invoice creations this hour. New invoice creation paused for the window.`),
         )
       }
       return {

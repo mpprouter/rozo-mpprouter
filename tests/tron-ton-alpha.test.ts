@@ -22,6 +22,7 @@ import {
 } from '../src/routes/tron-ton-alpha'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
+import { checkCreateInvoiceGate } from '../src/routes/create-invoice-gate'
 
 const PL = 'pl_testTronTonAlpha01'
 const SESSION = 'paymentSession_656a435c-ee45-4c3e-936c-b80929a4e7f2'
@@ -210,6 +211,17 @@ describe('tron-ton-alpha option: one order per Coinbase invoice', () => {
     expect(r.fees).toEqual({ invoiceUsd: '20.00', serviceFeeUsd: '0.20', feeBps: 100, networkFeeUsd: '0.10', totalUsd: '20.30' })
     expect(r.receivingAddress).toBe(TON_RAW)
     expect(r.receivingAddressDisplay).toBe('UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI')
+  })
+})
+
+describe('tron-ton-alpha option: rate limit', () => {
+  it('status re-reads use their own counters and never spend the create-invoice budget (codex P2)', async () => {
+    const env = makeEnv({ CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR: '2', CREATE_INVOICE_IP_LIMIT_PER_HOUR: '2' } as Partial<Env>)
+    for (let i = 0; i < 4; i++) {
+      expect((await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)).status).toBe(200)
+    }
+    const ci = await checkCreateInvoiceGate(optionReq({}), env)
+    expect(ci.ok).toBe(true)
   })
 })
 
