@@ -111,6 +111,12 @@ import { handleRozoWebhook, handleInvoiceStatus, FUNDER_WALLET } from './routes/
 import { handleInvoiceDetails } from './routes/invoice-details'
 import { EXISTING_ORDER_PATH, handleExistingOrder } from './routes/existing-order-endpoint'
 import {
+  TRON_TON_ALPHA_CAPABILITY_PATH,
+  TRON_TON_ALPHA_OPTION_PATH,
+  handleTronTonAlphaCapability,
+  handleTronTonAlphaOption,
+} from './routes/tron-ton-alpha'
+import {
   handleUpiResolve,
   handleUpiVerifiedPayIn,
   handleUpiFulfillmentStatus,
@@ -1185,6 +1191,16 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // remains the gate). Kept off quote-invoice so the quote stays fast.
       if (url.pathname === EXISTING_ORDER_PATH) {
         return handleExistingOrder(request, env)
+      }
+
+      // TRON / TON fixed-address pay-in alpha (off unless rozo-intents-api
+      // turns it on for merchant_openrouter). The order key is the Coinbase
+      // invoice id, derived server side, so coin switches reuse one order.
+      if (url.pathname === TRON_TON_ALPHA_CAPABILITY_PATH) {
+        return handleTronTonAlphaCapability(request, env)
+      }
+      if (url.pathname === TRON_TON_ALPHA_OPTION_PATH) {
+        return handleTronTonAlphaOption(request, env)
       }
 
       // Public create-invoice endpoint — quotes a Coinbase Payment Link,
