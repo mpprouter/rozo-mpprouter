@@ -340,12 +340,19 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
 
   const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
   const decimalsOk = new RegExp(`^\\d+\\.\\d{${option.displayDecimals}}$`).test(expected)
+  // Atomic amount (6 decimals) for wallet links (TON QR). Must be the same
+  // number as the displayed amount, or neither is shown.
+  const expectedAtomic = typeof data.expectedAmountAtomic === 'string' ? data.expectedAmountAtomic : ''
+  const atomicOk = decimalsOk && /^\d+$/.test(expectedAtomic) && parseUsdcAtomic(expected) === BigInt(expectedAtomic)
+  // TON: the USDT jetton master in wallet form for the transfer link.
+  const tokenIdentity = typeof data.tokenIdentity === 'string' ? data.tokenIdentity : ''
+  const tokenIdentityDisplay = option.network === 'ton' ? tonRawToFriendly(tokenIdentity, true) : tokenIdentity || null
   const address = typeof data.receivingAddress === 'string' ? data.receivingAddress : ''
   const ref = data.paymentReference == null ? null : String(data.paymentReference)
   const expiresAt = typeof data.expiresAt === 'string' ? data.expiresAt : ''
   const addressDisplay = option.network === 'ton' ? tonRawToFriendly(address) : address
   if (
-    !decimalsOk || !address || !addressDisplay || !Number.isFinite(Date.parse(expiresAt)) ||
+    !atomicOk || (option.network === 'ton' && !tokenIdentityDisplay) || !address || !addressDisplay || !Number.isFinite(Date.parse(expiresAt)) ||
     data.network !== option.network || data.tokenSymbol !== option.token ||
     (option.network === 'ton' ? !(ref && /^\d{6}$/.test(ref)) : ref !== null)
   ) {
@@ -381,11 +388,13 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     network: option.network,
     chainId: option.chainId,
     tokenSymbol: option.token,
-    tokenIdentity: typeof data.tokenIdentity === 'string' ? data.tokenIdentity : null,
+    tokenIdentity: tokenIdentity || null,
+    tokenIdentityDisplay,
     displayDecimals: option.displayDecimals,
     receivingAddress: address,
     receivingAddressDisplay: addressDisplay,
     expectedAmount: expected,
+    expectedAmountAtomic: expectedAtomic,
     paymentReference: ref,
     expiresAt,
     serverTime: typeof data.serverTime === 'string' ? data.serverTime : new Date().toISOString(),
