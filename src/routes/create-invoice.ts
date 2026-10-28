@@ -88,20 +88,20 @@ import {
 // that they live in checkout-web-pricing.
 export { buildCheckoutTitle, buildFullAmountTitle, buildTitle, formatTitleAmount }
 
-const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
+export const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const QUOTE_INVOICE_URL = 'https://agentapi.rozo.ai/quote-invoice'
 
 // ROZO_APP_ID (Stripe line) and OPENROUTER_APP_ID (Coinbase line, no discount,
 // exactOut for Lightning) live in existing-order.ts with the shared lookup.
 
 const BASE_CHAIN_ID = '8453'
-const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+export const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 
 // Settlement: caller pays USDC on Base → merchant receives USDC on Base
 // (same-chain). The receiver below is the merchant/API-developer wallet.
 const SETTLEMENT_CHAIN_ID = BASE_CHAIN_ID
 const SETTLEMENT_TOKEN_ADDRESS = BASE_USDC_ADDRESS
-const SETTLEMENT_RECEIVER = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
+export const SETTLEMENT_RECEIVER = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
 
 // ── Source override support (caller picks which chain/token to pay with) ──────
 // Agents may optionally specify `source` to pay from a non-Base chain. Settlement
@@ -1131,7 +1131,7 @@ export function formatUsdc(atomic: bigint): string {
   return formatUsdcAtomic(atomic)
 }
 
-function pricingFields(pricing: CheckoutPricing) {
+export function pricingFields(pricing: CheckoutPricing) {
   return {
     original: formatUsdc(pricing.originalAtomic),
     serviceFee: formatUsdc(pricing.serviceFeeAtomic),
@@ -1214,7 +1214,7 @@ function readMetadataObject(row: any): Record<string, unknown> | null {
  * price. Legacy zero-fee rows are accepted when their amount matches; once a
  * fee is enabled, missing/partial pricing metadata fails closed.
  */
-function pendingPricingMatches(row: any, pricing: CheckoutPricing): boolean {
+export function pendingPricingMatches(row: any, pricing: CheckoutPricing): boolean {
   const source = readRowSource(row)
   // exactOut rows (Lightning, native coins) carry the USD price on the
   // destination; their source amount is in BTC / coin units.

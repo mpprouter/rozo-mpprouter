@@ -37,6 +37,7 @@ import {
   drainCheckoutFeedbackNotifications,
 } from '../src/routes/checkout-feedback'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
+import { alphaOrderMarkerKey } from '../src/routes/tron-ton-alpha-order'
 import type { Env } from '../src/index'
 
 const TEST_SECRET = 'test-link-secret'
@@ -175,6 +176,51 @@ describe('webhook: test order delivery ack to Rozo', () => {
     expect(rec.status).toBe('test_settled')
     expect(rec.deliveredReported).toBeFalsy()
     expect(rec.deliveredReportAttempts).toBe(1)
+  })
+})
+
+describe('webhook: TRON / TON alpha test order (closes on payin, no payout exists)', () => {
+  const enabledEnv = () => ({ ...webhookEnv(), ROZO_DELIVERED_REPORT_ENABLED: 'true' })
+
+  it('payin_completed closes an invoice /option offered the alpha for, and reports delivered once', async () => {
+    const env = enabledEnv()
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }))
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef21')
+    await env.MPP_STORE.put(alphaOrderMarkerKey(id), '1')
+    const base = { data: { id: RPID, orderId: id, source: { amount: '1.01' } } }
+
+    const r = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'a1', type: 'payment_payin_completed' }), env)
+    expect(await r.json()).toMatchObject({ ok: true, test_invoice: true, status: 'test_settled' })
+    // Only the delivered ack: no funder balance RPC, no agentapi, no alert sink.
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(String(fetchSpy.mock.calls[0][0])).toMatch(new RegExp(`/payments/${RPID}/delivered$`))
+    const rec = JSON.parse(env.MPP_STORE._store.get(`invoice-fulfillment:${id}`))
+    expect(rec.status).toBe('test_settled')
+    expect(rec.deliveredReported).toBe(true)
+
+    // The outbox re-sends the payin webhook: terminal, nothing more.
+    await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'a2', type: 'payment_payin_completed' }), env)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('without the alpha marker a test payin still waits for the payout', async () => {
+    const env = enabledEnv()
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    vi.spyOn(console, 'log').mockImplementation(() => {})
+    const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef22')
+    const r = await handleRozoWebhook(await signedWebhook({ event_id: 'a3', type: 'payment_payin_completed', data: { id: RPID, orderId: id } }), env)
+    expect(await r.json()).toMatchObject({ test_invoice: true, status: 'payin_seen' })
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('the fund guard still holds for an alpha test id', async () => {
+    const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef23')
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const env = webhookEnv()
+    await env.MPP_STORE.put(alphaOrderMarkerKey(id), '1')
+    await expect(callAgentApiPayInvoice(env, id)).rejects.toBeInstanceOf(TestInvoiceFundGuardError)
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 })
 

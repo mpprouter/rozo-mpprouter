@@ -23,6 +23,10 @@ import {
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import { checkCreateInvoiceGate } from '../src/routes/create-invoice-gate'
+import { pendingPricingMatches } from '../src/routes/create-invoice'
+import { resolveCheckoutPricing } from '../src/routes/checkout-web-pricing'
+import { signTestPaymentId } from '../src/routes/native-sources'
+import { alphaOrderMarkerKey, buildAlphaBusinessOrderBody } from '../src/routes/tron-ton-alpha-order'
 
 const PL = 'pl_testTronTonAlpha01'
 const SESSION = 'paymentSession_656a435c-ee45-4c3e-936c-b80929a4e7f2'
@@ -30,15 +34,38 @@ const TRON_ADDR = 'TQ6sZ1jJcjC4Axq3dQ2h6YxSW5Znh5QGuf'
 const TON_RAW = '0:83dfd552e63729b472fcbcc8c45ebcc6691702558b68ec7527e1ba403a0f31a8'
 const KEY = 'test-router-intents-key'
 
+const TEST_SECRET = 'test-link-secret'
+
+function freshKv() {
+  const m = new Map<string, string>()
+  return {
+    map: m,
+    get: async (k: string) => m.get(k) ?? null,
+    put: async (k: string, v: string) => { m.set(k, v) },
+    delete: async (k: string) => { m.delete(k) },
+  }
+}
+
 function makeEnv(extra: Partial<Env> = {}): Env {
   return {
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     ROZO_INTENTS_API_KEY: KEY,
     CHECKOUT_WEB_FEE_BPS: '100',
+    ROZO_TEST_LINK_SECRET: TEST_SECRET,
     ATOMIC_STORE: makeAtomicStoreMock(),
+    MPP_STORE: freshKv(),
     ...extra,
   } as unknown as Env
 }
+
+// Intents payment-api fake for the business order (tron-ton-alpha-order.ts).
+interface FakeIntents {
+  lookups: string[]
+  creates: any[]
+  lookup?: (orderId: string) => Response | null
+  create?: (body: any) => Response | null
+}
+let intents: FakeIntents
 
 interface FakeUpstream {
   calls: Array<{ headers: Record<string, string>; body: any }>
@@ -90,6 +117,7 @@ beforeEach(() => {
   ;(fakeAllocate as any).orders = new Map()
   ;(fakeAllocate as any).seq = 0
   up = { calls: [] }
+  intents = { lookups: [], creates: [] }
   quoteLinkId = PL
   quoteStatus = 200
   linkExpiresAt = null
@@ -104,6 +132,20 @@ beforeEach(() => {
       if (custom) return custom
       if (!body.network) return new Response(JSON.stringify({ error: 'unsupported_asset' }), { status: 400 })
       return fakeAllocate(body)
+    }
+    if (u.includes('/functions/v1/payment-api/payments/order/')) {
+      const orderId = decodeURIComponent(u.split('/').pop()!)
+      intents.lookups.push(orderId)
+      const custom = intents.lookup?.(orderId)
+      if (custom) return custom
+      return new Response(JSON.stringify({ error: { code: 'paymentNotFound', message: 'Payment not found' } }), { status: 404 })
+    }
+    if (u === 'https://intentapiv4.rozo.ai/functions/v1/payment-api/' && init?.method === 'POST') {
+      const body = JSON.parse(init.body)
+      intents.creates.push(body)
+      const custom = intents.create?.(body)
+      if (custom) return custom
+      return new Response(JSON.stringify({ id: 'b0000000-0000-4000-8000-000000000001', status: 'payment_unpaid' }), { status: 201 })
     }
     if (u.includes('/quote-invoice')) {
       if (quoteStatus !== 200) return new Response('payment session is not payable: PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED', { status: quoteStatus })
@@ -305,5 +347,109 @@ describe('tonRawToFriendly', () => {
   it('rejects anything else', () => {
     expect(tonRawToFriendly('EQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqB2N')).toBeNull()
     expect(tonRawToFriendly('0:zz')).toBeNull()
+  })
+})
+
+describe('tron-ton-alpha option: the invoice business order (delivery gap, 2026-10-28)', () => {
+  const ok = (r: Response) => r.json().then((j: any) => ({ status: r.status, j }))
+
+  it('creates the merchant_openrouter order once, keyed by the invoice id, before showing instructions', async () => {
+    const env = makeEnv()
+    const a = await ok(await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env))
+    expect(a.status).toBe(200)
+    expect(intents.lookups).toEqual([PL])
+    expect(intents.creates).toHaveLength(1)
+    const body = intents.creates[0]
+    expect(body.appId).toBe('merchant_openrouter')
+    expect(body.orderId).toBe(PL)
+    expect(body.type).toBe('exactIn')
+    expect(body.source).toMatchObject({ chainId: '8453', tokenSymbol: 'USDC', amount: '20.2' })
+    expect(body.destination).toMatchObject({ chainId: '8453', tokenSymbol: 'USDC', receiverAddress: ALPHA_DESTINATION.receiverAddress })
+    // settle.ts compares metadata.original with the alpha base amount
+    expect(body.metadata.original).toBe('20')
+    expect(body.metadata.coinbasePaymentLinkId).toBe(PL)
+    expect(body.metadata.testMode).toBeUndefined()
+    // coin switches and status polls never create or look up again
+    await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'ton', token: 'USDT' }), env)
+    await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)
+    expect(intents.lookups).toHaveLength(1)
+    expect(intents.creates).toHaveLength(1)
+  })
+
+  it('creates an order the main checkout reuses (same price tuple as create-invoice)', () => {
+    const pricing = resolveCheckoutPricing(20_000_000n, 'OpenRouter, Inc', '100')
+    const body: any = buildAlphaBusinessOrderBody({ invoiceKey: PL, merchant: 'OpenRouter, Inc', pricing, test: false })
+    const asRow = { source: { chainId: '8453', tokenSymbol: 'USDC', amount: body.source.amount }, metadata: body.metadata }
+    expect(pendingPricingMatches(asRow, pricing)).toBe(true)
+  })
+
+  it('leaves an existing order alone', async () => {
+    intents.lookup = () => new Response(JSON.stringify({ id: 'x', status: 'payment_unpaid' }), { status: 200 })
+    expect((await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), makeEnv())).status).toBe(200)
+    expect(intents.creates).toHaveLength(0)
+  })
+
+  it('treats a concurrent create (orderIdConflict) as the order existing', async () => {
+    intents.create = () => new Response(JSON.stringify({ error: { code: 'orderIdConflict' } }), { status: 409 })
+    const env = makeEnv()
+    expect((await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)).status).toBe(200)
+    expect(await (env.MPP_STORE as any).get(alphaOrderMarkerKey(PL))).toBe('1')
+  })
+
+  it.each([
+    ['lookup fails', () => { intents.lookup = () => new Response('boom', { status: 500 }) }],
+    ['a non-intents 404', () => { intents.lookup = () => new Response(JSON.stringify({ code: 'NOT_FOUND' }), { status: 404 }) }],
+    ['create fails', () => { intents.create = () => new Response('{}', { status: 500 }) }],
+  ])('fails closed when the %s: no address shown, and the next read retries', async (_n, arrange) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    arrange()
+    const env = makeEnv()
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)
+    expect(r.status).toBe(502)
+    expect(await r.text()).not.toContain('TQ6s')
+    intents.lookup = undefined
+    intents.create = undefined
+    expect((await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)).status).toBe(200)
+  })
+
+  it('does not create an order when the alpha refuses or the link dies first', async () => {
+    up.reply = (body) => body.network ? new Response(JSON.stringify({ error: 'alpha_disabled' }), { status: 403 }) : null
+    expect((await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), makeEnv())).status).toBe(404)
+    up.reply = undefined
+    quoteLinkId = SESSION
+    linkExpiresAt = '2026-10-27T10:30:00.000Z'
+    expect((await handleTronTonAlphaOption(optionReq({ payment_id: SESSION, network: 'tron', token: 'USDT' }), makeEnv())).status).toBe(422)
+    expect(intents.creates).toHaveLength(0)
+  })
+})
+
+describe('tron-ton-alpha option: internal rozotest_ invoices', () => {
+  it('accepts a signed test id: amount from the id, no Coinbase quote or expiry, test order marked', async () => {
+    const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef12')
+    const env = makeEnv()
+    const r: any = await (await handleTronTonAlphaOption(optionReq({ payment_id: id, network: 'ton', token: 'USDT' }), env)).json()
+    expect(r.ok).toBe(true)
+    expect(r.linkId).toBe(id)
+    expect(r.linkExpiresAt).toBeNull()
+    const call = up.calls.find((c) => c.body.network)!
+    expect(call.body.merchantOrderId).toBe(id)
+    expect(call.body.baseServiceUsd).toBe(1)
+    expect(intents.creates[0].orderId).toBe(id)
+    expect(intents.creates[0].metadata.testMode).toBe(true)
+    const fetched = (globalThis.fetch as any).mock.calls.map((c: any[]) => String(typeof c[0] === 'string' ? c[0] : c[0].url))
+    expect(fetched.some((u: string) => u.includes('/quote-invoice') || u.includes('payments.coinbase.com'))).toBe(false)
+  })
+
+  it('rejects an unsigned or tampered test id before any upstream call', async () => {
+    const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef12')
+    const tampered = id.replace('rozotest_100_', 'rozotest_900_')
+    for (const bad of [tampered, 'rozotest_100_abcdef12_0000000000000000']) {
+      const r = await handleTronTonAlphaOption(optionReq({ payment_id: bad, network: 'tron', token: 'TRX' }), makeEnv())
+      expect(r.status).toBe(400)
+    }
+    const noSecret = await handleTronTonAlphaOption(optionReq({ payment_id: id, network: 'tron', token: 'TRX' }), makeEnv({ ROZO_TEST_LINK_SECRET: undefined } as Partial<Env>))
+    expect(noSecret.status).toBe(400)
+    expect(up.calls).toHaveLength(0)
+    expect(intents.creates).toHaveLength(0)
   })
 })

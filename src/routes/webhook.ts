@@ -1,5 +1,6 @@
 import type { Env } from '../index'
 import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, isTestPaymentId } from './native-sources'
+import { isAlphaInvoice } from './tron-ton-alpha-order'
 import { isBitrefillOrderId } from './bitrefill-invoice'
 import { ROZO_INTENTS_BASE, intentsReadBase } from './intents-base'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
@@ -767,7 +768,14 @@ export async function settleCoinbaseEvent(
   // payout landed (the same point a real invoice is paid for certain).
   // Test orders never alert: they print one order id + status line instead.
   if (containsTestPaymentId(plId)) {
-    if (eventType === 'payment_payout_completed') {
+    // A TRON / TON alpha order never reaches a payout (no hub payout by
+    // design): its payment_payin_completed is the settlement point, the same
+    // event a real alpha invoice is paid on. Only invoices /option offered
+    // the alpha for (tron-ton-alpha-order.ts marker) close here.
+    const closesTest =
+      eventType === 'payment_payout_completed' ||
+      (eventType === 'payment_payin_completed' && (await isAlphaInvoice(env, plId)))
+    if (closesTest) {
       rec.status = 'test_settled'
       rec.events.push({ kind: 'test_settled', at: new Date().toISOString() })
     }
