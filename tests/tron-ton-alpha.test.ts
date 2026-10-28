@@ -389,9 +389,17 @@ describe('tron-ton-alpha option: the invoice business order (delivery gap, 2026-
     expect(intents.creates).toHaveLength(0)
   })
 
-  it('treats a concurrent create (orderIdConflict) as the order existing', async () => {
+  it('after an orderIdConflict, shows instructions only once the winning order is re-read (codex P1)', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
     intents.create = () => new Response(JSON.stringify({ error: { code: 'orderIdConflict' } }), { status: 409 })
+    // the concurrent create rolled back: still missing on the re-read
     const env = makeEnv()
+    const lost = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)
+    expect(lost.status).toBe(502)
+    expect(await (env.MPP_STORE as any).get(alphaOrderMarkerKey(PL))).toBeNull()
+    // the concurrent create committed: found on the re-read
+    let n = 0
+    intents.lookup = () => (n++ % 2 === 1 ? new Response(JSON.stringify({ id: 'x', status: 'payment_unpaid' }), { status: 200 }) : null)
     expect((await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)).status).toBe(200)
     expect(await (env.MPP_STORE as any).get(alphaOrderMarkerKey(PL))).toBe('1')
   })

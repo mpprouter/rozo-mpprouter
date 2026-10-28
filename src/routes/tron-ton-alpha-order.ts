@@ -36,8 +36,7 @@ import { withForwardedClientHint } from './client-hint-forward'
 
 const ORDER_TIMEOUT_MS = 8_000
 // Set once the order is known to exist; later polls of the same invoice skip
-// the lookup. Also read by the webhook to close alpha test invoices on
-// payment_payin_completed (alpha orders never reach a payout).
+// the lookup. A cache only: a missing marker just costs one more lookup.
 const ORDER_MARKER_TTL_S = 2 * 24 * 60 * 60
 
 export function alphaOrderMarkerKey(invoiceKey: string): string {
@@ -127,17 +126,15 @@ export async function ensureAlphaBusinessOrder(
   }
   // A concurrent create (another tab, or the main checkout) took the orderId:
   // the order exists, which is all this needs.
+  // Re-read it rather than trusting the 409: payment-api also answers
+  // orderIdConflict for a create still in flight that may yet roll back.
   const text = await res.text().catch(() => '')
   if (res.status === 409 && /orderIdConflict/i.test(text)) {
+    const again = await lookupIntentsOrder(env, OPENROUTER_APP_ID, a.invoiceKey, AbortSignal.timeout(ORDER_TIMEOUT_MS))
+    if (again.state !== 'found') return { ok: false, reason: 'create_failed' }
     await mark()
     return { ok: true, state: 'raced' }
   }
   console.warn('[tron-ton-alpha] business order create refused', res.status)
   return { ok: false, reason: 'create_failed' }
-}
-
-/** True once /option ensured this invoice's order (alpha was offered for it). */
-export async function isAlphaInvoice(env: Env, invoiceKey: string): Promise<boolean> {
-  const v = await env.MPP_STORE.get(alphaOrderMarkerKey(invoiceKey)).catch(() => null)
-  return v !== null
 }
