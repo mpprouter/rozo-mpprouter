@@ -84,6 +84,12 @@ const DECIMAL_RE = /^(0|[1-9][0-9]*)(\.[0-9]+)?$/
 // v3 payment target networks that mean Base mainnet (exact match, lowercased).
 const V3_BASE_NETWORKS = new Set(['payment_target_network_base', 'base'])
 
+type Obj = Record<string, unknown>
+
+function asObj(v: unknown): Obj | undefined {
+  return v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Obj) : undefined
+}
+
 function fail(code: RewardBindingErrorCode, message: string): never {
   throw new RewardBindingError(code, message)
 }
@@ -203,15 +209,15 @@ export function decimalToAtomicStrict(value: unknown, decimals: number, label: s
  * Strict: every field the fingerprint needs must be present and well formed.
  */
 export function rewardBindingInputFromCoinbase(payload: unknown): RewardBindingInput {
-  if (!payload || typeof payload !== 'object') fail('missing_field', 'payload is required')
-  const p = payload as Record<string, any>
+  const p = asObj(payload)
+  if (!p) fail('missing_field', 'payload is required')
   if (typeof p.paymentSessionId === 'string') {
     const asset = requireString(p.asset, 'asset')
     if (asset.toLowerCase() !== 'usdc' && asset.toLowerCase() !== 'usd') {
       fail('unsupported_currency', 'payment session asset must be USDC')
     }
-    const wallet = p.target?.paymentTargetWallet
-    if (!wallet || typeof wallet !== 'object') fail('invalid_target', 'payment session has no paymentTargetWallet')
+    const wallet = asObj(asObj(p.target)?.paymentTargetWallet)
+    if (!wallet) fail('invalid_target', 'payment session has no paymentTargetWallet')
     const network = requireString(wallet.network, 'paymentTargetWallet.network')
     if (!V3_BASE_NETWORKS.has(network.toLowerCase())) {
       fail('unsupported_network', 'payment session does not target Base mainnet')
@@ -223,29 +229,35 @@ export function rewardBindingInputFromCoinbase(payload: unknown): RewardBindingI
       usdc_atomic: decimalToAtomicStrict(p.amount, 6, 'amount'),
       chain_id: BASE_CHAIN_ID,
       token_address: BASE_USDC,
-      target_binding: [network, wallet.address],
+      target_binding: [network, wallet.address as string],
     }
   }
   if (typeof p.id === 'string') {
-    const currency = requireString(p.fiat?.currency, 'fiat.currency')
+    const fiat = asObj(p.fiat)
+    const currency = requireString(fiat?.currency, 'fiat.currency')
     if (currency.toLowerCase() !== 'usd') fail('unsupported_currency', 'payment link fiat must be USD')
     if (typeof p.networkId !== 'number') fail('missing_field', 'networkId is required')
+    // Non-string fields are passed through and rejected by computeRewardBinding.
     return {
       provider_family: 'coinbase_v1',
       invoice_key: p.id,
-      usd_cents: decimalToAtomicStrict(p.fiat?.amount, 2, 'fiat.amount'),
+      usd_cents: decimalToAtomicStrict(fiat?.amount, 2, 'fiat.amount'),
       usdc_atomic: decimalToAtomicStrict(p.maxAmount, 6, 'maxAmount'),
       chain_id: p.networkId,
-      token_address: p.token,
-      target_binding: [p.contractAddress, p.nonce],
+      token_address: p.token as string,
+      target_binding: [p.contractAddress as string, p.nonce as string],
     }
   }
   fail('missing_field', 'payload is neither a v1 payment link nor a v3 payment session')
 }
 
 /** Fingerprint straight from a raw Coinbase payload. */
-export async function rewardBindingFromCoinbase(payload: unknown): Promise<RewardBinding> {
-  return computeRewardBinding(rewardBindingInputFromCoinbase(payload))
+export function rewardBindingFromCoinbase(payload: unknown): Promise<RewardBinding> {
+  try {
+    return computeRewardBinding(rewardBindingInputFromCoinbase(payload))
+  } catch (e) {
+    return Promise.reject(e)
+  }
 }
 
 export interface RewardPayability {
@@ -261,7 +273,7 @@ export interface RewardPayability {
  *   v3: status === PAYMENT_SESSION_STATUS_CREATED and expiresAt in the future
  */
 export function rewardPayability(payload: unknown, nowMs: number): RewardPayability {
-  const p = (payload ?? {}) as Record<string, any>
+  const p = asObj(payload) ?? {}
   let expMs: number
   if (typeof p.paymentSessionId === 'string') {
     expMs = typeof p.expiresAt === 'string' ? Date.parse(p.expiresAt) : NaN
