@@ -16,6 +16,7 @@
 // Endpoints (all X-Internal-Key: UPI_INTERNAL_KEY, never browser-facing):
 //   POST /api/invoice/resolve
 //   POST /api/invoice/verified-pay-in        (+ X-Signature, X-Idempotency-Key)
+//   POST /api/invoice/verified-funding       (v2, UPI rewards; same headers)
 //   GET  /api/invoice/fulfillment/<order_id>
 //
 // State machine for a fulfillment (keyed by MuggleLink order_id):
@@ -47,11 +48,12 @@ import {
   type NormalizedInvoice,
 } from './invoice-provider'
 import { casUpdate, casRead } from './stripe-atomic'
-import { claimInvoiceKey } from './invoice-claim'
+import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import {
   FUNDER_WALLET,
   callAgentApiPayInvoice,
   sendInvoiceFailureAlert,
+  type PayInvoiceExpectedBinding,
 } from './webhook'
 import {
   callStripePayInvoice,
@@ -61,6 +63,13 @@ import {
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
 import { checkoutDeliveryPaused } from './checkout-control'
+import {
+  RewardBindingError,
+  UPI_REWARD_BINDING_VERSION,
+  canonicalInteger,
+  rewardBindingFromCoinbase,
+} from '../utils/upi-reward-binding'
+import { verifyInvoiceApproval } from './upi-approval-verify'
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -84,6 +93,56 @@ export interface UpiFulfillmentRecord {
   createdAt: string
   updatedAt: string
   events: Array<{ kind: string; at: string; detail?: unknown }>
+  // ── verified-funding v2 only (absent on v1 records) ──
+  schemaVersion?: 2
+  funding?: V2FundingSummary
+  cashEvidence?: V2CashEvidence | null
+  executionPhase?: ExecutionPhase
+  failureClass?: FailureClass
+  attemptId?: string | null
+  // Why a not_started v2 record is still queued (e.g. eligibility_unavailable).
+  queuedReason?: string | null
+  binding?: V2FrozenBinding | null
+}
+
+// v2 execution bookkeeping (design §5.4 / §6):
+//   not_started → nothing was sent to the executor; only this phase can take
+//                 the execution right (one atomic CAS), or a refusal barrier.
+//   calling     → the executor call has been (or is being) made. A crash here
+//                 is `unknown`: it is never re-called.
+//   accepted    → the executor answered 2xx.
+//   terminal    → a definite outcome (paid, or definite_not_paid).
+export type ExecutionPhase = 'not_started' | 'calling' | 'accepted' | 'terminal'
+export type FailureClass = 'pre_execution_refusal' | 'definite_not_paid' | 'ambiguous' | null
+
+export type V2FundingKind = 'credit_only' | 'mixed' | 'cash_only'
+
+export interface V2FundingSummary {
+  kind: V2FundingKind
+  grossAmountMinor: string
+  creditMicro: string
+  cashMinor: string
+  redemptionId: string | null
+  merchantApprovalId: string | null
+  quoteId: string
+  quoteExpiresAt: string | null
+}
+
+export interface V2CashEvidence {
+  razorpayOrderId: string
+  razorpayPaymentId: string
+  capturedAt: string
+  currency: string
+  amountMinor: string
+}
+
+export interface V2FrozenBinding {
+  version: typeof UPI_REWARD_BINDING_VERSION
+  fingerprint: string
+  amountAtomic: string
+  usdCents: string
+  approvalId: string | null
+  approvalValidUntil: string | null
 }
 
 interface QuoteRecord {
@@ -245,6 +304,9 @@ export function classifyUpiUrl(raw: string): ClassifiedUrl {
 
 export interface LiveInvoice {
   normalized: NormalizedInvoice
+  // Coinbase only: the raw next-api payload the normalized view came from
+  // (the v2 binding fingerprint needs fields normalization drops).
+  raw?: unknown
   // Provider terminal mapping (design §10-6). `success` is the ONLY thing
   // that may ever turn a fulfillment into `paid`.
   terminal: 'success' | 'failure' | null
@@ -288,7 +350,7 @@ export async function fetchLiveInvoice(
       terminal = 'success'
     }
   }
-  return { normalized, terminal }
+  return { normalized, terminal, raw: payment }
 }
 
 // ── Quote records (KV, TTL) ─────────────────────────────────────────────────
@@ -369,11 +431,29 @@ async function transition(
 }
 
 function statusPayload(rec: UpiFulfillmentRecord) {
-  return {
+  const base = {
     state: rec.state,
     provider_final_state: rec.providerFinalState,
     execution_ref: rec.executionRef,
     updated_at: rec.updatedAt,
+  }
+  // v1 records answer exactly as before; v2 adds its execution bookkeeping.
+  if (rec.schemaVersion !== 2) return base
+  return { ...base, ...v2Fields(rec) }
+}
+
+function v2Reason(rec: UpiFulfillmentRecord): string | null {
+  if (rec.state === 'queued') return rec.queuedReason ?? null
+  return rec.failureReason
+}
+
+function v2Fields(rec: UpiFulfillmentRecord) {
+  return {
+    schema_version: 2 as const,
+    execution_phase: rec.executionPhase ?? 'not_started',
+    failure_class: rec.failureClass ?? null,
+    funding_kind: rec.funding?.kind ?? null,
+    reason: v2Reason(rec),
   }
 }
 
@@ -514,6 +594,24 @@ export async function handleUpiResolve(request: Request, env: Env): Promise<Resp
 
 // ── POST /api/invoice/verified-pay-in ───────────────────────────────────────
 
+/**
+ * Read the raw body and verify X-Signature = hex HMAC-SHA256(key, rawBody).
+ * Shared by verified-pay-in (v1) and verified-funding (v2); responses are the
+ * v1 ones, unchanged.
+ */
+async function readSignedBody(request: Request, secret: string): Promise<{ rawBody: string } | Response> {
+  const rawBody = await request.text()
+  const sigHeader = (request.headers.get('x-signature') ?? '').trim().replace(/^sha256=/i, '')
+  if (!/^[0-9a-f]{64}$/i.test(sigHeader)) {
+    return err(401, 'invalid_signature', 'X-Signature must be hex HMAC-SHA256 of the raw body')
+  }
+  const expectedSig = await hmacSha256Hex(secret, rawBody)
+  if (!timingSafeEqual(expectedSig, sigHeader.toLowerCase())) {
+    return err(401, 'invalid_signature', 'X-Signature does not match the body')
+  }
+  return { rawBody }
+}
+
 interface VerifiedPayInBody {
   order_id: string
   provider: UpiProvider
@@ -584,15 +682,9 @@ export async function handleUpiVerifiedPayIn(
   const secret = env.UPI_INTERNAL_KEY as string
 
   // 1. Raw body first — the signature covers the bytes as received.
-  const rawBody = await request.text()
-  const sigHeader = (request.headers.get('x-signature') ?? '').trim().replace(/^sha256=/i, '')
-  if (!/^[0-9a-f]{64}$/i.test(sigHeader)) {
-    return err(401, 'invalid_signature', 'X-Signature must be hex HMAC-SHA256 of the raw body')
-  }
-  const expectedSig = await hmacSha256Hex(secret, rawBody)
-  if (!timingSafeEqual(expectedSig, sigHeader.toLowerCase())) {
-    return err(401, 'invalid_signature', 'X-Signature does not match the body')
-  }
+  const signed = await readSignedBody(request, secret)
+  if (signed instanceof Response) return signed
+  const rawBody = signed.rawBody
 
   // 2. Parse + idempotency-key binding.
   const parsed = parseVerifiedPayInBody(rawBody)
@@ -936,6 +1028,7 @@ export async function confirmWithProvider(
   const rec = await loadFulfillment(env, orderId)
   if (!rec) return null
   if (TERMINAL_STATES.has(rec.state)) return rec
+  if (rec.schemaVersion === 2) return confirmV2WithProvider(env, rec, nowMs)
 
   let payUrl: string | null = null
   if (rec.provider === 'stripe_crypto') {
@@ -1001,6 +1094,663 @@ export async function confirmWithProvider(
   return (await updateFulfillment(env, orderId, (r) => {
     r.providerFinalState = live.normalized.state
   })) ?? rec
+}
+
+// ── POST /api/invoice/verified-funding (v2, UPI rewards) ────────────────────
+//
+// Same internal protocol as verified-pay-in (X-Internal-Key, X-Signature =
+// HMAC of the raw body, X-Idempotency-Key = order_id, raw-body hash replay
+// check) and the same records, claim (`invoice-claim:v1:<invoice_key>`),
+// wallet gate and executor. What v2 adds (design §5.4, §6, §6.1):
+//   - a funding summary (credit_micro / cash_minor) instead of "cash captured"
+//   - a merchant approval check against MuggleLink for any credit spend
+//   - the upi-reward-binding-v1 fingerprint, recomputed from the LIVE payload,
+//     frozen on the record and passed to the signer as expected_binding
+//   - persistent execution_phase / failure_class / attempt_id, so a refusal is
+//     a durable barrier and a crash after the call is never re-called
+// Credit eligibility is Coinbase v1/v3 only; Stripe stays on verified-pay-in.
+
+const V2_PROVIDERS: ReadonlySet<string> = new Set(['coinbase_v1', 'coinbase_v3'])
+const ID_RE = /^[A-Za-z0-9_.:-]{1,128}$/
+
+interface VerifiedFundingBody {
+  order_id: string
+  provider: 'coinbase_v1' | 'coinbase_v3'
+  invoice_key: string
+  quote_id: string
+  quote_expires_at: string | null
+  base_amount_minor: bigint
+  gross_amount_minor: bigint
+  credit_micro: bigint
+  cash_minor: bigint
+  redemption_id: string | null
+  merchant_approval_id: string | null
+  cash_payment: {
+    razorpay_order_id: string
+    razorpay_payment_id: string
+    captured_at: string
+    currency: string
+    amount_minor: bigint
+  } | null
+  kind: V2FundingKind
+}
+
+function intOf(v: unknown, label: string, allowZero: boolean): bigint {
+  // Throws RewardBindingError on anything but a canonical integer.
+  return BigInt(canonicalInteger(v, label, allowZero))
+}
+
+export function parseVerifiedFundingBody(raw: string): VerifiedFundingBody | string {
+  let b: Record<string, unknown>
+  try {
+    b = JSON.parse(raw)
+  } catch {
+    return 'body is not JSON'
+  }
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return 'body must be an object'
+  if (b.schema_version !== 2) return 'schema_version must be 2'
+  const str = (o: Record<string, unknown>, k: string) =>
+    typeof o[k] === 'string' && (o[k] as string).length > 0 ? (o[k] as string) : null
+  const orderId = str(b, 'order_id')
+  if (!orderId || !UUID_RE.test(orderId)) return 'order_id must be a UUID'
+  const provider = str(b, 'provider')
+  if (!provider || !V2_PROVIDERS.has(provider)) return 'provider must be coinbase_v1|coinbase_v3'
+  const invoiceKey = str(b, 'invoice_key')
+  if (!invoiceKey || invoiceKey.length > 200 || !/^[A-Za-z0-9_-]+$/.test(invoiceKey)) return 'invoice_key is invalid'
+  const quoteId = str(b, 'quote_id')
+  if (!quoteId || !/^[0-9a-f]{64}$/.test(quoteId)) return 'quote_id is invalid'
+  let quoteExpiresAt: string | null = null
+  if (b.quote_expires_at !== null) {
+    quoteExpiresAt = str(b, 'quote_expires_at')
+    if (!quoteExpiresAt || !Number.isFinite(Date.parse(quoteExpiresAt))) return 'quote_expires_at must be an ISO timestamp or null'
+  }
+  const f = b.funding as Record<string, unknown> | undefined
+  if (!f || typeof f !== 'object' || Array.isArray(f)) return 'funding is required'
+  let base: bigint, gross: bigint, credit: bigint, cash: bigint
+  try {
+    base = intOf(b.base_amount_minor, 'base_amount_minor', false)
+    gross = intOf(b.gross_amount_minor, 'gross_amount_minor', false)
+    credit = intOf(f.credit_micro, 'funding.credit_micro', true)
+    cash = intOf(f.cash_minor, 'funding.cash_minor', true)
+  } catch (e) {
+    return e instanceof RewardBindingError ? e.message : 'amounts must be integers'
+  }
+  if (gross < base) return 'gross_amount_minor must be >= base_amount_minor'
+  if (gross * 10_000n !== cash * 10_000n + credit) {
+    return 'gross_amount_minor * 10000 must equal cash_minor * 10000 + credit_micro'
+  }
+  const optId = (k: string): string | null | false => {
+    if (f[k] === null || f[k] === undefined) return null
+    return typeof f[k] === 'string' && ID_RE.test(f[k] as string) ? (f[k] as string) : false
+  }
+  const redemptionId = optId('redemption_id')
+  const approvalId = optId('merchant_approval_id')
+  if (redemptionId === false || approvalId === false) return 'funding ids are malformed'
+  if (credit > 0n && (!redemptionId || !approvalId)) {
+    return 'credit funding requires redemption_id and merchant_approval_id'
+  }
+  let cashPayment: VerifiedFundingBody['cash_payment'] = null
+  if (cash === 0n) {
+    if (b.cash_payment !== null) return 'cash_payment must be null when cash_minor is 0'
+    if (credit <= 0n) return 'a zero-cash order must carry credit'
+  } else {
+    const c = b.cash_payment as Record<string, unknown> | null | undefined
+    if (!c || typeof c !== 'object' || Array.isArray(c)) return 'cash_payment is required when cash_minor > 0'
+    const rzpOrder = str(c, 'razorpay_order_id')
+    const rzpPayment = str(c, 'razorpay_payment_id')
+    const capturedAt = str(c, 'captured_at')
+    const currency = str(c, 'currency')
+    if (!rzpOrder || !rzpPayment || !capturedAt || !currency) return 'cash_payment fields are required'
+    if (!/^[A-Z]{3}$/.test(currency)) return 'cash_payment.currency must be an ISO 4217 code'
+    let amount: bigint
+    try {
+      amount = intOf(c.amount_minor, 'cash_payment.amount_minor', false)
+    } catch (e) {
+      return e instanceof RewardBindingError ? e.message : 'cash_payment.amount_minor must be an integer'
+    }
+    // A USD capture must equal the fixed cash share exactly. Other currencies
+    // are provider minor units and are vouched for by MuggleLink's ledger RPC.
+    if (currency === 'USD' && amount !== cash) return 'cash_payment.amount_minor does not match cash_minor'
+    cashPayment = {
+      razorpay_order_id: rzpOrder,
+      razorpay_payment_id: rzpPayment,
+      captured_at: capturedAt,
+      currency,
+      amount_minor: amount,
+    }
+  }
+  return {
+    order_id: orderId,
+    provider: provider as VerifiedFundingBody['provider'],
+    invoice_key: invoiceKey,
+    quote_id: quoteId,
+    quote_expires_at: quoteExpiresAt,
+    base_amount_minor: base,
+    gross_amount_minor: gross,
+    credit_micro: credit,
+    cash_minor: cash,
+    redemption_id: redemptionId,
+    merchant_approval_id: approvalId,
+    cash_payment: cashPayment,
+    kind: credit > 0n ? (cash > 0n ? 'mixed' : 'credit_only') : 'cash_only',
+  }
+}
+
+/** A v2 record that has not entered the executor and carries no outcome. */
+function isV2Open(rec: UpiFulfillmentRecord): boolean {
+  return (
+    rec.schemaVersion === 2 &&
+    rec.state === 'queued' &&
+    (rec.executionPhase ?? 'not_started') === 'not_started' &&
+    (rec.failureClass ?? null) === null
+  )
+}
+
+/** Guarded CAS on a record: `fn` returns false (and must not mutate) to skip. */
+async function casV2(
+  env: Env,
+  orderId: string,
+  fn: (rec: UpiFulfillmentRecord) => boolean,
+): Promise<{ applied: boolean; rec: UpiFulfillmentRecord }> {
+  const out = await casUpdate<{ applied: boolean; rec: UpiFulfillmentRecord | null }>(
+    env,
+    fulfillmentKey(orderId),
+    (raw) => {
+      const rec = parseFulfillment(raw)
+      if (!rec || !fn(rec)) return { op: 'noop', result: { applied: false, rec: parseFulfillment(raw) } }
+      rec.updatedAt = new Date().toISOString()
+      return { op: 'set', value: JSON.stringify(rec), result: { applied: true, rec } }
+    },
+  )
+  if (!out.rec) throw new Error(`upi fulfillment ${orderId} disappeared`)
+  return out as { applied: boolean; rec: UpiFulfillmentRecord }
+}
+
+/**
+ * Persistent pre-execution refusal barrier. Only an open (not_started) record
+ * can take it, through the same CAS that grants the execution right, so a
+ * record that may have executed can never be relabelled "not executed".
+ */
+async function v2Refuse(
+  env: Env,
+  orderId: string,
+  code: string,
+  detail: { providerFinalState?: string | null; extra?: unknown } = {},
+): Promise<{ applied: boolean; rec: UpiFulfillmentRecord }> {
+  return casV2(env, orderId, (r) => {
+    if (!isV2Open(r)) return false
+    r.state = 'failed'
+    r.executionPhase = 'not_started'
+    r.failureClass = 'pre_execution_refusal'
+    r.failureReason = code
+    r.queuedReason = null
+    if (detail.providerFinalState !== undefined) r.providerFinalState = detail.providerFinalState
+    r.events.push({ kind: 'pre_execution_refusal', at: new Date().toISOString(), detail: { code, ...(detail.extra ? { extra: detail.extra } : {}) } })
+    return true
+  })
+}
+
+/** Keep an open record queued with a reason (nothing executed, nothing released). */
+async function v2Queue(env: Env, orderId: string, reason: string, extra?: unknown): Promise<UpiFulfillmentRecord> {
+  const { rec } = await casV2(env, orderId, (r) => {
+    if (!isV2Open(r)) return false
+    r.queuedReason = reason
+    r.events.push({ kind: 'queued', at: new Date().toISOString(), detail: { reason, ...(extra ? { extra } : {}) } })
+    return true
+  })
+  return rec
+}
+
+function v2Response(rec: UpiFulfillmentRecord): Response {
+  const fields = { fulfillment_id: rec.orderId, state: rec.state, ...v2Fields(rec) }
+  if (rec.state === 'failed' && rec.failureClass === 'pre_execution_refusal') {
+    if (rec.failureReason === 'already_claimed') {
+      return json(409, {
+        error: 'already_claimed',
+        message: 'invoice is already being settled by another channel',
+        ...fields,
+      })
+    }
+    return json(422, {
+      error: rec.failureReason ?? 'refused',
+      message: 'refused before execution; this order will never execute',
+      ...fields,
+    })
+  }
+  return json(202, fields)
+}
+
+type V2Gate =
+  | { kind: 'ok'; inv: NormalizedInvoice; binding: V2FrozenBinding }
+  | { kind: 'refuse'; code: string; providerFinalState?: string | null; extra?: unknown }
+  | { kind: 'unavailable'; reason: string; extra?: unknown }
+
+/**
+ * Re-resolve the live invoice and decide whether this order may proceed.
+ * Run before the claim and again right before the executor call. Never
+ * executes anything; a transient failure is `unavailable`, not a refusal.
+ */
+async function v2Gate(
+  env: Env,
+  body: VerifiedFundingBody,
+  frozen: V2FrozenBinding | null | undefined,
+  nowMs: number,
+): Promise<V2Gate> {
+  let live: LiveInvoice
+  try {
+    live = await fetchLiveInvoice(body.provider, body.invoice_key, null, nowMs)
+  } catch (e) {
+    if (e instanceof CoinbaseResolveError && e.kind === 'expired') return { kind: 'refuse', code: 'invoice_gone' }
+    if (e instanceof CoinbaseResolveError && e.kind === 'unsupported') return { kind: 'refuse', code: 'non_usd' }
+    return { kind: 'unavailable', reason: 'provider_unavailable' }
+  }
+  const inv = live.normalized
+  const pfs = inv.state
+  if (inv.invoiceKey !== body.invoice_key) return { kind: 'refuse', code: 'invalid_quote', providerFinalState: pfs }
+  const quote = await computeQuoteId(
+    env.UPI_INTERNAL_KEY as string,
+    body.provider,
+    body.invoice_key,
+    body.base_amount_minor.toString(),
+    inv.validBefore,
+  )
+  const sameExpiry =
+    body.quote_expires_at === null
+      ? inv.validBefore === null
+      : inv.validBefore !== null && Date.parse(body.quote_expires_at) === Date.parse(inv.validBefore)
+  if (!timingSafeEqual(quote, body.quote_id) || !sameExpiry) {
+    return { kind: 'refuse', code: 'invalid_quote', providerFinalState: pfs }
+  }
+  if (inv.fiatAmountMinor !== body.base_amount_minor.toString()) {
+    return { kind: 'refuse', code: 'invoice_changed', providerFinalState: pfs }
+  }
+  if (live.terminal === 'success') return { kind: 'refuse', code: 'already_paid', providerFinalState: pfs }
+  if (!inv.payable) {
+    return { kind: 'refuse', code: 'not_payable', providerFinalState: pfs, extra: { reason: inv.payableReason } }
+  }
+  if (!providersEnabled(env).has(body.provider)) return { kind: 'refuse', code: 'provider_disabled', providerFinalState: pfs }
+
+  let b
+  try {
+    b = await rewardBindingFromCoinbase(live.raw)
+  } catch (e) {
+    if (e instanceof RewardBindingError) {
+      return { kind: 'refuse', code: 'binding_invalid', providerFinalState: pfs, extra: { code: e.code } }
+    }
+    throw e
+  }
+  if (
+    b.provider_family !== body.provider ||
+    b.invoice_key !== body.invoice_key ||
+    b.usd_cents !== inv.fiatAmountMinor ||
+    b.usdc_atomic !== inv.stablecoinAmountAtomic
+  ) {
+    return { kind: 'refuse', code: 'binding_invalid', providerFinalState: pfs }
+  }
+  if (frozen && frozen.fingerprint !== b.fingerprint) {
+    return { kind: 'refuse', code: 'binding_changed', providerFinalState: pfs }
+  }
+
+  let approvalValidUntil: string | null = null
+  if (body.credit_micro > 0n) {
+    const a = await verifyInvoiceApproval(
+      env,
+      {
+        approval_id: body.merchant_approval_id as string,
+        provider: body.provider,
+        invoice_key: body.invoice_key,
+        fingerprint_version: UPI_REWARD_BINDING_VERSION,
+        fingerprint: b.fingerprint,
+        base_minor: Number(body.base_amount_minor),
+        expires_at: inv.validBefore,
+      },
+      nowMs,
+    )
+    if (a.kind === 'unavailable') return { kind: 'unavailable', reason: 'eligibility_unavailable', extra: { detail: a.detail } }
+    if (a.kind === 'refused') return { kind: 'refuse', code: a.reason, providerFinalState: pfs }
+    approvalValidUntil = a.validUntil
+  }
+  return {
+    kind: 'ok',
+    inv,
+    binding: {
+      version: UPI_REWARD_BINDING_VERSION,
+      fingerprint: b.fingerprint,
+      amountAtomic: b.usdc_atomic,
+      usdCents: b.usd_cents,
+      approvalId: body.merchant_approval_id,
+      approvalValidUntil,
+    },
+  }
+}
+
+/** Unset ⇒ 'none'; set but not a positive decimal integer ⇒ 'invalid' (fail closed). */
+function v2CreditLimit(env: Env): bigint | 'none' | 'invalid' {
+  const raw = env.UPI_V2_MAX_CREDIT_MICRO
+  if (raw === undefined || raw === null || raw === '') return 'none'
+  if (typeof raw !== 'string' || !/^[1-9][0-9]{0,17}$/.test(raw)) return 'invalid'
+  return BigInt(raw)
+}
+
+export async function handleUpiVerifiedFunding(
+  request: Request,
+  env: Env,
+  opts: VerifiedPayInOptions = {},
+): Promise<Response> {
+  if (request.method !== 'POST') return err(405, 'method_not_allowed', 'POST only')
+  const unauthorized = checkInternalKey(request, env)
+  if (unauthorized) return unauthorized
+  const signed = await readSignedBody(request, env.UPI_INTERNAL_KEY as string)
+  if (signed instanceof Response) return signed
+  const rawBody = signed.rawBody
+
+  const parsed = parseVerifiedFundingBody(rawBody)
+  if (typeof parsed === 'string') return err(400, 'invalid_body', parsed)
+  const body = parsed
+  const idem = request.headers.get('x-idempotency-key') ?? ''
+  if (idem !== body.order_id) {
+    return err(400, 'idempotency_key_mismatch', 'X-Idempotency-Key must equal order_id')
+  }
+  const bodyHash = await sha256Hex(rawBody)
+  const nowMs = (opts.now ?? Date.now)()
+  const nowIso = new Date(nowMs).toISOString()
+
+  // Create-or-load in one CAS. Same order + same bytes → the existing record
+  // (resumed only if it never left not_started); different bytes → 409.
+  const fresh: UpiFulfillmentRecord = {
+    orderId: body.order_id,
+    provider: body.provider,
+    invoiceKey: body.invoice_key,
+    bodyHash,
+    baseAmountMinor: body.base_amount_minor.toString(),
+    stablecoinAmountAtomic: '',
+    state: 'queued',
+    providerFinalState: null,
+    executionRef: null,
+    failureReason: null,
+    razorpayPaymentId: body.cash_payment?.razorpay_payment_id ?? null,
+    createdAt: nowIso,
+    updatedAt: nowIso,
+    events: [{ kind: 'verified_funding_received', at: nowIso }],
+    schemaVersion: 2,
+    funding: {
+      kind: body.kind,
+      grossAmountMinor: body.gross_amount_minor.toString(),
+      creditMicro: body.credit_micro.toString(),
+      cashMinor: body.cash_minor.toString(),
+      redemptionId: body.redemption_id,
+      merchantApprovalId: body.merchant_approval_id,
+      quoteId: body.quote_id,
+      quoteExpiresAt: body.quote_expires_at,
+    },
+    cashEvidence: body.cash_payment
+      ? {
+          razorpayOrderId: body.cash_payment.razorpay_order_id,
+          razorpayPaymentId: body.cash_payment.razorpay_payment_id,
+          capturedAt: body.cash_payment.captured_at,
+          currency: body.cash_payment.currency,
+          amountMinor: body.cash_payment.amount_minor.toString(),
+        }
+      : null,
+    executionPhase: 'not_started',
+    failureClass: null,
+    attemptId: null,
+    queuedReason: 'received',
+    binding: null,
+  }
+  const created = await casUpdate<{ kind: 'mismatch' } | { kind: 'rec'; rec: UpiFulfillmentRecord }>(
+    env,
+    fulfillmentKey(body.order_id),
+    (raw) => {
+      const cur = parseFulfillment(raw)
+      if (cur) return { op: 'noop', result: cur.bodyHash === bodyHash ? { kind: 'rec', rec: cur } : { kind: 'mismatch' } }
+      return { op: 'set', value: JSON.stringify(fresh), result: { kind: 'rec', rec: fresh } }
+    },
+  )
+  if (created.kind === 'mismatch') {
+    return err(409, 'order_body_mismatch', 'order_id was already submitted with a different body')
+  }
+  if (!isV2Open(created.rec)) return v2Response(created.rec)
+  return runV2(env, body, created.rec, opts, nowMs)
+}
+
+async function runV2(
+  env: Env,
+  body: VerifiedFundingBody,
+  rec: UpiFulfillmentRecord,
+  opts: VerifiedPayInOptions,
+  nowMs: number,
+): Promise<Response> {
+  const orderId = body.order_id
+  let claimed = false
+  const refuse = async (code: string, detail: { providerFinalState?: string | null; extra?: unknown } = {}) => {
+    const out = await v2Refuse(env, orderId, code, detail)
+    // The barrier makes this order permanently non-executing, so a claim it
+    // took can go back (definite pre-payment failure, invoice-claim.ts).
+    if (out.applied && claimed) await releaseInvoiceClaim(env, body.invoice_key, 'upi', orderId)
+    return v2Response(out.rec)
+  }
+
+  // 1. Switches and limits. Fail closed.
+  if (await checkoutDeliveryPaused(env)) return refuse('checkout_paused')
+  if (env.UPI_VERIFIED_FUNDING_V2_ENABLED !== 'true') return refuse('v2_disabled')
+  // Optional extra ceiling on reward credit per order. Unset = no ceiling
+  // beyond what v1 already has (pool balance check, signer limits).
+  const limit = v2CreditLimit(env)
+  if (limit === 'invalid') return refuse('limit_misconfigured')
+  if (limit !== 'none' && body.credit_micro > limit) return refuse('over_credit_limit')
+
+  // 2. Live quote, binding fingerprint and merchant approval.
+  const g1 = await v2Gate(env, body, rec.binding, nowMs)
+  if (g1.kind === 'refuse') return refuse(g1.code, g1)
+  if (g1.kind === 'unavailable') return v2Response(await v2Queue(env, orderId, g1.reason, g1.extra))
+  const frozen = await casV2(env, orderId, (r) => {
+    if (!isV2Open(r)) return false
+    if (r.binding && r.binding.fingerprint !== g1.binding.fingerprint) return false
+    r.binding = g1.binding
+    r.baseAmountMinor = g1.inv.fiatAmountMinor
+    r.stablecoinAmountAtomic = g1.inv.stablecoinAmountAtomic
+    r.queuedReason = 'claiming'
+    r.events.push({ kind: 'binding_frozen', at: new Date().toISOString(), detail: { fingerprint: g1.binding.fingerprint } })
+    return true
+  })
+  if (!frozen.applied) {
+    if (isV2Open(frozen.rec)) return refuse('binding_changed')
+    return v2Response(frozen.rec)
+  }
+
+  // 3. The one cross-channel claim shared with v1, crypto and coupon.
+  const claim = await claimInvoiceKey(env, body.invoice_key, 'upi', orderId, new Date(nowMs))
+  if (!claim.ok) {
+    return refuse('already_claimed', { extra: { holder_channel: claim.holder.channel } })
+  }
+  claimed = true
+
+  // 4. Re-check right before executing: fresh payload, same fingerprint,
+  //    approval still valid (design §6.1).
+  const g2 = await v2Gate(env, body, frozen.rec.binding, nowMs)
+  if (g2.kind === 'refuse') return refuse(g2.code, g2)
+  if (g2.kind === 'unavailable') return v2Response(await v2Queue(env, orderId, g2.reason, g2.extra))
+
+  // 5. Wallet inventory gate, as v1. Unreadable → attempt (executor re-checks).
+  const invoiceAtomic = BigInt(g2.inv.stablecoinAmountAtomic)
+  const balance = (await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)).balance
+  if (balance !== null && balance < invoiceAtomic) {
+    await sendInvoiceFailureAlert(env, {
+      kind: 'failed_insufficient_balance',
+      plId: `${body.invoice_key} (UPI order ${orderId})`,
+      invoiceAtomic,
+      funderBalanceAtomic: balance,
+      failureReason: 'UPI verified-funding refused: funder cannot cover the invoice',
+    })
+    return refuse('insufficient_funder_balance', {
+      extra: { balance: balance.toString(), invoice: invoiceAtomic.toString() },
+    })
+  }
+  if (await checkoutDeliveryPaused(env)) return refuse('checkout_paused')
+
+  // 6. Take the execution right: one CAS, only from not_started.
+  const expected: PayInvoiceExpectedBinding = {
+    version: UPI_REWARD_BINDING_VERSION,
+    invoice_key: body.invoice_key,
+    amount_atomic: g2.binding.amountAtomic,
+    fingerprint: g2.binding.fingerprint,
+  }
+  const attemptId = crypto.randomUUID()
+  const acquired = await casV2(env, orderId, (r) => {
+    if (!isV2Open(r)) return false
+    r.state = 'processing'
+    r.executionPhase = 'calling'
+    r.attemptId = attemptId
+    r.queuedReason = null
+    r.binding = g2.binding
+    r.events.push({ kind: 'execution_started', at: new Date().toISOString(), detail: { attempt_id: attemptId } })
+    return true
+  })
+  if (!acquired.applied) return v2Response(acquired.rec)
+
+  const run = executeCoinbaseV2(env, orderId, attemptId, body.invoice_key, expected, invoiceAtomic)
+  if (opts.ctx) {
+    opts.ctx.waitUntil(run.catch((e) => console.error('[upi-v2] execution error', e instanceof Error ? e.message : String(e))))
+    return v2Response(acquired.rec)
+  }
+  await run
+  return v2Response((await loadFulfillment(env, orderId)) ?? acquired.rec)
+}
+
+function isPreSignBindingMismatch(result: { status: number; body: unknown }): boolean {
+  const b = result.body as Record<string, unknown> | null
+  return (
+    result.status === 422 &&
+    !!b &&
+    typeof b === 'object' &&
+    b.error_code === 'PRE_SIGN_BINDING_MISMATCH' &&
+    b.payment_attempted === false
+  )
+}
+
+async function executeCoinbaseV2(
+  env: Env,
+  orderId: string,
+  attemptId: string,
+  invoiceKey: string,
+  expected: PayInvoiceExpectedBinding,
+  invoiceAtomic: bigint,
+): Promise<void> {
+  const mark = (kind: string, fn: (r: UpiFulfillmentRecord) => void, extra?: unknown) =>
+    casV2(env, orderId, (r) => {
+      if (r.attemptId !== attemptId || r.executionPhase !== 'calling' || TERMINAL_STATES.has(r.state)) return false
+      fn(r)
+      r.events.push({ kind, at: new Date().toISOString(), detail: extra })
+      return true
+    })
+
+  let result: { ok: boolean; status: number; body: unknown }
+  try {
+    result = await callAgentApiPayInvoice(env, invoiceKey, expected)
+  } catch {
+    // The signer MAY have run. Ambiguous → unknown; never re-called.
+    await mark('executor_ambiguous', (r) => {
+      r.state = 'unknown'
+      r.failureClass = 'ambiguous'
+      r.failureReason = 'executor transport error'
+    })
+    return
+  }
+  if (result.ok) {
+    await mark('executor_accepted', (r) => {
+      r.state = 'processing'
+      r.executionPhase = 'accepted'
+      r.executionRef = pickExecutionRef(result.body)
+    }, { status: result.status })
+    await confirmWithProvider(env, orderId)
+    return
+  }
+  if (isPreSignBindingMismatch(result)) {
+    // Trusted, structured downstream answer: refused before any signature or
+    // submission. The only post-call failure that is definite.
+    const out = await mark('pre_sign_binding_mismatch', (r) => {
+      r.state = 'failed'
+      r.executionPhase = 'terminal'
+      r.failureClass = 'definite_not_paid'
+      r.failureReason = 'pre_sign_binding_mismatch'
+    }, { status: result.status })
+    if (out.applied) await releaseInvoiceClaim(env, invoiceKey, 'upi', orderId)
+    return
+  }
+  // Any other post-call answer (4xx/5xx/unknown JSON) cannot rule out a spend.
+  await mark('executor_ambiguous', (r) => {
+    r.state = 'unknown'
+    r.failureClass = 'ambiguous'
+    r.failureReason = `executor status ${result.status}`
+  }, { status: result.status })
+  await sendInvoiceFailureAlert(env, {
+    kind: 'failed_pay_invoice',
+    plId: `${invoiceKey} (UPI order ${orderId})`,
+    invoiceAtomic,
+    funderBalanceAtomic: null,
+    failureReason: `UPI verified-funding: pay-invoice returned ${result.status}; outcome unknown`,
+  })
+}
+
+/**
+ * v2 provider confirmation (observes only, never pays):
+ *   not_started        → only "someone else paid it" ends it (refusal barrier);
+ *                        no staleness auto-fail (eligibility_unavailable waits)
+ *   calling / accepted → provider success = paid; a stale call or any
+ *                        provider failure = unknown/ambiguous, never re-called
+ *   unknown            → provider success = paid
+ */
+async function confirmV2WithProvider(
+  env: Env,
+  rec: UpiFulfillmentRecord,
+  nowMs: number,
+): Promise<UpiFulfillmentRecord> {
+  let live: LiveInvoice | null = null
+  try {
+    live = await fetchLiveInvoice(rec.provider, rec.invoiceKey, null, nowMs)
+  } catch {
+    live = null
+  }
+  const phase = rec.executionPhase ?? 'not_started'
+  if (phase === 'not_started') {
+    if (rec.state === 'queued' && live?.terminal === 'success') {
+      return (await v2Refuse(env, rec.orderId, 'paid_by_other_party', { providerFinalState: live.normalized.state })).rec
+    }
+    return rec
+  }
+  const notTerminal = (r: UpiFulfillmentRecord) => !TERMINAL_STATES.has(r.state) && (r.executionPhase ?? 'not_started') !== 'not_started'
+  if (live?.terminal === 'success') {
+    return (await casV2(env, rec.orderId, (r) => {
+      if (!notTerminal(r)) return false
+      r.state = 'paid'
+      r.executionPhase = 'terminal'
+      r.failureClass = null
+      r.failureReason = null
+      r.providerFinalState = live!.normalized.state
+      r.events.push({ kind: 'provider_confirmed', at: new Date().toISOString() })
+      return true
+    })).rec
+  }
+  const updatedMs = Date.parse(rec.updatedAt)
+  const stale = rec.state === 'processing' && Number.isFinite(updatedMs) && nowMs - updatedMs > PROCESSING_STALE_MS
+  if (live?.terminal === 'failure' || stale) {
+    return (await casV2(env, rec.orderId, (r) => {
+      if (!notTerminal(r) || r.state === 'unknown' || r.updatedAt !== rec.updatedAt) return false
+      r.state = 'unknown'
+      r.failureClass = 'ambiguous'
+      r.failureReason = stale ? 'no provider confirmation after the executor call' : 'provider_terminal_failure'
+      if (live) r.providerFinalState = live.normalized.state
+      r.events.push({ kind: stale ? 'processing_stale' : 'provider_failed', at: new Date().toISOString() })
+      return true
+    })).rec
+  }
+  if (!live) return rec
+  return (await casV2(env, rec.orderId, (r) => {
+    if (r.providerFinalState === live!.normalized.state) return false
+    r.providerFinalState = live!.normalized.state
+    return true
+  })).rec
 }
 
 // ── GET /api/invoice/fulfillment/:order_id ──────────────────────────────────

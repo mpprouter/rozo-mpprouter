@@ -419,9 +419,23 @@ export async function sendInvoiceFailureAlert(
 
 // Shared with the coupon redemption path (routes/coupon.ts) — both flows
 // settle Coinbase links through the same agentapi pay-invoice call.
+/**
+ * Binding the reward (verified-funding v2) path freezes before calling the
+ * signer. pay-invoice re-fetches the provider payload and refuses to sign
+ * (422 PRE_SIGN_BINDING_MISMATCH, payment_attempted:false) unless it matches.
+ * See utils/upi-reward-binding.ts.
+ */
+export interface PayInvoiceExpectedBinding {
+  version: 'upi-reward-binding-v1'
+  invoice_key: string
+  amount_atomic: string
+  fingerprint: string
+}
+
 export async function callAgentApiPayInvoice(
   env: Env,
   plId: string,
+  expectedBinding?: PayInvoiceExpectedBinding,
 ): Promise<{ ok: boolean; status: number; body: any }> {
   // Hard fund-safety guard: a test order is paid by nobody. Thrown (not a
   // soft failure) so no caller can mistake it for a retryable error.
@@ -432,7 +446,10 @@ export async function callAgentApiPayInvoice(
       'content-type': 'application/json',
       'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
     },
-    body: JSON.stringify({ payment_id: plId }),
+    // Legacy callers send exactly { payment_id } (byte-for-byte unchanged).
+    body: JSON.stringify(
+      expectedBinding ? { payment_id: plId, expected_binding: expectedBinding } : { payment_id: plId },
+    ),
   })
   const text = await resp.text()
   let parsed: any = null

@@ -119,6 +119,7 @@ import {
 import {
   handleUpiResolve,
   handleUpiVerifiedPayIn,
+  handleUpiVerifiedFunding,
   handleUpiFulfillmentStatus,
 } from './routes/upi-invoice'
 import { handlePreflight, withCors } from './utils/cors'
@@ -556,6 +557,19 @@ export interface Env {
   // Minimum seconds of validity an invoice must have left at resolve time to
   // be reported payable over UPI. Default 900. Plain var.
   UPI_MIN_VALIDITY_S?: string
+  // ---- UPI rewards: POST /api/invoice/verified-funding (v2) -------------
+  // Master switch for v2. Exactly "true" enables it; anything else refuses
+  // every new v2 order with a persistent pre-execution refusal (fail closed).
+  // Plain var. See routes/upi-invoice.ts.
+  UPI_VERIFIED_FUNDING_V2_ENABLED?: string
+  // Optional per-order ceiling on reward credit spent through v2, in
+  // micro-USD (decimal integer string). Unset ⇒ no extra ceiling (same
+  // limits as v1). Setting it is an operator lever, not a launch gate.
+  UPI_V2_MAX_CREDIT_MICRO?: string
+  // MuggleLink origin for the internal merchant-approval check
+  // (POST /api/internal/rewards/verify-invoice-approval), https only. Unset ⇒
+  // approval is unavailable and credit orders stay queued. Plain var.
+  UPI_MUGGLELINK_BASE_URL?: string
 
   // Caller-side daily-spend cap for Stripe fulfillment, in whole USD (e.g.
   // "200"). The webhook reserves against this ledger BEFORE calling pay-invoice
@@ -1245,6 +1259,9 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       }
       if (url.pathname === '/api/invoice/verified-pay-in') {
         return handleUpiVerifiedPayIn(request, env, { ctx })
+      }
+      if (url.pathname === '/api/invoice/verified-funding') {
+        return handleUpiVerifiedFunding(request, env, { ctx })
       }
       const upiStatusMatch = url.pathname.match(/^\/api\/invoice\/fulfillment\/([^/]+)$/)
       if (upiStatusMatch) {
