@@ -493,6 +493,8 @@ describe('verified-funding: eligibility_unavailable keeps the order queued', () 
     ['5xx', { status: 502, body: {} }],
     ['401 (signature/replay)', { status: 401, body: { error: 'unauthorized' } }],
     ['non-JSON / wrong approval id', { status: 200, body: { approval_id: 'other', approved: true } }],
+    ['approved but reason revoked', { status: 200, body: { approval_id: 'appr_1', approved: true, reason: 'revoked', valid_until: new Date(Date.now() + 3_600_000).toISOString() } }],
+    ['approved without valid_until', { status: 200, body: { approval_id: 'appr_1', approved: true, reason: 'ok' } }],
   ] as Array<[string, Answer]>) {
     it(`${label}: queued, not executed, not refused; a later replay proceeds once`, async () => {
       const env = makeEnv()

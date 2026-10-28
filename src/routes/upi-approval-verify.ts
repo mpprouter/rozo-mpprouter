@@ -123,13 +123,20 @@ export async function verifyInvoiceApproval(
   if (!body.approved) {
     return { kind: 'refused', reason: `merchant_not_approved:${reason}` }
   }
-  const validUntil = typeof body.valid_until === 'string' ? body.valid_until : null
-  if (validUntil !== null) {
-    const ms = Date.parse(validUntil)
-    if (!Number.isFinite(ms)) {
-      return { kind: 'unavailable', detail: 'approval valid_until is unparseable' }
-    }
-    if (ms <= nowMs) return { kind: 'refused', reason: 'merchant_not_approved:expired' }
+  // An approval must be internally consistent: reason 'ok' and a parseable
+  // future valid_until. Anything else is not trusted as approval (kept
+  // queued as unavailable, never executed).
+  if (body.reason !== 'ok') {
+    return { kind: 'unavailable', detail: 'approval verification approved without reason ok' }
   }
+  const validUntil = typeof body.valid_until === 'string' ? body.valid_until : null
+  if (validUntil === null) {
+    return { kind: 'unavailable', detail: 'approval verification approved without valid_until' }
+  }
+  const ms = Date.parse(validUntil)
+  if (!Number.isFinite(ms)) {
+    return { kind: 'unavailable', detail: 'approval valid_until is unparseable' }
+  }
+  if (ms <= nowMs) return { kind: 'refused', reason: 'merchant_not_approved:expired' }
   return { kind: 'approved', approvalId: req.approval_id, validUntil }
 }
