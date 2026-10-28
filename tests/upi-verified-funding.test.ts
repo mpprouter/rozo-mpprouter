@@ -416,6 +416,9 @@ describe('verified-funding: persistent pre-execution refusals', () => {
     world.approvalCalls.length = 0
     world.payCalls.length = 0
 
+    const envBad = makeEnv({ UPI_V2_MAX_CREDIT_MICRO: '10 dollars' })
+    await expectBarrier(envBad, await fund(envBad, creditBody(await quote(envBad, PS_URL))), 'limit_misconfigured')
+
     const env3 = makeEnv({ UPI_V2_MAX_CREDIT_MICRO: '11129999' })
     await expectBarrier(env3, await fund(env3, creditBody(await quote(env3, PS_URL))), 'over_credit_limit')
     expect(world.approvalCalls.length).toBe(0)

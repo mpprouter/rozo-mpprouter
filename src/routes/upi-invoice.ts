@@ -1424,9 +1424,11 @@ async function v2Gate(
   }
 }
 
-function v2CreditLimit(env: Env): bigint | null {
+/** Unset ⇒ 'none'; set but not a positive decimal integer ⇒ 'invalid' (fail closed). */
+function v2CreditLimit(env: Env): bigint | 'none' | 'invalid' {
   const raw = env.UPI_V2_MAX_CREDIT_MICRO
-  if (typeof raw !== 'string' || !/^[1-9][0-9]{0,17}$/.test(raw)) return null
+  if (raw === undefined || raw === null || raw === '') return 'none'
+  if (typeof raw !== 'string' || !/^[1-9][0-9]{0,17}$/.test(raw)) return 'invalid'
   return BigInt(raw)
 }
 
@@ -1535,7 +1537,8 @@ async function runV2(
   // Optional extra ceiling on reward credit per order. Unset = no ceiling
   // beyond what v1 already has (pool balance check, signer limits).
   const limit = v2CreditLimit(env)
-  if (limit !== null && body.credit_micro > limit) return refuse('over_credit_limit')
+  if (limit === 'invalid') return refuse('limit_misconfigured')
+  if (limit !== 'none' && body.credit_micro > limit) return refuse('over_credit_limit')
 
   // 2. Live quote, binding fingerprint and merchant approval.
   const g1 = await v2Gate(env, body, rec.binding, nowMs)
