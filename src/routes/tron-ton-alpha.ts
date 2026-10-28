@@ -370,7 +370,14 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   // TON: the USDT jetton master in wallet form for the transfer link.
   const tokenIdentity = typeof data.tokenIdentity === 'string' ? data.tokenIdentity : ''
   const tokenIdentityDisplay = option.network === 'ton' ? tonRawToFriendly(tokenIdentity, true) : tokenIdentity || null
-  const address = typeof data.receivingAddress === 'string' ? data.receivingAddress : ''
+  // TON: upstream sends the wallet form in receivingAddress and the canonical
+  // raw form in receivingAddressRaw (rozo-intents-api #854). This route
+  // returns the raw form and derives the wallet form itself, so read the raw
+  // one; an older upstream that sent raw in receivingAddress still works.
+  const rawAddress = option.network === 'ton' && typeof data.receivingAddressRaw === 'string'
+    ? data.receivingAddressRaw
+    : data.receivingAddress
+  const address = typeof rawAddress === 'string' ? rawAddress : ''
   const ref = data.paymentReference == null ? null : String(data.paymentReference)
   const expiresAt = typeof data.expiresAt === 'string' ? data.expiresAt : ''
   const addressDisplay = option.network === 'ton' ? tonRawToFriendly(address) : address

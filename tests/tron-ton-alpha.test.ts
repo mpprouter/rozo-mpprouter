@@ -73,6 +73,7 @@ interface FakeUpstream {
 }
 
 let up: FakeUpstream
+let legacyTonShape = false
 let quoteLinkId = PL
 let quoteStatus = 200
 let linkExpiresAt: string | null = null
@@ -105,7 +106,10 @@ function fakeAllocate(body: any): Response {
     orderId: body.merchantOrderId, alpha: true, reused, orderState: 'open', expired: false,
     chainId: body.network === 'ton' ? '1600' : '728126428', network: body.network, tokenSymbol: body.token,
     tokenIdentity: body.network === 'ton' ? '0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe' : (body.token === 'TRX' ? 'native' : 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t'), tokenDecimals: 6, displayDecimals: body.token === 'TRX' ? 1 : 2,
-    receivingAddress: body.network === 'ton' ? TON_RAW : TRON_ADDR,
+    // Production (rozo-intents-api #854) sends the TON wallet form here and
+    // the raw form in receivingAddressRaw; legacyTonShape sends raw here.
+    receivingAddress: body.network === 'ton' ? (legacyTonShape ? TON_RAW : 'UQDA3cWalletFormNotRawxxxxxxxxxxxxxxxxxxxxxxxxx') : TRON_ADDR,
+    ...(body.network === 'ton' && !legacyTonShape ? { receivingAddressRaw: TON_RAW } : {}),
     expectedAmount: opt.expectedAmount, expectedAmountAtomic: String(Math.round(Number(opt.expectedAmount) * 1e6)), paymentReference: opt.ref,
     grossUsd: opt.gross.toFixed(6), expiresAt: '2026-10-27T11:00:00.000Z', serverTime: firstQuote,
     notice: 'Alpha: payment is recorded and verified; top-up delivery is not automatic yet.',
@@ -117,6 +121,7 @@ beforeEach(() => {
   ;(fakeAllocate as any).orders = new Map()
   ;(fakeAllocate as any).seq = 0
   up = { calls: [] }
+  legacyTonShape = false
   intents = { lookups: [], creates: [] }
   quoteLinkId = PL
   quoteStatus = 200
@@ -459,5 +464,18 @@ describe('tron-ton-alpha option: internal rozotest_ invoices', () => {
     expect(noSecret.status).toBe(400)
     expect(up.calls).toHaveLength(0)
     expect(intents.creates).toHaveLength(0)
+  })
+})
+
+
+describe('tron-ton-alpha option: TON address forms from upstream', () => {
+  it('reads receivingAddressRaw (production shape) and still accepts a raw receivingAddress', async () => {
+    for (const legacy of [false, true]) {
+      legacyTonShape = legacy
+      const r: any = await (await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'ton', token: 'USDT' }), makeEnv())).json()
+      expect(r.ok).toBe(true)
+      expect(r.receivingAddress).toBe(TON_RAW)
+      expect(r.receivingAddressDisplay).toBe('UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI')
+    }
   })
 })
