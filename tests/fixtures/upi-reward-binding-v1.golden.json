@@ -1,0 +1,439 @@
+{
+  "version": "upi-reward-binding-v1",
+  "description": "Golden fixtures for upi-reward-binding-v1 (docs/design/20261028-upi-rewards-implementation.zh.md section 6). fingerprint = sha256 hex of UTF-8 JSON.stringify([version, provider_family, invoice_key, usd_cents, usdc_atomic, chain_id, lowercase token_address, target_binding_json]). Shared verbatim by MPP Router, shawn-local-skills pay-invoice and MuggleLink.",
+  "cases": [
+    {
+      "name": "v1 mixed-case address and nonce are lowercased",
+      "input": {
+        "provider_family": "coinbase_v1",
+        "invoice_key": "pl_01JABCDEF123",
+        "usd_cents": "1050",
+        "usdc_atomic": "10500000",
+        "chain_id": "8453",
+        "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "target_binding": [
+          "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+          "0xABABABABABABABABABABABABABABABAB0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        ]
+      },
+      "expected": {
+        "canonical_json": "[\"upi-reward-binding-v1\",\"coinbase_v1\",\"pl_01JABCDEF123\",\"1050\",\"10500000\",\"8453\",\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"[\\\"0xabcdef0123456789abcdef0123456789abcdef01\\\",\\\"0xabababababababababababababababab0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\\\"]\"]",
+        "fingerprint": "d8fafacabbcd1ee5e65391046a24168decd965eae2f9035d2ba54ac02e875d9a"
+      }
+    },
+    {
+      "name": "v1 minimum amount, already-lowercase inputs",
+      "input": {
+        "provider_family": "coinbase_v1",
+        "invoice_key": "pl_9",
+        "usd_cents": "100",
+        "usdc_atomic": "1000000",
+        "chain_id": "8453",
+        "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "target_binding": [
+          "0xabcdef0123456789abcdef0123456789abcdef01",
+          "0xabababababababababababababababab0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        ]
+      },
+      "expected": {
+        "canonical_json": "[\"upi-reward-binding-v1\",\"coinbase_v1\",\"pl_9\",\"100\",\"1000000\",\"8453\",\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"[\\\"0xabcdef0123456789abcdef0123456789abcdef01\\\",\\\"0xabababababababababababababababab0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\\\"]\"]",
+        "fingerprint": "0102edfb0b71366c01499fbfe8849f6be69c96291b9331feec6c547a6e3dbea8"
+      }
+    },
+    {
+      "name": "v3 Base session, network kept verbatim, address lowercased",
+      "input": {
+        "provider_family": "coinbase_v3",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usd_cents": "1113",
+        "usdc_atomic": "11130000",
+        "chain_id": "8453",
+        "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "target_binding": [
+          "PAYMENT_TARGET_NETWORK_BASE",
+          "0x1234567890AbCdEf1234567890aBcDeF12345678"
+        ]
+      },
+      "expected": {
+        "canonical_json": "[\"upi-reward-binding-v1\",\"coinbase_v3\",\"paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22\",\"1113\",\"11130000\",\"8453\",\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"[\\\"PAYMENT_TARGET_NETWORK_BASE\\\",\\\"0x1234567890abcdef1234567890abcdef12345678\\\"]\"]",
+        "fingerprint": "499bc6ca6dde548f2951d68b404e2c9ab68d34378232a2f810facdcbd64afd6b"
+      }
+    },
+    {
+      "name": "v3 numeric (safe integer) amounts canonicalize to the same decimal strings",
+      "input": {
+        "provider_family": "coinbase_v3",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usd_cents": 136,
+        "usdc_atomic": 1360000,
+        "chain_id": 8453,
+        "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "target_binding": [
+          "PAYMENT_TARGET_NETWORK_BASE",
+          "0x1234567890AbCdEf1234567890aBcDeF12345678"
+        ]
+      },
+      "expected": {
+        "canonical_json": "[\"upi-reward-binding-v1\",\"coinbase_v3\",\"paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22\",\"136\",\"1360000\",\"8453\",\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"[\\\"PAYMENT_TARGET_NETWORK_BASE\\\",\\\"0x1234567890abcdef1234567890abcdef12345678\\\"]\"]",
+        "fingerprint": "ac10246888e75be9d685bcd217fd35407d73c9bf98a85f877a605cd184badb7b"
+      }
+    },
+    {
+      "name": "rejects missing usd_cents",
+      "input": {
+        "provider_family": "coinbase_v3",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usdc_atomic": "11130000",
+        "chain_id": "8453",
+        "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "target_binding": [
+          "PAYMENT_TARGET_NETWORK_BASE",
+          "0x1234567890AbCdEf1234567890aBcDeF12345678"
+        ]
+      },
+      "expected_error": "missing_field"
+    },
+    {
+      "name": "rejects non-integer usd_cents",
+      "input": {
+        "provider_family": "coinbase_v3",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usd_cents": "11.13",
+        "usdc_atomic": "11130000",
+        "chain_id": "8453",
+        "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "target_binding": [
+          "PAYMENT_TARGET_NETWORK_BASE",
+          "0x1234567890AbCdEf1234567890aBcDeF12345678"
+        ]
+      },
+      "expected_error": "invalid_integer"
+    },
+    {
+      "name": "rejects surrounding whitespace in an amount",
+      "input": {
+        "provider_family": "coinbase_v3",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usd_cents": "1113",
+        "usdc_atomic": " 11130000",
+        "chain_id": "8453",
+        "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "target_binding": [
+          "PAYMENT_TARGET_NETWORK_BASE",
+          "0x1234567890AbCdEf1234567890aBcDeF12345678"
+        ]
+      },
+      "expected_error": "invalid_integer"
+    },
+    {
+      "name": "rejects leading zeros",
+      "input": {
+        "provider_family": "coinbase_v1",
+        "invoice_key": "pl_01JABCDEF123",
+        "usd_cents": "01050",
+        "usdc_atomic": "10500000",
+        "chain_id": "8453",
+        "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "target_binding": [
+          "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+          "0xABABABABABABABABABABABABABABABAB0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        ]
+      },
+      "expected_error": "invalid_integer"
+    },
+    {
+      "name": "rejects zero amount",
+      "input": {
+        "provider_family": "coinbase_v1",
+        "invoice_key": "pl_01JABCDEF123",
+        "usd_cents": "1050",
+        "usdc_atomic": "0",
+        "chain_id": "8453",
+        "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "target_binding": [
+          "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+          "0xABABABABABABABABABABABABABABABAB0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        ]
+      },
+      "expected_error": "invalid_integer"
+    },
+    {
+      "name": "rejects a short v3 target address",
+      "input": {
+        "provider_family": "coinbase_v3",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usd_cents": "1113",
+        "usdc_atomic": "11130000",
+        "chain_id": "8453",
+        "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "target_binding": [
+          "PAYMENT_TARGET_NETWORK_BASE",
+          "0xabc"
+        ]
+      },
+      "expected_error": "invalid_address"
+    },
+    {
+      "name": "rejects whitespace in token address",
+      "input": {
+        "provider_family": "coinbase_v1",
+        "invoice_key": "pl_01JABCDEF123",
+        "usd_cents": "1050",
+        "usdc_atomic": "10500000",
+        "chain_id": "8453",
+        "token_address": " 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "target_binding": [
+          "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+          "0xABABABABABABABABABABABABABABABAB0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        ]
+      },
+      "expected_error": "invalid_address"
+    },
+    {
+      "name": "rejects a v1 nonce that is not 32 bytes",
+      "input": {
+        "provider_family": "coinbase_v1",
+        "invoice_key": "pl_01JABCDEF123",
+        "usd_cents": "1050",
+        "usdc_atomic": "10500000",
+        "chain_id": "8453",
+        "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "target_binding": [
+          "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+          "0x1234"
+        ]
+      },
+      "expected_error": "invalid_nonce"
+    },
+    {
+      "name": "rejects a v3 id under the v1 family",
+      "input": {
+        "provider_family": "coinbase_v1",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usd_cents": "1050",
+        "usdc_atomic": "10500000",
+        "chain_id": "8453",
+        "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "target_binding": [
+          "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+          "0xABABABABABABABABABABABABABABABAB0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        ]
+      },
+      "expected_error": "invalid_invoice_key"
+    },
+    {
+      "name": "rejects an unknown provider family",
+      "input": {
+        "provider_family": "stripe_crypto",
+        "invoice_key": "pl_01JABCDEF123",
+        "usd_cents": "1050",
+        "usdc_atomic": "10500000",
+        "chain_id": "8453",
+        "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "target_binding": [
+          "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+          "0xABABABABABABABABABABABABABABABAB0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+        ]
+      },
+      "expected_error": "invalid_provider"
+    },
+    {
+      "name": "rejects a 3-element target binding",
+      "input": {
+        "provider_family": "coinbase_v3",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usd_cents": "1113",
+        "usdc_atomic": "11130000",
+        "chain_id": "8453",
+        "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "target_binding": [
+          "PAYMENT_TARGET_NETWORK_BASE",
+          "0x1234567890AbCdEf1234567890aBcDeF12345678",
+          "x"
+        ]
+      },
+      "expected_error": "invalid_target"
+    },
+    {
+      "name": "rejects whitespace in the v3 network",
+      "input": {
+        "provider_family": "coinbase_v3",
+        "invoice_key": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "usd_cents": "1113",
+        "usdc_atomic": "11130000",
+        "chain_id": "8453",
+        "token_address": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "target_binding": [
+          "PAYMENT_TARGET_NETWORK_BASE ",
+          "0x1234567890AbCdEf1234567890aBcDeF12345678"
+        ]
+      },
+      "expected_error": "invalid_target"
+    }
+  ],
+  "payload_cases": [
+    {
+      "name": "v1 payment link payload",
+      "payload": {
+        "id": "pl_01JABCDEF123",
+        "status": "ACTIVE",
+        "maxAmount": "10.50",
+        "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "networkId": 8453,
+        "preApprovalExpiry": "1893456000",
+        "maxUsage": 1,
+        "usageCount": 0,
+        "contractAddress": "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+        "nonce": "0xABABABABABABABABABABABABABABABAB0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "merchant": {
+          "name": "OpenRouter"
+        },
+        "fiat": {
+          "amount": "10.50",
+          "currency": "USD"
+        }
+      },
+      "expected_fingerprint": "d8fafacabbcd1ee5e65391046a24168decd965eae2f9035d2ba54ac02e875d9a"
+    },
+    {
+      "name": "v1 merchant display name never enters the hash",
+      "payload": {
+        "id": "pl_01JABCDEF123",
+        "status": "ACTIVE",
+        "maxAmount": "10.50",
+        "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "networkId": 8453,
+        "preApprovalExpiry": "1893456000",
+        "maxUsage": 1,
+        "usageCount": 0,
+        "contractAddress": "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+        "nonce": "0xABABABABABABABABABABABABABABABAB0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+        "merchant": {
+          "name": "Totally Different Name"
+        },
+        "fiat": {
+          "amount": "10.50",
+          "currency": "USD"
+        }
+      },
+      "expected_fingerprint": "d8fafacabbcd1ee5e65391046a24168decd965eae2f9035d2ba54ac02e875d9a"
+    },
+    {
+      "name": "v3 payment session payload",
+      "payload": {
+        "paymentSessionId": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "status": "PAYMENT_SESSION_STATUS_CREATED",
+        "amount": "11.13",
+        "asset": "usdc",
+        "expiresAt": "2030-01-01T00:00:00.000Z",
+        "customerDisplay": {
+          "merchantName": "OpenRouter"
+        },
+        "target": {
+          "paymentTargetWallet": {
+            "address": "0x1234567890AbCdEf1234567890aBcDeF12345678",
+            "network": "PAYMENT_TARGET_NETWORK_BASE"
+          }
+        }
+      },
+      "expected_fingerprint": "499bc6ca6dde548f2951d68b404e2c9ab68d34378232a2f810facdcbd64afd6b"
+    },
+    {
+      "name": "v3 swapped target address changes the fingerprint",
+      "payload": {
+        "paymentSessionId": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "status": "PAYMENT_SESSION_STATUS_CREATED",
+        "amount": "11.13",
+        "asset": "usdc",
+        "expiresAt": "2030-01-01T00:00:00.000Z",
+        "customerDisplay": {
+          "merchantName": "OpenRouter"
+        },
+        "target": {
+          "paymentTargetWallet": {
+            "address": "0x9999999999999999999999999999999999999999",
+            "network": "PAYMENT_TARGET_NETWORK_BASE"
+          }
+        }
+      },
+      "expected_fingerprint": "804c2a85ccd2a1368cc3e24e2e69aac554b36194baf5493de01b39acb27b937f"
+    },
+    {
+      "name": "v1 payload without nonce is rejected",
+      "payload": {
+        "id": "pl_01JABCDEF123",
+        "status": "ACTIVE",
+        "maxAmount": "10.50",
+        "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "networkId": 8453,
+        "preApprovalExpiry": "1893456000",
+        "maxUsage": 1,
+        "usageCount": 0,
+        "contractAddress": "0xAbCdEf0123456789aBcDeF0123456789ABCDEF01",
+        "merchant": {
+          "name": "OpenRouter"
+        },
+        "fiat": {
+          "amount": "10.50",
+          "currency": "USD"
+        }
+      },
+      "expected_error": "missing_field"
+    },
+    {
+      "name": "v3 payload without a target wallet is rejected",
+      "payload": {
+        "paymentSessionId": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "status": "PAYMENT_SESSION_STATUS_CREATED",
+        "amount": "11.13",
+        "asset": "usdc",
+        "expiresAt": "2030-01-01T00:00:00.000Z",
+        "customerDisplay": {
+          "merchantName": "OpenRouter"
+        },
+        "target": {}
+      },
+      "expected_error": "invalid_target"
+    },
+    {
+      "name": "v3 payload with sub-cent amount is rejected",
+      "payload": {
+        "paymentSessionId": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "status": "PAYMENT_SESSION_STATUS_CREATED",
+        "amount": "11.135",
+        "asset": "usdc",
+        "expiresAt": "2030-01-01T00:00:00.000Z",
+        "customerDisplay": {
+          "merchantName": "OpenRouter"
+        },
+        "target": {
+          "paymentTargetWallet": {
+            "address": "0x1234567890AbCdEf1234567890aBcDeF12345678",
+            "network": "PAYMENT_TARGET_NETWORK_BASE"
+          }
+        }
+      },
+      "expected_error": "invalid_amount"
+    },
+    {
+      "name": "v3 non-Base target network is rejected",
+      "payload": {
+        "paymentSessionId": "paymentSession_a5306b93-e4b7-4c28-8799-f991da38bf22",
+        "status": "PAYMENT_SESSION_STATUS_CREATED",
+        "amount": "11.13",
+        "asset": "usdc",
+        "expiresAt": "2030-01-01T00:00:00.000Z",
+        "customerDisplay": {
+          "merchantName": "OpenRouter"
+        },
+        "target": {
+          "paymentTargetWallet": {
+            "address": "0x1234567890AbCdEf1234567890aBcDeF12345678",
+            "network": "PAYMENT_TARGET_NETWORK_ETHEREUM"
+          }
+        }
+      },
+      "expected_error": "unsupported_network"
+    }
+  ]
+}
