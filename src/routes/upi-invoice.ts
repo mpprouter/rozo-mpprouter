@@ -1532,9 +1532,10 @@ async function runV2(
   // 1. Switches and limits. Fail closed.
   if (await checkoutDeliveryPaused(env)) return refuse('checkout_paused')
   if (env.UPI_VERIFIED_FUNDING_V2_ENABLED !== 'true') return refuse('v2_disabled')
+  // Optional extra ceiling on reward credit per order. Unset = no ceiling
+  // beyond what v1 already has (pool balance check, signer limits).
   const limit = v2CreditLimit(env)
-  if (limit === null) return refuse('limit_not_configured')
-  if (body.credit_micro > limit) return refuse('over_credit_limit')
+  if (limit !== null && body.credit_micro > limit) return refuse('over_credit_limit')
 
   // 2. Live quote, binding fingerprint and merchant approval.
   const g1 = await v2Gate(env, body, rec.binding, nowMs)

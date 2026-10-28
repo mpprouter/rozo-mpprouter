@@ -562,9 +562,9 @@ export interface Env {
   // every new v2 order with a persistent pre-execution refusal (fail closed).
   // Plain var. See routes/upi-invoice.ts.
   UPI_VERIFIED_FUNDING_V2_ENABLED?: string
-  // Per-order ceiling on reward credit spent through v2, in micro-USD
-  // (decimal integer string). Unset/invalid ⇒ v2 refuses (fail closed). No
-  // default: the value is a founder-approved number. Plain var.
+  // Optional per-order ceiling on reward credit spent through v2, in
+  // micro-USD (decimal integer string). Unset ⇒ no extra ceiling (same
+  // limits as v1). Setting it is an operator lever, not a launch gate.
   UPI_V2_MAX_CREDIT_MICRO?: string
   // MuggleLink origin for the internal merchant-approval check
   // (POST /api/internal/rewards/verify-invoice-approval), https only. Unset ⇒

@@ -402,14 +402,19 @@ describe('verified-funding: persistent pre-execution refusals', () => {
     await expectBarrier(env, await fund(env, b), 'v2_disabled')
   })
 
-  it('checkout pause, missing limit and over-limit credit refuse before anything', async () => {
+  it('checkout pause and over-limit credit refuse before anything; an unset limit is no limit', async () => {
     const env = makeEnv()
     const q = await quote(env, PS_URL)
     await stopCheckout(env, { reason: 'test', actor: 'test' } as any)
     await expectBarrier(env, await fund(env, creditBody(q)), 'checkout_paused')
 
     const env2 = makeEnv({ UPI_V2_MAX_CREDIT_MICRO: undefined })
-    await expectBarrier(env2, await fund(env2, creditBody(await quote(env2, PS_URL))), 'limit_not_configured')
+    const r2 = await fund(env2, creditBody(await quote(env2, PS_URL)))
+    expect(r2.status).toBe(202)
+    expect(r2.body.failure_class).toBeNull()
+    expect(world.payCalls.length).toBe(1)
+    world.approvalCalls.length = 0
+    world.payCalls.length = 0
 
     const env3 = makeEnv({ UPI_V2_MAX_CREDIT_MICRO: '11129999' })
     await expectBarrier(env3, await fund(env3, creditBody(await quote(env3, PS_URL))), 'over_credit_limit')
