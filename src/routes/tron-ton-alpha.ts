@@ -34,6 +34,9 @@ import { normalizePayInvoiceBody } from './pay-invoice-admin'
 import { resolveCheckoutPricing, formatUsdcAtomic, parseUsdcAtomic } from './checkout-web-pricing'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { resolveCoinbaseLinkExpiry } from './create-invoice'
+import { isTestPaymentId, TEST_MERCHANT_NAME, verifyTestPaymentId } from './native-sources'
+import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
+import { forwardedClientHintHeader } from './client-hint-forward'
 
 export const TRON_TON_ALPHA_CAPABILITY_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/capability'
 export const TRON_TON_ALPHA_OPTION_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/option'
@@ -278,45 +281,65 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     return fail(400, 'UNSUPPORTED_INVOICE', 'TRON / TON payments support Coinbase payment links only.')
   }
 
+  // Internal test invoice (rozotest_<cents>_<nonce>_<sig>, signed with
+  // ROZO_TEST_LINK_SECRET): the amount comes from the signed id, there is no
+  // Coinbase link to quote or expire, and the router's fund guard keeps it
+  // away from the funder and Coinbase (webhook.ts closes it as test_settled).
+  const testId = 'payment_id' in normalized && isTestPaymentId(normalized.payment_id)
+    ? String(normalized.payment_id)
+    : null
+  let testCents: number | null = null
+  if (testId !== null) {
+    testCents = await verifyTestPaymentId(env.ROZO_TEST_LINK_SECRET, testId)
+    if (testCents === null) return fail(400, 'INVALID_INPUT', 'Invalid test payment id.')
+  }
+
   // Fresh server-side quote every time (no client receipt): the amount facts
   // come from the provider, never from the page.
   let quote: any
-  try {
-    const qr = await fetch(QUOTE_INVOICE_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET },
-      body: JSON.stringify(normalized),
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    })
-    if (!qr.ok) {
-      const detail = await qr.text().catch(() => '')
-      if (qr.status === 409 || qr.status === 410) {
-        const paid = /PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED|already fully used/i.test(detail)
-        return paid
-          ? fail(409, 'PAYMENT_ALREADY_PAID', 'This payment link has already been paid.')
-          : fail(qr.status, 'LINK_USED_OR_EXPIRED', 'Payment link has already been used or has expired.')
+  if (testId !== null && testCents !== null) {
+    quote = { linkId: testId, merchant: TEST_MERCHANT_NAME, invoice: { amount: (testCents / 100).toFixed(2) } }
+  } else {
+    try {
+      const qr = await fetch(QUOTE_INVOICE_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET },
+        body: JSON.stringify(normalized),
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      })
+      if (!qr.ok) {
+        const detail = await qr.text().catch(() => '')
+        if (qr.status === 409 || qr.status === 410) {
+          const paid = /PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED|already fully used/i.test(detail)
+          return paid
+            ? fail(409, 'PAYMENT_ALREADY_PAID', 'This payment link has already been paid.')
+            : fail(qr.status, 'LINK_USED_OR_EXPIRED', 'Payment link has already been used or has expired.')
+        }
+        if (qr.status === 404) return fail(404, 'LINK_NOT_FOUND', 'No such payment link.')
+        if (qr.status >= 400 && qr.status < 500 && ![401, 403, 408, 429].includes(qr.status)) {
+          return fail(422, 'LINK_NOT_PAYABLE', 'This payment link cannot be quoted.')
+        }
+        return fail(502, 'QUOTE_FETCH_FAILED', 'Quote upstream returned an error.')
       }
-      if (qr.status === 404) return fail(404, 'LINK_NOT_FOUND', 'No such payment link.')
-      if (qr.status >= 400 && qr.status < 500 && ![401, 403, 408, 429].includes(qr.status)) {
-        return fail(422, 'LINK_NOT_PAYABLE', 'This payment link cannot be quoted.')
-      }
-      return fail(502, 'QUOTE_FETCH_FAILED', 'Quote upstream returned an error.')
+      quote = await qr.json()
+    } catch {
+      return fail(502, 'QUOTE_FETCH_FAILED', 'Quote upstream unreachable.')
     }
-    quote = await qr.json()
-  } catch {
-    return fail(502, 'QUOTE_FETCH_FAILED', 'Quote upstream unreachable.')
   }
 
   const invoiceKey: string = typeof quote?.linkId === 'string' ? quote.linkId : ''
   const merchant: string = typeof quote?.merchant === 'string' ? quote.merchant : ''
   const amount: string = typeof quote?.invoice?.amount === 'string' ? quote.invoice.amount : ''
-  if (!COINBASE_INVOICE_KEY.test(invoiceKey) || !merchant || !/^\d+(\.\d+)?$/.test(amount)) {
+  const keyOk = testId !== null ? invoiceKey === testId : COINBASE_INVOICE_KEY.test(invoiceKey)
+  if (!keyOk || !merchant || !/^\d+(\.\d+)?$/.test(amount)) {
     return fail(502, 'QUOTE_FETCH_FAILED', 'Quote response is missing the invoice id, merchant or amount.')
   }
   const pricing = resolveCheckoutPricing(parseUsdcAtomic(amount), merchant, env.CHECKOUT_WEB_FEE_BPS)
   const upstreamBody = buildAlphaUpstreamBody(invoiceKey, pricing.originalAtomic, pricing.serviceFeeAtomic, option)
 
-  const linkExpiresAtPromise = resolveCoinbaseLinkExpiry(invoiceKey)
+  const linkExpiresAtPromise: Promise<string | null> = testId !== null
+    ? Promise.resolve(null)
+    : resolveCoinbaseLinkExpiry(invoiceKey)
 
   let upstream: Response
   try {
@@ -368,6 +391,20 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   const linkExpiresAt = await linkExpiresAtPromise
   if (linkExpiresAt && Date.parse(linkExpiresAt) < Date.parse(expiresAt)) {
     return fail(422, 'LINK_EXPIRES_TOO_SOON', 'This payment link expires before a TRON / TON payment could finish. Pay with another coin.')
+  }
+
+  // The intents business order the matched payment settles into must exist
+  // before any instructions are shown (tron-ton-alpha-order.ts). Ensured only
+  // once the allocation succeeded; a failure hides the instructions and the
+  // next read retries it (later reads hit the KV marker, no extra calls).
+  const order = await ensureAlphaBusinessOrder(
+    env,
+    { invoiceKey, merchant, pricing, test: testId !== null },
+    forwardedClientHintHeader(request, null),
+  ).catch(() => ({ ok: false as const, reason: 'create_failed' as const }))
+  if (!order.ok) {
+    console.warn('[tron-ton-alpha] business order not ensured', order.reason)
+    return fail(UPSTREAM_FALLBACK.status, UPSTREAM_FALLBACK.code, UPSTREAM_FALLBACK.message)
   }
 
   const originalCents = pricing.originalAtomic / 10_000n

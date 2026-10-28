@@ -784,7 +784,22 @@ export async function settleCoinbaseEvent(
   // payout landed (the same point a real invoice is paid for certain).
   // Test orders never alert: they print one order id + status line instead.
   if (containsTestPaymentId(plId)) {
-    if (eventType === 'payment_payout_completed') {
+    let closesTest = eventType === 'payment_payout_completed'
+    // A TRON / TON alpha order never reaches a payout (no hub payout by
+    // design): its payment_payin_completed is the settlement point, the same
+    // event a real alpha invoice is paid on. Rozo is the authority on which
+    // rail paid: its /delivered accepts a payin_completed order ONLY when the
+    // alpha settle stamped it (rozo-intents-api merchant-delivered.ts) and
+    // answers 409 for every other rail, which keeps waiting for its payout.
+    if (!closesTest && eventType === 'payment_payin_completed' && rozoPaymentId && deliveredReportEnabled(env)) {
+      const rep = await reportDeliveredToRozo(env, rozoPaymentId, plId)
+      if (rep.ok) {
+        closesTest = true
+        rec.deliveredReported = true
+        rec.events.push({ kind: 'delivered_reported', at: new Date().toISOString(), detail: { status: rep.status, test: true, alpha: true } })
+      }
+    }
+    if (closesTest) {
       rec.status = 'test_settled'
       rec.events.push({ kind: 'test_settled', at: new Date().toISOString() })
     }
