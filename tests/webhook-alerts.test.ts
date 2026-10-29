@@ -20,6 +20,7 @@ import {
 } from '../src/routes/webhook'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
+import { bindingUpstream } from './helpers/coinbase-binding'
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -86,6 +87,8 @@ function makeEnv(overrides: Record<string, unknown> = {}) {
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     BASE_RPC_URL: 'https://rpc.test/primary',
     DINGTALK_ACCESS_TOKEN: 'dt-test-token',
+    // Order binding re-reads the Rozo order with this key.
+    ROZO_INTENTS_API_KEY: 'test-rozo-key',
     ...overrides,
   }
   return { env: env as unknown as Env, kv }
@@ -118,6 +121,8 @@ function stubFetch(opts: {
         dingtalkCalls.push({ url, body: JSON.parse(String(init?.body)) })
         return new Response(JSON.stringify({ errcode: 0 }), { status: 200 })
       }
+      const bound = bindingUpstream(url, init, { plId: 'pl_testInvoiceAlert1', rozoId: '11111111-2222-3333-4444-555555555555' })
+      if (bound) return bound
       if (url.includes('agentapi.rozo.ai/pay-invoice')) {
         return new Response(
           JSON.stringify(opts.payInvoiceBody ?? { error: 'boom' }),

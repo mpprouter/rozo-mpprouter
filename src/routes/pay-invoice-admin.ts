@@ -23,6 +23,7 @@ import {
   resolveTrustedCheckoutChannel,
 } from './checkout-web-pricing'
 import { checkoutDeliveryPaused, checkoutPausedResponse } from './checkout-control'
+import { timingSafeEqualStr } from '../utils/timing-safe'
 
 // ── Error code constants ─────────────────────────────────────────────────────
 
@@ -346,7 +347,7 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
   }
 
   const callerSecret = request.headers.get('x-admin-secret')?.trim()
-  if (!callerSecret || callerSecret !== env.PAYINVOICE_ADMIN_SECRET) {
+  if (!callerSecret || !timingSafeEqualStr(callerSecret, env.PAYINVOICE_ADMIN_SECRET)) {
     return json(401, { error: 'Unauthorized' })
   }
 

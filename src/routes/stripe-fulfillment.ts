@@ -66,11 +66,17 @@ export function stripeKvKey(invoiceKey: string): string {
 // UTC-day daily-spend ledger key. The daily cap is enforced fail-closed inside
 // pay-invoice; this counter is the caller-side ledger it reads via
 // spent_today_atomic. Keyed by UTC date so it rolls at 00:00 UTC.
-export function dailySpentKey(date: Date): string {
+//
+// Each settlement channel has its own ledger. 'stripe' (default) is the
+// original key shared by the Stripe webhook, UPI and Stripe coupon paths.
+// 'coinbase' is the Coinbase settle path (webhook.ts settleCoinbaseEvent).
+export type DailySpendLedger = 'stripe' | 'coinbase'
+
+export function dailySpentKey(date: Date, ledger: DailySpendLedger = 'stripe'): string {
   const y = date.getUTCFullYear()
   const m = String(date.getUTCMonth() + 1).padStart(2, '0')
   const d = String(date.getUTCDate()).padStart(2, '0')
-  return `stripe-daily-spent:${y}-${m}-${d}`
+  return `${ledger}-daily-spent:${y}-${m}-${d}`
 }
 
 // Router-side states for a Stripe fulfillment (design §8). This layer only ever
@@ -334,8 +340,12 @@ function parseAtomic(raw: string | null): bigint {
 }
 
 /** Current UTC-day cumulative spend from the DO ledger (read-only). */
-export async function readDailySpentAtomic(env: Env, now: Date): Promise<bigint> {
-  const { value } = await casRead(env, dailySpentKey(now))
+export async function readDailySpentAtomic(
+  env: Env,
+  now: Date,
+  ledger: DailySpendLedger = 'stripe',
+): Promise<bigint> {
+  const { value } = await casRead(env, dailySpentKey(now, ledger))
   return parseAtomic(value)
 }
 
@@ -353,6 +363,31 @@ function dailyCapAtomic(env: Env): bigint {
 }
 
 /**
+ * Cap for the 'coinbase' ledger, from COINBASE_SETTLE_DAILY_CAP_USD.
+ *
+ * No default value on purpose: the Stripe default ($200/day) is far below the
+ * Coinbase line's normal daily volume (single orders go up to $3,500), so
+ * reusing it would stop OpenRouter delivery. Until the variable is set the
+ * ledger runs in record-only mode: every settlement is still counted, nothing
+ * is refused. A malformed value is treated as unset (logged), never as zero.
+ * Returns null in record-only mode.
+ */
+export function coinbaseDailyCapAtomic(env: Env): bigint | null {
+  const raw = env.COINBASE_SETTLE_DAILY_CAP_USD
+  if (!raw) return null
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) {
+    console.warn('[daily-spend] COINBASE_SETTLE_DAILY_CAP_USD is malformed; coinbase ledger stays record-only')
+    return null
+  }
+  return BigInt(Math.floor(n * 1_000_000))
+}
+
+function ledgerCapAtomic(env: Env, ledger: DailySpendLedger): bigint | null {
+  return ledger === 'coinbase' ? coinbaseDailyCapAtomic(env) : dailyCapAtomic(env)
+}
+
+/**
  * Atomically RESERVE `deltaAtomic` against today's spend ledger BEFORE signing
  * (design §9): read current spend, and only if `current + delta <= cap` commit
  * the incremented total. Returns the pre-reservation spend (to pass to
@@ -364,11 +399,12 @@ export async function reserveDailySpend(
   env: Env,
   now: Date,
   deltaAtomic: bigint,
+  ledger: DailySpendLedger = 'stripe',
 ): Promise<bigint | null> {
-  const cap = dailyCapAtomic(env)
-  return casUpdate<bigint | null>(env, dailySpentKey(now), (raw) => {
+  const cap = ledgerCapAtomic(env, ledger)
+  return casUpdate<bigint | null>(env, dailySpentKey(now, ledger), (raw) => {
     const cur = parseAtomic(raw)
-    if (cur + deltaAtomic > cap) {
+    if (cap !== null && cur + deltaAtomic > cap) {
       return { op: 'noop', result: null }
     }
     return { op: 'set', value: (cur + deltaAtomic).toString(), result: cur }
@@ -384,8 +420,9 @@ export async function releaseDailySpend(
   env: Env,
   now: Date,
   deltaAtomic: bigint,
+  ledger: DailySpendLedger = 'stripe',
 ): Promise<void> {
-  await casUpdate<true>(env, dailySpentKey(now), (raw) => {
+  await casUpdate<true>(env, dailySpentKey(now, ledger), (raw) => {
     const cur = parseAtomic(raw)
     const next = cur - deltaAtomic
     return { op: 'set', value: (next < 0n ? 0n : next).toString(), result: true }

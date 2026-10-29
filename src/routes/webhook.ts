@@ -20,6 +20,12 @@ import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exe
 import { findExistingOrder } from './existing-order'
 import { lookupBudget } from './existing-order-endpoint'
 import { checkoutDeliveryPaused, recordPausedDelivery } from './checkout-control'
+import { OPENROUTER_APP_ID, readPaymentStatus } from './existing-order'
+import {
+  fetchCoinbasePayment as fetchCoinbaseInvoicePayload,
+  normalizeCoinbasePayment,
+} from './invoice-provider'
+import { coinbaseDailyCapAtomic, releaseDailySpend, reserveDailySpend } from './stripe-fulfillment'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -113,6 +119,10 @@ export type FulfillmentStatus =
   // Internal rozotest_ invoice (native-sources.ts): the Rozo order completed,
   // there is no Coinbase link to pay. Terminal; never calls pay-invoice.
   | 'test_settled'
+  // The Rozo order re-read before paying did not match this invoice (wrong
+  // link, wrong app, not paid, or the Coinbase amount exceeds what the order
+  // delivers). Terminal; pay-invoice was never called. Needs a human.
+  | 'order_binding_failed'
 
 export interface FulfillmentRecord {
   status: FulfillmentStatus
@@ -165,6 +175,7 @@ export const TERMINAL_STATUSES: ReadonlySet<FulfillmentStatus> = new Set<Fulfill
   'manual_review',
   'claimed_by_other_channel',
   'failed_pay_invoice',
+  'order_binding_failed',
 ])
 
 export function fulfillmentKvKey(plId: string) {
@@ -218,6 +229,7 @@ const STATUS_RANK: Record<FulfillmentStatus, number> = {
   manual_review: 3,
   failed_pay_invoice: 3,
   claimed_by_other_channel: 3,
+  order_binding_failed: 3,
   paid: 4,
   test_settled: 4,
 }
@@ -343,7 +355,7 @@ export function maskAddresses(text: string): string {
 }
 
 export interface InvoiceFailureAlertParams {
-  kind: 'failed_insufficient_balance' | 'failed_pay_invoice'
+  kind: 'failed_insufficient_balance' | 'failed_pay_invoice' | 'order_binding_failed' | 'daily_cap_reached'
   plId: string
   invoiceAtomic: bigint | null
   funderBalanceAtomic: bigint | null
@@ -362,11 +374,19 @@ export function buildInvoiceFailureAlert(params: InvoiceFailureAlertParams): str
   const headline =
     params.kind === 'failed_insufficient_balance'
       ? '🚨 Invoice fulfillment BLOCKED: insufficient funder balance'
-      : '🚨 Invoice fulfillment FAILED: pay-invoice call did not succeed'
+      : params.kind === 'order_binding_failed'
+        ? '🚨 Invoice fulfillment REFUSED: Rozo order does not match the invoice'
+        : params.kind === 'daily_cap_reached'
+          ? '🚨 Invoice fulfillment BLOCKED: Coinbase daily settlement cap reached'
+          : '🚨 Invoice fulfillment FAILED: pay-invoice call did not succeed'
   const action =
     params.kind === 'failed_insufficient_balance'
       ? 'Caller already paid — top up the funder wallet, then replay the webhook.'
-      : 'Caller already paid — investigate, then replay the webhook.'
+      : params.kind === 'order_binding_failed'
+        ? 'Nothing was paid. Check the Rozo order against the invoice by hand before any manual payment.'
+        : params.kind === 'daily_cap_reached'
+          ? 'Nothing was paid. Raise COINBASE_SETTLE_DAILY_CAP_USD or wait for 00:00 UTC, then replay the webhook.'
+          : 'Caller already paid — investigate, then replay the webhook.'
   const lines = [
     `[MPP Router] ${headline}`,
     `Invoice: ${params.plId} (${fmtUsdcAtomic(params.invoiceAtomic)} USDC)`,
@@ -597,6 +617,7 @@ export async function handleRozoWebhook(
     rozoPaymentId,
     evt,
     now,
+    waitUntil: ctx ? (p) => ctx.waitUntil(p) : undefined,
   })
   ctx?.waitUntil(settlement.catch(() => undefined))
   const summary = await settlement
@@ -705,13 +726,18 @@ export interface CoinbaseEventInput {
   rozoPaymentId: string | null
   evt: WebhookEvent
   now: number
+  // When given (the webhook passes ctx.waitUntil), a capture_pending or
+  // not-yet-acknowledged paid record is followed up a few seconds after
+  // pay-invoice without delaying the response (fastConfirmAfterPay). Callers
+  // without an execution context leave it to the cron sweep.
+  waitUntil?: (p: Promise<unknown>) => void
 }
 
 export async function settleCoinbaseEvent(
   env: Env,
   input: CoinbaseEventInput,
 ): Promise<Record<string, unknown>> {
-  const { eventId, eventType, plId, rozoPaymentId, evt, now } = input
+  const { eventId, eventType, plId, rozoPaymentId, evt, now, waitUntil } = input
 
   // Load or create fulfillment record.
   let rec = await loadRecord(env, plId)
@@ -851,9 +877,54 @@ export async function settleCoinbaseEvent(
   // stuck in `paying`, and blocked payable invoices). Two concurrent invoices
   // can both pass this check; agentapi pay-invoice re-checks the funder
   // balance itself and the loser fails into failed_pay_invoice + alert.
-  const invoiceAmountStr = evt.data?.destination?.amount ?? evt.data?.source?.amount ?? null
-  const invoiceAtomic = invoiceAmountStr ? parseUsdcAtomic(invoiceAmountStr) : null
-  rec.invoiceAmountAtomic = invoiceAtomic?.toString() ?? null
+  //
+  // 7c. Order binding (verifyCoinbaseOrderBinding). The webhook payload is
+  // not trusted for what gets paid: re-read the Rozo order and the Coinbase
+  // invoice, and pay only when the order is paid, belongs to this link and to
+  // the Coinbase app, and delivers at least the amount pay-invoice will pay.
+  // The amount used from here on is the Coinbase invoice amount (what
+  // pay-invoice actually pays), not the webhook's.
+  const binding = await verifyCoinbaseOrderBinding(env, {
+    plId,
+    rozoPaymentId,
+    eventType,
+    eventAppId: evt.data?.appId ?? null,
+  })
+  if (!binding.ok) {
+    if (binding.terminal) {
+      rec.status = 'order_binding_failed'
+      rec.failureReason = `order binding: ${binding.reason}`
+      rec.events.push({
+        kind: 'order_binding_failed',
+        at: new Date().toISOString(),
+        event_id: eventId,
+        detail: { reason: binding.reason },
+      })
+      await sendInvoiceFailureAlert(env, {
+        kind: 'order_binding_failed',
+        plId,
+        invoiceAtomic: binding.invoiceAtomic ?? null,
+        funderBalanceAtomic: null,
+        failureReason: rec.failureReason,
+      })
+      const saved = await saveRecordGuarded(env, plId, rec)
+      return { ok: true, status: saved.status, plId, reason: binding.reason }
+    }
+    rec.events.push({
+      kind: 'order_binding_deferred',
+      at: new Date().toISOString(),
+      event_id: eventId,
+      detail: { reason: binding.reason },
+    })
+    await saveRecordGuarded(env, plId, rec)
+    // Nothing was decided for this event: forget its dedup marker so a resent
+    // webhook (the sweep's stuck alert asks for exactly that) or a replay is
+    // processed again instead of being dropped as already seen.
+    await env.MPP_STORE.delete(eventKvKey(eventId)).catch(() => undefined)
+    return { ok: true, deferred: 'order_binding_unverified', reason: binding.reason, plId }
+  }
+  const invoiceAtomic: bigint = binding.invoiceAtomic
+  rec.invoiceAmountAtomic = invoiceAtomic.toString()
 
   const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
   const balance = balanceResult.balance
@@ -861,17 +932,6 @@ export async function settleCoinbaseEvent(
   console.log(
     `[webhook] balance for ${FUNDER_WALLET}: ${balance?.toString() ?? 'null'} (rpcs: ${JSON.stringify(balanceResult.rpcsTried)})`,
   )
-
-  if (invoiceAtomic === null) {
-    // Couldn't parse invoice amount — defer (this is a Rozo payload bug).
-    rec.events.push({
-      kind: 'invoice_unmeasurable',
-      at: new Date().toISOString(),
-      detail: { invoice: invoiceAmountStr },
-    })
-    await saveRecordGuarded(env, plId, rec)
-    return { ok: true, deferred: 'invoice_unmeasurable', plId }
-  }
 
   // If balance read failed (all RPCs down), don't sit forever — agentapi
   // pay-invoice will check funder balance itself and reject if low, so
@@ -925,11 +985,67 @@ export async function settleCoinbaseEvent(
     }
   }
 
+  // 8a. Daily spend ledger (stripe-fulfillment.ts reserveDailySpend, own
+  // 'coinbase' ledger). Reserved BEFORE the cross-channel claim, the same
+  // order the Stripe coupon path uses, so hitting the cap never has to undo a
+  // claim. Over the cap: nothing claimed, nothing sent, record keeps its
+  // pre-pay status (the sweep's stuck alert and a replay pick it up later).
+  // Record-only while COINBASE_SETTLE_DAILY_CAP_USD is unset.
+  const spendDay = new Date()
+  const capEnforced = coinbaseDailyCapAtomic(env) !== null
+  let dailyReserved = false
+  try {
+    const spentBefore = await reserveDailySpend(env, spendDay, invoiceAtomic, 'coinbase')
+    if (spentBefore === null) {
+      rec.events.push({
+        kind: 'daily_cap_reached',
+        at: new Date().toISOString(),
+        event_id: eventId,
+        detail: { invoice: invoiceAtomic.toString() },
+      })
+      if (eventType === 'payment_payout_completed') {
+        rec.status = 'failed_insufficient_balance'
+        rec.failureReason = 'coinbase daily settlement cap reached'
+        await sendInvoiceFailureAlert(env, {
+          kind: 'daily_cap_reached',
+          plId,
+          invoiceAtomic,
+          funderBalanceAtomic: balance,
+          failureReason: rec.failureReason,
+        })
+      }
+      await saveRecordGuarded(env, plId, rec)
+      return { ok: true, deferred: 'daily_cap_reached', eventType, plId }
+    }
+    dailyReserved = true
+  } catch (err) {
+    // Ledger unavailable. Enforced cap: fail closed (defer, nothing sent).
+    // Record-only mode: the ledger is bookkeeping, keep settling.
+    if (capEnforced) {
+      rec.events.push({ kind: 'daily_cap_unavailable', at: new Date().toISOString(), event_id: eventId })
+      await saveRecordGuarded(env, plId, rec)
+      return { ok: true, deferred: 'daily_cap_unavailable', plId }
+    }
+    console.warn(
+      `[webhook] coinbase daily ledger unavailable (record-only, continuing) for ${plId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+  }
+  // Give the reservation back on every path that ends without sending
+  // pay-invoice. Never throws.
+  const releaseReservation = async () => {
+    if (!dailyReserved) return
+    dailyReserved = false
+    await releaseDailySpend(env, spendDay, invoiceAtomic, 'coinbase').catch(() => undefined)
+  }
+
   // 8b. Cross-channel claim (linearizable DO CAS, see invoice-claim.ts). If
   // the UPI channel already holds this invoice, never pay it again from here:
   // the caller's crypto is refunded by a human, the invoice is settled once.
   const claim = await claimInvoiceKey(env, plId, 'crypto', plId)
   if (!claim.ok) {
+    await releaseReservation()
     rec.status = 'claimed_by_other_channel'
     rec.failureReason = `invoice already claimed by ${claim.holder.channel} channel`
     rec.events.push({ kind: 'claimed_by_other_channel', at: new Date().toISOString() })
@@ -951,6 +1067,8 @@ export async function settleCoinbaseEvent(
   // record it and do NOT pay.
   const gate = await acquireCoinbaseExecGate(env, plId, eventId, new Date(), rozoPaymentId ?? undefined)
   if (!gate.ok) {
+    // The holder reserved its own headroom; ours was never spent.
+    await releaseReservation()
     rec.events.push({
       kind: 'exec_gate_held',
       at: new Date().toISOString(),
@@ -965,6 +1083,7 @@ export async function settleCoinbaseEvent(
   // window between a stop and the send. Nothing was sent: give the gate back.
   if (await checkoutDeliveryPaused(env)) {
     await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
+    await releaseReservation()
     return deferForCheckoutPause(env, plId, rec, eventType, eventId)
   }
 
@@ -979,12 +1098,14 @@ export async function settleCoinbaseEvent(
     // Definite failure BEFORE the pay request was sent: give the gate back so
     // a later event can retry. This is the only release path.
     await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
+    await releaseReservation()
     throw err
   }
   if (rec.status !== 'paying') {
     // A concurrent writer (sweep / another event) holds a terminal state.
     // Nothing was sent yet, so release the gate and stop.
     await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
+    await releaseReservation()
     return { ok: true, alreadyTerminal: rec.status, plId }
   }
 
@@ -1021,6 +1142,10 @@ export async function settleCoinbaseEvent(
       },
     })
   } else {
+    // A definite 4xx refusal means nothing was paid: give the day's headroom
+    // back. Transport errors and 5xx are ambiguous (the payment may have
+    // gone out), so the reservation stays counted.
+    if (payResult.status >= 400 && payResult.status < 500) await releaseReservation()
     rec.status = 'failed_pay_invoice'
     rec.failureReason = `agentapi pay-invoice ${payResult.status}`
     rec.events.push({
@@ -1063,6 +1188,14 @@ export async function settleCoinbaseEvent(
     }
   }
 
+  // 13. Fast follow-up: a capture_pending record (or a paid one whose
+  // delivered report was not accepted yet) is re-checked a few seconds later
+  // instead of waiting for the next cron tick. Runs after the response via
+  // waitUntil; the cron sweep stays the fallback.
+  if (waitUntil && needsFastConfirm(env, rec)) {
+    waitUntil(fastConfirmAfterPay(env, plId).catch(() => undefined))
+  }
+
   return {
     ok: true,
     plId,
@@ -1071,6 +1204,206 @@ export async function settleCoinbaseEvent(
     coinbaseResult: payResult.ok ? payResult.body : null,
     error: payResult.ok ? null : payResult.body,
   }
+}
+
+// ── Order binding ──────────────────────────────────────────────────────────
+
+/**
+ * Rozo order statuses that prove the caller's payin landed. Mirrors the
+ * statuses checkout-control-admin.ts replays as a payin / payout event
+ * (PAYIN_LIKE plus payment_payout_completed), plus the terminal
+ * payment_completed.
+ */
+export const ROZO_ORDER_PAID_STATUSES: ReadonlySet<string> = new Set([
+  'payment_payin_completed',
+  'payment_payout_started',
+  'payment_bridging',
+  'payment_payout_review',
+  'payment_payout_completed',
+  'payment_completed',
+])
+
+// Statuses a payin_completed event may still read briefly while the order
+// row catches up. Seen on a payin event: defer, never terminal.
+const ROZO_ORDER_NOT_YET_PAID_STATUSES: ReadonlySet<string> = new Set(['payment_unpaid', 'payment_started'])
+
+const BINDING_READ_TIMEOUT_MS = 5000
+
+export type OrderBindingResult =
+  | { ok: true; invoiceAtomic: bigint; orderDestinationAtomic: bigint }
+  // terminal: a definite mismatch, never pay. Not terminal: could not verify
+  // right now (read failed, order still catching up); a later event retries.
+  | { ok: false; terminal: boolean; reason: string; invoiceAtomic?: bigint | null }
+
+/**
+ * Re-reads the Rozo order and the Coinbase invoice before pay-invoice and
+ * checks that they belong together:
+ *   - the order id from the signed webhook re-reads to a real order;
+ *   - its orderId (sibling suffix stripped) is this link;
+ *   - its appId is the Coinbase line (OPENROUTER_APP_ID), and so is the
+ *     webhook's appId when present;
+ *   - its status is a paid status (ROZO_ORDER_PAID_STATUSES);
+ *   - the Coinbase invoice amount (what pay-invoice pays) is at most the
+ *     order's destination amount. No tolerance: none is defined for this.
+ */
+// Backoff between attempts when the binding could not be verified (a read
+// failed or the order row was still catching up). Bounded: the settlement runs
+// under waitUntil, and a definite mismatch is never retried.
+export const BINDING_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000]
+
+export async function verifyCoinbaseOrderBinding(
+  env: Env,
+  input: { plId: string; rozoPaymentId: string | null; eventType: string; eventAppId: string | null },
+  opts: { retryDelaysMs?: readonly number[]; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<OrderBindingResult> {
+  const delays = opts.retryDelaysMs ?? BINDING_RETRY_DELAYS_MS
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  let result = await verifyCoinbaseOrderBindingOnce(env, input)
+  for (const d of delays) {
+    if (result.ok || result.terminal) return result
+    await sleep(d)
+    result = await verifyCoinbaseOrderBindingOnce(env, input)
+  }
+  return result
+}
+
+async function verifyCoinbaseOrderBindingOnce(
+  env: Env,
+  input: { plId: string; rozoPaymentId: string | null; eventType: string; eventAppId: string | null },
+): Promise<OrderBindingResult> {
+  const { plId, rozoPaymentId, eventType, eventAppId } = input
+  if (!rozoPaymentId) return { ok: false, terminal: true, reason: 'webhook carries no Rozo payment id' }
+  if (eventAppId && eventAppId !== OPENROUTER_APP_ID) {
+    return { ok: false, terminal: true, reason: `webhook appId ${eventAppId} is not ${OPENROUTER_APP_ID}` }
+  }
+
+  const order = await withTimeout(fetchRozoPaymentById(env, rozoPaymentId), BINDING_READ_TIMEOUT_MS)
+  if (!order || typeof order !== 'object') {
+    return { ok: false, terminal: false, reason: 'Rozo order unreadable' }
+  }
+  const orderId = typeof order.orderId === 'string' ? order.orderId : ''
+  if (!orderId || baseLinkIdOf(orderId) !== plId) {
+    return { ok: false, terminal: true, reason: 'Rozo order belongs to a different invoice' }
+  }
+  const appId = typeof order.appId === 'string' ? order.appId : ''
+  if (appId !== OPENROUTER_APP_ID) {
+    return { ok: false, terminal: true, reason: `Rozo order appId ${appId || 'missing'} is not ${OPENROUTER_APP_ID}` }
+  }
+  const status = readPaymentStatus(order) ?? ''
+  if (!ROZO_ORDER_PAID_STATUSES.has(status)) {
+    if (eventType === 'payment_payin_completed' && ROZO_ORDER_NOT_YET_PAID_STATUSES.has(status)) {
+      return { ok: false, terminal: false, reason: `Rozo order status ${status} (not paid yet)` }
+    }
+    return { ok: false, terminal: true, reason: `Rozo order status ${status || 'missing'} is not paid` }
+  }
+  const destRaw = order.destination?.amount ?? order.destination_amount ?? null
+  const orderDestinationAtomic = destRaw === null || destRaw === undefined ? null : parseUsdcAtomic(String(destRaw))
+  if (orderDestinationAtomic === null) {
+    return { ok: false, terminal: false, reason: 'Rozo order destination amount unreadable' }
+  }
+
+  let invoiceAtomic: bigint
+  try {
+    const payload = await fetchCoinbaseInvoicePayload(plId, AbortSignal.timeout(BINDING_READ_TIMEOUT_MS))
+    const normalized = await normalizeCoinbasePayment(payload)
+    invoiceAtomic = BigInt(normalized.stablecoinAmountAtomic)
+  } catch {
+    return { ok: false, terminal: false, reason: 'Coinbase invoice amount unreadable' }
+  }
+  if (invoiceAtomic <= 0n) {
+    return { ok: false, terminal: true, reason: 'Coinbase invoice amount is not positive', invoiceAtomic }
+  }
+  if (invoiceAtomic > orderDestinationAtomic) {
+    return {
+      ok: false,
+      terminal: true,
+      reason: `Coinbase invoice ${invoiceAtomic} exceeds Rozo order destination ${orderDestinationAtomic}`,
+      invoiceAtomic,
+    }
+  }
+  return { ok: true, invoiceAtomic, orderDestinationAtomic }
+}
+
+// ── Fast capture confirmation after pay-invoice ────────────────────────────
+
+/**
+ * Offsets (ms after pay-invoice returned) at which fastConfirmAfterPay
+ * re-checks. 20 s total keeps it well inside the Workers waitUntil budget.
+ */
+export const FAST_CONFIRM_OFFSETS_MS: readonly number[] = [5_000, 10_000, 20_000]
+
+function needsFastConfirm(env: Env, rec: FulfillmentRecord): boolean {
+  if (rec.status === 'capture_pending') return true
+  return rec.status === 'paid' && !rec.deliveredReported && Boolean(rec.rozoPaymentId) && deliveredReportEnabled(env)
+}
+
+/**
+ * Moves capture_pending to paid as soon as Coinbase reports the capture, and
+ * sends the delivered report for a paid record, at FAST_CONFIRM_OFFSETS_MS.
+ * Read-only towards Coinbase: it never calls pay-invoice, never moves a record
+ * to manual_review (the sweep owns the give-up decision), and stops as soon as
+ * the record is acknowledged or leaves capture_pending/paid. Idempotent: a
+ * repeat delivered report is answered 200 again, and saves are guarded.
+ * Never throws.
+ */
+export async function fastConfirmAfterPay(
+  env: Env,
+  plId: string,
+  opts: { offsetsMs?: readonly number[]; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<FulfillmentStatus | null> {
+  const offsets = opts.offsetsMs ?? FAST_CONFIRM_OFFSETS_MS
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  let elapsed = 0
+  let last: FulfillmentStatus | null = null
+  try {
+    for (const at of offsets) {
+      await sleep(Math.max(0, at - elapsed))
+      elapsed = at
+      let rec = await loadRecord(env, plId)
+      if (!rec) return null
+      last = rec.status
+      if (!needsFastConfirm(env, rec)) return rec.status
+
+      if (rec.status === 'capture_pending') {
+        const raw = await fetchCoinbasePayment(plId)
+        const safe = raw ? pickCoinbaseCallerSafe(raw) : null
+        if (!safe?.settled) continue
+        const nowIso = new Date().toISOString()
+        rec.status = 'paid'
+        rec.paidAt = rec.paidAt ?? nowIso
+        rec.events.push({
+          kind: 'fast_confirm_coinbase_settled',
+          at: nowIso,
+          detail: { from: 'capture_pending', coinbase_status: safe.status ?? null },
+        })
+        rec = await saveRecordGuarded(env, plId, rec)
+        last = rec.status
+        if (rec.status !== 'paid') return rec.status
+      }
+
+      if (rec.status === 'paid' && !rec.deliveredReported && rec.rozoPaymentId && deliveredReportEnabled(env)) {
+        const rep = await reportDeliveredToRozo(env, rec.rozoPaymentId, plId)
+        const pending = deliveredReportStillPending(rep, rec)
+        if (rep.ok) rec.deliveredReported = true
+        else if (!pending) rec.deliveredReportAttempts = (rec.deliveredReportAttempts ?? 0) + 1
+        rec.events.push({
+          kind: rep.ok ? 'delivered_reported' : pending ? 'delivered_report_pending' : 'delivered_report_failed',
+          at: new Date().toISOString(),
+          detail: { status: rep.status, fast: true },
+        })
+        rec = await saveRecordGuarded(env, plId, rec)
+        last = rec.status
+        if (rec.deliveredReported) return rec.status
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `[webhook] fast confirm error (non-fatal, sweep is the fallback) for ${plId}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+  }
+  return last
 }
 
 // Public read-only status endpoint.

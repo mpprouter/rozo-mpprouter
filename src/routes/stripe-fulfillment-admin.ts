@@ -19,6 +19,7 @@
 
 import type { Env } from '../index'
 import { resolveManualReview, retryAmbiguousStripeRecord, maskInvoiceKey, invoiceKeyFromOrderId, isStripeOrderId } from './stripe-fulfillment'
+import { timingSafeEqualStr } from '../utils/timing-safe'
 
 function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -35,7 +36,7 @@ export async function handleStripeFulfillmentResolve(request: Request, env: Env)
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.PAYINVOICE_ADMIN_SECRET) return json(500, { error: 'PAYINVOICE_ADMIN_SECRET is not configured' })
   const callerSecret = request.headers.get('x-admin-secret')?.trim()
-  if (!callerSecret || callerSecret !== env.PAYINVOICE_ADMIN_SECRET) return json(401, { error: 'Unauthorized' })
+  if (!callerSecret || !timingSafeEqualStr(callerSecret, env.PAYINVOICE_ADMIN_SECRET)) return json(401, { error: 'Unauthorized' })
 
   let body: any
   try {
@@ -126,7 +127,7 @@ export async function handleStripeFulfillmentRetry(request: Request, env: Env): 
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.PAYINVOICE_ADMIN_SECRET) return json(500, { error: 'PAYINVOICE_ADMIN_SECRET is not configured' })
   const callerSecret = request.headers.get('x-admin-secret')?.trim()
-  if (!callerSecret || callerSecret !== env.PAYINVOICE_ADMIN_SECRET) return json(401, { error: 'Unauthorized' })
+  if (!callerSecret || !timingSafeEqualStr(callerSecret, env.PAYINVOICE_ADMIN_SECRET)) return json(401, { error: 'Unauthorized' })
   let body: any
   try {
     body = await request.json()

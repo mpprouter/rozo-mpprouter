@@ -28,6 +28,7 @@
 
 import type { Env } from '../index'
 import type { SeedResponse } from '../mpp/atomic-store-do'
+import { timingSafeEqualStr } from '../utils/timing-safe'
 
 /** Internal URL base for DO /seed calls. The hostname is irrelevant — CF routes
  *  stub.fetch() internally and never makes an outbound network request. */
@@ -75,7 +76,7 @@ export async function handleAdminSeedStore(request: Request, env: Env): Promise<
     return json(500, { error: 'PAYINVOICE_ADMIN_SECRET is not configured' })
   }
   const callerSecret = request.headers.get('x-admin-secret')?.trim()
-  if (!callerSecret || callerSecret !== env.PAYINVOICE_ADMIN_SECRET) {
+  if (!callerSecret || !timingSafeEqualStr(callerSecret, env.PAYINVOICE_ADMIN_SECRET)) {
     return json(401, { error: 'Unauthorized' })
   }
 

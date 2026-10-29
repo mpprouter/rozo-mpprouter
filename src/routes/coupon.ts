@@ -87,6 +87,7 @@ import {
 } from './coupon-security'
 import { redactForAlert } from '../utils/alert-redaction'
 import { checkoutDeliveryPaused } from './checkout-control'
+import { timingSafeEqualStr } from '../utils/timing-safe'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -630,7 +631,7 @@ function adminAuthorized(request: Request, env: Env): Response | null {
     return json(500, { error: 'ADMIN_TOKEN is not configured' })
   }
   const secret = request.headers.get('x-admin-secret')?.trim()
-  if (!secret || secret !== env.ADMIN_TOKEN) {
+  if (!secret || !timingSafeEqualStr(secret, env.ADMIN_TOKEN)) {
     return json(401, { error: 'Unauthorized' })
   }
   return null

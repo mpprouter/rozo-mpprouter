@@ -13,6 +13,7 @@ import {
 import { hasSorobanTransactionData, isProvablyDeadEnvelope, validateSignedRefundXdr, verifyConfirmedRefund } from '../refund/stellar-proof'
 import { ReceiptSigningUnavailable, signReceipt } from '../refund/receipt-signer'
 import { rpc } from '@stellar/stellar-sdk'
+import { timingSafeEqualStr } from '../utils/timing-safe'
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, { status, headers: { 'Cache-Control': 'no-store' } })
@@ -25,8 +26,8 @@ function bearer(request: Request): string | undefined {
 function authorized(request: Request, env: Env): boolean {
   const supplied = bearer(request)
   return !!supplied && (
-    (!!env.REFUND_EXECUTOR_TOKEN && supplied === env.REFUND_EXECUTOR_TOKEN) ||
-    (!!env.ADMIN_TOKEN && supplied === env.ADMIN_TOKEN)
+    (!!env.REFUND_EXECUTOR_TOKEN && timingSafeEqualStr(supplied, env.REFUND_EXECUTOR_TOKEN)) ||
+    (!!env.ADMIN_TOKEN && timingSafeEqualStr(supplied, env.ADMIN_TOKEN))
   )
 }
 
@@ -42,7 +43,7 @@ function authorized(request: Request, env: Env): boolean {
  */
 function adminAuthorized(request: Request, env: Env): boolean {
   const supplied = bearer(request)
-  return !!supplied && !!env.ADMIN_TOKEN && supplied === env.ADMIN_TOKEN
+  return !!supplied && !!env.ADMIN_TOKEN && timingSafeEqualStr(supplied, env.ADMIN_TOKEN)
 }
 
 function signedReceipt(env: Env, record: NonNullable<Awaited<ReturnType<typeof readRefund>>>) {

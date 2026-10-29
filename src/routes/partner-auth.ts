@@ -252,7 +252,7 @@ export async function requirePartnerSession(request: Request, env: Env): Promise
 function adminAuthorized(request: Request, env: Env): Response | null {
   if (!env.ADMIN_TOKEN) return json(500, { error: 'ADMIN_TOKEN is not configured' })
   const secret = request.headers.get('x-admin-secret')?.trim()
-  if (!secret || secret !== env.ADMIN_TOKEN) return json(401, { error: 'Unauthorized' })
+  if (!secret || !timingSafeEqualStr(secret, env.ADMIN_TOKEN)) return json(401, { error: 'Unauthorized' })
   return null
 }
 

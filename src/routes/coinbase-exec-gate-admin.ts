@@ -28,6 +28,7 @@ import { casUpdate } from './stripe-atomic'
 import { readCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead as couponCasRead, couponKey, parseRecord as parseCouponRecord } from './coupon'
 import { fetchCoinbasePayment, isCoinbasePaymentId, loadRecord, saveRecordGuarded } from './webhook'
+import { timingSafeEqualStr } from '../utils/timing-safe'
 
 function json(status: number, payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -68,7 +69,7 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.PAYINVOICE_ADMIN_SECRET) return json(500, { error: 'PAYINVOICE_ADMIN_SECRET is not configured' })
   const callerSecret = request.headers.get('x-admin-secret')?.trim()
-  if (!callerSecret || callerSecret !== env.PAYINVOICE_ADMIN_SECRET) return json(401, { error: 'Unauthorized' })
+  if (!callerSecret || !timingSafeEqualStr(callerSecret, env.PAYINVOICE_ADMIN_SECRET)) return json(401, { error: 'Unauthorized' })
 
   let body: any
   try {

@@ -23,6 +23,7 @@ import { readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
 import { casRead, casUpdate } from '../src/routes/stripe-atomic'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
+import { boundCoinbaseLink } from './helpers/coinbase-binding'
 
 const WEBHOOK_SECRET = 'test-webhook-secret'
 const CONTROL_SECRET = 'test-control-secret'
@@ -110,6 +111,7 @@ function stubFetch(rozo: Record<string, unknown> | null = rozoPayment()) {
         calls.pay++
         return Response.json(CAPTURED_BODY)
       }
+      if (url.includes('payments.coinbase.com/next-api/')) return Response.json(boundCoinbaseLink(PL))
       if (url.includes('intentapiv4.rozo.ai')) {
         if (!rozo) return new Response('nf', { status: 404 })
         return Response.json(rozo)
