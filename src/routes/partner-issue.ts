@@ -40,6 +40,7 @@ import {
   setPartnerStatus,
   getPartnerIdByEmail,} from './partner-store'
 import { requirePartnerSession } from './partner-auth'
+import { timingSafeEqualStr } from '../utils/timing-safe'
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -326,7 +327,7 @@ export async function handleAdminPartnerTopup(request: Request, env: Env): Promi
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.ADMIN_TOKEN) return json(500, { error: 'ADMIN_TOKEN is not configured' })
   const secret = request.headers.get('x-admin-secret')?.trim()
-  if (!secret || secret !== env.ADMIN_TOKEN) return json(401, { error: 'Unauthorized' })
+  if (!secret || !timingSafeEqualStr(secret, env.ADMIN_TOKEN)) return json(401, { error: 'Unauthorized' })
 
   let body: any
   try {
@@ -395,7 +396,7 @@ export async function handleAdminPartnerStatus(request: Request, env: Env): Prom
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.ADMIN_TOKEN) return json(500, { error: 'ADMIN_TOKEN is not configured' })
   const secret = request.headers.get('x-admin-secret')?.trim()
-  if (!secret || secret !== env.ADMIN_TOKEN) return json(401, { error: 'Unauthorized' })
+  if (!secret || !timingSafeEqualStr(secret, env.ADMIN_TOKEN)) return json(401, { error: 'Unauthorized' })
 
   let body: any
   try {

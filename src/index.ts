@@ -577,6 +577,12 @@ export interface Env {
   // Defaults to $200 when unset. Set via: wrangler secret put
   // STRIPE_FULFILLMENT_DAILY_CAP_USD
   STRIPE_FULFILLMENT_DAILY_CAP_USD?: string
+  // Daily cap (USD) for the Coinbase settle path's own spend ledger
+  // (coinbase-daily-spent:<UTC day>, webhook.ts settleCoinbaseEvent). Unset =
+  // record-only: settlements are counted but never refused. There is no code
+  // default because the Stripe $200 default would block normal Coinbase
+  // volume.
+  COINBASE_SETTLE_DAILY_CAP_USD?: string
 
   // ── Coupon abuse protection (design: ainative 20260722-mpprouter-coupon-
   //    claim-security.md) ──

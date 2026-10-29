@@ -12,6 +12,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { handleRozoWebhook, saveRecordGuarded, type FulfillmentRecord } from '../src/routes/webhook'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
+import { boundCoinbaseLink, boundRozoOrder } from './helpers/coinbase-binding'
 
 // ── helpers (same shape as webhook-alerts.test.ts) ─────────────────────────
 
@@ -124,7 +125,7 @@ function stubFetch(cfg: Partial<Upstream> = {}) {
     balanceAtomic: 10_000_000n,
     payStatus: 200,
     payBody: CAPTURED_BODY,
-    coinbase: { id: PL, status: 'ACTIVE', usageCount: 0, maxUsage: 1, preApprovalExpiry: String(Math.floor(Date.now() / 1000) + 86400) },
+    coinbase: boundCoinbaseLink(PL),
     rozo: null,
     deliveredStatus: 200,
     intercom: 200,
@@ -163,6 +164,10 @@ function stubFetch(cfg: Partial<Upstream> = {}) {
       }
       if (url.includes('intentapiv4.rozo.ai')) {
         calls.rozoGet++
+        // Order binding re-reads each order by id: ROZO_ID is the __retry2
+        // order, OLD_ID the original order on the base link.
+        if (!up.rozo && url.endsWith(`/payments/${ROZO_ID}`)) return Response.json(boundRozoOrder(ROZO_ID, `${PL}__retry2`))
+        if (!up.rozo && url.endsWith(`/payments/${OLD_ID}`)) return Response.json(boundRozoOrder(OLD_ID, PL))
         if (!up.rozo) return new Response('nf', { status: 404 })
         return Response.json(up.rozo)
       }

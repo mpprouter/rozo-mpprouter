@@ -20,6 +20,7 @@ import { handleCoinbaseExecGateClear, coinbaseExecGateClearLogKey } from '../src
 import { casRead } from '../src/routes/stripe-atomic'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
+import { boundCoinbaseLink, boundRozoOrder } from './helpers/coinbase-binding'
 
 // ── helpers (same shape as webhook-alerts.test.ts) ─────────────────────────
 
@@ -133,8 +134,10 @@ function stubFetch(cfg: Partial<Upstream> = {}) {
     balanceAtomic: 10_000_000n,
     payStatus: 200,
     payBody: CAPTURED_BODY,
-    coinbase: { id: PL, status: 'ACTIVE', usageCount: 0, maxUsage: 1, preApprovalExpiry: String(Math.floor(Date.now() / 1000) + 86400) },
-    rozo: null,
+    coinbase: boundCoinbaseLink(PL),
+    // Paid order bound to PL (order binding). payin_completed, so the sweep's
+    // stuck check (payout_completed only) ignores it unless a test overrides.
+    rozo: boundRozoOrder(ROZO_ID, PL, { status: 'payment_payin_completed' }),
     deliveredStatus: 200,
     intercom: 200,
     funderTransfers: [],
@@ -596,7 +599,7 @@ describe('sweepCoinbaseFulfillments', () => {
   })
 
   it('delivery reporting is off unless ROZO_DELIVERED_REPORT_ENABLED=true (no POST, no attempts)', async () => {
-    const { calls } = stubFetch({ coinbase: { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1 } })
+    const { calls } = stubFetch({ coinbase: boundCoinbaseLink(PL, '1.00', { status: 'COMPLETED', usageCount: 1 }) })
     const { env, kv } = makeEnv({ ROZO_DELIVERED_REPORT_ENABLED: undefined })
     await handleRozoWebhook(await signedWebhookRequest(payoutEvent()), env)
     await sweepCoinbaseFulfillments(env)
@@ -888,7 +891,7 @@ describe('funder-reserved-atomic is gone', () => {
   })
 
   it('a full webhook settlement plus a sweep never touch the old counter key', async () => {
-    stubFetch({ coinbase: { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1 } })
+    stubFetch({ coinbase: boundCoinbaseLink(PL, '1.00', { status: 'COMPLETED', usageCount: 1 }) })
     const { env, kv } = makeEnv()
     await handleRozoWebhook(await signedWebhookRequest(payoutEvent('payment_payin_completed')), env)
     await sweepCoinbaseFulfillments(env)

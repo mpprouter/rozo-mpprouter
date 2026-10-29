@@ -14,6 +14,7 @@ import { readCheckoutControl, resumeCheckout, stopCheckout } from '../src/routes
 import { handleStripeWebhookEvent, seedStripeRecord } from '../src/routes/stripe-fulfillment'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import type { Env } from '../src/index'
+import { boundRozoOrder } from './helpers/coinbase-binding'
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
 
@@ -719,6 +720,15 @@ describe('Coinbase webhook vs UPI claim', () => {
     const { handleRozoWebhook } = await import('../src/routes/webhook')
     const env = makeEnv({ ROZO_WEBHOOK_SECRET: 'hook-secret' } as Partial<Env>)
     expect((await claimInvoiceKey(env, 'pl_abc123', 'upi', ORDER)).ok).toBe(true)
+    // Order binding re-reads the Rozo order before the claim check.
+    const inner = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+      if (url.includes('intentapiv4.rozo.ai') && url.endsWith('/payments/rozo-1')) {
+        return Response.json(boundRozoOrder('rozo-1', 'pl_abc123', { destination: { amount: '10.50' } }))
+      }
+      return inner(input, init)
+    }) as typeof fetch
     const body = JSON.stringify({
       event_id: 'evt-upi-1',
       type: 'payment_payout_completed',
