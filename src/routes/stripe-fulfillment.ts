@@ -1709,12 +1709,31 @@ export async function fetchRozoPaymentForSettle(env: Env, rozoId: string): Promi
   }
 }
 
-function recordPayoutTime(rec: StripeFulfillmentRecord): number {
-  const ev = rec.events.find((e) => e.kind === 'payout_seen' || e.kind === 'rozo_payout')
-  const t = ev ? Date.parse(ev.at) : NaN
-  if (Number.isFinite(t)) return t
+// When the funder received the intents payout, as this record saw it: the
+// webhook stores the Rozo event under its own type (`payment_payout_completed`,
+// handleStripeWebhookEvent); the settlement submit and paidAt are fallbacks a
+// few seconds later.
+const PAYOUT_TIME_EVENT_KINDS = ['payment_payout_completed', 'stripe_confirm_submitted', 'stripe_confirm_ambiguous']
+export function recordPayoutTime(rec: StripeFulfillmentRecord): number {
+  for (const kind of PAYOUT_TIME_EVENT_KINDS) {
+    const ev = rec.events.find((e) => e.kind === kind)
+    const t = ev ? Date.parse(ev.at) : NaN
+    if (Number.isFinite(t)) return t
+  }
   const paid = rec.paidAt ? Date.parse(rec.paidAt) : NaN
   return Number.isFinite(paid) ? paid : NaN
+}
+
+/** Why a manual_review record can never be closed from the chain (as opposed to "not yet"). */
+export function onchainUncheckableReason(
+  rec: StripeFulfillmentRecord,
+  all: StripeFulfillmentRecord[],
+): 'not_manual_review' | 'no_rozo_payment' | 'no_amount' | 'amount_conflict' | null {
+  if (rec.status !== 'manual_review') return 'not_manual_review'
+  if (!rec.rozoPaymentId) return 'no_rozo_payment'
+  if (!rec.invoiceAmountAtomic) return 'no_amount'
+  if (hasOnchainAmountConflict(rec, all)) return 'amount_conflict'
+  return null
 }
 
 /** Records whose amount is within ONCHAIN_AMOUNT_CONFLICT_BPS of `rec` and whose payout landed within ONCHAIN_AMOUNT_CONFLICT_MS. */
@@ -1745,10 +1764,8 @@ export async function settleManualReviewFromChain(
 ): Promise<OnchainSettleOutcome> {
   const rec = await loadStripeRecord(env, invoiceKey)
   if (!rec) return { checked: false, reason: 'no_record' }
-  if (rec.status !== 'manual_review') return { checked: false, reason: 'not_manual_review' }
-  if (!rec.rozoPaymentId) return { checked: false, reason: 'no_rozo_payment' }
-  if (!rec.invoiceAmountAtomic) return { checked: false, reason: 'no_amount' }
-  if (hasOnchainAmountConflict(rec, opts.all ?? [])) return { checked: false, reason: 'amount_conflict' }
+  const uncheckable = onchainUncheckableReason(rec, opts.all ?? [])
+  if (uncheckable) return { checked: false, reason: uncheckable }
   const nowIso = now.toISOString()
   // Claim the throttle inside the CAS so concurrent sweeps never both read the chain.
   const claimed = await updateStripeRecord<boolean>(env, invoiceKey, rec.orderId, (r) => {
@@ -1763,7 +1780,7 @@ export async function settleManualReviewFromChain(
   const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
   if (!payoutTx) return { checked: false, reason: 'no_payout_tx' }
   const rpc = opts.rpc ?? makeBaseRpc(env.BASE_RPC_URL)
-  const txHash = await findStripeRelayerPull(rpc, payoutTx, BigInt(rec.invoiceAmountAtomic))
+  const txHash = await findStripeRelayerPull(rpc, payoutTx, BigInt(rec.invoiceAmountAtomic ?? "0"))
   if (!txHash) return { checked: true, txHash: null, transition: null }
   const out = await resolveManualReview(env, invoiceKey, {
     resolution: 'paid',
@@ -1789,8 +1806,11 @@ export async function sweepManualReviewOnchain(
   }
   out.scanned = values.length
   const all = values.map(parseRecord).filter((r): r is StripeFulfillmentRecord => !!r)
-  const parked = all.filter((r) => r.status === 'manual_review' && r.rozoPaymentId)
-  out.manualReview = parked.length
+  out.manualReview = all.filter((r) => r.status === 'manual_review').length
+  // Records that can never be closed from the chain (no payment id / amount,
+  // or a same-amount neighbour) are left out before the per-run bound, so
+  // they cannot sit at the head of the queue and starve the checkable ones.
+  const parked = all.filter((r) => onchainUncheckableReason(r, all) === null)
   const checkedAt = (r: StripeFulfillmentRecord) => (r.onchainCheckAt ? Date.parse(r.onchainCheckAt) || 0 : 0)
   parked.sort((a, b) => checkedAt(a) - checkedAt(b))
   for (const rec of parked.slice(0, ONCHAIN_SWEEP_MAX)) {

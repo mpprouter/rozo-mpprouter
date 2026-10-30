@@ -8,6 +8,7 @@ import {
 } from '../src/routes/stripe-fulfillment'
 import { findStripeRelayerPull, STRIPE_RELAYER, STRIPE_PAYIN_CONTRACT, STRIPE_PULL_WINDOW_BLOCKS, STRIPE_PULL_CHUNK_BLOCKS, makeBaseRpc } from '../src/utils/stripe-relayer-pull'
 import { casRead } from '../src/routes/stripe-atomic'
+import { recordPayoutTime } from '../src/routes/stripe-fulfillment'
 import type { Env } from '../src/index'
 
 function makeDoNamespace() {
@@ -105,7 +106,7 @@ async function seed(env: Env, status: string, overrides: Record<string, unknown>
   await seedStripeRecord(env, { invoiceKey: key, merchantAccount: 'acct_1TESTonchain', invoiceAmountAtomic: AMOUNT.toString(), invoiceCurrency: 'usdc', lockFingerprint: 'fp', stripeUrl: 'https://crypto.stripe.com/pay/CDMx' + key, rozoPaymentId: rozoId })
   const raw = await casRead(env, stripeKvKey(key))
   const rec = JSON.parse(raw.value!)
-  Object.assign(rec, { status, events: [{ kind: 'payout_seen', at: T0.toISOString() }], ...overrides })
+  Object.assign(rec, { status, events: [{ kind: 'payment_payin_completed', at: new Date(T0.getTime() - 10_000).toISOString() }, { kind: 'payment_payout_completed', at: T0.toISOString() }, { kind: 'stripe_confirm_submitted', at: new Date(T0.getTime() + 4_000).toISOString() }], ...overrides })
   await (env as any).ATOMIC_STORE.get(null).fetch(new Request('http://do/commit', { method: 'POST', body: JSON.stringify({ key: stripeKvKey(key), expectedVersion: raw.version, op: 'set', value: JSON.stringify(rec) }) }))
 }
 const load = async (env: Env, key = KEY) => JSON.parse((await casRead(env, stripeKvKey(key))).value!)
@@ -150,14 +151,14 @@ describe('settleManualReviewFromChain', () => {
   it('a same-amount Stripe invoice paid out within 15 min blocks on-chain closure for both', async () => {
     const env = makeEnv(); await seed(env, 'manual_review')
     const other = 'cpis_1TESTonchainSettle00000002'
-    await seed(env, 'paid', { paidAt: new Date(T0.getTime() + 60_000).toISOString(), events: [{ kind: 'payout_seen', at: new Date(T0.getTime() + 60_000).toISOString() }] }, other, 'd0000000-0000-0000-0000-000000000000')
+    await seed(env, 'paid', { paidAt: new Date(T0.getTime() + 60_000).toISOString(), events: [{ kind: 'payment_payout_completed', at: new Date(T0.getTime() + 60_000).toISOString() }] }, other, 'd0000000-0000-0000-0000-000000000000')
     const { rpc, calls } = fakeRpc()
     const res = await sweepManualReviewOnchain(env, new Date(T0.getTime() + 3600_000), { rpc, fetchPayment: payment })
     expect(res.manualReview).toBe(1); expect(res.checked).toBe(0); expect(calls.length).toBe(0)
     expect((await load(env)).status).toBe('manual_review')
     // hours apart: no conflict
     const env2 = makeEnv(); await seed(env2, 'manual_review')
-    await seed(env2, 'paid', { paidAt: new Date(T0.getTime() + 3 * 3600_000).toISOString(), events: [{ kind: 'payout_seen', at: new Date(T0.getTime() + 3 * 3600_000).toISOString() }] }, other, 'd0000000-0000-0000-0000-000000000000')
+    await seed(env2, 'paid', { paidAt: new Date(T0.getTime() + 3 * 3600_000).toISOString(), events: [{ kind: 'payment_payout_completed', at: new Date(T0.getTime() + 3 * 3600_000).toISOString() }] }, other, 'd0000000-0000-0000-0000-000000000000')
     const res2 = await sweepManualReviewOnchain(env2, new Date(T0.getTime() + 4 * 3600_000), { rpc: fakeRpc().rpc, fetchPayment: payment })
     expect(res2.transitions).toEqual([expect.stringMatching(/:paid$/)])
     expect((await load(env2)).status).toBe('paid')
@@ -165,5 +166,22 @@ describe('settleManualReviewFromChain', () => {
   it('hasOnchainAmountConflict refuses records it cannot place in time', () => {
     const rec: any = { invoiceKey: 'a', invoiceAmountAtomic: '5800000', events: [], paidAt: null }
     expect(hasOnchainAmountConflict(rec, [])).toBe(true)
+  })
+  it('payout time comes from the webhook event the record really stores (codex P1)', () => {
+    const base: any = { invoiceKey: 'a', invoiceAmountAtomic: '1', paidAt: null }
+    expect(recordPayoutTime({ ...base, events: [{ kind: 'payment_payin_completed', at: '2026-09-02T15:05:00Z' }, { kind: 'payment_payout_completed', at: '2026-09-02T15:05:20Z' }, { kind: 'stripe_confirm_submitted', at: '2026-09-02T15:05:25Z' }] })).toBe(Date.parse('2026-09-02T15:05:20Z'))
+    expect(recordPayoutTime({ ...base, events: [{ kind: 'stripe_confirm_submitted', at: '2026-09-02T15:05:25Z' }] })).toBe(Date.parse('2026-09-02T15:05:25Z'))
+    expect(recordPayoutTime({ ...base, events: [{ kind: 'payout_seen', at: '2026-09-02T15:05:25Z' }], paidAt: '2026-09-02T15:06:00Z' })).toBe(Date.parse('2026-09-02T15:06:00Z'))
+    expect(recordPayoutTime({ ...base, events: [] })).toBeNaN()
+  })
+  it('uncheckable records never consume the per-run quota (codex P2)', async () => {
+    const env = makeEnv()
+    for (let i = 0; i < 6; i++) await seed(env, 'manual_review', { invoiceAmountAtomic: null }, `cpis_1TESTnoamount000000000${i}`, `00000000-0000-4000-8000-00000000001${i}`)
+    await seed(env, 'manual_review')
+    const { rpc } = fakeRpc()
+    const res = await sweepManualReviewOnchain(env, new Date(T0.getTime() + 3600_000), { rpc, fetchPayment: payment })
+    expect(res.manualReview).toBe(7); expect(res.checked).toBe(1)
+    expect(res.transitions).toEqual([expect.stringMatching(/:paid$/)])
+    expect((await load(env)).status).toBe('paid')
   })
 })
