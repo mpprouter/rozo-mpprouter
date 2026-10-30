@@ -26,9 +26,16 @@ const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a116
 export const STRIPE_PULL_WINDOW_BLOCKS = 300
 export const STRIPE_PULL_CHUNK_BLOCKS = 50
 // Another inbound transfer to the funder within this tolerance of the payout
-// amount, in the window around the payout, means a sibling order of about the
-// same size was paid out next to this one: not attributable.
+// amount means a sibling order of about the same size was paid out near this
+// one, and its pull could be the one we see: not attributable. A sibling's
+// automatic pull can only happen after its own payout and within the router's
+// retry budget (webhook settle, then at most AMBIGUOUS_MAX_AUTO_RETRIES
+// re-drives spaced AMBIGUOUS_RETRY_GRACE_MS apart, minutes in total), so a
+// sibling funded more than SIBLING_LOOKBACK_BLOCKS (~1 h) before this payout
+// can no longer produce a pull inside this payout's window; later pulls need
+// a human (admin retry), who sees both records.
 export const SIBLING_PAYOUT_TOLERANCE_BPS = 200n
+export const SIBLING_LOOKBACK_BLOCKS = 1800
 
 export function parseAtomic(v: unknown): bigint | null {
   if (typeof v !== 'string' || !/^\d{1,30}$/.test(v)) return null
@@ -101,9 +108,9 @@ export async function findStripeRelayerPull(
     const getLogs = async (from: number, to: number, topics: (string | null)[]) =>
       ((await rpc('eth_getLogs', [{ address: BASE_USDC, fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16), topics }])) ?? []) as Log[]
     // Sibling check: any other inbound transfer to the funder of about the
-    // payout amount in [start - W, start + W] makes this pull unattributable.
+    // payout amount in [start - LOOKBACK, start + W] makes this pull unattributable.
     const tolerance = (payoutAmount * SIBLING_PAYOUT_TOLERANCE_BPS) / 10_000n
-    for (let from = Math.max(0, start - STRIPE_PULL_WINDOW_BLOCKS); from <= start + STRIPE_PULL_WINDOW_BLOCKS; from += STRIPE_PULL_CHUNK_BLOCKS) {
+    for (let from = Math.max(0, start - SIBLING_LOOKBACK_BLOCKS); from <= start + STRIPE_PULL_WINDOW_BLOCKS; from += STRIPE_PULL_CHUNK_BLOCKS) {
       const to = Math.min(from + STRIPE_PULL_CHUNK_BLOCKS - 1, start + STRIPE_PULL_WINDOW_BLOCKS)
       for (const log of await getLogs(from, to, [ERC20_TRANSFER_TOPIC, null, funderTopic])) {
         if ((log.transactionHash ?? '').toLowerCase() === payoutTxHash.toLowerCase()) continue
@@ -127,5 +134,46 @@ export async function findStripeRelayerPull(
     return pulls.size === 1 ? [...pulls][0] : null
   } catch {
     return null
+  }
+}
+
+/**
+ * Verify a settlement tx pay-invoice reported for this session: sent by
+ * Stripe's relayer to Stripe's payin contract, succeeded, lands after the
+ * intents payout, and its USDC Transfer moves exactly `amountAtomic` out of
+ * the funder the payout delivered to. Anything else is false; never throws.
+ */
+export async function verifyStripeRelayerPull(
+  rpc: JsonRpc,
+  pullTxHash: string,
+  payoutTxHash: string,
+  amountAtomic: bigint,
+): Promise<boolean> {
+  try {
+    if (amountAtomic <= 0n || !TX_HASH_RE.test(pullTxHash) || !TX_HASH_RE.test(payoutTxHash)) return false
+    if (pullTxHash.toLowerCase() === payoutTxHash.toLowerCase()) return false
+    const payout = (await rpc('eth_getTransactionReceipt', [payoutTxHash])) as { status?: string; blockNumber?: string; logs?: Log[] } | null
+    if (!payout || hexInt(payout.status) !== 1) return false
+    const payoutLogs = (payout.logs ?? []).filter((l) => (l.address ?? '').toLowerCase() === BASE_USDC && l.topics?.[0] === ERC20_TRANSFER_TOPIC)
+    const receivers = new Set(payoutLogs.map((l) => '0x' + (l.topics?.[2] ?? '').slice(-40).toLowerCase()))
+    if (receivers.size !== 1) return false
+    const funder = [...receivers][0]
+    const payoutBlock = hexInt(payout.blockNumber)
+    const payoutIndex = Math.max(...payoutLogs.map((l) => hexInt(l.logIndex)))
+    const tx = ((await rpc('eth_getTransactionByHash', [pullTxHash])) ?? {}) as { from?: string; to?: string }
+    if ((tx.from ?? '').toLowerCase() !== STRIPE_RELAYER || (tx.to ?? '').toLowerCase() !== STRIPE_PAYIN_CONTRACT) return false
+    const pull = (await rpc('eth_getTransactionReceipt', [pullTxHash])) as { status?: string; blockNumber?: string; logs?: Log[] } | null
+    if (!pull || hexInt(pull.status) !== 1) return false
+    const pullBlock = hexInt(pull.blockNumber)
+    const moved = (pull.logs ?? []).filter(
+      (l) => (l.address ?? '').toLowerCase() === BASE_USDC && l.topics?.[0] === ERC20_TRANSFER_TOPIC
+        && '0x' + (l.topics?.[1] ?? '').slice(-40).toLowerCase() === funder && hexBig(l.data) === amountAtomic,
+    )
+    if (moved.length !== 1) return false
+    if (pullBlock < payoutBlock) return false
+    if (pullBlock === payoutBlock && hexInt(moved[0].logIndex) <= payoutIndex) return false
+    return true
+  } catch {
+    return false
   }
 }

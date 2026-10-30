@@ -6,7 +6,7 @@ import {
   seedStripeRecord, stripeKvKey, settleManualReviewFromChain, sweepManualReviewOnchain,
   ONCHAIN_RESOLVED_BY, ONCHAIN_RECHECK_MS,
 } from '../src/routes/stripe-fulfillment'
-import { findStripeRelayerPull, STRIPE_RELAYER, STRIPE_PAYIN_CONTRACT, STRIPE_PULL_WINDOW_BLOCKS, STRIPE_PULL_CHUNK_BLOCKS, makeBaseRpc, parseAtomic } from '../src/utils/stripe-relayer-pull'
+import { findStripeRelayerPull, verifyStripeRelayerPull, STRIPE_RELAYER, STRIPE_PAYIN_CONTRACT, STRIPE_PULL_WINDOW_BLOCKS, STRIPE_PULL_CHUNK_BLOCKS, SIBLING_LOOKBACK_BLOCKS, makeBaseRpc, parseAtomic } from '../src/utils/stripe-relayer-pull'
 import { casRead } from '../src/routes/stripe-atomic'
 import type { Env } from '../src/index'
 
@@ -71,8 +71,9 @@ describe('findStripeRelayerPull', () => {
   it('matches the exact amount pulled by the Stripe relayer after the payout', async () => {
     const { rpc, calls } = fakeRpc()
     expect(await findStripeRelayerPull(rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX)
-    // sibling scan over [start - W, start + W] plus the pull scan over [start, start + W], all in 50-block chunks
-    expect(calls.filter((m) => m === 'eth_getLogs').length).toBe(13 + STRIPE_PULL_WINDOW_BLOCKS / STRIPE_PULL_CHUNK_BLOCKS)
+    // sibling scan over [start - LOOKBACK, start + W] plus the pull scan over [start, start + W], all in 50-block chunks
+    const siblingChunks = Math.ceil((SIBLING_LOOKBACK_BLOCKS + STRIPE_PULL_WINDOW_BLOCKS + 1) / STRIPE_PULL_CHUNK_BLOCKS)
+    expect(calls.filter((m) => m === 'eth_getLogs').length).toBe(siblingChunks + STRIPE_PULL_WINDOW_BLOCKS / STRIPE_PULL_CHUNK_BLOCKS)
     expect(calls.filter((m) => m === 'eth_getTransactionByHash').length).toBe(1)
   })
   it('rejects other senders, contracts, amounts, failed payouts, ambiguous receivers, rpc failures', async () => {
@@ -97,6 +98,31 @@ describe('findStripeRelayerPull', () => {
     expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(31300000n, PAYOUT_BLOCK + 200)] }).rpc, PAYOUT_TX, AMOUNT)).toBeNull()   // within 2%, later
     expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(5800000n, PAYOUT_BLOCK + 10)] }).rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX)  // different size: fine
     expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(31760000n, PAYOUT_BLOCK + 301)] }).rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX) // outside the window
+    expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(31760000n, PAYOUT_BLOCK - 1500)] }).rpc, PAYOUT_TX, AMOUNT)).toBeNull()  // funded 50 min earlier: its late pull could be this one
+    expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(31760000n, PAYOUT_BLOCK - 1801)] }).rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX) // beyond any automatic retry
+  })
+  it('verifyStripeRelayerPull checks a session-bound settlement tx on chain', async () => {
+    const pullReceipt = (o: { from?: string; amount?: bigint; status?: string; block?: number; index?: number } = {}) => ({
+      status: o.status ?? '0x1', blockNumber: '0x' + (o.block ?? PAYOUT_BLOCK + 6).toString(16),
+      logs: [{ address: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', data: '0x' + (o.amount ?? AMOUNT).toString(16), transactionHash: PULL_TX,
+        blockNumber: '0x' + (o.block ?? PAYOUT_BLOCK + 6).toString(16), logIndex: '0x' + (o.index ?? 5).toString(16),
+        topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', '0x' + (o.from ?? FUNDER).slice(2).padStart(64, '0'), '0x' + 'f167'.padEnd(40, '0').padStart(64, '0')] }],
+    })
+    const rpcFor = (o: Parameters<typeof pullReceipt>[0] & { sender?: string; contract?: string } = {}) => async (method: string, params: unknown[]) => {
+      if (method === 'eth_getTransactionReceipt') return params[0] === PAYOUT_TX ? { status: '0x1', blockNumber: '0x' + PAYOUT_BLOCK.toString(16), logs: [transferLog(FUNDER, 31760000n, PAYOUT_TX, PAYOUT_BLOCK, 7)] } : pullReceipt(o)
+      if (method === 'eth_getTransactionByHash') return { from: o.sender ?? STRIPE_RELAYER, to: o.contract ?? STRIPE_PAYIN_CONTRACT }
+      throw new Error(method)
+    }
+    expect(await verifyStripeRelayerPull(rpcFor(), PULL_TX, PAYOUT_TX, AMOUNT)).toBe(true)
+    expect(await verifyStripeRelayerPull(rpcFor({ sender: FUNDER }), PULL_TX, PAYOUT_TX, AMOUNT)).toBe(false)
+    expect(await verifyStripeRelayerPull(rpcFor({ contract: '0x' + 'ab'.repeat(20) }), PULL_TX, PAYOUT_TX, AMOUNT)).toBe(false)
+    expect(await verifyStripeRelayerPull(rpcFor({ amount: 31430000n }), PULL_TX, PAYOUT_TX, AMOUNT)).toBe(false)
+    expect(await verifyStripeRelayerPull(rpcFor({ from: '0x' + 'cd'.repeat(20) }), PULL_TX, PAYOUT_TX, AMOUNT)).toBe(false)  // pulled from someone else
+    expect(await verifyStripeRelayerPull(rpcFor({ status: '0x0' }), PULL_TX, PAYOUT_TX, AMOUNT)).toBe(false)
+    expect(await verifyStripeRelayerPull(rpcFor({ block: PAYOUT_BLOCK - 1 }), PULL_TX, PAYOUT_TX, AMOUNT)).toBe(false)     // before the payout
+    expect(await verifyStripeRelayerPull(rpcFor({ block: PAYOUT_BLOCK, index: 3 }), PULL_TX, PAYOUT_TX, AMOUNT)).toBe(false)
+    expect(await verifyStripeRelayerPull(rpcFor(), PAYOUT_TX, PAYOUT_TX, AMOUNT)).toBe(false)
+    expect(await verifyStripeRelayerPull(async () => { throw new Error('down') }, PULL_TX, PAYOUT_TX, AMOUNT)).toBe(false)
   })
   it('parseAtomic is defensive', () => {
     expect(parseAtomic('31440000')).toBe(31440000n); expect(parseAtomic('0')).toBeNull(); expect(parseAtomic('abc')).toBeNull(); expect(parseAtomic(null)).toBeNull(); expect(parseAtomic('1e6')).toBeNull()
@@ -150,6 +176,32 @@ describe('settleManualReviewFromChain', () => {
     expect(await settleManualReviewFromChain(env, KEY, new Date(now.getTime() + ONCHAIN_RECHECK_MS - 1), { rpc, fetchPayment: payment })).toEqual({ checked: false, reason: 'throttled' })
     expect(calls.length).toBe(before)
     expect((await settleManualReviewFromChain(env, KEY, new Date(now.getTime() + ONCHAIN_RECHECK_MS + 1), { rpc, fetchPayment: payment })).checked).toBe(true)
+  })
+  it('prefers the settlement tx pay-invoice reported for the session, verified on chain, over the search', async () => {
+    const env = makeEnv(); await seed(env, 'manual_review', { providerResult: { ok: true, status: 200, blockchainTxId: PULL_TX } })
+    const calls: string[] = []
+    const rpc = async (method: string, params: unknown[]) => {
+      calls.push(method + (method === 'eth_getLogs' ? '!' : ''))
+      if (method === 'eth_getTransactionReceipt') return params[0] === PAYOUT_TX
+        ? { status: '0x1', blockNumber: '0x' + PAYOUT_BLOCK.toString(16), logs: [transferLog(FUNDER, 31760000n, PAYOUT_TX, PAYOUT_BLOCK, 7)] }
+        : { status: '0x1', blockNumber: '0x' + (PAYOUT_BLOCK + 6).toString(16), logs: [{ ...transferLog('0x' + 'f1'.repeat(20), AMOUNT, PULL_TX), topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', '0x' + FUNDER.slice(2).padStart(64, '0'), '0x' + 'f1'.repeat(20).padStart(64, '0')] }] }
+      if (method === 'eth_getTransactionByHash') return { from: STRIPE_RELAYER, to: STRIPE_PAYIN_CONTRACT }
+      throw new Error(method)
+    }
+    const out = await settleManualReviewFromChain(env, KEY, new Date(T0.getTime() + 3600_000), { rpc, fetchPayment: payment })
+    expect(out).toEqual({ checked: true, txHash: PULL_TX, transition: 'paid' })
+    expect(calls.some((c) => c.endsWith('!'))).toBe(false)   // no log search when the session-bound tx is known
+    const rec = await load(env)
+    expect(rec.manualResolution.evidence).toContain('pay-invoice reported settlement tx')
+    // a stored tx that does not verify is not trusted and does not fall back to the search
+    const env2 = makeEnv(); await seed(env2, 'manual_review', { providerResult: { ok: true, status: 200, blockchainTxId: '0x' + '99'.repeat(32) } })
+    const rpc2 = async (method: string, params: unknown[]) => {
+      if (method === 'eth_getTransactionByHash') return { from: FUNDER, to: STRIPE_PAYIN_CONTRACT }
+      if (method === 'eth_getTransactionReceipt') return { status: '0x1', blockNumber: '0x' + PAYOUT_BLOCK.toString(16), logs: [transferLog(FUNDER, 31760000n, PAYOUT_TX, PAYOUT_BLOCK, 7)] }
+      throw new Error(method)
+    }
+    expect(await settleManualReviewFromChain(env2, KEY, new Date(T0.getTime() + 3600_000), { rpc: rpc2, fetchPayment: payment })).toEqual({ checked: true, txHash: null, transition: null })
+    expect((await load(env2)).status).toBe('manual_review')
   })
   it.each(['paid', 'provider_paying', 'failed_provider', 'payout_seen'])('leaves %s alone', async (status) => {
     const env = makeEnv(); await seed(env, status)

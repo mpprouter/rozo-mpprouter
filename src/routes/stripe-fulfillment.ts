@@ -28,7 +28,7 @@ import { DELIVERED_MAX_ATTEMPTS } from './coinbase-sweep'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
-import { findStripeRelayerPull, makeBaseRpc, parseAtomic as parseInvoiceAtomic, STRIPE_RELAYER } from '../utils/stripe-relayer-pull'
+import { findStripeRelayerPull, verifyStripeRelayerPull, makeBaseRpc, parseAtomic as parseInvoiceAtomic, STRIPE_RELAYER } from '../utils/stripe-relayer-pull'
 import { intentsReadBase } from './intents-base'
 import { casRead, casUpdate, casScan } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
@@ -928,6 +928,9 @@ export function safeProviderResult(result: StripePayInvoiceResult): Record<strin
     success: pick('success'),
     state: pick('state'),
     provider: pick('provider'),
+    // Stripe's relayer settlement tx when pay-invoice's poll saw it: the
+    // session-bound evidence the on-chain closer prefers (not a capability).
+    blockchainTxId: pick('blockchainTxId'),
   }
 }
 
@@ -1705,6 +1708,13 @@ export async function fetchRozoPaymentForSettle(env: Env, rozoId: string): Promi
   }
 }
 
+/** The settlement tx pay-invoice reported for this session, if the record stored one. */
+export function boundSettlementTx(rec: StripeFulfillmentRecord): string | null {
+  const pr = rec.providerResult && typeof rec.providerResult === 'object' ? (rec.providerResult as Record<string, unknown>) : null
+  const v = pr?.blockchainTxId
+  return typeof v === 'string' && /^0x[0-9a-fA-F]{64}$/.test(v) ? v.toLowerCase() : null
+}
+
 /** Why a manual_review record can never be closed from the chain (as opposed to "not yet"). Never throws on bad data. */
 export function onchainUncheckableReason(
   rec: StripeFulfillmentRecord,
@@ -1743,11 +1753,24 @@ export async function settleManualReviewFromChain(
   const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
   if (!payoutTx) return { checked: false, reason: 'no_payout_tx' }
   const rpc = opts.rpc ?? makeBaseRpc(env.BASE_RPC_URL)
-  const txHash = await findStripeRelayerPull(rpc, payoutTx, parseInvoiceAtomic(rec.invoiceAmountAtomic) ?? 0n)
+  const amount = parseInvoiceAtomic(rec.invoiceAmountAtomic) ?? 0n
+  // Session-bound evidence first: the settlement tx pay-invoice reported for
+  // this very session. Verified on chain, never trusted as stored. Records
+  // written before it was persisted fall back to the by-exclusion search.
+  const bound = boundSettlementTx(rec)
+  let txHash: string | null
+  let evidence: string
+  if (bound) {
+    txHash = (await verifyStripeRelayerPull(rpc, bound, payoutTx, amount)) ? bound : null
+    evidence = `pay-invoice reported settlement tx ${bound.slice(0, 10)}… for this session; verified on Base: sent by Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)}, pulls the exact invoice amount from the funder after the intents payout ${payoutTx.slice(0, 10)}…`
+  } else {
+    txHash = await findStripeRelayerPull(rpc, payoutTx, amount)
+    evidence = `Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)} pulled the exact invoice amount from the funder on Base after the intents payout ${payoutTx.slice(0, 10)}… (the only such pull in 300 blocks, no similar-size payout to the funder in the 1800 blocks before or 300 after)`
+  }
   if (!txHash) return { checked: true, txHash: null, transition: null }
   const out = await resolveManualReview(env, invoiceKey, {
     resolution: 'paid',
-    evidence: `Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)} pulled the exact invoice amount from the funder on Base after the intents payout ${payoutTx.slice(0, 10)}… (the only such pull in 300 blocks, no similar-size payout to the funder within 300 blocks either side)`,
+    evidence,
     txHash,
     resolvedBy: ONCHAIN_RESOLVED_BY,
     now,
