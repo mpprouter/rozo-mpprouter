@@ -28,7 +28,7 @@ import { DELIVERED_MAX_ATTEMPTS } from './coinbase-sweep'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
-import { findStripeRelayerPull, makeBaseRpc, STRIPE_RELAYER } from '../utils/stripe-relayer-pull'
+import { findStripeRelayerPull, makeBaseRpc, parseAtomic as parseInvoiceAtomic, STRIPE_RELAYER } from '../utils/stripe-relayer-pull'
 import { intentsReadBase } from './intents-base'
 import { casRead, casUpdate, casScan } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
@@ -1688,10 +1688,6 @@ export async function resolveManualReview(
 
 export const ONCHAIN_SWEEP_MAX = 5
 export const ONCHAIN_RECHECK_MS = 24 * 60 * 60 * 1000
-// Two Stripe invoices of (about) the same amount paid out this close together
-// cannot be told apart on chain; neither is closed from the chain.
-export const ONCHAIN_AMOUNT_CONFLICT_MS = 15 * 60 * 1000
-export const ONCHAIN_AMOUNT_CONFLICT_BPS = 200n
 export const ONCHAIN_RESOLVED_BY = 'cron:stripe-relayer-pull'
 
 // Same read as the webhook's payment lookup, kept local so this module does
@@ -1709,62 +1705,29 @@ export async function fetchRozoPaymentForSettle(env: Env, rozoId: string): Promi
   }
 }
 
-// When the funder received the intents payout, as this record saw it: the
-// webhook stores the Rozo event under its own type (`payment_payout_completed`,
-// handleStripeWebhookEvent); the settlement submit and paidAt are fallbacks a
-// few seconds later.
-const PAYOUT_TIME_EVENT_KINDS = ['payment_payout_completed', 'stripe_confirm_submitted', 'stripe_confirm_ambiguous']
-export function recordPayoutTime(rec: StripeFulfillmentRecord): number {
-  for (const kind of PAYOUT_TIME_EVENT_KINDS) {
-    const ev = rec.events.find((e) => e.kind === kind)
-    const t = ev ? Date.parse(ev.at) : NaN
-    if (Number.isFinite(t)) return t
-  }
-  const paid = rec.paidAt ? Date.parse(rec.paidAt) : NaN
-  return Number.isFinite(paid) ? paid : NaN
-}
-
-/** Why a manual_review record can never be closed from the chain (as opposed to "not yet"). */
+/** Why a manual_review record can never be closed from the chain (as opposed to "not yet"). Never throws on bad data. */
 export function onchainUncheckableReason(
   rec: StripeFulfillmentRecord,
-  all: StripeFulfillmentRecord[],
-): 'not_manual_review' | 'no_rozo_payment' | 'no_amount' | 'amount_conflict' | null {
+): 'not_manual_review' | 'no_rozo_payment' | 'no_amount' | null {
   if (rec.status !== 'manual_review') return 'not_manual_review'
   if (!rec.rozoPaymentId) return 'no_rozo_payment'
-  if (!rec.invoiceAmountAtomic) return 'no_amount'
-  if (hasOnchainAmountConflict(rec, all)) return 'amount_conflict'
+  if (parseInvoiceAtomic(rec.invoiceAmountAtomic) === null) return 'no_amount'
   return null
 }
 
-/** Records whose amount is within ONCHAIN_AMOUNT_CONFLICT_BPS of `rec` and whose payout landed within ONCHAIN_AMOUNT_CONFLICT_MS. */
-export function hasOnchainAmountConflict(rec: StripeFulfillmentRecord, all: StripeFulfillmentRecord[]): boolean {
-  const amount = rec.invoiceAmountAtomic ? BigInt(rec.invoiceAmountAtomic) : 0n
-  const when = recordPayoutTime(rec)
-  if (amount <= 0n || !Number.isFinite(when)) return true // cannot place it in time: do not close from the chain
-  const tolerance = (amount * ONCHAIN_AMOUNT_CONFLICT_BPS) / 10_000n
-  for (const other of all) {
-    if (other.invoiceKey === rec.invoiceKey || !other.invoiceAmountAtomic) continue
-    const otherWhen = recordPayoutTime(other)
-    if (!Number.isFinite(otherWhen)) continue
-    const diff = BigInt(other.invoiceAmountAtomic) - amount
-    if ((diff < 0n ? -diff : diff) <= tolerance && Math.abs(otherWhen - when) <= ONCHAIN_AMOUNT_CONFLICT_MS) return true
-  }
-  return false
-}
-
 export type OnchainSettleOutcome =
-  | { checked: false; reason: 'no_record' | 'not_manual_review' | 'throttled' | 'no_rozo_payment' | 'no_payout_tx' | 'amount_conflict' | 'no_amount' }
+  | { checked: false; reason: 'no_record' | 'not_manual_review' | 'throttled' | 'no_rozo_payment' | 'no_payout_tx' | 'no_amount' }
   | { checked: true; txHash: string | null; transition: 'paid' | null }
 
 export async function settleManualReviewFromChain(
   env: Env,
   invoiceKey: string,
   now: Date,
-  opts: { all?: StripeFulfillmentRecord[]; rpc?: ReturnType<typeof makeBaseRpc>; fetchPayment?: typeof fetchRozoPaymentForSettle } = {},
+  opts: { rpc?: ReturnType<typeof makeBaseRpc>; fetchPayment?: typeof fetchRozoPaymentForSettle } = {},
 ): Promise<OnchainSettleOutcome> {
   const rec = await loadStripeRecord(env, invoiceKey)
   if (!rec) return { checked: false, reason: 'no_record' }
-  const uncheckable = onchainUncheckableReason(rec, opts.all ?? [])
+  const uncheckable = onchainUncheckableReason(rec)
   if (uncheckable) return { checked: false, reason: uncheckable }
   const nowIso = now.toISOString()
   // Claim the throttle inside the CAS so concurrent sweeps never both read the chain.
@@ -1780,11 +1743,11 @@ export async function settleManualReviewFromChain(
   const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
   if (!payoutTx) return { checked: false, reason: 'no_payout_tx' }
   const rpc = opts.rpc ?? makeBaseRpc(env.BASE_RPC_URL)
-  const txHash = await findStripeRelayerPull(rpc, payoutTx, BigInt(rec.invoiceAmountAtomic ?? "0"))
+  const txHash = await findStripeRelayerPull(rpc, payoutTx, parseInvoiceAtomic(rec.invoiceAmountAtomic) ?? 0n)
   if (!txHash) return { checked: true, txHash: null, transition: null }
   const out = await resolveManualReview(env, invoiceKey, {
     resolution: 'paid',
-    evidence: `Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)} pulled the exact invoice amount from the funder on Base after the intents payout ${payoutTx.slice(0, 10)}… (unique in ${300} blocks, no same-amount payout within 15 min)`,
+    evidence: `Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)} pulled the exact invoice amount from the funder on Base after the intents payout ${payoutTx.slice(0, 10)}… (the only such pull in 300 blocks, no similar-size payout to the funder within 300 blocks either side)`,
     txHash,
     resolvedBy: ONCHAIN_RESOLVED_BY,
     now,
@@ -1807,15 +1770,15 @@ export async function sweepManualReviewOnchain(
   out.scanned = values.length
   const all = values.map(parseRecord).filter((r): r is StripeFulfillmentRecord => !!r)
   out.manualReview = all.filter((r) => r.status === 'manual_review').length
-  // Records that can never be closed from the chain (no payment id / amount,
-  // or a same-amount neighbour) are left out before the per-run bound, so
-  // they cannot sit at the head of the queue and starve the checkable ones.
-  const parked = all.filter((r) => onchainUncheckableReason(r, all) === null)
+  // Records that can never be closed from the chain (no payment id, no
+  // parseable amount) are left out before the per-run bound, so they cannot
+  // sit at the head of the queue and starve the checkable ones.
+  const parked = all.filter((r) => onchainUncheckableReason(r) === null)
   const checkedAt = (r: StripeFulfillmentRecord) => (r.onchainCheckAt ? Date.parse(r.onchainCheckAt) || 0 : 0)
   parked.sort((a, b) => checkedAt(a) - checkedAt(b))
   for (const rec of parked.slice(0, ONCHAIN_SWEEP_MAX)) {
     try {
-      const r = await settleManualReviewFromChain(env, rec.invoiceKey, now, { all, ...opts })
+      const r = await settleManualReviewFromChain(env, rec.invoiceKey, now, opts)
       if (r.checked) out.checked++
       if (r.checked && r.transition) out.transitions.push(`${maskInvoiceKey(rec.invoiceKey)}:${r.transition}`)
     } catch {

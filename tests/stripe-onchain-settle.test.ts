@@ -4,11 +4,10 @@
 import { describe, it, expect } from 'vitest'
 import {
   seedStripeRecord, stripeKvKey, settleManualReviewFromChain, sweepManualReviewOnchain,
-  hasOnchainAmountConflict, ONCHAIN_RESOLVED_BY, ONCHAIN_RECHECK_MS,
+  ONCHAIN_RESOLVED_BY, ONCHAIN_RECHECK_MS,
 } from '../src/routes/stripe-fulfillment'
-import { findStripeRelayerPull, STRIPE_RELAYER, STRIPE_PAYIN_CONTRACT, STRIPE_PULL_WINDOW_BLOCKS, STRIPE_PULL_CHUNK_BLOCKS, makeBaseRpc } from '../src/utils/stripe-relayer-pull'
+import { findStripeRelayerPull, STRIPE_RELAYER, STRIPE_PAYIN_CONTRACT, STRIPE_PULL_WINDOW_BLOCKS, STRIPE_PULL_CHUNK_BLOCKS, makeBaseRpc, parseAtomic } from '../src/utils/stripe-relayer-pull'
 import { casRead } from '../src/routes/stripe-atomic'
-import { recordPayoutTime } from '../src/routes/stripe-fulfillment'
 import type { Env } from '../src/index'
 
 function makeDoNamespace() {
@@ -47,7 +46,7 @@ function transferLog(to: string, amount: bigint, tx: string, block = PAYOUT_BLOC
     blockNumber: '0x' + block.toString(16), logIndex: '0x' + index.toString(16),
     topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', '0x' + 'ab'.repeat(32), '0x' + to.slice(2).padStart(64, '0')] }
 }
-function fakeRpc(o: { sender?: string; contract?: string; amount?: bigint; status?: string; payoutLogs?: any[]; windowLogs?: any[] } = {}) {
+function fakeRpc(o: { sender?: string; contract?: string; amount?: bigint; status?: string; payoutLogs?: any[]; windowLogs?: any[]; inboundLogs?: any[] } = {}) {
   const calls: string[] = []
   const rpc = async (method: string, params: unknown[]) => {
     calls.push(method)
@@ -55,6 +54,11 @@ function fakeRpc(o: { sender?: string; contract?: string; amount?: bigint; statu
     if (method === 'eth_getLogs') {
       const f = params[0] as any
       expect(parseInt(f.toBlock, 16) - parseInt(f.fromBlock, 16)).toBeLessThan(STRIPE_PULL_CHUNK_BLOCKS)
+      if (f.topics[1] === null) {
+        // inbound to the funder: the payout itself plus whatever the test adds
+        const from = parseInt(f.fromBlock, 16), to = parseInt(f.toBlock, 16)
+        return [transferLog(FUNDER, 31760000n, PAYOUT_TX, PAYOUT_BLOCK, 7), ...(o.inboundLogs ?? [])].filter((l) => { const b = parseInt(l.blockNumber, 16); return b >= from && b <= to })
+      }
       return o.windowLogs ?? [transferLog(FUNDER, 5000000n, '0x' + '33'.repeat(32)), transferLog(FUNDER, o.amount ?? AMOUNT, PULL_TX)]
     }
     if (method === 'eth_getTransactionByHash') return { from: o.sender ?? STRIPE_RELAYER, to: o.contract ?? STRIPE_PAYIN_CONTRACT }
@@ -67,7 +71,8 @@ describe('findStripeRelayerPull', () => {
   it('matches the exact amount pulled by the Stripe relayer after the payout', async () => {
     const { rpc, calls } = fakeRpc()
     expect(await findStripeRelayerPull(rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX)
-    expect(calls.filter((m) => m === 'eth_getLogs').length).toBe(STRIPE_PULL_WINDOW_BLOCKS / STRIPE_PULL_CHUNK_BLOCKS)
+    // sibling scan over [start - W, start + W] plus the pull scan over [start, start + W], all in 50-block chunks
+    expect(calls.filter((m) => m === 'eth_getLogs').length).toBe(13 + STRIPE_PULL_WINDOW_BLOCKS / STRIPE_PULL_CHUNK_BLOCKS)
     expect(calls.filter((m) => m === 'eth_getTransactionByHash').length).toBe(1)
   })
   it('rejects other senders, contracts, amounts, failed payouts, ambiguous receivers, rpc failures', async () => {
@@ -85,6 +90,16 @@ describe('findStripeRelayerPull', () => {
     expect(await findStripeRelayerPull(fakeRpc({ windowLogs: [transferLog(FUNDER, AMOUNT, PULL_TX), transferLog(FUNDER, AMOUNT, other)] }).rpc, PAYOUT_TX, AMOUNT)).toBeNull()
     expect(await findStripeRelayerPull(fakeRpc({ windowLogs: [transferLog(FUNDER, AMOUNT, PULL_TX, PAYOUT_BLOCK, 3)] }).rpc, PAYOUT_TX, AMOUNT)).toBeNull()
     expect(await findStripeRelayerPull(fakeRpc({ windowLogs: [transferLog(FUNDER, AMOUNT, PULL_TX, PAYOUT_BLOCK, 9)] }).rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX)
+  })
+  it('a similar-size payout to the funder next to this one makes the pull unattributable (codex P1)', async () => {
+    const sibling = (amount: bigint, block: number) => transferLog(FUNDER, amount, '0x' + '55'.repeat(32), block, 1)
+    expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(31760000n, PAYOUT_BLOCK - 120)] }).rpc, PAYOUT_TX, AMOUNT)).toBeNull()   // same amount, 4 min earlier
+    expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(31300000n, PAYOUT_BLOCK + 200)] }).rpc, PAYOUT_TX, AMOUNT)).toBeNull()   // within 2%, later
+    expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(5800000n, PAYOUT_BLOCK + 10)] }).rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX)  // different size: fine
+    expect(await findStripeRelayerPull(fakeRpc({ inboundLogs: [sibling(31760000n, PAYOUT_BLOCK + 301)] }).rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX) // outside the window
+  })
+  it('parseAtomic is defensive', () => {
+    expect(parseAtomic('31440000')).toBe(31440000n); expect(parseAtomic('0')).toBeNull(); expect(parseAtomic('abc')).toBeNull(); expect(parseAtomic(null)).toBeNull(); expect(parseAtomic('1e6')).toBeNull()
   })
   it('makeBaseRpc falls through endpoints that error and redacts nothing into the result', async () => {
     const seen: string[] = []
@@ -148,31 +163,13 @@ describe('settleManualReviewFromChain', () => {
     expect(calls.length).toBe(0)
     expect((await load(env)).status).toBe('manual_review')
   })
-  it('a same-amount Stripe invoice paid out within 15 min blocks on-chain closure for both', async () => {
+  it('a malformed stored amount is skipped, not thrown, and does not abort the batch (codex P2)', async () => {
     const env = makeEnv(); await seed(env, 'manual_review')
-    const other = 'cpis_1TESTonchainSettle00000002'
-    await seed(env, 'paid', { paidAt: new Date(T0.getTime() + 60_000).toISOString(), events: [{ kind: 'payment_payout_completed', at: new Date(T0.getTime() + 60_000).toISOString() }] }, other, 'd0000000-0000-0000-0000-000000000000')
-    const { rpc, calls } = fakeRpc()
-    const res = await sweepManualReviewOnchain(env, new Date(T0.getTime() + 3600_000), { rpc, fetchPayment: payment })
-    expect(res.manualReview).toBe(1); expect(res.checked).toBe(0); expect(calls.length).toBe(0)
-    expect((await load(env)).status).toBe('manual_review')
-    // hours apart: no conflict
-    const env2 = makeEnv(); await seed(env2, 'manual_review')
-    await seed(env2, 'paid', { paidAt: new Date(T0.getTime() + 3 * 3600_000).toISOString(), events: [{ kind: 'payment_payout_completed', at: new Date(T0.getTime() + 3 * 3600_000).toISOString() }] }, other, 'd0000000-0000-0000-0000-000000000000')
-    const res2 = await sweepManualReviewOnchain(env2, new Date(T0.getTime() + 4 * 3600_000), { rpc: fakeRpc().rpc, fetchPayment: payment })
-    expect(res2.transitions).toEqual([expect.stringMatching(/:paid$/)])
-    expect((await load(env2)).status).toBe('paid')
-  })
-  it('hasOnchainAmountConflict refuses records it cannot place in time', () => {
-    const rec: any = { invoiceKey: 'a', invoiceAmountAtomic: '5800000', events: [], paidAt: null }
-    expect(hasOnchainAmountConflict(rec, [])).toBe(true)
-  })
-  it('payout time comes from the webhook event the record really stores (codex P1)', () => {
-    const base: any = { invoiceKey: 'a', invoiceAmountAtomic: '1', paidAt: null }
-    expect(recordPayoutTime({ ...base, events: [{ kind: 'payment_payin_completed', at: '2026-09-02T15:05:00Z' }, { kind: 'payment_payout_completed', at: '2026-09-02T15:05:20Z' }, { kind: 'stripe_confirm_submitted', at: '2026-09-02T15:05:25Z' }] })).toBe(Date.parse('2026-09-02T15:05:20Z'))
-    expect(recordPayoutTime({ ...base, events: [{ kind: 'stripe_confirm_submitted', at: '2026-09-02T15:05:25Z' }] })).toBe(Date.parse('2026-09-02T15:05:25Z'))
-    expect(recordPayoutTime({ ...base, events: [{ kind: 'payout_seen', at: '2026-09-02T15:05:25Z' }], paidAt: '2026-09-02T15:06:00Z' })).toBe(Date.parse('2026-09-02T15:06:00Z'))
-    expect(recordPayoutTime({ ...base, events: [] })).toBeNaN()
+    await seed(env, 'manual_review', { invoiceAmountAtomic: 'not-a-number' }, 'cpis_1TESTonchainSettle00000002', '00000000-0000-4000-8000-000000000002')
+    const res = await sweepManualReviewOnchain(env, new Date(T0.getTime() + 3600_000), { rpc: fakeRpc().rpc, fetchPayment: payment })
+    expect(res.manualReview).toBe(2); expect(res.checked).toBe(1)
+    expect((await load(env)).status).toBe('paid')
+    expect((await load(env, 'cpis_1TESTonchainSettle00000002')).status).toBe('manual_review')
   })
   it('uncheckable records never consume the per-run quota (codex P2)', async () => {
     const env = makeEnv()

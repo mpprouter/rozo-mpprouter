@@ -10,8 +10,10 @@
 //
 // Binding to one invoice (there is no session id in the calldata we can read):
 // the pull must come after the payout (block, then log index) and be the only
-// exact-amount relayer pull in the window. The caller additionally rules out
-// another same-amount Stripe invoice paid out around the same time.
+// exact-amount relayer pull in the window, and the funder must not have
+// received another payout of about the same size within the window on either
+// side (that would be a same-amount sibling invoice whose pull this could be).
+// All of it is read from the chain; record timestamps are never used.
 import { FALLBACK_BASE_RPCS } from './base-usdc-balance'
 
 export const STRIPE_RELAYER = '0x75d22dd531d9bfd3da6293eb5ddac8f351f21240'
@@ -23,6 +25,16 @@ const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a116
 // RPCs cap eth_getLogs at 50 blocks per call.
 export const STRIPE_PULL_WINDOW_BLOCKS = 300
 export const STRIPE_PULL_CHUNK_BLOCKS = 50
+// Another inbound transfer to the funder within this tolerance of the payout
+// amount, in the window around the payout, means a sibling order of about the
+// same size was paid out next to this one: not attributable.
+export const SIBLING_PAYOUT_TOLERANCE_BPS = 200n
+
+export function parseAtomic(v: unknown): bigint | null {
+  if (typeof v !== 'string' || !/^\d{1,30}$/.test(v)) return null
+  const n = BigInt(v)
+  return n > 0n ? n : null
+}
 
 export type JsonRpc = (method: string, params: unknown[]) => Promise<unknown>
 
@@ -84,11 +96,26 @@ export async function findStripeRelayerPull(
     if (!/^0x[0-9a-f]{40}$/.test(funder)) return null
     const start = hexInt(receipt.blockNumber)
     const payoutIndex = Math.max(...payoutLogs.map((l) => hexInt(l.logIndex)))
-    const topics = [ERC20_TRANSFER_TOPIC, '0x' + funder.slice(2).padStart(64, '0')]
+    const payoutAmount = payoutLogs.reduce((acc, l) => acc + hexBig(l.data), 0n)
+    const funderTopic = '0x' + funder.slice(2).padStart(64, '0')
+    const getLogs = async (from: number, to: number, topics: (string | null)[]) =>
+      ((await rpc('eth_getLogs', [{ address: BASE_USDC, fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16), topics }])) ?? []) as Log[]
+    // Sibling check: any other inbound transfer to the funder of about the
+    // payout amount in [start - W, start + W] makes this pull unattributable.
+    const tolerance = (payoutAmount * SIBLING_PAYOUT_TOLERANCE_BPS) / 10_000n
+    for (let from = Math.max(0, start - STRIPE_PULL_WINDOW_BLOCKS); from <= start + STRIPE_PULL_WINDOW_BLOCKS; from += STRIPE_PULL_CHUNK_BLOCKS) {
+      const to = Math.min(from + STRIPE_PULL_CHUNK_BLOCKS - 1, start + STRIPE_PULL_WINDOW_BLOCKS)
+      for (const log of await getLogs(from, to, [ERC20_TRANSFER_TOPIC, null, funderTopic])) {
+        if ((log.transactionHash ?? '').toLowerCase() === payoutTxHash.toLowerCase()) continue
+        const diff = hexBig(log.data) - payoutAmount
+        if ((diff < 0n ? -diff : diff) <= tolerance) return null
+      }
+    }
+    const topics = [ERC20_TRANSFER_TOPIC, funderTopic]
     const pulls = new Set<string>()
     for (let from = start; from < start + STRIPE_PULL_WINDOW_BLOCKS; from += STRIPE_PULL_CHUNK_BLOCKS) {
       const to = Math.min(from + STRIPE_PULL_CHUNK_BLOCKS - 1, start + STRIPE_PULL_WINDOW_BLOCKS)
-      const logs = ((await rpc('eth_getLogs', [{ address: BASE_USDC, fromBlock: '0x' + from.toString(16), toBlock: '0x' + to.toString(16), topics }])) ?? []) as Log[]
+      const logs = await getLogs(from, to, topics)
       for (const log of logs) {
         const hash = log.transactionHash ?? ''
         if (hexBig(log.data) !== amountAtomic || pulls.has(hash) || !TX_HASH_RE.test(hash)) continue
