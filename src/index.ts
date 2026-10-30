@@ -23,7 +23,7 @@
 
 import { handleProxy } from './routes/proxy'
 import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './routes/job-status'
-import { sweepInFlightStripeRecords, sweepStripeSessionIndex } from './routes/stripe-fulfillment'
+import { sweepInFlightStripeRecords, sweepStripeSessionIndex, sweepManualReviewOnchain } from './routes/stripe-fulfillment'
 import { sweepCoinbaseFulfillments } from './routes/coinbase-sweep'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
@@ -703,6 +703,10 @@ export default {
     // (the webhook request that started them may have been cut off by the
     // sender's 10s timeout). Read-only towards Stripe; never signs.
     ctx.waitUntil(sweepInFlightStripeRecords(env))
+    // Stripe Crypto: records parked in manual_review (session 410 while the
+    // settlement was in flight) are closed from the chain once Stripe's own
+    // relayer pull of the invoice amount is found. Read-only; never signs.
+    ctx.waitUntil(sweepManualReviewOnchain(env))
     // Coinbase: resolve `paying` / `capture_pending` records from Coinbase,
     // alert on payouts that never reached pay-invoice, and report delivery to
     // Rozo. Reads Coinbase only; never calls pay-invoice.

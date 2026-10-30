@@ -28,6 +28,8 @@ import { DELIVERED_MAX_ATTEMPTS } from './coinbase-sweep'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
+import { findStripeRelayerPull, verifyStripeRelayerPull, makeBaseRpc, parseAtomic as parseInvoiceAtomic, STRIPE_RELAYER } from '../utils/stripe-relayer-pull'
+import { intentsReadBase } from './intents-base'
 import { casRead, casUpdate, casScan } from './stripe-atomic'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
 import { claimInvoiceKey } from './invoice-claim'
@@ -146,6 +148,15 @@ export interface StripeFulfillmentRecord {
     resolvedBy: string
     at: string
   } | null
+  // Last time the cron looked on chain for Stripe's relayer pull of a
+  // manual_review record (ISO). Throttles the RPC reads; see
+  // sweepManualReviewOnchain.
+  onchainCheckAt?: string | null
+  // The relayer pull this record was matched to and verified on chain by the
+  // cron (its own closure, or while being checked as another record's
+  // same-amount sibling). Persisted so later sweeps need no chain reads to
+  // treat the record as accounted for.
+  onchainVerifiedPull?: string | null
   // One-shot marker: set (under CAS) the moment the sweep claims the right to
   // open the stuck-order Intercom ticket. Never cleared, so at most one
   // ticket per order even if the Intercom call fails.
@@ -922,6 +933,9 @@ export function safeProviderResult(result: StripePayInvoiceResult): Record<strin
     success: pick('success'),
     state: pick('state'),
     provider: pick('provider'),
+    // Stripe's relayer settlement tx when pay-invoice's poll saw it: the
+    // session-bound evidence the on-chain closer prefers (not a capability).
+    blockchainTxId: pick('blockchainTxId'),
   }
 }
 
@@ -1667,6 +1681,207 @@ export async function resolveManualReview(
     })
     return { rec, result: { kind: 'resolved', status: rec.status, paidAt: rec.paidAt } }
   })
+}
+
+// ── Cron: close manual_review from the chain ─────────────────────────────────
+//
+// Stripe stops resuming a session ~30 min after fulfilment (410), so a record
+// that was still in flight then is parked in manual_review and the provider
+// can never confirm it again. Stripe's own relayer pull of the exact invoice
+// amount from the funder, a few blocks after the intents payout, is Stripe's
+// confirmation on chain and stays readable for good. This sweep looks for it
+// and moves the record to `paid` through the same path a human resolution
+// takes, recording the pull tx as evidence. Read-only towards the chain and
+// intents; never signs, never calls pay-invoice.
+
+export const ONCHAIN_SWEEP_MAX = 5
+export const ONCHAIN_RECHECK_MS = 24 * 60 * 60 * 1000
+export const ONCHAIN_RESOLVED_BY = 'cron:stripe-relayer-pull'
+
+// Same read as the webhook's payment lookup, kept local so this module does
+// not import webhook.ts (see the FUNDER_WALLET note above).
+export async function fetchRozoPaymentForSettle(env: Env, rozoId: string): Promise<any | null> {
+  if (!env.ROZO_INTENTS_API_KEY) return null
+  try {
+    const r = await fetch(`${intentsReadBase(env)}/payments/${encodeURIComponent(rozoId)}`, {
+      headers: { 'X-API-Key': env.ROZO_INTENTS_API_KEY },
+    })
+    if (!r.ok) return null
+    return await r.json()
+  } catch {
+    return null
+  }
+}
+
+/** The settlement tx pay-invoice reported for this session, if the record stored one. */
+export function boundSettlementTx(rec: StripeFulfillmentRecord): string | null {
+  const pr = rec.providerResult && typeof rec.providerResult === 'object' ? (rec.providerResult as Record<string, unknown>) : null
+  const v = pr?.blockchainTxId
+  return typeof v === 'string' && /^0x[0-9a-fA-F]{64}$/.test(v) ? v.toLowerCase() : null
+}
+
+/** Why a manual_review record can never be closed from the chain (as opposed to "not yet"). Never throws on bad data. */
+export function onchainUncheckableReason(
+  rec: StripeFulfillmentRecord,
+): 'not_manual_review' | 'no_rozo_payment' | 'no_amount' | null {
+  if (rec.status !== 'manual_review') return 'not_manual_review'
+  if (!rec.rozoPaymentId) return 'no_rozo_payment'
+  if (parseInvoiceAtomic(rec.invoiceAmountAtomic) === null) return 'no_amount'
+  return null
+}
+
+// Sibling records that can never produce a Stripe pull: no payout reached the
+// funder, or the provider refused the invoice for good.
+const SIBLING_CANNOT_PULL = new Set<StripeRouterStatus>([
+  'rozo_payment_created', 'payin_seen', 'failed_invoice_changed', 'failed_invoice_expired', 'claimed_by_other_channel',
+])
+// Siblings still needing chain reads in one invocation; the result for each
+// is persisted (onchainVerifiedPull), so a popular denomination converges
+// over a few sweeps instead of being refused for good.
+export const SIBLING_CHECK_MAX = 8
+
+/**
+ * By-exclusion attribution only: every other Stripe record of the exact same
+ * invoice amount that could have produced a pull must be accounted for on
+ * chain, so a sibling's late pull (long outage, admin retry) is never taken
+ * for this invoice's. Accounted = its bound tx verifies on chain as its own
+ * pull, or its own window search finds a different pull. Anything else refuses.
+ */
+export async function siblingsAccountedFor(
+  rec: StripeFulfillmentRecord,
+  pull: string,
+  all: StripeFulfillmentRecord[],
+  deps: { rpc: ReturnType<typeof makeBaseRpc>; fetchPayment: (env: Env, id: string) => Promise<any | null>; env: Env },
+): Promise<boolean> {
+  const amount = parseInvoiceAtomic(rec.invoiceAmountAtomic)
+  if (amount === null) return false
+  const siblings = all.filter(
+    (o) => o.invoiceKey !== rec.invoiceKey && parseInvoiceAtomic(o.invoiceAmountAtomic) === amount && !SIBLING_CANNOT_PULL.has(o.status),
+  )
+  let reads = 0
+  for (const other of siblings) {
+    const known = (other.onchainVerifiedPull ?? '').toLowerCase()
+    if (known) {
+      if (known === pull.toLowerCase()) return false
+      continue // verified on an earlier sweep
+    }
+    if (++reads > SIBLING_CHECK_MAX) return false // not this time; progress is persisted
+    const bound = boundSettlementTx(other)
+    if (bound === pull.toLowerCase()) return false
+    if (!other.rozoPaymentId) return false
+    const payment = await deps.fetchPayment(deps.env, other.rozoPaymentId)
+    const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
+    if (!payoutTx) return false
+    // A stored hash (admin-supplied or from a failed attempt) is only
+    // accounting evidence once it verifies on chain as that sibling's pull.
+    let theirs: string | null = bound && (await verifyStripeRelayerPull(deps.rpc, bound, payoutTx, amount)) ? bound : null
+    if (!theirs) theirs = await findStripeRelayerPull(deps.rpc, payoutTx, amount)
+    if (!theirs || theirs.toLowerCase() === pull.toLowerCase()) return false
+    await rememberVerifiedPull(deps.env, other, theirs)
+  }
+  return true
+}
+
+async function rememberVerifiedPull(env: Env, rec: StripeFulfillmentRecord, txHash: string): Promise<void> {
+  try {
+    await updateStripeRecord<true>(env, rec.invoiceKey, rec.orderId, (r) => {
+      if (r.onchainVerifiedPull) return { noop: true }
+      r.onchainVerifiedPull = txHash.toLowerCase()
+      return { rec: r, result: true }
+    })
+  } catch {
+    // best effort: without the mark the sibling is simply re-verified next time
+  }
+}
+
+export type OnchainSettleOutcome =
+  | { checked: false; reason: 'no_record' | 'not_manual_review' | 'throttled' | 'no_rozo_payment' | 'no_payout_tx' | 'no_amount' }
+  | { checked: true; txHash: string | null; transition: 'paid' | null }
+
+export async function settleManualReviewFromChain(
+  env: Env,
+  invoiceKey: string,
+  now: Date,
+  opts: { all?: StripeFulfillmentRecord[]; rpc?: ReturnType<typeof makeBaseRpc>; fetchPayment?: typeof fetchRozoPaymentForSettle } = {},
+): Promise<OnchainSettleOutcome> {
+  const rec = await loadStripeRecord(env, invoiceKey)
+  if (!rec) return { checked: false, reason: 'no_record' }
+  const uncheckable = onchainUncheckableReason(rec)
+  if (uncheckable) return { checked: false, reason: uncheckable }
+  const nowIso = now.toISOString()
+  // Claim the throttle inside the CAS so concurrent sweeps never both read the chain.
+  const claimed = await updateStripeRecord<boolean>(env, invoiceKey, rec.orderId, (r) => {
+    if (r.status !== 'manual_review') return { noop: false }
+    const last = r.onchainCheckAt ? Date.parse(r.onchainCheckAt) : NaN
+    if (Number.isFinite(last) && now.getTime() - last < ONCHAIN_RECHECK_MS) return { noop: false }
+    r.onchainCheckAt = nowIso
+    return { rec: r, result: true }
+  })
+  if (!claimed) return { checked: false, reason: 'throttled' }
+  const payment = await (opts.fetchPayment ?? fetchRozoPaymentForSettle)(env, rec.rozoPaymentId ?? "")
+  const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
+  if (!payoutTx) return { checked: false, reason: 'no_payout_tx' }
+  const rpc = opts.rpc ?? makeBaseRpc(env.BASE_RPC_URL)
+  const amount = parseInvoiceAtomic(rec.invoiceAmountAtomic) ?? 0n
+  // Session-bound evidence first: the settlement tx pay-invoice reported for
+  // this very session. Verified on chain, never trusted as stored. Records
+  // written before it was persisted fall back to the by-exclusion search.
+  const bound = boundSettlementTx(rec)
+  let txHash: string | null
+  let evidence: string
+  if (bound) {
+    txHash = (await verifyStripeRelayerPull(rpc, bound, payoutTx, amount)) ? bound : null
+    evidence = `pay-invoice reported settlement tx ${bound.slice(0, 10)}… for this session; verified on Base: sent by Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)}, pulls the exact invoice amount from the funder after the intents payout ${payoutTx.slice(0, 10)}…`
+  } else {
+    txHash = await findStripeRelayerPull(rpc, payoutTx, amount)
+    if (txHash && !(await siblingsAccountedFor(rec, txHash, opts.all ?? [], { rpc, fetchPayment: opts.fetchPayment ?? fetchRozoPaymentForSettle, env }))) {
+      txHash = null
+    }
+    evidence = `Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)} pulled the exact invoice amount from the funder on Base after the intents payout ${payoutTx.slice(0, 10)}… (the only such pull in 300 blocks, no similar-size payout to the funder in the 1800 blocks before or 300 after, every other same-amount Stripe record accounted for by its own pull)`
+  }
+  if (!txHash) return { checked: true, txHash: null, transition: null }
+  await rememberVerifiedPull(env, rec, txHash)
+  const out = await resolveManualReview(env, invoiceKey, {
+    resolution: 'paid',
+    evidence,
+    txHash,
+    resolvedBy: ONCHAIN_RESOLVED_BY,
+    now,
+  })
+  return { checked: true, txHash, transition: out.kind === 'resolved' ? 'paid' : null }
+}
+
+export async function sweepManualReviewOnchain(
+  env: Env,
+  now: Date = new Date(),
+  opts: { rpc?: ReturnType<typeof makeBaseRpc>; fetchPayment?: typeof fetchRozoPaymentForSettle } = {},
+): Promise<{ scanned: number; manualReview: number; checked: number; transitions: string[] }> {
+  const out = { scanned: 0, manualReview: 0, checked: 0, transitions: [] as string[] }
+  let values: string[]
+  try {
+    values = await casScan(env, 'invoice-fulfillment:v2:stripe_crypto:')
+  } catch {
+    return out
+  }
+  out.scanned = values.length
+  const all = values.map(parseRecord).filter((r): r is StripeFulfillmentRecord => !!r)
+  out.manualReview = all.filter((r) => r.status === 'manual_review').length
+  // Records that can never be closed from the chain (no payment id, no
+  // parseable amount) are left out before the per-run bound, so they cannot
+  // sit at the head of the queue and starve the checkable ones.
+  const parked = all.filter((r) => onchainUncheckableReason(r) === null)
+  const checkedAt = (r: StripeFulfillmentRecord) => (r.onchainCheckAt ? Date.parse(r.onchainCheckAt) || 0 : 0)
+  parked.sort((a, b) => checkedAt(a) - checkedAt(b))
+  for (const rec of parked.slice(0, ONCHAIN_SWEEP_MAX)) {
+    try {
+      const r = await settleManualReviewFromChain(env, rec.invoiceKey, now, { all, ...opts })
+      if (r.checked) out.checked++
+      if (r.checked && r.transition) out.transitions.push(`${maskInvoiceKey(rec.invoiceKey)}:${r.transition}`)
+    } catch {
+      // next record
+    }
+  }
+  return out
 }
 
 /**
