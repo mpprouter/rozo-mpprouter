@@ -1315,9 +1315,9 @@ function quoteReceiptRequiredResponse(
  * header with the stage breakdown (StageTimer), plus the upstream intents
  * `Server-Timing` as `X-Upstream-Server-Timing` when upstream sent one.
  */
-export async function handleCreateInvoice(request: Request, env: Env): Promise<Response> {
+export async function handleCreateInvoice(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
   const timer = new StageTimer()
-  let res = await handleCreateInvoiceTimed(request, env, timer)
+  let res = await handleCreateInvoiceTimed(request, env, timer, ctx)
   const stages = timer.stages()
   // Everything between the upstream call and the response is the post-create
   // re-reads (status / slot re-checks) plus building the body.
@@ -1352,7 +1352,19 @@ export function relayableUpstreamTiming(raw: string | null): string | null {
   return kept ? kept.slice(0, UPSTREAM_TIMING_MAX_CHARS) : null
 }
 
-async function handleCreateInvoiceTimed(request: Request, env: Env, timer: StageTimer): Promise<Response> {
+/**
+ * The stored copy of the merchant link (payment-link-store) is best effort by
+ * design: with an ExecutionContext the D1 write runs after the response is
+ * sent (`post` stage measured 300 ms of a 5.7 s fresh create, 2026-10-30);
+ * without one (tests, direct calls) it is awaited as before.
+ */
+function deferBestEffort(ctx: ExecutionContext | undefined, work: Promise<unknown>): Promise<unknown> {
+  if (!ctx) return work
+  ctx.waitUntil(work.catch(() => undefined))
+  return Promise.resolve()
+}
+
+async function handleCreateInvoiceTimed(request: Request, env: Env, timer: StageTimer, ctx?: ExecutionContext): Promise<Response> {
   if (request.method !== 'POST') {
     return json(405, { error: 'Method not allowed' })
   }
@@ -2338,7 +2350,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       // Reused order: make the stored link idempotent (founder 2026-10-26).
       if (linkId && row?.id) {
         const reusedUrl = raw_url || coinbaseLinkFromId(linkId)
-        if (reusedUrl) await saveOriginalPaymentLink(env, { rozoPaymentId: String(row.id), provider: 'coinbase', orderRef: linkId, url: reusedUrl })
+        if (reusedUrl) await deferBestEffort(ctx, saveOriginalPaymentLink(env, { rozoPaymentId: String(row.id), provider: 'coinbase', orderRef: linkId, url: reusedUrl }))
       }
       return json(200, {
         ok: true,
@@ -2627,7 +2639,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           // Reused order: make the stored link idempotent (founder 2026-10-26).
           if (linkId && winner?.id) {
             const reusedUrl = raw_url || coinbaseLinkFromId(linkId)
-            if (reusedUrl) await saveOriginalPaymentLink(env, { rozoPaymentId: String(winner.id), provider: 'coinbase', orderRef: linkId, url: reusedUrl })
+            if (reusedUrl) await deferBestEffort(ctx, saveOriginalPaymentLink(env, { rozoPaymentId: String(winner.id), provider: 'coinbase', orderRef: linkId, url: reusedUrl }))
           }
           return json(200, {
             ok: true,
@@ -2741,12 +2753,12 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   const rozoPaymentId =
     intentsJson?.id ?? intentsJson?.paymentId ?? intentsJson?.data?.id ?? null
   const expiresAt = intentsJson?.expiresAt ?? null
-  // Keep the original merchant link (founder 2026-10-26). Best effort, never
-  // on the response path's critical section; the Rozo order already exists.
+  // Keep the original merchant link (founder 2026-10-26). Best effort, off the
+  // response path when the runtime gives us a context; the Rozo order exists.
   if (rozoPaymentId && linkId) {
     const originalUrl = raw_url || coinbaseLinkFromId(linkId)
     if (originalUrl) {
-      await saveOriginalPaymentLink(env, { rozoPaymentId: String(rozoPaymentId), provider: 'coinbase', orderRef: linkId, url: originalUrl })
+      await deferBestEffort(ctx, saveOriginalPaymentLink(env, { rozoPaymentId: String(rozoPaymentId), provider: 'coinbase', orderRef: linkId, url: originalUrl }))
     }
   }
 
