@@ -1736,8 +1736,8 @@ export const SIBLING_CHECK_MAX = 3
  * By-exclusion attribution only: every other Stripe record of the exact same
  * invoice amount that could have produced a pull must be accounted for on
  * chain, so a sibling's late pull (long outage, admin retry) is never taken
- * for this invoice's. Accounted = it carries a verified-different bound tx,
- * or its own window search finds a different pull. Anything else refuses.
+ * for this invoice's. Accounted = its bound tx verifies on chain as its own
+ * pull, or its own window search finds a different pull. Anything else refuses.
  */
 export async function siblingsAccountedFor(
   rec: StripeFulfillmentRecord,
@@ -1753,14 +1753,14 @@ export async function siblingsAccountedFor(
   if (siblings.length > SIBLING_CHECK_MAX) return false
   for (const other of siblings) {
     const bound = boundSettlementTx(other)
-    if (bound) {
-      if (bound === pull.toLowerCase()) return false
-      continue
-    }
+    if (bound === pull.toLowerCase()) return false
     if (!other.rozoPaymentId) return false
     const payment = await deps.fetchPayment(deps.env, other.rozoPaymentId)
     const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
     if (!payoutTx) return false
+    // A stored hash (admin-supplied or from a failed attempt) is only
+    // accounting evidence once it verifies on chain as that sibling's pull.
+    if (bound && (await verifyStripeRelayerPull(deps.rpc, bound, payoutTx, amount))) continue
     const theirs = await findStripeRelayerPull(deps.rpc, payoutTx, amount)
     if (!theirs || theirs.toLowerCase() === pull.toLowerCase()) return false
   }

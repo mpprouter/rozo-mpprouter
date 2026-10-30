@@ -210,6 +210,12 @@ describe('settleManualReviewFromChain', () => {
     // rpc that answers both windows: ours finds PULL_TX, the sibling's finds `siblingPull` (or nothing)
     const rpcFor = (siblingPull: string | null) => async (method: string, params: unknown[]) => {
       if (method === 'eth_getTransactionReceipt') {
+        if (params[0] === SIB_PULL || params[0] === PULL_TX) {
+          // a real pull receipt: USDC moves from the funder to Stripe's collector
+          const b = params[0] === SIB_PULL ? SIB_BLOCK + 6 : PAYOUT_BLOCK + 6
+          return { status: '0x1', blockNumber: '0x' + b.toString(16), logs: [{ ...transferLog('0x' + 'f1'.repeat(20), AMOUNT, params[0] as string, b, 5), topics: ['0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef', '0x' + FUNDER.slice(2).padStart(64, '0'), '0x' + 'f1'.repeat(20).padStart(64, '0')] }] }
+        }
+        if (params[0] === '0x' + '88'.repeat(32)) return { status: '0x0', blockNumber: '0x' + (SIB_BLOCK + 6).toString(16), logs: [] }  // a stored hash that is not a pull
         const which = params[0] === SIB_PAYOUT ? SIB_BLOCK : PAYOUT_BLOCK
         return { status: '0x1', blockNumber: '0x' + which.toString(16), logs: [transferLog(FUNDER, 31760000n, params[0] as string, which, 7)] }
       }
@@ -236,10 +242,18 @@ describe('settleManualReviewFromChain', () => {
     env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'manual_review', {}, SIB, SIB_ROZO)
     res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
     expect(res.transitions).toEqual([]); expect((await load(env)).status).toBe('manual_review')
-    // sibling paid with a verified-different bound tx: accounted, ours closes without re-searching it
+    // sibling paid with a bound tx that verifies on chain as its own pull: accounted, ours closes
     env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { providerResult: { blockchainTxId: SIB_PULL } }, SIB, SIB_ROZO)
     res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
     expect(res.transitions.length).toBe(1); expect((await load(env)).status).toBe('paid')
+    // sibling whose stored hash does not verify (admin typo / failed attempt) and has no pull of its own: refuse (codex P1 round 5)
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { providerResult: { blockchainTxId: '0x' + '88'.repeat(32) } }, SIB, SIB_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
+    expect(res.transitions).toEqual([]); expect((await load(env)).status).toBe('manual_review')
+    // same unverifiable stored hash, but the sibling's own window has its real pull: accounted
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { providerResult: { blockchainTxId: '0x' + '88'.repeat(32) } }, SIB, SIB_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(SIB_PULL), fetchPayment: fetchBoth })
+    expect(res.transitions.length).toBe(1)
     // sibling paid whose bound tx IS the pull we found: it is theirs, refuse
     env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { providerResult: { blockchainTxId: PULL_TX } }, SIB, SIB_ROZO)
     res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
