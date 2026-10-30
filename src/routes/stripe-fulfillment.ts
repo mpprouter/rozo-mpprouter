@@ -152,6 +152,11 @@ export interface StripeFulfillmentRecord {
   // manual_review record (ISO). Throttles the RPC reads; see
   // sweepManualReviewOnchain.
   onchainCheckAt?: string | null
+  // The relayer pull this record was matched to and verified on chain by the
+  // cron (its own closure, or while being checked as another record's
+  // same-amount sibling). Persisted so later sweeps need no chain reads to
+  // treat the record as accounted for.
+  onchainVerifiedPull?: string | null
   // One-shot marker: set (under CAS) the moment the sweep claims the right to
   // open the stuck-order Intercom ticket. Never cleared, so at most one
   // ticket per order even if the Intercom call fails.
@@ -1730,7 +1735,10 @@ export function onchainUncheckableReason(
 const SIBLING_CANNOT_PULL = new Set<StripeRouterStatus>([
   'rozo_payment_created', 'payin_seen', 'failed_invoice_changed', 'failed_invoice_expired', 'claimed_by_other_channel',
 ])
-export const SIBLING_CHECK_MAX = 3
+// Siblings still needing chain reads in one invocation; the result for each
+// is persisted (onchainVerifiedPull), so a popular denomination converges
+// over a few sweeps instead of being refused for good.
+export const SIBLING_CHECK_MAX = 8
 
 /**
  * By-exclusion attribution only: every other Stripe record of the exact same
@@ -1750,8 +1758,14 @@ export async function siblingsAccountedFor(
   const siblings = all.filter(
     (o) => o.invoiceKey !== rec.invoiceKey && parseInvoiceAtomic(o.invoiceAmountAtomic) === amount && !SIBLING_CANNOT_PULL.has(o.status),
   )
-  if (siblings.length > SIBLING_CHECK_MAX) return false
+  let reads = 0
   for (const other of siblings) {
+    const known = (other.onchainVerifiedPull ?? '').toLowerCase()
+    if (known) {
+      if (known === pull.toLowerCase()) return false
+      continue // verified on an earlier sweep
+    }
+    if (++reads > SIBLING_CHECK_MAX) return false // not this time; progress is persisted
     const bound = boundSettlementTx(other)
     if (bound === pull.toLowerCase()) return false
     if (!other.rozoPaymentId) return false
@@ -1760,11 +1774,24 @@ export async function siblingsAccountedFor(
     if (!payoutTx) return false
     // A stored hash (admin-supplied or from a failed attempt) is only
     // accounting evidence once it verifies on chain as that sibling's pull.
-    if (bound && (await verifyStripeRelayerPull(deps.rpc, bound, payoutTx, amount))) continue
-    const theirs = await findStripeRelayerPull(deps.rpc, payoutTx, amount)
+    let theirs: string | null = bound && (await verifyStripeRelayerPull(deps.rpc, bound, payoutTx, amount)) ? bound : null
+    if (!theirs) theirs = await findStripeRelayerPull(deps.rpc, payoutTx, amount)
     if (!theirs || theirs.toLowerCase() === pull.toLowerCase()) return false
+    await rememberVerifiedPull(deps.env, other, theirs)
   }
   return true
+}
+
+async function rememberVerifiedPull(env: Env, rec: StripeFulfillmentRecord, txHash: string): Promise<void> {
+  try {
+    await updateStripeRecord<true>(env, rec.invoiceKey, rec.orderId, (r) => {
+      if (r.onchainVerifiedPull) return { noop: true }
+      r.onchainVerifiedPull = txHash.toLowerCase()
+      return { rec: r, result: true }
+    })
+  } catch {
+    // best effort: without the mark the sibling is simply re-verified next time
+  }
 }
 
 export type OnchainSettleOutcome =
@@ -1813,6 +1840,7 @@ export async function settleManualReviewFromChain(
     evidence = `Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)} pulled the exact invoice amount from the funder on Base after the intents payout ${payoutTx.slice(0, 10)}… (the only such pull in 300 blocks, no similar-size payout to the funder in the 1800 blocks before or 300 after, every other same-amount Stripe record accounted for by its own pull)`
   }
   if (!txHash) return { checked: true, txHash: null, transition: null }
+  await rememberVerifiedPull(env, rec, txHash)
   const out = await resolveManualReview(env, invoiceKey, {
     resolution: 'paid',
     evidence,

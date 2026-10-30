@@ -258,6 +258,19 @@ describe('settleManualReviewFromChain', () => {
     env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { providerResult: { blockchainTxId: PULL_TX } }, SIB, SIB_ROZO)
     res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
     expect(res.transitions).toEqual([]); expect((await load(env)).status).toBe('manual_review')
+    // progress persists: after the first sweep both records carry their verified pull, and a record
+    // whose persisted pull is the one we found refuses without any chain read (codex P2 round 6)
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'manual_review', {}, SIB, SIB_ROZO)
+    await sweepManualReviewOnchain(env, later, { rpc: rpcFor(SIB_PULL), fetchPayment: fetchBoth })
+    expect((await load(env)).onchainVerifiedPull).toBe(PULL_TX); expect((await load(env, SIB)).onchainVerifiedPull).toBe(SIB_PULL)
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { onchainVerifiedPull: PULL_TX }, SIB, SIB_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
+    expect(res.transitions).toEqual([]); expect((await load(env)).status).toBe('manual_review')
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { onchainVerifiedPull: SIB_PULL }, SIB, SIB_ROZO)
+    const quiet = { calls: 0 }
+    const countingRpc = async (m: string, p: unknown[]) => { quiet.calls++; return rpcFor(null)(m, p) }
+    res = await sweepManualReviewOnchain(env, later, { rpc: countingRpc, fetchPayment: async (e: any, id: string) => { if (id !== ROZO_ID) throw new Error('sibling re-fetched'); return fetchBoth(e, id) } })
+    expect(res.transitions.length).toBe(1)
     // sibling that never reached payout cannot have a pull: ignored
     env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'failed_invoice_expired', {}, SIB, SIB_ROZO)
     res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
