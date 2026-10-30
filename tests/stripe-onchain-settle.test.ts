@@ -203,6 +203,56 @@ describe('settleManualReviewFromChain', () => {
     expect(await settleManualReviewFromChain(env2, KEY, new Date(T0.getTime() + 3600_000), { rpc: rpc2, fetchPayment: payment })).toEqual({ checked: true, txHash: null, transition: null })
     expect((await load(env2)).status).toBe('manual_review')
   })
+  it('by-exclusion closure needs every same-amount sibling accounted for by its own pull (codex P1 round 4)', async () => {
+    const SIB = 'cpis_1TESTonchainSettle00000002', SIB_ROZO = '00000000-0000-4000-8000-000000000002'
+    const SIB_PAYOUT = '0x' + '66'.repeat(32), SIB_PULL = '0x' + '77'.repeat(32), SIB_BLOCK = PAYOUT_BLOCK - 5000
+    const fetchBoth = async (_env: any, id: string) => id === ROZO_ID ? payment() : { destination: { txHash: SIB_PAYOUT } }
+    // rpc that answers both windows: ours finds PULL_TX, the sibling's finds `siblingPull` (or nothing)
+    const rpcFor = (siblingPull: string | null) => async (method: string, params: unknown[]) => {
+      if (method === 'eth_getTransactionReceipt') {
+        const which = params[0] === SIB_PAYOUT ? SIB_BLOCK : PAYOUT_BLOCK
+        return { status: '0x1', blockNumber: '0x' + which.toString(16), logs: [transferLog(FUNDER, 31760000n, params[0] as string, which, 7)] }
+      }
+      if (method === 'eth_getLogs') {
+        const f = params[0] as any; const from = parseInt(f.fromBlock, 16), to = parseInt(f.toBlock, 16)
+        const inSib = from <= SIB_BLOCK + 300 && to >= SIB_BLOCK - 1800, inOurs = from <= PAYOUT_BLOCK + 300 && to >= PAYOUT_BLOCK - 1800
+        if (f.topics[1] === null) {
+          return [transferLog(FUNDER, 31760000n, PAYOUT_TX, PAYOUT_BLOCK, 7), transferLog(FUNDER, 31760000n, SIB_PAYOUT, SIB_BLOCK, 7)].filter((l) => { const b = parseInt(l.blockNumber, 16); return b >= from && b <= to })
+        }
+        const out: any[] = []
+        if (inOurs && from <= PAYOUT_BLOCK + 6 && to >= PAYOUT_BLOCK + 6) out.push(transferLog(FUNDER, AMOUNT, PULL_TX, PAYOUT_BLOCK + 6))
+        if (siblingPull && inSib && from <= SIB_BLOCK + 6 && to >= SIB_BLOCK + 6) out.push(transferLog(FUNDER, AMOUNT, siblingPull, SIB_BLOCK + 6))
+        return out
+      }
+      if (method === 'eth_getTransactionByHash') return { from: STRIPE_RELAYER, to: STRIPE_PAYIN_CONTRACT }
+      throw new Error(method)
+    }
+    const later = new Date(T0.getTime() + 3600_000)
+    // sibling parked too, but with its own distinct pull: ours closes
+    let env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'manual_review', {}, SIB, SIB_ROZO)
+    let res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(SIB_PULL), fetchPayment: fetchBoth })
+    expect(res.transitions.length).toBe(2); expect((await load(env)).status).toBe('paid'); expect((await load(env, SIB)).status).toBe('paid')
+    // sibling has no pull of its own: the one we see might be its late pull, refuse
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'manual_review', {}, SIB, SIB_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
+    expect(res.transitions).toEqual([]); expect((await load(env)).status).toBe('manual_review')
+    // sibling paid with a verified-different bound tx: accounted, ours closes without re-searching it
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { providerResult: { blockchainTxId: SIB_PULL } }, SIB, SIB_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
+    expect(res.transitions.length).toBe(1); expect((await load(env)).status).toBe('paid')
+    // sibling paid whose bound tx IS the pull we found: it is theirs, refuse
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'paid', { providerResult: { blockchainTxId: PULL_TX } }, SIB, SIB_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
+    expect(res.transitions).toEqual([]); expect((await load(env)).status).toBe('manual_review')
+    // sibling that never reached payout cannot have a pull: ignored
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'failed_invoice_expired', {}, SIB, SIB_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
+    expect(res.transitions.length).toBe(1)
+    // sibling without a rozo payment id cannot be checked: refuse
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'payout_seen', { rozoPaymentId: null }, SIB, SIB_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
+    expect(res.transitions).toEqual([])
+  })
   it.each(['paid', 'provider_paying', 'failed_provider', 'payout_seen'])('leaves %s alone', async (status) => {
     const env = makeEnv(); await seed(env, status)
     expect(await settleManualReviewFromChain(env, KEY, new Date(), { rpc: fakeRpc().rpc, fetchPayment: payment })).toEqual({ checked: false, reason: 'not_manual_review' })

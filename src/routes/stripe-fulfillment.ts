@@ -1725,6 +1725,48 @@ export function onchainUncheckableReason(
   return null
 }
 
+// Sibling records that can never produce a Stripe pull: no payout reached the
+// funder, or the provider refused the invoice for good.
+const SIBLING_CANNOT_PULL = new Set<StripeRouterStatus>([
+  'rozo_payment_created', 'payin_seen', 'failed_invoice_changed', 'failed_invoice_expired', 'claimed_by_other_channel',
+])
+export const SIBLING_CHECK_MAX = 3
+
+/**
+ * By-exclusion attribution only: every other Stripe record of the exact same
+ * invoice amount that could have produced a pull must be accounted for on
+ * chain, so a sibling's late pull (long outage, admin retry) is never taken
+ * for this invoice's. Accounted = it carries a verified-different bound tx,
+ * or its own window search finds a different pull. Anything else refuses.
+ */
+export async function siblingsAccountedFor(
+  rec: StripeFulfillmentRecord,
+  pull: string,
+  all: StripeFulfillmentRecord[],
+  deps: { rpc: ReturnType<typeof makeBaseRpc>; fetchPayment: (env: Env, id: string) => Promise<any | null>; env: Env },
+): Promise<boolean> {
+  const amount = parseInvoiceAtomic(rec.invoiceAmountAtomic)
+  if (amount === null) return false
+  const siblings = all.filter(
+    (o) => o.invoiceKey !== rec.invoiceKey && parseInvoiceAtomic(o.invoiceAmountAtomic) === amount && !SIBLING_CANNOT_PULL.has(o.status),
+  )
+  if (siblings.length > SIBLING_CHECK_MAX) return false
+  for (const other of siblings) {
+    const bound = boundSettlementTx(other)
+    if (bound) {
+      if (bound === pull.toLowerCase()) return false
+      continue
+    }
+    if (!other.rozoPaymentId) return false
+    const payment = await deps.fetchPayment(deps.env, other.rozoPaymentId)
+    const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
+    if (!payoutTx) return false
+    const theirs = await findStripeRelayerPull(deps.rpc, payoutTx, amount)
+    if (!theirs || theirs.toLowerCase() === pull.toLowerCase()) return false
+  }
+  return true
+}
+
 export type OnchainSettleOutcome =
   | { checked: false; reason: 'no_record' | 'not_manual_review' | 'throttled' | 'no_rozo_payment' | 'no_payout_tx' | 'no_amount' }
   | { checked: true; txHash: string | null; transition: 'paid' | null }
@@ -1733,7 +1775,7 @@ export async function settleManualReviewFromChain(
   env: Env,
   invoiceKey: string,
   now: Date,
-  opts: { rpc?: ReturnType<typeof makeBaseRpc>; fetchPayment?: typeof fetchRozoPaymentForSettle } = {},
+  opts: { all?: StripeFulfillmentRecord[]; rpc?: ReturnType<typeof makeBaseRpc>; fetchPayment?: typeof fetchRozoPaymentForSettle } = {},
 ): Promise<OnchainSettleOutcome> {
   const rec = await loadStripeRecord(env, invoiceKey)
   if (!rec) return { checked: false, reason: 'no_record' }
@@ -1765,7 +1807,10 @@ export async function settleManualReviewFromChain(
     evidence = `pay-invoice reported settlement tx ${bound.slice(0, 10)}… for this session; verified on Base: sent by Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)}, pulls the exact invoice amount from the funder after the intents payout ${payoutTx.slice(0, 10)}…`
   } else {
     txHash = await findStripeRelayerPull(rpc, payoutTx, amount)
-    evidence = `Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)} pulled the exact invoice amount from the funder on Base after the intents payout ${payoutTx.slice(0, 10)}… (the only such pull in 300 blocks, no similar-size payout to the funder in the 1800 blocks before or 300 after)`
+    if (txHash && !(await siblingsAccountedFor(rec, txHash, opts.all ?? [], { rpc, fetchPayment: opts.fetchPayment ?? fetchRozoPaymentForSettle, env }))) {
+      txHash = null
+    }
+    evidence = `Stripe relayer ${STRIPE_RELAYER.slice(0, 6)}…${STRIPE_RELAYER.slice(-4)} pulled the exact invoice amount from the funder on Base after the intents payout ${payoutTx.slice(0, 10)}… (the only such pull in 300 blocks, no similar-size payout to the funder in the 1800 blocks before or 300 after, every other same-amount Stripe record accounted for by its own pull)`
   }
   if (!txHash) return { checked: true, txHash: null, transition: null }
   const out = await resolveManualReview(env, invoiceKey, {
@@ -1801,7 +1846,7 @@ export async function sweepManualReviewOnchain(
   parked.sort((a, b) => checkedAt(a) - checkedAt(b))
   for (const rec of parked.slice(0, ONCHAIN_SWEEP_MAX)) {
     try {
-      const r = await settleManualReviewFromChain(env, rec.invoiceKey, now, opts)
+      const r = await settleManualReviewFromChain(env, rec.invoiceKey, now, { all, ...opts })
       if (r.checked) out.checked++
       if (r.checked && r.transition) out.transitions.push(`${maskInvoiceKey(rec.invoiceKey)}:${r.transition}`)
     } catch {
