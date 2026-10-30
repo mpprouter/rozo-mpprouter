@@ -25,6 +25,7 @@ import { handleProxy } from './routes/proxy'
 import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './routes/job-status'
 import { sweepInFlightStripeRecords, sweepStripeSessionIndex, sweepManualReviewOnchain } from './routes/stripe-fulfillment'
 import { sweepCoinbaseFulfillments } from './routes/coinbase-sweep'
+import { INTENTS_WARMUP_CRON, warmIntentsPaymentApi } from './utils/intents-warmup'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
 import { handleAllServiceMetrics, handleServiceMetrics } from './routes/service-metrics'
@@ -396,6 +397,9 @@ export interface Env {
   // source via /checkout. Flip only after rozo-intents-api #672 and #674 are
   // deployed (they retire the old BOLT11 on rotation). Anything else = refuse.
   LIGHTNING_ROTATE_OUT_ENABLED?: string
+  // Intents payment-api warm-up trial (2026-10-31 to 2026-11-07): one OPTIONS
+  // a minute on the "* * * * *" cron. "off" disables; unset/anything else = on.
+  INTENTS_WARMUP?: string
   // Bitrefill invoice payment (provider: "bitrefill"); "true" enables it.
   BITREFILL_ENABLED?: string
   // Rozo Intents API key bound to wallet account wallet_bitrefillpay (payment-api takes the
@@ -697,7 +701,15 @@ export default {
     const response = await route(request, env, ctx)
     return withCors(request, response)
   },
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // Two crons (wrangler.toml). The 1-minute one runs ONLY the intents
+    // warm-up trial; every job below stays on the 2-minute cron and must not
+    // run more often (several assume that cadence). Any other cron value,
+    // e.g. a manual dashboard trigger, runs the regular jobs as before.
+    if (controller.cron === INTENTS_WARMUP_CRON) {
+      ctx.waitUntil(warmIntentsPaymentApi(env))
+      return
+    }
     ctx.waitUntil(reconcileAsyncRefunds(env))
     // Stripe Crypto: confirm in-flight settlements against the live session
     // (the webhook request that started them may have been cut off by the

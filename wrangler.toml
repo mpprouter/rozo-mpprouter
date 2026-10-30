@@ -5,7 +5,10 @@ compatibility_flags = ["nodejs_compat"]
 account_id = "2d3f34ca0a1426b30a7d07cf79bdac90"
 
 [triggers]
-crons = ["*/2 * * * *"]
+# "*/2 * * * *" runs every regular job in scheduled(). "* * * * *" runs ONLY
+# the intents payment-api warm-up trial (src/utils/intents-warmup.ts); remove it
+# with INTENTS_WARMUP when the trial ends (2026-11-07).
+crons = ["*/2 * * * *", "* * * * *"]
 
 # Custom domains.
 #
@@ -177,6 +180,9 @@ NATIVE_SOURCES = "ETH@8453,ETH@1,BNB@56,SOL@900,ETH@42161,POL@137"
 # and #674 are deployed: older upstreams rotate without retiring the old BOLT11
 # invoice, leaving it payable (double pay). "false" = refuse locally.
 LIGHTNING_ROTATE_OUT_ENABLED = "true"
+# Intents payment-api warm-up trial, 2026-10-31 to 2026-11-07: one OPTIONS a
+# minute to the intents payment-api edge function to keep it warm. "off" = stop.
+INTENTS_WARMUP = "on"
 # Beta native coins (src/routes/native-sources.ts). Never open from this list
 # alone: a coin here joins the allowed set only for a quote-invoice /
 # create-invoice request carrying ?beta=<symbol> (e.g. ?beta=zec). ZEC on
