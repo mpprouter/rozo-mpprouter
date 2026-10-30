@@ -120,7 +120,7 @@ export async function findStripeRelayerPull(
     }
     const topics = [ERC20_TRANSFER_TOPIC, funderTopic]
     const pulls = new Set<string>()
-    for (let from = start; from < start + STRIPE_PULL_WINDOW_BLOCKS; from += STRIPE_PULL_CHUNK_BLOCKS) {
+    for (let from = start; from <= start + STRIPE_PULL_WINDOW_BLOCKS; from += STRIPE_PULL_CHUNK_BLOCKS) {
       const to = Math.min(from + STRIPE_PULL_CHUNK_BLOCKS - 1, start + STRIPE_PULL_WINDOW_BLOCKS)
       const logs = await getLogs(from, to, topics)
       for (const log of logs) {

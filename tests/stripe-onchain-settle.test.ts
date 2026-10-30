@@ -73,7 +73,7 @@ describe('findStripeRelayerPull', () => {
     expect(await findStripeRelayerPull(rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX)
     // sibling scan over [start - LOOKBACK, start + W] plus the pull scan over [start, start + W], all in 50-block chunks
     const siblingChunks = Math.ceil((SIBLING_LOOKBACK_BLOCKS + STRIPE_PULL_WINDOW_BLOCKS + 1) / STRIPE_PULL_CHUNK_BLOCKS)
-    expect(calls.filter((m) => m === 'eth_getLogs').length).toBe(siblingChunks + STRIPE_PULL_WINDOW_BLOCKS / STRIPE_PULL_CHUNK_BLOCKS)
+    expect(calls.filter((m) => m === 'eth_getLogs').length).toBe(siblingChunks + Math.ceil((STRIPE_PULL_WINDOW_BLOCKS + 1) / STRIPE_PULL_CHUNK_BLOCKS))
     expect(calls.filter((m) => m === 'eth_getTransactionByHash').length).toBe(1)
   })
   it('rejects other senders, contracts, amounts, failed payouts, ambiguous receivers, rpc failures', async () => {
@@ -91,6 +91,16 @@ describe('findStripeRelayerPull', () => {
     expect(await findStripeRelayerPull(fakeRpc({ windowLogs: [transferLog(FUNDER, AMOUNT, PULL_TX), transferLog(FUNDER, AMOUNT, other)] }).rpc, PAYOUT_TX, AMOUNT)).toBeNull()
     expect(await findStripeRelayerPull(fakeRpc({ windowLogs: [transferLog(FUNDER, AMOUNT, PULL_TX, PAYOUT_BLOCK, 3)] }).rpc, PAYOUT_TX, AMOUNT)).toBeNull()
     expect(await findStripeRelayerPull(fakeRpc({ windowLogs: [transferLog(FUNDER, AMOUNT, PULL_TX, PAYOUT_BLOCK, 9)] }).rpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX)
+    // the window's last block is searched (codex P2 round 7): only a chunk covering start+300 returns the pull
+    const edge = fakeRpc()
+    const edgeRpc = async (m: string, p: unknown[]) => {
+      if (m === 'eth_getLogs' && (p[0] as any).topics[1] !== null) {
+        const f = p[0] as any; const b = PAYOUT_BLOCK + STRIPE_PULL_WINDOW_BLOCKS
+        return parseInt(f.fromBlock, 16) <= b && parseInt(f.toBlock, 16) >= b ? [transferLog(FUNDER, AMOUNT, PULL_TX, b, 1)] : []
+      }
+      return edge.rpc(m, p)
+    }
+    expect(await findStripeRelayerPull(edgeRpc, PAYOUT_TX, AMOUNT)).toBe(PULL_TX)
   })
   it('a similar-size payout to the funder next to this one makes the pull unattributable (codex P1)', async () => {
     const sibling = (amount: bigint, block: number) => transferLog(FUNDER, amount, '0x' + '55'.repeat(32), block, 1)
