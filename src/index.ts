@@ -111,6 +111,7 @@ import { settlePlaygroundChannels } from './playground/channel-settle'
 import { handleRozoWebhook, handleInvoiceStatus, FUNDER_WALLET } from './routes/webhook'
 import { handleInvoiceDetails } from './routes/invoice-details'
 import { EXISTING_ORDER_PATH, handleExistingOrder } from './routes/existing-order-endpoint'
+import { SITE_NOTICE_ADMIN_PATH, SITE_NOTICE_PATH, handleSiteNotice, handleSiteNoticeAdmin } from './routes/site-notice'
 import {
   TRON_TON_ALPHA_CAPABILITY_PATH,
   TRON_TON_ALPHA_OPTION_PATH,
@@ -1099,6 +1100,12 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return handleCheckoutControl(request, env)
       }
 
+      // Site notice banner for checkout.rozo.ai / upi.rozo.ai, same operator
+      // secret. See routes/site-notice.ts.
+      if (url.pathname === SITE_NOTICE_ADMIN_PATH) {
+        return handleSiteNoticeAdmin(request, env)
+      }
+
       // ── Partner platform ──────────────────────────────────────────────
       //
       // Pages and API are served from THIS worker on purpose: same-origin, so
@@ -1227,6 +1234,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // remains the gate). Kept off quote-invoice so the quote stays fast.
       if (url.pathname === EXISTING_ORDER_PATH) {
         return handleExistingOrder(request, env)
+      }
+
+      // Public banner text for checkout.rozo.ai / upi.rozo.ai (read-only).
+      if (url.pathname === SITE_NOTICE_PATH) {
+        return handleSiteNotice(request, env)
       }
 
       // TRON / TON fixed-address pay-in alpha (off unless rozo-intents-api
