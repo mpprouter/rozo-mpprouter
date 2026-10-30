@@ -152,6 +152,9 @@ export interface StripeFulfillmentRecord {
   // manual_review record (ISO). Throttles the RPC reads; see
   // sweepManualReviewOnchain.
   onchainCheckAt?: string | null
+  // Rule version the stamp above was made under; a stamp from an older
+  // version does not throttle (the rules changed, re-check now).
+  onchainCheckVersion?: number | null
   // The relayer pull this record was matched to and verified on chain by the
   // cron (its own closure, or while being checked as another record's
   // same-amount sibling). Persisted so later sweeps need no chain reads to
@@ -1696,6 +1699,9 @@ export async function resolveManualReview(
 
 export const ONCHAIN_SWEEP_MAX = 5
 export const ONCHAIN_RECHECK_MS = 24 * 60 * 60 * 1000
+// Bump when the attribution rules change so records throttled under the old
+// rules are re-checked on the next sweep instead of a day later.
+export const ONCHAIN_CHECK_VERSION = 2
 export const ONCHAIN_RESOLVED_BY = 'cron:stripe-relayer-pull'
 
 // Same read as the webhook's payment lookup, kept local so this module does
@@ -1758,6 +1764,11 @@ export async function siblingsAccountedFor(
   const siblings = all.filter(
     (o) => o.invoiceKey !== rec.invoiceKey && parseInvoiceAtomic(o.invoiceAmountAtomic) === amount && !SIBLING_CANNOT_PULL.has(o.status),
   )
+  // A pull can only follow its own payout (pay-invoice runs after the payout
+  // webhook), so a sibling paid out after this pull landed cannot own it.
+  const pullReceipt = (await deps.rpc('eth_getTransactionReceipt', [pull])) as { blockNumber?: string } | null
+  const pullBlock = parseInt(String(pullReceipt?.blockNumber ?? ''), 16)
+  if (!Number.isFinite(pullBlock)) return false
   let reads = 0
   for (const other of siblings) {
     const known = (other.onchainVerifiedPull ?? '').toLowerCase()
@@ -1772,6 +1783,10 @@ export async function siblingsAccountedFor(
     const payment = await deps.fetchPayment(deps.env, other.rozoPaymentId)
     const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
     if (!payoutTx) return false
+    const theirPayout = (await deps.rpc('eth_getTransactionReceipt', [payoutTx])) as { blockNumber?: string } | null
+    const theirBlock = parseInt(String(theirPayout?.blockNumber ?? ''), 16)
+    if (!Number.isFinite(theirBlock)) return false
+    if (theirBlock > pullBlock) continue // paid out after our pull: cannot be its owner
     // A stored hash (admin-supplied or from a failed attempt) is only
     // accounting evidence once it verifies on chain as that sibling's pull.
     let theirs: string | null = bound && (await verifyStripeRelayerPull(deps.rpc, bound, payoutTx, amount)) ? bound : null
@@ -1813,8 +1828,9 @@ export async function settleManualReviewFromChain(
   const claimed = await updateStripeRecord<boolean>(env, invoiceKey, rec.orderId, (r) => {
     if (r.status !== 'manual_review') return { noop: false }
     const last = r.onchainCheckAt ? Date.parse(r.onchainCheckAt) : NaN
-    if (Number.isFinite(last) && now.getTime() - last < ONCHAIN_RECHECK_MS) return { noop: false }
+    if (r.onchainCheckVersion === ONCHAIN_CHECK_VERSION && Number.isFinite(last) && now.getTime() - last < ONCHAIN_RECHECK_MS) return { noop: false }
     r.onchainCheckAt = nowIso
+    r.onchainCheckVersion = ONCHAIN_CHECK_VERSION
     return { rec: r, result: true }
   })
   if (!claimed) return { checked: false, reason: 'throttled' }
