@@ -4,7 +4,7 @@
 import { describe, it, expect } from 'vitest'
 import {
   seedStripeRecord, stripeKvKey, settleManualReviewFromChain, sweepManualReviewOnchain,
-  ONCHAIN_RESOLVED_BY, ONCHAIN_RECHECK_MS,
+  ONCHAIN_RESOLVED_BY, ONCHAIN_RECHECK_MS, ONCHAIN_CHECK_VERSION,
 } from '../src/routes/stripe-fulfillment'
 import { findStripeRelayerPull, verifyStripeRelayerPull, STRIPE_RELAYER, STRIPE_PAYIN_CONTRACT, STRIPE_PULL_WINDOW_BLOCKS, STRIPE_PULL_CHUNK_BLOCKS, SIBLING_LOOKBACK_BLOCKS, makeBaseRpc, parseAtomic } from '../src/utils/stripe-relayer-pull'
 import { casRead } from '../src/routes/stripe-atomic'
@@ -186,6 +186,12 @@ describe('settleManualReviewFromChain', () => {
     expect(await settleManualReviewFromChain(env, KEY, new Date(now.getTime() + ONCHAIN_RECHECK_MS - 1), { rpc, fetchPayment: payment })).toEqual({ checked: false, reason: 'throttled' })
     expect(calls.length).toBe(before)
     expect((await settleManualReviewFromChain(env, KEY, new Date(now.getTime() + ONCHAIN_RECHECK_MS + 1), { rpc, fetchPayment: payment })).checked).toBe(true)
+    expect((await load(env)).onchainCheckVersion).toBe(ONCHAIN_CHECK_VERSION)
+    // a stamp made under older rules does not throttle
+    const env2 = makeEnv(); await seed(env2, 'manual_review', { onchainCheckAt: now.toISOString(), onchainCheckVersion: ONCHAIN_CHECK_VERSION - 1 })
+    expect((await settleManualReviewFromChain(env2, KEY, new Date(now.getTime() + 60_000), { rpc, fetchPayment: payment })).checked).toBe(true)
+    const env3 = makeEnv(); await seed(env3, 'manual_review', { onchainCheckAt: now.toISOString() })   // no version at all (pre-v2 stamp)
+    expect((await settleManualReviewFromChain(env3, KEY, new Date(now.getTime() + 60_000), { rpc, fetchPayment: payment })).checked).toBe(true)
   })
   it('prefers the settlement tx pay-invoice reported for the session, verified on chain, over the search', async () => {
     const env = makeEnv(); await seed(env, 'manual_review', { providerResult: { ok: true, status: 200, blockchainTxId: PULL_TX } })
@@ -281,6 +287,16 @@ describe('settleManualReviewFromChain', () => {
     const countingRpc = async (m: string, p: unknown[]) => { quiet.calls++; return rpcFor(null)(m, p) }
     res = await sweepManualReviewOnchain(env, later, { rpc: countingRpc, fetchPayment: async (e: any, id: string) => { if (id !== ROZO_ID) throw new Error('sibling re-fetched'); return fetchBoth(e, id) } })
     expect(res.transitions.length).toBe(1)
+    // a sibling paid out AFTER our pull (e.g. months later, hand-paid, parked with no pull) cannot own it: ignored
+    const LATE = 'cpis_1TESTonchainSettle00000003', LATE_ROZO = '00000000-0000-4000-8000-000000000003', LATE_PAYOUT = '0x' + '99'.repeat(32)
+    const fetchLate = async (_env: any, id: string) => id === ROZO_ID ? payment() : { destination: { txHash: LATE_PAYOUT } }
+    const rpcLate = async (m: string, p: unknown[]) => {
+      if (m === 'eth_getTransactionReceipt' && p[0] === LATE_PAYOUT) return { status: '0x1', blockNumber: '0x' + (PAYOUT_BLOCK + 50_000).toString(16), logs: [transferLog(FUNDER, 5800000n, LATE_PAYOUT, PAYOUT_BLOCK + 50_000, 7)] }
+      return rpcFor(null)(m, p)
+    }
+    env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'manual_review', {}, LATE, LATE_ROZO)
+    res = await sweepManualReviewOnchain(env, later, { rpc: rpcLate, fetchPayment: fetchLate })
+    expect((await load(env)).status).toBe('paid'); expect((await load(env, LATE)).status).toBe('manual_review')
     // sibling that never reached payout cannot have a pull: ignored
     env = makeEnv(); await seed(env, 'manual_review'); await seed(env, 'failed_invoice_expired', {}, SIB, SIB_ROZO)
     res = await sweepManualReviewOnchain(env, later, { rpc: rpcFor(null), fetchPayment: fetchBoth })
