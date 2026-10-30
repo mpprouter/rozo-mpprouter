@@ -1776,7 +1776,7 @@ export async function settleManualReviewFromChain(
     return { rec: r, result: true }
   })
   if (!claimed) return { checked: false, reason: 'throttled' }
-  const payment = await (opts.fetchPayment ?? fetchRozoPaymentForSettle)(env, rec.rozoPaymentId)
+  const payment = await (opts.fetchPayment ?? fetchRozoPaymentForSettle)(env, rec.rozoPaymentId ?? "")
   const payoutTx: string = payment?.destination?.txHash ?? payment?.destination_tx_hash ?? ''
   if (!payoutTx) return { checked: false, reason: 'no_payout_tx' }
   const rpc = opts.rpc ?? makeBaseRpc(env.BASE_RPC_URL)
