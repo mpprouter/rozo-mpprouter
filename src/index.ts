@@ -1227,7 +1227,7 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // applies the router's discount (max $5 off, capped at ~4.76%), and
       // creates a Rozo intent so the caller can pay the discounted amount.
       if (url.pathname === '/v1/services/rozo-agent-api/create-invoice') {
-        return withFeedbackToken(await handleCreateInvoice(request, env), env)
+        return withFeedbackToken(await handleCreateInvoice(request, env, ctx), env)
       }
 
       // Optional post-payment feedback from checkout.rozo.ai: one free-text
