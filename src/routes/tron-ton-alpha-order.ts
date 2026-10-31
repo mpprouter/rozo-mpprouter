@@ -33,14 +33,40 @@ import {
 } from './create-invoice'
 import { buildCheckoutTitle, type CheckoutPricing } from './checkout-web-pricing'
 import { withForwardedClientHint } from './client-hint-forward'
+import { coinbaseLinkFromId, saveOriginalPaymentLink } from './payment-link-store'
 
 const ORDER_TIMEOUT_MS = 8_000
 // Set once the order is known to exist; later polls of the same invoice skip
 // the lookup. A cache only: a missing marker just costs one more lookup.
+// v2 (2026-10-31): the marker also means the original payment link is in
+// checkout_payment_links. Bumped so invoices marked before the link was
+// stored get one more lookup, which writes their row.
 const ORDER_MARKER_TTL_S = 2 * 24 * 60 * 60
 
 export function alphaOrderMarkerKey(invoiceKey: string): string {
-  return `tta:order:${invoiceKey}`
+  return `tta:order:v2:${invoiceKey}`
+}
+
+function rozoPaymentIdOf(row: unknown): string | null {
+  const r = row as Record<string, any> | null | undefined
+  const id = r?.id ?? r?.paymentId ?? r?.data?.id
+  return typeof id === 'string' && id !== '' ? id : null
+}
+
+/**
+ * Keep the invoice's original Coinbase link next to its Rozo order (founder
+ * 2026-10-31: every checkout order, alpha rails included), through the same
+ * helper create-invoice uses. Never throws. Returns false only when a row was
+ * due and could not be written, so the caller leaves the marker unset and the
+ * next poll retries; rozotest_ ids (no Coinbase link) and a missing binding
+ * have nothing to write and return true.
+ */
+async function storeOriginalLink(env: Env, invoiceKey: string, row: unknown): Promise<boolean> {
+  const url = coinbaseLinkFromId(invoiceKey)
+  if (!url || !env.COUPON_SECURITY_DB) return true
+  const rozoPaymentId = rozoPaymentIdOf(row)
+  if (!rozoPaymentId) return false
+  return saveOriginalPaymentLink(env, { rozoPaymentId, provider: 'coinbase', orderRef: invoiceKey, url }).catch(() => false)
 }
 
 export interface AlphaOrderArgs {
@@ -97,12 +123,18 @@ export async function ensureAlphaBusinessOrder(
   const marker = alphaOrderMarkerKey(a.invoiceKey)
   const cached = await env.MPP_STORE.get(marker).catch(() => null)
   if (cached) return { ok: true, state: 'cached' }
-  const mark = () => env.MPP_STORE.put(marker, '1', { expirationTtl: ORDER_MARKER_TTL_S }).catch(() => undefined)
+  // The order exists: store its link, and cache that only once the link is in.
+  // A failed link write never fails the option (the order is what delivery
+  // needs); it only costs the next poll one more lookup.
+  const mark = async (row: unknown) => {
+    if (!(await storeOriginalLink(env, a.invoiceKey, row))) return
+    await env.MPP_STORE.put(marker, '1', { expirationTtl: ORDER_MARKER_TTL_S }).catch(() => undefined)
+  }
 
   const found = await lookupIntentsOrder(env, OPENROUTER_APP_ID, a.invoiceKey, AbortSignal.timeout(ORDER_TIMEOUT_MS))
   if (found.state === 'error') return { ok: false, reason: 'lookup_failed' }
   if (found.state === 'found') {
-    await mark()
+    await mark(found.row)
     return { ok: true, state: 'existing' }
   }
 
@@ -121,7 +153,7 @@ export async function ensureAlphaBusinessOrder(
     return { ok: false, reason: 'create_failed' }
   }
   if (res.ok) {
-    await mark()
+    await mark(await res.json().catch(() => null))
     return { ok: true, state: 'created' }
   }
   // A concurrent create (another tab, or the main checkout) took the orderId:
@@ -132,7 +164,7 @@ export async function ensureAlphaBusinessOrder(
   if (res.status === 409 && /orderIdConflict/i.test(text)) {
     const again = await lookupIntentsOrder(env, OPENROUTER_APP_ID, a.invoiceKey, AbortSignal.timeout(ORDER_TIMEOUT_MS))
     if (again.state !== 'found') return { ok: false, reason: 'create_failed' }
-    await mark()
+    await mark(again.row)
     return { ok: true, state: 'raced' }
   }
   console.warn('[tron-ton-alpha] business order create refused', res.status)

@@ -70,7 +70,8 @@ export async function saveOriginalPaymentLink(
     // Best effort by design: the order exists upstream; losing the copy of the
     // link is the lesser failure and is visible as a missing row.
     console.warn(
-      `[payment-link-store] save failed for ${link.provider} ${link.orderRef}: ${err instanceof Error ? err.message.slice(0, 160) : 'unknown'}`,
+      // Not the full orderRef: a Coinbase id rebuilds the payable link.
+      `[payment-link-store] save failed for ${link.provider} ${link.orderRef.slice(0, 18)}…: ${err instanceof Error ? err.message.slice(0, 160) : 'unknown'}`,
     )
     return false
   }
