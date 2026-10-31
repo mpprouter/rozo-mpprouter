@@ -27,6 +27,8 @@ import { pendingPricingMatches } from '../src/routes/create-invoice'
 import { resolveCheckoutPricing } from '../src/routes/checkout-web-pricing'
 import { signTestPaymentId } from '../src/routes/native-sources'
 import { alphaOrderMarkerKey, buildAlphaBusinessOrderBody } from '../src/routes/tron-ton-alpha-order'
+import { DatabaseSync } from 'node:sqlite'
+import { readFileSync } from 'node:fs'
 
 const PL = 'pl_testTronTonAlpha01'
 const SESSION = 'paymentSession_656a435c-ee45-4c3e-936c-b80929a4e7f2'
@@ -477,5 +479,85 @@ describe('tron-ton-alpha option: TON address forms from upstream', () => {
       expect(r.receivingAddress).toBe(TON_RAW)
       expect(r.receivingAddressDisplay).toBe('UQCD39VS5jcptHL8vMjEXrzGaRcCVYto7HUn4bpAOg8xqEBI')
     }
+  })
+})
+
+// Founder 2026-10-31: every checkout order keeps its original payment link in
+// checkout_payment_links, alpha rails included (gap: TON order 998a11ea had none).
+function makeLinksD1(opts: { fail?: () => boolean } = {}) {
+  const sql = new DatabaseSync(':memory:')
+  sql.exec(readFileSync(new URL('../migrations/0005_checkout_payment_links.sql', import.meta.url), 'utf8'))
+  const db: any = {
+    prepare(q: string) {
+      let args: any[] = []
+      return {
+        bind(...a: any[]) { args = a; return this },
+        async run() {
+          if (opts.fail?.()) throw new Error('D1_ERROR: network connection lost')
+          sql.prepare(q).run(...args)
+          return { success: true }
+        },
+        async first() { return (sql.prepare(q).get(...args) as any) ?? null },
+      }
+    },
+  }
+  const rows = () => sql.prepare('SELECT rozo_payment_id, provider, order_ref, url FROM checkout_payment_links').all() as any[]
+  return { db, rows }
+}
+
+describe('tron-ton-alpha option: original payment link stored (2026-10-31)', () => {
+  const CREATED_ID = 'b0000000-0000-4000-8000-000000000001'
+  const EXISTING_ID = 'c0000000-0000-4000-8000-000000000002'
+
+  it('a created order stores its rebuilt Coinbase link once, keyed by the Rozo payment id; never in the response', async () => {
+    quoteLinkId = SESSION
+    const { db, rows } = makeLinksD1()
+    const env = makeEnv({ COUPON_SECURITY_DB: db } as Partial<Env>)
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: SESSION, network: 'ton', token: 'USDT' }), env)
+    expect(r.status).toBe(200)
+    expect(await r.text()).not.toContain('payments.coinbase.com')
+    expect(rows()).toEqual([{ rozo_payment_id: CREATED_ID, provider: 'coinbase', order_ref: SESSION, url: `https://payments.coinbase.com/payment-sessions/${SESSION}` }])
+    // the intents order metadata never carries the url
+    expect(JSON.stringify(intents.creates[0])).not.toContain('payments.coinbase.com')
+    // coin switch: cached, no second write or lookup
+    await handleTronTonAlphaOption(optionReq({ payment_id: SESSION, network: 'tron', token: 'USDT' }), env)
+    expect(intents.lookups).toHaveLength(1)
+    expect(rows()).toHaveLength(1)
+  })
+
+  it('an order that already exists (main checkout or pre-deploy alpha) gets its row from the lookup', async () => {
+    intents.lookup = () => new Response(JSON.stringify({ id: EXISTING_ID, status: 'payment_unpaid' }), { status: 200 })
+    const { db, rows } = makeLinksD1()
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), makeEnv({ COUPON_SECURITY_DB: db } as Partial<Env>))
+    expect(r.status).toBe(200)
+    expect(intents.creates).toHaveLength(0)
+    expect(rows()).toEqual([{ rozo_payment_id: EXISTING_ID, provider: 'coinbase', order_ref: PL, url: `https://payments.coinbase.com/payment-links/${PL}` }])
+  })
+
+  it('a D1 failure never fails the option or logs the link; the next poll repairs the row', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    let failing = true
+    const { db, rows } = makeLinksD1({ fail: () => failing })
+    const env = makeEnv({ COUPON_SECURITY_DB: db } as Partial<Env>)
+    const first = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)
+    expect(first.status).toBe(200)
+    expect(rows()).toHaveLength(0)
+    expect(await (env.MPP_STORE as any).get(alphaOrderMarkerKey(PL))).toBeNull()
+    for (const call of warn.mock.calls) expect(call.join(' ')).not.toContain(PL)
+    failing = false
+    intents.lookup = () => new Response(JSON.stringify({ id: CREATED_ID, status: 'payment_unpaid' }), { status: 200 })
+    expect((await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)).status).toBe(200)
+    expect(intents.creates).toHaveLength(1)
+    expect(rows()).toHaveLength(1)
+    expect(await (env.MPP_STORE as any).get(alphaOrderMarkerKey(PL))).toBe('1')
+  })
+
+  it('a rozotest_ id has no Coinbase link: no row, order still cached', async () => {
+    const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef12')
+    const { db, rows } = makeLinksD1()
+    const env = makeEnv({ COUPON_SECURITY_DB: db } as Partial<Env>)
+    expect((await handleTronTonAlphaOption(optionReq({ payment_id: id, network: 'ton', token: 'USDT' }), env)).status).toBe(200)
+    expect(rows()).toHaveLength(0)
+    expect(await (env.MPP_STORE as any).get(alphaOrderMarkerKey(id))).toBe('1')
   })
 })
