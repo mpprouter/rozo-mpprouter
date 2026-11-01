@@ -1534,7 +1534,10 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   const source = sourceResult.resolved
   const nativeSource = isNativeSymbol(source.chainId, source.tokenSymbol)
 
-  // Echo of the invoice URL the CALLER supplied in THIS request, so a client
+  // Echo of the invoice URL the CALLER supplied in THIS request (in its
+  // normalized spelling: http upgraded to https, and a bare Coinbase id or the
+  // Base wallet wrapper rewritten to the payments.coinbase.com URL, see
+  // canonicalCoinbaseCheckoutUrl), so a client
   // that keeps only our response can still link back to the merchant's own
   // invoice page. This discloses nothing new: the caller already holds this
   // exact string, and we hand back only what they just sent us.
