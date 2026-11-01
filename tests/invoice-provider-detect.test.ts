@@ -143,7 +143,9 @@ describe('normalizeInvoiceUrl — http:// is rewritten to https:// for known pro
     expect(normalizeInvoiceUrl(https)).toBe(https)
     expect(normalizeInvoiceUrl('http://example.com/pay/CDM')).toBe('http://example.com/pay/CDM')
     expect(normalizeInvoiceUrl('not a url')).toBe('not a url')
-    expect(normalizeInvoiceUrl('pl_abc')).toBe('pl_abc')
+  })
+  it('canonicalizes a bare Coinbase checkout id to its payments.coinbase.com URL', () => {
+    expect(normalizeInvoiceUrl('pl_abc')).toBe('https://payments.coinbase.com/payment-links/pl_abc')
   })
   it('normalizePayInvoiceBody exposes the https form and classifies the provider', () => {
     const r = normalizePayInvoiceBody({ url: 'http://crypto.stripe.com/pay/CDM' })

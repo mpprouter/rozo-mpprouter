@@ -837,6 +837,49 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     expect(createBody.destination.tokenSymbol).toBe('USDC')
   })
 
+  // 2026-11-01: a payer pasted the Base wallet wrapper, then a bare id. quote
+  // signed the receipt for the real id, but create could not read the id from
+  // that input, never matched the receipt and refused 9 creates in a row.
+  it('accepts a fee receipt when the url is a bare id or the Base wallet wrapper', async () => {
+    const session = 'paymentSession_31532424-74fd-474a-9f2f-fcf5f5d6ee82'
+    const receiptFor = (id: string) => createQuoteReceipt(
+      id,
+      '105',
+      'OpenRouter, Inc.',
+      'test-admin-secret',
+      Math.floor(Date.now() / 1000),
+      {
+        original: '105',
+        serviceFee: '1.05',
+        callerPays: '106.05',
+        feeBps: 100,
+        pricingVersion: 'checkout-web-fee-v3',
+        client: null,
+        channel: null,
+      },
+    )
+    const cases: Array<[string, string]> = [
+      ['pl_test123', 'pl_test123'],
+      [session, session],
+      [`payments.coinbase.com/payment-sessions/${session}`, session],
+      [
+        `https://wallet.coinbase.com/base-pay?paymentSessionId=${session}` +
+          '&baseURL=https%3A%2F%2Fapi.cdp.coinbase.com%2Fplatform&amount=10.50&asset=usdc',
+        session,
+      ],
+    ]
+    for (const [url, id] of cases) {
+      const { status, json, createBody, quoteFetches } = await run(
+        { url, client: 'rozo-checkout-web', quoteReceipt: await receiptFor(id) },
+        '100',
+      )
+      expect(status, url).toBe(200)
+      expect(quoteFetches, url).toBe(0)
+      expect(json.callerPays, url).toBe('106.05')
+      expect(createBody.source.amount, url).toBe('106.05')
+    }
+  })
+
   it('charges the same 1% browser fee on stablecoin and Lightning and persists its breakdown', async () => {
     const quoteReceipt = await createQuoteReceipt(
       'pl_test123',

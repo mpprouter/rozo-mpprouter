@@ -101,6 +101,8 @@ export function detectProvider(raw: string): InvoiceProvider | null {
  * existing errors — this never widens what is accepted).
  */
 export function normalizeInvoiceUrl(raw: string): string {
+  const coinbase = canonicalCoinbaseCheckoutUrl(raw)
+  if (coinbase) return coinbase
   if (detectProvider(raw) === null) return raw
   try {
     const u = new URL(raw)
@@ -110,6 +112,70 @@ export function normalizeInvoiceUrl(raw: string): string {
   } catch {
     return raw
   }
+}
+
+// ── Coinbase checkout input canonicalization ────────────────────────────────
+
+const COINBASE_SESSION_ID_RE = /^paymentSession_[A-Za-z0-9_-]+$/
+const COINBASE_LEGACY_ID_RE = /^pl_[A-Za-z0-9_-]+$/
+const BARE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+const COINBASE_CHECKOUT_BASE = 'https://payments.coinbase.com'
+
+/**
+ * Map the other spellings of a Coinbase checkout that payers actually paste to
+ * the one canonical payments.coinbase.com URL, or return null.
+ *
+ * Why (2026-11-01): quote-invoice resolved these spellings through Coinbase
+ * and signed a receipt for the real session id, but create-invoice only knew
+ * the id when it could parse it from an allowlisted URL. For a bare id the
+ * receipt was never matched, so every create answered
+ * QUOTE_RECEIPT_INVALID_OR_EXPIRED however fresh the receipt was, and the Base
+ * wallet wrapper was refused outright as LINK_NOT_PAYABLE.
+ *
+ * Accepted, and nothing else:
+ *  1. Base wallet wrapper: https://wallet.coinbase.com/base-pay?paymentSessionId=<id>
+ *     (exact host and path; one paymentSessionId; a bare UUID gets the
+ *     paymentSession_ prefix). The wrapper is never fetched and its other
+ *     params (amount, asset, baseURL) are ignored: the amount is always re-read
+ *     from Coinbase by id.
+ *  2. A bare checkout id: paymentSession_* or pl_*.
+ *  3. A payments.coinbase.com checkout URL without the scheme.
+ * The output is always on the existing allowlisted host, built from an id that
+ * passes the same grammar the resolver already uses.
+ */
+export function canonicalCoinbaseCheckoutUrl(raw: string): string | null {
+  const s = typeof raw === 'string' ? raw.trim() : ''
+  if (!s) return null
+
+  if (COINBASE_SESSION_ID_RE.test(s)) return `${COINBASE_CHECKOUT_BASE}/payment-sessions/${s}`
+  if (COINBASE_LEGACY_ID_RE.test(s)) return `${COINBASE_CHECKOUT_BASE}/payment-links/${s}`
+
+  if (/^payments\.coinbase\.com\//i.test(s)) {
+    const id = extractCoinbaseCheckoutId(`https://${s}`)
+    if (!id) return null
+    return isCoinbasePaymentSessionId(id)
+      ? `${COINBASE_CHECKOUT_BASE}/payment-sessions/${id}`
+      : `${COINBASE_CHECKOUT_BASE}/payment-links/${id}`
+  }
+
+  let u: URL
+  try {
+    u = new URL(s)
+  } catch {
+    return null
+  }
+  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null
+  if (u.hostname.toLowerCase() !== 'wallet.coinbase.com') return null
+  if (u.pathname !== '/base-pay' && u.pathname !== '/base-pay/') return null
+  const values = u.searchParams.getAll('paymentSessionId')
+  if (values.length !== 1) return null
+  const value = values[0].trim()
+  const id = COINBASE_SESSION_ID_RE.test(value)
+    ? value
+    : BARE_UUID_RE.test(value)
+      ? `paymentSession_${value.toLowerCase()}`
+      : null
+  return id ? `${COINBASE_CHECKOUT_BASE}/payment-sessions/${id}` : null
 }
 
 // ── Coinbase checkout ID extraction ──────────────────────────────────────────
