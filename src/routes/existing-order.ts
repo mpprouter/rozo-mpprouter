@@ -14,7 +14,7 @@
 import type { Env } from '../index'
 import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import { stripeOrderId } from './stripe-fulfillment'
-import { rowFundingEvidence } from './relink-guard'
+import { rowFundingEvidence, zecQuoteExpiredUnfunded } from './relink-guard'
 
 import { ROZO_INTENTS_BASE, intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
 
@@ -152,9 +152,13 @@ export function isLookupTargetValid(target: ExistingOrderTarget): boolean {
   return COINBASE_ID_RE.test(target.linkId) || TEST_ID_RE.test(target.linkId)
 }
 
-function isLive(row: any): boolean {
+/**
+ * Live = still payable: expiresAt in the future, and not a ZEC custody order
+ * whose quote expired unfunded (zecQuoteExpiredUnfunded).
+ */
+export function isLive(row: any): boolean {
   const exp = Date.parse(row?.expiresAt ?? '')
-  return Number.isFinite(exp) && exp > Date.now()
+  return Number.isFinite(exp) && exp > Date.now() && !zecQuoteExpiredUnfunded(row)
 }
 
 export function classifyOrderState(row: any): ExistingOrderState {
@@ -191,7 +195,7 @@ export interface OrderSlotEntry {
   id: string
   slot: 'base' | 'contract' | 'retry'
   row: any | null
-  /** expiresAt in the future (create-invoice's "live"). */
+  /** isLive (create-invoice's "live"). */
   live: boolean
 }
 

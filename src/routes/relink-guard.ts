@@ -88,6 +88,29 @@ export function rowFundingEvidence(row: any): string | null {
   return hit ? hit[0] : null
 }
 
+/**
+ * An unpaid ZEC custody order whose QUOTE has expired with nothing received
+ * (rozo-intents-api source.zec: rail zec_custody, payinState 'expired',
+ * receivedZat '0'), and no funding evidence anywhere on the row. Upstream
+ * keeps such an order payment_unpaid until its link window (expiresAt, about
+ * 12 h) ends, but the custody ledger has already closed its pay-in: a late
+ * payment to its address (transparent t1 or shielded pool address) becomes
+ * anomaly funds, never a payout. So it is not a live order for this link and
+ * a fresh order (either pay-in mode) may replace it. Read from the row the
+ * order lookup already returned; no extra request. Anything else (funds seen,
+ * any other payinState, a malformed block) stays live / blocking.
+ * 2026-11-02 incident: payment 22291f1a (quote expired 02:38Z, link 14:38Z)
+ * blocked a shielded create for 12 hours as a mode mismatch.
+ */
+export function zecQuoteExpiredUnfunded(row: any): boolean {
+  const status = row?.status ?? row?.payment_status ?? null
+  if (status !== 'payment_unpaid') return false
+  const z = row?.source?.zec
+  if (!z || typeof z !== 'object') return false
+  if (z.rail !== 'zec_custody' || z.payinState !== 'expired' || z.receivedZat !== '0') return false
+  return rowFundingEvidence(row) === null
+}
+
 function blocked(row: any, reason: RelinkBlockReason): RelinkCheck {
   return {
     ok: false,
@@ -129,6 +152,10 @@ export async function checkPreviousOrderUnfunded(_env: Env, row: any): Promise<R
   const status = row?.status ?? row?.payment_status ?? null
   const id = typeof row?.id === 'string' ? row.id : null
   if (rowFundingEvidence(row)) return blocked(row, 'previous_order_funded')
+  // ZEC custody order whose quote expired unfunded: the custody ledger (not
+  // the EVM omni scan, which never covers Zcash) is the authority, and it
+  // reports nothing received. Late funds there become anomaly funds.
+  if (id && zecQuoteExpiredUnfunded(row)) return { ok: true }
   if (status !== 'payment_expired' || !id) return blocked(row, 'previous_order_not_closed')
   const verdict = await scanVerdict(id)
   if (verdict === 'nothing_found') return { ok: true }
