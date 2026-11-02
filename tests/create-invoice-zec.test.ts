@@ -855,6 +855,19 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(bad.json.code).toBe('INVALID_SOURCE')
   })
 
+  it('a shielded order keeps the merchant link expiry rule and forwards merchant_link_expires_at', async () => {
+    linkExpiresAt = inMinutes(40)
+    const short = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(short.status).toBe(400)
+    expect(short.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+    expect(createCalls).toBe(0)
+    linkExpiresAt = inMinutes(120)
+    createAnswer = shieldedCreate
+    const ok = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(ok.status).toBe(200)
+    expect(typeof createdIntent.metadata.merchant_link_expires_at).toBe('string')
+  })
+
   it('a refund address with a shielded order is refused; shielded on a non-ZEC coin is ignored with a warning', async () => {
     const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED, refund_address: T1 }, { env: custodyEnv(), query: BOTH })
     expect(r.status).toBe(400)

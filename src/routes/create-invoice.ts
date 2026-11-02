@@ -1703,7 +1703,10 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   }
   // A shielded order has no refund path (a short or late payment is handled
   // as anomaly funds upstream), so no refund address is required or accepted.
-  const refundAddressCoin = !shieldedSource && nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
+  // ZEC in either mode: the merchant-link expiry rule applies (zecCoin); the
+  // refund-address rules apply to transparent ZEC only (refundAddressCoin).
+  const zecCoin = nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
+  const refundAddressCoin = !shieldedSource && zecCoin
   const refundAddressMandatory =
     refundAddressCoin && nativeRefundAddressMandatory(source.chainId, source.tokenSymbol, zecRail)
   let refundAddress: string | null = null
@@ -2524,7 +2527,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // /checkout carries no refund address. Other native coins can be rotated
   // upstream (rozo-intents-api NATIVE_ROTATION).
   let merchantLinkExpiresAt: string | null = null
-  if (refundAddressCoin) {
+  if (zecCoin) {
     const linkExpiry =
       testInvoiceCents !== null
         ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
