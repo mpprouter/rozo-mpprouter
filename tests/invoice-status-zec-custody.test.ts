@@ -41,7 +41,8 @@ describe('invoice-status relays the custody ZEC fields', () => {
     expect(out.refundTxHash).toBe('a'.repeat(64))
     expect(out.paymentHold).toEqual({ kind: 'zec_late_review' })
     expect(out.source.minAcceptedAmount).toBe('0.08143000')
-    expect(out.source.zec).toEqual(ZEC)
+    expect(out.source.zec).toEqual({ ...ZEC, receive: 'transparent' })
+    expect(out.source).not.toHaveProperty('paymentUri')
     expect(out.internalSecret).toBeUndefined()
     expect(out.source.receiverMemo).toBeUndefined()
   })
@@ -102,3 +103,25 @@ describe('invoice-status relays the custody ZEC fields', () => {
     expect(out.source.zec).toBeUndefined()
   })
 })
+
+describe('shielded pay-in fields (stage 2)', () => {
+  const UA = 'u1' + 'q'.repeat(140)
+  const URI = `zcash:${UA}?amount=0.00413867&memo=MjU4NjQzMmM`
+  it('relays receive=shielded and the ZIP-321 paymentUri; transparent rows never carry a uri', () => {
+    const out: any = pickRozoCallerSafe({ ...ROW, source: { ...ROW.source, receiverAddress: UA, paymentUri: URI, zec: { ...ZEC, receive: 'shielded' } } })
+    expect(out.source.zec.receive).toBe('shielded')
+    expect(out.source.paymentUri).toBe(URI)
+    const t: any = pickRozoCallerSafe({ ...ROW, source: { ...ROW.source, paymentUri: URI } })
+    expect(t.source.zec.receive).toBe('transparent')
+    expect(t.source).not.toHaveProperty('paymentUri')
+  })
+  it('drops a foreign receive value and malformed uris', () => {
+    expect(pickZecCustodyStatus({ ...ZEC, receive: 'private' })).toBeNull()
+    expect(pickZecCustodyStatus({ ...ZEC, receive: 'shielded' })?.receive).toBe('shielded')
+    for (const bad of ['bitcoin:x', 'zcash:' + 'a'.repeat(600), 42, null]) {
+      const out: any = pickRozoCallerSafe({ ...ROW, source: { ...ROW.source, paymentUri: bad, zec: { ...ZEC, receive: 'shielded' } } })
+      expect(out.source).not.toHaveProperty('paymentUri')
+    }
+  })
+})
+

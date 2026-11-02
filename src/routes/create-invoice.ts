@@ -56,6 +56,8 @@ import {
   supportedSources,
   verifyTestPaymentId,
   withBetaSources,
+  zecShieldedAvailable,
+  zecShieldedMaxUsd,
   ZEC_BLOCK_TARGET_SECONDS,
   ZEC_CUSTODY_CONFIRMATIONS,
   ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN,
@@ -158,7 +160,29 @@ export interface ResolvedSource {
   // Empty string for chains without an ERC-20-style token address (e.g.
   // Lightning BTC, where the payment rail carries no contract address).
   tokenAddress: string
+  /** ZEC only: the payer wants to pay from a shielded balance (rozo-intents-api source.shielded). */
+  shielded?: true
   warnings: string[]
+}
+
+/** Requested ZEC pay-in mode of a resolved source. */
+export function requestedZecReceive(source: Pick<ResolvedSource, 'shielded'>): 'shielded' | 'transparent' {
+  return source.shielded ? 'shielded' : 'transparent'
+}
+
+/**
+ * Public ZEC pay-in fields of a rozo-intents-api order for the create-invoice
+ * response: `zec.receive` (shielded | transparent) and, for a shielded order,
+ * the ZIP-321 `paymentUri` the checkout renders as the QR. Nothing is invented:
+ * absent upstream = absent here.
+ */
+export function zecReceiveFields(row: any): { zec?: { receive: 'shielded' | 'transparent' }; paymentUri?: string } {
+  const out: { zec?: { receive: 'shielded' | 'transparent' }; paymentUri?: string } = {}
+  const receive = row?.source?.zec?.receive
+  if (receive === 'shielded' || receive === 'transparent') out.zec = { receive }
+  const uri = row?.source?.paymentUri
+  if (receive === 'shielded' && typeof uri === 'string' && uri.startsWith('zcash:') && uri.length <= 512) out.paymentUri = uri
+  return out
 }
 
 export interface SourceError {
@@ -352,6 +376,17 @@ export function resolveSource(
     if ('tokenAddress' in src && src.tokenAddress !== undefined && src.tokenAddress !== null && src.tokenAddress !== '') {
       warnings.push('source.tokenAddress was ignored for a native coin source.')
     }
+    // Shielded pay-in mode is a ZEC-only flag; the rail / beta gate is applied by the caller.
+    if (src.shielded !== undefined && src.shielded !== null && src.shielded !== false) {
+      if (src.shielded !== true) {
+        return { error: { code: 'INVALID_SOURCE', message: 'source.shielded must be true or false.' } }
+      }
+      if (def.symbol !== 'ZEC') {
+        warnings.push('source.shielded was ignored: only ZEC supports a shielded pay-in.')
+      } else {
+        return { resolved: { chainId, tokenSymbol: def.symbol, tokenAddress: def.tokenAddress, shielded: true, warnings } }
+      }
+    }
     return { resolved: { chainId, tokenSymbol: def.symbol, tokenAddress: def.tokenAddress, warnings } }
   }
 
@@ -419,6 +454,10 @@ export type CreateInvoiceErrorCode =
   | 'REFUND_ADDRESS_REQUIRED'
   | 'MERCHANT_LINK_EXPIRES_TOO_SOON'
   | 'ZEC_SHIELDED_ADDRESS_NOT_SUPPORTED'
+  // Shielded pay-in mode (source.shielded=true): needs ?beta=zec_shielded on the custody rail.
+  | 'ZEC_SHIELDED_NOT_ENABLED'
+  // A shielded order has no refund path: refund_address must not be sent with it.
+  | 'ZEC_SHIELDED_REFUND_ADDRESS_NOT_APPLICABLE'
   | 'ZEC_NOT_ENABLED'
   | 'QUOTE_DRIFT'
   | 'ZEC_REQUIRES_EXACT_OUT'
@@ -832,11 +871,25 @@ const STRIPE_PAID_STATUSES = new Set(['payment_payin_completed', 'payment_payout
  * for. An unknown row source is not treated as a mismatch (nothing to compare).
  */
 function sourceDiffers(
-  rowSource: { chainId: string | null; tokenSymbol: string | null },
+  rowSource: { chainId: string | null; tokenSymbol: string | null; receive?: 'shielded' | 'transparent' | null },
   source: ResolvedSource,
 ): boolean {
   if (rowSource.chainId === null) return false
-  return rowSource.chainId !== source.chainId || rowSource.tokenSymbol !== source.tokenSymbol
+  if (rowSource.chainId !== source.chainId || rowSource.tokenSymbol !== source.tokenSymbol) return true
+  return zecReceiveDiffers(rowSource, source)
+}
+
+/**
+ * Same ZEC coin, different pay-in mode: a transparent order is never handed to
+ * a payer who asked for shielded and vice versa (the addresses, the amount
+ * rules and the refund path differ). A row without the field is transparent.
+ */
+function zecReceiveDiffers(
+  rowSource: { chainId: string | null; tokenSymbol: string | null; receive?: 'shielded' | 'transparent' | null },
+  source: ResolvedSource,
+): boolean {
+  if (rowSource.tokenSymbol !== 'ZEC' || source.tokenSymbol !== 'ZEC') return false
+  return (rowSource.receive ?? 'transparent') !== requestedZecReceive(source)
 }
 
 /**
@@ -1101,6 +1154,14 @@ function sourceMismatchWarning(
   source: ResolvedSource,
   reason: string,
 ): string {
+  if (reason === 'zec_receive_mode_mismatch') {
+    return (
+      `Requested a ${requestedZecReceive(source)} ZEC pay-in, but the existing order for this ` +
+      `invoice is a ${(rowSource as { receive?: string | null }).receive ?? 'transparent'} one; an order's pay-in mode ` +
+      `is never switched. Either pay the existing order as shown above, or wait for it to expire ` +
+      `and create a new one.`
+    )
+  }
   return (
     `Requested ${source.tokenSymbol} on chain ${source.chainId}, but the existing ` +
     `order for this invoice pays ${rowSource.tokenSymbol ?? 'unknown'} on chain ` +
@@ -1626,8 +1687,26 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // 2026-10-13): optional, since the deposit address is our own wallet and a
   // late or short payment is handled manually; a provided one is still
   // checked and forwarded.
-  const refundAddressCoin = nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
   const zecRail = parseZecRail(env.ZEC_RAIL)
+  // Shielded pay-in (stage 2, 2026-11-02): only on the custody rail and only
+  // when the request carries ?beta=zec_shielded (the checkout sets it for the
+  // beta link); otherwise the flag is refused, never silently downgraded to a
+  // transparent order the payer did not ask for.
+  const shieldedSource = source.shielded === true
+  if (shieldedSource && !zecShieldedAvailable(nativeAllowed, zecRail, request.url)) {
+    return errorResponse(400, {
+      code: 'ZEC_SHIELDED_NOT_ENABLED',
+      message: 'Shielded ZEC pay-in is not enabled for this checkout. Pay with transparent ZEC or USDC/USDT instead.',
+      normalized_input: normalized,
+      link_id_detected,
+    })
+  }
+  // A shielded order has no refund path (a short or late payment is handled
+  // as anomaly funds upstream), so no refund address is required or accepted.
+  // ZEC in either mode: the merchant-link expiry rule applies (zecCoin); the
+  // refund-address rules apply to transparent ZEC only (refundAddressCoin).
+  const zecCoin = nativeRequiresRefundAddress(source.chainId, source.tokenSymbol)
+  const refundAddressCoin = !shieldedSource && zecCoin
   const refundAddressMandatory =
     refundAddressCoin && nativeRefundAddressMandatory(source.chainId, source.tokenSymbol, zecRail)
   let refundAddress: string | null = null
@@ -1638,6 +1717,14 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     rawRefundAddress !== undefined &&
     rawRefundAddress !== null &&
     !(typeof rawRefundAddress === 'string' && rawRefundAddress.trim() === '')
+  if (shieldedSource && refundAddressGiven) {
+    return errorResponse(400, {
+      code: 'ZEC_SHIELDED_REFUND_ADDRESS_NOT_APPLICABLE',
+      message: 'A shielded ZEC pay-in has no refund address. Remove refund_address, or pay with transparent ZEC.',
+      normalized_input: normalized,
+      link_id_detected,
+    })
+  }
   if (refundAddressCoin && (refundAddressMandatory || refundAddressGiven)) {
     const r = resolveRefundAddress(rawRefundAddress)
     if (!r.ok) {
@@ -1879,7 +1966,23 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
+  // Shielded ZEC orders have their own cap (ZEC_SHIELDED_MAX_USD, default
+  // $1,200 = intents ZEC_SHIELD_CAPS.max_order_usd), checked right before a
+  // FRESH shielded create (shieldedCapBlock below) so that an existing order
+  // of the other mode is still reported as a mode mismatch first. The
+  // transparent custody cap (3499.99) is untouched. rozo-intents-api stays
+  // the final gate.
   const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail)
+  const shieldedCap = Math.min(zecShieldedMaxUsd(env.ZEC_SHIELDED_MAX_USD), nativeCap)
+  const shieldedCapBlock = (): Response | null =>
+    shieldedSource && Number(callerPays) > shieldedCap
+      ? errorResponse(400, {
+          code: 'UNSUPPORTED_SOURCE',
+          message: `Shielded ZEC payment is limited to $${shieldedCap} per invoice. Pay with transparent ZEC or USDC/USDT instead.`,
+          normalized_input: normalized,
+          link_id_detected,
+        })
+      : null
   if (nativeSource && Number(callerPays) > nativeCap) {
     return errorResponse(400, {
       code: 'UNSUPPORTED_SOURCE',
@@ -2187,7 +2290,10 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       if (!pendingPricingMatches(existing, pricing)) {
         return pricingMismatchResponse({ linkId }, existing)
       }
-      if (refundAddressCoin) {
+      // A shielded ZEC row binds no refund address (none exists on that
+      // rail); a request of the other mode is reported below as a pay-in
+      // mode mismatch instead.
+      if (refundAddressCoin && readRowSource(existing).receive !== 'shielded') {
         const refundBlock = await refundAddressReuseBlock(existing, refundAddress, { linkId }, refundAddressMandatory)
         if (refundBlock) return refundBlock
       }
@@ -2225,7 +2331,11 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         refundAddressCoin ||
         nativeRequiresRefundAddress(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
       if (sourceDiffers(rowSource, source) && existing?.id) {
-        if (refundAddressCoinInvolved) {
+        if (zecReceiveDiffers(rowSource, source)) {
+          // Same coin, other pay-in mode: never switched in place (the
+          // existing address may already have been shown or funded).
+          rotationFailure = 'zec_receive_mode_mismatch'
+        } else if (refundAddressCoinInvolved) {
           rotationFailure = 'native_not_rotatable'
         } else if (rowSource.chainId === 'lightning' && !lightningRotateOutEnabled(env)) {
           rotationFailure = 'lightning_not_rotatable'
@@ -2384,9 +2494,11 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         source: {
           chainId: rowSource.chainId,
           tokenSymbol: rowSource.tokenSymbol,
+          ...zecReceiveFields(row),
         },
         ...(sourceRotated ? { sourceRotated: true, ...previousAddressFields(row) } : {}),
         ...(rotationFailure ? { sourceMismatch: true } : {}),
+        ...(rotationFailure === 'zec_receive_mode_mismatch' ? { sourceMismatchCode: 'ZEC_RECEIVE_MODE_MISMATCH' } : {}),
         ...(intentMismatch ? { intentMismatch: true } : {}),
         ...(warnings.length ? { warnings } : {}),
         raw: row,
@@ -2415,7 +2527,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // /checkout carries no refund address. Other native coins can be rotated
   // upstream (rozo-intents-api NATIVE_ROTATION).
   let merchantLinkExpiresAt: string | null = null
-  if (refundAddressCoin) {
+  if (zecCoin) {
     const linkExpiry =
       testInvoiceCents !== null
         ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
@@ -2430,6 +2542,13 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       })
     }
     merchantLinkExpiresAt = check.iso
+  }
+
+  // A fresh shielded order: the shielded per-invoice cap applies here (after
+  // reuse, so an existing transparent order is reported as a mode mismatch).
+  {
+    const capped = shieldedCapBlock()
+    if (capped) return capped
   }
 
   // Native coins (ETH/BNB/POL/SOL) settle exactOut like Lightning: the merchant
@@ -2450,6 +2569,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           : {
               chainId: source.chainId,
               tokenSymbol: source.tokenSymbol,
+              ...(shieldedSource ? { shielded: true } : {}),
               ...(refundAddress ? { refundAddress } : {}),
             },
         destination: {
@@ -2547,7 +2667,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     // capacity / pause / stale monitor) are caller-actionable; pass status and
     // code through unchanged instead of a generic 502. Checked before the 429
     // relay so a custody refusal keeps its own code; anything else falls through.
-    if (refundAddressCoin) {
+    if (zecCoin) {
       const zecErr = zecUpstreamError(intentsResp.status, intentsText)
       if (zecErr) {
         return errorResponse(intentsResp.status, {
@@ -2634,11 +2754,17 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           if (!pendingPricingMatches(winner, pricing)) {
             return pricingMismatchResponse({ linkId }, winner)
           }
-          if (refundAddressCoin) {
+          const winnerSource = readRowSource(winner)
+          // A shielded winner binds no refund address; a transparent request
+          // against it is reported as a mode mismatch below (same as reuse).
+          if (refundAddressCoin && winnerSource.receive !== 'shielded') {
             const refundBlock = await refundAddressReuseBlock(winner, refundAddress, { linkId }, refundAddressMandatory)
             if (refundBlock) return refundBlock
           }
-          const winnerSource = readRowSource(winner)
+          // The winner may be the other ZEC pay-in mode (a transparent and a
+          // shielded create racing for the slot): report it, never hand it
+          // over silently or switch it (same rule as the reuse path).
+          const winnerModeMismatch = zecReceiveDiffers(winnerSource, source)
           // Reused order: make the stored link idempotent (founder 2026-10-26).
           if (linkId && winner?.id) {
             const reusedUrl = raw_url || coinbaseLinkFromId(linkId)
@@ -2666,8 +2792,17 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
             source: {
               chainId: winnerSource.chainId,
               tokenSymbol: winnerSource.tokenSymbol,
+              ...zecReceiveFields(winner),
             },
-            ...(source.warnings.length ? { warnings: source.warnings } : {}),
+            ...(winnerModeMismatch ? { sourceMismatch: true, sourceMismatchCode: 'ZEC_RECEIVE_MODE_MISMATCH' } : {}),
+            ...(source.warnings.length || winnerModeMismatch
+              ? {
+                  warnings: [
+                    ...source.warnings,
+                    ...(winnerModeMismatch ? [sourceMismatchWarning(winnerSource, source, 'zec_receive_mode_mismatch')] : []),
+                  ],
+                }
+              : {}),
             ...(replacedRows.length > 0
               ? { replacesExpiredPaymentIds: replacedRows.map((r) => r?.id ?? null) }
               : {}),
@@ -2799,6 +2934,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       chainId: source.chainId,
       tokenSymbol: source.tokenSymbol,
       tokenAddress: source.tokenAddress,
+      ...zecReceiveFields(intentsJson),
     },
     ...(supersededClassic
       ? {
