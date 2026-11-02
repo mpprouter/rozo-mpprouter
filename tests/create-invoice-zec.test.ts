@@ -868,6 +868,13 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(typeof createdIntent.metadata.merchant_link_expires_at).toBe('string')
   })
 
+  it('upstream ZEC refusals pass through with their status for a shielded create too', async () => {
+    createAnswer = () => new Response(JSON.stringify({ error: { code: 'ZEC_CAPACITY_BUSY', message: 'Shielded ZEC payins are temporarily unavailable.' }, data: { errorCode: 'ZEC_CAPACITY_BUSY', reason: 'monitor_missing' } }), { status: 503 })
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(503)
+    expect(r.json.code).toBe('ZEC_CAPACITY_BUSY')
+  })
+
   it('a refund address with a shielded order is refused; shielded on a non-ZEC coin is ignored with a warning', async () => {
     const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED, refund_address: T1 }, { env: custodyEnv(), query: BOTH })
     expect(r.status).toBe(400)

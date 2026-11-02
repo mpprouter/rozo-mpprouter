@@ -2667,7 +2667,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     // capacity / pause / stale monitor) are caller-actionable; pass status and
     // code through unchanged instead of a generic 502. Checked before the 429
     // relay so a custody refusal keeps its own code; anything else falls through.
-    if (refundAddressCoin) {
+    if (zecCoin) {
       const zecErr = zecUpstreamError(intentsResp.status, intentsText)
       if (zecErr) {
         return errorResponse(intentsResp.status, {
