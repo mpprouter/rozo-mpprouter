@@ -789,27 +789,27 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(zecShieldedAvailable(open, 'near', 'https://x/?beta=zec,zec_shielded')).toBe(false)
     expect(zecShieldedAvailable(open, 'custody', 'https://x/?beta=zec')).toBe(false)
     expect(zecShieldedAvailable(parseNativeSources(PROD_NATIVE), 'custody', 'https://x/?beta=zec,zec_shielded')).toBe(false)
-    expect(zecShieldedMaxUsd(undefined)).toBe(100)
+    expect(zecShieldedMaxUsd(undefined)).toBe(1200)
     expect(zecShieldedMaxUsd('50')).toBe(50)
-    expect(zecShieldedMaxUsd('-1')).toBe(100)
+    expect(zecShieldedMaxUsd('-1')).toBe(1200)
   })
 
-  it('sourceMeta marks shielded_available only on custody with the flag', () => {
+  it('sourceMeta marks shieldedAvailable only on custody with the flag', () => {
     const open = withBetaSources(parseNativeSources(PROD_NATIVE), 'ZEC@9133', 'https://x/?beta=zec')
-    expect(sourceMeta(open, 'custody', true)['ZEC@9133'].shielded_available).toBe(true)
-    expect(sourceMeta(open, 'custody', false)['ZEC@9133']).not.toHaveProperty('shielded_available')
-    expect(sourceMeta(open, 'near', true)['ZEC@9133']).not.toHaveProperty('shielded_available')
+    expect(sourceMeta(open, 'custody', true)['ZEC@9133'].shieldedAvailable).toBe(true)
+    expect(sourceMeta(open, 'custody', false)['ZEC@9133']).not.toHaveProperty('shieldedAvailable')
+    expect(sourceMeta(open, 'near', true)['ZEC@9133']).not.toHaveProperty('shieldedAvailable')
   })
 
-  it('quote-invoice shows shielded_available with ?beta=zec,zec_shielded on custody only', async () => {
+  it('quote-invoice shows shieldedAvailable with ?beta=zec,zec_shielded on custody only', async () => {
     const both = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: custodyEnv(), query: BOTH })
-    expect(both.json.sourceMeta['ZEC@9133'].shielded_available).toBe(true)
+    expect(both.json.sourceMeta['ZEC@9133'].shieldedAvailable).toBe(true)
     const coinOnly = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: custodyEnv(), query: '?beta=zec' })
-    expect(coinOnly.json.sourceMeta['ZEC@9133']).not.toHaveProperty('shielded_available')
+    expect(coinOnly.json.sourceMeta['ZEC@9133']).not.toHaveProperty('shieldedAvailable')
     const flagOnly = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: custodyEnv(), query: '?beta=zec_shielded' })
     expect(flagOnly.json.sourceMeta).toEqual({})
     const near = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: BOTH })
-    expect(near.json.sourceMeta['ZEC@9133']).not.toHaveProperty('shielded_available')
+    expect(near.json.sourceMeta['ZEC@9133']).not.toHaveProperty('shieldedAvailable')
   })
 
   it('creates a shielded order: source.shielded passed through, no refund fields, receive + paymentUri echoed', async () => {
@@ -822,6 +822,9 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(createdIntent.metadata.zec_refund_address_none).toBeUndefined()
     expect(createdIntent.metadata[ZEC_REFUND_DIGEST_KEY]).toBeUndefined()
     expect(json.source).toEqual({ chainId: '9133', tokenSymbol: 'ZEC', tokenAddress: '', zec: { receive: 'shielded' }, paymentUri: URI })
+    expect(json.raw.source.zec.receive).toBe('shielded')
+    expect(json.raw.source.paymentUri).toBe(URI)
+    expect(json.raw.source.receiverAddress).toBe(UA)
   })
 
   it('a transparent order echoes receive=transparent and never a paymentUri', async () => {
@@ -864,8 +867,8 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
   })
 
   it.each([
-    ['100', undefined, 200],
-    ['100.01', undefined, 400],
+    ['1200', undefined, 200],
+    ['1200.01', undefined, 400],
     ['50', '50', 200],
     ['50.01', '50', 400],
   ] as const)('shielded cap: callerPays %s with ZEC_SHIELDED_MAX_USD=%s -> %i', async (amount, cap, expected) => {
@@ -882,7 +885,7 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
   })
 
   it('the shielded cap does not touch transparent custody orders', async () => {
-    quoteAmount = '150'
+    quoteAmount = '1500'
     const { status } = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
     expect(status).toBe(200)
   })
@@ -906,7 +909,11 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(t.status).toBe(200)
     expect(t.json.reused).toBe(true)
     expect(t.json.sourceMismatch).toBe(true)
+    expect(t.json.sourceMismatchCode).toBe('ZEC_RECEIVE_MODE_MISMATCH')
     expect(t.json.source).toEqual({ chainId: '9133', tokenSymbol: 'ZEC', zec: { receive: 'shielded' }, paymentUri: URI })
+    // raw is the intents row, untouched: the checkout reads raw.source.zec.receive / raw.source.paymentUri on refresh
+    expect(t.json.raw.source.zec.receive).toBe('shielded')
+    expect(t.json.raw.source.paymentUri).toBe(URI)
     expect(t.json.warnings.join(' ')).toContain('pay-in mode')
     expect(createCalls).toBe(0)
     // shielded request against the same shielded row: plain reuse
@@ -925,5 +932,38 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(x.json.source).toEqual({ chainId: '9133', tokenSymbol: 'ZEC' })
     expect(createCalls).toBe(0)
   })
-})
 
+  it('an existing transparent order above the shielded cap is reported as a mode mismatch, not a cap error', async () => {
+    quoteAmount = '1500'
+    createAnswer = transparentCreate
+    await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    const row = { ...rowFrom(createdIntent), provider: 'rozo', quoteExpiresAt: '2999-01-01T01:00:00.000Z',
+      source: { chainId: '9133', tokenSymbol: 'ZEC', amount: '0.1', receiverAddress: T1, zec: { rail: 'zec_custody', receive: 'transparent' } } }
+    createCalls = 0
+    existingOrder = row
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(200)
+    expect(r.json.reused).toBe(true)
+    expect(r.json.sourceMismatchCode).toBe('ZEC_RECEIVE_MODE_MISMATCH')
+    expect(createCalls).toBe(0)
+  })
+
+  it('race winner of the other pay-in mode is reported with sourceMismatch', async () => {
+    createAnswer = transparentCreate
+    await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    raceWinner = { id: 'rozo-pay-winner', status: 'payment_unpaid', paymentLink: 'https://pay.rozo.ai/w', expiresAt: '2999-01-01T01:00:00.000Z',
+      provider: 'rozo', quoteExpiresAt: '2999-01-01T01:00:00.000Z',
+      source: { chainId: '9133', tokenSymbol: 'ZEC', amount: '0.00413867', receiverAddress: T1, zec: { rail: 'zec_custody', receive: 'transparent' } },
+      destination: { ...createdIntent.destination }, metadata: { ...createdIntent.metadata } }
+    createAnswer = () => new Response(JSON.stringify({ error: { code: 'orderIdConflict' } }), { status: 409 })
+    createCalls = 0
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(200)
+    expect(r.json.reused).toBe(true)
+    expect(r.json.rozoPaymentId).toBe('rozo-pay-winner')
+    expect(r.json.sourceMismatch).toBe(true)
+    expect(r.json.sourceMismatchCode).toBe('ZEC_RECEIVE_MODE_MISMATCH')
+    expect(r.json.warnings.join(' ')).toContain('pay-in mode')
+    expect(r.json.source.zec).toEqual({ receive: 'transparent' })
+  })
+})

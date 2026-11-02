@@ -202,10 +202,11 @@ export function zecShieldedAvailable(
   return zecRail === 'custody' && nativeAllowed.has('ZEC@9133') && zecShieldedRequested(requestUrl)
 }
 
-/** Per-invoice cap for a shielded ZEC order (ZEC_SHIELDED_MAX_USD, default $100: stage 2 single-order cap). */
+/** Per-invoice cap for a shielded ZEC order (ZEC_SHIELDED_MAX_USD, default $1,200: founder 2026-11-02, = intents ZEC_SHIELD_CAPS.max_order_usd). */
+export const ZEC_SHIELDED_MAX_USD_DEFAULT = 1200
 export function zecShieldedMaxUsd(raw: string | undefined): number {
   const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : 100
+  return Number.isFinite(n) && n > 0 ? n : ZEC_SHIELDED_MAX_USD_DEFAULT
 }
 
 /**
@@ -238,7 +239,7 @@ export interface NativeSourceMeta {
   /** Custody ZEC only: confirmations required below / from $110 payable. */
   confirmations?: { under110: number; from110: number }
   /** Custody ZEC with `?beta=zec_shielded`: a shielded-balance pay-in may be requested (source.shielded=true). */
-  shielded_available?: true
+  shieldedAvailable?: true
 }
 
 /**
@@ -265,7 +266,7 @@ export function sourceMeta(
       // addresses are derived per order and watched for that order only.
       address_single_use: d.provider === 'near' || d.provider === 'rozo',
       ...(d.provider === 'rozo' ? { confirmations: { ...ZEC_CUSTODY_CONFIRMATIONS } } : {}),
-      ...(d.provider === 'rozo' && shieldedRequested ? { shielded_available: true as const } : {}),
+      ...(d.provider === 'rozo' && shieldedRequested ? { shieldedAvailable: true as const } : {}),
     }
   }
   return out

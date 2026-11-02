@@ -161,6 +161,19 @@ describe('quote-invoice makes no order lookup', () => {
 })
 
 describe('GET existing-order', () => {
+  it('a ZEC row carries its pay-in mode (receive) and still no address, amount or uri', async () => {
+    const zec = { ...row('rozo-z', 'payment_unpaid'), source: { chainId: '9133', tokenSymbol: 'ZEC', receiverAddress: 'RECEIVER_ADDR_SECRET', amount: '0.0123', paymentUri: 'zcash:RECEIVER_ADDR_SECRET?amount=0.0123', zec: { rail: 'zec_custody', receive: 'shielded' } } }
+    mockFetch({ [`merchant_openrouter/${LINK}`]: zec })
+    const { status, json } = await existing({ payment_id: LINK })
+    expect(status).toBe(200)
+    expect(json.existingOrder.source).toEqual({ chainId: '9133', tokenSymbol: 'ZEC', receive: 'shielded' })
+    expectNoSecrets(json)
+    expect(JSON.stringify(json)).not.toContain('zcash:')
+    const legacy = { ...zec, source: { chainId: '9133', tokenSymbol: 'ZEC', receiverAddress: 'RECEIVER_ADDR_SECRET', amount: '0.0123' } }
+    mockFetch({ [`merchant_openrouter/${LINK}`]: legacy })
+    expect((await existing({ payment_id: LINK })).json.existingOrder.source).toEqual({ chainId: '9133', tokenSymbol: 'ZEC', receive: 'transparent' })
+  })
+
   it('returns the existing order with only safe fields', async () => {
     mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
     const { status, json, res } = await existing({ payment_id: LINK })

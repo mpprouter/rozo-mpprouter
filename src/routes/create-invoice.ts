@@ -1963,18 +1963,27 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
-  // Shielded ZEC orders have their own, lower cap (ZEC_SHIELDED_MAX_USD,
-  // default $100: shielded stage 2 single-order cap); the transparent custody
-  // cap (3499.99) is untouched. rozo-intents-api stays the final gate.
-  const nativeCap = shieldedSource
-    ? Math.min(zecShieldedMaxUsd(env.ZEC_SHIELDED_MAX_USD), nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail))
-    : nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail)
+  // Shielded ZEC orders have their own cap (ZEC_SHIELDED_MAX_USD, default
+  // $1,200 = intents ZEC_SHIELD_CAPS.max_order_usd), checked right before a
+  // FRESH shielded create (shieldedCapBlock below) so that an existing order
+  // of the other mode is still reported as a mode mismatch first. The
+  // transparent custody cap (3499.99) is untouched. rozo-intents-api stays
+  // the final gate.
+  const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail)
+  const shieldedCap = Math.min(zecShieldedMaxUsd(env.ZEC_SHIELDED_MAX_USD), nativeCap)
+  const shieldedCapBlock = (): Response | null =>
+    shieldedSource && Number(callerPays) > shieldedCap
+      ? errorResponse(400, {
+          code: 'UNSUPPORTED_SOURCE',
+          message: `Shielded ZEC payment is limited to $${shieldedCap} per invoice. Pay with transparent ZEC or USDC/USDT instead.`,
+          normalized_input: normalized,
+          link_id_detected,
+        })
+      : null
   if (nativeSource && Number(callerPays) > nativeCap) {
     return errorResponse(400, {
       code: 'UNSUPPORTED_SOURCE',
-      message: shieldedSource
-        ? `Shielded ZEC payment is limited to $${nativeCap} per invoice. Pay with transparent ZEC or USDC/USDT instead.`
-        : `Native coin payment is limited to $${nativeCap} per invoice. Pay with USDC/USDT instead.`,
+      message: `Native coin payment is limited to $${nativeCap} per invoice. Pay with USDC/USDT instead.`,
       normalized_input: normalized,
       link_id_detected,
     })
@@ -2486,6 +2495,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         },
         ...(sourceRotated ? { sourceRotated: true, ...previousAddressFields(row) } : {}),
         ...(rotationFailure ? { sourceMismatch: true } : {}),
+        ...(rotationFailure === 'zec_receive_mode_mismatch' ? { sourceMismatchCode: 'ZEC_RECEIVE_MODE_MISMATCH' } : {}),
         ...(intentMismatch ? { intentMismatch: true } : {}),
         ...(warnings.length ? { warnings } : {}),
         raw: row,
@@ -2529,6 +2539,13 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       })
     }
     merchantLinkExpiresAt = check.iso
+  }
+
+  // A fresh shielded order: the shielded per-invoice cap applies here (after
+  // reuse, so an existing transparent order is reported as a mode mismatch).
+  {
+    const capped = shieldedCapBlock()
+    if (capped) return capped
   }
 
   // Native coins (ETH/BNB/POL/SOL) settle exactOut like Lightning: the merchant
@@ -2739,6 +2756,10 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
             if (refundBlock) return refundBlock
           }
           const winnerSource = readRowSource(winner)
+          // The winner may be the other ZEC pay-in mode (a transparent and a
+          // shielded create racing for the slot): report it, never hand it
+          // over silently or switch it (same rule as the reuse path).
+          const winnerModeMismatch = zecReceiveDiffers(winnerSource, source)
           // Reused order: make the stored link idempotent (founder 2026-10-26).
           if (linkId && winner?.id) {
             const reusedUrl = raw_url || coinbaseLinkFromId(linkId)
@@ -2768,7 +2789,15 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
               tokenSymbol: winnerSource.tokenSymbol,
               ...zecReceiveFields(winner),
             },
-            ...(source.warnings.length ? { warnings: source.warnings } : {}),
+            ...(winnerModeMismatch ? { sourceMismatch: true, sourceMismatchCode: 'ZEC_RECEIVE_MODE_MISMATCH' } : {}),
+            ...(source.warnings.length || winnerModeMismatch
+              ? {
+                  warnings: [
+                    ...source.warnings,
+                    ...(winnerModeMismatch ? [sourceMismatchWarning(winnerSource, source, 'zec_receive_mode_mismatch')] : []),
+                  ],
+                }
+              : {}),
             ...(replacedRows.length > 0
               ? { replacesExpiredPaymentIds: replacedRows.map((r) => r?.id ?? null) }
               : {}),
