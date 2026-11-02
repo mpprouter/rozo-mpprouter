@@ -965,5 +965,16 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(r.json.sourceMismatchCode).toBe('ZEC_RECEIVE_MODE_MISMATCH')
     expect(r.json.warnings.join(' ')).toContain('pay-in mode')
     expect(r.json.source.zec).toEqual({ receive: 'transparent' })
+    // the other way round: a shielded winner (no refund binding) vs a transparent request
+    createAnswer = shieldedCreate
+    await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    raceWinner = { ...raceWinner, source: { chainId: '9133', tokenSymbol: 'ZEC', amount: '0.00413867', receiverAddress: UA, paymentUri: URI, zec: { rail: 'zec_custody', receive: 'shielded' } },
+      destination: { ...createdIntent.destination }, metadata: { ...createdIntent.metadata } }
+    createAnswer = () => new Response(JSON.stringify({ error: { code: 'orderIdConflict' } }), { status: 409 })
+    const t = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC, refund_address: T1 }, { env: custodyEnv(), query: BOTH })
+    expect(t.status).toBe(200)
+    expect(t.json.reused).toBe(true)
+    expect(t.json.sourceMismatchCode).toBe('ZEC_RECEIVE_MODE_MISMATCH')
+    expect(t.json.source).toEqual({ chainId: '9133', tokenSymbol: 'ZEC', zec: { receive: 'shielded' }, paymentUri: URI })
   })
 })

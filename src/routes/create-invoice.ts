@@ -2751,11 +2751,13 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           if (!pendingPricingMatches(winner, pricing)) {
             return pricingMismatchResponse({ linkId }, winner)
           }
-          if (refundAddressCoin) {
+          const winnerSource = readRowSource(winner)
+          // A shielded winner binds no refund address; a transparent request
+          // against it is reported as a mode mismatch below (same as reuse).
+          if (refundAddressCoin && winnerSource.receive !== 'shielded') {
             const refundBlock = await refundAddressReuseBlock(winner, refundAddress, { linkId }, refundAddressMandatory)
             if (refundBlock) return refundBlock
           }
-          const winnerSource = readRowSource(winner)
           // The winner may be the other ZEC pay-in mode (a transparent and a
           // shielded create racing for the slot): report it, never hand it
           // over silently or switch it (same rule as the reuse path).
