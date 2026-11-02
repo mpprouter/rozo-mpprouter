@@ -22,6 +22,7 @@ import {
   zecUpstreamError,
 } from '../src/routes/create-invoice'
 import { handleQuoteInvoice } from '../src/routes/pay-invoice-admin'
+import { zecQuoteExpiredUnfunded } from '../src/routes/relink-guard'
 import {
   ALL_NATIVE_SOURCES,
   STABLE_SOURCES,
@@ -75,6 +76,8 @@ let createAnswer: (() => Response) | null = null
 let existingOrder: any = null
 /** Row that order lookup returns only after a create was attempted (slot race). */
 let raceWinner: any = null
+/** What GET /payments/<existingOrder.id> returns after the create (null = the existing row itself). */
+let paymentRowOverride: any = null
 
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 
@@ -86,6 +89,7 @@ beforeEach(() => {
   createAnswer = null
   existingOrder = null
   raceWinner = null
+  paymentRowOverride = null
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     if (u.includes('payments.coinbase.com/next-api/')) {
@@ -130,6 +134,10 @@ beforeEach(() => {
         quoteExpiresAt: '2999-01-01T01:00:00.000Z',
         source: { chainId: '9133', tokenSymbol: 'ZEC', amount: '0.08143000', receiverAddress: 't1DepositAddrXXXXXXXXXXXXXXXXXXXXX', fee: '0.00010000' },
       }), { status: 200 })
+    }
+    // GET /payments/<id> of the existing order: its full row (the post-create re-check reads it).
+    if (u.includes('/payment-api') && existingOrder?.id && u.endsWith(`/payments/${existingOrder.id}`)) {
+      return new Response(JSON.stringify(paymentRowOverride ?? existingOrder), { status: 200 })
     }
     if (u.includes('/payment-api')) return new Response(JSON.stringify({ status: 'payment_unpaid' }), { status: 200 })
     return new Response('{}', { status: 200 })
@@ -998,3 +1006,175 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(t.json.source).toEqual({ chainId: '9133', tokenSymbol: 'ZEC', zec: { receive: 'shielded' }, paymentUri: URI })
   })
 })
+
+// ── Quote-expired unfunded ZEC custody order is replaceable (2026-11-02) ────
+//
+// Incident: payment 22291f1a (transparent ZEC custody, quote expired 02:38Z,
+// receivedZat 0, still payment_unpaid upstream until its 14:38Z link window)
+// blocked a shielded create on the same link for 12 hours as a pay-in mode
+// mismatch. Such an order is not live: a fresh order (either mode) replaces
+// it in the next slot. Funds seen, or any other payinState, still blocks.
+describe('quote-expired unfunded ZEC custody order', () => {
+  const custodyEnv = () => makeEnv({ ZEC_RAIL: 'custody' })
+  const BOTH = '?beta=zec,zec_shielded'
+  const UA = 'u1' + 'q'.repeat(140)
+  const URI = `zcash:${UA}?amount=0.00413867&memo=MjU4NjQzMmM`
+  const SHIELDED = { ...ZEC, shielded: true }
+  const zecBlock = (receive: 'shielded' | 'transparent', payinState: string, receivedZat = '0') => ({
+    rail: 'zec_custody', receive, requiredConfirmations: 1, confirmations: 0, requiredZat: '413867', receivedZat, payinState,
+    quoteExpiresAt: '2000-01-01T00:00:00.000Z',
+  })
+  const answer = (receive: 'shielded' | 'transparent') => () => new Response(JSON.stringify({
+    id: `rozo-pay-new-${receive}`, provider: 'rozo', paymentLink: 'https://pay.rozo.ai/n', expiresAt: '2999-01-01T01:00:00.000Z',
+    quoteExpiresAt: '2999-01-01T01:00:00.000Z',
+    source: { chainId: '9133', tokenSymbol: 'ZEC', amount: '0.00413867', receiverAddress: receive === 'shielded' ? UA : T1,
+      ...(receive === 'shielded' ? { paymentUri: URI } : {}), zec: { ...zecBlock(receive, 'awaiting'), quoteExpiresAt: '2999-01-01T01:00:00.000Z' } },
+  }), { status: 200 })
+
+  /** An existing order of `receive` mode on the base slot, priced like a fresh create of that mode. */
+  async function existingRow(receive: 'shielded' | 'transparent', payinState: string, receivedZat = '0', extra: Record<string, unknown> = {}) {
+    existingOrder = null
+    raceWinner = null
+    createAnswer = answer(receive)
+    await post(handleCreateInvoice, { payment_id: SESSION_ID, source: receive === 'shielded' ? SHIELDED : ZEC }, { env: custodyEnv(), query: BOTH })
+    const intent = createdIntent
+    createCalls = 0
+    createdIntent = null
+    return {
+      id: 'rozo-pay-old', status: 'payment_unpaid', paymentLink: 'https://pay.rozo.ai/old', provider: 'rozo',
+      expiresAt: '2999-01-01T01:00:00.000Z', quoteExpiresAt: '2000-01-01T00:00:00.000Z',
+      source: { chainId: '9133', tokenSymbol: 'ZEC', amount: '0.00413867', receiverAddress: receive === 'shielded' ? UA : T1,
+        ...(receive === 'shielded' ? { paymentUri: URI } : {}), zec: zecBlock(receive, payinState, receivedZat) },
+      destination: { ...intent.destination },
+      metadata: { ...intent.metadata },
+      ...extra,
+    }
+  }
+
+  beforeEach(() => { linkExpiresAt = inMinutes(120) })
+
+  it('predicate: only payment_unpaid + zec_custody + payinState expired + receivedZat 0 + no funding evidence', () => {
+    const base = { status: 'payment_unpaid', source: { chainId: '9133', tokenSymbol: 'ZEC', zec: zecBlock('transparent', 'expired') } }
+    expect(zecQuoteExpiredUnfunded(base)).toBe(true)
+    expect(zecQuoteExpiredUnfunded({ ...base, status: 'payment_payin_completed' })).toBe(false)
+    expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, zec: zecBlock('transparent', 'expired', '1') } })).toBe(false)
+    for (const st of ['awaiting', 'seen', 'confirming', 'underpaid', 'late_review', 'reorged', 'eligible']) {
+      expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, zec: zecBlock('transparent', st) } })).toBe(false)
+    }
+    expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, txHash: 'ab'.repeat(32) } })).toBe(false)
+    expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, zec: { ...zecBlock('transparent', 'expired'), rail: 'near' } } })).toBe(false)
+    expect(zecQuoteExpiredUnfunded({ status: 'payment_unpaid', source: { chainId: '9133', tokenSymbol: 'ZEC' } })).toBe(false)
+    // not a ZEC order, or a malformed / contradictory custody block: stays live
+    expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, chainId: '8453' } })).toBe(false)
+    expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, tokenSymbol: 'ETH' } })).toBe(false)
+    const z = zecBlock('transparent', 'expired')
+    for (const bad of [{ confirmations: 1 }, { receive: 'private' }, { requiredConfirmations: 3 }, { requiredZat: 'x' },
+                       { quoteExpiresAt: 'soon' }, { quoteExpiresAt: '2999-01-01T00:00:00.000Z' }, { receivedZat: 0 }]) {
+      expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, zec: { ...z, ...bad } } })).toBe(false)
+    }
+    // shielded rows qualify the same way; receive absent = transparent row
+    expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, zec: zecBlock('shielded', 'expired') } })).toBe(true)
+    const { receive: _omit, ...noReceive } = z
+    expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, zec: noReceive } })).toBe(true)
+  })
+
+  it('transparent order expired unfunded: a shielded create gets a fresh order in the next slot', async () => {
+    existingOrder = await existingRow('transparent', 'expired')
+    createAnswer = answer('shielded')
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(200)
+    expect(r.json.reused).toBe(false)
+    expect(r.json.sourceMismatch).toBeUndefined()
+    expect(r.json.rozoPaymentId).toBe('rozo-pay-new-shielded')
+    expect(r.json.replacesExpiredPaymentIds).toEqual(['rozo-pay-old'])
+    expect(createCalls).toBe(1)
+    expect(createdIntent.orderId).toMatch(new RegExp(`^${SESSION_ID}__retry\\d+$`))
+    expect(createdIntent.source.shielded).toBe(true)
+  })
+
+  it('shielded order expired unfunded: a transparent create gets a fresh order', async () => {
+    existingOrder = await existingRow('shielded', 'expired')
+    createAnswer = answer('transparent')
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(200)
+    expect(r.json.reused).toBe(false)
+    expect(r.json.rozoPaymentId).toBe('rozo-pay-new-transparent')
+    expect(createCalls).toBe(1)
+    expect('shielded' in createdIntent.source).toBe(false)
+  })
+
+  it('same mode, quote expired unfunded: a fresh order too (the old quote is dead)', async () => {
+    existingOrder = await existingRow('transparent', 'expired')
+    createAnswer = answer('transparent')
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(200)
+    expect(r.json.reused).toBe(false)
+    expect(createCalls).toBe(1)
+  })
+
+  it('expired with funds seen still blocks: reused and reported, never replaced', async () => {
+    existingOrder = await existingRow('transparent', 'expired', '1000')
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(200)
+    expect(r.json.reused).toBe(true)
+    expect(r.json.sourceMismatchCode).toBe('ZEC_RECEIVE_MODE_MISMATCH')
+    expect(createCalls).toBe(0)
+    // funding evidence elsewhere on the row (receivedZat still '0') blocks as well
+    existingOrder = await existingRow('transparent', 'expired', '0', {})
+    existingOrder.source.txHash = 'ab'.repeat(32)
+    const t = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(t.json.reused).toBe(true)
+    expect(createCalls).toBe(0)
+  })
+
+  it('awaiting (quote still open) still reuses; a seen payment still blocks', async () => {
+    existingOrder = await existingRow('transparent', 'awaiting')
+    const same = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    expect(same.status).toBe(200)
+    expect(same.json.reused).toBe(true)
+    expect(same.json.sourceMismatch).toBeUndefined()
+    const other = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(other.json.reused).toBe(true)
+    expect(other.json.sourceMismatchCode).toBe('ZEC_RECEIVE_MODE_MISMATCH')
+    existingOrder = await existingRow('shielded', 'seen')
+    const seen = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    expect(seen.json.reused).toBe(true)
+    expect(createCalls).toBe(0)
+  })
+
+  it('the replaced order revived mid-request (funds seen on re-read): 409, the new order is not handed out', async () => {
+    existingOrder = await existingRow('transparent', 'expired')
+    paymentRowOverride = { ...existingOrder, source: { ...existingOrder.source, zec: zecBlock('transparent', 'expired', '5000') } }
+    createAnswer = answer('shielded')
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(409)
+    expect(r.json.error.code).toBe('ORDER_ALREADY_ACTIVE')
+    expect(r.json.rozoPaymentId).toBe('rozo-pay-old')
+  })
+
+  it('the replaced order changed state on re-read (late_review), or cannot be re-read: not handed out', async () => {
+    existingOrder = await existingRow('transparent', 'expired')
+    paymentRowOverride = { ...existingOrder, source: { ...existingOrder.source, zec: zecBlock('transparent', 'late_review') } }
+    createAnswer = answer('shielded')
+    const changed = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(changed.status).toBe(409)
+    expect(changed.json.error.code).toBe('ORDER_ALREADY_ACTIVE')
+    existingOrder = await existingRow('transparent', 'expired')
+    paymentRowOverride = { unreadable: true } // no status: treated as a failed read
+    createAnswer = answer('shielded')
+    const unreadable = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    expect(unreadable.status).toBe(502)
+    expect(unreadable.json.code).toBe('INTENTS_API_FAILED')
+  })
+
+  it('a quote-expired unfunded race winner is not handed back', async () => {
+    const winner = await existingRow('transparent', 'expired')
+    raceWinner = { ...winner, id: 'rozo-pay-winner' }
+    createAnswer = () => new Response(JSON.stringify({ error: { code: 'orderIdConflict' } }), { status: 409 })
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    expect(r.status).toBe(409)
+    expect(r.json.reused).toBeUndefined()
+    expect(r.json.rozoPaymentId).not.toBe('rozo-pay-winner')
+  })
+})
+

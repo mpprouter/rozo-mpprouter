@@ -174,6 +174,18 @@ describe('GET existing-order', () => {
     expect((await existing({ payment_id: LINK })).json.existingOrder.source).toEqual({ chainId: '9133', tokenSymbol: 'ZEC', receive: 'transparent' })
   })
 
+  it('a ZEC custody order whose quote expired unfunded is not payable (ended); funds seen keeps it funded', async () => {
+    const zecRow = (payinState: string, receivedZat: string) => ({ ...row('rozo-z', 'payment_unpaid'),
+      source: { chainId: '9133', tokenSymbol: 'ZEC', receiverAddress: 'RECEIVER_ADDR_SECRET', amount: '0.0123',
+        zec: { rail: 'zec_custody', receive: 'transparent', payinState, receivedZat, requiredZat: '1', requiredConfirmations: 1, confirmations: 0, quoteExpiresAt: '2000-01-01T00:00:00.000Z' } } })
+    mockFetch({ [`merchant_openrouter/${LINK}`]: zecRow('expired', '0') })
+    expect((await existing({ payment_id: LINK })).json.existingOrder.state).toBe('ended')
+    mockFetch({ [`merchant_openrouter/${LINK}`]: zecRow('awaiting', '0') })
+    expect((await existing({ payment_id: LINK })).json.existingOrder.state).toBe('payable')
+    mockFetch({ [`merchant_openrouter/${LINK}`]: zecRow('expired', '7') })
+    expect((await existing({ payment_id: LINK })).json.existingOrder.state).toBe('payable')
+  })
+
   it('returns the existing order with only safe fields', async () => {
     mockFetch({ [`merchant_openrouter/${LINK}`]: row('rozo-1', 'payment_unpaid') })
     const { status, json, res } = await existing({ payment_id: LINK })

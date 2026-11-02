@@ -25,6 +25,7 @@ import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import {
   OPENROUTER_APP_ID,
   REUSABLE_PAYMENT_STATUS,
+  isLive,
   ROZO_APP_ID,
   ROZO_INTENTS_BASE,
   isContractRow,
@@ -38,6 +39,7 @@ import {
   PREVIOUS_ORDER_FUNDED_MESSAGE,
   PREVIOUS_ORDER_PENDING_MESSAGE,
   type RelinkCheck,
+  zecQuoteExpiredUnfunded,
 } from './relink-guard'
 import { verifyQuoteReceipt, type QuoteReceiptPayload } from './quote-receipt'
 import {
@@ -2053,9 +2055,12 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // in-flight check answers from the real state.
   const replacedRowsBlock = async (): Promise<Response | null> => {
     if (replacedRows.length === 0) return null
-    const nowStatuses = await Promise.all(
-      replacedRows.map((r) => refetchPaymentStatus(env, String(r?.id ?? ''))),
+    // One read per replaced row (the full row: a quote-expired ZEC custody
+    // order stays payment_unpaid upstream and is judged by its source.zec).
+    const nowRows = await Promise.all(
+      replacedRows.map((r) => refetchPaymentRow(env, String(r?.id ?? ''))),
     )
+    const nowStatuses = nowRows.map((row) => (row ? readPaymentStatus(row) : null))
     if (nowStatuses.some((st) => st === null)) {
       return errorResponse(502, {
         code: 'INTENTS_API_FAILED',
@@ -2067,7 +2072,9 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         link_id_detected,
       })
     }
-    const revivedIdx = nowStatuses.findIndex((st) => st !== 'payment_expired')
+    const revivedIdx = nowStatuses.findIndex(
+      (st, i) => st !== 'payment_expired' && !zecQuoteExpiredUnfunded(nowRows[i]),
+    )
     if (revivedIdx < 0) return null
     const revived = replacedRows[revivedIdx]
     return json(409, {
@@ -2094,9 +2101,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     let allIds = firstIds
     let scanned = await Promise.all(firstIds.map((id) => lookupOrder(id)))
     const baseScan = scanned[0]
-    const baseLive =
-      baseScan.state === 'found' &&
-      Boolean(baseScan.row?.expiresAt && Date.parse(baseScan.row.expiresAt) > Date.now())
+    const baseLive = baseScan.state === 'found' && isLive(baseScan.row)
     if (baseScan.state === 'found' && !baseLive) {
       const retryIds = retryOrderIds(orderId)
       const more = await Promise.all(retryIds.map((id) => lookupOrder(id)))
@@ -2123,8 +2128,9 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     const entries = allIds.map((id, i) => {
       const r = scanned[i]
       const row = r.state === 'found' ? r.row : null
-      const expiresAt: string | null = row?.expiresAt ?? null
-      const live = Boolean(expiresAt && Date.parse(expiresAt) > Date.now())
+      // isLive: expiresAt in the future AND not a ZEC custody order whose
+      // quote expired unfunded (that one is replaceable, see relink-guard).
+      const live = row ? isLive(row) : false
       const slot: 'base' | 'contract' | 'retry' =
         i === 0 ? 'base' : i < firstIds.length ? 'contract' : 'retry'
       return { id, row, live, slot, status: row ? readPaymentStatus(row) : null }
@@ -2731,7 +2737,9 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         if (
           winner &&
           winnerValid &&
-          readPaymentStatus(winner) === REUSABLE_PAYMENT_STATUS
+          readPaymentStatus(winner) === REUSABLE_PAYMENT_STATUS &&
+          // A quote-expired unfunded ZEC order is never handed back as live.
+          !zecQuoteExpiredUnfunded(winner)
         ) {
           // Same re-order race check as the successful-create path.
           const blocked = await replacedRowsBlock()
