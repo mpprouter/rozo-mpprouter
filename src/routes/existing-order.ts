@@ -33,14 +33,24 @@ export function readPaymentStatus(row: any): string | null {
   return row?.status ?? row?.payment_status ?? null
 }
 
-/** Source (chain/token) an intents_payments row currently pays from. */
-export function readRowSource(row: any): { chainId: string | null; tokenSymbol: string | null } {
+export type ZecReceive = 'shielded' | 'transparent'
+
+/**
+ * Source (chain/token) an intents_payments row currently pays from. For a ZEC
+ * row, `receive` is the pay-in mode (rozo-intents-api source.zec.receive, or
+ * metadata.internal.zec_receive); a ZEC row that predates the field is
+ * transparent. Non-ZEC rows carry null.
+ */
+export function readRowSource(row: any): { chainId: string | null; tokenSymbol: string | null; receive?: ZecReceive } {
   const chainId = row?.source?.chainId ?? row?.source_chain_id ?? null
   const tokenSymbol = row?.source?.tokenSymbol ?? row?.source_token_symbol ?? null
+  const symbol = tokenSymbol === null || tokenSymbol === undefined ? null : String(tokenSymbol).toUpperCase()
+  const rawReceive = row?.source?.zec?.receive ?? row?.metadata?.internal?.zec_receive
   return {
     chainId: chainId === null || chainId === undefined ? null : String(chainId),
-    tokenSymbol:
-      tokenSymbol === null || tokenSymbol === undefined ? null : String(tokenSymbol).toUpperCase(),
+    tokenSymbol: symbol,
+    // Only ZEC rows carry a pay-in mode; other rows keep their exact shape.
+    ...(symbol === 'ZEC' ? { receive: rawReceive === 'shielded' ? 'shielded' as const : 'transparent' as const } : {}),
   }
 }
 

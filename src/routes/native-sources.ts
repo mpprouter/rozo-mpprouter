@@ -183,6 +183,32 @@ export function betaParamSymbols(url: string | URL | null | undefined): Set<stri
 }
 
 /**
+ * `?beta=zec_shielded`: the caller wants the shielded-balance pay-in mode of
+ * ZEC offered. It is a mode flag, not a coin: the coin itself still needs
+ * `?beta=zec` (withBetaSources) and the custody rail (ZEC_RAIL).
+ */
+export const ZEC_SHIELDED_BETA = 'zec_shielded'
+
+export function zecShieldedRequested(requestUrl: string | URL | null | undefined): boolean {
+  return betaParamSymbols(requestUrl).has(ZEC_SHIELDED_BETA)
+}
+
+/** Shielded pay-in offered on this request: ZEC open, custody rail, and the mode flag present. */
+export function zecShieldedAvailable(
+  nativeAllowed: ReadonlySet<string>,
+  zecRail: ZecRailMode,
+  requestUrl: string | URL | null | undefined,
+): boolean {
+  return zecRail === 'custody' && nativeAllowed.has('ZEC@9133') && zecShieldedRequested(requestUrl)
+}
+
+/** Per-invoice cap for a shielded ZEC order (ZEC_SHIELDED_MAX_USD, default $100: stage 2 single-order cap). */
+export function zecShieldedMaxUsd(raw: string | undefined): number {
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 ? n : 100
+}
+
+/**
  * The native set for one request: `base` plus each NATIVE_SOURCES_BETA coin
  * whose symbol the request named in `?beta=`. No param (or an unset
  * NATIVE_SOURCES_BETA) returns `base` unchanged.
@@ -211,6 +237,8 @@ export interface NativeSourceMeta {
   address_single_use: boolean
   /** Custody ZEC only: confirmations required below / from $110 payable. */
   confirmations?: { under110: number; from110: number }
+  /** Custody ZEC with `?beta=zec_shielded`: a shielded-balance pay-in may be requested (source.shielded=true). */
+  shielded_available?: true
 }
 
 /**
@@ -221,6 +249,7 @@ export interface NativeSourceMeta {
 export function sourceMeta(
   nativeAllowed: ReadonlySet<string> = new Set(),
   zecRail: ZecRailMode = 'near',
+  shieldedRequested = false,
 ): Record<string, NativeSourceMeta> {
   const out: Record<string, NativeSourceMeta> = {}
   for (const chainId of Object.keys(NATIVE_SOURCE_DEFS)) {
@@ -236,6 +265,7 @@ export function sourceMeta(
       // addresses are derived per order and watched for that order only.
       address_single_use: d.provider === 'near' || d.provider === 'rozo',
       ...(d.provider === 'rozo' ? { confirmations: { ...ZEC_CUSTODY_CONFIRMATIONS } } : {}),
+      ...(d.provider === 'rozo' && shieldedRequested ? { shielded_available: true as const } : {}),
     }
   }
   return out

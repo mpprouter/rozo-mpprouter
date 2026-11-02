@@ -1627,8 +1627,13 @@ export function pickZecCustodyStatus(z: any) {
   if (typeof z.payinState !== 'string' || !ZEC_PAYIN_STATES.has(z.payinState)) return null
   const quoteExpiresAt = safeIso(z.quoteExpiresAt)
   if (!quoteExpiresAt) return null
+  // Pay-in mode (shielded stage 1, 2026-11-01). Absent = transparent (rows
+  // from before the field); any other value is a foreign shape.
+  const receive = z.receive === undefined ? 'transparent' : z.receive
+  if (receive !== 'shielded' && receive !== 'transparent') return null
   return {
     rail: 'zec_custody' as const,
+    receive: receive as 'shielded' | 'transparent',
     requiredConfirmations: z.requiredConfirmations as 1 | 2,
     confirmations: z.confirmations as number,
     requiredZat: z.requiredZat as string,
@@ -1636,6 +1641,13 @@ export function pickZecCustodyStatus(z: any) {
     payinState: z.payinState as string,
     quoteExpiresAt,
   }
+}
+
+/** ZIP-321 payment URI of a shielded ZEC order (rozo-intents-api source.paymentUri), or null. */
+export function pickZecPaymentUri(source: any): string | null {
+  const u = source?.paymentUri
+  if (typeof u !== 'string' || !u.startsWith('zcash:') || u.length > 512) return null
+  return pickZecCustodyStatus(source?.zec)?.receive === 'shielded' ? u : null
 }
 
 // bech32 BOLT11: ln + network prefix + amount, up to a few KB.
@@ -1720,6 +1732,10 @@ export function pickRozoCallerSafe(rp: any) {
           ...(() => {
             const zec = pickZecCustodyStatus(rp.source.zec)
             return zec ? { zec } : {}
+          })(),
+          ...(() => {
+            const paymentUri = pickZecPaymentUri(rp.source)
+            return paymentUri ? { paymentUri } : {}
           })(),
         }
       : null,
