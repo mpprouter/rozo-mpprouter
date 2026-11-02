@@ -105,9 +105,23 @@ export function rowFundingEvidence(row: any): string | null {
 export function zecQuoteExpiredUnfunded(row: any): boolean {
   const status = row?.status ?? row?.payment_status ?? null
   if (status !== 'payment_unpaid') return false
-  const z = row?.source?.zec
+  const src = row?.source
+  // The order itself must be a ZEC order (chain 9133), not just carry a zec block.
+  if (String(src?.chainId ?? src?.source_chain_id ?? '') !== '9133') return false
+  if (String(src?.tokenSymbol ?? '').toUpperCase() !== 'ZEC') return false
+  const z = src?.zec
   if (!z || typeof z !== 'object') return false
-  if (z.rail !== 'zec_custody' || z.payinState !== 'expired' || z.receivedZat !== '0') return false
+  // The full, well-formed custody status block (same contract as webhook.ts
+  // pickZecCustodyStatus); anything missing or contradictory keeps it live.
+  if (z.rail !== 'zec_custody') return false
+  if (z.receive !== undefined && z.receive !== 'shielded' && z.receive !== 'transparent') return false
+  if (z.requiredConfirmations !== 1 && z.requiredConfirmations !== 2) return false
+  if (typeof z.requiredZat !== 'string' || !/^\d{1,20}$/.test(z.requiredZat)) return false
+  if (typeof z.quoteExpiresAt !== 'string' || !Number.isFinite(Date.parse(z.quoteExpiresAt))) return false
+  // Closed pay-in with nothing received and nothing confirmed.
+  if (z.payinState !== 'expired' || z.receivedZat !== '0' || z.confirmations !== 0) return false
+  // The quote really is over (a clock-skewed 'expired' with a future quote is not trusted).
+  if (Date.parse(z.quoteExpiresAt) > Date.now()) return false
   return rowFundingEvidence(row) === null
 }
 
