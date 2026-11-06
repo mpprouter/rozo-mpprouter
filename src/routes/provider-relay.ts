@@ -21,7 +21,7 @@
  * Nothing clever. The router forwards the buyer's request — including
  * whatever payment credential they attached (`Authorization: Payment …`
  * for mppx, `PAYMENT-SIGNATURE` / `X-PAYMENT` for x402) — to the
- * provider's own endpoint and returns the provider's answer verbatim, 402
+ * provider's own endpoint and returns the provider's status and body, 402
  * included. The buyer pays the provider's own challenge with the
  * provider's own facilitator; the router signs nothing, settles nothing
  * and holds nothing. There is no leg on which the router can lose the
@@ -70,8 +70,35 @@ function forwardableAuthorization(value: string | null): string | null {
 
 const DROP_RESPONSE_HEADERS = new Set([
   'connection', 'keep-alive', 'transfer-encoding', 'content-encoding', 'content-length',
-  'alt-svc', 'server', 'cf-ray', 'cf-cache-status', 'set-cookie',
+  'alt-svc', 'server', 'cf-ray', 'cf-cache-status', 'set-cookie', 'set-cookie2',
+  // A provider must not navigate, clear state, install reporting policies or
+  // expand service-worker scope on the router/partner origin.
+  'refresh', 'link', 'clear-site-data', 'service-worker-allowed',
+  'content-security-policy-report-only', 'report-to', 'reporting-endpoints', 'nel',
 ])
+
+/**
+ * Provider bytes are untrusted even on 402/4xx/5xx. These routes can be
+ * reached on a host carrying a partner session, so never let upstream
+ * content become an active document or executable script on that origin.
+ * API clients still receive the original status, payment headers and stream.
+ */
+function isolatedResponseHeaders(source: HeadersInit): Headers {
+  const headers = new Headers(source)
+  headers.set('Content-Security-Policy', "sandbox; default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+  headers.set('X-Content-Type-Options', 'nosniff')
+  const mime = (headers.get('Content-Type') ?? '').split(';', 1)[0].trim().toLowerCase()
+  const passiveApiType = mime === 'application/json' || mime === 'text/plain' || mime === 'text/event-stream'
+    || /^application\/[a-z0-9!#$&^_.+-]+\+json$/.test(mime)
+  if (!passiveApiType) {
+    // Content-Disposition alone does not cover script/worker subresources.
+    // Octet-stream + nosniff also prevents a supplied JS/CSS MIME from being
+    // treated as executable code. No body sniffing or buffering is needed.
+    headers.set('Content-Type', 'application/octet-stream')
+    headers.set('Content-Disposition', 'attachment; filename="provider-response.bin"')
+  }
+  return headers
+}
 
 export function isDirectSettlementRoute(route: PublicServiceRoute): boolean {
   // A hosted route has no provider-side 402 to relay to: the router IS its
@@ -141,7 +168,7 @@ export async function relayDirectSettlementRoute(
       detail: timedOut ? 'The provider did not answer within the relay timeout.' : 'The provider could not be reached.',
       charged: false,
       note: 'MPP Router relays this route to the provider and never holds the payment; nothing was charged by the router.',
-    }), { status: 502, headers: { 'Content-Type': 'application/json' } })
+    }), { status: 502, headers: isolatedResponseHeaders({ 'Content-Type': 'application/json' }) })
   }
   clearTimeout(timer)
   const latencyMs = Date.now() - startedAt
@@ -156,7 +183,7 @@ export async function relayDirectSettlementRoute(
       provider: route.operator!.id,
       status: upstream.status,
       detail: 'Direct-settlement routes must be served on the verified origin without redirects.',
-    }), { status: 502, headers: { 'Content-Type': 'application/json' } })
+    }), { status: 502, headers: isolatedResponseHeaders({ 'Content-Type': 'application/json' }) })
   }
 
   // A 402 to a request that CARRIED a payment credential is the provider
@@ -186,5 +213,5 @@ export async function relayDirectSettlementRoute(
     'Payment-Required', 'Payment-Response', 'X-Payment-Response', 'Payment-Receipt', 'WWW-Authenticate',
     'X-MPP-Router-Settlement', 'X-MPP-Router-Provider',
   ].join(', '))
-  return new Response(upstream.body, { status: upstream.status, headers: out })
+  return new Response(upstream.body, { status: upstream.status, headers: isolatedResponseHeaders(out) })
 }
