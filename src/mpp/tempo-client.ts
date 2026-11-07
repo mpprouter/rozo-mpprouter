@@ -602,6 +602,12 @@ export async function payMerchantSession(
      * the base-unit (USDC-6) delta the router is paying for THIS call.
      */
     onCredentialSigned?: (amountRaw?: string) => void
+    /**
+     * The amount the buyer was charged for. The signed delta must equal it,
+     * so a re-quoted price is refused before signing rather than settled
+     * against the old charge.
+     */
+    expectedAmountRaw?: string
   } = {},
 ): Promise<{ response: Response; channelBefore: TempoChannelState }> {
   const channel = await getTempoChannel(env, merchantId)
@@ -635,6 +641,9 @@ export async function payMerchantSession(
       // last point at which refusing is free.
       if (opts.maxAmountRaw) {
         assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw)
+      }
+      if (opts.expectedAmountRaw !== undefined && delta !== opts.expectedAmountRaw) {
+        throw new SessionChallengeMismatchError(merchantId, 'amount changed since the quote')
       }
       // Compute the new cumulative FIRST — if addRaw throws (malformed
       // stored/delta amount) nothing was signed and `paid` must stay false.

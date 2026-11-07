@@ -9,6 +9,8 @@
  * challenge signed vouchers against a token the channel did not hold, which
  * the merchant rejected after the buyer had paid.
  */
+import { Challenge } from 'mppx'
+
 import type { TempoChannelState } from './channel-store'
 
 /** Known Tempo tokens, for labels only. Unknown tokens show a short address. */
@@ -142,4 +144,19 @@ export function filterPayableCandidates<
       String(c?.challenge?.intent ?? '').toLowerCase() === 'session' &&
       sessionChallengeMismatch(c?.challenge?.request ?? {}, channel) === null,
   )
+}
+
+/**
+ * Parse the header with mppx's own list parser, the one the payment retry
+ * uses. It throws when any challenge is malformed; callers must then refuse
+ * before charging, because the retry would fail the same way after payment.
+ */
+export function parseTempoChallengesStrict(wwwAuthenticate: string): ParsedTempoChallenge[] {
+  return Challenge.deserializeList(wwwAuthenticate).map((c: any) => ({
+    id: String(c.id),
+    realm: String(c.realm ?? ''),
+    intent: String(c.intent ?? 'charge'),
+    request: c.request,
+    expires: c.expires,
+  }))
 }

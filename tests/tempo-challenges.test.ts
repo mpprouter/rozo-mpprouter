@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import {
   filterPayableCandidates,
   parseTempoChallenges,
+  parseTempoChallengesStrict,
   selectSessionChallenge,
   sessionChallengeMismatch,
   tokenSymbol,
@@ -121,5 +122,19 @@ describe('tokenSymbol', () => {
     expect(tokenSymbol(USDC)).toBe('USDC.e')
     expect(tokenSymbol(OUSD)).toBe('OUSD')
     expect(tokenSymbol(MACH)).toBe('0x20c0...c032')
+  })
+})
+
+describe('parseTempoChallengesStrict (mppx parser)', () => {
+  it('parses the live three-token header like the lenient parser', () => {
+    const header = [challenge('a', OUSD), challenge('b', USDC), challenge('c', MACH)].join(', ')
+    const strict = parseTempoChallengesStrict(header)
+    expect(strict.map((c) => String(c.request.currency).toLowerCase())).toEqual([OUSD, USDC, MACH].map((x) => x.toLowerCase()))
+    const r = selectSessionChallenge(strict, usdcChannel)
+    expect(r.ok && String(r.challenge.request.currency).toLowerCase()).toBe(USDC)
+  })
+
+  it('throws on a malformed entry, so the proxy refuses before charging', () => {
+    expect(() => parseTempoChallengesStrict(`Payment id="bad", request="%%%", ${challenge('b', USDC)}`)).toThrow()
   })
 })
