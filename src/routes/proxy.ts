@@ -31,7 +31,7 @@ import {
   payMerchantSession,
 } from '../mpp/tempo-client'
 import { bumpCumulative, getTempoChannel, sessionChannelKeyFor } from '../mpp/channel-store'
-import { parseTempoChallenges, parseTempoChallengesStrict, selectSessionChallenge } from '../mpp/tempo-challenges'
+import { parseTempoChallengesStrict, selectSessionChallenge } from '../mpp/tempo-challenges'
 import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult, type X402CachedResult } from '../mpp/idempotency'
 import { isEnvelopeLiftedRoute, presentMerchantEnvelope } from './merchant-envelope'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
@@ -1744,21 +1744,24 @@ export async function handleProxy(
   // pre-flight against the one our channel can pay, and refuse before charging
   // when none matches. Charge routes keep the first challenge.
   if (wwwAuth && !route.fixedPricing) {
-    if (parseTempoChallenges(wwwAuth).some((c) => c.intent.toLowerCase() === 'session')) {
-      // Parse with mppx's parser: the payment retry parses the same header and
-      // fails on any malformed entry, so an unusable list is refused here, unpaid.
-      let offered: ReturnType<typeof parseTempoChallengesStrict> | null = null
-      try {
-        offered = parseTempoChallengesStrict(wwwAuth)
-      } catch {
-        offered = null
-      }
-      const channel = offered ? await getTempoChannel(env, sessionChannelKeyFor(route)) : null
-      const selection = !offered
-        ? { ok: false as const, reason: 'unparseable_challenge', offered: [] as string[] }
-        : channel
-          ? selectSessionChallenge(offered, channel)
-          : { ok: false as const, reason: 'channel_not_installed', offered: [] as string[] }
+    // Validate the whole header with mppx's parser, the one the payment retry
+    // uses: a malformed entry anywhere fails that retry after the buyer paid,
+    // so refuse it here while nothing is charged.
+    let offered: ReturnType<typeof parseTempoChallengesStrict>
+    try {
+      offered = parseTempoChallengesStrict(wwwAuth)
+    } catch {
+      console.error(`[proxy] merchant challenge header not parseable by mppx, route=${route.id}`)
+      return new Response(JSON.stringify({
+        error: 'Could not parse merchant challenge',
+        detail: 'Nothing was charged.',
+      }), { status: 502, headers: { 'Content-Type': 'application/json' } })
+    }
+    if (offered.some((c) => c.intent.toLowerCase() === 'session')) {
+      const channel = await getTempoChannel(env, sessionChannelKeyFor(route))
+      const selection = channel
+        ? selectSessionChallenge(offered, channel)
+        : { ok: false as const, reason: 'channel_not_installed', offered: [] as string[] }
       if (!selection.ok) {
         console.error(
           `[proxy] session challenge refused: reason=${selection.reason}, route=${route.id}, ` +
