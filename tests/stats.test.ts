@@ -22,7 +22,7 @@ function order(o: Partial<any> & { route_id: string; ts: string }) {
     latency_ms: 100,
     refund_status: 'none',
     request_path: '/x',
-    settlement_ref: null,
+    settlement_ref: 'stellar-tx',
     ...o,
   })
 }
@@ -31,7 +31,9 @@ function order(o: Partial<any> & { route_id: string; ts: string }) {
  * Metrics D1 stub. `serviceIds` answers the DISTINCT service_id query used to
  * seed services that have quality rows but no ledger rows.
  */
-const MIGRATION = readFileSync(new URL('../migrations-metrics/0002_order_ledger_stats.sql', import.meta.url), 'utf8')
+const MIGRATION =
+  readFileSync(new URL('../migrations-metrics/0002_order_ledger_stats.sql', import.meta.url), 'utf8') +
+  readFileSync(new URL('../migrations-metrics/0003_order_ledger_stats_settled.sql', import.meta.url), 'utf8')
 
 /**
  * D1 stub: `order_ledger_stats` SQL runs against a real in-memory SQLite
@@ -76,7 +78,7 @@ async function env(records: string[], opts: { internal?: string; unresolved?: st
     if (!row) continue
     db.sqlite
       .prepare(UPSERT_ORDER_STATS_SQL)
-      .run(row.order_id, row.created_at, row.service_id, row.amount_micros, row.payer_digest, row.refunded)
+      .run(row.order_id, row.created_at, row.service_id, row.amount_micros, row.payer_digest, row.refunded, row.settled)
   }
   return {
     MPP_STORE: forbiddenKv,
@@ -115,25 +117,48 @@ describe('getStats', () => {
   })
 
 
-  it('counts every recorded call, whoever paid', async () => {
-    // The payer-classification split was removed deliberately: this is an
-    // internal operating view, so "internal vs external" was a distinction
-    // nobody read and three counters to keep true.
+  it('counts settled external calls and publishes internal and unsettled separately', async () => {
     const s = await getStats(
       await env(
         [
           order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: BUYER_A, amount_usd: '1' }),
           order({ route_id: 'mercury_a', ts: iso(now - 2000), payer: INTERNAL, amount_usd: '2' }),
           order({ route_id: 'mercury_a', ts: iso(now - 3000), payer: null, amount_usd: '4' }),
+          order({ route_id: 'mercury_a', ts: iso(now - 4000), payer: BUYER_B, amount_usd: '8', settlement_status: 'failed', settlement_ref: null }),
+          order({ route_id: 'mercury_a', ts: iso(now - 5000), payer: BUYER_B, amount_usd: '16', settlement_ref: null }),
+          order({ route_id: 'mercury_a', ts: iso(now - 6000), payer: BUYER_B, amount_usd: '32', settlement_status: 'pending', settlement_ref: null }),
         ],
         { internal: INTERNAL },
       ),
       '30d',
     )
-    expect(s.totals.calls).toBe(3)
-    expect(s.totals.volume_usd).toBe('7')
-    // An undecodable payer is still a call, just not a distinct buyer.
-    expect(s.totals.buyers).toBe(2)
+    // Buyer A and the undecodable payer settled; internal, failed, legacy
+    // no-reference and pending rows are not paid customer calls.
+    expect(s.totals.calls).toBe(2)
+    expect(s.totals.volume_usd).toBe('5')
+    expect(s.totals.buyers).toBe(1)
+    expect(s.totals.internal_calls).toBe(1)
+    // failed + legacy without a settlement reference; pending is not final yet.
+    expect(s.totals.unsettled_calls).toBe(2)
+    expect(s.services[0].unsettled_calls).toBe(2)
+    expect(s.services[0].internal_calls).toBe(1)
+  })
+
+  it('flips an unresolved row to settled when it resolves', async () => {
+    const e = await env([])
+    const db = (e as any).ROUTE_METRICS_DB.sqlite
+    const base = JSON.parse(order({ route_id: 'mercury_a', ts: iso(now - 1000), settlement_status: 'unknown', settlement_ref: null }))
+    for (const entry of [base, { ...base, settlement_status: 'settled', settlement_ref: 'tx' }]) {
+      const row = await orderStatsRow(entry)
+      db.prepare(UPSERT_ORDER_STATS_SQL).run(row!.order_id, row!.created_at, row!.service_id, row!.amount_micros, row!.payer_digest, row!.refunded, row!.settled)
+    }
+    const s = await getStats(e, '30d')
+    expect(s.totals.calls).toBe(1)
+    expect(s.totals.unsettled_calls).toBe(0)
+    // A late replay of the old unresolved state must not undo the settlement.
+    const stale = await orderStatsRow(base)
+    db.prepare(UPSERT_ORDER_STATS_SQL).run(stale!.order_id, stale!.created_at, stale!.service_id, stale!.amount_micros, stale!.payer_digest, stale!.refunded, stale!.settled)
+    expect((await getStats(e, '30d')).totals.calls).toBe(1)
   })
 
   it('counts distinct buyers, not calls', async () => {
