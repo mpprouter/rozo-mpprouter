@@ -24,7 +24,7 @@
  * request, and the charge path should not pay that overhead.
  */
 
-import { filterPayableCandidates, sessionChallengeMismatch } from './tempo-challenges'
+import { filterChargeCandidates, filterPayableCandidates, sessionChallengeMismatch } from './tempo-challenges'
 import { Mppx, tempo, sessionLegacy as legacySession, Transport } from 'mppx/client'
 import { privateKeyToAccount } from 'viem/accounts'
 import type { Env } from '../index'
@@ -522,15 +522,34 @@ export async function payMerchant(
      * real-cost reconciliation. Existing no-arg callers ignore it.
      */
     onCredentialSigned?: (amountRaw?: string) => void
+    /**
+     * Pay only a charge challenge in this token. Set when the merchant offered
+     * several tokens and the proxy quoted the buyer and checked the pool for
+     * this one; the retry's fresh 402 must be answered in the same token, and
+     * with none left mppx refuses before signing. Omit it and behaviour is
+     * exactly as before (the merchant's first payable challenge).
+     */
+    currency?: string
   } = {},
 ): Promise<Response> {
-  const needsHook = Boolean(opts.maxAmountRaw || opts.onCredentialSigned)
+  const currency = opts.currency
+  const needsHook = Boolean(opts.maxAmountRaw || opts.onCredentialSigned || currency)
   const client = createTempoClientInternal(
     env,
     needsHook
       ? {
+          ...(currency
+            ? { orderChallenges: (candidates: any[]) => filterChargeCandidates(candidates, currency) }
+            : {}),
           onChallenge: async (challenge, { createCredential }) => {
             if (opts.maxAmountRaw) assertWithinBudget(challenge, merchantUrl, opts.maxAmountRaw)
+            // Second check on the chosen challenge, in case the filter was bypassed.
+            if (currency) {
+              const got = String((challenge as any).request?.currency ?? '')
+              if (got.toLowerCase() !== currency.toLowerCase()) {
+                throw new Error(`tempo.charge challenge currency ${got} does not match quoted ${currency}`)
+              }
+            }
             // No context: tempo.charge signs its default single-shot intent.
             const credential = await createCredential()
             // Signal ONLY AFTER the credential actually exists. If

@@ -160,3 +160,71 @@ export function parseTempoChallengesStrict(wwwAuthenticate: string): ParsedTempo
     expires: c.expires,
   }))
 }
+
+/**
+ * Charge tokens the router will pay a merchant in when it offers a choice,
+ * most preferred first. Both are 6-decimal USD stablecoins, the assumption the
+ * Stellar quote conversion relies on. A token not listed here is never chosen
+ * over the merchant's first offer.
+ */
+export const CHARGE_TOKEN_PREFERENCE: readonly string[] = [
+  '0x20c000000000000000000000b9537d11c60e8b50', // USDC.e
+  '0x20c0000000000000000000006a37da5c996874be', // OUSD
+]
+
+export interface ChargeChallengeSelection {
+  challenge: ParsedTempoChallenge
+  /** Currency the paid retry must answer in; set only when there was a choice. */
+  lockCurrency: string
+}
+
+/**
+ * Choose which charge challenge to pay when a merchant offers several, one per
+ * accepted token (fal and Firecrawl, 2026-11-07: OUSD, USDC.e, pathUSD).
+ *
+ * Returns null when there is no choice to make (zero or one charge challenge,
+ * or none in a preferred token): the caller keeps the merchant's first offer,
+ * the pre-existing behaviour. Otherwise the first preferred token whose pool
+ * balance covers that challenge's amount wins; when none does (or balances are
+ * unreadable) the most preferred offer is returned so the pool pre-flight
+ * refuses it, or proceeds exactly as it did before on an unreadable balance.
+ */
+export async function selectChargeChallenge(
+  challenges: ParsedTempoChallenge[],
+  balanceOf: (currency: string) => Promise<bigint | null>,
+): Promise<ChargeChallengeSelection | null> {
+  const charges = challenges.filter((c) => c.intent.toLowerCase() === 'charge')
+  if (charges.length < 2) return null
+  const preferred: ParsedTempoChallenge[] = []
+  for (const token of CHARGE_TOKEN_PREFERENCE) {
+    const match = charges.find((c) => same(c.request.currency, token))
+    if (match) preferred.push(match)
+  }
+  if (preferred.length === 0) return null
+  for (const c of preferred) {
+    let amount: bigint
+    try {
+      amount = BigInt(c.request.amount)
+    } catch {
+      continue
+    }
+    const balance = await balanceOf(c.request.currency)
+    if (balance !== null && balance >= amount) return { challenge: c, lockCurrency: c.request.currency }
+  }
+  return { challenge: preferred[0], lockCurrency: preferred[0].request.currency }
+}
+
+/**
+ * mppx `orderChallenges` hook body for the charge leg: keep only charge
+ * candidates in `currency`, the token the buyer was quoted and the pool was
+ * checked for. An empty result makes mppx stop before signing anything.
+ */
+export function filterChargeCandidates<
+  T extends { challenge?: { intent?: string; request?: { currency?: unknown } } },
+>(candidates: T[], currency: string): T[] {
+  return candidates.filter(
+    (c) =>
+      String(c?.challenge?.intent ?? '').toLowerCase() === 'charge' &&
+      same(c?.challenge?.request?.currency, currency),
+  )
+}
