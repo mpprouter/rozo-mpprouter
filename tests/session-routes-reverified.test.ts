@@ -19,5 +19,6 @@ describe('re-verified session routes', () => {
     const entry = listPublicCatalog({} as never).find((e) => e.id === id)!
     expect(entry.payment_enabled).toBe(true)
     expect(entry.payment_status).toBe('verified')
+    expect(entry.session_rozo_verified).toBe(true)
   })
 })

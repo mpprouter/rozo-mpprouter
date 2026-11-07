@@ -271,13 +271,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     // 2026-11-07: delisted for the token migration, then re-verified the same
     // day on a new USDC.e session channel (the merchant's 402 offers OUSD,
     // USDC.e and MACH; the router answers in its channel's token, PR #305).
-    verifiedMode: 'charge',
-    chargeVerified: true,
-    chargeVerifiedAt: '2026-11-07T11:40:47Z',
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-11-07T11:40:47Z',
     verifiedNote:
       'Delivers completions. Re-verified 2026-11-07 with a real paid call ' +
       'through the router (claude-haiku-4-5, settled 0.001 USDC, 200 with a ' +
-      'completion, no refund) on the new USDC.e session channel.',
+      'completion, no refund) on the new USDC.e session channel it shares ' +
+      'with anthropic_messages.',
     // Facade: registered per founder decision 2026-08-24. A normal service
     // registration.
     //
