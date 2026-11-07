@@ -100,6 +100,7 @@ export interface SettleAndRecordParams {
   routeId: string
   payer: string | null
   amountUsd: string
+  upstreamCurrency?: string
   requestPath: string
   upstreamStatus: number
   latencyMs: number
@@ -116,6 +117,7 @@ export async function settleAndRecordX402(p: SettleAndRecordParams): Promise<Ste
     route_id: p.routeId,
     payer: p.payer,
     amount_usd: p.amountUsd,
+    ...(p.upstreamCurrency ? { upstream_currency: p.upstreamCurrency } : {}),
     settlement_ref: null,
     settlement_status: 'pending',
     settlement_attempt_txs: [],

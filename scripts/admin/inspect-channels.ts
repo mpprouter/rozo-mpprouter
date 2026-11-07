@@ -43,7 +43,7 @@ function loadDevVars(): Record<string, string> {
   } catch {
     throw new Error(
       `Could not read ${path}. Copy .dev.vars.example (or ask the ` +
-        `operator) and populate STELLAR_ROUTER_PUBLIC, TEMPO_ROUTER_ADDRESS.`,
+        `operator) and populate STELLAR_ROUTER_PUBLIC.`,
     )
   }
   const out: Record<string, string> = {}
@@ -286,9 +286,14 @@ function shortHex(h: string, head = 6, tail = 4): string {
 async function main() {
   const vars = loadDevVars()
   const stellarPublic = vars.STELLAR_ROUTER_PUBLIC
-  const tempoAddress = vars.TEMPO_ROUTER_ADDRESS
+  // The live router's address, so a rotation cannot leave this tool reading an
+  // old wallet from a stale local file.
+  const health = (await (await fetch('https://apiserver.mpprouter.dev/health')).json()) as {
+    tempo?: { router_pool?: string }
+  }
+  const tempoAddress = health.tempo?.router_pool
   if (!stellarPublic) throw new Error('Missing STELLAR_ROUTER_PUBLIC in .dev.vars')
-  if (!tempoAddress) throw new Error('Missing TEMPO_ROUTER_ADDRESS in .dev.vars')
+  if (!tempoAddress) throw new Error('Could not read tempo.router_pool from /health')
 
   const now = new Date().toISOString()
   console.log(`=== ROUTER LEDGER @ ${now} ===\n`)
