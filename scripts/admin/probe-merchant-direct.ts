@@ -15,7 +15,7 @@ import { readFileSync, existsSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Mppx, tempo } from 'mppx/client'
-import { privateKeyToAccount } from 'viem/accounts'
+import { loadTempoRouterAccount } from './lib/tempo-router-key'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
@@ -50,9 +50,7 @@ async function main() {
   const method = process.env.METHOD ?? 'POST'
 
   const vars = loadDevVars()
-  const pk = vars.TEMPO_ROUTER_PRIVATE_KEY
-  if (!pk) throw new Error('No TEMPO_ROUTER_PRIVATE_KEY in .dev.vars')
-  const account = privateKeyToAccount(pk as `0x${string}`)
+  const account = loadTempoRouterAccount()
 
   const maskedAddress = `${account.address.slice(0, 6)}...${account.address.slice(-4)}`
 

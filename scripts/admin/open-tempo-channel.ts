@@ -4,18 +4,19 @@
  * payment channel for one merchant and persist its state to KV.
  *
  * This spends real money: it broadcasts an on-chain Tempo L2
- * transaction funded by TEMPO_ROUTER_PRIVATE_KEY that locks
- * `--deposit` USDC into the merchant's escrow contract.
+ * transaction, signed with the router key from the macOS Keychain, that locks
+ * `--deposit` of the merchant's quoted token into its escrow contract.
  *
  * Usage:
- *   npx tsx scripts/admin/open-tempo-channel.ts <merchantId> [--deposit N]
+ *   npx tsx scripts/admin/open-tempo-channel.ts <merchantId> \
+ *     --deposit N --expect-currency 0x... --max-deposit N \
+ *     --old-channel <0x...|none> --snapshot-dir <path> [--yes]
  *
- * Examples:
- *   # Open a $1 channel for openrouter
- *   npx tsx scripts/admin/open-tempo-channel.ts openrouter --deposit 1
- *
- *   # Default deposit is $1 USDC
- *   npx tsx scripts/admin/open-tempo-channel.ts anthropic
+ * Without --yes it stops after the checks and spends nothing. It stops, before
+ * spending, when the live 402 is not what was approved, when the wallet is not
+ * the router's live address, when the route is still payable, or when the KV
+ * slots are not as expected. After opening, a channel that fails any check is
+ * NOT written to KV.
  *
  * Design note:
  * This script uses mppx's AUTO-MODE session helper (pass `deposit`
@@ -35,8 +36,8 @@
  * "voucher" (manual).
  */
 
-import { execSync } from 'node:child_process'
-import { readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
@@ -44,37 +45,28 @@ import { tmpdir } from 'node:os'
 import { tempo } from 'mppx/client'
 import { Session } from 'mppx/tempo'
 import { createClient, http } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
 import { tempo as tempoChain } from 'viem/chains'
 
+import {
+  assertChallengeMatchesApproval,
+  assertOpenedChannel,
+  assertWithinDepositCeiling,
+  guardedChallengeFetch,
+  assertSlotsReady,
+  installChannel,
+  parseSessionChallenge,
+  sameAddress,
+  type SlotRecord,
+  type SlotStore,
+} from './lib/tempo-channel-migration'
+import { loadTempoRouterAccount } from './lib/tempo-router-key'
+
 // ----------------------------------------------------------------------------
-// Paths + dev vars (same pattern as inspect-channels.ts)
+// Paths
 // ----------------------------------------------------------------------------
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = resolve(__dirname, '..', '..')
-
-function loadDevVars(): Record<string, string> {
-  const path = resolve(REPO_ROOT, '.dev.vars')
-  const raw = readFileSync(path, 'utf8')
-  const out: Record<string, string> = {}
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const eq = trimmed.indexOf('=')
-    if (eq === -1) continue
-    const key = trimmed.slice(0, eq).trim()
-    let value = trimmed.slice(eq + 1).trim()
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1)
-    }
-    out[key] = value
-  }
-  return out
-}
 
 // ----------------------------------------------------------------------------
 // Merchant catalog (hand-resolved from mpp.dev/api/services on 2026-04-11)
@@ -131,7 +123,7 @@ const MERCHANTS: Record<string, SessionMerchant> = {
     probePath: '/v1/messages',
     probeMethod: 'POST',
     probeBody: {
-      model: 'claude-3-5-sonnet-latest',
+      model: 'claude-haiku-4-5',
       max_tokens: 1,
       messages: [{ role: 'user', content: 'probe' }],
     },
@@ -220,52 +212,113 @@ const MERCHANTS: Record<string, SessionMerchant> = {
 // Argument parsing
 // ----------------------------------------------------------------------------
 
-type Args = { merchantId: string; depositUsdc: string }
+type Args = {
+  merchantId: string
+  deposit: string
+  maxDeposit: string
+  expectCurrency: string
+  oldChannelId: string | null
+  snapshotDir: string
+  yes: boolean
+}
+
+const USAGE =
+  'Usage: npx tsx scripts/admin/open-tempo-channel.ts <merchantId> --deposit N --max-deposit N ' +
+  '--expect-currency 0x... --old-channel <0x...|none> --snapshot-dir <path> [--yes]'
 
 function parseArgs(argv: string[]): Args {
   const args = argv.slice(2)
-  if (args.length === 0) {
-    console.error('Usage: npx tsx scripts/admin/open-tempo-channel.ts <merchantId> [--deposit N]')
+  const flag = (name: string) => {
+    const i = args.indexOf(name)
+    return i === -1 ? undefined : args[i + 1]
+  }
+  const merchantId = args[0]
+  const deposit = flag('--deposit')
+  const maxDeposit = flag('--max-deposit')
+  const expectCurrency = flag('--expect-currency')
+  const oldChannel = flag('--old-channel')
+  const snapshotDir = flag('--snapshot-dir')
+  if (!merchantId || merchantId.startsWith('-') || !deposit || !maxDeposit || !expectCurrency || !oldChannel || !snapshotDir) {
+    console.error(USAGE)
     console.error(`\nKnown merchant ids:\n${Object.keys(MERCHANTS).map((id) => `  ${id}`).join('\n')}`)
     process.exit(1)
   }
-  const merchantId = args[0]
-  let depositUsdc = '1'
-  for (let i = 1; i < args.length; i++) {
-    if (args[i] === '--deposit' && i + 1 < args.length) {
-      depositUsdc = args[i + 1]
-      i++
+  for (const value of [deposit, maxDeposit]) {
+    if (!/^\d+(\.\d{1,6})?$/.test(value)) {
+      console.error(`Invalid amount: ${value}. Expected a decimal like "1" or "0.5".`)
+      process.exit(1)
     }
   }
-  if (!/^\d+(\.\d+)?$/.test(depositUsdc)) {
-    console.error(`Invalid --deposit value: ${depositUsdc}. Expected a decimal USDC amount like "1" or "0.5".`)
-    process.exit(1)
+  return {
+    merchantId,
+    deposit,
+    maxDeposit,
+    expectCurrency,
+    oldChannelId: oldChannel === 'none' ? null : oldChannel,
+    snapshotDir,
+    yes: args.includes('--yes'),
   }
-  return { merchantId, depositUsdc }
 }
 
 // ----------------------------------------------------------------------------
-// KV writer (shells out to wrangler — same as inspect-channels.ts)
+// KV access (shells out to wrangler, no shell, always the remote namespace)
 // ----------------------------------------------------------------------------
 
-function kvPut(key: string, value: string): void {
-  // wrangler kv key put takes the value either as a positional
-  // arg or from a file. Values with special chars (JSON with
-  // quotes, newlines) break positional args across shells, so
-  // we always go through a temp file.
-  const tmpFile = resolve(tmpdir(), `mpp-kv-${Date.now()}.json`)
-  writeFileSync(tmpFile, value)
+function kvGet(key: string): string | null {
   try {
-    execSync(
-      `npx wrangler kv key put --binding MPP_STORE '${key}' --path '${tmpFile}' --remote`,
-      { encoding: 'utf8', cwd: REPO_ROOT, stdio: 'inherit' },
-    )
+    const value = execFileSync('npx', ['wrangler', 'kv', 'key', 'get', '--binding', 'MPP_STORE', key, '--remote', '--text'], {
+      encoding: 'utf8',
+      cwd: REPO_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    // wrangler appends a newline to stdout; it is not part of the stored value.
+    return value.endsWith('\n') ? value.slice(0, -1) : value
+  } catch (err) {
+    // wrangler exits non-zero for both "no such key" and a real failure.
+    const stderr = String((err as { stderr?: unknown }).stderr ?? '')
+    if (/\b404\b|not found/i.test(stderr)) return null
+    throw new Error(`KV read failed for ${key}: ${stderr.slice(0, 200)}`)
+  }
+}
+
+function kvPut(key: string, value: string): void {
+  // Values with quotes and newlines break positional args, so use a temp file.
+  const tmpFile = resolve(tmpdir(), `mpp-kv-${Date.now()}.json`)
+  writeFileSync(tmpFile, value, { mode: 0o600 })
+  try {
+    execFileSync('npx', ['wrangler', 'kv', 'key', 'put', '--binding', 'MPP_STORE', key, '--path', tmpFile, '--remote'], {
+      encoding: 'utf8',
+      cwd: REPO_ROOT,
+      stdio: 'inherit',
+    })
   } finally {
     try {
       unlinkSync(tmpFile)
     } catch {
       // tmp cleanup best-effort
     }
+  }
+}
+
+const kvStore: SlotStore = {
+  get: kvGet,
+  put: kvPut,
+  wait: () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5_000),
+}
+
+/** The routes this channel serves must be closed before a slot changes. */
+async function assertRoutesClosed(channelKey: string): Promise<void> {
+  const body = (await (await fetch('https://apiserver.mpprouter.dev/services')).json()) as {
+    services?: Array<{ id: string; payment_enabled: boolean }>
+  }
+  const services = body.services ?? (body as unknown as Array<{ id: string; payment_enabled: boolean }>)
+  const served = channelKey === 'anthropic_messages'
+    ? ['anthropic_messages', 'anthropic_chat_completions']
+    : [channelKey]
+  for (const id of served) {
+    const entry = services.find((s) => s.id === id)
+    if (!entry) throw new Error(`/services has no entry for ${id}`)
+    if (entry.payment_enabled) throw new Error(`${id} is still payable; delist it before moving its channel`)
   }
 }
 
@@ -317,7 +370,7 @@ function toBaseUnits(decimal: string, decimals: number): bigint {
 // ----------------------------------------------------------------------------
 
 async function main() {
-  const { merchantId, depositUsdc } = parseArgs(process.argv)
+  const { merchantId, deposit, maxDeposit, expectCurrency, oldChannelId, snapshotDir, yes } = parseArgs(process.argv)
   const merchant = MERCHANTS[merchantId]
   if (!merchant) {
     console.error(`Unknown merchant id: ${merchantId}`)
@@ -325,19 +378,60 @@ async function main() {
     process.exit(1)
   }
 
-  const vars = loadDevVars()
-  const pk = vars.TEMPO_ROUTER_PRIVATE_KEY
-  if (!pk) throw new Error('Missing TEMPO_ROUTER_PRIVATE_KEY in .dev.vars')
+  const account = loadTempoRouterAccount()
+  const rpcUrl = process.env.TEMPO_RPC_URL ?? 'https://rpc.tempo.xyz'
+  const depositRaw = toBaseUnits(deposit, 6)
+  const maxDepositCeilingRaw = toBaseUnits(maxDeposit, 6)
 
-  const account = privateKeyToAccount(pk as `0x${string}`)
-  const rpcUrl = vars.TEMPO_RPC_URL ?? 'https://rpc.tempo.xyz'
+  // Every check below runs before a transaction exists.
+  const health = (await (await fetch('https://apiserver.mpprouter.dev/health')).json()) as {
+    tempo?: { router_pool?: string }
+  }
+  if (!sameAddress(health.tempo?.router_pool, account.address)) {
+    throw new Error('Keychain key does not derive the address /health reports; refusing')
+  }
+  const unpaid = await fetch(`${merchant.serviceUrl}${merchant.probePath}`, {
+    method: merchant.probeMethod,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(merchant.probeBody),
+  })
+  if (unpaid.status !== 402) throw new Error(`merchant answered ${unpaid.status}, expected an unpaid 402`)
+  const challenge = parseSessionChallenge(unpaid.headers.get('www-authenticate'))
+  assertChallengeMatchesApproval(challenge, {
+    currency: expectCurrency,
+    depositRaw,
+    maxDepositRaw: maxDepositCeilingRaw,
+  })
+  await assertRoutesClosed(merchant.id)
+  const slotExpectation = {
+    merchantId: merchant.id,
+    oldChannelId,
+    walletAddress: account.address,
+    snapshot: (slots: { primary: string | null; alt: string | null }) => {
+      mkdirSync(snapshotDir, { recursive: true, mode: 0o700 })
+      const file = resolve(snapshotDir, `${merchant.id}-${Date.now()}.json`)
+      writeFileSync(file, JSON.stringify(slots, null, 2), { mode: 0o600 })
+      console.log(`  Slot snapshot:    ${file}`)
+    },
+  }
+  assertSlotsReady(kvStore, slotExpectation)
+
   console.log(`Opening Tempo session channel for ${merchant.name} (${merchant.id})`)
   console.log(`  Router wallet:    ${account.address}`)
   console.log(`  Merchant service: ${merchant.serviceUrl}`)
   console.log(`  Probe endpoint:   ${merchant.probeMethod} ${merchant.probePath}`)
   console.log(`  Tempo RPC:        ${rpcUrl}`)
-  console.log(`  Deposit:          ${depositUsdc} USDC (${toBaseUnits(depositUsdc, 6).toString()} base units)`)
+  console.log(`  Currency:         ${challenge.currency}`)
+  console.log(`  Payee:            ${challenge.recipient}`)
+  console.log(`  Escrow:           ${challenge.escrowContract}`)
+  console.log(`  Chain:            ${challenge.chainId}`)
+  console.log(`  Quote:            ${challenge.amount} base units`)
+  console.log(`  Deposit:          ${deposit} (${depositRaw} base units), ceiling ${maxDeposit}`)
   console.log('')
+  if (!yes) {
+    console.log('Checks passed. Dry run: re-run with --yes to open the channel.')
+    return
+  }
 
   // viem Tempo client — the session manager needs a real viem
   // client to sign the on-chain open tx. We use the `tempo` chain
@@ -363,16 +457,10 @@ async function main() {
   // that includes the full TIP-1034 `descriptor`. We capture the
   // stored channel there so the KV write below can include it.
   //
-  // `maxDeposit` is the manager's HARD cap for both the initial open AND
-  // any later topUp(). When resuming an existing channel whose cumulative is
-  // already non-zero, a topUp to `cumulative + --deposit headroom` can exceed
-  // a cap set to just `--deposit`, and the topUp is rejected ("exceeds local
-  // maxDeposit"). So we set the cap to `--deposit` PLUS a 1 USDC buffer that
-  // comfortably covers any existing cumulative (these channels carry only a
-  // few thousand base units). This only RAISES the ceiling; the actual
-  // on-chain deposit is still driven by the open/topUp amounts below.
-  const maxDepositRaw = toBaseUnits(depositUsdc, 6) + toBaseUnits('1', 6)
-  const maxDepositUsdc = (Number(maxDepositRaw) / 1e6).toString()
+  // `maxDeposit` is the manager's hard cap for the initial open and any later
+  // topUp(). The approved ceiling is the cap, so an unexpected suggested deposit
+  // cannot spend more than the operator signed off on.
+  const maxDepositUsdc = maxDeposit
 
   let capturedStored: {
     descriptor: PersistedChannelState['descriptor']
@@ -392,6 +480,7 @@ async function main() {
     // fully control, sidestepping the exhausted legacy channels.
     bootstrap: false,
     maxDeposit: maxDepositUsdc,
+    fetch: guardedChallengeFetch(challenge),
     sessionStore: {
       get() {
         // Fresh open — no prior channel to resume from.
@@ -455,9 +544,10 @@ async function main() {
   // on-chain deposit so that deposit >= cumulative + the requested headroom.
   // `--deposit N` is treated as the desired FREE headroom above the current
   // cumulative. topUp() broadcasts a real on-chain Tempo L2 deposit tx.
-  const desiredHeadroomRaw = toBaseUnits(depositUsdc, 6)
+  const desiredHeadroomRaw = depositRaw
   const requiredDepositRaw = BigInt(sm.cumulative) + desiredHeadroomRaw
   const currentDepositRaw = BigInt(capturedStored?.deposit ?? '0')
+  assertWithinDepositCeiling(requiredDepositRaw, maxDepositCeilingRaw)
   if (currentDepositRaw < requiredDepositRaw) {
     const topUpRaw = requiredDepositRaw - currentDepositRaw
     console.log(
@@ -483,79 +573,55 @@ async function main() {
   const onChain = await Session.Precompile.Chain.getChannelState(client as any, sm.channelId as `0x${string}`)
   const onChainDepositRaw = BigInt(onChain.deposit)
   console.log(`  On-chain deposit:  ${onChainDepositRaw} base units (settled ${onChain.settled})`)
-  const depositShort = onChainDepositRaw < requiredDepositRaw
 
-  // Extract what we need from the SessionManager state + the
-  // probe challenge. SessionManager doesn't expose escrowContract
-  // on its public surface, but the probe response carries a
-  // `challenge` field (via the PaymentResponse extension) that
-  // has `methodDetails.escrowContract`.
-  const challengeFromProbe = (probeResult as any).challenge
-  const methodDetails = challengeFromProbe?.request?.methodDetails ?? {}
-  const escrowContract = methodDetails.escrowContract ?? ''
-  const payee = methodDetails.recipient ?? challengeFromProbe?.request?.recipient ?? ''
-  const chainId = methodDetails.chainId ?? 0
-
-  // Prefer escrowContract from the probe challenge; fall back to the
-  // escrow address reported by the session manager's stored channel.
-  const resolvedEscrow = escrowContract || capturedStored?.escrow || ''
+  // Stop here rather than warn: the Worker signs from these fields, and a bad
+  // record makes it sign vouchers the merchant rejects. The channel stays open
+  // on chain and is recoverable with requestClose, so report its id.
+  const escrow = capturedStored?.escrow ?? ''
+  const descriptor = capturedStored?.descriptor
+  assertOpenedChannel(
+    {
+      channelId: sm.channelId as string,
+      escrow,
+      descriptor,
+      derivedChannelId: descriptor
+        ? Session.Precompile.Channel.computeId({
+            ...(descriptor as any),
+            chainId: challenge.chainId,
+            escrow: escrow as `0x${string}`,
+          })
+        : '',
+      onChain: {
+        deposit: onChainDepositRaw,
+        settled: BigInt(onChain.settled),
+        closeRequestedAt: BigInt(onChain.closeRequestedAt),
+      },
+    },
+    challenge,
+    account.address,
+    requiredDepositRaw,
+  )
 
   const state: PersistedChannelState = {
     channelId: sm.channelId as string,
-    escrowContract: resolvedEscrow,
-    payee,
-    // Canonical Tempo USDC asset handle — verified the same for
-    // all 9 session merchants on 2026-04-11 via mpp.dev/api/services.
-    currency: '0x20c000000000000000000000b9537d11c60e8b50',
-    chainId,
+    escrowContract: escrow,
+    payee: challenge.recipient,
+    currency: challenge.currency,
+    chainId: challenge.chainId,
     authorizedSigner: account.address,
-    // Cumulative the manager reported via sessionStore.set() — the amount
-    // already authorized on this channel (0 for a truly fresh channel, or
-    // the prior watermark when resuming an existing on-chain channel).
+    // Cumulative the manager reported via sessionStore.set(): the amount the
+    // open's own probe already authorized on this channel.
     cumulativeRaw: capturedStored?.cumulativeAmount ?? sm.cumulative.toString(),
-    // Deposit is read back from the escrow precompile after the top-up
-    // attempt. Neither the requested figure nor the manager's
-    // sessionStore.set() echo is trustworthy here (see the topUp catch).
+    // Deposit is read back from the escrow precompile, never the requested figure.
     depositRaw: onChainDepositRaw.toString(),
     openedAt: new Date().toISOString(),
-    // TIP-1034 descriptor captured via sessionStore.set() — required by
-    // the Worker's TIP-1034 session method to produce manual vouchers.
-    ...(capturedStored?.descriptor ? { descriptor: capturedStored.descriptor } : {}),
+    descriptor,
   }
 
-  if (!state.escrowContract) {
-    console.warn('  ⚠️  escrowContract not captured from probe challenge or sessionStore.')
-    console.warn('      Router voucher signing WILL fail without this field.')
-    console.warn('      Hand-fill via `wrangler kv key put` before flipping the route.')
-  }
-  if (!state.payee) {
-    console.warn('  ⚠️  payee not captured. Not used by voucher signing but')
-    console.warn('      shows blank in inspect-channels.ts.')
-  }
-  if (!state.descriptor) {
-    console.warn('  ⚠️  TIP-1034 descriptor not captured via sessionStore.')
-    console.warn('      This means the merchant may be using v1 protocol, or')
-    console.warn('      sessionStore.set() was not called during the open sequence.')
-    console.warn('      v2 merchants (anthropic, openai, gemini, openrouter) REQUIRE')
-    console.warn('      descriptor in KV for the Worker to produce manual vouchers.')
-  }
-
-  // Persist to KV
-  const kvKey = `tempoChannel:${merchant.id}`
-  const kvValue = JSON.stringify(state, null, 2)
-  console.log(`\n→ Writing to KV: ${kvKey}`)
-  console.log(kvValue)
-  console.log('')
-  kvPut(kvKey, kvValue)
-  console.log(`✅ KV write complete.\n`)
-
-  if (depositShort) {
-    console.error(
-      `❌ On-chain deposit ${onChainDepositRaw} is below the required ${requiredDepositRaw}. ` +
-        `KV records the real figure. Top it up with scripts/admin/topup-tempo-channel.ts.`,
-    )
-    process.exit(1)
-  }
+  console.log(`\n→ Installing in KV: tempoChannel:${merchant.id}`)
+  console.log(JSON.stringify(state, null, 2))
+  installChannel(kvStore, slotExpectation, state as unknown as SlotRecord)
+  console.log(`✅ KV write complete and read back.\n`)
 
   console.log('Next step: run `npx tsx scripts/admin/inspect-channels.ts` to verify the new channel is visible.')
 }

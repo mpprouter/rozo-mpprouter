@@ -1,6 +1,6 @@
 /**
  * One-shot: poll a StableStudio async job by signing the SIWX (EIP-4361)
- * challenge with TEMPO_ROUTER_PRIVATE_KEY from .dev.vars.
+ * challenge with the Tempo router key from the macOS Keychain.
  *
  *   npx tsx scripts/fetch-job.ts <jobId>
  *   npx tsx scripts/fetch-job.ts cmobn9mi9000e04l51w62943i
@@ -9,7 +9,7 @@
  * worker would serve at /v1/services/stablestudio/jobs/<id>.
  */
 
-import { privateKeyToAccount } from 'viem/accounts'
+import { loadTempoRouterAccount } from './admin/lib/tempo-router-key'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -72,10 +72,7 @@ async function main() {
     process.exit(1)
   }
   const vars = loadDevVars()
-  const key = vars.TEMPO_ROUTER_PRIVATE_KEY
-  if (!key) throw new Error('TEMPO_ROUTER_PRIVATE_KEY missing from .dev.vars')
-
-  const account = privateKeyToAccount(key as `0x${string}`)
+  const account = loadTempoRouterAccount()
   console.log(`[fetch-job] signer address: ${account.address}`)
 
   const url = `https://stablestudio.dev/api/jobs/${jobId}`

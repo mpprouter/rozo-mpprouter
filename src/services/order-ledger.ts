@@ -43,7 +43,13 @@ export interface OrderLedgerEntry {
   route_id: string
   /** Stellar G... address, or null when not extractable (see settlement_ref note). */
   payer: string | null
+  /** The merchant's quote in its own token, taken as USD 1:1. See upstream_currency. */
   amount_usd: string
+  /**
+   * Token the merchant was paid in (USDC.e or OUSD). Internal cost accounting;
+   * absent on rows from before 2026-11-07.
+   */
+  upstream_currency?: string
   /**
    * Charge mode: Stellar tx hash. Session mode: channel id + voucher
    * sequence (not used by any Mercury route in v1 — Mercury is

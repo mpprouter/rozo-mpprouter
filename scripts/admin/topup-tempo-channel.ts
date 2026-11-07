@@ -6,7 +6,7 @@
  *
  * MOVES MONEY (L3): broadcasts a Tempo transaction from the router's Tempo
  * pool wallet. Founder runs it himself, in Terminal.app, from a checkout of
- * this repo with .dev.vars present.
+ * this repo. The key comes from the macOS Keychain (lib/tempo-router-key.ts).
  *
  * Usage:
  *   npx tsx scripts/admin/topup-tempo-channel.ts <channelKey> --amount <USDC>          # dry run
@@ -27,7 +27,7 @@ import { tmpdir } from 'node:os'
 
 import { Session } from 'mppx/tempo'
 import { createClient, http } from 'viem'
-import { privateKeyToAccount } from 'viem/accounts'
+import { loadTempoRouterAccount } from './lib/tempo-router-key'
 import { tempo as tempoChain } from 'viem/chains'
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
@@ -91,7 +91,7 @@ async function main() {
   if (!stored.descriptor || !stored.channelId) throw new Error(`${kvKey} has no TIP-1034 descriptor; cannot top up`)
   if (String(stored.escrowContract).toLowerCase() !== ESCROW) throw new Error(`${kvKey} is not on the TIP-1034 escrow`)
 
-  const account = privateKeyToAccount(loadDevVars().TEMPO_ROUTER_PRIVATE_KEY as `0x${string}`)
+  const account = loadTempoRouterAccount()
   if (account.address.toLowerCase() !== String(stored.descriptor.payer).toLowerCase()) {
     throw new Error('router key is not the channel payer; refusing')
   }

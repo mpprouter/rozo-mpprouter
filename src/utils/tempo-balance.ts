@@ -18,7 +18,7 @@ import { parseRpcUrls } from '../mpp/tempo-rpc'
  * Tempo USDC asset handle — the ERC-20-compatible token contract
  * for USDC on Tempo L2. Same constant used in inspect-channels.ts.
  */
-const TEMPO_USDC_HANDLE = '0x20c000000000000000000000b9537d11c60e8b50'
+export const TEMPO_USDC_HANDLE = '0x20c000000000000000000000b9537d11c60e8b50'
 
 /**
  * How long a pool balance reading is reused.
@@ -57,7 +57,20 @@ export async function getTempoUsdcBalance(
   address: string,
   primaryRpcUrl?: string,
 ): Promise<bigint | null> {
-  const key = `${primaryRpcUrl ?? ''}|${rpcUrl}|${address}`
+  return getTempoTokenBalance(rpcUrl, address, primaryRpcUrl, TEMPO_USDC_HANDLE)
+}
+
+/**
+ * Same as getTempoUsdcBalance for any 6-decimal Tempo token. Merchants can quote
+ * in a token other than USDC.e, and a wallet full of USDC.e cannot pay those.
+ */
+export async function getTempoTokenBalance(
+  rpcUrl: string,
+  address: string,
+  primaryRpcUrl: string | undefined,
+  token: string,
+): Promise<bigint | null> {
+  const key = `${primaryRpcUrl ?? ''}|${rpcUrl}|${address}|${token.toLowerCase()}`
 
   const cached = balanceCache.get(key)
   if (cached && cached.expiresAt > Date.now()) return cached.value
@@ -65,7 +78,7 @@ export async function getTempoUsdcBalance(
   const existing = balanceInFlight.get(key)
   if (existing) return existing
 
-  const pending = fetchTempoUsdcBalance(rpcUrl, address, primaryRpcUrl)
+  const pending = fetchTempoTokenBalance(rpcUrl, address, primaryRpcUrl, token)
     .then((value) => {
       balanceCache.set(key, { value, expiresAt: Date.now() + BALANCE_CACHE_MS })
       return value
@@ -88,10 +101,11 @@ export function resetTempoBalanceCache(): void {
  * Uncached read. Kept as a separate function so the caching wrapper above
  * stays trivially auditable.
  */
-async function fetchTempoUsdcBalance(
+async function fetchTempoTokenBalance(
   rpcUrl: string,
   address: string,
-  primaryRpcUrl?: string,
+  primaryRpcUrl: string | undefined,
+  token: string,
 ): Promise<bigint | null> {
   // `rpcUrl` is a comma-separated POOL, not a single endpoint (see
   // tempo-rpc.ts). This function used to hand it to `fetch()` verbatim,
@@ -116,8 +130,8 @@ async function fetchTempoUsdcBalance(
   // so the eth_call path is what actually returns a number today. Keeping
   // both means a provider that re-enables the native method still works.
   const bodies = [
-    { jsonrpc: '2.0', id: 1, method: 'tempo_getBalance', params: [address, TEMPO_USDC_HANDLE] },
-    { jsonrpc: '2.0', id: 2, method: 'eth_call', params: [{ to: TEMPO_USDC_HANDLE, data }, 'latest'] },
+    { jsonrpc: '2.0', id: 1, method: 'tempo_getBalance', params: [address, token] },
+    { jsonrpc: '2.0', id: 2, method: 'eth_call', params: [{ to: token, data }, 'latest'] },
   ]
 
   for (const url of urls) {

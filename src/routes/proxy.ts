@@ -56,7 +56,8 @@ import {
   verifyStellarX402WithFacilitator,
 } from '../mpp/stellar-x402-server'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
-import { claimTempoLowBalanceAlertSlot, getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
+import { claimTempoLowBalanceAlertSlot, getTempoTokenBalance, LOW_BALANCE_THRESHOLD, TEMPO_USDC_HANDLE } from '../utils/tempo-balance'
+import { checkSessionPreflight } from '../mpp/session-preflight'
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
 import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
 import { newOrderId, recordOrder, updateOrderRefundStatus, type RefundStatus } from '../services/order-ledger'
@@ -1737,15 +1738,44 @@ export async function handleProxy(
   const merchantQuoteBaseUnits = route.fixedPricing ? null : (() => {
     try { return BigInt(parsed.request.amount) } catch { return null }
   })()
-  if (merchantQuoteBaseUnits !== null) {
-    const tempoBalance = await getTempoUsdcBalance(
+  if (!route.fixedPricing && merchantQuoteBaseUnits === null && parsed.intent.toLowerCase() === 'session') {
+    return new Response(JSON.stringify({
+      error: 'Router temporarily unable to serve this route',
+      detail: 'Merchant quote is unreadable. Nothing was charged.',
+    }), { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '300' } })
+  }
+  if (merchantQuoteBaseUnits !== null && parsed.intent.toLowerCase() === 'session') {
+    // A session call spends channel deposit, in the channel's token.
+    const preflight = await checkSessionPreflight(
+      env,
+      sessionChannelKeyFor(route),
+      parsed.request.currency,
+      merchantQuoteBaseUnits,
+    )
+    if (!preflight.ok) {
+      console.error(`[proxy] session preflight refused: reason=${preflight.reason}, route=${route.id}`)
+      return new Response(JSON.stringify({
+        error: 'Router temporarily unable to serve this route',
+        detail: `Session channel check failed: ${preflight.reason}. Nothing was charged.`,
+      }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '300' },
+      })
+    }
+  } else if (merchantQuoteBaseUnits !== null) {
+    // Read the token the merchant actually quotes. A currency-less challenge
+    // keeps the historical USDC.e reading.
+    const quotedToken = parsed.request.currency || TEMPO_USDC_HANDLE
+    const quotesUsdc = quotedToken.toLowerCase() === TEMPO_USDC_HANDLE
+    const tempoBalance = await getTempoTokenBalance(
       env.TEMPO_RPC_URL,
       env.TEMPO_ROUTER_ADDRESS,
       env.TEMPO_RPC_URL_PRIMARY,
+      quotedToken,
     )
     if (tempoBalance !== null) {
       // Alert if balance < 5 USDC, deduped hourly (fire-and-forget)
-      if (tempoBalance < LOW_BALANCE_THRESHOLD && alertSinkConfigured(env)) {
+      if (quotesUsdc && tempoBalance < LOW_BALANCE_THRESHOLD && alertSinkConfigured(env)) {
         const balanceStr = (Number(tempoBalance) / 1_000_000).toFixed(2)
         ctx.waitUntil((async () => {
           if (!(await claimTempoLowBalanceAlertSlot(env, env.TEMPO_ROUTER_ADDRESS))) return
@@ -1761,12 +1791,13 @@ export async function handleProxy(
       if (tempoBalance < merchantQuoteBaseUnits) {
         const balanceStr = (Number(tempoBalance) / 1_000_000).toFixed(2)
         const quoteStr = (Number(merchantQuoteBaseUnits) / 1_000_000).toFixed(4)
+        const tokenLabel = quotesUsdc ? 'USDC' : 'quoted token'
         console.error(
-          `[proxy] Tempo pool insufficient: balance=${balanceStr} USDC, quote=${quoteStr} USDC, route=${route.id}`,
+          `[proxy] Tempo pool insufficient: balance=${balanceStr} ${tokenLabel}, quote=${quoteStr}, route=${route.id}`,
         )
         return new Response(JSON.stringify({
           error: 'Router temporarily unable to serve this route',
-          detail: `Tempo pool balance (${balanceStr} USDC) is insufficient for merchant quote (${quoteStr} USDC). Please try again later.`,
+          detail: `Tempo pool balance (${balanceStr} ${tokenLabel}) is insufficient for merchant quote (${quoteStr}). Please try again later.`,
         }), {
           status: 503,
           headers: {
@@ -1987,6 +2018,7 @@ export async function handleProxy(
         routeId: route.id,
         payer: prepared.payer,
         amountUsd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+        upstreamCurrency: parsed.request.currency,
         requestPath: `${upstreamPath}${forwardedSearch}`,
         upstreamStatus: payResult.merchantStatus,
         latencyMs: payResult.latencyMs ?? 0,
@@ -2012,6 +2044,7 @@ export async function handleProxy(
       routeId: route.id,
       payer: prepared.payer,
       amountUsd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      upstreamCurrency: parsed.request.currency,
       requestPath: `${upstreamPath}${forwardedSearch}`,
       upstreamStatus: payResult.merchantStatus,
       latencyMs: payResult.latencyMs ?? 0,
@@ -2679,6 +2712,7 @@ export async function handleProxy(
         route_id: route.id,
         payer: settledPayment.payer ?? null,
         amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+        upstream_currency: parsed.request.currency,
         settlement_ref: settledPayment.paymentTx ?? null,
         request_path: `${upstreamPath}${forwardedSearch}`,
         upstream_status: 429,
@@ -2769,6 +2803,7 @@ export async function handleProxy(
         route_id: route.id,
         payer: settledPayment.payer ?? null,
         amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+        upstream_currency: parsed.request.currency,
         settlement_ref: settledPayment.paymentTx ?? null,
         request_path: `${upstreamPath}${forwardedSearch}`,
         // 0 means "the merchant never answered" (transport error/throw);
@@ -2939,6 +2974,7 @@ export async function handleProxy(
       route_id: route.id,
       payer: settledPayment?.payer ?? null,
       amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      upstream_currency: parsed.request.currency,
       settlement_ref: settledPayment?.paymentTx ?? null,
       request_path: `${upstreamPath}${forwardedSearch}`,
       upstream_status: payResult.merchantStatus,
