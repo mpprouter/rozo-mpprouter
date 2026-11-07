@@ -1739,16 +1739,6 @@ export async function handleProxy(
   }
   } // end: !route.fixedPricing probe branch
 
-  if (!parsed) {
-    return new Response(JSON.stringify({
-      error: 'Could not parse merchant challenge',
-      raw: wwwAuth,
-    }), {
-      status: 502,
-      headers: { 'Content-Type': 'application/json' },
-    })
-  }
-
   // Session merchants offer one challenge per accepted token. Quote, charge and
   // pre-flight against the one our channel can pay, and refuse before charging
   // when none matches. Charge routes keep the first challenge.
@@ -1775,6 +1765,17 @@ export async function handleProxy(
       parsed = selection.challenge
     }
   }
+
+  if (!parsed) {
+    return new Response(JSON.stringify({
+      error: 'Could not parse merchant challenge',
+      raw: wwwAuth,
+    }), {
+      status: 502,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
+
 
   // ---- Tempo pool balance pre-flight check -------------------------
   // Before accepting the agent's Stellar payment, verify the Router's

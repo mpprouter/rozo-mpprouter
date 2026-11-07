@@ -40,7 +40,7 @@ export interface ParsedTempoChallenge {
 
 /** One header can carry several `Payment ...` challenges separated by commas. */
 export function splitChallenges(wwwAuthenticate: string): string[] {
-  return wwwAuthenticate.split(/,\s*(?=Payment\s)/)
+  return wwwAuthenticate.split(/,\s*(?=Payment\s)/i)
 }
 
 function parseOne(text: string): ParsedTempoChallenge | null {
@@ -129,9 +129,17 @@ export function selectSessionChallenge(
  * mppx `orderChallenges` hook body: keep only candidates payable from
  * `channel`. An empty result makes mppx stop before signing anything.
  */
-export function filterPayableCandidates<T extends { challenge?: { request?: SessionChallengeRequestLike } }>(
+export function filterPayableCandidates<
+  T extends { challenge?: { intent?: string; request?: SessionChallengeRequestLike } },
+>(
   candidates: T[],
   channel: Pick<TempoChannelState, 'currency' | 'payee' | 'escrowContract' | 'chainId'>,
 ): T[] {
-  return candidates.filter((c) => sessionChallengeMismatch(c?.challenge?.request ?? {}, channel) === null)
+  // Session only: the proxy quoted and pre-flighted a session challenge, so a
+  // charge candidate with the same fields must not be the one mppx pays.
+  return candidates.filter(
+    (c) =>
+      String(c?.challenge?.intent ?? '').toLowerCase() === 'session' &&
+      sessionChallengeMismatch(c?.challenge?.request ?? {}, channel) === null,
+  )
 }

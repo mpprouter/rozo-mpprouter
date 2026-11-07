@@ -60,6 +60,12 @@ describe('selectSessionChallenge', () => {
     expect(r.ok).toBe(false)
   })
 
+  it('splits a lower-case payment scheme like mppx does', () => {
+    const header = `${challenge('a', OUSD)}, ${challenge('b', USDC).replace(/^Payment/, 'payment')}`
+    const r = selectSessionChallenge(parseTempoChallenges(header), usdcChannel)
+    expect(r.ok && r.challenge.id).toBe('b')
+  })
+
   it('skips an unparseable challenge and still finds the good one', () => {
     const header = `Payment id="bad", request="%%%", ${challenge('b', USDC)}`
     const r = selectSessionChallenge(parseTempoChallenges(header), usdcChannel)
@@ -92,12 +98,17 @@ describe('sessionChallengeMismatch', () => {
 
 describe('filterPayableCandidates (mppx orderChallenges)', () => {
   const candidate = (currency: string) => ({
-    challenge: { request: { currency, recipient: PAYEE, methodDetails: { escrowContract: ESCROW, chainId: 4217 } } },
+    challenge: { intent: 'session', request: { currency, recipient: PAYEE, methodDetails: { escrowContract: ESCROW, chainId: 4217 } } },
   })
 
   it('keeps only the channel token, whatever the order', () => {
     expect(filterPayableCandidates([candidate(OUSD), candidate(USDC)], usdcChannel)).toEqual([candidate(USDC)])
     expect(filterPayableCandidates([candidate(USDC), candidate(OUSD)], ousdChannel)).toEqual([candidate(OUSD)])
+  })
+
+  it('never keeps a charge candidate, even with matching fields', () => {
+    const charge = { challenge: { ...candidate(USDC).challenge, intent: 'charge' } }
+    expect(filterPayableCandidates([charge, candidate(USDC)], usdcChannel)).toEqual([candidate(USDC)])
   })
 
   it('returns nothing to sign when the token is absent', () => {
