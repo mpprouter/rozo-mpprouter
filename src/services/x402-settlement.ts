@@ -124,33 +124,37 @@ export async function settleAndRecordX402(p: SettleAndRecordParams): Promise<Ste
     refund_status: 'none',
   }
   const key = openKey(entry.order_id)
-  const writeOpen = (e: OrderLedgerEntry) =>
-    env.MPP_STORE.put(key, JSON.stringify({ entry: e, created_at: startedAt } satisfies OpenSettlement), {
-      expirationTtl: OPEN_TTL_SECONDS,
-    })
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  // KV allows one write per key per second, and a retry signs a second hash
+  // soon after the first. Space the writes rather than lose a hash.
+  let lastOpenWrite = 0
+  const writeOpen = async (e: OrderLedgerEntry): Promise<void> => {
+    const put = async () => {
+      const wait = KV_SAME_KEY_GAP_MS - (Date.now() - lastOpenWrite)
+      if (wait > 0) await sleep(wait)
+      lastOpenWrite = Date.now()
+      await env.MPP_STORE.put(key, JSON.stringify({ entry: e, created_at: startedAt } satisfies OpenSettlement), {
+        expirationTtl: OPEN_TTL_SECONDS,
+      })
+    }
+    try {
+      await put()
+    } catch {
+      await put().catch((err) => {
+        console.warn(`[x402-settlement] open marker write failed for ${entry.order_id}: ${String(err)}`)
+      })
+    }
+  }
 
   // Before settlement, so a Worker killed mid-settlement still leaves both.
   await recordOrder(env, entry)
-  try {
-    await writeOpen(entry)
-  } catch (err) {
-    console.warn(`[x402-settlement] open marker write failed for ${entry.order_id}: ${String(err)}`)
-  }
+  const rowWrittenAt = Date.now()
+  await writeOpen(entry)
 
   const settlement = (async () => {
     const result = await (p.settle ?? settleStellarX402)(env, p.payload, p.requirements, {
       // Before submission, so a killed Worker still leaves a hash to look up.
-      onSigned: async (hashes) => {
-        const next = { ...entry, settlement_attempt_txs: [...hashes] }
-        try {
-          await writeOpen(next)
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, KV_SAME_KEY_GAP_MS))
-          await writeOpen(next).catch((err) => {
-            console.warn(`[x402-settlement] hash write failed for ${entry.order_id}: ${String(err)}`)
-          })
-        }
-      },
+      onSigned: (hashes) => writeOpen({ ...entry, settlement_attempt_txs: [...hashes] }),
     })
     if (!result.success) {
       console.error(
@@ -158,8 +162,8 @@ export async function settleAndRecordX402(p: SettleAndRecordParams): Promise<Ste
           `${result.errorReason ?? ''} ${result.errorMessage ?? ''}`,
       )
     }
-    const wait = KV_SAME_KEY_GAP_MS - (Date.now() - startedAt)
-    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait))
+    const wait = KV_SAME_KEY_GAP_MS - (Date.now() - rowWrittenAt)
+    if (wait > 0) await sleep(wait)
 
     const final = applyResult(entry, result)
     const written = await recordOrder(env, final)
@@ -167,7 +171,7 @@ export async function settleAndRecordX402(p: SettleAndRecordParams): Promise<Ste
     if (written && result.outcome !== 'unknown') {
       await env.MPP_STORE.delete(key).catch(() => undefined)
     } else if (result.outcome === 'unknown') {
-      await writeOpen(final).catch(() => undefined)
+      await writeOpen(final)
     }
     if (result.outcome === 'failed') await alertUnsettled(env, final)
     return result

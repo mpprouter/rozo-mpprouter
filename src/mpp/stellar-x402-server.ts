@@ -172,6 +172,9 @@ rpc.Server.prototype.sendTransaction = async function tracedSendTransaction(
   ...args: Parameters<typeof originalSendTransaction>
 ) {
   const trace = settleTrace.getStore()
+  // The caller already has this settlement's result and hash list; a tx sent
+  // now could land with nothing left to find it.
+  if (trace?.abandoned) throw new Error('settlement deadline passed; not submitting')
   try {
     const result = await originalSendTransaction.apply(this, args)
     if (trace) {

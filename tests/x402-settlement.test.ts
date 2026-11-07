@@ -1,3 +1,4 @@
+import { rpc } from '@stellar/stellar-sdk'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Env } from '../src/index'
 import { checkAndBumpWindowLimit } from '../src/mpp/rate-limit-do'
@@ -149,6 +150,22 @@ describe('runBoundedSettlement', () => {
     expect(r.causes[0]).toContain('preflight queue full')
   })
 
+  it('refuses to submit after the deadline', async () => {
+    let refused: unknown
+    let done: () => void = () => undefined
+    const finished = new Promise<void>((resolve) => {
+      done = resolve
+    })
+    await runBoundedSettlement(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40))
+      refused = await new rpc.Server('https://rpc.invalid').sendTransaction({} as never).catch((e) => e)
+      done()
+      return { success: false }
+    }, undefined, 10)
+    await finished
+    expect(String(refused)).toContain('not submitting')
+  })
+
   it('does not capture console.error from outside a settlement', async () => {
     const r = await runBoundedSettlement(async () => {
       await new Promise((resolve) => setTimeout(resolve, 1))
@@ -238,6 +255,29 @@ describe('settleAndRecordX402', () => {
 
     await resolveOpenX402Settlements(env, { getStatus: async () => 'SUCCESS', now: Date.now() + 70_000 })
     expect(rows(store)[0]).toMatchObject({ settlement_status: 'settled', settlement_ref: 'h1' })
+  })
+})
+
+describe('open marker writes', () => {
+  it('spaces same-key writes so a second hash is not rate limited', async () => {
+    const { env } = fakeEnv()
+    const { ctx } = fakeCtx()
+    const times: number[] = []
+    const put = env.MPP_STORE.put.bind(env.MPP_STORE)
+    env.MPP_STORE.put = (async (k: string, v: string) => {
+      if (k.startsWith('x402_settle_open:')) times.push(Date.now())
+      return put(k, v)
+    }) as never
+    await settleAndRecordX402({
+      ...baseParams, env, ctx,
+      settle: async (_e, _p, _r, opts) => {
+        await opts?.onSigned?.(['h1'])
+        await opts?.onSigned?.(['h1', 'h2'])
+        return { success: false, outcome: 'unknown', attemptedTxs: ['h1', 'h2'], causes: [] }
+      },
+    })
+    expect(times.length).toBeGreaterThanOrEqual(4)
+    for (let i = 1; i < times.length; i++) expect(times[i] - times[i - 1]).toBeGreaterThanOrEqual(1_000)
   })
 })
 
