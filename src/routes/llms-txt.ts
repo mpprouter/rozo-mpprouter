@@ -148,10 +148,11 @@ the merchant pre-charges the maximum) and it returns the plain OpenAI
 chat-completion shape with no wrapper:
 
   POST /v1/services/deepseek/chat
-  {"model":"deepseek-flash","max_tokens":16,
+  {"model":"deepseek-flash","max_tokens":256,
    "messages":[{"role":"user","content":"Say hi in three words."}]}
 
-Expect 200 with choices[0].message.content set.
+Expect 200 with choices[0].message.content set. A very small max_tokens
+can return empty content with finish_reason "length" while still paid.
 
 Pitfalls seen in real integrations:
 

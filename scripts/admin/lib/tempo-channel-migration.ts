@@ -19,6 +19,11 @@ export interface SessionChallenge {
 /** Parse an unpaid 402 `WWW-Authenticate` header. Throws on anything unusable. */
 export function parseSessionChallenge(wwwAuthenticate: string | null): SessionChallenge {
   if (!wwwAuthenticate) throw new Error('merchant returned no WWW-Authenticate challenge')
+  // The manager picks from a challenge list by its own rules. With more than one
+  // on offer, checking the first would not prove which one it signs.
+  if ((wwwAuthenticate.match(/\brequest="/g) ?? []).length !== 1) {
+    throw new Error('expected exactly one payment challenge')
+  }
   const intent = wwwAuthenticate.match(/intent="([^"]+)"/)?.[1]
   const encoded = wwwAuthenticate.match(/request="([^"]+)"/)?.[1]
   if (!intent || !encoded) throw new Error('challenge has no intent or request')

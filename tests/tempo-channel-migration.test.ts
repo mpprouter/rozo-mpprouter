@@ -66,6 +66,7 @@ describe('parseSessionChallenge', () => {
     ['no currency', header({ ...REQUEST, currency: '' })],
     ['no chain', header({ ...REQUEST, methodDetails: { escrowContract: ESCROW } })],
     ['other decimals', header({ ...REQUEST, decimals: 18 })],
+    ['two challenges', `${header(REQUEST)}, ${header({ ...REQUEST, recipient: WALLET })}`],
   ])('refuses %s', (_name, value) => {
     expect(() => parseSessionChallenge(value)).toThrow()
   })
