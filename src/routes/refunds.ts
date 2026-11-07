@@ -1,3 +1,4 @@
+import { stellarRpcUrl } from '../utils/stellar-rpc'
 import type { Env } from '../index'
 import {
   completeRefund,
@@ -247,7 +248,7 @@ export async function handleRefundAdmin(request: Request, env: Env, url: URL): P
       return json({ error: 'Submitted refund not found or lease mismatch' }, 409)
     }
     try {
-      const proof = await verifyConfirmedRefund(current, current.signedXdr, env.STELLAR_NETWORK, env.STELLAR_RPC_URL)
+      const proof = await verifyConfirmedRefund(current, current.signedXdr, env.STELLAR_NETWORK, stellarRpcUrl(env))
       const job = await completeRefund(env, body.refundId, body.leaseId, {
         state: 'confirmed', refundTx: proof.txHash, confirmedLedger: proof.ledger,
       })
@@ -264,7 +265,7 @@ export async function handleRefundAdmin(request: Request, env: Env, url: URL): P
     }
     const computed = validateSignedRefundXdr(current, current.signedXdr, env.STELLAR_NETWORK)
     if (computed !== current.refundTx) return json({ error: 'Stored refund proof mismatch' }, 409)
-    const result = await new rpc.Server(env.STELLAR_RPC_URL).getTransaction(current.refundTx)
+    const result = await new rpc.Server(stellarRpcUrl(env)).getTransaction(current.refundTx)
     if (result.status !== rpc.Api.GetTransactionStatus.NOT_FOUND) {
       return json({ error: `Refusing to replace transaction in state ${result.status}` }, 409)
     }

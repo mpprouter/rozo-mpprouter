@@ -214,6 +214,12 @@ CREATE_INVOICE_GLOBAL_LIMIT_PER_HOUR = "1500"
 INTERCOM_TICKET_TYPE_ID = "4"
 INTERCOM_TICKET_CONTACT_ID = "6a9cac997c5b31a93e30847f"
 STELLAR_NETWORK = "stellar:pubnet"
+# Public default, also advertised to clients by GET /v1/playground/config.
+# A keyed endpoint belongs in the STELLAR_RPC_URL_PRIMARY *secret*, which replaces
+# this URL for every Worker read when set. There is no request-time fallback.
+# It is a separate secret for the same two reasons as TEMPO_RPC_URL_PRIMARY below,
+# and because this value is public. Set with:
+#   wrangler secret put STELLAR_RPC_URL_PRIMARY
 STELLAR_RPC_URL = "https://soroban-rpc.mainnet.stellar.gateway.fm"
 # Comma-separated POOL, round-robined per request (src/mpp/tempo-rpc.ts).
 # Public Tempo endpoints rate-limit per source IP, and on Workers the egress

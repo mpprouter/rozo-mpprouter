@@ -18,6 +18,7 @@
  *            unreadable for RESOLVER_GIVE_UP_MS.
  */
 
+import { stellarRpcUrl } from '../utils/stellar-rpc'
 import { rpc } from '@stellar/stellar-sdk'
 import type { PaymentPayload, PaymentRequirements } from '@x402/core/types'
 import type { Env } from '../index'
@@ -199,7 +200,7 @@ export async function resolveOpenX402Settlements(env: Env, deps: ResolverDeps = 
   try {
     const listed = await env.MPP_STORE.list({ prefix: OPEN_PREFIX, limit: RESOLVER_BATCH })
     if (listed.keys.length === 0) return
-    const server = new rpc.Server(env.STELLAR_RPC_URL)
+    const server = new rpc.Server(stellarRpcUrl(env))
     const getStatus = deps.getStatus ?? (async (hash: string) => (await server.getTransaction(hash)).status as ChainStatus)
     const now = deps.now ?? Date.now()
     for (const { name } of listed.keys) {

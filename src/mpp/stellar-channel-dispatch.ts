@@ -40,6 +40,7 @@
  * merchant-pay phase to consume.
  */
 
+import { stellarRpcUrl } from '../utils/stellar-rpc'
 import { stellar } from '@stellar/mpp/channel/server'
 import { Mppx, Store } from 'mppx/server'
 import { Credential } from 'mppx'
@@ -150,7 +151,7 @@ export function createStellarChannelPayment(
     commitmentKey,
     store,
     network: env.STELLAR_NETWORK as any,
-    rpcUrl: env.STELLAR_RPC_URL,
+    rpcUrl: stellarRpcUrl(env),
     // V2 rollout decision (2026-04-11): no feePayer. Agent pays
     // its own XLM for Soroban resource fees because fee-bump
     // cannot cover them (see notes.md §N1). Router does not

@@ -66,6 +66,7 @@
  * stellar.charge / stellar.channel ones.
  */
 
+import { scrubRpcSecret, stellarRpcUrl } from '../utils/stellar-rpc'
 import { x402Facilitator } from '@x402/core/facilitator'
 import { parsePaymentPayload } from '@x402/core/schemas'
 // Use the unified PaymentPayload type from `@x402/core/types` rather
@@ -151,7 +152,7 @@ function describeCause(value: unknown): string {
 }
 
 function addCause(trace: SettleTrace, cause: string): void {
-  if (trace.causes.length < MAX_TRACED_CAUSES) trace.causes.push(cause.slice(0, MAX_CAUSE_CHARS))
+  if (trace.causes.length < MAX_TRACED_CAUSES) trace.causes.push(scrubRpcSecret(cause).slice(0, MAX_CAUSE_CHARS))
 }
 
 /**
@@ -269,9 +270,10 @@ let cachedFacilitator:
   | null = null
 
 function getFacilitator(env: Env): x402Facilitator {
+  const rpcUrl = stellarRpcUrl(env)
   if (
     cachedFacilitator &&
-    cachedFacilitator.rpcUrl === env.STELLAR_RPC_URL &&
+    cachedFacilitator.rpcUrl === rpcUrl &&
     cachedFacilitator.network === env.STELLAR_NETWORK
   ) {
     return cachedFacilitator.facilitator
@@ -289,7 +291,7 @@ function getFacilitator(env: Env): x402Facilitator {
   ))
 
   const scheme = new ExactStellarScheme([signer], {
-    rpcConfig: { url: env.STELLAR_RPC_URL },
+    rpcConfig: { url: rpcUrl },
     // areFeesSponsored defaults to true — the facilitator pays tx
     // fees on behalf of the agent. This matches our gas-sponsor
     // wallet model where the router's STELLAR_GAS_SECRET account
@@ -321,7 +323,7 @@ function getFacilitator(env: Env): x402Facilitator {
 
   cachedFacilitator = {
     facilitator,
-    rpcUrl: env.STELLAR_RPC_URL,
+    rpcUrl,
     network: env.STELLAR_NETWORK,
   }
   return facilitator
@@ -1031,15 +1033,29 @@ export async function settleStellarX402(
       success: false,
       outcome: 'failed',
       errorReason: 'facilitator_init_failed',
-      errorMessage: err.message,
+      errorMessage: scrubRpcSecret(String(err.message)),
       attemptedTxs: [],
       causes: [],
     }
   }
-  return runBoundedSettlement(
+  return scrubSettleResult(await runBoundedSettlement(
     () => facilitator.settle(payload, requirements),
     opts.onSigned,
-  )
+  ))
+}
+
+/**
+ * These fields reach the 200 response's PAYMENT-RESPONSE and
+ * X-Payment-Settle-Reason headers, and the replay cache, none of which the
+ * error-response guard sees.
+ */
+export function scrubSettleResult(result: StellarX402SettleResult): StellarX402SettleResult {
+  return {
+    ...result,
+    errorReason: result.errorReason === undefined ? undefined : scrubRpcSecret(result.errorReason),
+    errorMessage: result.errorMessage === undefined ? undefined : scrubRpcSecret(result.errorMessage),
+    causes: result.causes.map(scrubRpcSecret),
+  }
 }
 
 /**

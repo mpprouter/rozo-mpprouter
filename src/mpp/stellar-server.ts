@@ -24,6 +24,7 @@
  * for OpenRouter. Agent-side streaming is V2 — see §9 wishlist.
  */
 
+import { stellarRpcUrl } from '../utils/stellar-rpc'
 import { stellar } from '@stellar/mpp/charge/server'
 import { Mppx, Store } from 'mppx/server'
 import type { Env } from '../index'
@@ -96,7 +97,7 @@ export function createStellarPaymentForRecipient(
     currency: getStellarUsdcSac(env),
     recipient,
     network: env.STELLAR_NETWORK as any,
-    rpcUrl: env.STELLAR_RPC_URL,
+    rpcUrl: stellarRpcUrl(env),
     store,
     // Gas sponsor: pays Stellar tx fees so agents don't need XLM
     feePayer: {
