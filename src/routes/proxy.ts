@@ -183,12 +183,14 @@ export function forwardHeaders(
     // challenge the merchant offers and leaves zero candidates ("No method
     // found for challenges"). The router pays merchants on its own terms.
     if (lower === 'accept-payment') continue
-    // The agent's x402 credential pays THE ROUTER (Stellar). Merchants that
+    // The agent's x402 v2 credential pays THE ROUTER (Stellar). Merchants that
     // also speak x402 (Exa, Parallel; 2026-11-07) read it as an attempt to pay
     // THEM, reject it as invalid and answer without the Tempo challenge, so the
     // router 502'd "Merchant returned 402 without WWW-Authenticate header".
-    // Transparent passthrough keeps them: there the agent pays the merchant.
-    if ((lower === 'payment-signature' || lower === 'x-payment') && !opts.keepAuthorization) continue
+    // Transparent passthrough keeps it: there the agent pays the merchant.
+    // The legacy X-PAYMENT header is never read by the router, so it is left
+    // alone for clients that pay the merchant directly with it.
+    if (lower === 'payment-signature' && !opts.keepAuthorization) continue
     headers[key] = value
   }
   return headers
@@ -1044,7 +1046,11 @@ async function payMerchantAndGetBodyInner(
         method: request.method,
         headers: forwardHeaders(request),
         body: requestBody,
-      }, parsed.lockCurrency ? { currency: parsed.lockCurrency } : {})
+      }, parsed.lockCurrency
+        // The buyer was quoted this challenge: pay it in the same token and
+        // never more than its amount, or refuse before signing.
+        ? { currency: parsed.lockCurrency, maxAmountRaw: parsed.request.amount }
+        : {})
     }
   } catch (err: any) {
     if (err instanceof ChannelNotInstalledError || err?.name === 'ChannelDepositExhaustedError') {
