@@ -23,6 +23,7 @@ import {
 } from '../services/merchants'
 import { normalizePayInvoiceBody } from './pay-invoice-admin'
 import { recordRouteFailure, recordRouteSuccess } from '../services/route-health'
+import { settleAndRecordX402 } from '../services/x402-settlement'
 import { asyncCallId, classifyOutcome, recordRouteCall } from '../services/route-metrics'
 import {
   ChannelNotInstalledError,
@@ -52,7 +53,6 @@ import {
   checkAndReserveNonce,
   isStellarX402ForThisRouter,
   prepareStellarX402Inbound,
-  settleStellarX402,
   verifyStellarX402WithFacilitator,
 } from '../mpp/stellar-x402-server'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
@@ -1979,73 +1979,59 @@ export async function handleProxy(
     const asyncResponse = await handleAsyncJob(env, payResult, route, authHeader, url)
     if (asyncResponse) {
       // Still need to settle the x402 payment — agent paid, merchant accepted
-      const settle = await settleStellarX402(env, verify.payload, verify.requirements)
-      if (!settle.success) {
-        console.error(
-          `[proxy] stellar.x402 SETTLE FAILED (async 202) for ${route.id}: ` +
-            `${settle.errorReason ?? ''} ${settle.errorMessage ?? ''}`,
-        )
-      }
+      await settleAndRecordX402({
+        env,
+        ctx,
+        payload: verify.payload,
+        requirements: verify.requirements,
+        routeId: route.id,
+        payer: prepared.payer,
+        amountUsd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+        requestPath: `${upstreamPath}${forwardedSearch}`,
+        upstreamStatus: payResult.merchantStatus,
+        latencyMs: payResult.latencyMs ?? 0,
+      })
       return asyncResponse
     }
 
-    // Merchant 2xx — now submit the agent's signed Soroban invoke
-    // on chain. Failures here are logged loudly but do NOT hide
-    // merchant content from the agent: they already got served,
-    // router has committed to the cost, and we don't want to
-    // confuse them with a 500 after a successful upstream call.
-    const settle = await settleStellarX402(env, verify.payload, verify.requirements)
-    if (!settle.success) {
-      console.error(
-        `[proxy] stellar.x402 SETTLE FAILED after merchant 2xx for ${route.id}: ` +
-          `${settle.errorReason ?? ''} ${settle.errorMessage ?? ''}`,
-      )
-      // Do NOT release the nonce reservation — we DID verify and we
-      // DID pay the merchant, so the agent cannot safely re-use the
-      // same authorization. The KV entry expires on its TTL.
-    } else {
+    // Merchant 2xx — now submit the agent's signed Soroban invoke on chain.
+    // Failures here do NOT hide merchant content from the agent: they already
+    // got served, and router has committed to the cost. On failure the nonce
+    // reservation stays: we DID pay the merchant, so the agent cannot safely
+    // re-use the same authorization. It expires on its TTL.
+    //
+    // The ledger row and bounded wait live in settleAndRecordX402: a row is
+    // written for EVERY paid call, before settlement starts, because the
+    // records back the public GET /v1/ledger. Payer is decoded from the signed
+    // XDR and stays null when the payload shape defeats decoding.
+    const settle = await settleAndRecordX402({
+      env,
+      ctx,
+      payload: verify.payload,
+      requirements: verify.requirements,
+      routeId: route.id,
+      payer: prepared.payer,
+      amountUsd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
+      requestPath: `${upstreamPath}${forwardedSearch}`,
+      upstreamStatus: payResult.merchantStatus,
+      latencyMs: payResult.latencyMs ?? 0,
+    })
+    if (settle.success) {
       console.log(
         `[proxy] stellar.x402 settled for ${route.id}: tx=${settle.transaction ?? 'n/a'}`,
       )
     }
 
     // Payment log. The idempotency cache on this branch is keyed on the
-    // signed payload hash, not on the decoded payer: prepare() decodes the
-    // payer for LEDGER ATTRIBUTION only, and that is a best-effort value that
-    // can be null, so it must never scope a cached paid response. The
-    // payload hash is the credential itself (see buildX402ReplayKey), which
-    // is what lets a dropped-connection retry recover the result below.
+    // signed payload hash, not on the decoded payer, because the payer can be
+    // null and must never scope a cached paid response. The payload hash is
+    // the credential itself (see buildX402ReplayKey), which is what lets a
+    // dropped-connection retry recover the result below.
     ctx.waitUntil((async () => {
       console.log(
         `[payment] route=${route.id} method=stellar.x402 merchant=${merchantHost} upstreamPath=${upstreamPath}`,
       )
     })())
-
-    // Per-call order ledger (design doc §2.9). Recorded for EVERY settled
-    // call, not only router-held-credential (Mercury) routes: the records
-    // now back the public GET /v1/ledger, and a ledger that silently omits
-    // most of the router's paid traffic misrepresents it. settlement_ref is
-    // the on-chain settle tx when it succeeded.
-    //
-    // Payer IS now decoded from the signed XDR (extractPayerFromXdr, run
-    // during prepare). It stays null when the payload shape defeats
-    // decoding, so consumers must still treat null as "unknown", not as
-    // "no payer". Attribution never gates the payment: prepare already
-    // succeeded by this point regardless of what the decoder returned.
-    {
-      ctx.waitUntil(recordOrder(env, {
-        order_id: newOrderId(),
-        ts: new Date().toISOString(),
-        route_id: route.id,
-        payer: prepared.payer,
-        amount_usd: baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
-        settlement_ref: settle.transaction ?? null,
-        request_path: `${upstreamPath}${forwardedSearch}`,
-        upstream_status: payResult.merchantStatus,
-        latency_ms: payResult.latencyMs ?? 0,
-        refund_status: 'none' as RefundStatus,
-      }))
-    }
 
     const headers: Record<string, string> = {
       'Content-Type': payResult.contentType,
@@ -2057,19 +2043,19 @@ export async function handleProxy(
       'X-MPPRouter-Upstream-Cost': baseUnitsToDecimalString(parsed.request.amount, TEMPO_DEFAULT_DECIMALS),
     }
     if (prepared.payer) headers['X-MPPRouter-Payer'] = prepared.payer
-    if (settle.transaction) headers['X-Payment-Tx'] = settle.transaction
+    if (settle.success && settle.transaction) headers['X-Payment-Tx'] = settle.transaction
     // Spec-shaped settlement receipt for x402 clients (@x402/core reads
     // PAYMENT-RESPONSE); the X-Payment-Tx form above is kept for existing readers.
     headers['PAYMENT-RESPONSE'] = btoa(JSON.stringify({
       success: settle.success,
-      transaction: settle.transaction ?? '',
+      transaction: settle.success ? (settle.transaction ?? '') : '',
       network: env.STELLAR_NETWORK,
       ...(prepared.payer ? { payer: prepared.payer } : {}),
       ...(settle.errorReason ? { errorReason: settle.errorReason } : {}),
     }))
     headers['X-Payment-Method'] = 'stellar.x402'
     if (!settle.success) {
-      headers['X-Payment-Settle-Status'] = 'failed'
+      headers['X-Payment-Settle-Status'] = settle.outcome
       if (settle.errorReason) headers['X-Payment-Settle-Reason'] = settle.errorReason
     } else {
       headers['X-Payment-Settle-Status'] = 'settled'

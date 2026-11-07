@@ -58,6 +58,7 @@ import { handleOpenApi } from './routes/openapi'
 import { handleAiPlugin } from './routes/ai-plugin'
 import { handleAdminPayInvoice, handleQuoteInvoice } from './routes/pay-invoice-admin'
 import { handleAdminSeedStore } from './routes/admin-seed-store'
+import { resolveOpenX402Settlements } from './services/x402-settlement'
 import { handleStripeFulfillmentResolve, handleStripeFulfillmentRetry } from './routes/stripe-fulfillment-admin'
 import { handleCoinbaseExecGateClear } from './routes/coinbase-exec-gate-admin'
 import { handleCheckoutControl } from './routes/checkout-control-admin'
@@ -714,6 +715,9 @@ export default {
       return
     }
     ctx.waitUntil(reconcileAsyncRefunds(env))
+    // stellar.x402 rows whose settlement outcome was unknown when the request
+    // ended. Read-only on chain; no RPC calls when nothing is open.
+    ctx.waitUntil(resolveOpenX402Settlements(env))
     // Stripe Crypto: confirm in-flight settlements against the live session
     // (the webhook request that started them may have been cut off by the
     // sender's 10s timeout). Read-only towards Stripe; never signs.
