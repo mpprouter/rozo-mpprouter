@@ -33,7 +33,8 @@ function order(o: Partial<any> & { route_id: string; ts: string }) {
  */
 const MIGRATION =
   readFileSync(new URL('../migrations-metrics/0002_order_ledger_stats.sql', import.meta.url), 'utf8') +
-  readFileSync(new URL('../migrations-metrics/0003_order_ledger_stats_settled.sql', import.meta.url), 'utf8')
+  readFileSync(new URL('../migrations-metrics/0003_order_ledger_stats_settled.sql', import.meta.url), 'utf8') +
+  readFileSync(new URL('../migrations-metrics/0004_order_ledger_stats_upstream_ok.sql', import.meta.url), 'utf8')
 
 /**
  * D1 stub: `order_ledger_stats` SQL runs against a real in-memory SQLite
@@ -78,7 +79,7 @@ async function env(records: string[], opts: { internal?: string; unresolved?: st
     if (!row) continue
     db.sqlite
       .prepare(UPSERT_ORDER_STATS_SQL)
-      .run(row.order_id, row.created_at, row.service_id, row.amount_micros, row.payer_digest, row.refunded, row.settled)
+      .run(row.order_id, row.created_at, row.service_id, row.amount_micros, row.payer_digest, row.refunded, row.settled, row.upstream_ok)
   }
   return {
     MPP_STORE: forbiddenKv,
@@ -150,14 +151,14 @@ describe('getStats', () => {
     const base = JSON.parse(order({ route_id: 'mercury_a', ts: iso(now - 1000), settlement_status: 'unknown', settlement_ref: null }))
     for (const entry of [base, { ...base, settlement_status: 'settled', settlement_ref: 'tx' }]) {
       const row = await orderStatsRow(entry)
-      db.prepare(UPSERT_ORDER_STATS_SQL).run(row!.order_id, row!.created_at, row!.service_id, row!.amount_micros, row!.payer_digest, row!.refunded, row!.settled)
+      db.prepare(UPSERT_ORDER_STATS_SQL).run(row!.order_id, row!.created_at, row!.service_id, row!.amount_micros, row!.payer_digest, row!.refunded, row!.settled, row!.upstream_ok)
     }
     const s = await getStats(e, '30d')
     expect(s.totals.calls).toBe(1)
     expect(s.totals.unsettled_calls).toBe(0)
     // A late replay of the old unresolved state must not undo the settlement.
     const stale = await orderStatsRow(base)
-    db.prepare(UPSERT_ORDER_STATS_SQL).run(stale!.order_id, stale!.created_at, stale!.service_id, stale!.amount_micros, stale!.payer_digest, stale!.refunded, stale!.settled)
+    db.prepare(UPSERT_ORDER_STATS_SQL).run(stale!.order_id, stale!.created_at, stale!.service_id, stale!.amount_micros, stale!.payer_digest, stale!.refunded, stale!.settled, stale!.upstream_ok)
     expect((await getStats(e, '30d')).totals.calls).toBe(1)
   })
 
@@ -290,5 +291,101 @@ describe('getStats commerce rollup', () => {
     expect(s.totals.refunded).toBe(1)
     const row = db.sqlite.prepare('SELECT payer_digest FROM order_ledger_stats').get() as any
     expect(row.payer_digest).not.toContain('G')
+  })
+})
+
+describe('getStats last_verified_at', () => {
+  const at = (ms: number) => Math.floor(ms / 1000) * 1000
+  const t1 = at(now - 1 * DAY)
+  const t2 = at(now - 2 * DAY)
+  const t3 = at(now - 3 * DAY)
+
+  it('is the newest internal call whose upstream delivered', async () => {
+    const s = await getStats(
+      await env(
+        [
+          order({ route_id: 'mercury_a', ts: iso(t2), payer: INTERNAL }),
+          order({ route_id: 'mercury_b', ts: iso(t3), payer: INTERNAL }),
+        ],
+        { internal: INTERNAL },
+      ),
+      '30d',
+    )
+    const m = s.services.find((x) => x.service_id === 'mercury')!
+    expect(m.last_verified_at).toBe(t2)
+    // Internal calls still stay out of every commerce figure.
+    expect(m.calls).toBe(0)
+    expect(m.last_call_at).toBeNull()
+    expect(m.internal_calls).toBe(2)
+  })
+
+  it('does not count internal calls that failed upstream, were refunded or did not settle', async () => {
+    const s = await getStats(
+      await env(
+        [
+          order({ route_id: 'mercury_a', ts: iso(t3), payer: INTERNAL }),
+          order({ route_id: 'mercury_a', ts: iso(t2), payer: INTERNAL, upstream_status: 502, refund_status: 'pending' }),
+          order({ route_id: 'mercury_a', ts: iso(t1), payer: INTERNAL, upstream_status: 200, refund_status: 'refunded' }),
+          order({ route_id: 'mercury_a', ts: iso(now - 1000), payer: INTERNAL, settlement_status: 'failed', settlement_ref: null }),
+          order({ route_id: 'exa_search', ts: iso(t1), payer: INTERNAL, upstream_status: 403, refund_status: 'none' }),
+        ],
+        { internal: INTERNAL },
+      ),
+      '30d',
+    )
+    expect(s.services.find((x) => x.service_id === 'mercury')!.last_verified_at).toBe(t3)
+    expect(s.services.find((x) => x.service_id === 'exa')!.last_verified_at).toBeNull()
+  })
+
+  it('does not count external calls', async () => {
+    const s = await getStats(
+      await env([order({ route_id: 'mercury_a', ts: iso(t1), payer: BUYER_A })], { internal: INTERNAL }),
+      '30d',
+    )
+    expect(s.services[0].calls).toBe(1)
+    expect(s.services[0].last_call_at).toBe(t1)
+    expect(s.services[0].last_verified_at).toBeNull()
+  })
+
+  it('is null for everyone when no internal payer list is configured', async () => {
+    const s = await getStats(await env([order({ route_id: 'mercury_a', ts: iso(t1), payer: INTERNAL })]), '30d')
+    expect(s.services[0].last_verified_at).toBeNull()
+  })
+
+  it('looks back 90 days even on a 24h window', async () => {
+    const records = [
+      order({ route_id: 'exa_search', ts: iso(now - 1000), payer: BUYER_A }),
+      order({ route_id: 'exa_search', ts: iso(at(now - 40 * DAY)), payer: INTERNAL }),
+      order({ route_id: 'exa_search', ts: iso(at(now - 100 * DAY)), payer: INTERNAL }),
+    ]
+    const day = await getStats(await env(records, { internal: INTERNAL }), '24h')
+    expect(day.services[0].last_verified_at).toBe(at(now - 40 * DAY))
+    expect(day.services[0].internal_calls).toBe(0)
+    const all = await getStats(await env([records[2]], { internal: INTERNAL }), 'all')
+    expect(all.services[0].last_verified_at).toBe(at(now - 100 * DAY))
+  })
+
+  it('a later refund un-verifies a call and a replay cannot re-verify it', async () => {
+    const e = await env([], { internal: INTERNAL })
+    const db = (e as any).ROUTE_METRICS_DB.sqlite
+    const base = JSON.parse(order({ route_id: 'mercury_a', ts: iso(t1), payer: INTERNAL }))
+    for (const entry of [base, { ...base, refund_status: 'refunded' }, base]) {
+      const row = (await orderStatsRow(entry))!
+      db.prepare(UPSERT_ORDER_STATS_SQL).run(row.order_id, row.created_at, row.service_id, row.amount_micros, row.payer_digest, row.refunded, row.settled, row.upstream_ok)
+    }
+    expect((await getStats(e, '30d')).services[0].last_verified_at).toBeNull()
+  })
+
+  it('fills a pre-migration NULL on re-upsert', async () => {
+    const e = await env([], { internal: INTERNAL })
+    const db = (e as any).ROUTE_METRICS_DB.sqlite
+    const entry = JSON.parse(order({ route_id: 'mercury_a', ts: iso(t1), payer: INTERNAL }))
+    const row = (await orderStatsRow(entry))!
+    db.prepare(
+      'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded, settled) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run(row.order_id, row.created_at, row.service_id, row.amount_micros, row.payer_digest, row.refunded, row.settled)
+    expect((await getStats(e, '30d')).services[0].last_verified_at).toBeNull()
+    db.prepare(UPSERT_ORDER_STATS_SQL).run(row.order_id, row.created_at, row.service_id, row.amount_micros, row.payer_digest, row.refunded, row.settled, row.upstream_ok)
+    expect((await getStats(e, '30d')).services[0].last_verified_at).toBe(t1)
   })
 })

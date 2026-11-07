@@ -1,0 +1,13 @@
+-- Record whether the upstream leg delivered, so /stats can publish when each
+-- service was last verified by our own paid probe call (2026-11-07).
+--
+-- Since #307, our own E2E and monitoring calls are excluded from calls,
+-- volume, buyers and last_call_at. A service we verified an hour ago then
+-- reads "no recent activity", which hides real evidence. last_verified_at is
+-- the newest internal call that settled, got a 2xx from the upstream and was
+-- not refunded. The rollup had no upstream outcome, so this column adds it.
+--
+-- Add-only: a nullable column. Existing writers that do not name it keep
+-- working and leave NULL, which never counts as verified. Rows written before
+-- this migration stay NULL unless re-upserted from the KV ledger.
+ALTER TABLE order_ledger_stats ADD COLUMN upstream_ok INTEGER;

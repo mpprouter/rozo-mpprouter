@@ -61,9 +61,10 @@ for (let i = 0; i < listed.length; i += 100) {
       continue
     }
     statements.push(
-      'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded, settled) VALUES (' +
-        [sqlStr(row.order_id), row.created_at, sqlStr(row.service_id), row.amount_micros, sqlStr(row.payer_digest), row.refunded, row.settled].join(', ') +
-        ') ON CONFLICT(order_id) DO UPDATE SET refunded = MAX(order_ledger_stats.refunded, excluded.refunded), settled = MAX(order_ledger_stats.settled, excluded.settled);',
+      'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded, settled, upstream_ok) VALUES (' +
+        [sqlStr(row.order_id), row.created_at, sqlStr(row.service_id), row.amount_micros, sqlStr(row.payer_digest), row.refunded, row.settled, row.upstream_ok].join(', ') +
+        ') ON CONFLICT(order_id) DO UPDATE SET refunded = MAX(order_ledger_stats.refunded, excluded.refunded), settled = MAX(order_ledger_stats.settled, excluded.settled), ' +
+        'upstream_ok = COALESCE(MIN(order_ledger_stats.upstream_ok, excluded.upstream_ok), excluded.upstream_ok);',
     )
   }
   process.stdout.write(`read ${Math.min(i + 100, listed.length)}/${listed.length}\r`)
