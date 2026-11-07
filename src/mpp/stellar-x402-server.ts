@@ -67,6 +67,7 @@
  */
 
 import { scrubRpcSecret, stellarRpcUrl } from '../utils/stellar-rpc'
+import { currentInclusionBid, INCLUSION_BID_CAP_STROOPS, refreshInclusionBid } from './stellar-inclusion-bid'
 import { x402Facilitator } from '@x402/core/facilitator'
 import { parsePaymentPayload } from '@x402/core/schemas'
 // Use the unified PaymentPayload type from `@x402/core/types` rather
@@ -263,18 +264,22 @@ function boundSettlementPolling(scheme: ExactStellarScheme): void {
  *
  * Cached key includes the rpc URL and network so a mid-isolate
  * config change (which shouldn't happen in Workers) forces a
- * rebuild.
+ * rebuild. The inclusion bid is part of the key because the scheme
+ * only takes it at construction; a settlement already running keeps
+ * the instance it started with.
  */
 let cachedFacilitator:
-  | { facilitator: x402Facilitator; rpcUrl: string; network: string }
+  | { facilitator: x402Facilitator; rpcUrl: string; network: string; inclusionBid: number }
   | null = null
 
 function getFacilitator(env: Env): x402Facilitator {
   const rpcUrl = stellarRpcUrl(env)
+  const inclusionBid = currentInclusionBid()
   if (
     cachedFacilitator &&
     cachedFacilitator.rpcUrl === rpcUrl &&
-    cachedFacilitator.network === env.STELLAR_NETWORK
+    cachedFacilitator.network === env.STELLAR_NETWORK &&
+    cachedFacilitator.inclusionBid === inclusionBid
   ) {
     return cachedFacilitator.facilitator
   }
@@ -314,7 +319,13 @@ function getFacilitator(env: Env): x402Facilitator {
     // while still bounding what the sponsor can be made to pay per
     // call. Fees come from the router's gas-sponsor wallet, so this
     // is a real spend ceiling, not a formality.
-    maxTransactionFeeStroops: 500_000,
+    //
+    // The inclusion bid counts against this ceiling and can rise between the
+    // pre-request verify and settle's re-verify, so leave room for its cap:
+    // the merchant is already paid by then.
+    maxTransactionFeeStroops: 500_000 + INCLUSION_BID_CAP_STROOPS,
+    // Added on top of the resource fee. See stellar-inclusion-bid.ts.
+    inclusionFeeStroops: inclusionBid,
   })
   boundSettlementPolling(scheme)
 
@@ -325,6 +336,7 @@ function getFacilitator(env: Env): x402Facilitator {
     facilitator,
     rpcUrl,
     network: env.STELLAR_NETWORK,
+    inclusionBid,
   }
   return facilitator
 }
@@ -1025,9 +1037,8 @@ export async function settleStellarX402(
   requirements: PaymentRequirements,
   opts: { onSigned?: (hashes: readonly string[]) => Promise<void> } = {},
 ): Promise<StellarX402SettleResult> {
-  let facilitator: x402Facilitator
   try {
-    facilitator = getFacilitator(env)
+    getFacilitator(env)
   } catch (err: any) {
     return {
       success: false,
@@ -1039,7 +1050,14 @@ export async function settleStellarX402(
     }
   }
   return scrubSettleResult(await runBoundedSettlement(
-    () => facilitator.settle(payload, requirements),
+    async () => {
+      // Inside the bounded run so the read counts against the deadline. Only
+      // the bid may change here: the signed auth entry is taken from the
+      // payload untouched, so its single-use nonce still rules out a double
+      // charge across a retry. The retry reuses the cached reading.
+      await refreshInclusionBid(stellarRpcUrl(env))
+      return getFacilitator(env).settle(payload, requirements)
+    },
     opts.onSigned,
   ))
 }
