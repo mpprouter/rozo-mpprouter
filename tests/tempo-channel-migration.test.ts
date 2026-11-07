@@ -4,6 +4,8 @@ import { privateKeyToAccount } from 'viem/accounts'
 import {
   assertChallengeMatchesApproval,
   assertOpenedChannel,
+  assertWithinDepositCeiling,
+  guardedChallengeFetch,
   assertSlotsReady,
   installChannel,
   parseSessionChallenge,
@@ -87,7 +89,8 @@ describe('assertOpenedChannel', () => {
     channelId: '0xnew',
     escrow: ESCROW,
     descriptor: DESCRIPTOR,
-    onChain: { token: OUSD, deposit: 1_000_000n, settled: 0n, closeRequestedAt: 0n },
+    derivedChannelId: '0xnew',
+    onChain: { deposit: 1_000_000n, settled: 0n, closeRequestedAt: 0n },
   }
   it('accepts a channel that agrees everywhere', () => {
     expect(() => assertOpenedChannel(good, CHALLENGE, WALLET, 1_000_000n)).not.toThrow()
@@ -99,10 +102,36 @@ describe('assertOpenedChannel', () => {
     ['wrong payee', { descriptor: { ...DESCRIPTOR, payee: WALLET } }],
     ['wrong payer', { descriptor: { ...DESCRIPTOR, payer: OLD_WALLET } }],
     ['wrong signer', { descriptor: { ...DESCRIPTOR, authorizedSigner: OLD_WALLET } }],
+    ['descriptor not deriving the id', { derivedChannelId: '0xother' }],
     ['short deposit', { onChain: { ...good.onChain, deposit: 1n } }],
     ['closing', { onChain: { ...good.onChain, closeRequestedAt: 5n } }],
   ])('refuses %s', (_name, over) => {
     expect(() => assertOpenedChannel({ ...good, ...over }, CHALLENGE, WALLET, 1_000_000n)).toThrow(/refusing/)
+  })
+})
+
+describe('guardedChallengeFetch', () => {
+  const answer = (request: Record<string, unknown>) => async () =>
+    new Response(null, { status: 402, headers: { 'www-authenticate': header(request) } })
+  it('passes the approved challenge and non-402 responses', async () => {
+    await expect(guardedChallengeFetch(CHALLENGE, answer(REQUEST) as never)('https://x')).resolves.toBeDefined()
+    const ok = async () => new Response('{}', { status: 200 })
+    await expect(guardedChallengeFetch(CHALLENGE, ok as never)('https://x')).resolves.toBeDefined()
+  })
+  it.each([
+    ['currency', { ...REQUEST, currency: USDC }],
+    ['recipient', { ...REQUEST, recipient: WALLET }],
+    ['escrow', { ...REQUEST, methodDetails: { escrowContract: PAYEE, chainId: 4217 } }],
+    ['chain', { ...REQUEST, methodDetails: { escrowContract: ESCROW, chainId: 1 } }],
+  ])('refuses a changed %s before signing', async (_name, changed) => {
+    await expect(guardedChallengeFetch(CHALLENGE, answer(changed) as never)('https://x')).rejects.toThrow(/refusing/)
+  })
+})
+
+describe('assertWithinDepositCeiling', () => {
+  it('refuses a top-up past the ceiling', () => {
+    expect(() => assertWithinDepositCeiling(2n, 1n)).toThrow(/ceiling/)
+    expect(() => assertWithinDepositCeiling(1n, 1n)).not.toThrow()
   })
 })
 

@@ -50,6 +50,8 @@ import { tempo as tempoChain } from 'viem/chains'
 import {
   assertChallengeMatchesApproval,
   assertOpenedChannel,
+  assertWithinDepositCeiling,
+  guardedChallengeFetch,
   assertSlotsReady,
   installChannel,
   parseSessionChallenge,
@@ -478,6 +480,7 @@ async function main() {
     // fully control, sidestepping the exhausted legacy channels.
     bootstrap: false,
     maxDeposit: maxDepositUsdc,
+    fetch: guardedChallengeFetch(challenge),
     sessionStore: {
       get() {
         // Fresh open — no prior channel to resume from.
@@ -544,6 +547,7 @@ async function main() {
   const desiredHeadroomRaw = depositRaw
   const requiredDepositRaw = BigInt(sm.cumulative) + desiredHeadroomRaw
   const currentDepositRaw = BigInt(capturedStored?.deposit ?? '0')
+  assertWithinDepositCeiling(requiredDepositRaw, maxDepositCeilingRaw)
   if (currentDepositRaw < requiredDepositRaw) {
     const topUpRaw = requiredDepositRaw - currentDepositRaw
     console.log(
@@ -580,8 +584,14 @@ async function main() {
       channelId: sm.channelId as string,
       escrow,
       descriptor,
+      derivedChannelId: descriptor
+        ? Session.Precompile.Channel.computeId({
+            ...(descriptor as any),
+            chainId: challenge.chainId,
+            escrow: escrow as `0x${string}`,
+          })
+        : '',
       onChain: {
-        token: descriptor?.token,
         deposit: onChainDepositRaw,
         settled: BigInt(onChain.settled),
         closeRequestedAt: BigInt(onChain.closeRequestedAt),

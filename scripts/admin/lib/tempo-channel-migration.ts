@@ -65,6 +65,39 @@ export function assertChallengeMatchesApproval(challenge: SessionChallenge, expe
   }
 }
 
+/**
+ * A fetch for the session manager that re-checks every 402 before the manager
+ * can sign. The approved challenge was read in a separate request, and the
+ * merchant can answer this one differently.
+ */
+export function guardedChallengeFetch(
+  approved: SessionChallenge,
+  underlying: typeof fetch = fetch,
+): typeof fetch {
+  return async (input, init) => {
+    const response = await underlying(input, init)
+    if (response.status === 402) {
+      const live = parseSessionChallenge(response.headers.get('www-authenticate'))
+      if (
+        !sameAddress(live.currency, approved.currency) ||
+        !sameAddress(live.recipient, approved.recipient) ||
+        !sameAddress(live.escrowContract, approved.escrowContract) ||
+        live.chainId !== approved.chainId
+      ) {
+        throw new Error('merchant changed the challenge after approval; refusing to sign')
+      }
+    }
+    return response
+  }
+}
+
+/** The script's own arithmetic, so the ceiling does not rest on the manager's. */
+export function assertWithinDepositCeiling(requiredDepositRaw: bigint, ceilingRaw: bigint): void {
+  if (requiredDepositRaw > ceilingRaw) {
+    throw new Error(`required deposit ${requiredDepositRaw} exceeds the approved ceiling ${ceilingRaw}; not topping up`)
+  }
+}
+
 export interface ChannelDescriptor {
   authorizedSigner: string
   expiringNonceHash: string
@@ -79,7 +112,12 @@ export interface OpenedChannel {
   channelId: string
   escrow: string
   descriptor?: ChannelDescriptor
-  onChain: { token?: string; payer?: string; payee?: string; deposit: bigint; settled: bigint; closeRequestedAt?: bigint }
+  /**
+   * Channel id recomputed from the descriptor. The id commits to token, payer,
+   * payee and signer, so a match proves the descriptor is the on-chain channel.
+   */
+  derivedChannelId: string
+  onChain: { deposit: bigint; settled: bigint; closeRequestedAt: bigint }
 }
 
 /** Every field the Worker signs with must agree before the channel enters KV. */
@@ -101,12 +139,12 @@ export function assertOpenedChannel(
     if (!sameAddress(d.payer, walletAddress)) problems.push('descriptor payer is not the wallet')
     if (!sameAddress(d.authorizedSigner, walletAddress)) problems.push('descriptor signer is not the wallet')
   }
-  const { token, payer, payee, deposit, closeRequestedAt } = opened.onChain
-  if (token !== undefined && !sameAddress(token, challenge.currency)) problems.push('on-chain token differs')
-  if (payer !== undefined && !sameAddress(payer, walletAddress)) problems.push('on-chain payer differs')
-  if (payee !== undefined && !sameAddress(payee, challenge.recipient)) problems.push('on-chain payee differs')
+  if (opened.derivedChannelId.toLowerCase() !== opened.channelId.toLowerCase()) {
+    problems.push('descriptor does not derive the channel id')
+  }
+  const { deposit, closeRequestedAt } = opened.onChain
   if (deposit < requiredDepositRaw) problems.push(`on-chain deposit ${deposit} is below ${requiredDepositRaw}`)
-  if (closeRequestedAt !== undefined && closeRequestedAt !== 0n) problems.push('channel has a pending close')
+  if (closeRequestedAt !== 0n) problems.push('channel has a pending close')
   if (problems.length) throw new Error(`refusing to install channel ${opened.channelId}: ${problems.join('; ')}`)
 }
 

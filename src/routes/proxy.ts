@@ -1738,6 +1738,12 @@ export async function handleProxy(
   const merchantQuoteBaseUnits = route.fixedPricing ? null : (() => {
     try { return BigInt(parsed.request.amount) } catch { return null }
   })()
+  if (!route.fixedPricing && merchantQuoteBaseUnits === null && parsed.intent.toLowerCase() === 'session') {
+    return new Response(JSON.stringify({
+      error: 'Router temporarily unable to serve this route',
+      detail: 'Merchant quote is unreadable. Nothing was charged.',
+    }), { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '300' } })
+  }
   if (merchantQuoteBaseUnits !== null && parsed.intent.toLowerCase() === 'session') {
     // A session call spends channel deposit, in the channel's token.
     const preflight = await checkSessionPreflight(
