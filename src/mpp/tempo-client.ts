@@ -24,6 +24,7 @@
  * request, and the charge path should not pay that overhead.
  */
 
+import { filterPayableCandidates, sessionChallengeMismatch } from './tempo-challenges'
 import { Mppx, tempo, sessionLegacy as legacySession, Transport } from 'mppx/client'
 import { privateKeyToAccount } from 'viem/accounts'
 import type { Env } from '../index'
@@ -79,6 +80,17 @@ type ChannelEntryLike = {
  * Only callers that pass `maxAmountRaw` can see this. Callers that omit it
  * (the public proxy) keep their existing unbounded behaviour byte-for-byte.
  */
+/**
+ * The merchant offered no session challenge payable from our channel: wrong
+ * token, payee, escrow, chain or decimals. Raised before anything is signed.
+ */
+export class SessionChallengeMismatchError extends Error {
+  constructor(merchantId: string, detail: string) {
+    super(`no session challenge payable from channel ${merchantId}: ${detail}`)
+    this.name = 'SessionChallengeMismatchError'
+  }
+}
+
 export class BudgetExceededError extends Error {
   constructor(
     public readonly merchantUrl: string,
@@ -387,6 +399,12 @@ function createTempoClientInternal(
      */
     onChallenge?: Parameters<typeof Mppx.create>[0]['onChallenge']
     /**
+     * Narrows mppx's candidate challenges before one is chosen. The session
+     * path keeps only challenges payable from its channel, so mppx never
+     * signs against a token the channel does not hold.
+     */
+    orderChallenges?: (candidates: any[]) => any[] | Promise<any[]>
+    /**
      * Called by mppx after every successful voucher sign. We use
      * it to bump the KV watermark. mppx passes `cumulativeAmount`
      * as a bigint here, which matches what the KV store already
@@ -448,6 +466,7 @@ function createTempoClientInternal(
     ],
     polyfill: false,
     onChallenge: opts.onChallenge,
+    ...(opts.orderChallenges ? { orderChallenges: opts.orderChallenges } : {}),
     // Wrap the underlying fetch so we sanitize the upstream merchant's
     // 402 BEFORE mppx parses it. This covers BOTH the charge
     // (`payMerchant`) and session (`payMerchantSession`) legs because
@@ -591,6 +610,9 @@ export async function payMerchantSession(
   }
 
   const client = createTempoClientInternal(env, {
+    // Several challenges arrive, one per accepted token. Keep only the ones
+    // this channel can pay; with none left mppx throws before signing.
+    orderChallenges: (candidates) => filterPayableCandidates(candidates, channel),
     // Intercept the merchant's 402 challenge so we can compute the
     // cumulative-after-this-request ourselves. mppx then signs a
     // voucher with that value and retries.
@@ -598,6 +620,10 @@ export async function payMerchantSession(
       // Session challenge request shape (after the zod transform
       // in tempo.session's request schema): amount is a base-unit
       // string like "10000" for $0.01 at 6 decimals.
+      // Second check on the chosen challenge itself, in case the candidate
+      // filter was bypassed: never sign for a token the channel does not hold.
+      const mismatch = sessionChallengeMismatch((challenge as any).request ?? {}, channel)
+      if (mismatch) throw new SessionChallengeMismatchError(merchantId, mismatch)
       const delta = (challenge as any).request?.amount as string | undefined
       if (!delta || !/^\d+$/.test(delta)) {
         throw new Error(
@@ -652,7 +678,17 @@ export async function payMerchantSession(
     },
   })
 
-  const response = await client.fetch(merchantUrl, init)
+  let response: Response
+  try {
+    response = await client.fetch(merchantUrl, init)
+  } catch (err) {
+    // The candidate filter left nothing, so mppx found no challenge to answer.
+    // Nothing was signed; report it as our mismatch, not a merchant failure.
+    if (err instanceof Error && err.message.startsWith('No method found for challenges')) {
+      throw new SessionChallengeMismatchError(merchantId, 'channel token not offered')
+    }
+    throw err
+  }
   return { response, channelBefore: channel }
 }
 

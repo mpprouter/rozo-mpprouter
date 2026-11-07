@@ -21,10 +21,12 @@
 
 import { Session } from 'mppx/tempo'
 
+import { tokenSymbol } from '../mpp/tempo-challenges'
+
 /** TIP-1034 escrow precompile. Channels on other escrows are not checked. */
 export const TIP1034_ESCROW = '0x4d50500000000000000000000000000000000000'
 
-/** Alert when a channel's voucher headroom is below $0.05 (USDC, 6 decimals). */
+/** Alert when a channel's voucher headroom is below 0.05 of its token (6 decimals). */
 export const CHANNEL_LOW_HEADROOM_RAW = 50_000n
 
 /** Sample at most every 15 minutes. */
@@ -33,6 +35,8 @@ export const CHANNEL_WATCH_INTERVAL_MS = 15 * 60 * 1000
 const STATE_KEY = 'tempo-channel-watch:state'
 const LAST_RUN_KEY = 'tempo-channel-watch:last-run'
 const CHANNEL_PREFIX = 'tempoChannel:'
+/** Second slot used across a router key rotation (src/mpp/channel-store.ts). */
+const ALT_PREFIX = 'tempoChannelAlt:'
 
 export type ChannelHealth = 'ok' | 'low'
 
@@ -42,6 +46,8 @@ export interface ChannelReading {
   depositRaw: bigint
   usedRaw: bigint
   headroomRaw: bigint
+  /** Channel token, for the alert label. */
+  currency?: string
 }
 
 export interface ChannelOnChainState {
@@ -63,6 +69,12 @@ export interface ChannelWatchDeps {
   kv: KvLike
   /** Batch read of on-chain channel states, same order as `channelIds`. */
   readStates: (channelIds: `0x${string}`[]) => Promise<ChannelOnChainState[]>
+  /**
+   * Address the current router key signs with. When set, each merchant is read
+   * from whichever slot that key can sign, as the payment path does, so a
+   * rotated-away channel is not reported. Unset keeps the primary slot only.
+   */
+  routerSigner?: string | null
   now?: Date
 }
 
@@ -83,11 +95,11 @@ export function classifyChannel(r: ChannelReading): ChannelHealth {
   return r.headroomRaw < CHANNEL_LOW_HEADROOM_RAW ? 'low' : 'ok'
 }
 
-async function listChannelKeys(kv: KvLike): Promise<string[]> {
+async function listChannelKeys(kv: KvLike, prefix: string = CHANNEL_PREFIX): Promise<string[]> {
   const out: string[] = []
   let cursor: string | undefined
   for (let i = 0; i < 20; i++) {
-    const page = await kv.list({ prefix: CHANNEL_PREFIX, cursor })
+    const page = await kv.list({ prefix, cursor })
     for (const k of page.keys) out.push(k.name)
     if (page.list_complete || !page.cursor) break
     cursor = page.cursor
@@ -104,19 +116,50 @@ export async function checkTempoChannels(deps: ChannelWatchDeps): Promise<Channe
   const lastRun = Number((await deps.kv.get(LAST_RUN_KEY)) ?? '0')
   if (Number.isFinite(lastRun) && now.getTime() - lastRun < CHANNEL_WATCH_INTERVAL_MS) return null
 
-  const entries: Array<{ key: string; channelId: `0x${string}`; cumulative: bigint }> = []
-  for (const name of await listChannelKeys(deps.kv)) {
-    const raw = await deps.kv.get(name)
-    if (!raw) continue
+  type Entry = { key: string; channelId: `0x${string}`; cumulative: bigint; currency?: string }
+  const parse = (raw: string | null): (Entry & { signer?: string }) | null => {
+    if (!raw) return null
     try {
-      const v = JSON.parse(raw) as { channelId?: string; escrowContract?: string; cumulativeRaw?: string }
-      if (!v.channelId || !/^0x[0-9a-fA-F]{64}$/.test(v.channelId)) continue
-      if ((v.escrowContract ?? '').toLowerCase() !== TIP1034_ESCROW) continue
+      const v = JSON.parse(raw) as {
+        channelId?: string
+        escrowContract?: string
+        cumulativeRaw?: string
+        currency?: string
+        authorizedSigner?: string
+      }
+      if (!v.channelId || !/^0x[0-9a-fA-F]{64}$/.test(v.channelId)) return null
+      if ((v.escrowContract ?? '').toLowerCase() !== TIP1034_ESCROW) return null
       const cumulative = /^\d+$/.test(v.cumulativeRaw ?? '') ? BigInt(v.cumulativeRaw as string) : 0n
-      entries.push({ key: name.slice(CHANNEL_PREFIX.length), channelId: v.channelId as `0x${string}`, cumulative })
+      return {
+        key: '',
+        channelId: v.channelId as `0x${string}`,
+        cumulative,
+        currency: v.currency,
+        signer: v.authorizedSigner?.toLowerCase(),
+      }
     } catch {
       // A malformed KV entry is the payment path's problem to report; skip.
+      return null
     }
+  }
+  const signer = deps.routerSigner?.toLowerCase() ?? null
+  const merchants = new Set<string>()
+  for (const name of await listChannelKeys(deps.kv)) merchants.add(name.slice(CHANNEL_PREFIX.length))
+  if (signer) {
+    for (const name of await listChannelKeys(deps.kv, ALT_PREFIX)) merchants.add(name.slice(ALT_PREFIX.length))
+  }
+  const entries: Entry[] = []
+  for (const merchant of merchants) {
+    const primary = parse(await deps.kv.get(CHANNEL_PREFIX + merchant))
+    let chosen = primary
+    if (signer) {
+      chosen = primary && primary.signer === signer ? primary : null
+      if (!chosen) {
+        const alt = parse(await deps.kv.get(ALT_PREFIX + merchant))
+        chosen = alt && alt.signer === signer ? alt : null
+      }
+    }
+    if (chosen) entries.push({ key: merchant, channelId: chosen.channelId, cumulative: chosen.cumulative, currency: chosen.currency })
   }
 
   const lastRunCommit = () => deps.kv.put(LAST_RUN_KEY, String(now.getTime()))
@@ -151,12 +194,14 @@ export async function checkTempoChannels(deps: ChannelWatchDeps): Promise<Channe
       depositRaw: s.deposit,
       usedRaw: used,
       headroomRaw: s.deposit - used,
+      currency: e.currency,
     }
     const health = classifyChannel(reading)
     next[e.key] = health
+    const unit = tokenSymbol(e.currency)
     const line =
-      `- ${e.key} (${e.channelId.slice(0, 10)}...): on-chain deposit ${formatUsdc(reading.depositRaw)} USDC, ` +
-      `used ${formatUsdc(reading.usedRaw)}, headroom ${formatUsdc(reading.headroomRaw)}`
+      `- ${e.key} (${e.channelId.slice(0, 10)}...): on-chain deposit ${formatUsdc(reading.depositRaw)} ${unit}, ` +
+      `used ${formatUsdc(reading.usedRaw)}, headroom ${formatUsdc(reading.headroomRaw)} ${unit}`
     if (health === 'low' && previous[e.key] !== 'low') lowLines.push(line)
     if (health === 'ok' && previous[e.key] === 'low') recoveredLines.push(line)
   }
@@ -165,11 +210,11 @@ export async function checkTempoChannels(deps: ChannelWatchDeps): Promise<Channe
   if (lowLines.length > 0) {
     messages.push(
       `[MPP Router] Tempo session channel low deposit: ${lowLines.length} channel(s) below ` +
-        `${formatUsdc(CHANNEL_LOW_HEADROOM_RAW)} USDC headroom\n` +
+        `${formatUsdc(CHANNEL_LOW_HEADROOM_RAW)} headroom in the channel token\n` +
         lowLines.join('\n') +
         '\nSession-mode calls to these merchants fail with 402 amount-exceeds-deposit ' +
         '(auto-refunded) until the channel is topped up. Founder action (L3): ' +
-        'npx tsx scripts/admin/topup-tempo-channel.ts <key> --amount <USDC>',
+        'npx tsx scripts/admin/topup-tempo-channel.ts <key> --amount <amount in the channel token>',
     )
   }
   if (recoveredLines.length > 0) {
