@@ -62,6 +62,7 @@ const { mintSessionToken } = await import('../src/playground/session-token')
 const { makePlaygroundLedgerMock } = await import('./helpers/playground-ledger-mock')
 const { makeAtomicStoreMock } = await import('./helpers/atomic-store-mock')
 import type { Env } from '../src/index'
+import { getRouteByPublicPath } from '../src/services/merchants'
 
 const SECRET = 'playground-test-secret-not-a-real-key'
 const ALICE = 'GA6SKSJLJ3E33KKDNB3UDBRIECIBQKGYLGXLCBTXNQ7WWJ27BMDUH6JW'
@@ -92,6 +93,15 @@ function makeEnv(kvSeed: Record<string, string> = {}): Env {
     STELLAR_ROUTER_PUBLIC: ROUTER,
     MPP_STORE: makeKv(kvSeed),
   } as unknown as Env
+}
+
+/**
+ * openai and anthropic are delisted during the OUSD migration (2026-11-07), so
+ * resolvePlaygroundRoute refuses them. The seam logic under test is unchanged:
+ * use the catalog route as it will be once re-verified.
+ */
+function sessionRoute(path: string) {
+  return { ...getRouteByPublicPath(path, 'POST')!, verifiedMode: 'session' as const }
 }
 
 /** A $1 ceiling — far above any real playground price, for seam-selection tests. */
@@ -187,7 +197,7 @@ describe('seam selection', () => {
   it('routes a tempo.session route through payMerchantSession, keyed by route.id', async () => {
     const env = makeEnv()
     payMerchantSession.mockImplementation(paidSession)
-    const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
+    const route = sessionRoute('/v1/services/openai/chat')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
 
     await callUpstream(env, { route, body: { model: 'gpt-4o-mini' }, budgetAtomic: ANY_BUDGET })
@@ -207,7 +217,7 @@ describe('seam selection', () => {
     // (same realm, recipient and token) via `sessionChannelKey`.
     const env = makeEnv()
     payMerchantSession.mockImplementation(paidSession)
-    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    const route = sessionRoute('/v1/services/anthropic/chat_completions')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
 
     await callUpstream(env, { route, body: { model: 'claude-haiku-4-5' }, budgetAtomic: ANY_BUDGET })
@@ -219,7 +229,7 @@ describe('seam selection', () => {
   it('routes the openai chat route through the session seam too', async () => {
     const env = makeEnv()
     payMerchantSession.mockImplementation(paidSession)
-    const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
+    const route = sessionRoute('/v1/services/openai/chat')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
 
     await callUpstream(env, { route, body: { model: 'gpt-4o-mini' }, budgetAtomic: ANY_BUDGET })
@@ -253,7 +263,7 @@ describe('channel not installed', () => {
   it('maps ChannelNotInstalledError to a 503 UpstreamError', async () => {
     const env = makeEnv()
     payMerchantSession.mockRejectedValue(new ChannelNotInstalledError('openai_chat'))
-    const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
+    const route = sessionRoute('/v1/services/openai/chat')
 
     await expect(
       callUpstream(env, { route, body: {}, budgetAtomic: ANY_BUDGET }),
@@ -563,7 +573,7 @@ describe('model catalog after the 2026-08-18 anthropic delisting', () => {
   it('keeps the relisted anthropic chat_completions on the session seam', () => {
     // Was pinned to tempo.charge until 2026-10-25, when the merchant went
     // session-only; it now shares the anthropic_messages channel.
-    const route = resolvePlaygroundRoute('/v1/services/anthropic/chat_completions', 'POST')
+    const route = sessionRoute('/v1/services/anthropic/chat_completions')
     expect(route.upstreamPaymentMethod).toBe('tempo.session')
     expect(route.sessionChannelKey).toBe('anthropic_messages')
   })
@@ -614,7 +624,7 @@ describe('upstream budget ceiling (P0-2)', () => {
       response: completion(),
       channelBefore: { cumulativeRaw: '0' },
     })
-    const route = resolvePlaygroundRoute('/v1/services/openai/chat', 'POST')
+    const route = sessionRoute('/v1/services/openai/chat')
 
     await callUpstream(env, { route, body: {}, budgetAtomic: parseUsd('0.08') })
 

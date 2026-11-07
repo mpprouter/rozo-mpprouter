@@ -1390,8 +1390,8 @@ export async function handleProxy(
   // The refusal is intentionally generic — no merchant host, channel id,
   // or internal reason — so it doesn't help an attacker probe the fleet.
   // Launch gate escape hatch (P1 fix, codex review 2026-08-12): a route
-  // can name a `launchGate` Env var (currently only the 4 Mercury
-  // routes → 'MERCURY_LAUNCH_MODE'). When that var is literally
+  // can name a `launchGate` Env var (the Mercury routes and the OUSD session
+  // routes). When that var is literally
   // 'verify', we let the route through despite verifiedMode === false —
   // this is how a brand-new router-held-credential route gets its FIRST
   // real paid call (verifiedMode can only ever flip away from false

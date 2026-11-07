@@ -128,8 +128,8 @@ GET /llms.txt                 — This file
 
 ## Quick start (x402 v2, recommended)
 
-1. GET /v1/services/search?q=openai&status=active — find a service
-2. POST /v1/services/openai/chat with your request body, no auth header.
+1. GET /v1/services/search?q=deepseek&status=active — find a service
+2. POST /v1/services/deepseek/chat with your request body, no auth header.
    Router returns 402 with a Payment-Required header.
 3. Decode the Payment-Required header. Sign a Soroban auth entry for the
    amount shown, paying to the router's STELLAR_X402_PAY_TO address.
@@ -142,18 +142,16 @@ works against any x402 v2 server, no router-specific code needed.
 ## Recommended first paid call (smoke test)
 
 Use this exact request to prove your wallet integration end to end.
-It is the cheapest verified LLM route (0.001 USDC per call as of
-2026-09-15; confirm with the live 402 quote) and returns the plain
-OpenAI chat-completion shape with no wrapper:
+A short request on this route quotes about 0.004 USDC as of 2026-11-07
+(the live 402 quote is the price; a large max_tokens raises it, because
+the merchant pre-charges the maximum) and it returns the plain OpenAI
+chat-completion shape with no wrapper:
 
-  POST /v1/services/openai/chat
-  {"model":"gpt-4o-mini","max_tokens":16,
+  POST /v1/services/deepseek/chat
+  {"model":"deepseek-flash","max_tokens":16,
    "messages":[{"role":"user","content":"Say hi in three words."}]}
 
-Expect 200 with choices[0].message.content set and
-finish_reason "stop". Alternative at the same price:
-POST /v1/services/anthropic/messages with model claude-haiku-4-5
-(Anthropic Messages shape: content[0].text, stop_reason "end_turn").
+Expect 200 with choices[0].message.content set.
 
 Pitfalls seen in real integrations:
 

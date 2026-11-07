@@ -265,17 +265,17 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     // paid re-probes 2026-08-18 and 2026-08-19), so each paid call
     // settles and is then automatically refunded in full within 1-2
     // minutes — which is exactly the behaviour refund testing and the
-    // SCF44 tranche-2 video need to demonstrate. Do NOT delist it again
-    // for being undeliverable; that is the point. Delist only if the
-    // refund path itself stops working.
-    verifiedMode: 'charge',
-    chargeVerified: true,
-    chargeVerifiedAt: '2026-08-24T02:44:14Z',
-    verifiedNote:
-      'Delivers completions. Re-verified 2026-08-24 with a real paid call ' +
-      'through the router (claude-haiku-4-5, settled 0.001 USDC, 200 with a ' +
-      'completion, no refund). The 403-after-payment recorded from ' +
-      '2026-08-18 no longer reproduces.',
+    // SCF44 tranche-2 video need to demonstrate. The founder overrode this on
+    // 2026-11-07 for the delisting below, because the route cannot be paid at
+    // all until OUSD channels exist.
+    // 2026-11-07: DELISTED before the OUSD migration. The merchant now quotes
+    // this route in OUSD while the router's channels hold USDC.e, so a paid
+    // call cannot be delivered. Founder rule: verified only returns after a
+    // real paid call on an OUSD channel. `launchGate` admits that call, see
+    // docs/design in ainative 20261107-mpprouter-ousd-session-routes.zh.md.
+    verifiedMode: false,
+    launchGate: 'OUSD_SESSION_LAUNCH_MODE',
+    verifiedNote: 'Not payable: the merchant quotes OUSD and the router holds no OUSD channel yet.',
     // Facade: registered per founder decision 2026-08-24. A normal service
     // registration.
     //
@@ -366,14 +366,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     // Note for the next re-probe: verify through the ROUTER. A direct probe
     // that bypasses it carries the operator's own IP, and Anthropic does not
     // serve every region; that is what produced a false 403 on 2026-08-24.
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-08-24T03:18:26Z',
-    verifiedNote:
-      'Delivers completions. Re-verified 2026-08-24 with a real paid call ' +
-      'through the router (claude-haiku-4-5, 200 + native completion, no ' +
-      'refund). The 403-after-payment recorded on 2026-08-18 no longer ' +
-      'reproduces. Verify through the router, not a direct merchant probe.',
+    // 2026-11-07: DELISTED before the OUSD migration. The merchant now quotes
+    // this route in OUSD while the router's channels hold USDC.e, so a paid
+    // call cannot be delivered. Founder rule: verified only returns after a
+    // real paid call on an OUSD channel. `launchGate` admits that call, see
+    // docs/design in ainative 20261107-mpprouter-ousd-session-routes.zh.md.
+    verifiedMode: false,
+    launchGate: 'OUSD_SESSION_LAUNCH_MODE',
+    verifiedNote: 'Not payable: the merchant quotes OUSD and the router holds no OUSD channel yet. Verify through the router, not a direct merchant probe.',
   },
   // 2026-08-01: disabled. Same shape as openrouter above — the payment
   // settles, then the merchant's own call to OpenAI is refused:
@@ -388,13 +388,14 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'openai_chat',
     publicPath: '/v1/services/openai/chat',
     upstreamPaymentMethod: 'tempo.session',
-    verifiedMode: 'session',
-    sessionVerified: true,
-    sessionVerifiedAt: '2026-08-09T03:51:00Z',
-    verifiedNote:
-      'Verified with a real paid call on 2026-08-09: 202, chat completion ' +
-      'returned. The earlier post-settlement 403 (2026-08-01, filed as ' +
-      'tempoxyz/mpp#852) no longer reproduces.',
+    // 2026-11-07: DELISTED before the OUSD migration. The merchant now quotes
+    // this route in OUSD while the router's channels hold USDC.e, so a paid
+    // call cannot be delivered. Founder rule: verified only returns after a
+    // real paid call on an OUSD channel. `launchGate` admits that call, see
+    // docs/design in ainative 20261107-mpprouter-ousd-session-routes.zh.md.
+    verifiedMode: false,
+    launchGate: 'OUSD_SESSION_LAUNCH_MODE',
+    verifiedNote: 'Not payable: the merchant quotes OUSD and the router holds no OUSD channel yet.',
   },
   // Google Gemini — uses {model} placeholder, defaults to gemini-2.0-flash
   // The upstream path uses Google's `:generateContent` literal
