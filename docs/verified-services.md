@@ -5,6 +5,8 @@
 > source of truth for `verifiedMode` values in `OPERATOR_OVERLAY`
 > (`src/services/merchants.ts`).
 
+> **2026-11-07: `openai_chat`, `anthropic_messages` and `anthropic_chat_completions` are delisted.** The merchant now quotes them in OUSD and the router's channels hold USDC.e, so paid calls cannot be delivered. The verified-service count is 18 until a real paid call on an OUSD channel re-verifies them. The rows below record past evidence.
+
 ## How stellar.intents Works
 
 The catalog's `methods.stellar.intents` field tells Stellar clients which

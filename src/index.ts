@@ -458,6 +458,11 @@ export interface Env {
   // See `PublicServiceRoute.launchGate` / proxy.ts SECURITY GATE. Unset
   // (default) → still 403 for everyone. Not a secret; plain var is fine.
   MERCURY_LAUNCH_MODE?: string
+  // Launch gate for openai_chat, anthropic_messages and
+  // anthropic_chat_completions while they move to OUSD channels (2026-11-07).
+  // 'verify' admits real paid verification calls; unset refuses everyone.
+  // Stays out of wrangler.toml so a normal deploy cannot open these routes.
+  OUSD_SESSION_LAUNCH_MODE?: string
 
   // Optional paid Base RPC (Alchemy / QuickNode / Infura) used as the
   // primary endpoint for funder balance checks. Falls back to public

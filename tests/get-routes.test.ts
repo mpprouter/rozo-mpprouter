@@ -167,7 +167,9 @@ describe('GET routes — build', () => {
     // when exa moved to api.exa.ai (see the POST count note above).
     // 446 → 445 on 2026-10-25: storage_upload disabled (POST /:key dropped
     // from the mpp.dev catalog; paid calls returned an empty response).
-    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(445)
+    // 445 → 442 on 2026-11-07: openai_chat and both anthropic routes delisted
+    // until a paid call on an OUSD channel re-verifies them.
+    expect(routes.filter(r => r.verifiedMode !== false)).toHaveLength(442)
     // 3 → 4 on 2026-08-18: the mercury GET routes are the only listed GETs, and
     // events/by-ledger joined them at the beta launch (see the note above).
     expect(getRoutes.filter(r => r.verifiedMode !== false)).toHaveLength(4)
@@ -232,10 +234,11 @@ describe('GET routes — build', () => {
     )
     // 21 → 20 on 2026-10-25: storage's only verified route (storage_upload)
     // was disabled after the upstream dropped POST /:key.
-    expect(verifiedServices.size).toBe(20)
-    // The commitment itself, stated independently of the exact figure above,
-    // so a future delisting that drops us under 20 fails loudly.
-    expect(verifiedServices.size).toBeGreaterThanOrEqual(20)
+    // 20 → 18 on 2026-11-07: openai and anthropic delisted by founder decision
+    // while they move to OUSD channels. THIS IS BELOW THE SCF #44 COMMITMENT OF
+    // 20. Both routes were already undeliverable, so the earlier 20 overstated
+    // the truth. Restore 20 and the floor assertion when they are re-verified.
+    expect(verifiedServices.size).toBe(18)
   })
 
   it('explains in verifiedNote why each gated-off GET route is gated', () => {
