@@ -34,6 +34,7 @@ vi.mock('mppx/server', () => ({
 vi.mock('../src/mpp/kv-atomic-store', () => ({ doAtomicParams: () => ({}) }))
 
 import {
+  fenceChannelPersistent,
   getLatestVoucher,
   putLatestVoucher,
   markVoucherSettled,
@@ -456,5 +457,55 @@ describe('settlePlaygroundChannels — fail-closed collector binding (P0-D)', ()
     await settlePlaygroundChannels(e, deps)
     expect(closeMock).toHaveBeenCalledOnce()
     expect(closeMock.mock.calls[0][0].feePayer.envelopeSigner).toBe(COLLECTOR_SECRET)
+  })
+
+  describe('RPC load control', () => {
+    async function channelWithVoucher(cumulativeRaw: string) {
+      const e = env(makeKv())
+      await putPgChannel(e, {
+        channelContract: CHANNEL,
+        commitmentKey: FUNDER,
+        agentAccount: FUNDER,
+        currency: USDC_SAC,
+        network: 'stellar:pubnet',
+        depositRaw: '5000000',
+        to: COLLECTOR,
+        wasmHash: WASM_HASH,
+        provenanceVersion: PG_PROVENANCE_VERSION,
+        openedAt: 'now',
+      })
+      await putLatestVoucher(e, CHANNEL, {
+        amountDecimal: '0.5000000',
+        cumulativeRaw,
+        signature: SIG_HEX,
+      })
+      return e
+    }
+
+    it('skips the chain read for a blocked, fully settled channel', async () => {
+      const e = await channelWithVoucher('5000000')
+      await markVoucherSettled(e, CHANNEL, '5000000')
+      await fenceChannelPersistent(e, CHANNEL)
+      await settlePlaygroundChannels(e, deps)
+      expect(deps.getChannelState).not.toHaveBeenCalled()
+    })
+
+    it('still reads an open, fully settled channel so it can observe close_start', async () => {
+      const e = await channelWithVoucher('5000000')
+      await markVoucherSettled(e, CHANNEL, '5000000')
+      await settlePlaygroundChannels(e, deps)
+      expect(deps.getChannelState).toHaveBeenCalledOnce()
+    })
+
+    it('still collects a blocked channel with an unsettled amount', async () => {
+      const e = await channelWithVoucher('5000000')
+      await fenceChannelPersistent(e, CHANNEL)
+      ;(deps.getChannelState as any).mockResolvedValue({
+        closeEffectiveAtLedger: 999,
+        currentLedger: 900,
+      })
+      await settlePlaygroundChannels(e, deps)
+      expect(closeMock).toHaveBeenCalledOnce()
+    })
   })
 })

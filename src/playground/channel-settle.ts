@@ -37,6 +37,7 @@ import { listPgChannels, pgChannelProvenanceOk } from './channel-pg-store'
 import {
   fenceChannelPersistent,
   getLatestVoucher,
+  isChannelBlocked,
   markChannelClosed,
   markVoucherSettled,
   markVoucherWrittenOff,
@@ -296,6 +297,12 @@ export async function settlePlaygroundChannels(
       // re-reads the authoritative latest voucher UNDER the lock (P0-1).
       const voucher = await getLatestVoucher(env, state.channelContract)
       if (!voucher) continue
+      // A blocked channel takes no new calls, so once it is fully settled the
+      // chain has nothing left to tell us. Each read costs 7 RPC calls, and
+      // these channels would otherwise be read every 2 minutes forever. Any
+      // unsettled amount still goes through settleOneChannel.
+      const unsettled = BigInt(voucher.cumulativeRaw) - BigInt(voucher.lastSettledRaw || '0')
+      if (unsettled <= 0n && (await isChannelBlocked(env, state.channelContract))) continue
       await settleOneChannel(env, state.channelContract, deps)
     } catch (e: any) {
       // Include the top of the stack so a tail shows WHERE it threw (e.g.
