@@ -1757,7 +1757,13 @@ export async function handleProxy(
         detail: 'Nothing was charged.',
       }), { status: 502, headers: { 'Content-Type': 'application/json' } })
     }
-    if (offered.some((c) => c.intent.toLowerCase() === 'session')) {
+    // Use the session path only when this route is a session route, or when
+    // the merchant's first offer is a session (what mppx would pick for an
+    // unfiltered call, the pre-existing behaviour). A charge route whose header
+    // merely also lists a session offer keeps the charge path.
+    const sessionRoute =
+      route.upstreamPaymentMethod === 'tempo.session' || offered[0]?.intent.toLowerCase() === 'session'
+    if (sessionRoute) {
       const channel = await getTempoChannel(env, sessionChannelKeyFor(route))
       const selection = channel
         ? selectSessionChallenge(offered, channel)
