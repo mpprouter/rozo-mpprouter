@@ -54,7 +54,7 @@ import {
   guardedChallengeFetch,
   assertSlotsReady,
   installChannel,
-  parseSessionChallenge,
+  selectSessionChallenge,
   sameAddress,
   type SlotRecord,
   type SlotStore,
@@ -396,7 +396,7 @@ async function main() {
     body: JSON.stringify(merchant.probeBody),
   })
   if (unpaid.status !== 402) throw new Error(`merchant answered ${unpaid.status}, expected an unpaid 402`)
-  const challenge = parseSessionChallenge(unpaid.headers.get('www-authenticate'))
+  const challenge = selectSessionChallenge(unpaid.headers.get('www-authenticate'), expectCurrency)
   assertChallengeMatchesApproval(challenge, {
     currency: expectCurrency,
     depositRaw,

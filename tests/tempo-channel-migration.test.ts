@@ -8,7 +8,7 @@ import {
   guardedChallengeFetch,
   assertSlotsReady,
   installChannel,
-  parseSessionChallenge,
+  selectSessionChallenge,
   type SlotStore,
 } from '../scripts/admin/lib/tempo-channel-migration'
 import { loadTempoRouterAccount } from '../scripts/admin/lib/tempo-router-key'
@@ -30,7 +30,7 @@ const REQUEST = {
   recipient: PAYEE,
   methodDetails: { escrowContract: ESCROW, chainId: 4217 },
 }
-const CHALLENGE = parseSessionChallenge(header(REQUEST))
+const CHALLENGE = selectSessionChallenge(header(REQUEST), OUSD)
 const DESCRIPTOR = {
   authorizedSigner: WALLET,
   expiringNonceHash: '0x00',
@@ -55,20 +55,25 @@ const expected = (over = {}) => ({
   ...over,
 })
 
-describe('parseSessionChallenge', () => {
-  it('reads the live OUSD challenge fields', () => {
+describe('selectSessionChallenge', () => {
+  const offered = `${header(REQUEST)}, ${header({ ...REQUEST, currency: USDC })}`
+  it('reads the OUSD challenge fields', () => {
     expect(CHALLENGE).toMatchObject({ currency: OUSD, recipient: PAYEE, escrowContract: ESCROW, chainId: 4217, decimals: 6 })
   })
+  it('selects by token from a multi-token 402, wherever it is listed', () => {
+    expect(selectSessionChallenge(offered, USDC).currency).toBe(USDC)
+    expect(selectSessionChallenge(offered, OUSD).currency).toBe(OUSD)
+  })
   it.each([
-    ['no header', null],
-    ['charge intent', header(REQUEST, 'charge')],
-    ['no escrow', header({ ...REQUEST, methodDetails: { chainId: 4217 } })],
-    ['no currency', header({ ...REQUEST, currency: '' })],
-    ['no chain', header({ ...REQUEST, methodDetails: { escrowContract: ESCROW } })],
-    ['other decimals', header({ ...REQUEST, decimals: 18 })],
-    ['two challenges', `${header(REQUEST)}, ${header({ ...REQUEST, recipient: WALLET })}`],
-  ])('refuses %s', (_name, value) => {
-    expect(() => parseSessionChallenge(value)).toThrow()
+    ['no header', null, OUSD],
+    ['token not offered', header({ ...REQUEST, currency: USDC }), OUSD],
+    ['token offered twice', `${header(REQUEST)}, ${header({ ...REQUEST, recipient: WALLET })}`, OUSD],
+    ['charge intent', header(REQUEST, 'charge'), OUSD],
+    ['no escrow', header({ ...REQUEST, methodDetails: { chainId: 4217 } }), OUSD],
+    ['no chain', header({ ...REQUEST, methodDetails: { escrowContract: ESCROW } }), OUSD],
+    ['other decimals', header({ ...REQUEST, decimals: 18 }), OUSD],
+  ])('refuses %s', (_name, value, currency) => {
+    expect(() => selectSessionChallenge(value, currency)).toThrow()
   })
 })
 
@@ -119,13 +124,23 @@ describe('guardedChallengeFetch', () => {
     const ok = async () => new Response('{}', { status: 200 })
     await expect(guardedChallengeFetch(CHALLENGE, ok as never)('https://x')).resolves.toBeDefined()
   })
+  it('hands the manager only the approved challenge, even listed second', async () => {
+    const both = async () => new Response(null, {
+      status: 402,
+      headers: { 'www-authenticate': `${header({ ...REQUEST, currency: USDC })}, ${header(REQUEST)}`, 'payment-required': 'e30=' },
+    })
+    const response = await guardedChallengeFetch(CHALLENGE, both as never)('https://x')
+    expect(response.headers.get('www-authenticate')).toBe(header(REQUEST))
+    expect(response.headers.get('payment-required')).toBeNull()
+  })
   it.each([
     ['currency', { ...REQUEST, currency: USDC }],
+    ['higher amount', { ...REQUEST, amount: '1001' }],
     ['recipient', { ...REQUEST, recipient: WALLET }],
     ['escrow', { ...REQUEST, methodDetails: { escrowContract: PAYEE, chainId: 4217 } }],
     ['chain', { ...REQUEST, methodDetails: { escrowContract: ESCROW, chainId: 1 } }],
   ])('refuses a changed %s before signing', async (_name, changed) => {
-    await expect(guardedChallengeFetch(CHALLENGE, answer(changed) as never)('https://x')).rejects.toThrow(/refusing/)
+    await expect(guardedChallengeFetch(CHALLENGE, answer(changed) as never)('https://x')).rejects.toThrow()
   })
 })
 
