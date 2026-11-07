@@ -16,22 +16,23 @@ export interface SessionChallenge {
   chainId: number
 }
 
-/** Parse an unpaid 402 `WWW-Authenticate` header. Throws on anything unusable. */
-export function parseSessionChallenge(wwwAuthenticate: string | null): SessionChallenge {
-  if (!wwwAuthenticate) throw new Error('merchant returned no WWW-Authenticate challenge')
-  // The manager picks from a challenge list by its own rules. With more than one
-  // on offer, checking the first would not prove which one it signs.
-  if ((wwwAuthenticate.match(/\brequest="/g) ?? []).length !== 1) {
-    throw new Error('expected exactly one payment challenge')
-  }
-  const intent = wwwAuthenticate.match(/intent="([^"]+)"/)?.[1]
-  const encoded = wwwAuthenticate.match(/request="([^"]+)"/)?.[1]
+/**
+ * Split a `WWW-Authenticate` value into its challenges. Merchants offer one
+ * session challenge per accepted token in a single header.
+ */
+export function splitChallenges(wwwAuthenticate: string): string[] {
+  return wwwAuthenticate.split(/,\s*(?=Payment\s)/)
+}
+
+function parseOneChallenge(text: string): SessionChallenge {
+  const intent = text.match(/intent="([^"]+)"/)?.[1]
+  const encoded = text.match(/request="([^"]+)"/)?.[1]
   if (!intent || !encoded) throw new Error('challenge has no intent or request')
   const request = JSON.parse(
     Buffer.from(encoded.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'),
   )
   const details = request.methodDetails ?? {}
-  const challenge: SessionChallenge = {
+  return {
     intent,
     amount: String(request.amount ?? ''),
     currency: String(request.currency ?? ''),
@@ -40,10 +41,23 @@ export function parseSessionChallenge(wwwAuthenticate: string | null): SessionCh
     escrowContract: String(details.escrowContract ?? ''),
     chainId: Number(details.chainId ?? 0),
   }
-  if (challenge.intent !== 'session') throw new Error(`expected a session challenge, got ${challenge.intent}`)
+}
+
+/**
+ * Pick the session challenge in `currency` from an unpaid 402. Throws on anything
+ * unusable, and when the token is not offered exactly once.
+ */
+export function selectSessionChallenge(wwwAuthenticate: string | null, currency: string): SessionChallenge {
+  if (!wwwAuthenticate) throw new Error('merchant returned no WWW-Authenticate challenge')
+  const matches = splitChallenges(wwwAuthenticate)
+    .map(parseOneChallenge)
+    .filter((c) => c.intent === 'session' && sameAddress(c.currency, currency))
+  if (matches.length !== 1) {
+    throw new Error(`expected one session challenge in ${currency}, found ${matches.length}`)
+  }
+  const challenge = matches[0]
   if (!/^\d+$/.test(challenge.amount)) throw new Error('challenge amount is not a base-unit integer')
   for (const [name, value] of [
-    ['currency', challenge.currency],
     ['recipient', challenge.recipient],
     ['escrowContract', challenge.escrowContract],
   ] as const) {
@@ -71,9 +85,11 @@ export function assertChallengeMatchesApproval(challenge: SessionChallenge, expe
 }
 
 /**
- * A fetch for the session manager that re-checks every 402 before the manager
- * can sign. The approved challenge was read in a separate request, and the
- * merchant can answer this one differently.
+ * A fetch for the session manager that shows it only the approved challenge.
+ *
+ * mppx signs the first challenge it can use, and merchants list several tokens,
+ * so filtering the header decides what gets signed. The approved challenge was
+ * read in a separate request, so the fields are compared again here.
  */
 export function guardedChallengeFetch(
   approved: SessionChallenge,
@@ -81,18 +97,23 @@ export function guardedChallengeFetch(
 ): typeof fetch {
   return async (input, init) => {
     const response = await underlying(input, init)
-    if (response.status === 402) {
-      const live = parseSessionChallenge(response.headers.get('www-authenticate'))
-      if (
-        !sameAddress(live.currency, approved.currency) ||
-        !sameAddress(live.recipient, approved.recipient) ||
-        !sameAddress(live.escrowContract, approved.escrowContract) ||
-        live.chainId !== approved.chainId
-      ) {
-        throw new Error('merchant changed the challenge after approval; refusing to sign')
-      }
+    if (response.status !== 402) return response
+    const header = response.headers.get('www-authenticate')
+    const live = selectSessionChallenge(header, approved.currency)
+    if (
+      !sameAddress(live.recipient, approved.recipient) ||
+      !sameAddress(live.escrowContract, approved.escrowContract) ||
+      live.chainId !== approved.chainId
+    ) {
+      throw new Error('merchant changed the challenge after approval; refusing to sign')
     }
-    return response
+    const only = splitChallenges(header as string).filter((text) => {
+      const c = parseOneChallenge(text)
+      return c.intent === 'session' && sameAddress(c.currency, approved.currency)
+    })
+    const headers = new Headers(response.headers)
+    headers.set('www-authenticate', only[0])
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   }
 }
 
