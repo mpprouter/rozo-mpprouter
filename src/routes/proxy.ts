@@ -1761,8 +1761,12 @@ export async function handleProxy(
     // the merchant's first offer is a session (what mppx would pick for an
     // unfiltered call, the pre-existing behaviour). A charge route whose header
     // merely also lists a session offer keeps the charge path.
+    // A charge-only live quote keeps the charge path even on a session route,
+    // as before: we follow what the merchant actually offers.
+    const offersSession = offered.some((c) => c.intent.toLowerCase() === 'session')
     const sessionRoute =
-      route.upstreamPaymentMethod === 'tempo.session' || offered[0]?.intent.toLowerCase() === 'session'
+      offersSession &&
+      (route.upstreamPaymentMethod === 'tempo.session' || offered[0]?.intent.toLowerCase() === 'session')
     if (sessionRoute) {
       const channel = await getTempoChannel(env, sessionChannelKeyFor(route))
       const selection = channel
