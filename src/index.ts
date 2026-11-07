@@ -1,3 +1,4 @@
+import { privateKeyToAccount } from 'viem/accounts'
 /**
  * MPP Router — Cloudflare Worker
  *
@@ -830,6 +831,9 @@ async function watchTempoChannels(env: Env): Promise<void> {
     const result = await checkTempoChannels({
       kv: env.MPP_STORE as any,
       readStates: precompileStateReader(getTempoClient(env.TEMPO_RPC_URL, env.TEMPO_RPC_URL_PRIMARY)),
+      routerSigner: env.TEMPO_ROUTER_PRIVATE_KEY
+        ? privateKeyToAccount(env.TEMPO_ROUTER_PRIVATE_KEY as `0x${string}`).address
+        : env.TEMPO_ROUTER_ADDRESS ?? null,
     })
     if (!result) return
     for (const message of result.messages) {

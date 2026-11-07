@@ -30,7 +30,8 @@ import {
   payMerchant,
   payMerchantSession,
 } from '../mpp/tempo-client'
-import { bumpCumulative, sessionChannelKeyFor } from '../mpp/channel-store'
+import { bumpCumulative, getTempoChannel, sessionChannelKeyFor } from '../mpp/channel-store'
+import { parseTempoChallengesStrict, selectSessionChallenge } from '../mpp/tempo-challenges'
 import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult, type X402CachedResult } from '../mpp/idempotency'
 import { isEnvelopeLiftedRoute, presentMerchantEnvelope } from './merchant-envelope'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
@@ -600,6 +601,8 @@ const ROUTER_SIDE_ERROR_NAMES = new Set([
   'BudgetExceededError',
   // src/mpp/tempo-client.ts — our session channel's deposit is used up.
   'ChannelDepositExhaustedError',
+  // src/mpp/tempo-client.ts — no offered challenge matches our channel's token.
+  'SessionChallengeMismatchError',
 ])
 
 /**
@@ -1008,6 +1011,11 @@ async function payMerchantAndGetBodyInner(
         method: request.method,
         headers: forwardHeaders(request),
         body: requestBody,
+      }, {
+        // The buyer was charged for this quote. The retry's fresh 402 carries a
+        // new challenge id, so bind on token (filter) and exact amount here;
+        // any change is refused before the voucher is signed.
+        expectedAmountRaw: parsed.request.amount,
       })
       merchantResponse = sessionResult.response
       if (merchantResponse.ok) {
@@ -1051,6 +1059,22 @@ async function payMerchantAndGetBodyInner(
             status: 503,
             headers: { 'Content-Type': 'application/json' },
           },
+        ),
+      }
+    }
+    if (err?.name === 'SessionChallengeMismatchError') {
+      // Refused before signing: the merchant did not offer our channel's token.
+      console.error(`[proxy] ${err.message}`)
+      return {
+        kind: 'error',
+        refundReason: 'upstream_5xx',
+        routerSideFailure: true,
+        response: new Response(
+          JSON.stringify({
+            error: 'Router temporarily unable to serve this route',
+            detail: 'The merchant did not offer a payment challenge in this route\'s channel token.',
+          }),
+          { status: 503, headers: { 'Content-Type': 'application/json', 'Retry-After': '300' } },
         ),
       }
     }
@@ -1716,6 +1740,55 @@ export async function handleProxy(
   }
   } // end: !route.fixedPricing probe branch
 
+  // Session merchants offer one challenge per accepted token. Quote, charge and
+  // pre-flight against the one our channel can pay, and refuse before charging
+  // when none matches. Charge routes keep the first challenge.
+  if (wwwAuth && !route.fixedPricing) {
+    // Validate the whole header with mppx's parser, the one the payment retry
+    // uses: a malformed entry anywhere fails that retry after the buyer paid,
+    // so refuse it here while nothing is charged.
+    let offered: ReturnType<typeof parseTempoChallengesStrict>
+    try {
+      offered = parseTempoChallengesStrict(wwwAuth)
+    } catch {
+      console.error(`[proxy] merchant challenge header not parseable by mppx, route=${route.id}`)
+      return new Response(JSON.stringify({
+        error: 'Could not parse merchant challenge',
+        detail: 'Nothing was charged.',
+      }), { status: 502, headers: { 'Content-Type': 'application/json' } })
+    }
+    // Use the session path only when this route is a session route, or when
+    // the merchant's first offer is a session (what mppx would pick for an
+    // unfiltered call, the pre-existing behaviour). A charge route whose header
+    // merely also lists a session offer keeps the charge path.
+    // A charge-only live quote keeps the charge path even on a session route,
+    // as before: we follow what the merchant actually offers.
+    const offersSession = offered.some((c) => c.intent.toLowerCase() === 'session')
+    const sessionRoute =
+      offersSession &&
+      (route.upstreamPaymentMethod === 'tempo.session' || offered[0]?.intent.toLowerCase() === 'session')
+    if (sessionRoute) {
+      const channel = await getTempoChannel(env, sessionChannelKeyFor(route))
+      const selection = channel
+        ? selectSessionChallenge(offered, channel)
+        : { ok: false as const, reason: 'channel_not_installed', offered: [] as string[] }
+      if (!selection.ok) {
+        console.error(
+          `[proxy] session challenge refused: reason=${selection.reason}, route=${route.id}, ` +
+            `offered=${selection.offered.join('|') || 'none'}`,
+        )
+        return new Response(JSON.stringify({
+          error: 'Router temporarily unable to serve this route',
+          detail: `Session channel check failed: ${selection.reason}. Nothing was charged.`,
+        }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json', 'Retry-After': '300' },
+        })
+      }
+      parsed = selection.challenge
+    }
+  }
+
   if (!parsed) {
     return new Response(JSON.stringify({
       error: 'Could not parse merchant challenge',
@@ -1725,6 +1798,7 @@ export async function handleProxy(
       headers: { 'Content-Type': 'application/json' },
     })
   }
+
 
   // ---- Tempo pool balance pre-flight check -------------------------
   // Before accepting the agent's Stellar payment, verify the Router's

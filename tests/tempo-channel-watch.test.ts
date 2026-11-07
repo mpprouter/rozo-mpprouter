@@ -97,3 +97,53 @@ describe('route fixes 2026-10-25', () => {
     expect(route.verifiedMode).toBe(false)
   })
 })
+
+describe('tempo channel watch slots and labels (2026-11-07)', () => {
+  const OUSD = '0x20c0000000000000000000006a37DA5C996874BE'
+  const NEW = '0x5096cf4df15c039d6a9d9ea4051874372206e795'
+  const OLD = '0x4374b2072ff9bc5c0e263cae7866a41a4c601d29'
+  const id = (n: number) => `0x${String(n).repeat(64).slice(0, 64)}` as `0x${string}`
+  function kv(entries: Record<string, unknown>) {
+    const store = new Map(Object.entries(entries).map(([k, v]) => [k, JSON.stringify(v)]))
+    return {
+      store,
+      async get(k: string) { return store.get(k) ?? null },
+      async put(k: string, v: string) { store.set(k, v) },
+      async list({ prefix }: { prefix: string }) {
+        return { keys: [...store.keys()].filter((k) => k.startsWith(prefix)).map((name) => ({ name })), list_complete: true }
+      },
+    }
+  }
+  const base = { escrowContract: '0x4d50500000000000000000000000000000000000', cumulativeRaw: '0' }
+
+  it('reads the slot the current key signs and labels the token', async () => {
+    const store = kv({
+      'tempoChannel:openai_chat': { ...base, channelId: id(1), authorizedSigner: OLD, currency: '0x20c000000000000000000000b9537d11c60e8b50' },
+      'tempoChannelAlt:openai_chat': { ...base, channelId: id(2), authorizedSigner: NEW, currency: OUSD },
+    })
+    const read: string[] = []
+    const { checkTempoChannels } = await import('../src/utils/tempo-channel-watch')
+    const r = await checkTempoChannels({
+      kv: store as any,
+      routerSigner: NEW,
+      readStates: async (ids) => { read.push(...ids); return ids.map(() => ({ deposit: 10_000n, settled: 0n })) },
+    })
+    expect(read).toEqual([id(2)])
+    expect(r!.messages[0]).toContain('OUSD')
+    expect(r!.messages[0]).not.toContain(' USDC,')
+  })
+
+  it('without a signer keeps the primary slot only', async () => {
+    const store = kv({
+      'tempoChannel:openai_chat': { ...base, channelId: id(1), authorizedSigner: OLD },
+      'tempoChannelAlt:openai_chat': { ...base, channelId: id(2), authorizedSigner: NEW },
+    })
+    const read: string[] = []
+    const { checkTempoChannels } = await import('../src/utils/tempo-channel-watch')
+    await checkTempoChannels({
+      kv: store as any,
+      readStates: async (ids) => { read.push(...ids); return ids.map(() => ({ deposit: 10_000_000n, settled: 0n })) },
+    })
+    expect(read).toEqual([id(1)])
+  })
+})
