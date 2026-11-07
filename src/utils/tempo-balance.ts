@@ -10,6 +10,8 @@
  * or null if the query fails (network error, unsupported method).
  */
 
+import type { Env } from '../index'
+import { checkAndBumpWindowLimit } from '../mpp/rate-limit-do'
 import { parseRpcUrls } from '../mpp/tempo-rpc'
 
 /**
@@ -140,3 +142,37 @@ async function fetchTempoUsdcBalance(
 
 /** 5 USDC in base units (6 decimals) */
 export const LOW_BALANCE_THRESHOLD = 5_000_000n
+
+/** A low Tempo pool alerts at most once per address per UTC-aligned hour. */
+export const LOW_BALANCE_ALERT_WINDOW_MS = 60 * 60 * 1000
+
+/**
+ * Claim the single low-balance alert slot for this hour.
+ *
+ * The balance check runs on every paid request, so without this an empty pool
+ * sends one alert per request (452 in one night on 2026-11-06). The counter
+ * lives in the rate-limit Durable Object because concurrent requests would all
+ * read an unset KV key and alert anyway.
+ *
+ * Fails open: if the limiter is unavailable, a repeated alert is better than a
+ * silent empty pool.
+ */
+export async function claimTempoLowBalanceAlertSlot(
+  env: Env,
+  address: string,
+  now: number = Date.now(),
+): Promise<boolean> {
+  try {
+    const slot = await checkAndBumpWindowLimit(
+      env,
+      `alert:tempo-low-balance:${address.toLowerCase()}`,
+      1,
+      LOW_BALANCE_ALERT_WINDOW_MS,
+      now,
+    )
+    return slot.ok
+  } catch (err) {
+    console.warn(`[proxy] Tempo low-balance alert dedupe failed: ${String(err)}`)
+    return true
+  }
+}

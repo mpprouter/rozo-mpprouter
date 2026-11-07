@@ -56,7 +56,7 @@ import {
   verifyStellarX402WithFacilitator,
 } from '../mpp/stellar-x402-server'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
-import { getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
+import { claimTempoLowBalanceAlertSlot, getTempoUsdcBalance, LOW_BALANCE_THRESHOLD } from '../utils/tempo-balance'
 import { extractStellarAddress, type JobAuthRecord } from './job-status'
 import { checkAndBumpDailyLimit, peekDailyLimit, secondsUntilUtcMidnight, utcDateKey } from '../mpp/rate-limit-do'
 import { newOrderId, recordOrder, updateOrderRefundStatus, type RefundStatus } from '../services/order-ledger'
@@ -1729,7 +1729,7 @@ export async function handleProxy(
   // Before accepting the agent's Stellar payment, verify the Router's
   // Tempo wallet has enough USDC.e to cover the merchant quote. If
   // not, return 503 so the agent doesn't pay and get nothing back.
-  // Also fire a DingTalk alert when the pool is below 5 USDC.
+  // Also fire an alert when the pool is below 5 USDC, at most once per hour.
   // Fixed-price routes (Mercury MVP) never pay a merchant on Tempo —
   // `payMerchantAndGetBody`'s upstreamAuth branch calls the upstream
   // directly — so the Tempo pool balance is irrelevant to whether this
@@ -1744,17 +1744,18 @@ export async function handleProxy(
       env.TEMPO_RPC_URL_PRIMARY,
     )
     if (tempoBalance !== null) {
-      // Fire DingTalk alert if balance < 5 USDC (fire-and-forget)
+      // Alert if balance < 5 USDC, deduped hourly (fire-and-forget)
       if (tempoBalance < LOW_BALANCE_THRESHOLD && alertSinkConfigured(env)) {
         const balanceStr = (Number(tempoBalance) / 1_000_000).toFixed(2)
-        ctx.waitUntil(
-          sendAlert(env,
+        ctx.waitUntil((async () => {
+          if (!(await claimTempoLowBalanceAlertSlot(env, env.TEMPO_ROUTER_ADDRESS))) return
+          await sendAlert(env,
             redactForAlert(`[MPP Router] ⚠️ Tempo pool low balance: ${balanceStr} USDC\n` +
             `Address: ${env.TEMPO_ROUTER_ADDRESS}\n` +
             `Threshold: 5 USDC\n` +
             `Action needed: top up the Tempo pool to avoid service disruption.`),
-          ),
-        )
+          )
+        })())
       }
       // Reject if balance can't cover this request
       if (tempoBalance < merchantQuoteBaseUnits) {
