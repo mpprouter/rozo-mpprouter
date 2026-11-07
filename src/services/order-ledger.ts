@@ -148,10 +148,13 @@ export function isSettledEntry(entry: OrderLedgerEntry): boolean {
   return Boolean(entry.settlement_ref)
 }
 
+// `settled` only ever moves 0 -> 1: unknown resolves to settled or failed,
+// and a settled payment never unsettles. MAX keeps a late or replayed
+// write from undoing a settlement already recorded.
 export const UPSERT_ORDER_STATS_SQL =
   'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded, settled) ' +
   'VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET ' +
-  'refunded = MAX(order_ledger_stats.refunded, excluded.refunded), settled = excluded.settled'
+  'refunded = MAX(order_ledger_stats.refunded, excluded.refunded), settled = MAX(order_ledger_stats.settled, excluded.settled)'
 
 /**
  * Mirror one order into the D1 stats rollup. Best-effort and logged, like the

@@ -155,6 +155,10 @@ describe('getStats', () => {
     const s = await getStats(e, '30d')
     expect(s.totals.calls).toBe(1)
     expect(s.totals.unsettled_calls).toBe(0)
+    // A late replay of the old unresolved state must not undo the settlement.
+    const stale = await orderStatsRow(base)
+    db.prepare(UPSERT_ORDER_STATS_SQL).run(stale!.order_id, stale!.created_at, stale!.service_id, stale!.amount_micros, stale!.payer_digest, stale!.refunded, stale!.settled)
+    expect((await getStats(e, '30d')).totals.calls).toBe(1)
   })
 
   it('counts distinct buyers, not calls', async () => {
