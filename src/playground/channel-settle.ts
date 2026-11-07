@@ -28,6 +28,7 @@
  * logged (fail-safe, bounded loss).
  */
 
+import { stellarRpcUrl } from '../utils/stellar-rpc'
 import { close as sdkClose, getChannelState } from '@stellar/mpp/channel/server'
 import { Keypair } from '@stellar/stellar-sdk'
 import type { Env } from '../index'
@@ -171,7 +172,7 @@ export async function settleOneChannel(
     const state = await deps.getChannelState({
       channel: channelContract,
       network: env.STELLAR_NETWORK,
-      rpcUrl: env.STELLAR_RPC_URL,
+      rpcUrl: stellarRpcUrl(env),
     })
     const closing = state.closeEffectiveAtLedger != null
 
@@ -236,7 +237,7 @@ export async function settleOneChannel(
         },
         maxFeeBumpStroops: 10_000_000, // 1 XLM cap on the bumped fee
         network: env.STELLAR_NETWORK,
-        rpcUrl: env.STELLAR_RPC_URL,
+        rpcUrl: stellarRpcUrl(env),
       })
     } catch (err: any) {
       // The funder's unilateral refund already emptied the channel: the close's

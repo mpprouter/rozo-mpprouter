@@ -23,6 +23,7 @@
  * logic (`checkChannelMatches`) is trivially unit-testable without a live RPC.
  */
 
+import { stellarRpcUrl } from '../utils/stellar-rpc'
 import {
   Account,
   Address,
@@ -206,12 +207,13 @@ function dataKeyName(key: xdr.ScVal): string | null {
  * decode failure so the caller returns a 502 rather than trusting the client.
  */
 export async function readChannelOnChain(
-  env: { STELLAR_RPC_URL: string; STELLAR_NETWORK: string; STELLAR_ROUTER_PUBLIC: string },
+  env: { STELLAR_RPC_URL: string; STELLAR_RPC_URL_PRIMARY?: string; STELLAR_NETWORK: string; STELLAR_ROUTER_PUBLIC: string },
   channelContract: string,
   usdcSac: string,
 ): Promise<OnChainChannel> {
-  const server = new rpc.Server(env.STELLAR_RPC_URL, {
-    allowHttp: env.STELLAR_RPC_URL.startsWith('http://'),
+  const rpcUrl = stellarRpcUrl(env)
+  const server = new rpc.Server(rpcUrl, {
+    allowHttp: rpcUrl.startsWith('http://'),
   })
 
   // 1) Contract instance entry — carries all `.instance()` storage AND the

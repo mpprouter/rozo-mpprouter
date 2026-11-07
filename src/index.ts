@@ -126,6 +126,7 @@ import {
   handleUpiFulfillmentStatus,
 } from './routes/upi-invoice'
 import { handlePreflight, withCors } from './utils/cors'
+import { scrubErrorResponse, stellarRpcUrl } from './utils/stellar-rpc'
 import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
 import { checkTempoChannels, precompileStateReader } from './utils/tempo-channel-watch'
@@ -229,7 +230,11 @@ export interface Env {
   STELLAR_GAS_PUBLIC: string      // G... address
 
   STELLAR_NETWORK: string
+  // Public fallback, also advertised to clients by GET /v1/playground/config.
   STELLAR_RPC_URL: string
+  // Keyed RPC URL. Read only through utils/stellar-rpc.ts stellarRpcUrl().
+  // Set via: wrangler secret put STELLAR_RPC_URL_PRIMARY
+  STELLAR_RPC_URL_PRIMARY?: string
 
   // Tempo (merchant-facing)
   TEMPO_ROUTER_PRIVATE_KEY: string
@@ -702,10 +707,12 @@ export interface Env {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     if (request.method === 'OPTIONS') return handlePreflight(request)
-    const response = await route(request, env, ctx)
+    stellarRpcUrl(env) // Registers the key for scrubbing before any code can log it.
+    const response = await scrubErrorResponse(await route(request, env, ctx))
     return withCors(request, response)
   },
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    stellarRpcUrl(env) // Registers the key for scrubbing before any code can log it.
     // Two crons (wrangler.toml). The 1-minute one runs ONLY the intents
     // warm-up trial; every job below stays on the 2-minute cron and must not
     // run more often (several assume that cadence). Any other cron value,

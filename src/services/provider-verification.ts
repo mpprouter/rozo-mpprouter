@@ -57,6 +57,7 @@
  * onboards today", never "an unverified payout address goes live".
  */
 
+import { scrubRpcSecret, stellarRpcUrl } from '../utils/stellar-rpc'
 import { Mppx } from 'mppx/client'
 import { stellar } from '@stellar/mpp/charge/client'
 import { Keypair } from '@stellar/stellar-sdk'
@@ -823,7 +824,7 @@ export async function gateRealMoneyCall(
     )
   }
 
-  if (dialect === 'x402' && !env.STELLAR_RPC_URL) {
+  if (dialect === 'x402' && !stellarRpcUrl(env)) {
     return failure(
       'gate_unavailable',
       'Paying an x402 challenge on Stellar needs a Soroban RPC (STELLAR_RPC_URL) on this deployment.',
@@ -857,7 +858,7 @@ export async function gateRealMoneyCall(
       url,
       method: spec.method,
       secret,
-      rpcUrl: env.STELLAR_RPC_URL ?? '',
+      rpcUrl: stellarRpcUrl(env) ?? '',
       network: stellarPayout.network,
       signal: controller.signal,
       expected: { payTo: stellarPayout.payTo, maxAmountBaseUnits: maxAmount },
@@ -866,11 +867,11 @@ export async function gateRealMoneyCall(
     if (err instanceof ChallengeMismatchError) {
       // Nothing was signed; the provider's paid-phase challenge disagreed
       // with what it showed the probe. Safe to retry, and worth recording.
-      return failure('challenge_mismatch', err.message, { dialect })
+      return failure('challenge_mismatch', scrubRpcSecret(String(err.message)), { dialect })
     }
     return failure(
       'paid_call_failed',
-      `The paid call did not complete: ${err?.message ?? 'unknown error'}. ` +
+      `The paid call did not complete: ${scrubRpcSecret(String(err?.message ?? 'unknown error'))}. ` +
         'Common causes: the challenge asks for an asset our wallet does not hold, ' +
         'or the endpoint rejects the credential it issued.',
       { dialect },

@@ -24,6 +24,7 @@
  * unverifiable channel).
  */
 
+import { stellarRpcUrl } from '../utils/stellar-rpc'
 import { getChannelState } from '@stellar/mpp/channel/server'
 import type { Env } from '../index'
 
@@ -69,7 +70,7 @@ async function readCloseState(
   const s = await deps.getChannelState({
     channel: channelContract,
     network: env.STELLAR_NETWORK,
-    rpcUrl: env.STELLAR_RPC_URL,
+    rpcUrl: stellarRpcUrl(env),
   })
   const entry = {
     closeEffectiveAtLedger: s.closeEffectiveAtLedger,

@@ -271,6 +271,7 @@ export function handlePlaygroundConfig(env: Env, origin: string): Response {
       router_recipient: env.STELLAR_ROUTER_PUBLIC,
       network: env.STELLAR_NETWORK,
       network_passphrase: channelNetworkPassphrase(env),
+      // Public by design: never the keyed STELLAR_RPC_URL_PRIMARY.
       soroban_rpc_url: env.STELLAR_RPC_URL,
       horizon_url: channelHorizonUrl(env),
       refund_waiting_period: CHANNEL_REFUND_WAITING_PERIOD,

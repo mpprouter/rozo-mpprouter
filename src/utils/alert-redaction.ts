@@ -27,6 +27,8 @@
  *     secret is never partially revealed by a narrower rule matching first.
  */
 
+import { scrubRpcSecret } from './stellar-rpc'
+
 declare const redactedAlertBrand: unique symbol
 
 /**
@@ -277,7 +279,8 @@ function restoreLabelledHashes(text: string, hashes: string[]): string {
 }
 
 export function redactForAlert(content: unknown): RedactedAlert {
-  const preserved = preserveLabelledHashes(stringify(content))
+  // Runs first so a key is gone before any narrower rule can keep part of it.
+  const preserved = preserveLabelledHashes(scrubRpcSecret(stringify(content)))
   let text = preserved.text
 
   for (const rule of CREDENTIAL_RULES) {
