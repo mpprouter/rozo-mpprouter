@@ -17,6 +17,7 @@
  * re-implement voucher freshness checks here.
  */
 
+import { privateKeyToAccount } from 'viem/accounts'
 import type { Env } from '../index'
 
 /**
@@ -103,20 +104,25 @@ export type TempoChannelState = {
  */
 const KEY_PREFIX = 'tempoChannel:'
 
+/**
+ * Second slot used across a router key rotation. A voucher only redeems when
+ * signed by the channel's on-chain `authorizedSigner`, and a Worker secret
+ * change cannot be atomic with a KV write, so during a rotation the entries for
+ * both keys exist and each Worker version picks the one its own key can sign.
+ * Rolling the secrets back therefore also rolls the channels back.
+ */
+const ALT_KEY_PREFIX = 'tempoChannelAlt:'
+
 function key(merchantId: string): string {
   return `${KEY_PREFIX}${merchantId}`
 }
 
-/**
- * Read the current channel state for a merchant. Returns `null`
- * if no channel has been opened yet — callers must treat this as
- * "session path unavailable, fall back or fail loudly".
- */
-export async function getTempoChannel(
-  env: Env,
-  merchantId: string,
-): Promise<TempoChannelState | null> {
-  const raw = await env.MPP_STORE.get(key(merchantId))
+function altKey(merchantId: string): string {
+  return `${ALT_KEY_PREFIX}${merchantId}`
+}
+
+async function readSlot(env: Env, kvKey: string): Promise<TempoChannelState | null> {
+  const raw = await env.MPP_STORE.get(kvKey)
   if (!raw) return null
   try {
     return JSON.parse(raw) as TempoChannelState
@@ -127,6 +133,55 @@ export async function getTempoChannel(
     // charge-mode routes that share the Worker.
     return null
   }
+}
+
+/**
+ * The address that actually signs vouchers. Derived from the key rather than
+ * read from TEMPO_ROUTER_ADDRESS, so a mismatched secret pair cannot select a
+ * channel this key is unable to sign for.
+ */
+function routerSigner(env: Env): string | null {
+  const privateKey = env.TEMPO_ROUTER_PRIVATE_KEY
+  if (privateKey) return privateKeyToAccount(privateKey as `0x${string}`).address.toLowerCase()
+  return env.TEMPO_ROUTER_ADDRESS?.toLowerCase() ?? null
+}
+
+function signedByRouter(env: Env, state: TempoChannelState): boolean {
+  const signer = state.authorizedSigner?.toLowerCase()
+  const router = routerSigner(env)
+  // No key configured means nothing can be signed; only then is there nothing to compare.
+  return router === null || signer === router
+}
+
+/**
+ * Find the slot holding a channel the current router key can sign for. A
+ * channel in neither slot is reported as absent: signing it would produce a
+ * voucher the merchant must reject, while the watermark still advanced.
+ */
+async function resolveChannel(
+  env: Env,
+  merchantId: string,
+): Promise<{ kvKey: string; state: TempoChannelState } | null> {
+  const primaryKey = key(merchantId)
+  const primary = await readSlot(env, primaryKey)
+  if (primary && signedByRouter(env, primary)) return { kvKey: primaryKey, state: primary }
+  const alternateKey = altKey(merchantId)
+  const alternate = await readSlot(env, alternateKey)
+  if (alternate && signedByRouter(env, alternate)) return { kvKey: alternateKey, state: alternate }
+  return null
+}
+
+/**
+ * Read the current channel state for a merchant. Returns `null`
+ * if no channel signable by the current router key is installed —
+ * callers must treat this as "session path unavailable, fall back
+ * or fail loudly".
+ */
+export async function getTempoChannel(
+  env: Env,
+  merchantId: string,
+): Promise<TempoChannelState | null> {
+  return (await resolveChannel(env, merchantId))?.state ?? null
 }
 
 /**
@@ -166,7 +221,7 @@ export async function listTempoChannels(
     const page = await env.MPP_STORE.list({ prefix: KEY_PREFIX, cursor })
     for (const k of page.keys) {
       const merchantId = k.name.slice(KEY_PREFIX.length)
-      const state = await getTempoChannel(env, merchantId)
+      const state = await readSlot(env, k.name)
       if (state) out.push({ merchantId, state })
     }
     cursor = page.list_complete ? undefined : page.cursor
@@ -205,8 +260,9 @@ export async function bumpCumulative(
       `bumpCumulative: cumulative must be non-negative integer string, got ${newCumulativeRaw}`,
     )
   }
-  const current = await getTempoChannel(env, merchantId)
-  if (!current) {
+  const resolved = await resolveChannel(env, merchantId)
+  const current = resolved?.state
+  if (!resolved || !current) {
     // No channel means no session to bump. This should never
     // happen in practice — callers read the channel before
     // signing a voucher — but we refuse rather than silently
@@ -221,7 +277,7 @@ export async function bumpCumulative(
     cumulativeRaw: incoming.toString(),
     lastVoucherAt: new Date().toISOString(),
   }
-  await env.MPP_STORE.put(key(merchantId), JSON.stringify(next))
+  await env.MPP_STORE.put(resolved.kvKey, JSON.stringify(next))
 }
 
 /**
