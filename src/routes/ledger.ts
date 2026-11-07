@@ -107,6 +107,14 @@ export interface PublicLedgerRow {
   amount_usd: string
   /** Stellar transaction hash of the settlement, or null if settlement did not produce one. */
   settlement_tx: string | null
+  /**
+   * settled | pending | failed | unknown | not_recorded. `delivered` below only
+   * means the upstream answered; this says whether the buyer paid. `not_recorded`
+   * is an older row, or another payment branch, with no settlement tx.
+   */
+  settlement_status: string
+  /** Why the settlement did not complete, when known. */
+  settlement_error_reason?: string
   /** delivered | failed | refund_pending | refunded | refund_unknown — see toPublicRow. */
   status: string
   /** HTTP status the upstream merchant returned. */
@@ -176,6 +184,8 @@ export function toPublicRow(entry: OrderLedgerEntry, lists: PayerLists): PublicL
     payer: entry.payer,
     amount_usd: entry.amount_usd,
     settlement_tx: entry.settlement_ref,
+    settlement_status: entry.settlement_status ?? (entry.settlement_ref ? 'settled' : 'not_recorded'),
+    ...(entry.settlement_error_reason ? { settlement_error_reason: entry.settlement_error_reason } : {}),
     status,
     upstream_status: entry.upstream_status,
     internal,

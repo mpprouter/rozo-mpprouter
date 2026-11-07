@@ -85,15 +85,170 @@ import {
   getUsdcAddress,
 } from '@x402/stellar'
 import { ExactStellarScheme } from '@x402/stellar/exact/facilitator'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
   Networks,
   StrKey,
   TransactionBuilder,
+  rpc,
   scValToNative,
   type Transaction,
 } from '@stellar/stellar-sdk'
 import type { RouteOperator } from '../services/merchants-types'
 import type { Env } from '../index'
+
+// ---------------------------------------------------------------------
+// Settlement tracing
+// ---------------------------------------------------------------------
+
+/**
+ * Total time one settlement may hold the response. Below the ~120 s after
+ * which clients were seen to give up (2026-11-06), and below the 30 s a Worker
+ * keeps running after a disconnect, so the result is still written.
+ */
+export const SETTLE_WAIT_MS = 28_000
+const SETTLE_POLL_INTERVAL_MS = 2_000
+const SETTLE_RETRY_DELAY_MS = 1_500
+/** No second attempt unless it can plausibly finish inside SETTLE_WAIT_MS. */
+const SETTLE_RETRY_MIN_REMAINING_MS = 10_000
+const MAX_TRACED_CAUSES = 6
+const MAX_CAUSE_CHARS = 300
+
+/**
+ * What the library knows but does not return. It reduces every RPC error to a
+ * generic errorReason (`unexpected_verify_error`), drops the sendTransaction
+ * status, and hides the tx hash until it returns. Per-call, hence the
+ * AsyncLocalStorage: the facilitator is an isolate-wide singleton.
+ */
+interface SettleTrace {
+  /** Every envelope we signed. Any of them could still land until it expires. */
+  hashes: string[]
+  /** Set once the RPC accepted a tx (PENDING). Rules out a retry. */
+  accepted: boolean
+  /** Latest getTransaction / sendTransaction status. */
+  rpcStatus?: string
+  /** True when the chain applied the tx and it failed. */
+  failedOnChain: boolean
+  causes: string[]
+  /** Set at the deadline: a still-running attempt must not sign anything new. */
+  abandoned: boolean
+  /** The one permitted retry has been used. */
+  retried?: boolean
+  deadlineMs: number
+  onSigned?: (hashes: readonly string[]) => Promise<void>
+}
+
+const settleTrace = new AsyncLocalStorage<SettleTrace>()
+
+function describeCause(value: unknown): string {
+  if (!(value instanceof Error) && (typeof value !== 'object' || value === null)) return String(value)
+  const err = value as { name?: string; message?: string; response?: { status?: number; data?: unknown }; cause?: unknown }
+  const parts = [err.message ? `${err.name ?? 'Error'}: ${err.message}` : JSON.stringify(value)]
+  if (err.response?.status !== undefined) parts.push(`status=${err.response.status}`)
+  if (err.response?.data !== undefined) parts.push(`data=${JSON.stringify(err.response.data)}`)
+  if (err.cause !== undefined) parts.push(`cause=${describeCause(err.cause)}`)
+  return parts.join(' ')
+}
+
+function addCause(trace: SettleTrace, cause: string): void {
+  if (trace.causes.length < MAX_TRACED_CAUSES) trace.causes.push(cause.slice(0, MAX_CAUSE_CHARS))
+}
+
+/**
+ * The only place the library reports the real error is console.error. Copy it
+ * into the current settlement's trace; output outside a settlement is untouched.
+ */
+const originalConsoleError = console.error.bind(console)
+console.error = (...args: unknown[]) => {
+  const trace = settleTrace.getStore()
+  if (trace) addCause(trace, args.map(describeCause).join(' '))
+  originalConsoleError(...args)
+}
+
+/** The library discards the sendTransaction status and error code; keep them. */
+const originalSendTransaction = rpc.Server.prototype.sendTransaction
+rpc.Server.prototype.sendTransaction = async function tracedSendTransaction(
+  this: rpc.Server,
+  ...args: Parameters<typeof originalSendTransaction>
+) {
+  const trace = settleTrace.getStore()
+  // The caller already has this settlement's result and hash list; a tx sent
+  // now could land with nothing left to find it.
+  if (trace?.abandoned) throw new Error('settlement deadline passed; not submitting')
+  try {
+    const result = await originalSendTransaction.apply(this, args)
+    if (trace) {
+      trace.rpcStatus = result.status
+      if (result.status === 'PENDING') trace.accepted = true
+      else addCause(trace, `sendTransaction status=${result.status}${sendErrorCode(result)}`)
+    }
+    return result
+  } catch (err) {
+    if (trace) addCause(trace, `sendTransaction threw: ${describeCause(err)}`)
+    throw err
+  }
+}
+
+function sendErrorCode(result: { errorResult?: { result(): { switch(): { name: string } } } }): string {
+  try {
+    const code = result.errorResult?.result().switch().name
+    return code ? ` code=${code}` : ''
+  } catch {
+    return ''
+  }
+}
+
+type FacilitatorSigner = ReturnType<typeof createEd25519Signer>
+
+/** Records each envelope's hash, durably, before the library can submit it. */
+function traceSigner(signer: FacilitatorSigner): FacilitatorSigner {
+  return {
+    ...signer,
+    signTransaction: async (xdr, opts) => {
+      const trace = settleTrace.getStore()
+      if (trace?.abandoned) {
+        return { signedTxXdr: '', error: { code: -1, message: 'settlement deadline passed' } }
+      }
+      const signed = await signer.signTransaction(xdr, opts)
+      if (trace && signed.signedTxXdr && !signed.error && opts?.networkPassphrase) {
+        const tx = TransactionBuilder.fromXDR(signed.signedTxXdr, opts.networkPassphrase)
+        trace.hashes.push(tx.hash().toString('hex'))
+        await trace.onSigned?.(trace.hashes)
+      }
+      return signed
+    },
+  }
+}
+
+/**
+ * The library polls `maxTimeoutSeconds` times, one per second. That value is
+ * 300 and cannot change: verify() compares it with what the client signed. So
+ * replace only the wait, which ends at this settlement's deadline.
+ */
+function boundSettlementPolling(scheme: ExactStellarScheme): void {
+  const target = scheme as unknown as {
+    pollForTransaction: (server: rpc.Server, hash: string) => Promise<{ success: boolean }>
+  }
+  target.pollForTransaction = async (server, hash) => {
+    const trace = settleTrace.getStore()
+    const deadline = trace?.deadlineMs ?? Date.now() + SETTLE_WAIT_MS
+    while (Date.now() < deadline && !trace?.abandoned) {
+      try {
+        const result = await server.getTransaction(hash)
+        if (trace) trace.rpcStatus = result.status
+        if (result.status === 'SUCCESS') return { success: true }
+        if (result.status === 'FAILED') {
+          if (trace) trace.failedOnChain = true
+          return { success: false }
+        }
+      } catch (err) {
+        if (trace) addCause(trace, `getTransaction threw: ${describeCause(err)}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, SETTLE_POLL_INTERVAL_MS))
+    }
+    return { success: false }
+  }
+}
 
 // ---------------------------------------------------------------------
 // Facilitator singleton
@@ -128,10 +283,10 @@ function getFacilitator(env: Env): x402Facilitator {
   // sets the network passphrase used when signTransaction is called
   // without an explicit override — we pass the router's configured
   // network.
-  const signer = createEd25519Signer(
+  const signer = traceSigner(createEd25519Signer(
     env.STELLAR_X402_FACILITATOR_SECRET,
     network,
-  )
+  ))
 
   const scheme = new ExactStellarScheme([signer], {
     rpcConfig: { url: env.STELLAR_RPC_URL },
@@ -159,6 +314,7 @@ function getFacilitator(env: Env): x402Facilitator {
     // is a real spend ceiling, not a formality.
     maxTransactionFeeStroops: 500_000,
   })
+  boundSettlementPolling(scheme)
 
   const facilitator = new x402Facilitator()
   facilitator.register(network, scheme)
@@ -837,9 +993,16 @@ export async function verifyStellarX402WithFacilitator(
 
 export type StellarX402SettleResult = {
   success: boolean
+  /** `unknown`: a signed tx may still land. See services/x402-settlement.ts. */
+  outcome: 'settled' | 'failed' | 'unknown'
+  /** On a non-settled outcome, the last signed hash, not proof of payment. */
   transaction?: string
   errorReason?: string
   errorMessage?: string
+  attemptedTxs: string[]
+  rpcStatus?: string
+  /** Underlying errors the library logged but did not return. */
+  causes: string[]
 }
 
 /**
@@ -858,6 +1021,7 @@ export async function settleStellarX402(
   env: Env,
   payload: PaymentPayload,
   requirements: PaymentRequirements,
+  opts: { onSigned?: (hashes: readonly string[]) => Promise<void> } = {},
 ): Promise<StellarX402SettleResult> {
   let facilitator: x402Facilitator
   try {
@@ -865,23 +1029,110 @@ export async function settleStellarX402(
   } catch (err: any) {
     return {
       success: false,
+      outcome: 'failed',
       errorReason: 'facilitator_init_failed',
       errorMessage: err.message,
+      attemptedTxs: [],
+      causes: [],
     }
   }
-  try {
-    const result = await facilitator.settle(payload, requirements)
-    return {
-      success: result.success,
-      transaction: result.transaction,
-      errorReason: result.errorReason,
-      errorMessage: result.errorMessage,
-    }
-  } catch (err: any) {
-    return {
-      success: false,
-      errorReason: 'settle_threw',
-      errorMessage: err.message,
-    }
-  }
+  return runBoundedSettlement(
+    () => facilitator.settle(payload, requirements),
+    opts.onSigned,
+  )
 }
+
+/**
+ * Failures raised before the RPC accepted a tx. A second attempt cannot charge
+ * twice: it resubmits the same client-signed auth entry, the library rejects
+ * any entry without address credentials (validateAuthEntries), and those
+ * credentials carry a nonce the Soroban host consumes on first use. If the
+ * first attempt did land, the retry fails simulation, and the first hash is
+ * still resolved from attemptedTxs.
+ */
+const RETRYABLE_SETTLE_REASONS = new Set([
+  'unexpected_verify_error',
+  'unexpected_settle_error',
+  'settle_exact_stellar_transaction_submission_failed',
+])
+
+interface SettleAttemptResult {
+  success: boolean
+  transaction?: string
+  errorReason?: string
+  errorMessage?: string
+}
+
+/** Exported for tests: the library's RPC calls cannot be injected. */
+export async function runBoundedSettlement(
+  attempt: () => Promise<SettleAttemptResult>,
+  onSigned?: (hashes: readonly string[]) => Promise<void>,
+  waitMs: number = SETTLE_WAIT_MS,
+  traceHook?: (trace: SettleTrace) => void,
+): Promise<StellarX402SettleResult> {
+  const startedAt = Date.now()
+  const trace: SettleTrace = {
+    hashes: [],
+    accepted: false,
+    failedOnChain: false,
+    causes: [],
+    abandoned: false,
+    deadlineMs: startedAt + waitMs,
+    onSigned,
+  }
+  traceHook?.(trace)
+
+  const attempts = settleTrace.run(trace, async (): Promise<SettleAttemptResult> => {
+    for (;;) {
+      let result: SettleAttemptResult
+      try {
+        result = await attempt()
+      } catch (err: any) {
+        addCause(trace, describeCause(err))
+        result = {
+          success: false,
+          errorReason: err?.errorReason ?? 'settle_threw',
+          errorMessage: err?.errorMessage ?? err?.message,
+        }
+      }
+      const retryable =
+        !result.success &&
+        !trace.accepted &&
+        !trace.retried &&
+        RETRYABLE_SETTLE_REASONS.has(result.errorReason ?? '') &&
+        trace.deadlineMs - Date.now() >= SETTLE_RETRY_MIN_REMAINING_MS
+      if (!retryable) return result
+      trace.retried = true
+      await new Promise((resolve) => setTimeout(resolve, SETTLE_RETRY_DELAY_MS))
+    }
+  })
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const deadline = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), waitMs)
+  })
+  const result = await Promise.race([attempts, deadline])
+  clearTimeout(timer)
+  if (result === null) trace.abandoned = true
+
+  const shared = {
+    attemptedTxs: [...trace.hashes],
+    rpcStatus: trace.rpcStatus,
+    causes: [...trace.causes],
+  }
+  if (result?.success) {
+    return { ...shared, success: true, outcome: 'settled', transaction: result.transaction }
+  }
+  // A signed envelope that the chain has not rejected may still land until its
+  // time bound passes. Only the resolver can call that one failed.
+  const definitelyFailed =
+    result !== null &&
+    (trace.hashes.length === 0 || (trace.failedOnChain && trace.hashes.length === 1))
+  return {
+    ...shared,
+    success: false,
+    outcome: definitelyFailed ? 'failed' : 'unknown',
+    transaction: trace.hashes[trace.hashes.length - 1],
+    errorReason: result?.errorReason ?? 'settle_wait_exceeded',
+    errorMessage: result?.errorMessage ?? trace.causes[0],
+  }}

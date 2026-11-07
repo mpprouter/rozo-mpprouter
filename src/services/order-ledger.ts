@@ -55,7 +55,21 @@ export interface OrderLedgerEntry {
   upstream_status: number
   latency_ms: number
   refund_status: RefundStatus
+  /**
+   * stellar.x402 only (services/x402-settlement.ts documents the states). A row
+   * without this field is from another branch, or predates 2026-11-07.
+   */
+  settlement_status?: SettlementStatus
+  /** Every settlement envelope signed for this call. May be non-empty while settlement_ref is null. */
+  settlement_attempt_txs?: string[]
+  /** Library errorReason, e.g. `unexpected_verify_error`. */
+  settlement_error_reason?: string
+  /** Redacted underlying cause (HTTP status, RPC message). Kept out of the public ledger. */
+  settlement_error?: string
+  settlement_rpc_status?: string
 }
+
+export type SettlementStatus = 'pending' | 'settled' | 'failed' | 'unknown'
 
 export function orderKey(orderId: string): string {
   return `mercury_order:${orderId}`
@@ -96,6 +110,8 @@ export interface OrderStatsRow {
 
 /** Null when the entry's timestamp is unusable; such rows were never countable. */
 export async function orderStatsRow(entry: OrderLedgerEntry): Promise<OrderStatsRow | null> {
+  // /v1/stats publishes settled volume. A row becomes countable when it settles.
+  if (entry.settlement_status && entry.settlement_status !== 'settled') return null
   const created = Date.parse(entry.ts)
   if (Number.isNaN(created)) return null
   return {
