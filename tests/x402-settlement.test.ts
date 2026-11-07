@@ -246,7 +246,8 @@ describe('settleAndRecordX402', () => {
         return new Promise(() => undefined)
       },
     })
-    await new Promise((resolve) => setTimeout(resolve, 5))
+    // The hash write waits out the KV same-key gap after the first marker write.
+    await new Promise((resolve) => setTimeout(resolve, 1_300))
     expect(pending).toHaveLength(1)
     expect(rows(store)[0].settlement_status).toBe('pending')
 
