@@ -75,6 +75,8 @@ export interface ServiceStats {
    * (LEDGER_INTERNAL_PAYERS) that settled, got a 2xx from the upstream and
    * was not refunded, or null. Looks back over the window or 90 days,
    * whichever is longer, so a 24h view still shows a recent verification.
+   * The lookback fills this field for services the window already lists; it
+   * does not add services, so each window keeps the same rows as before.
    * Internal calls stay out of every commerce figure; this only says when
    * we last proved the route delivers.
    */
