@@ -112,12 +112,19 @@ export interface OrderStatsRow {
   amount_micros: number
   payer_digest: string | null
   refunded: number
+  /**
+   * 1 when the buyer's payment settled, 0 when the merchant was paid but the
+   * buyer was not charged (settlement failed or still unknown). /v1/stats
+   * counts volume, calls and buyers on settled rows only and publishes the
+   * unsettled count beside them.
+   */
+  settled: number
 }
 
 /** Null when the entry's timestamp is unusable; such rows were never countable. */
 export async function orderStatsRow(entry: OrderLedgerEntry): Promise<OrderStatsRow | null> {
-  // /v1/stats publishes settled volume. A row becomes countable when it settles.
-  if (entry.settlement_status && entry.settlement_status !== 'settled') return null
+  // Pending rows are not yet final; they are written once settlement resolves.
+  if (entry.settlement_status === 'pending') return null
   const created = Date.parse(entry.ts)
   if (Number.isNaN(created)) return null
   return {
@@ -127,12 +134,24 @@ export async function orderStatsRow(entry: OrderLedgerEntry): Promise<OrderStats
     amount_micros: usdToMicros(entry.amount_usd),
     payer_digest: entry.payer ? await sha256Hex(entry.payer) : null,
     refunded: entry.refund_status === 'refunded' ? 1 : 0,
+    settled: isSettledEntry(entry) ? 1 : 0,
   }
 }
 
+/**
+ * Whether the buyer actually paid. Mirrors GET /v1/ledger's
+ * `settlement_status`: an explicit status wins, and a legacy row with no
+ * status counts as settled only when it carries a settlement reference.
+ */
+export function isSettledEntry(entry: OrderLedgerEntry): boolean {
+  if (entry.settlement_status) return entry.settlement_status === 'settled'
+  return Boolean(entry.settlement_ref)
+}
+
 export const UPSERT_ORDER_STATS_SQL =
-  'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded) ' +
-  'VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET refunded = MAX(order_ledger_stats.refunded, excluded.refunded)'
+  'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded, settled) ' +
+  'VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET ' +
+  'refunded = MAX(order_ledger_stats.refunded, excluded.refunded), settled = excluded.settled'
 
 /**
  * Mirror one order into the D1 stats rollup. Best-effort and logged, like the
@@ -146,7 +165,7 @@ export async function recordOrderStats(env: Env, entry: OrderLedgerEntry): Promi
     if (!r) return
     await db
       .prepare(UPSERT_ORDER_STATS_SQL)
-      .bind(r.order_id, r.created_at, r.service_id, r.amount_micros, r.payer_digest, r.refunded)
+      .bind(r.order_id, r.created_at, r.service_id, r.amount_micros, r.payer_digest, r.refunded, r.settled)
       .run()
   } catch (err: any) {
     console.error(`[order-ledger] stats rollup write failed for ${entry.order_id}: ${err.message}`)

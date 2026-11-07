@@ -346,13 +346,19 @@ describe('counting and display', () => {
     settlement_ref: null, request_path: '/', upstream_status: 200, latency_ms: 1, refund_status: 'none',
   }
 
-  it.each(['pending', 'failed', 'unknown'] as const)('does not count a %s row as volume', async (settlement_status) => {
-    expect(await orderStatsRow({ ...entry, settlement_status })).toBeNull()
+  it('writes no stats row while settlement is pending', async () => {
+    expect(await orderStatsRow({ ...entry, settlement_status: 'pending' })).toBeNull()
   })
 
-  it('counts settled rows and rows from other branches', async () => {
-    expect(await orderStatsRow({ ...entry, settlement_status: 'settled' })).not.toBeNull()
-    expect(await orderStatsRow(entry)).not.toBeNull()
+  it.each(['failed', 'unknown'] as const)('writes a %s row as unsettled, not as volume', async (settlement_status) => {
+    expect((await orderStatsRow({ ...entry, settlement_status }))?.settled).toBe(0)
+  })
+
+  it('counts settled rows and other branches that carry a settlement reference', async () => {
+    expect((await orderStatsRow({ ...entry, settlement_status: 'settled' }))?.settled).toBe(1)
+    expect((await orderStatsRow({ ...entry, settlement_ref: 'receipt-ref' }))?.settled).toBe(1)
+    // A legacy row with neither a status nor a reference never settled.
+    expect((await orderStatsRow(entry))?.settled).toBe(0)
   })
 
   it('shows the settlement state publicly, without the internal detail', () => {

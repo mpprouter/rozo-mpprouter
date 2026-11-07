@@ -16,9 +16,12 @@
  * one buyer's calls across every service they bought from. Aggregating on
  * the server and publishing only counts leaks nothing.
  *
- * Every recorded call is counted, whoever paid. The page is an internal
- * operating view for now, so splitting traffic by payer classification
- * added a distinction nobody was reading and three counters to keep true.
+ * Commerce counts only settled calls from payers outside
+ * LEDGER_INTERNAL_PAYERS (2026-11-07). The page is public, and counting our
+ * own E2E probes and calls whose settlement failed as paid customer calls
+ * overstated calls, volume and buyers. Both are still published, as
+ * `internal_calls` and `unsettled_calls`, rather than dropped. This reverses
+ * #113, which counted every recorded call while the page was internal only.
  */
 
 import {
@@ -50,8 +53,17 @@ export interface ServiceStats {
    */
   operator?: { id: string; name: string }
   settlement?: 'direct'
-  /** Paid calls from external payers in the window. */
+  /** Settled paid calls from external payers in the window. */
   calls: number
+  /**
+   * External calls where the merchant was paid but the buyer was not
+   * charged: settlement failed or is still unresolved. Not in `calls` or
+   * `volume_usd`. Calls whose ledger row was never written (before #296)
+   * cannot be counted here; see coverage.known_gaps.
+   */
+  unsettled_calls: number
+  /** Calls from our own payers (LEDGER_INTERNAL_PAYERS), excluded from every commerce figure. */
+  internal_calls: number
   /** Summed USDC, external payers only. String to avoid float drift. */
   volume_usd: string
   /** Distinct external payers. Computed server-side; no payer id is published. */
@@ -77,6 +89,11 @@ export interface ServiceStats {
   router_fault: number | null
   /** Async calls accepted but not yet resolved. Never counted as success. */
   pending: number | null
+  /**
+   * Median upstream leg of successful calls: paying the provider and its
+   * response. It excludes the buyer's own payment and Stellar settlement,
+   * which add several seconds; it is not end-to-end latency.
+   */
   latency_p50_ms: number | null
   /**
    * Refunded external calls over external calls, from the ORDER LEDGER, not
@@ -119,6 +136,8 @@ export interface StatsPayload {
   }
   totals: {
     calls: number
+    unsettled_calls: number
+    internal_calls: number
     volume_usd: string
     buyers: number
     provider_success_rate: number | null
@@ -144,11 +163,13 @@ function microsToUsd(micros: number | bigint): string {
 interface CommerceRow {
   service_id: string
   calls: number
+  unsettled: number
+  internal: number
   volume_micros: number
   refunded: number
   buyers: number
   first_at: number
-  last_at: number
+  last_at: number | null
 }
 
 interface Commerce {
@@ -166,31 +187,59 @@ interface Commerce {
  * failure degrades to empty figures with `ok: false`, which the payload
  * reports as `truncated` rather than publishing a confident zero.
  */
+/** sha256 hex digests of LEDGER_INTERNAL_PAYERS, matching order_ledger_stats.payer_digest. */
+async function internalPayerDigests(env: Env): Promise<string[]> {
+  const list = (env.LEDGER_INTERNAL_PAYERS ?? '')
+    .split(',')
+    .map((x) => x.trim())
+    .filter(Boolean)
+  const out: string[] = []
+  for (const payer of list) {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(payer))
+    out.push([...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join(''))
+  }
+  return out
+}
+
 async function readCommerce(env: Env, cutoff: number): Promise<Commerce> {
   const empty: Commerce = { services: [], hourly: new Map(), total_buyers: 0, ok: false }
   const db = env.ROUTE_METRICS_DB
   if (!db) return empty
   try {
+    const internal = await internalPayerDigests(env)
+    // `internal` is bound, never interpolated. With no list configured the
+    // predicate is a literal false: `IN (NULL)` would evaluate to NULL, and
+    // NOT NULL would silently drop every row from the counts.
+    const isInternal = internal.length
+      ? `(payer_digest IS NOT NULL AND payer_digest IN (${internal.map(() => '?').join(', ')}))`
+      : '(0 = 1)'
+    const counted = `settled = 1 AND NOT ${isInternal}`
     const [perService, perHour, buyers] = await db.batch([
       db
         .prepare(
-          `SELECT service_id, COUNT(*) AS calls, COALESCE(SUM(amount_micros), 0) AS volume_micros,
-                  COALESCE(SUM(refunded), 0) AS refunded, COUNT(DISTINCT payer_digest) AS buyers,
-                  MIN(created_at) AS first_at, MAX(created_at) AS last_at
+          `SELECT service_id,
+                  SUM(CASE WHEN ${counted} THEN 1 ELSE 0 END) AS calls,
+                  SUM(CASE WHEN settled = 0 AND NOT ${isInternal} THEN 1 ELSE 0 END) AS unsettled,
+                  SUM(CASE WHEN ${isInternal} THEN 1 ELSE 0 END) AS internal,
+                  COALESCE(SUM(CASE WHEN ${counted} THEN amount_micros ELSE 0 END), 0) AS volume_micros,
+                  COALESCE(SUM(CASE WHEN ${counted} THEN refunded ELSE 0 END), 0) AS refunded,
+                  COUNT(DISTINCT CASE WHEN ${counted} THEN payer_digest END) AS buyers,
+                  MIN(created_at) AS first_at,
+                  MAX(CASE WHEN ${counted} THEN created_at END) AS last_at
              FROM order_ledger_stats WHERE created_at >= ? GROUP BY service_id`,
         )
-        .bind(cutoff),
+        .bind(...internal, ...internal, ...internal, ...internal, ...internal, ...internal, ...internal, cutoff),
       db
         .prepare(
           `SELECT service_id, (created_at / 3600000) * 3600000 AS hour_start, COUNT(*) AS n
-             FROM order_ledger_stats WHERE created_at >= ? GROUP BY service_id, hour_start`,
+             FROM order_ledger_stats WHERE created_at >= ? AND ${counted} GROUP BY service_id, hour_start`,
         )
-        .bind(cutoff),
+        .bind(cutoff, ...internal),
       db
         .prepare(
-          'SELECT COUNT(DISTINCT payer_digest) AS n FROM order_ledger_stats WHERE created_at >= ?',
+          `SELECT COUNT(DISTINCT payer_digest) AS n FROM order_ledger_stats WHERE created_at >= ? AND ${counted}`,
         )
-        .bind(cutoff),
+        .bind(cutoff, ...internal),
     ])
     const hourly = new Map<string, { hour_start: number; n: number }[]>()
     for (const r of (perHour.results ?? []) as any[]) {
@@ -201,12 +250,14 @@ async function readCommerce(env: Env, cutoff: number): Promise<Commerce> {
     return {
       services: ((perService.results ?? []) as any[]).map((r) => ({
         service_id: String(r.service_id),
-        calls: Number(r.calls),
+        calls: Number(r.calls ?? 0),
+        unsettled: Number(r.unsettled ?? 0),
+        internal: Number(r.internal ?? 0),
         volume_micros: Number(r.volume_micros),
         refunded: Number(r.refunded),
         buyers: Number(r.buyers),
         first_at: Number(r.first_at),
-        last_at: Number(r.last_at),
+        last_at: r.last_at === null || r.last_at === undefined ? null : Number(r.last_at),
       })),
       hourly,
       total_buyers: Number(((buyers.results ?? [])[0] as any)?.n ?? 0),
@@ -255,6 +306,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
 
   interface Acc {
     calls: number
+    unsettled: number
+    internal: number
     refunded: number
     volume_micros: number
     buyers: number
@@ -265,7 +318,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   const acc = (id: string): Acc => {
     let a = byService.get(id)
     if (!a) {
-      a = { calls: 0, refunded: 0, volume_micros: 0, buyers: 0, first: now, last: null }
+      a = { calls: 0, unsettled: 0, internal: 0, refunded: 0, volume_micros: 0, buyers: 0, first: now, last: null }
       byService.set(id, a)
     }
     return a
@@ -273,6 +326,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   for (const r of commerce.services) {
     const a = acc(r.service_id)
     a.calls = r.calls
+    a.unsettled = r.unsettled
+    a.internal = r.internal
     a.refunded = r.refunded
     a.volume_micros = r.volume_micros
     a.buyers = r.buyers
@@ -311,6 +366,8 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       service_id: serviceId,
       ...(operator ? { operator, settlement: 'direct' as const } : {}),
       calls: a.calls,
+      unsettled_calls: a.unsettled,
+      internal_calls: a.internal,
       volume_usd: microsToUsd(a.volume_micros),
       buyers: a.buyers,
       last_call_at: a.last,
@@ -335,21 +392,23 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     generated_at: new Date(now).toISOString(),
     coverage: {
       commerce_source:
-        'Per-call order ledger, aggregated from its D1 rollup (order_ledger_stats). Volume, buyers and calls are settled orders only.',
+        'Per-call order ledger, aggregated from its D1 rollup (order_ledger_stats). Calls, volume and buyers are settled orders from external payers only. Our own test and monitoring payers are counted separately as internal_calls; calls whose settlement failed or is unresolved are counted as unsettled_calls.',
       quality_source:
-        'route_metric_calls (D1), written at the proxy chokepoint every paid call passes through.',
+        'route_metric_calls (D1), written at the proxy chokepoint every paid call passes through. Success is the provider answering correctly, not the buyer settling. Latency is the upstream leg only and excludes Stellar settlement.',
       quality_availability:
         anyQualityReadFailed && qualityAvailability === 'ok'
           ? 'read_failed'
           : qualityAvailability,
       known_gaps: [
         'Successful asynchronous (202) purchases return before the order ledger is written, so they are absent from volume, buyer and call counts. Their quality outcome IS recorded.',
-        'An x402 payment whose settlement fails after the merchant already answered 2xx still writes an order row, so volume can overstate settled commerce during facilitator or chain incidents. The settlement outcome is not yet persisted per order.',
+        'Before 2026-11-07, an x402 call whose settlement never completed could leave no order row at all (23 deepseek_chat calls on 2026-11-06). Those calls appear in the quality figures but in neither calls nor unsettled_calls.',
         'Order-ledger records expire after 400 days, so the "all" window is a trailing 400 days for volume, buyers and refunds rather than true all-time. Quality history in D1 does not expire.',
       ],
     },
     totals: {
       calls: services.reduce((n, s) => n + s.calls, 0),
+      unsettled_calls: services.reduce((n, s) => n + s.unsettled_calls, 0),
+      internal_calls: services.reduce((n, s) => n + s.internal_calls, 0),
       volume_usd: microsToUsd([...byService.values()].reduce((v, a) => v + BigInt(a.volume_micros), 0n)),
       buyers: commerce.total_buyers,
       provider_success_rate:

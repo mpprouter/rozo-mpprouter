@@ -61,9 +61,9 @@ for (let i = 0; i < listed.length; i += 100) {
       continue
     }
     statements.push(
-      'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded) VALUES (' +
-        [sqlStr(row.order_id), row.created_at, sqlStr(row.service_id), row.amount_micros, sqlStr(row.payer_digest), row.refunded].join(', ') +
-        ') ON CONFLICT(order_id) DO UPDATE SET refunded = MAX(order_ledger_stats.refunded, excluded.refunded);',
+      'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded, settled) VALUES (' +
+        [sqlStr(row.order_id), row.created_at, sqlStr(row.service_id), row.amount_micros, sqlStr(row.payer_digest), row.refunded, row.settled].join(', ') +
+        ') ON CONFLICT(order_id) DO UPDATE SET refunded = MAX(order_ledger_stats.refunded, excluded.refunded), settled = excluded.settled;',
     )
   }
   process.stdout.write(`read ${Math.min(i + 100, listed.length)}/${listed.length}\r`)
