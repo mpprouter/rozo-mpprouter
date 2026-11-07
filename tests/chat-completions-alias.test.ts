@@ -26,8 +26,7 @@ describe('OpenAI chat completions facade', () => {
     const response = handleModels()
     const body = await response.json() as { data: Array<{ id: string }> }
     expect(body.data.map(model => model.id).sort()).toEqual([
-      // Anthropic models removed 2026-11-07 while the route moves to OUSD; they
-      // return when a paid call re-verifies it.
+      'claude-haiku-4-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5',
       // deepseek-v4-pro added 2026-09-08: paid list-models returned it and a
       // paid /deepseek/chat echoed the id back in a completion.
       // deepseek-flash added 2026-09-15: the paid listing now carries it
@@ -52,11 +51,17 @@ describe('OpenAI chat completions facade', () => {
     }
   })
 
-  it('hides the anthropic models until the OUSD channel is re-verified', () => {
-    // Founder decision 2026-08-24 registered these models. Founder decision
-    // 2026-11-07 delists the route until a paid call on an OUSD channel lands.
-    // Restore the four ids here when that happens.
-    expect(FACADE_MODELS.filter(model => model.provider === 'anthropic')).toEqual([])
+  it('exposes the anthropic models, per the 2026-08-24 founder decision', () => {
+    // Registered as a normal service. Note the upstream merchant was still
+    // answering 403-after-payment on a paid probe on 2026-08-24, so these
+    // currently refund rather than deliver; that is the merchant's state, not
+    // a restriction this router imposes. This test exists so that removing
+    // them is a conscious decision rather than a tidy-up.
+    const anthropic = FACADE_MODELS.filter(model => model.provider === 'anthropic')
+    expect(anthropic.map(model => model.id).sort()).toEqual([
+      'claude-haiku-4-5', 'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5',
+    ])
+    expect(anthropic.every(model => model.route === '/v1/services/anthropic/chat_completions')).toBe(true)
   })
 
   it('rejects grok-3-mini before payment, since the upstream substitutes grok-4.3', () => {

@@ -268,14 +268,17 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     // SCF44 tranche-2 video need to demonstrate. The founder overrode this on
     // 2026-11-07 for the delisting below, because the route cannot be paid at
     // all until OUSD channels exist.
-    // 2026-11-07: DELISTED before the OUSD migration. The merchant now quotes
-    // this route in OUSD while the router's channels hold USDC.e, so a paid
-    // call cannot be delivered. Founder rule: verified only returns after a
-    // real paid call on an OUSD channel. `launchGate` admits that call, see
-    // docs/design in ainative 20261107-mpprouter-ousd-session-routes.zh.md.
-    verifiedMode: false,
-    launchGate: 'OUSD_SESSION_LAUNCH_MODE',
-    verifiedNote: 'Not payable: the merchant quotes OUSD and the router holds no OUSD channel yet.',
+    // 2026-11-07: delisted for the token migration, then re-verified the same
+    // day on a new USDC.e session channel (the merchant's 402 offers OUSD,
+    // USDC.e and MACH; the router answers in its channel's token, PR #305).
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-11-07T11:40:47Z',
+    verifiedNote:
+      'Delivers completions. Re-verified 2026-11-07 with a real paid call ' +
+      'through the router (claude-haiku-4-5, settled 0.001 USDC, 200 with a ' +
+      'completion, no refund) on the new USDC.e session channel it shares ' +
+      'with anthropic_messages.',
     // Facade: registered per founder decision 2026-08-24. A normal service
     // registration.
     //
@@ -366,14 +369,16 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     // Note for the next re-probe: verify through the ROUTER. A direct probe
     // that bypasses it carries the operator's own IP, and Anthropic does not
     // serve every region; that is what produced a false 403 on 2026-08-24.
-    // 2026-11-07: DELISTED before the OUSD migration. The merchant now quotes
-    // this route in OUSD while the router's channels hold USDC.e, so a paid
-    // call cannot be delivered. Founder rule: verified only returns after a
-    // real paid call on an OUSD channel. `launchGate` admits that call, see
-    // docs/design in ainative 20261107-mpprouter-ousd-session-routes.zh.md.
-    verifiedMode: false,
-    launchGate: 'OUSD_SESSION_LAUNCH_MODE',
-    verifiedNote: 'Not payable: the merchant quotes OUSD and the router holds no OUSD channel yet. Verify through the router, not a direct merchant probe.',
+    // 2026-11-07: delisted for the token migration, then re-verified the same
+    // day on a new USDC.e session channel (PR #305 answers in the channel's token).
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-11-07T11:40:47Z',
+    verifiedNote:
+      'Delivers completions. Re-verified 2026-11-07 with a real paid call ' +
+      'through the router (claude-haiku-4-5, 200 + native completion, no ' +
+      'refund) on the new USDC.e session channel. Verify through the router, ' +
+      'not a direct merchant probe.',
   },
   // 2026-08-01: disabled. Same shape as openrouter above — the payment
   // settles, then the merchant's own call to OpenAI is refused:
@@ -388,14 +393,15 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     id: 'openai_chat',
     publicPath: '/v1/services/openai/chat',
     upstreamPaymentMethod: 'tempo.session',
-    // 2026-11-07: DELISTED before the OUSD migration. The merchant now quotes
-    // this route in OUSD while the router's channels hold USDC.e, so a paid
-    // call cannot be delivered. Founder rule: verified only returns after a
-    // real paid call on an OUSD channel. `launchGate` admits that call, see
-    // docs/design in ainative 20261107-mpprouter-ousd-session-routes.zh.md.
-    verifiedMode: false,
-    launchGate: 'OUSD_SESSION_LAUNCH_MODE',
-    verifiedNote: 'Not payable: the merchant quotes OUSD and the router holds no OUSD channel yet.',
+    // 2026-11-07: delisted for the token migration, then re-verified the same
+    // day on a new USDC.e session channel (PR #305 answers in the channel's token).
+    verifiedMode: 'session',
+    sessionVerified: true,
+    sessionVerifiedAt: '2026-11-07T11:40:47Z',
+    verifiedNote:
+      'Delivers completions. Re-verified 2026-11-07 with a real paid call ' +
+      'through the router (gpt-4o-mini, 200 + chat completion, no refund) on ' +
+      'the new USDC.e session channel.',
   },
   // Google Gemini — uses {model} placeholder, defaults to gemini-2.0-flash
   // The upstream path uses Google's `:generateContent` literal
