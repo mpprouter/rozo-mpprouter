@@ -1,9 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  filterChargeCandidates,
   filterPayableCandidates,
   parseTempoChallenges,
   parseTempoChallengesStrict,
+  selectChargeChallenge,
   selectSessionChallenge,
   sessionChallengeMismatch,
   tokenSymbol,
@@ -136,5 +138,72 @@ describe('parseTempoChallengesStrict (mppx parser)', () => {
 
   it('throws on a malformed entry, so the proxy refuses before charging', () => {
     expect(() => parseTempoChallengesStrict(`Payment id="bad", request="%%%", ${challenge('b', USDC)}`)).toThrow()
+  })
+})
+
+describe('selectChargeChallenge', () => {
+  const PATHUSD = '0x20c0000000000000000000000000000000000000'
+  // fal / Firecrawl live order on 2026-11-07: OUSD, USDC.e, pathUSD.
+  const live = [challenge('o', OUSD, {}, 'charge'), challenge('u', USDC, {}, 'charge'), challenge('p', PATHUSD, {}, 'charge')].join(', ')
+  const balances = (m: Record<string, bigint | null>) => async (c: string) => m[c.toLowerCase()] ?? 0n
+
+  it('picks USDC.e when the pool holds it, even though OUSD is offered first', async () => {
+    const r = await selectChargeChallenge(parseTempoChallengesStrict(live), balances({ [USDC]: 13_950_000n, [OUSD.toLowerCase()]: 0n }))
+    expect(r?.challenge.id).toBe('u')
+    expect(r?.lockCurrency.toLowerCase()).toBe(USDC)
+  })
+
+  it('falls back to OUSD when only OUSD covers the quote', async () => {
+    const r = await selectChargeChallenge(parseTempoChallengesStrict(live), balances({ [USDC]: 10n, [OUSD.toLowerCase()]: 5_000_000n }))
+    expect(r?.challenge.id).toBe('o')
+  })
+
+  it('returns the most preferred offer when nothing covers it, so the pre-flight refuses', async () => {
+    const r = await selectChargeChallenge(parseTempoChallengesStrict(live), balances({}))
+    expect(r?.challenge.id).toBe('u')
+  })
+
+  it('treats an unreadable balance as not enough and still returns the preferred offer', async () => {
+    const r = await selectChargeChallenge(parseTempoChallengesStrict(live), async () => null)
+    expect(r?.challenge.id).toBe('u')
+  })
+
+  it('never picks a token outside the preference list', async () => {
+    const r = await selectChargeChallenge(parseTempoChallengesStrict(live), balances({ [PATHUSD]: 10n ** 12n }))
+    expect(r?.challenge.id).toBe('u')
+  })
+
+  it('leaves single-challenge merchants alone (no balance reads)', async () => {
+    let reads = 0
+    const r = await selectChargeChallenge(parseTempoChallengesStrict(challenge('x', OUSD, {}, 'charge')), async () => { reads++; return 0n })
+    expect(r).toBeNull()
+    expect(reads).toBe(0)
+  })
+
+  it('leaves multi-challenge headers without a preferred token alone', async () => {
+    const header = [challenge('m', MACH, {}, 'charge'), challenge('p', PATHUSD, {}, 'charge')].join(', ')
+    expect(await selectChargeChallenge(parseTempoChallengesStrict(header), async () => 10n ** 12n)).toBeNull()
+  })
+
+  it('ignores session challenges when counting charge offers', async () => {
+    const header = [challenge('s', OUSD), challenge('c', USDC, {}, 'charge')].join(', ')
+    expect(await selectChargeChallenge(parseTempoChallengesStrict(header), async () => 10n ** 12n)).toBeNull()
+  })
+})
+
+describe('filterChargeCandidates', () => {
+  const cand = (intent: string, currency: string) => ({ challenge: { intent, request: { currency } } })
+
+  it('keeps only charge candidates in the locked token, any casing', () => {
+    const out = filterChargeCandidates(
+      [cand('charge', OUSD), cand('charge', USDC.toUpperCase().replace('0X', '0x')), cand('session', USDC)],
+      USDC,
+    )
+    expect(out).toHaveLength(1)
+    expect(out[0].challenge.intent).toBe('charge')
+  })
+
+  it('returns nothing when the token is gone, so mppx refuses before signing', () => {
+    expect(filterChargeCandidates([cand('charge', OUSD)], USDC)).toEqual([])
   })
 })

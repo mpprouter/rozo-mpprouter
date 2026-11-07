@@ -31,7 +31,7 @@ import {
   payMerchantSession,
 } from '../mpp/tempo-client'
 import { bumpCumulative, getTempoChannel, sessionChannelKeyFor } from '../mpp/channel-store'
-import { parseTempoChallengesStrict, selectSessionChallenge } from '../mpp/tempo-challenges'
+import { parseTempoChallengesStrict, selectChargeChallenge, selectSessionChallenge, tokenSymbol } from '../mpp/tempo-challenges'
 import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult, type X402CachedResult } from '../mpp/idempotency'
 import { isEnvelopeLiftedRoute, presentMerchantEnvelope } from './merchant-envelope'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
@@ -183,6 +183,14 @@ export function forwardHeaders(
     // challenge the merchant offers and leaves zero candidates ("No method
     // found for challenges"). The router pays merchants on its own terms.
     if (lower === 'accept-payment') continue
+    // The agent's x402 v2 credential pays THE ROUTER (Stellar). Merchants that
+    // also speak x402 (Exa, Parallel; 2026-11-07) read it as an attempt to pay
+    // THEM, reject it as invalid and answer without the Tempo challenge, so the
+    // router 502'd "Merchant returned 402 without WWW-Authenticate header".
+    // Transparent passthrough keeps it: there the agent pays the merchant.
+    // The legacy X-PAYMENT header is never read by the router, so it is left
+    // alone for clients that pay the merchant directly with it.
+    if (lower === 'payment-signature' && !opts.keepAuthorization) continue
     headers[key] = value
   }
   return headers
@@ -446,6 +454,8 @@ function parseTempoChallenge(wwwAuth: string): {
   intent: string
   request: { amount: string; currency: string; recipient: string; decimals?: number; [key: string]: any }
   expires?: string
+  /** Charge token the merchant leg must pay in; set when the merchant offered a choice. */
+  lockCurrency?: string
 } | null {
   try {
     const idMatch = wwwAuth.match(/id="([^"]+)"/)
@@ -1036,7 +1046,11 @@ async function payMerchantAndGetBodyInner(
         method: request.method,
         headers: forwardHeaders(request),
         body: requestBody,
-      })
+      }, parsed.lockCurrency
+        // The buyer was quoted this challenge: pay it in the same token and
+        // never more than its amount, or refuse before signing.
+        ? { currency: parsed.lockCurrency, maxAmountRaw: parsed.request.amount }
+        : {})
     }
   } catch (err: any) {
     if (err instanceof ChannelNotInstalledError || err?.name === 'ChannelDepositExhaustedError') {
@@ -1786,6 +1800,22 @@ export async function handleProxy(
         })
       }
       parsed = selection.challenge
+    } else {
+      // Charge merchants may also offer one challenge per accepted token
+      // (fal, Firecrawl: OUSD first, then USDC.e and pathUSD). Paying the first
+      // one asked the pool for a token it does not hold and 503'd every call.
+      // Pick a preferred token the pool can cover, then quote, pre-flight and
+      // pay in that token. A single-challenge merchant is untouched.
+      const chosen = await selectChargeChallenge(offered, (currency) =>
+        getTempoTokenBalance(env.TEMPO_RPC_URL, env.TEMPO_ROUTER_ADDRESS, env.TEMPO_RPC_URL_PRIMARY, currency),
+      )
+      if (chosen) {
+        parsed = { ...chosen.challenge, lockCurrency: chosen.lockCurrency }
+        console.log(
+          `[proxy] charge challenge chosen: ${tokenSymbol(chosen.lockCurrency)} of ` +
+            `${offered.map((c) => tokenSymbol(String(c.request.currency ?? ''))).join('|')}, route=${route.id}`,
+        )
+      }
     }
   }
 

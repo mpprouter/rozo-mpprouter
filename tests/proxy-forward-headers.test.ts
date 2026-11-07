@@ -63,4 +63,36 @@ describe('forwardHeaders', () => {
     // Accept-Payment stays stripped even in transparent-passthrough mode.
     expect(kept).not.toContain('accept-payment')
   })
+
+  // 2026-11-07: Exa and Parallel now also speak x402. The agent's
+  // PAYMENT-SIGNATURE (paying the router on Stellar) reached them on the probe,
+  // they rejected it without a Tempo challenge, and every call 502'd.
+  it('strips the agent x402 v2 credential on the merchant leg', () => {
+    const request = new Request('https://router.example/v1/services/exa/search', {
+      method: 'POST',
+      headers: {
+        'PAYMENT-SIGNATURE': 'eyJ4NDAyVmVyc2lvbiI6Mn0=',
+        'Content-Type': 'application/json',
+      },
+    })
+    const keys = headerKeys(forwardHeaders(request))
+    expect(keys).not.toContain('payment-signature')
+    expect(keys).toContain('content-type')
+  })
+
+  it('leaves the legacy X-PAYMENT header alone (the router never reads it)', () => {
+    const request = new Request('https://router.example/v1/services/exa/search', {
+      method: 'POST',
+      headers: { 'X-PAYMENT': 'eyJ4NDAyVmVyc2lvbiI6MX0=' },
+    })
+    expect(headerKeys(forwardHeaders(request))).toContain('x-payment')
+  })
+
+  it('keeps PAYMENT-SIGNATURE in transparent passthrough, where the agent pays the merchant', () => {
+    const request = new Request('https://router.example/v1/services/exa/search', {
+      method: 'POST',
+      headers: { 'payment-signature': 'abc' },
+    })
+    expect(headerKeys(forwardHeaders(request, { keepAuthorization: true }))).toContain('payment-signature')
+  })
 })
