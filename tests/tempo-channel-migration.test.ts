@@ -127,13 +127,15 @@ describe('guardedChallengeFetch', () => {
   it('hands the manager only the approved challenge, even listed second', async () => {
     const both = async () => new Response(null, {
       status: 402,
-      headers: { 'www-authenticate': `${header({ ...REQUEST, currency: USDC })}, ${header(REQUEST)}` },
+      headers: { 'www-authenticate': `${header({ ...REQUEST, currency: USDC })}, ${header(REQUEST)}`, 'payment-required': 'e30=' },
     })
     const response = await guardedChallengeFetch(CHALLENGE, both as never)('https://x')
     expect(response.headers.get('www-authenticate')).toBe(header(REQUEST))
+    expect(response.headers.get('payment-required')).toBeNull()
   })
   it.each([
     ['currency', { ...REQUEST, currency: USDC }],
+    ['higher amount', { ...REQUEST, amount: '1001' }],
     ['recipient', { ...REQUEST, recipient: WALLET }],
     ['escrow', { ...REQUEST, methodDetails: { escrowContract: PAYEE, chainId: 4217 } }],
     ['chain', { ...REQUEST, methodDetails: { escrowContract: ESCROW, chainId: 1 } }],

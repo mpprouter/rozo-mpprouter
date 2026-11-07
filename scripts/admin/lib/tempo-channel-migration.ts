@@ -103,7 +103,8 @@ export function guardedChallengeFetch(
     if (
       !sameAddress(live.recipient, approved.recipient) ||
       !sameAddress(live.escrowContract, approved.escrowContract) ||
-      live.chainId !== approved.chainId
+      live.chainId !== approved.chainId ||
+      BigInt(live.amount) > BigInt(approved.amount)
     ) {
       throw new Error('merchant changed the challenge after approval; refusing to sign')
     }
@@ -113,6 +114,9 @@ export function guardedChallengeFetch(
     })
     const headers = new Headers(response.headers)
     headers.set('www-authenticate', only[0])
+    // mppx also reads x402 challenges from this header, which would put another
+    // token back in front of its selector.
+    headers.delete('payment-required')
     return new Response(response.body, { status: response.status, statusText: response.statusText, headers })
   }
 }
