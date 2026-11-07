@@ -70,6 +70,15 @@ export interface ServiceStats {
   buyers: number
   /** Epoch ms of the most recent external call, or null. */
   last_call_at: number | null
+  /**
+   * Epoch ms of the most recent call from our own payers
+   * (LEDGER_INTERNAL_PAYERS) that settled, got a 2xx from the upstream and
+   * was not refunded, or null. Looks back over the window or 90 days,
+   * whichever is longer, so a 24h view still shows a recent verification.
+   * Internal calls stay out of every commerce figure; this only says when
+   * we last proved the route delivers.
+   */
+  last_verified_at: number | null
   /** ok / (ok + provider_fault), or null when nothing was served. */
   /**
    * Null — not 0 — whenever quality storage could not be read. Zeroes here
@@ -174,6 +183,8 @@ interface CommerceRow {
 
 interface Commerce {
   services: CommerceRow[]
+  /** Newest verified internal call per service (see ServiceStats.last_verified_at). */
+  verified: Map<string, number>
   /** Hourly call counts per service, for the activity sparkline. */
   hourly: Map<string, { hour_start: number; n: number }[]>
   total_buyers: number
@@ -201,8 +212,8 @@ async function internalPayerDigests(env: Env): Promise<string[]> {
   return out
 }
 
-async function readCommerce(env: Env, cutoff: number): Promise<Commerce> {
-  const empty: Commerce = { services: [], hourly: new Map(), total_buyers: 0, ok: false }
+async function readCommerce(env: Env, cutoff: number, verifiedCutoff: number): Promise<Commerce> {
+  const empty: Commerce = { services: [], verified: new Map(), hourly: new Map(), total_buyers: 0, ok: false }
   const db = env.ROUTE_METRICS_DB
   if (!db) return empty
   try {
@@ -214,7 +225,8 @@ async function readCommerce(env: Env, cutoff: number): Promise<Commerce> {
       ? `(payer_digest IS NOT NULL AND payer_digest IN (${internal.map(() => '?').join(', ')}))`
       : '(0 = 1)'
     const counted = `settled = 1 AND NOT ${isInternal}`
-    const [perService, perHour, buyers] = await db.batch([
+    const verifiedCall = `${isInternal} AND upstream_ok = 1 AND refunded = 0 AND settled = 1`
+    const [perService, perHour, buyers, verified] = await db.batch([
       db
         .prepare(
           `SELECT service_id,
@@ -240,6 +252,12 @@ async function readCommerce(env: Env, cutoff: number): Promise<Commerce> {
           `SELECT COUNT(DISTINCT payer_digest) AS n FROM order_ledger_stats WHERE created_at >= ? AND ${counted}`,
         )
         .bind(cutoff, ...internal),
+      db
+        .prepare(
+          `SELECT service_id, MAX(created_at) AS last_verified_at
+             FROM order_ledger_stats WHERE created_at >= ? AND ${verifiedCall} GROUP BY service_id`,
+        )
+        .bind(verifiedCutoff, ...internal),
     ])
     const hourly = new Map<string, { hour_start: number; n: number }[]>()
     for (const r of (perHour.results ?? []) as any[]) {
@@ -247,7 +265,14 @@ async function readCommerce(env: Env, cutoff: number): Promise<Commerce> {
       list.push({ hour_start: Number(r.hour_start), n: Number(r.n) })
       hourly.set(r.service_id, list)
     }
+    const verifiedAt = new Map<string, number>()
+    for (const r of (verified.results ?? []) as any[]) {
+      if (r.last_verified_at !== null && r.last_verified_at !== undefined) {
+        verifiedAt.set(String(r.service_id), Number(r.last_verified_at))
+      }
+    }
     return {
+      verified: verifiedAt,
       services: ((perService.results ?? []) as any[]).map((r) => ({
         service_id: String(r.service_id),
         calls: Number(r.calls ?? 0),
@@ -301,7 +326,10 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
   const now = Date.now()
   const cutoff = window === 'all' ? 0 : now - WINDOW_MS[window]
 
-  const commerce = await readCommerce(env, cutoff)
+  // Verification looks back at least 90 days: "last verified" is a property
+  // of the route, not of the window, and a 24h view should still show it.
+  const verifiedCutoff = Math.min(cutoff, now - WINDOW_MS['90d'])
+  const commerce = await readCommerce(env, cutoff, verifiedCutoff)
   const truncated = !commerce.ok
 
   interface Acc {
@@ -371,6 +399,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
       volume_usd: microsToUsd(a.volume_micros),
       buyers: a.buyers,
       last_call_at: a.last,
+      last_verified_at: commerce.verified.get(serviceId) ?? null,
       // Absent data, not zero, when the store could not be read.
       provider_success_rate: qualityReadable ? w.provider_success_rate : null,
       caller_error: qualityReadable ? w.caller_error : null,
@@ -392,7 +421,7 @@ export async function getStats(env: Env, window: MetricsWindow): Promise<StatsPa
     generated_at: new Date(now).toISOString(),
     coverage: {
       commerce_source:
-        'Per-call order ledger, aggregated from its D1 rollup (order_ledger_stats). Calls, volume and buyers are settled orders from external payers only. Our own test and monitoring payers are counted separately as internal_calls; calls whose settlement failed or is unresolved are counted as unsettled_calls.',
+        'Per-call order ledger, aggregated from its D1 rollup (order_ledger_stats). Calls, volume and buyers are settled orders from external payers only. Our own test and monitoring payers are counted separately as internal_calls; calls whose settlement failed or is unresolved are counted as unsettled_calls. last_verified_at is the newest internal call that settled, got a 2xx upstream and was not refunded, over the window or 90 days, whichever is longer.',
       quality_source:
         'route_metric_calls (D1), written at the proxy chokepoint every paid call passes through. Success is the provider answering correctly, not the buyer settling. Latency is the upstream leg only and excludes Stellar settlement.',
       quality_availability:

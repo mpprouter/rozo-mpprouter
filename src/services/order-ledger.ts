@@ -119,6 +119,11 @@ export interface OrderStatsRow {
    * unsettled count beside them.
    */
   settled: number
+  /**
+   * 1 when the upstream answered 2xx and no refund was opened, else 0.
+   * /v1/stats uses it, on internal rows only, for `last_verified_at`.
+   */
+  upstream_ok: number
 }
 
 /** Null when the entry's timestamp is unusable; such rows were never countable. */
@@ -135,7 +140,14 @@ export async function orderStatsRow(entry: OrderLedgerEntry): Promise<OrderStats
     payer_digest: entry.payer ? await sha256Hex(entry.payer) : null,
     refunded: entry.refund_status === 'refunded' ? 1 : 0,
     settled: isSettledEntry(entry) ? 1 : 0,
+    upstream_ok: isUpstreamOkEntry(entry) ? 1 : 0,
   }
+}
+
+/** The upstream delivered: a 2xx status and no refund opened for the call. */
+export function isUpstreamOkEntry(entry: OrderLedgerEntry): boolean {
+  const status = Number(entry.upstream_status)
+  return status >= 200 && status < 300 && (entry.refund_status ?? 'none') === 'none'
 }
 
 /**
@@ -151,10 +163,15 @@ export function isSettledEntry(entry: OrderLedgerEntry): boolean {
 // `settled` only ever moves 0 -> 1: unknown resolves to settled or failed,
 // and a settled payment never unsettles. MAX keeps a late or replayed
 // write from undoing a settlement already recorded.
+//
+// `upstream_ok` only ever moves 1 -> 0 (a later refund un-verifies a call),
+// and a NULL from before migrations-metrics/0004 takes the new value. The
+// multi-argument MIN returns NULL when either side is NULL, hence COALESCE.
 export const UPSERT_ORDER_STATS_SQL =
-  'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded, settled) ' +
-  'VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET ' +
-  'refunded = MAX(order_ledger_stats.refunded, excluded.refunded), settled = MAX(order_ledger_stats.settled, excluded.settled)'
+  'INSERT INTO order_ledger_stats (order_id, created_at, service_id, amount_micros, payer_digest, refunded, settled, upstream_ok) ' +
+  'VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(order_id) DO UPDATE SET ' +
+  'refunded = MAX(order_ledger_stats.refunded, excluded.refunded), settled = MAX(order_ledger_stats.settled, excluded.settled), ' +
+  'upstream_ok = COALESCE(MIN(order_ledger_stats.upstream_ok, excluded.upstream_ok), excluded.upstream_ok)'
 
 /**
  * Mirror one order into the D1 stats rollup. Best-effort and logged, like the
@@ -168,7 +185,7 @@ export async function recordOrderStats(env: Env, entry: OrderLedgerEntry): Promi
     if (!r) return
     await db
       .prepare(UPSERT_ORDER_STATS_SQL)
-      .bind(r.order_id, r.created_at, r.service_id, r.amount_micros, r.payer_digest, r.refunded, r.settled)
+      .bind(r.order_id, r.created_at, r.service_id, r.amount_micros, r.payer_digest, r.refunded, r.settled, r.upstream_ok)
       .run()
   } catch (err: any) {
     console.error(`[order-ledger] stats rollup write failed for ${entry.order_id}: ${err.message}`)
