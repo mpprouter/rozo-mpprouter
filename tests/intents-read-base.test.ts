@@ -245,7 +245,8 @@ describe('bitrefill-invoice.ts lookupExisting', () => {
           id: 'rozo-pay-bitrefill',
           paymentLink: 'https://pay.rozo.ai/b',
           expiresAt: '2999-01-01T12:00:00.000Z',
-          source: { amount: '12.37', chainId: '1500' },
+          // payment-api echoes the partner fee it priced (1% of the invoice).
+          source: { amount: '12.37', chainId: '1500', partnerFee: '0.1235', partnerFeeBps: 100 },
         }), { status: 200 })
       }
       return new Response('{}', { status: 200 })

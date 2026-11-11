@@ -8,6 +8,17 @@
  * wallet, no pay-invoice call and no exec gate: settlement is the Rozo
  * payout itself, so the webhook ignores these orders (see webhook.ts).
  *
+ * Service fee (founder 2026-11-11: "Bitrefill 收 1%"): the order is created
+ * with `partnerFeeBps = BITREFILL_FEE_BPS` and payment-api's partner-fee
+ * mechanism (rozo-intents-api shared/partner-fee.ts) adds 1% of the invoice
+ * amount to what the payer sends. Bitrefill still receives exactly `amount`;
+ * the fee stays in the Rozo hub, is booked on the order (partner_fee) and is
+ * settled to the wallet_bitrefillpay partner_fee_configs recipient (the Base
+ * USDC funder). That needs a partner_fee_configs row for wallet_bitrefillpay;
+ * without it payment-api refuses the order with 400. The fee figures in our
+ * response are copied from payment-api's reply, never computed on our side
+ * alone, and an order priced with any other rate is refused.
+ *
  * Idempotency follows the Coinbase line: the orderId is derived from the
  * Bitrefill invoice id, and the Rozo payment-api lookup
  * GET /payments/order/:appId/:orderId is the source of truth (an orderId can
@@ -17,8 +28,8 @@ import type { Env } from '../index'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
-import { isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
-import { normalizeCheckoutClient } from './checkout-web-pricing'
+import { isNativeSymbol, parseNativeSources } from './native-sources'
+import { formatUsdcAtomic, normalizeCheckoutClient, parseUsdcAtomic } from './checkout-web-pricing'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 // Dedicated WALLET-type account. It must not be a merchant account: payment-api
@@ -41,6 +52,56 @@ const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
  * and payment-api applies its own pay-in and liquidity caps upstream.
  */
 export const BITREFILL_MAX_USDC = 1050
+/**
+ * Rozo service fee on Bitrefill invoices, in basis points of the invoice
+ * amount (founder 2026-11-11: "Bitrefill 收 1%"). Sent to payment-api as
+ * partnerFeeBps; 1% of a 204 invoice is 2.04, so the payer sends 206.04 plus
+ * the bridge fee.
+ */
+export const BITREFILL_FEE_BPS = 100
+
+/**
+ * Largest fee payment-api can quote for `originalAtomic` at `bps`: it rounds
+ * the partner fee UP to 4 decimals (shared/partner-fee.ts quotePartnerFee,
+ * formatDecimalUp4). 4 decimals = 100 atomic USDC units. Its float epsilon can
+ * only make the quoted fee smaller, never larger.
+ */
+export function maxBitrefillFeeAtomic(originalAtomic: bigint, bps: number): bigint {
+  const raw = originalAtomic * BigInt(bps) // atomic * 10_000
+  const unit = 10_000n * 100n
+  return ((raw + unit - 1n) / unit) * 100n
+}
+
+/**
+ * Pricing of an order as payment-api reports it in `source.partnerFee` /
+ * `source.partnerFeeBps`. `legacy` = the order has no partner fee fields
+ * (created before the fee existed). Returns null when the fields are present
+ * but unusable (fee above what the rate can produce, malformed, negative).
+ */
+export function bitrefillPricingFromOrder(
+  source: any,
+  amount: string,
+): { original: string; serviceFee: string; feeBps: number; callerPays: string; legacy: boolean } | null {
+  const originalAtomic = parseUsdcAtomic(amount)
+  const hasBps = source && source.partnerFeeBps !== undefined && source.partnerFeeBps !== null
+  if (!hasBps) {
+    return { original: formatUsdcAtomic(originalAtomic), serviceFee: '0', feeBps: 0, callerPays: formatUsdcAtomic(originalAtomic), legacy: true }
+  }
+  const bps = source.partnerFeeBps
+  if (typeof bps !== 'number' || !Number.isInteger(bps) || bps < 0 || bps > BITREFILL_FEE_BPS) return null
+  const feeRaw = source.partnerFee
+  if (typeof feeRaw !== 'string' || !/^\d+(?:\.\d{1,6})?$/.test(feeRaw)) return null
+  const feeAtomic = parseUsdcAtomic(feeRaw)
+  if (feeAtomic > maxBitrefillFeeAtomic(originalAtomic, bps)) return null
+  return {
+    original: formatUsdcAtomic(originalAtomic),
+    serviceFee: formatUsdcAtomic(feeAtomic),
+    feeBps: bps,
+    callerPays: formatUsdcAtomic(originalAtomic + feeAtomic),
+    legacy: false,
+  }
+}
+
 /** Minimum time left on the Bitrefill invoice before we open a deposit. */
 export const BITREFILL_MIN_REMAINING_MS = 5 * 60 * 1000
 /**
@@ -197,8 +258,12 @@ export async function handleBitrefillCreateInvoice(
     })
   }
   const source = src.resolved
-  if (isNativeSymbol(source.chainId, source.tokenSymbol) && Number(amount) > nativeMaxUsd(env.NATIVE_MAX_USD)) {
-    return fail(400, 'AMOUNT_OUT_OF_RANGE', `Native coin payment is limited to $${nativeMaxUsd(env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`)
+  // payment-api charges the partner fee only on USDC/USDT sources: native
+  // coins and Lightning would carry partnerFeeBps 100 but a 0 fee
+  // (shared/partner-fee.ts first-phase scope). Refuse them before any order
+  // exists instead of creating an unpayable or unpriced one.
+  if (source.chainId === 'lightning' || isNativeSymbol(source.chainId, source.tokenSymbol)) {
+    return fail(400, 'UNSUPPORTED_SOURCE', 'Bitrefill invoices can be paid with USDC or USDT only. Native coins and Lightning are not available for Bitrefill.')
   }
 
   const orderId = bitrefillOrderId(invoiceId)
@@ -219,18 +284,36 @@ export async function handleBitrefillCreateInvoice(
       return { state: 'error' }
     }
   }
-  const duplicate = (row: any) =>
-    !row?.id
-      ? fail(503, 'RETRY_LATER', 'A payment for this Bitrefill invoice is being created. Retry in a few seconds to get its id; do not pay yet.')
-      : fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
+  const duplicate = (row: any) => {
+    if (!row?.id) {
+      return fail(503, 'RETRY_LATER', 'A payment for this Bitrefill invoice is being created. Retry in a few seconds to get its id; do not pay yet.')
+    }
+    // Report the existing order's pricing exactly as payment-api froze it, so
+    // a resumed order shows the fee it really carries (0 for orders created
+    // before the fee). An order whose fee fields cannot be trusted is not
+    // offered for resume.
+    const rowAmount = typeof row?.destination?.amount === 'string' && AMOUNT_RE.test(row.destination.amount) ? row.destination.amount : amount
+    const pricing = bitrefillPricingFromOrder(row?.source, rowAmount)
+    if (!pricing) {
+      return fail(502, 'FEE_MISMATCH', 'The existing payment for this Bitrefill invoice has unexpected fee data. Do not pay it; create a new Bitrefill invoice.', {
+        invoiceId,
+        rozoPaymentId: row.id,
+      })
+    }
+    return fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
       invoiceId,
       rozoPaymentId: row?.id ?? null,
+      original: pricing.original,
+      serviceFee: pricing.serviceFee,
+      feeBps: pricing.feeBps,
+      callerPays: pricing.callerPays,
       // Effective expiry: the earlier of the Bitrefill expiry stored at create
       // time and the Rozo deposit's (~1h). Both are now about an hour, so either
       // can come first.
       expiresAt: earlierIso(row?.metadata?.bitrefillExpiresAt, row?.expiresAt),
       ...(row?.source ? { source: row.source } : {}),
     })
+  }
 
   const existing = await lookupExisting()
   if (existing.state === 'found') return duplicate(existing.row)
@@ -261,6 +344,9 @@ export async function handleBitrefillCreateInvoice(
       tokenAddress: BASE_USDC_ADDRESS,
       amount,
     },
+    // Per-order partner fee: payment-api adds it on top of `amount` and the
+    // Rozo bridge fee; Bitrefill still receives exactly `amount`.
+    partnerFeeBps: BITREFILL_FEE_BPS,
     ...attributionField,
     ...(contactEmail ? { email: contactEmail } : {}),
     metadata: {
@@ -335,6 +421,18 @@ export async function handleBitrefillCreateInvoice(
     return fail(502, 'INTENTS_API_FAILED', 'Rozo intents API returned a malformed body.')
   }
 
+  // The fee must be exactly what we asked for: rate BITREFILL_FEE_BPS, a
+  // non-zero fee no larger than that rate can produce. Anything else (missing
+  // partner config, out-of-scope route) and no deposit is shown; the unpaid
+  // order simply expires.
+  const pricing = bitrefillPricingFromOrder(created?.source, amount)
+  if (!pricing || pricing.legacy || pricing.feeBps !== BITREFILL_FEE_BPS || pricing.serviceFee === '0') {
+    return fail(502, 'FEE_MISMATCH', 'The payment was not priced with the Bitrefill service fee. Do not pay it; retry later with a new Bitrefill invoice.', {
+      invoiceId,
+      rozoPaymentId: created?.id ?? null,
+    })
+  }
+
   // Effective expiry: the earlier of Bitrefill's and the Rozo deposit's.
   const effectiveExpiresAt = earlierIso(expiresAtIso, created?.expiresAt)
 
@@ -343,6 +441,14 @@ export async function handleBitrefillCreateInvoice(
     invoiceId,
     rozoPaymentId: created?.id ?? null,
     destination: { chainId: BASE_CHAIN_ID, tokenSymbol: 'USDC', address, amount },
+    // Same field names as the Coinbase line: original = invoice amount
+    // Bitrefill receives, serviceFee = Rozo's fee (copied from payment-api),
+    // callerPays = original + serviceFee. The deposit (source.amount) adds
+    // the bridge fee (source.fee) on top.
+    original: pricing.original,
+    serviceFee: pricing.serviceFee,
+    feeBps: pricing.feeBps,
+    callerPays: pricing.callerPays,
     expiresAt: effectiveExpiresAt,
     // Rozo's hosted paymentLink is intentionally withheld: that page stays
     // payable on Rozo's own ~1h clock, which can outlive the Bitrefill invoice.

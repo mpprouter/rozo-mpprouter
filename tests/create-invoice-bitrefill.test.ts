@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { handleCreateInvoice } from '../src/routes/create-invoice'
-import { BITREFILL_MAX_USDC, isBitrefillOrderId } from '../src/routes/bitrefill-invoice'
+import {
+  BITREFILL_FEE_BPS,
+  BITREFILL_MAX_USDC,
+  bitrefillPricingFromOrder,
+  isBitrefillOrderId,
+  maxBitrefillFeeAtomic,
+} from '../src/routes/bitrefill-invoice'
 import type { Env } from '../src/index'
 
 const ADDR = '0x1111111111111111111111111111111111111111'
@@ -26,6 +32,9 @@ let existingOrder: any = null
 let seenKeys: string[] = []
 let rozoExpiresAt = '2999-01-01T12:00:00.000Z'
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
+// Mirrors payment-api quotePartnerFee for exactOut: ceil to 4 dp.
+const ceil4 = (v: number) => Math.ceil((v - 0.00000001) * 10000) / 10000
+let upstreamSourceOverride: Record<string, unknown> | null = null
 
 beforeEach(() => {
   createdIntent = null
@@ -33,6 +42,7 @@ beforeEach(() => {
   existingOrder = null
   seenKeys = []
   rozoExpiresAt = '2999-01-01T12:00:00.000Z'
+  upstreamSourceOverride = null
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     seenKeys.push(new Headers(init?.headers).get('X-API-Key') ?? '')
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -44,11 +54,17 @@ beforeEach(() => {
     if (u.includes('/payment-api') && init?.method === 'POST') {
       posts++
       createdIntent = JSON.parse(String(init?.body ?? '{}'))
+      const bps = createdIntent.partnerFeeBps
+      const fee = ceil4((Number(createdIntent.destination?.amount) * bps) / 10000)
       return new Response(JSON.stringify({
         id: 'rozo-pay-bitrefill',
         paymentLink: 'https://pay.rozo.ai/b',
         expiresAt: rozoExpiresAt,
-        source: { amount: '12.37', chainId: '1500' },
+        source: {
+          amount: '12.37', chainId: '1500', fee: '0.02',
+          partnerFee: fee.toFixed(4), partnerFeeBps: bps,
+          ...(upstreamSourceOverride ?? {}),
+        },
       }), { status: 200 })
     }
     return new Response('{}', { status: 200 })
@@ -215,30 +231,16 @@ describe('create-invoice provider=bitrefill', () => {
     expect(seenKeys).toEqual([])
   })
 
-  it('applies NATIVE_MAX_USD to native sources', async () => {
-    const env = makeEnv({ NATIVE_SOURCES: 'ETH@8453', NATIVE_MAX_USD: '50' })
-    const over = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '60' }), env)
-    expect(over.status).toBe(400)
-    expect(over.json.error).toBe('AMOUNT_OUT_OF_RANGE')
-    const under = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '40' }), env)
-    expect(under.status).toBe(200)
-  })
-
-  it('400 UNSUPPORTED_SOURCE (not 502) when payment-api has native disabled for Bitrefill', async () => {
-    vi.mocked(globalThis.fetch).mockImplementation((async (input: any) => {
-      const u = typeof input === 'string' ? input : input.url
-      if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
-      posts++
-      return new Response(JSON.stringify({
-        error: { code: 'invalidRequest', message: 'Native ETH payin on chain 8453 is not enabled for this app' },
-      }), { status: 400 })
-    }) as typeof fetch)
+  it('refuses native coin and Lightning sources before any upstream call (no partner fee there)', async () => {
     const env = makeEnv({ NATIVE_SOURCES: 'ETH@8453' })
-    const { status, json } = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '10' }), env)
-    expect(status).toBe(400)
-    expect(json.error).toBe('UNSUPPORTED_SOURCE')
-    expect(json.message).toMatch(/Native ETH on chainId 8453 is not available for Bitrefill/)
-    expect(json.upstream_message).toBe('Native ETH payin on chain 8453 is not enabled for this app')
+    const native = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '40' }), env)
+    expect(native.status).toBe(400)
+    expect(native.json.error).toBe('UNSUPPORTED_SOURCE')
+    const ln = await post(body({ source: { chainId: 'lightning', tokenSymbol: 'BTC' } }, { amount: '40' }), env)
+    expect(ln.status).toBe(400)
+    expect(ln.json.error).toBe('UNSUPPORTED_SOURCE')
+    expect(posts).toBe(0)
+    expect(seenKeys).toEqual([])
   })
 
   it('maps any other payment-api 400 to 400 INTENTS_API_REJECTED, keeps 5xx as 502', async () => {
@@ -285,7 +287,7 @@ describe('create-invoice provider=bitrefill', () => {
       if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
       return new Response(JSON.stringify({ error: { code: 'amountTooLow', message: 'Minimum is $1 for ETH' } }), { status: 400 })
     }) as typeof fetch)
-    const low = await post(body({ source: { chainId: '8453', tokenSymbol: 'ETH' } }, { amount: '0.5' }), makeEnv({ NATIVE_SOURCES: 'ETH@8453' }))
+    const low = await post(body({}, { amount: '0.5' }))
     expect(low.status).toBe(400)
     expect(low.json.error).toBe('AMOUNT_OUT_OF_RANGE')
     expect(low.json.message).toBe('Minimum is $1 for ETH')
@@ -331,6 +333,84 @@ describe('create-invoice provider=bitrefill', () => {
     existingOrder = { id: 'rozo-existing', expiresAt: inMinutes(65), metadata: { bitrefillExpiresAt: bitrefillExp } }
     r = await post(body())
     expect(r.json.expiresAt).toBe(bitrefillExp)
+  })
+
+  describe('service fee (1%)', () => {
+    it('sends partnerFeeBps 100 and returns original / serviceFee / feeBps / callerPays from payment-api', async () => {
+      const { status, json } = await post(body({}, { amount: '204' }))
+      expect(status).toBe(200)
+      expect(BITREFILL_FEE_BPS).toBe(100)
+      expect(createdIntent.partnerFeeBps).toBe(100)
+      expect(createdIntent.type).toBe('exactOut')
+      // Bitrefill still receives exactly the invoice amount.
+      expect(createdIntent.destination.amount).toBe('204')
+      expect(json.destination.amount).toBe('204')
+      expect(json).toMatchObject({ original: '204', serviceFee: '2.04', feeBps: 100, callerPays: '206.04' })
+    })
+
+    it('copies the 4 dp fee payment-api rounds up (not a cent rounding)', async () => {
+      const { json } = await post(body({}, { amount: '204.37' }))
+      expect(json).toMatchObject({ original: '204.37', serviceFee: '2.0437', callerPays: '206.4137' })
+      const six = await post(body({}, { amount: '12.345678' }))
+      expect(six.json).toMatchObject({ serviceFee: '0.1235', callerPays: '12.469178' })
+    })
+
+    it('fee at the 1050 cap', async () => {
+      const { json } = await post(body({}, { amount: '1050' }))
+      expect(json).toMatchObject({ original: '1050', serviceFee: '10.5', feeBps: 100, callerPays: '1060.5' })
+    })
+
+    it.each([
+      [{ partnerFeeBps: 50 }],
+      [{ partnerFeeBps: undefined, partnerFee: undefined }],
+      [{ partnerFee: '0.0000' }],
+      [{ partnerFee: '9.9999' }],
+      [{ partnerFee: 'abc' }],
+      [{ partnerFeeBps: 1000, partnerFee: '20.40' }],
+    ])('502 FEE_MISMATCH, no deposit, when payment-api priced it differently: %j', async (over) => {
+      upstreamSourceOverride = over
+      const { status, json } = await post(body({}, { amount: '204' }))
+      expect(status).toBe(502)
+      expect(json.error).toBe('FEE_MISMATCH')
+      expect(json.source).toBeUndefined()
+      expect(json.callerPays).toBeUndefined()
+    })
+
+    it('duplicate reports the existing order fee as frozen upstream', async () => {
+      existingOrder = {
+        id: 'rozo-existing', expiresAt: '2999-01-01T00:00:00.000Z',
+        destination: { amount: '204.000000' },
+        source: { amount: '206.1', partnerFee: '2.0400', partnerFeeBps: 100 },
+      }
+      const { status, json } = await post(body({}, { amount: '204' }))
+      expect(status).toBe(409)
+      expect(json).toMatchObject({ error: 'DUPLICATE_INVOICE', rozoPaymentId: 'rozo-existing', original: '204', serviceFee: '2.04', feeBps: 100, callerPays: '206.04' })
+      expect(posts).toBe(0)
+    })
+
+    it('duplicate of a pre-fee order reports a zero fee; corrupt fee data is not resumable', async () => {
+      existingOrder = { id: 'rozo-old', expiresAt: '2999-01-01T00:00:00.000Z', destination: { amount: '50' }, source: { amount: '50.2' } }
+      let r = await post(body({}, { amount: '50' }))
+      expect(r.status).toBe(409)
+      expect(r.json).toMatchObject({ serviceFee: '0', feeBps: 0, callerPays: '50' })
+      existingOrder = { id: 'rozo-bad', destination: { amount: '50' }, source: { partnerFee: '5.0000', partnerFeeBps: 100 } }
+      r = await post(body({}, { amount: '50' }))
+      expect(r.status).toBe(502)
+      expect(r.json.error).toBe('FEE_MISMATCH')
+      expect(r.json.source).toBeUndefined()
+    })
+
+    it('maxBitrefillFeeAtomic / bitrefillPricingFromOrder arithmetic', () => {
+      expect(maxBitrefillFeeAtomic(204_000_000n, 100)).toBe(2_040_000n)
+      expect(maxBitrefillFeeAtomic(204_370_000n, 100)).toBe(2_043_700n)
+      expect(maxBitrefillFeeAtomic(1_000_001n, 100)).toBe(10_100n)
+      expect(maxBitrefillFeeAtomic(1n, 100)).toBe(100n)
+      expect(bitrefillPricingFromOrder({ partnerFee: '0.0101', partnerFeeBps: 100 }, '1.000001')?.callerPays).toBe('1.010101')
+      // payment-api's float epsilon can quote one 4dp step lower; still accepted.
+      expect(bitrefillPricingFromOrder({ partnerFee: '0.0100', partnerFeeBps: 100 }, '1.000001')?.serviceFee).toBe('0.01')
+      expect(bitrefillPricingFromOrder({ partnerFee: '0.0102', partnerFeeBps: 100 }, '1.000001')).toBeNull()
+      expect(bitrefillPricingFromOrder({ partnerFee: '-1', partnerFeeBps: 100 }, '1')).toBeNull()
+    })
   })
 
   it('tags orderIds so the webhook skips router settlement', () => {
