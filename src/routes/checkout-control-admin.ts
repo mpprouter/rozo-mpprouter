@@ -297,7 +297,7 @@ export async function checkoutStatus(env: Env): Promise<Record<string, unknown>>
         const rec: FulfillmentRecord | null = await loadRecord(env, plId)
         if (!rec) continue
         const row = { provider: 'coinbase' as const, ref: plId, status: rec.status, since: rec.payingAt ?? null }
-        if (rec.status === 'paying' || rec.status === 'capture_pending') inFlight.push(row)
+        if (rec.status === 'paying' || rec.status === 'capture_pending' || rec.status === 'pay_invoice_unknown') inFlight.push(row)
         const started = rec.payingAt ? Date.parse(rec.payingAt) : NaN
         if (stoppedAt !== null && Number.isFinite(started) && started >= stoppedAt) startedAfterStop.push(row)
       }

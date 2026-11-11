@@ -360,7 +360,7 @@ describe('handleRozoWebhook failure alerts (state machine integration)', () => {
     expect(content).toContain(FUNDER_MASKED)
   })
 
-  it('payout_completed + agentapi pay-invoice 500 → failed_pay_invoice + DingTalk alert', async () => {
+  it('payout_completed + agentapi pay-invoice 500 → pay_invoice_unknown + DingTalk alert', async () => {
     // balance 10 USDC covers the 1.00 invoice; agentapi then fails.
     const dingtalkCalls = stubFetch({
       balanceAtomic: 10_000_000n,
@@ -372,10 +372,10 @@ describe('handleRozoWebhook failure alerts (state machine integration)', () => {
     const res = await handleRozoWebhook(await signedWebhookRequest(payoutEvent()), env)
     expect(res.status).toBe(200)
     const body = (await res.json()) as any
-    expect(body.status).toBe('failed_pay_invoice')
+    expect(body.status).toBe('pay_invoice_unknown')
 
     const rec = JSON.parse(kv._store.get('invoice-fulfillment:pl_testInvoiceAlert1')!)
-    expect(rec.status).toBe('failed_pay_invoice')
+    expect(rec.status).toBe('pay_invoice_unknown')
 
     expect(dingtalkCalls).toHaveLength(1)
     const content = dingtalkCalls[0].body.text.content

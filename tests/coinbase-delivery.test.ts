@@ -11,6 +11,7 @@ import { join, resolve } from 'node:path'
 import {
   handleRozoWebhook,
   payInvoiceCaptured,
+  payInvoiceRefusedBeforeSend,
   saveRecordGuarded,
   type FulfillmentRecord,
 } from '../src/routes/webhook'
@@ -119,6 +120,8 @@ interface Upstream {
   payBody: unknown
   // Held pay-invoice responses (lets two events overlap inside `paying`).
   payGate?: Promise<void>
+  // pay-invoice fetch throws (transport error / timeout) instead of answering.
+  payThrows?: boolean
   // Coinbase public read: v1 link object, or null → HTTP 500.
   coinbase: Record<string, unknown> | null
   rozo: Record<string, unknown> | null
@@ -162,6 +165,7 @@ function stubFetch(cfg: Partial<Upstream> = {}) {
       if (url.includes('agentapi.rozo.ai/pay-invoice')) {
         calls.pay++
         if (up.payGate) await up.payGate
+        if (up.payThrows) throw new Error('The operation was aborted due to timeout')
         return new Response(JSON.stringify(up.payBody), { status: up.payStatus })
       }
       if (url.includes('payments.coinbase.com/next-api/')) {
@@ -341,6 +345,135 @@ describe('webhook Coinbase settlement (M1/M2/M5)', () => {
 
 // ── saveRecordGuarded ───────────────────────────────────────────────────────
 
+// ── G3: definite refusal vs unknown outcome after pay-invoice ───────────────
+
+describe('pay-invoice outcome split: refused (failed_pay_invoice) vs unknown (pay_invoice_unknown)', () => {
+  it('payInvoiceRefusedBeforeSend: only 4xx refusals, never timeouts, 5xx or transport errors', () => {
+    for (const s of [400, 401, 403, 404, 409, 410, 422, 429]) expect(payInvoiceRefusedBeforeSend(s)).toBe(true)
+    for (const s of [0, 200, 302, 408, 499, 500, 502, 503, 504, 546]) expect(payInvoiceRefusedBeforeSend(s)).toBe(false)
+  })
+
+  for (const status of [400, 409, 410, 422]) {
+    it(`pay-invoice ${status} → failed_pay_invoice (nothing paid); gate stays held, a later event never pays`, async () => {
+      const { calls } = stubFetch({ payStatus: status, payBody: { error: 'refused' } })
+      const { env, kv } = makeEnv()
+      const res = await handleRozoWebhook(await signedWebhookRequest(payoutEvent()), env)
+      expect(((await res.json()) as any).status).toBe('failed_pay_invoice')
+      const rec = readRec(kv)
+      expect(rec.status).toBe('failed_pay_invoice')
+      expect(rec.events.some((e) => e.kind === 'pay_invoice_failed')).toBe(true)
+      expect(calls.dingtalk).toHaveLength(1)
+      expect(calls.dingtalk[0]).toContain('FAILED')
+      expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
+      await handleRozoWebhook(await signedWebhookRequest(payoutEvent()), env)
+      expect(calls.pay).toBe(1)
+    })
+  }
+
+  const unknownCases: Array<[string, Partial<Upstream>]> = [
+    ['transport error / timeout (fetch throws)', { payThrows: true }],
+    ['408 request timeout', { payStatus: 408, payBody: { error: 'timeout' } }],
+    ['500', { payStatus: 500, payBody: { error: 'coinbase pay failed (admin mode): boom' } }],
+    ['502', { payStatus: 502, payBody: { error: 'bad gateway' } }],
+    ['504', { payStatus: 504, payBody: { raw: 'gateway timeout' } }],
+  ]
+  for (const [label, cfg] of unknownCases) {
+    it(`pay-invoice ${label} → pay_invoice_unknown; never re-paid, gate never released`, async () => {
+      const { calls } = stubFetch(cfg)
+      const { env, kv } = makeEnv()
+      const res = await handleRozoWebhook(await signedWebhookRequest(payoutEvent()), env)
+      expect(((await res.json()) as any).status).toBe('pay_invoice_unknown')
+      const rec = readRec(kv)
+      expect(rec.status).toBe('pay_invoice_unknown')
+      expect(rec.failureReason).toContain('outcome unknown')
+      expect(rec.events.some((e) => e.kind === 'pay_invoice_unknown')).toBe(true)
+      expect(calls.pay).toBe(1)
+      expect(calls.dingtalk).toHaveLength(1)
+      expect(calls.dingtalk[0]).toContain('UNKNOWN')
+      expect(calls.dingtalk[0]).toContain('Do NOT re-pay')
+      expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
+
+      // Replays of both settle events stay terminal and never pay again.
+      for (const type of ['payment_payout_completed', 'payment_payin_completed']) {
+        const again = await handleRozoWebhook(await signedWebhookRequest(payoutEvent(type)), env)
+        expect(((await again.json()) as any).alreadyTerminal).toBe('pay_invoice_unknown')
+      }
+      expect(calls.pay).toBe(1)
+      expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
+    })
+  }
+
+  it('an unknown outcome is never lowered back to a pre-pay state', async () => {
+    const { env, kv } = makeEnv()
+    seedRec(kv, { status: 'pay_invoice_unknown' })
+    for (const st of ['paying', 'payin_seen', 'failed_insufficient_balance'] as const) {
+      await saveRecordGuarded(env, PL, { ...readRec(kv), status: st })
+      expect(readRec(kv).status).toBe('pay_invoice_unknown')
+    }
+  })
+
+  it('sweep: unknown + Coinbase settled → paid and delivery reported; no pay, gate kept', async () => {
+    const { calls, up } = stubFetch({ payStatus: 502, payBody: { error: 'bad gateway' } })
+    const { env, kv } = makeEnv()
+    await handleRozoWebhook(await signedWebhookRequest(payoutEvent()), env)
+    expect(readRec(kv).status).toBe('pay_invoice_unknown')
+    up.coinbase = { ...boundCoinbaseLink(PL), status: 'COMPLETED', usageCount: 1, maxUsage: 1 }
+    await sweepCoinbaseFulfillments(env)
+    const rec = readRec(kv)
+    expect(rec.status).toBe('paid')
+    expect(rec.events.some((e) => e.kind === 'sweep_coinbase_settled' && (e.detail as any)?.from === 'pay_invoice_unknown')).toBe(true)
+    expect(rec.deliveredReported).toBe(true)
+    expect(calls.pay).toBe(1)
+    expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
+  })
+
+  it('sweep: unknown + Coinbase still unpaid → stays unknown inside 30 min, then manual_review + one alert; never paid', async () => {
+    const { calls } = stubFetch({ coinbase: boundCoinbaseLink(PL) })
+    const { env, kv } = makeEnv()
+    await acquireCoinbaseExecGate(env, PL, 'evt-1')
+    seedRec(kv, { status: 'pay_invoice_unknown', payingAt: ago(5) })
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('pay_invoice_unknown')
+    expect(calls.coinbase).toBe(1)
+    expect(calls.dingtalk).toHaveLength(0)
+
+    seedRec(kv, { ...readRec(kv), payingAt: ago(31) })
+    await sweepCoinbaseFulfillments(env)
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('manual_review')
+    expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.dingtalk[0]).toContain('NEVER retried automatically')
+    expect(calls.pay).toBe(0)
+    expect((await readCoinbaseExecGate(env, PL))?.holder).toBe('evt-1')
+  })
+
+  it('sweep: unknown + Coinbase failed/expired → manual_review immediately; never paid', async () => {
+    const { calls } = stubFetch({ coinbase: { paymentSessionId: PL, status: 'PAYMENT_SESSION_STATUS_CAPTURE_FAILED', expiresAt: new Date(Date.now() + 86400_000).toISOString() } })
+    const { env, kv } = makeEnv()
+    seedRec(kv, { status: 'pay_invoice_unknown', payingAt: ago(2) })
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('manual_review')
+    expect(calls.pay).toBe(0)
+  })
+
+  it('sweep: unknown + Coinbase read fails → stays unknown (alert only after 30 min of failures); never paid', async () => {
+    const { calls } = stubFetch({ coinbase: null })
+    const { env, kv } = makeEnv()
+    await acquireCoinbaseExecGate(env, PL, 'evt-1')
+    seedRec(kv, { status: 'pay_invoice_unknown', payingAt: ago(45) })
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('pay_invoice_unknown')
+    expect(calls.dingtalk).toHaveLength(0)
+    seedRec(kv, { ...readRec(kv), coinbaseQueryFailingSince: ago(31) })
+    await sweepCoinbaseFulfillments(env)
+    await sweepCoinbaseFulfillments(env)
+    expect(readRec(kv).status).toBe('pay_invoice_unknown')
+    expect(calls.dingtalk).toHaveLength(1)
+    expect(calls.pay).toBe(0)
+    expect((await readCoinbaseExecGate(env, PL))?.holder).toBe('evt-1')
+  })
+})
+
 describe('saveRecordGuarded', () => {
   it('never downgrades paid; merges events; deliveredReported only goes false → true', async () => {
     const { env, kv } = makeEnv()
@@ -365,7 +498,7 @@ describe('saveRecordGuarded', () => {
     await saveRecordGuarded(env, PL, { ...readRec(kv), status: 'failed_pay_invoice' })
     expect(readRec(kv).status).toBe('manual_review')
     // paid (rank 4) is never downgraded by anything.
-    for (const st of ['manual_review', 'failed_pay_invoice', 'claimed_by_other_channel', 'capture_pending', 'paying', 'payin_seen'] as const) {
+    for (const st of ['manual_review', 'failed_pay_invoice', 'claimed_by_other_channel', 'capture_pending', 'pay_invoice_unknown', 'paying', 'payin_seen'] as const) {
       seedRec(kv, { status: 'paid' })
       await saveRecordGuarded(env, PL, { ...readRec(kv), status: st })
       expect(readRec(kv).status).toBe('paid')
@@ -818,7 +951,7 @@ describe('POST /admin/coinbase-exec-gate/clear', () => {
     expect(await readCoinbaseExecGate(env, PL)).toBeNull()
   })
 
-  for (const st of ['paying', 'capture_pending', 'paid', 'payin_seen', null] as const) {
+  for (const st of ['paying', 'capture_pending', 'pay_invoice_unknown', 'paid', 'payin_seen', null] as const) {
     it(`refuses when the record is ${st ?? 'missing'} (pay may be in flight / settled)`, async () => {
       const { env, calls } = await setup(st, V3_CREATED)
       const res = await handleCoinbaseExecGateClear(clearReq({ expectedHolder: 'evt-1' }), env)

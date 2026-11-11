@@ -739,7 +739,8 @@ export default {
     // settlement was in flight) are closed from the chain once Stripe's own
     // relayer pull of the invoice amount is found. Read-only; never signs.
     ctx.waitUntil(sweepManualReviewOnchain(env))
-    // Coinbase: resolve `paying` / `capture_pending` records from Coinbase,
+    // Coinbase: resolve `paying` / `capture_pending` / `pay_invoice_unknown`
+    // records from Coinbase,
     // alert on payouts that never reached pay-invoice, and report delivery to
     // Rozo. Reads Coinbase only; never calls pay-invoice.
     ctx.waitUntil(sweepCoinbaseFulfillments(env))
