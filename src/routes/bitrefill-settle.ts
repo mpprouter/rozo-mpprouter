@@ -7,14 +7,19 @@
  *     OUT to the funder is paid, and only for the invoice amount frozen at
  *     create time (metadata.bitrefill, HMAC bound). The router re-checks all of
  *     it here; pay-invoice re-checks it again from its own order read.
+ *   - Only invoices on BITREFILL_FUNDER_ALLOWED_INVOICES (or "*") are paid;
+ *     any other is deferred before the ledger, the gate or pay-invoice.
  *   - At most one pay-invoice request per invoice: the same non re-entrant
- *     exec gate as the Coinbase line (coinbase-exec-gate.ts), taken after the
- *     daily reservation, never released once the request was sent.
- *   - `paying` (with the nonce) is persisted BEFORE the request.
+ *     exec gate as the Coinbase line (coinbase-exec-gate.ts). Order before a
+ *     send: gate -> daily reservation -> persist `paying` -> call. Every exit
+ *     before the call releases what was taken; the gate is never released
+ *     once the request was sent. The gate holder is unique per attempt.
  *   - Unknown outcomes (`pay_invoice_unknown`, or `paying` older than 10 min)
- *     are resolved ONLY by reading USDC.authorizationState(funder, nonce).
- *     Nothing here ever sends a second request. The nonce is deterministic per
- *     invoice, so even a manual re-pay can never execute twice on chain.
+ *     are resolved ONLY by reading USDC.authorizationState(funder, nonce);
+ *     "unused" needs two independent RPC endpoints. Nothing here ever sends a
+ *     second request, and nothing in the router re-pays a Bitrefill invoice.
+ *     The nonce is deterministic per invoice, so even a manual re-pay (direct
+ *     admin call to pay-invoice, private ops runbook) can never execute twice.
  */
 import type { Env } from '../index'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
@@ -25,7 +30,7 @@ import { checkoutDeliveryPaused } from './checkout-control'
 import { OPENROUTER_APP_ID, readPaymentStatus } from './existing-order'
 import { bitrefillDailyCapAtomic, releaseDailySpend, reserveDailySpend } from './stripe-fulfillment'
 import { computeServiceFeeAtomic, parseUsdcAtomic } from './checkout-web-pricing'
-import { BITREFILL_MAX_USDC, BITREFILL_ORDER_PREFIX, isBitrefillOrderId } from './bitrefill-invoice'
+import { BITREFILL_MAX_USDC, BITREFILL_ORDER_PREFIX, bitrefillInvoiceAllowed, isBitrefillOrderId } from './bitrefill-invoice'
 import {
   BITREFILL_FEE_BPS,
   bitrefillNonce,
@@ -62,6 +67,14 @@ export const BITREFILL_MAX_AUTH_VALIDITY_MS = 300 * 1000
 export const BITREFILL_UNKNOWN_GRACE_MS = 120 * 1000
 export const BITREFILL_PAYING_STALE_MS = 10 * 60 * 1000
 export const BITREFILL_SWEEP_MAX_RECORDS = 20
+/** Stop starting new re-drives after this much wall time in one sweep run (cron runs every 2 min). */
+export const BITREFILL_SWEEP_REDRIVE_BUDGET_MS = 60 * 1000
+/** pay-invoice never signs a validBefore later than the invoice expiry minus this. */
+export const BITREFILL_EXPIRY_MARGIN_MS = 60 * 1000
+/** Per-endpoint timeout of one authorizationState read. */
+export const BITREFILL_RPC_TIMEOUT_MS = 10 * 1000
+/** Independent RPC endpoints that must read the nonce unused before manual_review. */
+export const BITREFILL_UNUSED_QUORUM = 2
 export const BITREFILL_DELIVERED_MAX_ATTEMPTS = 5
 // Computed at call time: bitrefill-invoice.ts and this module import each
 // other through webhook.ts, so its exports are not initialized at load.
@@ -93,6 +106,10 @@ async function sendBitrefillAlert(env: Env, lines: string[]): Promise<void> {
     console.warn(`[bitrefill-settle] alert error (non-fatal): ${err instanceof Error ? err.message : String(err)}`)
   }
 }
+
+/** F3: the only manual re-pay path; there is no admin route that clears the exec gate for Bitrefill. */
+const MANUAL_REPAY_TEXT =
+  'Nothing in the router re-pays a Bitrefill invoice. A manual re-pay is a direct admin call to pay-invoice with the same ids (same nonce) following the private ops runbook, only after the nonce reads unused past validBefore and while the invoice is still open; otherwise refund the payer by hand.'
 
 function fmt(atomic: bigint | string | null | undefined): string {
   if (atomic === null || atomic === undefined) return '?'
@@ -201,7 +218,15 @@ export async function callBitrefillPayInvoice(
   }
 }
 
-export type BitrefillPayVerdict = 'paid' | 'refused' | 'expired' | 'presign_transient' | 'unknown'
+export type BitrefillPayVerdict =
+  | 'paid'
+  | 'refused'
+  | 'expired'
+  | 'presign_transient'
+  | 'unknown'
+  // 409 NONCE_USED_WITHOUT_PAY_LOG: the nonce is consumed on chain but
+  // pay-invoice holds no matching pay log row. Humans check the chain.
+  | 'nonce_used_unlogged'
 
 /** Map a pay-invoice answer onto the contract table. Anything unproven is unknown. */
 export function classifyBitrefillPayResult(r: BitrefillPayResult): BitrefillPayVerdict {
@@ -212,8 +237,24 @@ export function classifyBitrefillPayResult(r: BitrefillPayResult): BitrefillPayV
   // missing or wrong, 500 when its key is missing or malformed) carry
   // signed:false but no provider tag: nothing was signed.
   if (b && typeof b === 'object' && !fromUs && b.signed === false && (r.status === 402 || r.status === 500)) return 'refused'
+  // pay-invoice's own allowlist disagrees with ours (403, signed:false, before
+  // any order read). Accepted with or without the provider tag: signed:false
+  // plus this exact code means nothing was signed.
+  if (
+    r.status === 403 && b && typeof b === 'object' && b.signed === false &&
+    (b.code === 'bitrefill_invoice_not_allowlisted' || b.error === 'bitrefill_invoice_not_allowlisted')
+  ) {
+    return 'refused'
+  }
   if (fromUs && b.signed === false && b.ok === false) {
     if (r.status === 409 && b.code === 'INVOICE_EXPIRED') return 'expired'
+    // An earlier signature for this invoice can still execute: NOT a refusal.
+    // Treated like an unknown outcome (gate and ledger kept, sweep resolves by
+    // nonce after validBefore / the invoice expiry).
+    if (r.status === 409 && b.code === 'PAY_IN_FLIGHT') return 'unknown'
+    if (r.status === 409 && b.code === 'NONCE_USED_WITHOUT_PAY_LOG') return 'nonce_used_unlogged'
+    // 422 PAYOUT_NOT_PROVEN_ON_CHAIN and every other provider-tagged 4xx
+    // (signed:false) is a definite refusal.
     if (r.status >= 400 && r.status < 500 && r.status !== 408) return 'refused'
     if (r.status === 503) return 'presign_transient'
   }
@@ -299,6 +340,26 @@ export async function settleBitrefillFunderEvent(
     return { ok: true, deferred: 'funder_send_disabled', plId }
   }
 
+  // Single-invoice isolation: a non-listed invoice is deferred exactly like
+  // the switch-off case (no reservation, no gate, no pay-invoice call). Adding
+  // it to the list (or "*") later lets the sweep re-drive this payout while it
+  // is younger than 2 hours.
+  if (!bitrefillInvoiceAllowed(env, invoiceIdOf(plId))) {
+    const alert = !rec.alertedStuck
+    rec.alertedStuck = true
+    rec.events.push({ kind: 'bitrefill_invoice_not_allowlisted', at: nowIso(), event_id: eventId })
+    await saveRecordGuarded(env, plId, rec)
+    await forgetWebhookEvent(env, eventId)
+    if (alert) {
+      await sendBitrefillAlert(env, [
+        '[MPP Router] 🚨 Bitrefill invoice NOT paid: invoice is not on BITREFILL_FUNDER_ALLOWED_INVOICES',
+        `Invoice: ${plId}, Rozo payment ${(rozoPaymentId ?? '?').slice(0, 8)}`,
+        'The payer paid and the funder holds the money. Adding the invoice to the list (or "*") within 2 hours of the payout lets the sweep pay it automatically; otherwise refund by hand.',
+      ])
+    }
+    return { ok: true, deferred: 'invoice_not_allowlisted', plId }
+  }
+
   if (await checkoutDeliveryPaused(env)) {
     return deferForCheckoutPause(env, plId, rec, eventType, eventId)
   }
@@ -353,18 +414,67 @@ export async function settleBitrefillFunderEvent(
     return { ok: true, status: saved.status, plId, reason: 'late_payin' }
   }
 
+  // Read-only pre-check; nothing is taken yet.
+  const balance = (await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)).balance
+  if (balance !== null && balance < facts.amountAtomic) {
+    rec.status = 'failed_insufficient_balance'
+    rec.failureReason = `funder balance ${balance} < invoice ${facts.amountAtomic}`
+    rec.events.push({ kind: 'balance_check', at: nowIso(), detail: { balance: balance.toString(), sufficient: false } })
+    await saveRecordGuarded(env, plId, rec)
+    await forgetWebhookEvent(env, eventId)
+    await sendBitrefillAlert(env, [
+      '[MPP Router] 🚨 Bitrefill invoice BLOCKED: insufficient funder balance',
+      `Invoice: ${plId} (${fmt(facts.amountAtomic)} USDC), funder balance ${fmt(balance)} USDC`,
+      'Top up the funder, then replay the webhook before the invoice expires.',
+    ])
+    return { ok: true, deferred: 'insufficient_balance', plId }
+  }
+
+  // Order before a send: gate -> reservation -> persist `paying` -> call.
+  // Every exit before the call releases what was taken. The holder is unique
+  // per attempt, so a release can never drop a gate another attempt holds
+  // (webhook dedup stays keyed on the real event id).
+  const gateHolder = `${eventId}#${crypto.randomUUID()}`
+  let gate: Awaited<ReturnType<typeof acquireCoinbaseExecGate>>
+  try {
+    gate = await acquireCoinbaseExecGate(env, plId, gateHolder, new Date(), rozoPaymentId ?? undefined)
+  } catch {
+    // Nothing was sent. The CAS may or may not have committed: give back a
+    // gate held by this attempt (no-op otherwise), keep the record
+    // re-drivable, and let a replay of this event through.
+    await releaseCoinbaseExecGate(env, plId, gateHolder).catch(() => false)
+    rec.events.push({ kind: 'exec_gate_unavailable', at: nowIso(), event_id: eventId })
+    await saveRecordGuarded(env, plId, rec)
+    await forgetWebhookEvent(env, eventId)
+    return { ok: true, deferred: 'exec_gate_unavailable', plId }
+  }
+  if (!gate.ok) {
+    rec.events.push({ kind: 'exec_gate_held', at: nowIso(), event_id: eventId, detail: { holder: gate.holder.holder } })
+    await saveRecordGuarded(env, plId, rec)
+    return { ok: true, exec_gate_held: true, plId }
+  }
+  const releaseGate = () => releaseCoinbaseExecGate(env, plId, gateHolder).catch(() => false)
+  if (await checkoutDeliveryPaused(env)) {
+    await releaseGate()
+    return deferForCheckoutPause(env, plId, rec, eventType, eventId)
+  }
+
   // Daily ledger (always enforced for this line; DO error = fail closed).
+  // Taken only while the gate is held, so a reservation is only ever left
+  // behind if the worker dies between this call and the `paying` save below.
   const spendDay = new Date()
   let spentBefore: bigint | null
   try {
     spentBefore = await reserveDailySpend(env, spendDay, facts.amountAtomic, 'bitrefill')
   } catch {
+    await releaseGate()
     rec.events.push({ kind: 'daily_cap_unavailable', at: nowIso(), event_id: eventId })
     await saveRecordGuarded(env, plId, rec)
     await forgetWebhookEvent(env, eventId)
     return { ok: true, deferred: 'daily_cap_unavailable', plId }
   }
   if (spentBefore === null) {
+    await releaseGate()
     rec.status = 'failed_insufficient_balance'
     rec.failureReason = `bitrefill daily cap ${bitrefillDailyCapAtomic(env)} reached`
     rec.events.push({ kind: 'daily_cap_reached', at: nowIso(), event_id: eventId })
@@ -384,60 +494,18 @@ export async function settleBitrefillFunderEvent(
     await releaseDailySpend(env, spendDay, facts.amountAtomic, 'bitrefill').catch(() => undefined)
   }
 
-  const balance = (await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)).balance
-  if (balance !== null && balance < facts.amountAtomic) {
-    await releaseReservation()
-    rec.status = 'failed_insufficient_balance'
-    rec.failureReason = `funder balance ${balance} < invoice ${facts.amountAtomic}`
-    rec.events.push({ kind: 'balance_check', at: nowIso(), detail: { balance: balance.toString(), sufficient: false } })
-    await saveRecordGuarded(env, plId, rec)
-    await forgetWebhookEvent(env, eventId)
-    await sendBitrefillAlert(env, [
-      '[MPP Router] 🚨 Bitrefill invoice BLOCKED: insufficient funder balance',
-      `Invoice: ${plId} (${fmt(facts.amountAtomic)} USDC), funder balance ${fmt(balance)} USDC`,
-      'Top up the funder, then replay the webhook before the invoice expires.',
-    ])
-    return { ok: true, deferred: 'insufficient_balance', plId }
-  }
-
-  let gate: Awaited<ReturnType<typeof acquireCoinbaseExecGate>>
-  try {
-    gate = await acquireCoinbaseExecGate(env, plId, eventId, new Date(), rozoPaymentId ?? undefined)
-  } catch {
-    // Nothing was sent. The CAS may or may not have committed: give back a
-    // gate held by this event (no-op otherwise) and the day's headroom, keep
-    // the record re-drivable, and let a replay of this event through.
-    await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
-    await releaseReservation()
-    rec.events.push({ kind: 'exec_gate_unavailable', at: nowIso(), event_id: eventId })
-    await saveRecordGuarded(env, plId, rec)
-    await forgetWebhookEvent(env, eventId)
-    return { ok: true, deferred: 'exec_gate_unavailable', plId }
-  }
-  if (!gate.ok) {
-    await releaseReservation()
-    rec.events.push({ kind: 'exec_gate_held', at: nowIso(), event_id: eventId, detail: { holder: gate.holder.holder } })
-    await saveRecordGuarded(env, plId, rec)
-    return { ok: true, exec_gate_held: true, plId }
-  }
-  if (await checkoutDeliveryPaused(env)) {
-    await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
-    await releaseReservation()
-    return deferForCheckoutPause(env, plId, rec, eventType, eventId)
-  }
-
   rec.status = 'paying'
   rec.payingAt = nowIso()
   try {
     rec = await saveRecordGuarded(env, plId, rec)
   } catch (err) {
-    await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
     await releaseReservation()
+    await releaseGate()
     throw err
   }
   if (rec.status !== 'paying') {
-    await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
     await releaseReservation()
+    await releaseGate()
     return { ok: true, alreadyTerminal: rec.status, plId }
   }
 
@@ -473,6 +541,12 @@ export async function settleBitrefillFunderEvent(
     rec.failureReason = 'pay-invoice refused: Bitrefill invoice expired (late payin), nothing signed'
     rec.alertedManualReview = true
     rec.events.push({ kind: 'bitrefill_late_payin', at: nowIso(), detail })
+  } else if (verdict === 'nonce_used_unlogged') {
+    // Gate and ledger kept: the authorization slot is consumed on chain.
+    rec.status = 'manual_review'
+    rec.failureReason = 'pay-invoice: nonce already used on chain but no matching pay log row (NONCE_USED_WITHOUT_PAY_LOG)'
+    rec.alertedManualReview = true
+    rec.events.push({ kind: 'bitrefill_nonce_used_without_pay_log', at: nowIso(), detail })
   } else if (verdict === 'refused' || verdict === 'presign_transient') {
     await releaseReservation()
     rec.status = 'failed_pay_invoice'
@@ -489,14 +563,18 @@ export async function settleBitrefillFunderEvent(
     await sendBitrefillAlert(env, [
       verdict === 'unknown'
         ? '[MPP Router] 🚨 Bitrefill payment UNKNOWN: sent, outcome not known'
-        : '[MPP Router] 🚨 Bitrefill invoice NOT paid',
+        : verdict === 'nonce_used_unlogged'
+          ? '[MPP Router] 🚨 Bitrefill invoice needs a human: nonce used on chain without a pay log row'
+          : '[MPP Router] 🚨 Bitrefill invoice NOT paid',
       `Invoice: ${plId} (${fmt(facts.amountAtomic)} USDC)`,
       `Reason: ${rec.failureReason}`,
       verdict === 'unknown'
-        ? 'Do NOT re-pay or clear the exec gate. The cron sweep reads authorizationState(funder, nonce) and moves it to paid or manual_review.'
+        ? 'Do NOT re-pay and do NOT refund. The cron sweep reads authorizationState(funder, nonce) from two RPC sources and moves it to paid or manual_review.'
         : verdict === 'expired'
           ? 'Nothing was sent. The funder holds the money; refund the payer by hand.'
-          : 'Nothing was signed. Investigate; a manual re-pay clears the exec gate through the admin route.',
+          : verdict === 'nonce_used_unlogged'
+            ? 'The authorization for this invoice was consumed on chain. Check the chain by hand (who executed it, to which address, how much) before any re-pay or refund. Do not re-pay.'
+            : `Nothing was signed. ${MANUAL_REPAY_TEXT}`,
     ])
   } else {
     await reportDelivered(env, plId, rec)
@@ -535,28 +613,63 @@ const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 // keccak256("authorizationState(address,bytes32)")[0:4]
 export const AUTHORIZATION_STATE_SELECTOR = '0xe94a0102'
 
-/** true / false from chain, or null when no RPC answered (unknown, never "no"). */
-export async function readAuthorizationUsed(env: Env, funder: string, nonce: string): Promise<boolean | null> {
+export interface AuthorizationQuorumRead {
+  /** true: some endpoint read used. false: at least BITREFILL_UNUSED_QUORUM distinct endpoints read unused and none read used. null: undecided. */
+  used: boolean | null
+  answers: Array<{ endpoint: string; used: boolean | null }>
+}
+
+/**
+ * Read USDC.authorizationState(funder, nonce) at `latest` from every
+ * configured endpoint (BASE_RPC_URL plus the public fallbacks, de-duplicated
+ * by host). One `true` anywhere resolves to used; "unused" needs two
+ * independent endpoints; anything less is undecided (never "no").
+ */
+export async function readAuthorizationQuorum(env: Env, funder: string, nonce: string): Promise<AuthorizationQuorumRead> {
   const data =
     AUTHORIZATION_STATE_SELECTOR +
     funder.toLowerCase().replace(/^0x/, '').padStart(64, '0') +
     nonce.toLowerCase().replace(/^0x/, '').padStart(64, '0')
-  const candidates = env.BASE_RPC_URL ? [env.BASE_RPC_URL, ...FALLBACK_BASE_RPCS] : FALLBACK_BASE_RPCS
+  const candidates = env.BASE_RPC_URL ? [env.BASE_RPC_URL, ...FALLBACK_BASE_RPCS] : [...FALLBACK_BASE_RPCS]
+  const byHost = new Map<string, string>()
   for (const url of candidates) {
+    let host: string
     try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: BASE_USDC, data }, 'latest'] }),
-      })
-      if (!res.ok) continue
-      const json = (await res.json()) as { result?: string }
-      if (typeof json.result === 'string' && /^0x[0-9a-fA-F]{64}$/.test(json.result)) return BigInt(json.result) !== 0n
+      host = new URL(url).host
     } catch {
-      console.warn(`[bitrefill-settle] authorizationState via ${redactRpcUrl(url)} failed`)
+      continue
     }
+    if (!byHost.has(host)) byHost.set(host, url)
   }
-  return null
+  const answers = await Promise.all(
+    [...byHost.entries()].map(async ([host, url]) => {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_call', params: [{ to: BASE_USDC, data }, 'latest'] }),
+          signal: AbortSignal.timeout(BITREFILL_RPC_TIMEOUT_MS),
+        })
+        if (!res.ok) return { endpoint: host, used: null }
+        const json = (await res.json()) as { result?: string }
+        if (typeof json.result === 'string' && /^0x[0-9a-fA-F]{64}$/.test(json.result)) {
+          return { endpoint: host, used: BigInt(json.result) !== 0n }
+        }
+        return { endpoint: host, used: null }
+      } catch {
+        console.warn(`[bitrefill-settle] authorizationState via ${redactRpcUrl(url)} failed`)
+        return { endpoint: host, used: null }
+      }
+    }),
+  )
+  if (answers.some((a) => a.used === true)) return { used: true, answers }
+  const unused = answers.filter((a) => a.used === false).length
+  return { used: unused >= BITREFILL_UNUSED_QUORUM ? false : null, answers }
+}
+
+/** true / false / null (undecided) under the quorum rule of readAuthorizationQuorum. */
+export async function readAuthorizationUsed(env: Env, funder: string, nonce: string): Promise<boolean | null> {
+  return (await readAuthorizationQuorum(env, funder, nonce)).used
 }
 
 // ── Cron sweep ──────────────────────────────────────────────────────────────
@@ -567,7 +680,7 @@ function msOf(iso: string | null | undefined): number | null {
   return Number.isFinite(t) ? t : null
 }
 
-type SweepAction = 'resolve' | 'deliver' | 'redrive'
+type SweepAction = 'resolve' | 'recheck' | 'deliver' | 'redrive'
 
 /** Bounded re-drives of a payout whose pre-send verification was deferred. */
 export const BITREFILL_MAX_REDRIVES = 10
@@ -587,7 +700,7 @@ function redriveExhausted(rec: FulfillmentRecord, seenMs: number, now: number): 
   return (rec.bitrefillRedrives ?? 0) >= BITREFILL_MAX_REDRIVES || now - seenMs > REDRIVE_WINDOW_MS
 }
 
-function classify(env: Env, rec: FulfillmentRecord, now: number): SweepAction | null {
+function classify(env: Env, plId: string, rec: FulfillmentRecord, now: number): SweepAction | null {
   if (rec.status === 'pay_invoice_unknown') return 'resolve'
   // The payout webhook came in, nothing was sent, and the pre-send check was
   // only deferred (order unreadable, payout tx not visible yet, ledger down).
@@ -596,6 +709,9 @@ function classify(env: Env, rec: FulfillmentRecord, now: number): SweepAction | 
   // re-drive goes through the full settle path (exec gate included).
   if (rec.status === 'payin_seen' && rec.rozoPaymentId) {
     if (String(env.BITREFILL_FUNDER_SEND_ENABLED ?? '').toLowerCase() !== 'true') return null
+    // Not on the invoice allowlist: not re-driven (same as switch off). Adding
+    // the invoice (or "*") later re-drives payouts younger than 2 hours.
+    if (!bitrefillInvoiceAllowed(env, invoiceIdOf(plId))) return null
     const seen = payoutSeenAtMs(rec)
     if (seen === null) return null
     // Window over or attempts used up: stop, but alert once.
@@ -606,6 +722,10 @@ function classify(env: Env, rec: FulfillmentRecord, now: number): SweepAction | 
     const since = msOf(rec.payingAt ?? null)
     return since !== null && now - since > BITREFILL_PAYING_STALE_MS ? 'resolve' : null
   }
+  // A record that reached manual_review from an unknown outcome may still be
+  // executed on chain by a signature we never saw: re-read its nonce for the
+  // lifetime of the record (KV TTL 7 days from the last write).
+  if (rec.status === 'manual_review' && rec.bitrefillUnknownOrigin) return 'recheck'
   if (rec.status === 'paid') {
     if (!deliveredReportEnabled(env) || rec.deliveredReported || !rec.rozoPaymentId) return null
     if ((rec.deliveredReportAttempts ?? 0) >= BITREFILL_DELIVERED_MAX_ATTEMPTS) return null
@@ -614,10 +734,22 @@ function classify(env: Env, rec: FulfillmentRecord, now: number): SweepAction | 
   return null
 }
 
-/** Latest moment an authorization for this record can still execute, ms. */
+/**
+ * Latest moment an authorization for this record can still execute, ms.
+ * pay-invoice never signs a validBefore later than the frozen invoice expiry
+ * minus 60 s, so that is a true upper bound whatever was (or was not)
+ * reported back. With a recorded validBefore the later of the two is used:
+ * it is never earlier than the recorded validBefore, and it still covers an
+ * earlier or concurrent signature whose validBefore we never saw. Only when
+ * the expiry is missing too does it fall back to payingAt + 300 s + timeout.
+ */
 export function authorizationDeadlineMs(rec: FulfillmentRecord): number | null {
-  const vb = rec.bitrefill?.validBefore
-  if (typeof vb === 'number' && vb > 0) return vb * 1000
+  const vbRaw = rec.bitrefill?.validBefore
+  const vb = typeof vbRaw === 'number' && vbRaw > 0 ? vbRaw * 1000 : null
+  const exp = msOf(rec.bitrefill?.expiresAt ?? null)
+  const expBound = exp === null ? null : exp - BITREFILL_EXPIRY_MARGIN_MS
+  if (expBound !== null) return vb === null ? expBound : Math.max(vb, expBound)
+  if (vb !== null) return vb
   const paying = msOf(rec.payingAt ?? null)
   // pay-invoice never signs validBefore beyond now + 300 s, and signs only
   // after the request arrived (after payingAt).
@@ -626,7 +758,8 @@ export function authorizationDeadlineMs(rec: FulfillmentRecord): number | null {
 
 export async function resolveBitrefillUnknown(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
   const nonce = rec.bitrefill?.nonce ?? bitrefillNonce(invoiceIdOf(plId))
-  const used = await readAuthorizationUsed(env, FUNDER_WALLET, nonce)
+  const read = await readAuthorizationQuorum(env, FUNDER_WALLET, nonce)
+  const used = read.used
   const nowIso = new Date(now).toISOString()
   if (used === null) return
   if (used) {
@@ -643,17 +776,49 @@ export async function resolveBitrefillUnknown(env: Env, plId: string, rec: Fulfi
   const from = rec.status
   rec.status = 'manual_review'
   rec.failureReason = 'authorization expired unused: nothing was paid to Bitrefill'
+  // Came from an unknown outcome: the sweep keeps re-reading the nonce.
+  if (from === 'pay_invoice_unknown' || from === 'paying') rec.bitrefillUnknownOrigin = true
   const alert = !rec.alertedManualReview
   rec.alertedManualReview = true
-  rec.events.push({ kind: 'sweep_manual_review', at: nowIso, detail: { from, reason: rec.failureReason } })
+  rec.events.push({
+    kind: 'sweep_manual_review',
+    at: nowIso,
+    detail: { from, reason: rec.failureReason, deadline: new Date(deadline).toISOString(), unusedReads: read.answers.filter((a) => a.used === false).map((a) => a.endpoint) },
+  })
   await saveRecordGuarded(env, plId, rec)
   if (alert) {
     await sendBitrefillAlert(env, [
       '[MPP Router] 🚨 Bitrefill invoice NOT paid: the signed authorization expired unused',
-      `Invoice: ${plId} (${fmt(rec.invoiceAmountAtomic)} USDC), was ${from}`,
-      'Chain shows the nonce unused after validBefore, so no transfer happened. The funder holds the money. Re-pay by hand (same nonce) if the invoice is still open, else refund the payer by hand.',
+      `Invoice: ${plId} (${fmt(rec.invoiceAmountAtomic)} USDC), was ${from}, invoice expiry ${rec.bitrefill?.expiresAt ?? 'unknown'}`,
+      `Two RPC sources read the nonce unused after ${new Date(deadline).toISOString()} + grace, so no transfer is visible. The funder holds the money. The sweep keeps re-reading the nonce and alerts if it ever reads used.`,
+      'Do not refund until the nonce is read unused after the invoice expiry time by two sources.',
+      MANUAL_REPAY_TEXT,
     ])
   }
+}
+
+/**
+ * manual_review records that came from an unknown outcome: re-read the nonce.
+ * If it now reads used, the authorization executed late: the record becomes
+ * paid (manual_review -> paid is a rank increase, so saveRecordGuarded allows
+ * it; this is the only Bitrefill path that writes it), a loud alert goes out
+ * and delivery is reported. Unused or undecided: no change.
+ */
+export async function recheckBitrefillManualReview(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
+  if (rec.status !== 'manual_review' || !rec.bitrefillUnknownOrigin) return
+  const nonce = rec.bitrefill?.nonce ?? bitrefillNonce(invoiceIdOf(plId))
+  if ((await readAuthorizationQuorum(env, FUNDER_WALLET, nonce)).used !== true) return
+  const nowIso = new Date(now).toISOString()
+  rec.status = 'paid'
+  rec.paidAt = rec.paidAt ?? nowIso
+  rec.events.push({ kind: 'sweep_bitrefill_late_execution', at: nowIso, detail: { from: 'manual_review' } })
+  const saved = await saveRecordGuarded(env, plId, rec)
+  await sendBitrefillAlert(env, [
+    '[MPP Router] 🚨🚨 Bitrefill invoice was manual_review, chain now shows paid',
+    `Invoice: ${plId} (${fmt(rec.invoiceAmountAtomic)} USDC), Rozo payment ${(rec.rozoPaymentId ?? '?').slice(0, 8)}`,
+    'authorizationState(funder, nonce) now reads used: the funder paid Bitrefill after the record went to manual review. If a refund was already sent to the payer, recover it.',
+  ])
+  if (saved.status === 'paid') await reportDelivered(env, plId, saved, now)
 }
 
 async function redriveDeferredPayout(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
@@ -672,7 +837,10 @@ async function redriveDeferredPayout(env: Env, plId: string, rec: FulfillmentRec
   rec.bitrefillRedrives = attempts + 1
   await saveRecordGuarded(env, plId, rec)
   await settleBitrefillFunderEvent(env, {
-    eventId: `bitrefill-sweep:${plId}:${attempts + 1}`,
+    // Unique per attempt: two overlapping sweep runs never share an event id
+    // (the exec gate holder derives from it). Not a webhook id, so webhook
+    // dedup is unaffected.
+    eventId: `bitrefill-sweep:${plId}:${attempts + 1}:${crypto.randomUUID()}`,
     eventType: 'payment_payout_completed',
     plId,
     rozoPaymentId: rec.rozoPaymentId,
@@ -686,10 +854,24 @@ async function redriveDeferredPayout(env: Env, plId: string, rec: FulfillmentRec
  * path that can lead to a send is a bounded re-drive of a deferred payout,
  * which runs the full webhook settle path (exec gate, paying-before-call).
  */
-export async function sweepBitrefillFulfillments(env: Env, now: number = Date.now()): Promise<{ scanned: number; acted: number }> {
+export async function sweepBitrefillFulfillments(
+  env: Env,
+  now: number = Date.now(),
+  clock: () => number = Date.now,
+): Promise<{ scanned: number; acted: number }> {
+  const startedAt = clock()
   let scanned = 0
   let acted = 0
   try {
+    // Cost model (not measured against Cloudflare limits, which are unverified
+    // here): per run at most 5 KV list calls (1,000 keys each) plus one KV get
+    // per bitrefill_ fulfillment key, then per action: re-drive = order read +
+    // balance read + DO gate/ledger calls + up to 2 pay-invoice calls (60 s
+    // timeout each); resolve/recheck = one eth_call per distinct RPC host (5,
+    // 10 s timeout, in parallel); deliver = one POST. Records carry no list
+    // metadata (webhook.ts saveRecord writes none), so terminal records cannot
+    // be skipped before the get; adding status metadata there would touch the
+    // Coinbase line and is left out of this change.
     const candidates: Array<{ plId: string; rec: FulfillmentRecord; action: SweepAction }> = []
     let cursor: string | undefined
     for (let page = 0; page < 5; page++) {
@@ -700,7 +882,7 @@ export async function sweepBitrefillFulfillments(env: Env, now: number = Date.no
         scanned++
         const rec = await loadRecord(env, plId)
         if (!rec) continue
-        const action = classify(env, rec, now)
+        const action = classify(env, plId, rec, now)
         if (action) candidates.push({ plId, rec, action })
       }
       if (res.list_complete) break
@@ -710,12 +892,17 @@ export async function sweepBitrefillFulfillments(env: Env, now: number = Date.no
     // Each action gets its own budget so unresolvable unknowns cannot starve
     // the time-sensitive re-drives (invoice expiry) or the delivered reports.
     // Re-drives run first.
-    const order: SweepAction[] = ['redrive', 'resolve', 'deliver']
+    const order: SweepAction[] = ['redrive', 'resolve', 'recheck', 'deliver']
     const picked = order.flatMap((a) => candidates.filter((c) => c.action === a).slice(0, BITREFILL_SWEEP_MAX_RECORDS))
     for (const { plId, rec, action } of picked) {
+      // A re-drive can take ~2 minutes (pay-invoice timeout + retry): stop
+      // starting new ones once the run has used its wall budget so it does not
+      // overlap the next cron tick. Skipped ones are picked up by a later run.
+      if (action === 'redrive' && clock() - startedAt > BITREFILL_SWEEP_REDRIVE_BUDGET_MS) continue
       acted++
       try {
         if (action === 'resolve') await resolveBitrefillUnknown(env, plId, rec, now)
+        else if (action === 'recheck') await recheckBitrefillManualReview(env, plId, rec, now)
         else if (action === 'redrive') await redriveDeferredPayout(env, plId, rec, now)
         else await reportDelivered(env, plId, rec, now)
       } catch (err) {

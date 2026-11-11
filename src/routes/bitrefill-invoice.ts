@@ -71,25 +71,6 @@ export const BITREFILL_MAX_REMAINING_MS = 61 * 60 * 1000
 /** orderId prefix; the webhook uses it to skip router-side settlement. */
 export const BITREFILL_ORDER_PREFIX = 'bitrefill_'
 
-// Known compromised / attacker EVM addresses. No shared blocklist exists in
-// this repo, so these are hard-coded here and compared lowercased.
-const BLOCKED_ADDRESSES: ReadonlySet<string> = new Set(
-  [
-    '0x0000000000000000000000000000000000000000',
-    '0x8FE7155119d2975780c9e19B07dD98393965Bc2a',
-    '0xa9E3Da13EF5eADFC6EcB2BB6BDddE95016B567dB',
-    '0x5772FBe7a7817ef7F586215CA8b23b8dD22C8897',
-    '0x44d6B5a11FFc5Ba1043734d88af5E5dea36a648A',
-    '0x467AeD16d024405116cF4Ba12976Bf63B404517b',
-    '0xF621Ee3BaE3cbE924Ec05f795d14E31384Bd11b6',
-    '0x49CD5655Cc9bf7c7C93fBb2DF36AA3020d11eEe0',
-    '0xa9BacE1614d6cFf8aa159A2A41eE8BaA9a91Cc7B',
-    '0xfD0e6fA2ABA8436e95f3Fb3523AC14Ba299c0e79',
-  ].map((a) => a.toLowerCase()),
-)
-
-const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
-
 /** Earliest parseable ISO timestamp among the inputs, or null if none parse. */
 export function earlierIso(...values: unknown[]): string | null {
   const ts = values
@@ -182,11 +163,15 @@ export async function handleBitrefillCreateInvoice(
   if (typeof invoiceId !== 'string' || !INVOICE_ID_RE.test(invoiceId)) {
     return fail(400, 'INVALID_INPUT', 'bitrefill.invoiceId must be 1-128 chars of [A-Za-z0-9_-].')
   }
-  if (typeof address !== 'string' || !ADDRESS_RE.test(address)) {
-    return fail(400, 'INVALID_ADDRESS', 'bitrefill.address must be a 0x-prefixed 40-hex Base address.')
-  }
-  if (BLOCKED_ADDRESSES.has(address.toLowerCase())) {
-    return fail(400, 'BLOCKED_ADDRESS', 'This receiving address is not allowed.')
+  // Same refusal set as the funder model (bitrefill-binding.ts, the 17 charter
+  // EVM entries incl. the funder lookalike, plus zero, the funder itself and
+  // the USDC contract). Response codes are unchanged: malformed =
+  // INVALID_ADDRESS, refused = BLOCKED_ADDRESS.
+  const receiverRefusal = bitrefillReceiverRefusal(address)
+  if (receiverRefusal || typeof address !== 'string') {
+    return receiverRefusal === null || receiverRefusal.startsWith('not a')
+      ? fail(400, 'INVALID_ADDRESS', 'bitrefill.address must be a 0x-prefixed 40-hex Base address.')
+      : fail(400, 'BLOCKED_ADDRESS', 'This receiving address is not allowed.')
   }
   if (typeof amount !== 'string' || !AMOUNT_RE.test(amount) || Number(amount) <= 0) {
     return fail(400, 'INVALID_AMOUNT', 'bitrefill.amount must be a positive decimal string with at most 6 decimals.')
@@ -402,6 +387,36 @@ export function bitrefillFunderSendEnabled(env: Env): boolean {
   return String(env.BITREFILL_FUNDER_SEND_ENABLED ?? '').toLowerCase() === 'true'
 }
 
+/**
+ * Parse BITREFILL_FUNDER_ALLOWED_INVOICES. After trim it is either exactly "*"
+ * (every invoice) or a comma-separated list of lowercase invoice UUIDs
+ * (whitespace around items tolerated). Unset, empty, or ANY malformed token
+ * ("*" mixed with ids, uppercase, non-UUID, empty item) = null: nothing is
+ * allowed (fail closed). The same grammar is used by pay-invoice's
+ * BITREFILL_FUNDER_PAY_INVOICE_ALLOWLIST.
+ */
+export function parseBitrefillInvoiceAllowlist(raw: unknown): { all: true } | { all: false; ids: ReadonlySet<string> } | null {
+  if (typeof raw !== 'string') return null
+  const v = raw.trim()
+  if (v === '') return null
+  if (v === '*') return { all: true }
+  const ids = new Set<string>()
+  for (const item of v.split(',')) {
+    const id = item.trim()
+    if (!isBitrefillUuid(id)) return null
+    ids.add(id)
+  }
+  return { all: false, ids }
+}
+
+/** True only when the allowlist parses and contains this invoice (or is "*"). */
+export function bitrefillInvoiceAllowed(env: Env, invoiceId: string): boolean {
+  const list = parseBitrefillInvoiceAllowlist(env.BITREFILL_FUNDER_ALLOWED_INVOICES)
+  if (!list) return false
+  if (list.all) return true
+  return list.ids.has(invoiceId.trim().toLowerCase())
+}
+
 const BASE_USDC_TOKEN = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 
 type Lookup = { state: 'found'; row: any } | { state: 'missing' } | { state: 'error' }
@@ -494,6 +509,15 @@ export async function handleBitrefillFunderCreate(
   }
   const { invoiceId: rawId, address, amount, expiresAt } = br as Record<string, unknown>
   const invoiceId = typeof rawId === 'string' ? rawId.trim().toLowerCase() : ''
+  // Single-invoice isolation (fail closed). Checked before the account claim,
+  // the duplicate lookups and any create, so a non-listed invoice can neither
+  // open an order nor be handed the deposit of an existing one (the 409
+  // DUPLICATE_INVOICE body carries the order's source). Never falls back to
+  // the direct model while the funder switch is on: an empty list is the
+  // "pause all Bitrefill creation" state.
+  if (!bitrefillInvoiceAllowed(env, invoiceId)) {
+    return fail(403, 'BITREFILL_INVOICE_NOT_ALLOWED', 'This Bitrefill invoice is not open for payment right now.')
+  }
   if (!isBitrefillUuid(invoiceId)) {
     return fail(400, 'INVALID_INPUT', 'bitrefill.invoiceId must be the Bitrefill invoice UUID.')
   }

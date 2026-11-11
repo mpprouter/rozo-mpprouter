@@ -178,6 +178,11 @@ export interface FulfillmentRecord {
   // send used and the authorization identity the sweep resolves by.
   // Sweep re-drives of a Bitrefill payout whose pre-send check was deferred.
   bitrefillRedrives?: number
+  // Set when a Bitrefill record moved to manual_review FROM pay_invoice_unknown
+  // or paying (a signature may exist). The sweep keeps re-reading the nonce
+  // for such records; if it later reads used, the record becomes paid
+  // (manual_review -> paid is a rank increase, allowed by saveRecordGuarded).
+  bitrefillUnknownOrigin?: boolean
   bitrefill?: {
     invoiceId: string
     nonce: string

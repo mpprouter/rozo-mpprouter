@@ -17,11 +17,14 @@ import {
 } from '../src/routes/bitrefill-binding'
 import {
   AUTHORIZATION_STATE_SELECTOR,
+  BITREFILL_SWEEP_MAX_RECORDS,
   authorizationDeadlineMs,
   classifyBitrefillPayResult,
+  readAuthorizationQuorum,
   sweepBitrefillFulfillments,
 } from '../src/routes/bitrefill-settle'
-import { readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
+import { bitrefillInvoiceAllowed, parseBitrefillInvoiceAllowlist } from '../src/routes/bitrefill-invoice'
+import { acquireCoinbaseExecGate, readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
 import { readDailySpentAtomic } from '../src/routes/stripe-fulfillment'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
@@ -34,6 +37,7 @@ const KEY = `invoice-fulfillment:${PL}`
 const RECEIVER = '0x1111111111111111111111111111111111111111'
 const ROZO_ID = '22222222-3333-4444-5555-666666666666'
 const TX = '0x' + 'ab'.repeat(32)
+const OTHER_INVOICE = 'ec9482de-1111-4222-8333-34a72b96b322'
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 
 function makeKv() {
@@ -65,6 +69,7 @@ function makeEnv(overrides: Record<string, unknown> = {}) {
     ROZO_DELIVERED_REPORT_ENABLED: 'true',
     BITREFILL_ENABLED: 'true',
     BITREFILL_FUNDER_SEND_ENABLED: 'true',
+    BITREFILL_FUNDER_ALLOWED_INVOICES: '*',
     NATIVE_SOURCES: 'ETH@8453',
     ...overrides,
   }
@@ -324,6 +329,60 @@ describe('create (funder model)', () => {
     expect(created.appId).toBe('wallet_bitrefillpay')
     expect(created.destination.receiverAddress).toBe(RECEIVER)
   })
+
+  it('allowlist (F1): a listed invoice creates; non-listed, unset, empty or malformed = 403 before the claim, no direct fallback', async () => {
+    let r = await post(body(), makeEnv({ BITREFILL_FUNDER_ALLOWED_INVOICES: ` ${INVOICE} , ${OTHER_INVOICE}` }).env)
+    expect(r.status).toBe(200)
+    expect(posts).toBe(1)
+    expect(created.appId).toBe('merchant_openrouter')
+    const lists = [undefined, '', '   ', OTHER_INVOICE, `*,${INVOICE}`, INVOICE.toUpperCase(), `${INVOICE},`, 'not-a-uuid']
+    for (const list of lists) {
+      const { env } = makeEnv({ BITREFILL_FUNDER_ALLOWED_INVOICES: list })
+      seenKeys = []
+      r = await post(body(), env)
+      expect(r.status, String(list)).toBe(403)
+      expect(r.json.error, String(list)).toBe('BITREFILL_INVOICE_NOT_ALLOWED')
+      // No lookup and no create happened.
+      expect(seenKeys, String(list)).toHaveLength(0)
+      // No account claim was taken: once the switch is off, the direct model
+      // can still create this invoice (a taken claim would answer 409).
+      ;(env as any).BITREFILL_FUNDER_SEND_ENABLED = undefined
+      const d = await post(body({ invoiceId: INVOICE, expiresAt: inMinutes(15) }, { source: { chainId: '1500', tokenSymbol: 'USDC' } }), env)
+      expect(d.status, String(list)).toBe(200)
+      expect(created.appId).toBe('wallet_bitrefillpay')
+    }
+    expect(posts).toBe(1 + lists.length)
+  })
+
+  it('allowlist (F1) also gates the resume answer: no 409 with the deposit for a non-listed invoice', async () => {
+    existing = { merchant_openrouter: await frozenOrder({ status: 'payment_unpaid', source: { chainId: '8453', receiverAddress: '0x' + '77'.repeat(20) } }) }
+    let r = await post(body(), makeEnv({ BITREFILL_FUNDER_ALLOWED_INVOICES: '' }).env)
+    expect(r.status).toBe(403)
+    expect(r.json.source).toBeUndefined()
+    expect(r.json.rozoPaymentId).toBeUndefined()
+    r = await post(body(), makeEnv({ BITREFILL_FUNDER_ALLOWED_INVOICES: INVOICE }).env)
+    expect(r.status).toBe(409)
+    expect(r.json.source).toBeDefined()
+    expect(posts).toBe(0)
+  })
+
+  it('direct model (R11) uses the same 17-entry refusal set: the funder lookalike is refused, codes unchanged', async () => {
+    const env = makeEnv({ BITREFILL_FUNDER_SEND_ENABLED: undefined }).env
+    for (const [address, code] of [
+      ['0x235248a78985cb2166c2d5b43d527ea09fc31739', 'BLOCKED_ADDRESS'],
+      ['0x4374b2072ff9bc5c0e263CaE7866a41a4C601d29', 'BLOCKED_ADDRESS'],
+      ['0x5772FBe7a7817ef7F586215CA8b23b8dD22C8897', 'BLOCKED_ADDRESS'],
+      ['nope', 'INVALID_ADDRESS'],
+    ] as const) {
+      const r = await post(body({ invoiceId: 'inv-abc123', address, expiresAt: inMinutes(15) }, { source: { chainId: '1500', tokenSymbol: 'USDC' } }), env)
+      expect(r.status, address).toBe(400)
+      expect(r.json.error, address).toBe(code)
+    }
+    expect(posts).toBe(0)
+    // A valid address still creates.
+    const ok = await post(body({ invoiceId: 'inv-abc123', expiresAt: inMinutes(15) }, { source: { chainId: '1500', tokenSymbol: 'USDC' } }), env)
+    expect(ok.status).toBe(200)
+  })
 })
 
 // ── Settle ──────────────────────────────────────────────────────────────────
@@ -362,7 +421,7 @@ interface Up {
 
 function stub(cfg: Partial<Up> = {}) {
   const up: Up = { order: null, pay: [{ status: 200, body: { provider: 'bitrefill', ok: true, status: 'paid', signed: true, transaction: TX, validBefore: 1 } }], authUsed: false, balance: 1_000_000_000n, ...cfg }
-  const calls = { pay: 0, payBodies: [] as any[], delivered: 0, alerts: [] as string[], auth: 0, orderGet: 0 }
+  const calls = { pay: 0, payBodies: [] as any[], delivered: 0, alerts: [] as string[], auth: 0, orderGet: 0, log: [] as string[] }
   vi.stubGlobal(
     'fetch',
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -372,6 +431,7 @@ function stub(cfg: Partial<Up> = {}) {
         return Response.json({ errcode: 0 })
       }
       if (url.includes('agentapi.rozo.ai/pay-invoice')) {
+        calls.log.push('pay')
         const r = up.pay[Math.min(calls.pay, up.pay.length - 1)]
         calls.pay++
         calls.payBodies.push(JSON.parse(String(init?.body)))
@@ -380,16 +440,19 @@ function stub(cfg: Partial<Up> = {}) {
       }
       if (url.includes('intentapiv4.rozo.ai') && url.endsWith('/delivered')) {
         calls.delivered++
+        calls.log.push('delivered')
         return new Response('{}', { status: 200 })
       }
       if (url.includes('intentapiv4.rozo.ai')) {
         calls.orderGet++
+        calls.log.push('order')
         return up.order ? Response.json(up.order) : new Response('nf', { status: 404 })
       }
       const rpc = JSON.parse(String(init?.body ?? '{}'))
       const data: string = rpc?.params?.[0]?.data ?? ''
       if (data.startsWith(AUTHORIZATION_STATE_SELECTOR)) {
         calls.auth++
+        calls.log.push('auth')
         if (up.authUsed === 'fail') return new Response('down', { status: 503 })
         return Response.json({ jsonrpc: '2.0', id: 1, result: '0x' + (up.authUsed ? '1' : '0').padStart(64, '0') })
       }
@@ -435,7 +498,8 @@ describe('settle (funder model)', () => {
     expect(r.status).toBe('paid')
     expect(r.bitrefill?.nonce).toBe(bitrefillNonce(INVOICE))
     expect(calls.delivered).toBe(1)
-    expect((await readCoinbaseExecGate(env, PL))?.holder).toMatch(/^evt-br-/)
+    // Holder = event id + a per-attempt random suffix (R9).
+    expect((await readCoinbaseExecGate(env, PL))?.holder).toMatch(/^evt-br-\d+#[0-9a-f-]{36}$/)
     expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(204_000_000n)
     // A replayed payout event never sends again.
     await run(await signedEvent(), env)
@@ -643,8 +707,14 @@ describe('sweep (unknown resolution)', () => {
     const s = stub({ authUsed: false })
     await sweepBitrefillFulfillments(env)
     expect(rec(kv).status).toBe('pay_invoice_unknown')
+    // validBefore + grace is past, but the deadline is the later of
+    // validBefore and the invoice expiry - 60 s (expiry is +30 min here).
     await sweepBitrefillFulfillments(env, Date.now() + 10 * 60_000)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+    await sweepBitrefillFulfillments(env, Date.now() + 40 * 60_000)
     expect(rec(kv).status).toBe('manual_review')
+    expect(rec(kv).bitrefillUnknownOrigin).toBe(true)
+    expect(s.calls.alerts.some((a) => a.includes('Do not refund until the nonce is read unused after the invoice expiry time by two sources'))).toBe(true)
     expect(s.calls.pay).toBe(0)
   })
 
@@ -684,9 +754,316 @@ describe('sweep (unknown resolution)', () => {
     expect(s.calls.alerts.filter((a) => a.includes('delivery report'))).toHaveLength(1)
   })
 
-  it('deadline without validBefore is payingAt + 300 s + the call timeout', () => {
+  it('deadline: invoice expiry - 60 s without validBefore; never earlier than a recorded validBefore; old formula only without expiry', () => {
     const payingAt = '2026-11-11T10:00:00.000Z'
-    const d = authorizationDeadlineMs({ payingAt } as FulfillmentRecord)
-    expect(d).toBe(Date.parse(payingAt) + 360_000)
+    const expiresAt = '2026-11-11T10:40:00.000Z'
+    const b = (o: Record<string, unknown>) => ({ invoiceId: INVOICE, nonce: '0x', address: RECEIVER, amountAtomic: '1', expiresAt, ...o })
+    // No validBefore: frozen expiry - 60 s (not payingAt + 360 s).
+    expect(authorizationDeadlineMs({ payingAt, bitrefill: b({ validBefore: null }) } as unknown as FulfillmentRecord)).toBe(Date.parse(expiresAt) - 60_000)
+    // validBefore earlier than expiry - 60 s: the expiry bound still wins (covers an unseen signature).
+    const vbEarly = Math.floor(Date.parse('2026-11-11T10:05:00.000Z') / 1000)
+    expect(authorizationDeadlineMs({ payingAt, bitrefill: b({ validBefore: vbEarly }) } as unknown as FulfillmentRecord)).toBe(Date.parse(expiresAt) - 60_000)
+    // A recorded validBefore later than the expiry bound is never undercut.
+    const vbLate = Math.floor(Date.parse('2026-11-11T10:45:00.000Z') / 1000)
+    expect(authorizationDeadlineMs({ payingAt, bitrefill: b({ validBefore: vbLate }) } as unknown as FulfillmentRecord)).toBe(vbLate * 1000)
+    // No expiry recorded: validBefore, else the old payingAt + 300 s + timeout.
+    expect(authorizationDeadlineMs({ payingAt, bitrefill: b({ expiresAt: undefined, validBefore: vbEarly }) } as unknown as FulfillmentRecord)).toBe(vbEarly * 1000)
+    expect(authorizationDeadlineMs({ payingAt } as FulfillmentRecord)).toBe(Date.parse(payingAt) + 360_000)
+  })
+})
+
+// ── Fix batch 2026-11-12 ────────────────────────────────────────────────────
+
+describe('invoice allowlist grammar (F1)', () => {
+  it('exactly "*" or a list of lowercase UUIDs; anything else allows nothing', () => {
+    expect(parseBitrefillInvoiceAllowlist('*')).toEqual({ all: true })
+    expect(parseBitrefillInvoiceAllowlist('  *  ')).toEqual({ all: true })
+    const l = parseBitrefillInvoiceAllowlist(` ${INVOICE} ,${OTHER_INVOICE} `)
+    expect(l && !l.all ? [...l.ids] : null).toEqual([INVOICE, OTHER_INVOICE])
+    for (const bad of [undefined, null, 42, '', '   ', `*,${INVOICE}`, '**', INVOICE.toUpperCase(), `${INVOICE},`, `,${INVOICE}`, 'abc', `${INVOICE} ${OTHER_INVOICE}`]) {
+      expect(parseBitrefillInvoiceAllowlist(bad), String(bad)).toBeNull()
+    }
+    const env = (v: unknown) => ({ BITREFILL_FUNDER_ALLOWED_INVOICES: v }) as unknown as Env
+    expect(bitrefillInvoiceAllowed(env(INVOICE), INVOICE.toUpperCase())).toBe(true)
+    expect(bitrefillInvoiceAllowed(env(INVOICE), OTHER_INVOICE)).toBe(false)
+    expect(bitrefillInvoiceAllowed(env('*'), OTHER_INVOICE)).toBe(true)
+    expect(bitrefillInvoiceAllowed(env(undefined), INVOICE)).toBe(false)
+    expect(bitrefillInvoiceAllowed(env(`*,${INVOICE}`), INVOICE)).toBe(false)
+  })
+})
+
+describe('settle: allowlist, signer codes, gate and ledger order', () => {
+  it('invoice not allowlisted: deferred, no reservation, no gate, no pay-invoice, alert once; not re-driven until listed', async () => {
+    const { env, kv } = makeEnv({ BITREFILL_FUNDER_ALLOWED_INVOICES: OTHER_INVOICE })
+    const { calls } = stub({ order: await frozenOrder() })
+    const out = await run(await signedEvent(), env)
+    await run(await signedEvent(), env)
+    expect(out.deferred).toBe('invoice_not_allowlisted')
+    expect(calls.pay).toBe(0)
+    expect(rec(kv).status).toBe('payin_seen')
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+    expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(0n)
+    expect(calls.alerts.filter((a) => a.includes('BITREFILL_FUNDER_ALLOWED_INVOICES'))).toHaveLength(1)
+    // The sweep does not re-drive a non-listed invoice.
+    await sweepBitrefillFulfillments(env)
+    expect(calls.pay).toBe(0)
+    expect(rec(kv).bitrefillRedrives ?? 0).toBe(0)
+    // Listing it later: the sweep re-drives the payout (younger than 2 h) and pays.
+    ;(env as any).BITREFILL_FUNDER_ALLOWED_INVOICES = INVOICE
+    await sweepBitrefillFulfillments(env)
+    expect(calls.pay).toBe(1)
+    expect(rec(kv).status).toBe('paid')
+  })
+
+  it('maps the new signer codes', () => {
+    const tagged = (status: number, code: string) => ({ status, body: { provider: 'bitrefill', ok: false, code, signed: false } })
+    expect(classifyBitrefillPayResult(tagged(403, 'bitrefill_invoice_not_allowlisted'))).toBe('refused')
+    expect(classifyBitrefillPayResult({ status: 403, body: { error: 'bitrefill_invoice_not_allowlisted', signed: false } })).toBe('refused')
+    expect(classifyBitrefillPayResult({ status: 403, body: { error: 'bitrefill_invoice_not_allowlisted' } })).toBe('unknown')
+    expect(classifyBitrefillPayResult(tagged(422, 'PAYOUT_NOT_PROVEN_ON_CHAIN'))).toBe('refused')
+    expect(classifyBitrefillPayResult(tagged(409, 'PAY_IN_FLIGHT'))).toBe('unknown')
+    expect(classifyBitrefillPayResult(tagged(409, 'NONCE_USED_WITHOUT_PAY_LOG'))).toBe('nonce_used_unlogged')
+    expect(classifyBitrefillPayResult(tagged(409, 'PAY_LOG_CONFLICT'))).toBe('refused')
+  })
+
+  it('409 PAY_IN_FLIGHT -> pay_invoice_unknown, gate and ledger kept', async () => {
+    const { env, kv } = makeEnv()
+    stub({ order: await frozenOrder(), pay: [{ status: 409, body: { provider: 'bitrefill', ok: false, code: 'PAY_IN_FLIGHT', signed: false } }] })
+    await run(await signedEvent(), env)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+    expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
+    expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(204_000_000n)
+  })
+
+  it('409 NONCE_USED_WITHOUT_PAY_LOG -> manual_review with an alert, gate kept, never re-read as a late execution', async () => {
+    const { env, kv } = makeEnv()
+    const { calls } = stub({ order: await frozenOrder(), authUsed: true, pay: [{ status: 409, body: { provider: 'bitrefill', ok: false, code: 'NONCE_USED_WITHOUT_PAY_LOG', signed: false } }] })
+    await run(await signedEvent(), env)
+    expect(rec(kv).status).toBe('manual_review')
+    expect(rec(kv).bitrefillUnknownOrigin).toBeFalsy()
+    expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
+    expect(calls.alerts.some((a) => a.includes('without a pay log row'))).toBe(true)
+    const authBefore = calls.auth
+    await sweepBitrefillFulfillments(env)
+    expect(calls.auth).toBe(authBefore)
+    expect(rec(kv).status).toBe('manual_review')
+  })
+
+  it('422 PAYOUT_NOT_PROVEN_ON_CHAIN and the signer allowlist refusal -> failed_pay_invoice, ledger released; text has no admin-route clearing', async () => {
+    for (const body of [
+      { provider: 'bitrefill', ok: false, code: 'PAYOUT_NOT_PROVEN_ON_CHAIN', signed: false },
+      { provider: 'bitrefill', ok: false, code: 'bitrefill_invoice_not_allowlisted', signed: false },
+    ]) {
+      const { env, kv } = makeEnv()
+      const { calls } = stub({ order: await frozenOrder(), pay: [{ status: body.code === 'PAYOUT_NOT_PROVEN_ON_CHAIN' ? 422 : 403, body }] })
+      await run(await signedEvent(), env)
+      expect(rec(kv).status, body.code).toBe('failed_pay_invoice')
+      expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(0n)
+      const alert = calls.alerts.find((a) => a.includes('NOT paid'))!
+      expect(alert).toMatch(/Nothing in the router re-pays a Bitrefill invoice/)
+      expect(alert).not.toMatch(/admin route|clears? the exec gate/)
+    }
+  })
+
+  it('R10 order: gate -> reservation -> paying persisted -> call', async () => {
+    const { env, kv } = makeEnv()
+    const { calls } = stub({ order: await frozenOrder() })
+    const gateMod = await import('../src/routes/coinbase-exec-gate')
+    const ledgerMod = await import('../src/routes/stripe-fulfillment')
+    const origGate = gateMod.acquireCoinbaseExecGate
+    const origReserve = ledgerMod.reserveDailySpend
+    vi.spyOn(gateMod, 'acquireCoinbaseExecGate').mockImplementation(async (...a: Parameters<typeof origGate>) => {
+      calls.log.push('gate')
+      return origGate(...a)
+    })
+    vi.spyOn(ledgerMod, 'reserveDailySpend').mockImplementation(async (...a: Parameters<typeof origReserve>) => {
+      calls.log.push('reserve')
+      return origReserve(...a)
+    })
+    const put = kv.put
+    kv.put = async (k: string, v: string) => {
+      if (k === KEY && JSON.parse(v).status === 'paying') calls.log.push('paying')
+      return put(k, v)
+    }
+    await run(await signedEvent(), env)
+    expect(calls.log.filter((x) => ['gate', 'reserve', 'paying', 'pay'].includes(x))).toEqual(['gate', 'reserve', 'paying', 'pay'])
+    expect(rec(kv).status).toBe('paid')
+  })
+
+  it('R10 pre-send exits release the gate and leave no reservation (ledger DO error, checkout pause after the gate)', async () => {
+    let { env, kv } = makeEnv()
+    let s = stub({ order: await frozenOrder() })
+    const ledgerMod = await import('../src/routes/stripe-fulfillment')
+    const spy = vi.spyOn(ledgerMod, 'reserveDailySpend').mockRejectedValueOnce(new Error('DO down'))
+    await run(await signedEvent(), env)
+    expect(s.calls.pay).toBe(0)
+    expect(rec(kv).status).toBe('payin_seen')
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+    spy.mockRestore()
+    ;({ env, kv } = makeEnv())
+    s = stub({ order: await frozenOrder() })
+    const ctrl = await import('../src/routes/checkout-control')
+    // Paused only once the gate is held: the second pause check.
+    vi.spyOn(ctrl, 'checkoutDeliveryPaused').mockImplementation(async (e: Env) => (await readCoinbaseExecGate(e, PL)) !== null)
+    await run(await signedEvent(), env)
+    expect(s.calls.pay).toBe(0)
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+    expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(0n)
+  })
+
+  it('R9: a pre-send release never drops a gate held by another attempt with the same event id', async () => {
+    const { env } = makeEnv()
+    const { calls } = stub({ order: await frozenOrder() })
+    const req = await signedEvent()
+    const eventId = JSON.parse(await req.clone().text()).event_id
+    // Another attempt holds the gate under the bare event id (old-style holder).
+    expect((await acquireCoinbaseExecGate(env, PL, eventId)).ok).toBe(true)
+    const gateMod = await import('../src/routes/coinbase-exec-gate')
+    vi.spyOn(gateMod, 'acquireCoinbaseExecGate').mockRejectedValueOnce(new Error('DO down'))
+    await run(req, env)
+    expect(calls.pay).toBe(0)
+    expect((await readCoinbaseExecGate(env, PL))?.holder).toBe(eventId)
+  })
+
+  it('R9: sweep re-drive event ids are unique per attempt', async () => {
+    const { env, kv } = makeEnv()
+    stub({ order: null })
+    await run(await signedEvent(), env)
+    await sweepBitrefillFulfillments(env)
+    await sweepBitrefillFulfillments(env)
+    const ids = rec(kv).webhookEventIds.filter((i) => i.startsWith('bitrefill-sweep:'))
+    expect(ids).toHaveLength(2)
+    for (const [n, id] of ids.entries()) expect(id).toMatch(new RegExp(`^bitrefill-sweep:${PL}:${n + 1}:[0-9a-f-]{36}$`))
+  })
+})
+
+describe('chain quorum and late execution (F2)', () => {
+  function rpcStub(answers: Record<string, boolean | 'fail'>) {
+    const calls = { alerts: [] as string[], delivered: 0, hosts: [] as string[] }
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input)
+      if (url.includes('oapi.dingtalk.com')) {
+        calls.alerts.push(JSON.parse(String(init?.body)).text.content)
+        return Response.json({ errcode: 0 })
+      }
+      if (url.endsWith('/delivered')) {
+        calls.delivered++
+        return new Response('{}', { status: 200 })
+      }
+      const host = new URL(url).host
+      calls.hosts.push(host)
+      const a = answers[host] ?? 'fail'
+      if (a === 'fail') return new Response('down', { status: 503 })
+      return Response.json({ jsonrpc: '2.0', id: 1, result: '0x' + (a ? '1' : '0').padStart(64, '0') })
+    }))
+    return calls
+  }
+
+  it('one true anywhere = used; unused needs two distinct hosts; fewer = undecided', async () => {
+    const { env } = makeEnv()
+    rpcStub({ 'rpc.test': false, 'base.drpc.org': true })
+    expect((await readAuthorizationQuorum(env, FUNDER_WALLET, bitrefillNonce(INVOICE))).used).toBe(true)
+    rpcStub({ 'rpc.test': false })
+    expect((await readAuthorizationQuorum(env, FUNDER_WALLET, bitrefillNonce(INVOICE))).used).toBeNull()
+    rpcStub({ 'rpc.test': false, 'mainnet.base.org': false })
+    expect((await readAuthorizationQuorum(env, FUNDER_WALLET, bitrefillNonce(INVOICE))).used).toBe(false)
+    // BASE_RPC_URL on the same host as a fallback counts once.
+    const dup = makeEnv({ BASE_RPC_URL: 'https://mainnet.base.org/key' }).env
+    const c = rpcStub({ 'mainnet.base.org': false })
+    expect((await readAuthorizationQuorum(dup, FUNDER_WALLET, bitrefillNonce(INVOICE))).used).toBeNull()
+    expect(c.hosts.filter((h) => h === 'mainnet.base.org')).toHaveLength(1)
+  })
+
+  function seedRec(kv: ReturnType<typeof makeKv>, r: Partial<FulfillmentRecord>) {
+    kv._store.set(KEY, JSON.stringify({
+      status: 'pay_invoice_unknown', pl_id: PL, rozoPaymentId: ROZO_ID, invoiceAmountAtomic: '204000000',
+      funderBalanceAtomic: null, paidAt: null, payingAt: new Date(Date.now() - 3_600_000).toISOString(),
+      coinbaseResult: null, failureReason: null, webhookEventIds: [], events: [],
+      bitrefill: { invoiceId: INVOICE, nonce: bitrefillNonce(INVOICE), address: RECEIVER, amountAtomic: '204000000', expiresAt: new Date(Date.now() - 10 * 60_000).toISOString(), validBefore: null },
+      ...r,
+    }))
+  }
+
+  it('past the deadline, a single unused read keeps the record unknown', async () => {
+    const { env, kv } = makeEnv()
+    seedRec(kv, {})
+    rpcStub({ 'rpc.test': false })
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+  })
+
+  it('manual_review from an unknown outcome keeps being re-read; nonce later used -> paid, loud alert, delivered', async () => {
+    const { env, kv } = makeEnv()
+    seedRec(kv, {})
+    let c = rpcStub({ 'rpc.test': false, 'mainnet.base.org': false })
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('manual_review')
+    expect(rec(kv).bitrefillUnknownOrigin).toBe(true)
+    // Still unused: no change.
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('manual_review')
+    // The authorization executed late.
+    c = rpcStub({ 'base.llamarpc.com': true })
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('paid')
+    expect(rec(kv).events.some((e) => e.kind === 'sweep_bitrefill_late_execution')).toBe(true)
+    expect(c.alerts.filter((a) => a.includes('was manual_review, chain now shows paid'))).toHaveLength(1)
+    expect(c.alerts[0]).toMatch(/recover it/)
+    expect(c.delivered).toBe(1)
+    await sweepBitrefillFulfillments(env)
+    expect(c.alerts.filter((a) => a.includes('was manual_review'))).toHaveLength(1)
+  })
+
+  it('manual_review that did not come from an unknown outcome is not re-read', async () => {
+    const { env, kv } = makeEnv()
+    seedRec(kv, { status: 'manual_review' })
+    const c = rpcStub({ 'rpc.test': true })
+    await sweepBitrefillFulfillments(env)
+    expect(c.hosts).toHaveLength(0)
+    expect(rec(kv).status).toBe('manual_review')
+  })
+})
+
+describe('sweep budget and ordering (R7)', () => {
+  const invN = (i: number) => `ec9482de-1111-4222-8333-${(0xa00 + i).toString(16).padStart(12, '0')}`
+  function seedN(kv: ReturnType<typeof makeKv>, inv: string, r: Partial<FulfillmentRecord>) {
+    const pl = `bitrefill_${inv}`
+    kv._store.set(`invoice-fulfillment:${pl}`, JSON.stringify({
+      status: 'payin_seen', pl_id: pl, rozoPaymentId: ROZO_ID, invoiceAmountAtomic: '204000000',
+      funderBalanceAtomic: null, paidAt: null, payingAt: null, coinbaseResult: null, failureReason: null,
+      webhookEventIds: [], events: [{ kind: 'payment_payout_completed', at: new Date().toISOString() }],
+      bitrefill: { invoiceId: inv, nonce: bitrefillNonce(inv), address: RECEIVER, amountAtomic: '204000000', expiresAt: inMinutes(30), validBefore: null },
+      ...r,
+    }))
+  }
+  const load = (kv: ReturnType<typeof makeKv>, inv: string): FulfillmentRecord => JSON.parse(kv._store.get(`invoice-fulfillment:bitrefill_${inv}`) as string)
+
+  it('each action is capped at BITREFILL_SWEEP_MAX_RECORDS and re-drives run first', async () => {
+    const { env, kv } = makeEnv()
+    const n = BITREFILL_SWEEP_MAX_RECORDS + 5
+    for (let i = 0; i < n; i++) {
+      seedN(kv, invN(i), {}) // re-drive (order unreadable)
+      seedN(kv, invN(100 + i), { status: 'pay_invoice_unknown', payingAt: new Date(Date.now() - 60_000).toISOString() })
+      seedN(kv, invN(200 + i), { status: 'paid', paidAt: new Date().toISOString() })
+    }
+    const { calls } = stub({ order: null, authUsed: true })
+    await sweepBitrefillFulfillments(env)
+    const range = (a: number) => Array.from({ length: n }, (_, i) => load(kv, invN(a + i)))
+    expect(range(0).filter((r) => (r.bitrefillRedrives ?? 0) === 1)).toHaveLength(BITREFILL_SWEEP_MAX_RECORDS)
+    expect(range(100).filter((r) => r.status === 'paid')).toHaveLength(BITREFILL_SWEEP_MAX_RECORDS)
+    expect(range(200).filter((r) => r.deliveredReported)).toHaveLength(BITREFILL_SWEEP_MAX_RECORDS)
+    expect(calls.pay).toBe(0)
+    // All re-drive work (order reads) happened before the first chain read.
+    expect(calls.log.lastIndexOf('order')).toBeLessThan(calls.log.indexOf('auth'))
+  })
+
+  it('stops starting re-drives once the run used its 60 s wall budget', async () => {
+    const { env, kv } = makeEnv()
+    for (let i = 0; i < 3; i++) seedN(kv, invN(i), {})
+    stub({ order: null })
+    const clock = vi.fn<() => number>().mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(61_000)
+    await sweepBitrefillFulfillments(env, Date.now(), clock)
+    const done = [0, 1, 2].filter((i) => (load(kv, invN(i)).bitrefillRedrives ?? 0) === 1)
+    expect(done).toHaveLength(1)
   })
 })

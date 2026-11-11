@@ -423,6 +423,16 @@ export interface Env {
   // pay-invoice (provider "bitrefill") to pay the invoice from the funder.
   // Anything else = today's direct wallet_bitrefillpay model, no funder send.
   BITREFILL_FUNDER_SEND_ENABLED?: string
+  // Single-invoice isolation for the funder model (fix batch 2026-11-12).
+  // After trim: exactly "*" (every invoice) or a comma-separated list of
+  // lowercase Bitrefill invoice UUIDs. Unset, empty or any malformed token =
+  // nothing allowed (fail closed). Only consulted while
+  // BITREFILL_FUNDER_SEND_ENABLED is true: create answers 403
+  // BITREFILL_INVOICE_NOT_ALLOWED (never falls back to the direct model);
+  // settle and the sweep defer a non-listed invoice without reserving, taking
+  // the gate or calling pay-invoice. Adding an invoice (or "*") later lets the
+  // sweep re-drive deferred payouts younger than 2 hours, so they get paid.
+  BITREFILL_FUNDER_ALLOWED_INVOICES?: string
   // Router-side daily cap for Bitrefill funder payments, USD. Unset = 2000
   // (proposed, not approved). Malformed = 0 (nothing is paid).
   BITREFILL_SETTLE_DAILY_CAP_USD?: string
@@ -753,8 +763,11 @@ export default {
     // alert on payouts that never reached pay-invoice, and report delivery to
     // Rozo. Reads Coinbase only; never calls pay-invoice.
     ctx.waitUntil(sweepCoinbaseFulfillments(env))
-    // Bitrefill funder model: resolve `paying` / `pay_invoice_unknown` from
-    // USDC.authorizationState(funder, nonce) and report delivery. Never pays.
+    // Bitrefill funder model: resolve `paying` / `pay_invoice_unknown` (and
+    // re-read manual_review records that came from an unknown outcome) from
+    // USDC.authorizationState(funder, nonce), and report delivery. Never sends
+    // directly; a bounded re-drive of a deferred payout runs the full settle
+    // path (allowlist, exec gate, paying-before-call).
     ctx.waitUntil(sweepBitrefillFulfillments(env))
     // One-time backfill of the pay-URL → session index for records created
     // before the index existed (bounded per run; no-op once caught up).
