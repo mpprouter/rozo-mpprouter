@@ -111,7 +111,16 @@ export type FulfillmentStatus =
   // the pay request. Never re-paid automatically.
   | 'manual_review'
   | 'failed_insufficient_balance'
+  // pay-invoice answered a definite refusal (4xx, see
+  // payInvoiceRefusedBeforeSend): agentapi rejected the request before it
+  // signed anything, so nothing was paid. Terminal; needs a human.
   | 'failed_pay_invoice'
+  // The pay request was sent but its outcome is unknown: transport error,
+  // timeout or 5xx. The payment may have gone out, so this is terminal for
+  // paying (never re-paid, the exec gate is never released). The cron sweep
+  // (coinbase-sweep.ts) reads Coinbase and moves it to `paid` or
+  // `manual_review`, exactly like `capture_pending`.
+  | 'pay_invoice_unknown'
   // The invoice was claimed by another channel (UPI fiat) before this
   // crypto payin could settle it. Terminal: the caller's crypto needs a
   // human refund, and the invoice must NOT be paid a second time.
@@ -172,6 +181,7 @@ export const TERMINAL_STATUSES: ReadonlySet<FulfillmentStatus> = new Set<Fulfill
   'test_settled',
   'paid',
   'capture_pending',
+  'pay_invoice_unknown',
   'manual_review',
   'claimed_by_other_channel',
   'failed_pay_invoice',
@@ -226,6 +236,7 @@ const STATUS_RANK: Record<FulfillmentStatus, number> = {
   failed_insufficient_balance: 0,
   paying: 1,
   capture_pending: 2,
+  pay_invoice_unknown: 2,
   manual_review: 3,
   failed_pay_invoice: 3,
   claimed_by_other_channel: 3,
@@ -355,7 +366,12 @@ export function maskAddresses(text: string): string {
 }
 
 export interface InvoiceFailureAlertParams {
-  kind: 'failed_insufficient_balance' | 'failed_pay_invoice' | 'order_binding_failed' | 'daily_cap_reached'
+  kind:
+    | 'failed_insufficient_balance'
+    | 'failed_pay_invoice'
+    | 'pay_invoice_unknown'
+    | 'order_binding_failed'
+    | 'daily_cap_reached'
   plId: string
   invoiceAtomic: bigint | null
   funderBalanceAtomic: bigint | null
@@ -378,7 +394,9 @@ export function buildInvoiceFailureAlert(params: InvoiceFailureAlertParams): str
         ? '🚨 Invoice fulfillment REFUSED: Rozo order does not match the invoice'
         : params.kind === 'daily_cap_reached'
           ? '🚨 Invoice fulfillment BLOCKED: Coinbase daily settlement cap reached'
-          : '🚨 Invoice fulfillment FAILED: pay-invoice call did not succeed'
+          : params.kind === 'pay_invoice_unknown'
+            ? '🚨 Invoice fulfillment UNKNOWN: pay-invoice was sent, outcome not known'
+            : '🚨 Invoice fulfillment FAILED: pay-invoice call did not succeed'
   const action =
     params.kind === 'failed_insufficient_balance'
       ? 'Caller already paid — top up the funder wallet, then replay the webhook.'
@@ -386,7 +404,9 @@ export function buildInvoiceFailureAlert(params: InvoiceFailureAlertParams): str
         ? 'Nothing was paid. Check the Rozo order against the invoice by hand before any manual payment.'
         : params.kind === 'daily_cap_reached'
           ? 'Nothing was paid. Raise COINBASE_SETTLE_DAILY_CAP_USD or wait for 00:00 UTC, then replay the webhook.'
-          : 'Caller already paid — investigate, then replay the webhook.'
+          : params.kind === 'pay_invoice_unknown'
+            ? 'The payment MAY have gone out. Do NOT re-pay or clear the exec gate; the cron sweep reads Coinbase and moves it to paid or manual_review.'
+            : 'Caller already paid — investigate, then replay the webhook.'
   const lines = [
     `[MPP Router] ${headline}`,
     `Invoice: ${params.plId} (${fmtUsdcAtomic(params.invoiceAtomic)} USDC)`,
@@ -450,6 +470,18 @@ export interface PayInvoiceExpectedBinding {
   invoice_key: string
   amount_atomic: string
   fingerprint: string
+}
+
+/**
+ * True only for an answer that proves pay-invoice sent nothing: agentapi
+ * pay-invoice answers 4xx before it signs (bad request, link used / expired /
+ * not payable, binding mismatch), and a gateway 4xx means the function never
+ * ran. 408 and 499 are timeouts, not refusals. Everything else that is not
+ * 2xx (status 0 = transport error or thrown fetch, 5xx, anything unexpected)
+ * may have paid and must be treated as unknown.
+ */
+export function payInvoiceRefusedBeforeSend(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 499
 }
 
 export async function callAgentApiPayInvoice(
@@ -876,7 +908,8 @@ export async function settleCoinbaseEvent(
   // was a non-atomic KV read-modify-write that leaked whenever a record got
   // stuck in `paying`, and blocked payable invoices). Two concurrent invoices
   // can both pass this check; agentapi pay-invoice re-checks the funder
-  // balance itself and the loser fails into failed_pay_invoice + alert.
+  // balance itself and the loser fails (its 5xx lands in pay_invoice_unknown,
+  // resolved by the sweep from Coinbase) + alert.
   //
   // 7c. Order binding (verifyCoinbaseOrderBinding). The webhook payload is
   // not trusted for what gets paid: re-read the Rozo order and the Coinbase
@@ -1141,11 +1174,11 @@ export async function settleCoinbaseEvent(
         session_status: payResult.body?.coinbase?.session?.status ?? null,
       },
     })
-  } else {
+  } else if (payInvoiceRefusedBeforeSend(payResult.status)) {
     // A definite 4xx refusal means nothing was paid: give the day's headroom
-    // back. Transport errors and 5xx are ambiguous (the payment may have
-    // gone out), so the reservation stays counted.
-    if (payResult.status >= 400 && payResult.status < 500) await releaseReservation()
+    // back. Terminal, needs a human (the exec gate stays held; only the
+    // exec-gate admin route may clear it).
+    await releaseReservation()
     rec.status = 'failed_pay_invoice'
     rec.failureReason = `agentapi pay-invoice ${payResult.status}`
     rec.events.push({
@@ -1153,10 +1186,29 @@ export async function settleCoinbaseEvent(
       at: new Date().toISOString(),
       detail: { status: payResult.status, body: payResult.body },
     })
-    // Ops alert: caller paid but the Coinbase settlement call failed —
-    // terminal state, needs a human. sendInvoiceFailureAlert never throws.
+    // Ops alert: caller paid but the Coinbase settlement call was refused.
+    // sendInvoiceFailureAlert never throws.
     await sendInvoiceFailureAlert(env, {
       kind: 'failed_pay_invoice',
+      plId,
+      invoiceAtomic,
+      funderBalanceAtomic: balance,
+      failureReason: rec.failureReason,
+      detail: JSON.stringify(payResult.body),
+    })
+  } else {
+    // Transport error, timeout or 5xx: the payment may have gone out. The
+    // reservation stays counted, the exec gate stays held, and the cron sweep
+    // resolves the record from Coinbase (never by paying again).
+    rec.status = 'pay_invoice_unknown'
+    rec.failureReason = `agentapi pay-invoice ${payResult.status} (outcome unknown)`
+    rec.events.push({
+      kind: 'pay_invoice_unknown',
+      at: new Date().toISOString(),
+      detail: { status: payResult.status, body: payResult.body },
+    })
+    await sendInvoiceFailureAlert(env, {
+      kind: 'pay_invoice_unknown',
       plId,
       invoiceAtomic,
       funderBalanceAtomic: balance,
@@ -1514,6 +1566,7 @@ const ROUTER_STATES_IMPLYING_PAYIN = new Set([
   'provider_disabled',
   'paid',
   'capture_pending',
+  'pay_invoice_unknown',
   'manual_review',
   'claimed_by_other_channel',
 ])

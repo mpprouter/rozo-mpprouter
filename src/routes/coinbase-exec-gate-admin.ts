@@ -7,7 +7,9 @@
 //
 //   (a) the holder's own record is parked for a human:
 //       - webhook holder: KV fulfillment record status is `manual_review` or
-//         `failed_pay_invoice` (never paying / capture_pending / paid / payin_seen);
+//         `failed_pay_invoice` (never paying / capture_pending /
+//         pay_invoice_unknown / paid / payin_seen: an unknown outcome is only
+//         clearable after the sweep has moved it to manual_review);
 //       - coupon holder (`coupon:<code>:<attemptId>`): the coupon record is in
 //         `manual_review` for this same attempt and link;
 //   (b) Coinbase returns an explicitly recognized NOT-settled state

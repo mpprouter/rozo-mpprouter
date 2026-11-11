@@ -6,7 +6,8 @@
 // and anything that would need a second payment goes to a human.
 //
 // Per record (≤ SWEEP_MAX_RECORDS acted on per run):
-//   1. capture_pending, or paying for > 10 min (payingAt): read Coinbase.
+//   1. capture_pending or pay_invoice_unknown (pay request sent, outcome not
+//      known), or paying for > 10 min (payingAt): read Coinbase.
 //      settled → paid. failed/expired, or still pending > 30 min after
 //      payingAt → manual_review + one alert. Query failure → no state change;
 //      one alert only if queries keep failing for > 30 min.
@@ -96,7 +97,7 @@ function payingSinceMs(rec: FulfillmentRecord): number | null {
 }
 
 function classify(env: Env, rec: FulfillmentRecord, now: number): Action | null {
-  if (rec.status === 'capture_pending') return 'confirm'
+  if (rec.status === 'capture_pending' || rec.status === 'pay_invoice_unknown') return 'confirm'
   if (rec.status === 'paying') {
     const since = payingSinceMs(rec)
     return since !== null && now - since > PAYING_STALE_MS ? 'confirm' : null
