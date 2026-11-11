@@ -92,7 +92,11 @@ export function bitrefillPricingFromOrder(
   const feeRaw = source.partnerFee
   if (typeof feeRaw !== 'string' || !/^\d+(?:\.\d{1,6})?$/.test(feeRaw)) return null
   const feeAtomic = parseUsdcAtomic(feeRaw)
-  if (feeAtomic > maxBitrefillFeeAtomic(originalAtomic, bps)) return null
+  const maxFee = maxBitrefillFeeAtomic(originalAtomic, bps)
+  // payment-api's float epsilon can land one 4 dp step (100 atomic) below the
+  // exact round-up, never more; anything lower is not this rate's fee.
+  const minFee = maxFee > 100n ? maxFee - 100n : 0n
+  if (feeAtomic > maxFee || feeAtomic < minFee) return null
   return {
     original: formatUsdcAtomic(originalAtomic),
     serviceFee: formatUsdcAtomic(feeAtomic),
@@ -294,7 +298,14 @@ export async function handleBitrefillCreateInvoice(
     // offered for resume.
     const rowAmount = typeof row?.destination?.amount === 'string' && AMOUNT_RE.test(row.destination.amount) ? row.destination.amount : amount
     const pricing = bitrefillPricingFromOrder(row?.source, rowAmount)
-    if (!pricing) {
+    // Orders created by this version carry metadata.serviceFeeBps. Those must
+    // carry exactly that fee, so a create refused with FEE_MISMATCH cannot be
+    // resumed through a retry. Only orders without the marker (created before
+    // the fee existed) may resume with their frozen zero fee.
+    const markedBps = row?.metadata?.serviceFeeBps
+    const markedOk = markedBps === undefined || markedBps === null ||
+      (pricing && !pricing.legacy && pricing.feeBps === markedBps && pricing.serviceFee !== '0')
+    if (!pricing || !markedOk) {
       return fail(502, 'FEE_MISMATCH', 'The existing payment for this Bitrefill invoice has unexpected fee data. Do not pay it; create a new Bitrefill invoice.', {
         invoiceId,
         rozoPaymentId: row.id,
@@ -354,6 +365,8 @@ export async function handleBitrefillCreateInvoice(
       provider: 'bitrefill',
       bitrefillInvoiceId: invoiceId,
       bitrefillExpiresAt: expiresAtIso,
+      // Marks this order as created with the service fee (see duplicate()).
+      serviceFeeBps: BITREFILL_FEE_BPS,
       ...(client ? { client } : {}),
     },
   }

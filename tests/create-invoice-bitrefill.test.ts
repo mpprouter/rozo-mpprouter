@@ -400,6 +400,31 @@ describe('create-invoice provider=bitrefill', () => {
       expect(r.json.source).toBeUndefined()
     })
 
+    it('a create refused with FEE_MISMATCH cannot be resumed by retrying', async () => {
+      upstreamSourceOverride = { partnerFeeBps: 50 }
+      const first = await post(body({}, { amount: '204' }))
+      expect(first.json.error).toBe('FEE_MISMATCH')
+      expect(createdIntent.metadata.serviceFeeBps).toBe(100)
+      for (const src of [
+        { partnerFee: '1.0200', partnerFeeBps: 50 },
+        { partnerFee: '0.0000', partnerFeeBps: 100 },
+        {},
+      ]) {
+        existingOrder = { id: 'rozo-pay-bitrefill', destination: { amount: '204' }, source: src, metadata: { serviceFeeBps: 100 } }
+        const retry = await post(body({}, { amount: '204' }))
+        expect(retry.status).toBe(502)
+        expect(retry.json.error).toBe('FEE_MISMATCH')
+        expect(retry.json.source).toBeUndefined()
+      }
+    })
+
+    it('a fee below what 1% produces is refused', async () => {
+      upstreamSourceOverride = { partnerFee: '2.0300' }
+      const { status, json } = await post(body({}, { amount: '204' }))
+      expect(status).toBe(502)
+      expect(json.error).toBe('FEE_MISMATCH')
+    })
+
     it('maxBitrefillFeeAtomic / bitrefillPricingFromOrder arithmetic', () => {
       expect(maxBitrefillFeeAtomic(204_000_000n, 100)).toBe(2_040_000n)
       expect(maxBitrefillFeeAtomic(204_370_000n, 100)).toBe(2_043_700n)
@@ -410,6 +435,7 @@ describe('create-invoice provider=bitrefill', () => {
       expect(bitrefillPricingFromOrder({ partnerFee: '0.0100', partnerFeeBps: 100 }, '1.000001')?.serviceFee).toBe('0.01')
       expect(bitrefillPricingFromOrder({ partnerFee: '0.0102', partnerFeeBps: 100 }, '1.000001')).toBeNull()
       expect(bitrefillPricingFromOrder({ partnerFee: '-1', partnerFeeBps: 100 }, '1')).toBeNull()
+      expect(bitrefillPricingFromOrder({ partnerFee: '0.0099', partnerFeeBps: 100 }, '1.000001')).toBeNull()
     })
   })
 
