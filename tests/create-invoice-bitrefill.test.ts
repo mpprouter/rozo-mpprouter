@@ -171,6 +171,8 @@ describe('create-invoice provider=bitrefill', () => {
     [{ amount: '1.1234567' }, 'INVALID_AMOUNT'],
     [{ amount: 5 }, 'INVALID_AMOUNT'],
     [{ amount: String(BITREFILL_MAX_USDC + 0.01) }, 'AMOUNT_OUT_OF_RANGE'],
+    [{ amount: '1050.000001' }, 'AMOUNT_OUT_OF_RANGE'],
+    [{ amount: '1051' }, 'AMOUNT_OUT_OF_RANGE'],
     [{ address: '0x8fe7155119d2975780c9e19b07dd98393965bc2a' }, 'BLOCKED_ADDRESS'],
     [{ address: '0xFD0E6FA2ABA8436E95F3FB3523AC14BA299C0E79' }, 'BLOCKED_ADDRESS'],
     [{ expiresAt: inMinutes(1) }, 'INVOICE_EXPIRING'],
@@ -185,6 +187,18 @@ describe('create-invoice provider=bitrefill', () => {
     expect(status).toBe(400)
     expect(json).toMatchObject({ ok: false, error: code })
     expect(posts).toBe(0)
+  })
+
+  it('caps the invoice amount at 1050 USDC (founder 2026-11-11)', async () => {
+    expect(BITREFILL_MAX_USDC).toBe(1050)
+    const atCap = await post(body({}, { amount: '1050' }))
+    expect(atCap.status).toBe(200)
+    expect(createdIntent.destination.amount).toBe('1050')
+    expect(createdIntent.type).toBe('exactOut')
+    const over = await post(body({}, { amount: '1050.000001' }))
+    expect(over.status).toBe(400)
+    expect(over.json.error).toBe('AMOUNT_OUT_OF_RANGE')
+    expect(over.json.message).toContain('1050')
   })
 
   it('accepts a mixed-case (checksum-insensitive) address and the max amount', async () => {

@@ -31,8 +31,16 @@ export const BITREFILL_APP_ID = 'wallet_bitrefillpay'
 const BASE_CHAIN_ID = '8453'
 const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 
-/** Max USDC a single Bitrefill invoice may route through us. */
-export const BITREFILL_MAX_USDC = 200
+/**
+ * Max USDC a single Bitrefill invoice may route through us (founder
+ * 2026-11-11: "上限 1050", was 200). Compared against `bitrefill.amount`, the
+ * invoice amount Bitrefill receives on Base, NOT the larger amount the payer
+ * sends (that adds the bridge fee). Bitrefill prices a card above its face
+ * value (a 200 card is a 204 invoice), so 1050 covers cards up to the ~1,000
+ * USD tier. Native sources are still bounded separately by NATIVE_MAX_USD,
+ * and payment-api applies its own pay-in and liquidity caps upstream.
+ */
+export const BITREFILL_MAX_USDC = 1050
 /** Minimum time left on the Bitrefill invoice before we open a deposit. */
 export const BITREFILL_MIN_REMAINING_MS = 5 * 60 * 1000
 /**
@@ -161,7 +169,7 @@ export async function handleBitrefillCreateInvoice(
     return fail(400, 'INVALID_AMOUNT', 'bitrefill.amount must be a positive decimal string with at most 6 decimals.')
   }
   if (Number(amount) > BITREFILL_MAX_USDC) {
-    return fail(400, 'AMOUNT_OUT_OF_RANGE', `bitrefill.amount must be at most ${BITREFILL_MAX_USDC} USDC.`)
+    return fail(400, 'AMOUNT_OUT_OF_RANGE', `bitrefill.amount (the invoice amount) must be at most ${BITREFILL_MAX_USDC} USDC.`)
   }
   // expiresAt is required. Rozo's deposit TTL is fixed at ~1h by payment-api
   // and cannot be shortened by the caller, so the deposit can stay payable
