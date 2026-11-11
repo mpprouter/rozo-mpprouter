@@ -479,22 +479,32 @@ interface BitrefillLedger {
   holds: Record<string, string>
 }
 
+/**
+ * Fail closed: only an absent key is zero; a legacy plain integer keeps its
+ * total with no holds. A present value that does not parse, or parses to the
+ * wrong shape (t not a digit string, h not a plain object of digit strings),
+ * THROWS, so reserve/release/read surface as "ledger unavailable" (the settle
+ * path defers) instead of silently resetting the day to zero.
+ */
 export function parseBitrefillLedger(raw: string | null): BitrefillLedger {
-  if (!raw) return { total: 0n, holds: {} }
+  if (raw === null || raw === undefined) return { total: 0n, holds: {} }
   if (/^\d+$/.test(raw)) return { total: BigInt(raw), holds: {} }
+  let j: unknown
   try {
-    const j = JSON.parse(raw) as { t?: unknown; h?: unknown }
-    const total = typeof j.t === 'string' && /^\d+$/.test(j.t) ? BigInt(j.t) : 0n
-    const holds: Record<string, string> = {}
-    if (j.h && typeof j.h === 'object') {
-      for (const [k, v] of Object.entries(j.h as Record<string, unknown>)) {
-        if (typeof v === 'string' && /^\d+$/.test(v)) holds[k] = v
-      }
-    }
-    return { total, holds }
+    j = JSON.parse(raw)
   } catch {
-    return { total: 0n, holds: {} }
+    throw new Error('bitrefill daily ledger value is not parseable')
   }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('bitrefill daily ledger value is not an object')
+  const { t, h } = j as { t?: unknown; h?: unknown }
+  if (typeof t !== 'string' || !/^\d+$/.test(t)) throw new Error('bitrefill daily ledger total is invalid')
+  if (!h || typeof h !== 'object' || Array.isArray(h)) throw new Error('bitrefill daily ledger holds are invalid')
+  const holds: Record<string, string> = {}
+  for (const [k, v] of Object.entries(h as Record<string, unknown>)) {
+    if (typeof v !== 'string' || !/^\d+$/.test(v)) throw new Error('bitrefill daily ledger hold is invalid')
+    holds[k] = v
+  }
+  return { total: BigInt(t), holds }
 }
 
 function serializeBitrefillLedger(l: BitrefillLedger): string {

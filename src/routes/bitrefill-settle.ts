@@ -222,8 +222,9 @@ export type BitrefillPayVerdict =
   | 'expired'
   | 'presign_transient'
   | 'unknown'
-  // 409 NONCE_USED_WITHOUT_PAY_LOG: the nonce is consumed on chain but
-  // pay-invoice holds no matching pay log row. Humans check the chain.
+  // 409 NONCE_USED_WITHOUT_PAY_LOG (nonce consumed, no matching pay log row)
+  // or 409 NONCE_USED_TRANSFER_NOT_PROVEN (nonce consumed, transfer not
+  // proven). Humans check the chain; gate and ledger kept.
   | 'nonce_used_unlogged'
 
 /** Map a pay-invoice answer onto the contract table. Anything unproven is unknown. */
@@ -250,7 +251,11 @@ export function classifyBitrefillPayResult(r: BitrefillPayResult): BitrefillPayV
     // Treated like an unknown outcome (gate and ledger kept, sweep resolves by
     // nonce after validBefore / the invoice expiry).
     if (r.status === 409 && b.code === 'PAY_IN_FLIGHT') return 'unknown'
-    if (r.status === 409 && b.code === 'NONCE_USED_WITHOUT_PAY_LOG') return 'nonce_used_unlogged'
+    if (r.status === 409 && (b.code === 'NONCE_USED_WITHOUT_PAY_LOG' || b.code === 'NONCE_USED_TRANSFER_NOT_PROVEN')) return 'nonce_used_unlogged'
+    // The signer could not prove the transfer from the chain right now: the
+    // authorization may have executed. Unknown (gate and ledger kept, no
+    // immediate retry); the sweep resolves it under the round 3 rule.
+    if (r.status === 503 && b.code === 'TRANSFER_PROOF_UNAVAILABLE') return 'unknown'
     // 422 PAYOUT_NOT_PROVEN_ON_CHAIN and every other provider-tagged 4xx
     // (signed:false) is a definite refusal.
     if (r.status >= 400 && r.status < 500 && r.status !== 408) return 'refused'
@@ -553,7 +558,9 @@ export async function settleBitrefillFunderEvent(
   } else if (verdict === 'nonce_used_unlogged') {
     // Gate and ledger kept: the authorization slot is consumed on chain.
     rec.status = 'manual_review'
-    rec.failureReason = 'pay-invoice: nonce already used on chain but no matching pay log row (NONCE_USED_WITHOUT_PAY_LOG)'
+    rec.failureReason = result.body?.code === 'NONCE_USED_TRANSFER_NOT_PROVEN'
+      ? 'pay-invoice: nonce consumed on chain, transfer not proven (NONCE_USED_TRANSFER_NOT_PROVEN)'
+      : 'pay-invoice: nonce already used on chain but no matching pay log row (NONCE_USED_WITHOUT_PAY_LOG)'
     rec.alertedManualReview = true
     rec.events.push({ kind: 'bitrefill_nonce_used_without_pay_log', at: nowIso(), detail })
   } else if (verdict === 'refused' || verdict === 'presign_transient') {
@@ -573,7 +580,9 @@ export async function settleBitrefillFunderEvent(
       verdict === 'unknown'
         ? '[MPP Router] 🚨 Bitrefill payment UNKNOWN: sent, outcome not known'
         : verdict === 'nonce_used_unlogged'
-          ? '[MPP Router] 🚨 Bitrefill invoice needs a human: nonce used on chain without a pay log row'
+          ? result.body?.code === 'NONCE_USED_TRANSFER_NOT_PROVEN'
+            ? '[MPP Router] 🚨 Bitrefill invoice needs a human: nonce consumed, transfer not proven'
+            : '[MPP Router] 🚨 Bitrefill invoice needs a human: nonce used on chain without a pay log row'
           : '[MPP Router] 🚨 Bitrefill invoice NOT paid',
       `Invoice: ${plId} (${fmt(facts.amountAtomic)} USDC)`,
       `Reason: ${rec.failureReason}`,
@@ -582,7 +591,7 @@ export async function settleBitrefillFunderEvent(
         : verdict === 'expired'
           ? 'Nothing was sent. The funder holds the money; refund the payer by hand.'
           : verdict === 'nonce_used_unlogged'
-            ? 'The authorization for this invoice was consumed on chain. Check the chain by hand (who executed it, to which address, how much) before any re-pay or refund. Do not re-pay.'
+            ? 'The authorization for this invoice was consumed on chain. Check the chain by hand (who executed it, to which address, how much). Do not re-pay with the same nonce, do not refund until checked.'
             : `Nothing was signed. ${MANUAL_REPAY_TEXT}`,
     ])
   } else {
@@ -626,33 +635,46 @@ async function reportDelivered(env: Env, plId: string, rec: FulfillmentRecord, n
 
 // ── Chain read: USDC.authorizationState(funder, nonce) ─────────────────────
 //
-// Evidence rules (fix batch round 2). An RPC error, timeout, malformed answer
+// Evidence rules (fix batch round 3). An RPC error, timeout, malformed answer
 // or HTTP error is never evidence either way.
-//   used   (-> paid)          : at least 2 distinct hosts read the nonce used
-//                               AND no host read it unused in the same round,
-//                               PLUS transfer proof when it can be obtained
-//                               (readBitrefillTransferProof).
-//   unused (-> manual_review) : at least 2 distinct hosts read it unused AND no
-//                               host read it used, past the deadline + grace.
-//   anything else (mixed, fewer than 2 answers): no state change this round.
-// The signer's own 200 paid / already_paid answer stays sufficient (the signer
-// proves the transfer from the receipt and the nonce before answering paid).
+//   nonce quorum : "used" = at least 2 distinct hosts read authorizationState
+//                  true and none false; "unused" the mirror image; anything
+//                  else is no decision this round.
+//   paid         : nonce quorum used AND a transfer proof BOUND TO THIS
+//                  AUTHORIZATION confirmed by at least 2 distinct hosts (one
+//                  successful transaction whose receipt holds, both from the
+//                  USDC contract and not removed, AuthorizationUsed(funder,
+//                  nonce) and Transfer(funder -> frozen address, exact frozen
+//                  amount)); see readBitrefillTransferProof. There is no
+//                  "paid on the nonce quorum alone" path.
+//   manual_review: nonce quorum unused past deadline + grace; or used with the
+//                  proof disproven (stop re-checking); or used with the proof
+//                  unavailable past deadline + grace (keep re-checking).
+// Host distinctness is by hostname only: it does not prove independent
+// operators or independent chain data. BASE_RPC_URL should be a provider we
+// pay for; the public fallbacks are best effort.
+// The signer's own 200 paid / already_paid answer stays sufficient at settle
+// (the signer proves the transfer from the receipt and the nonce first).
 
 const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 // keccak256("authorizationState(address,bytes32)")[0:4]
 export const AUTHORIZATION_STATE_SELECTOR = '0xe94a0102'
 // keccak256("Transfer(address,address,uint256)")
 export const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-/** Same threshold for both directions. */
+// keccak256("AuthorizationUsed(address,bytes32)"), pinned by a viem test.
+export const AUTHORIZATION_USED_TOPIC = '0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5'
+/** Same threshold for the nonce quorum (both directions) and the transfer proof. */
 export const BITREFILL_CHAIN_QUORUM = 2
 /** Base produces a block every 2 s. */
 const BASE_BLOCK_MS = 2_000
-/** Extra blocks before payingAt in the log window (clock skew). */
-const LOG_WINDOW_MARGIN_BLOCKS = 150
+/** The log window starts this long before payingAt (signing happens after payingAt). */
+const LOG_WINDOW_LEAD_MS = 10 * 60 * 1000
+/** Further safety margin in blocks below that lower bound. */
+const LOG_WINDOW_MARGIN_BLOCKS = 600
 /**
  * Widest eth_getLogs window we ask for (~5 h of Base blocks). Public RPC log
- * range limits are unverified; an older record or a refused range falls back
- * to the nonce quorum, recorded in the event detail.
+ * range limits are unverified. A wider window is "proof unavailable" (never
+ * paid); a recorded transaction hash needs no window.
  */
 export const BITREFILL_LOG_MAX_BLOCKS = 9_000
 
@@ -730,10 +752,25 @@ export async function readAuthorizationUsed(env: Env, funder: string, nonce: str
 
 const pad32 = (addr: string) => '0x' + addr.toLowerCase().replace(/^0x/, '').padStart(64, '0')
 
-/** A Base USDC Transfer log funder -> `to` for exactly `amount`. */
+function isUsdcLog(log: any): boolean {
+  return !!log && typeof log === 'object' && log.removed !== true && String(log.address ?? '').toLowerCase() === BASE_USDC.toLowerCase()
+}
+
+/** AuthorizationUsed(authorizer = funder, nonce) from the USDC contract. */
+function isAuthorizationUsedLog(log: any, funder: string, nonce: string): boolean {
+  if (!isUsdcLog(log)) return false
+  const t = log.topics
+  return (
+    Array.isArray(t) && t.length === 3 &&
+    String(t[0]).toLowerCase() === AUTHORIZATION_USED_TOPIC &&
+    String(t[1]).toLowerCase() === pad32(funder) &&
+    String(t[2]).toLowerCase() === pad32(nonce)
+  )
+}
+
+/** Transfer(funder -> `to`, exactly `amount`) from the USDC contract. */
 function isExactTransferLog(log: any, funder: string, to: string, amount: bigint): boolean {
-  if (!log || typeof log !== 'object' || log.removed === true) return false
-  if (String(log.address ?? '').toLowerCase() !== BASE_USDC.toLowerCase()) return false
+  if (!isUsdcLog(log)) return false
   const t = log.topics
   if (!Array.isArray(t) || t.length !== 3) return false
   if (String(t[0]).toLowerCase() !== ERC20_TRANSFER_TOPIC) return false
@@ -744,94 +781,91 @@ function isExactTransferLog(log: any, funder: string, to: string, amount: bigint
 
 export type TransferProof = {
   /**
-   * proven     : one host returned a receipt (of the recorded tx) or a log with
-   *              the exact transfer.
-   * disproven  : two distinct hosts answered eth_getLogs over a window that
-   *              covers the whole payment period with no exact transfer.
-   * unavailable: no tx hash or its receipt shows no exact transfer, and logs
-   *              were unsupported, refused, or the window is too old.
-   * retry      : a tx hash is recorded but no host could be read for it.
+   * proven     : at least 2 distinct hosts show the SAME successful transaction
+   *              whose receipt holds AuthorizationUsed(funder, nonce) AND the
+   *              exact Transfer funder -> frozen address, and no host shows the
+   *              authorization's transaction without that Transfer.
+   * disproven  : at least 2 distinct hosts show the SAME successful transaction
+   *              with AuthorizationUsed(funder, nonce) and NO matching Transfer,
+   *              and no host proves it.
+   * unavailable: anything else (logs refused or empty, receipt unreadable, fewer
+   *              than 2 hosts, hosts disagree, window over the cap). Never paid.
    */
-  result: 'proven' | 'disproven' | 'unavailable' | 'retry'
-  via?: 'receipt' | 'logs'
+  result: 'proven' | 'disproven' | 'unavailable'
+  transaction?: string
   notes: string[]
 }
 
+type HostProof = { host: string; verdict: 'proven' | 'disproven' | 'unavailable'; tx?: string; note?: string }
+
 /**
- * Look for the actual Base USDC Transfer funder -> frozen address of exactly
- * the frozen invoice amount. Receipt first (when the signer returned a tx
- * hash), then a bounded eth_getLogs over [payingAt - margin, latest].
+ * Look, on each host independently, for the transaction that consumed this
+ * invoice's authorization: the recorded transaction hash if any, else
+ * eth_getLogs [AuthorizationUsed, funder, nonce] over a bounded window. Then
+ * check that transaction's receipt on the same host. A same-address,
+ * same-amount Transfer in a different transaction is not proof.
  */
-export async function readBitrefillTransferProof(env: Env, rec: FulfillmentRecord, now: number): Promise<TransferProof> {
-  const notes: string[] = []
+export async function readBitrefillTransferProof(env: Env, rec: FulfillmentRecord, now: number, nonce: string): Promise<TransferProof> {
   const b = rec.bitrefill
   const amount = b && /^\d+$/.test(b.amountAtomic ?? '') ? BigInt(b.amountAtomic) : null
   if (!b || amount === null || !/^0x[0-9a-fA-F]{40}$/.test(b.address ?? '')) {
     return { result: 'unavailable', notes: ['no frozen address/amount on the record'] }
   }
-  const endpoints = rpcEndpoints(env)
-  const tx = typeof b.transaction === 'string' && /^0x[0-9a-fA-F]{64}$/.test(b.transaction) ? b.transaction : null
-  if (tx) {
-    let answered = 0
-    for (const { url } of endpoints) {
-      const r = await rpcCall(url, 'eth_getTransactionReceipt', [tx])
-      if (!r.ok) continue
-      answered++
-      if (r.result === null) continue // not found on this host
-      const receipt = r.result as any
-      if (receipt && typeof receipt === 'object' && Array.isArray(receipt.logs)) {
-        if (receipt.status === '0x1' && receipt.logs.some((l: any) => isExactTransferLog(l, FUNDER_WALLET, b.address, amount))) {
-          return { result: 'proven', via: 'receipt', notes }
-        }
-        notes.push(`recorded tx receipt (status ${String(receipt.status)}) has no exact transfer`)
-        break
-      }
-    }
-    if (answered === 0) return { result: 'retry', notes: ['recorded tx receipt unreadable on every host'] }
-    if (!notes.length) notes.push('recorded tx not found on any answering host')
-  } else {
-    notes.push('no tx hash recorded')
-  }
+  const recorded = typeof b.transaction === 'string' && /^0x[0-9a-fA-F]{64}$/.test(b.transaction) ? b.transaction.toLowerCase() : null
   const startMs = msOf(rec.payingAt ?? null)
-  if (startMs === null) return { result: 'unavailable', notes: [...notes, 'no payingAt: log window unknown'] }
-  const span = Math.ceil(Math.max(0, now - startMs) / BASE_BLOCK_MS) + LOG_WINDOW_MARGIN_BLOCKS
-  if (span > BITREFILL_LOG_MAX_BLOCKS) {
-    return { result: 'unavailable', notes: [...notes, `log window ${span} blocks exceeds ${BITREFILL_LOG_MAX_BLOCKS}: nonce quorum only`] }
+  const span = startMs === null ? null : Math.ceil(Math.max(0, now - (startMs - LOG_WINDOW_LEAD_MS)) / BASE_BLOCK_MS) + LOG_WINDOW_MARGIN_BLOCKS
+
+  const checkReceipt = async (url: string, tx: string): Promise<HostProof['verdict'] | 'no_auth'> => {
+    const r = await rpcCall(url, 'eth_getTransactionReceipt', [tx])
+    if (!r.ok || !r.result || typeof r.result !== 'object') return 'unavailable'
+    const receipt = r.result as any
+    if (receipt.status !== '0x1' || !Array.isArray(receipt.logs)) return 'no_auth'
+    if (!receipt.logs.some((l: any) => isAuthorizationUsedLog(l, FUNDER_WALLET, nonce))) return 'no_auth'
+    return receipt.logs.some((l: any) => isExactTransferLog(l, FUNDER_WALLET, b.address, amount)) ? 'proven' : 'disproven'
   }
-  let emptyHosts = 0
-  let refused = 0
-  for (const { url } of endpoints) {
-    const head = await rpcCall(url, 'eth_blockNumber', [])
-    if (!head.ok || typeof head.result !== 'string' || !/^0x[0-9a-fA-F]+$/.test(head.result)) {
-      refused++
-      continue
-    }
-    const latest = BigInt(head.result)
-    const from = latest > BigInt(span) ? latest - BigInt(span) : 0n
-    const logs = await rpcCall(url, 'eth_getLogs', [
-      {
-        address: BASE_USDC,
-        topics: [ERC20_TRANSFER_TOPIC, pad32(FUNDER_WALLET), pad32(b.address)],
-        fromBlock: '0x' + from.toString(16),
-        toBlock: '0x' + latest.toString(16),
-      },
-    ])
-    if (!logs.ok || !Array.isArray(logs.result)) {
-      refused++
-      continue
-    }
-    if (logs.result.some((l: any) => isExactTransferLog(l, FUNDER_WALLET, b.address, amount))) {
-      return { result: 'proven', via: 'logs', notes }
-    }
-    emptyHosts++
-    if (emptyHosts >= BITREFILL_CHAIN_QUORUM) {
-      return { result: 'disproven', via: 'logs', notes: [...notes, `${emptyHosts} hosts: no exact transfer in the last ${span} blocks`] }
-    }
+
+  const perHost = await Promise.all(
+    rpcEndpoints(env).map(async ({ host, url }): Promise<HostProof> => {
+      if (recorded) {
+        const v = await checkReceipt(url, recorded)
+        if (v === 'proven' || v === 'disproven') return { host, verdict: v, tx: recorded }
+        // Recorded tx unreadable here or did not consume this authorization:
+        // look the authorization up by its log instead.
+      }
+      if (span === null) return { host, verdict: 'unavailable', note: 'no payingAt: log window unknown' }
+      if (span > BITREFILL_LOG_MAX_BLOCKS) return { host, verdict: 'unavailable', note: `log window ${span} blocks over the ${BITREFILL_LOG_MAX_BLOCKS} cap` }
+      const head = await rpcCall(url, 'eth_blockNumber', [])
+      if (!head.ok || typeof head.result !== 'string' || !/^0x[0-9a-fA-F]+$/.test(head.result)) return { host, verdict: 'unavailable', note: 'block number unreadable' }
+      const latest = BigInt(head.result)
+      const from = latest > BigInt(span) ? latest - BigInt(span) : 0n
+      const logs = await rpcCall(url, 'eth_getLogs', [
+        {
+          address: BASE_USDC,
+          topics: [AUTHORIZATION_USED_TOPIC, pad32(FUNDER_WALLET), pad32(nonce)],
+          fromBlock: '0x' + from.toString(16),
+          toBlock: '0x' + latest.toString(16),
+        },
+      ])
+      if (!logs.ok || !Array.isArray(logs.result)) return { host, verdict: 'unavailable', note: 'eth_getLogs refused or unsupported' }
+      const hit = logs.result.find((l: any) => isAuthorizationUsedLog(l, FUNDER_WALLET, nonce) && typeof l.transactionHash === 'string' && /^0x[0-9a-fA-F]{64}$/.test(l.transactionHash))
+      // Empty logs are never "disproven".
+      if (!hit) return { host, verdict: 'unavailable', note: 'no AuthorizationUsed log in the window' }
+      const tx = String(hit.transactionHash).toLowerCase()
+      const v = await checkReceipt(url, tx)
+      if (v === 'proven' || v === 'disproven') return { host, verdict: v, tx }
+      return { host, verdict: 'unavailable', tx, note: 'receipt of the AuthorizationUsed transaction unreadable' }
+    }),
+  )
+
+  const notes = perHost.map((h) => `${h.host}:${h.verdict}${h.tx ? '@' + h.tx.slice(0, 10) : ''}${h.note ? ' (' + h.note + ')' : ''}`)
+  const decided = perHost.filter((h) => h.verdict !== 'unavailable')
+  const txs = new Set(decided.map((h) => h.tx))
+  const verdicts = new Set(decided.map((h) => h.verdict))
+  // Hosts must agree on both the transaction and the verdict.
+  if (decided.length >= BITREFILL_CHAIN_QUORUM && txs.size === 1 && verdicts.size === 1) {
+    return { result: decided[0].verdict as 'proven' | 'disproven', transaction: decided[0].tx, notes }
   }
-  return {
-    result: 'unavailable',
-    notes: [...notes, `eth_getLogs: ${emptyHosts} host(s) without a match, ${refused} unsupported or failed: nonce quorum only`],
-  }
+  return { result: 'unavailable', notes }
 }
 
 // ── Cron sweep ──────────────────────────────────────────────────────────────
@@ -924,12 +958,13 @@ export async function resolveBitrefillUnknown(env: Env, plId: string, rec: Fulfi
   const used = read.used
   const nowIso = new Date(now).toISOString()
   if (used === null) return
+  const deadline = authorizationDeadlineMs(rec)
+  const pastDeadline = deadline !== null && now > deadline + BITREFILL_UNKNOWN_GRACE_MS
   if (used) {
-    await applyChainUsed(env, plId, rec, now, read, false)
+    await applyChainUsed(env, plId, rec, now, read, nonce, false, pastDeadline)
     return
   }
-  const deadline = authorizationDeadlineMs(rec)
-  if (deadline === null || now <= deadline + BITREFILL_UNKNOWN_GRACE_MS) return
+  if (!pastDeadline || deadline === null) return
   const from = rec.status
   rec.status = 'manual_review'
   rec.failureReason = 'authorization expired unused: nothing was paid to Bitrefill'
@@ -955,14 +990,13 @@ export async function resolveBitrefillUnknown(env: Env, plId: string, rec: Fulfi
 }
 
 /**
- * The nonce quorum reads used (2+ hosts used, none unused). Look for the
- * transfer itself:
- *   proven      -> paid (event detail names the proof)
- *   unavailable -> paid on the nonce quorum alone (detail says why no proof)
- *   retry       -> no change this round (tx hash recorded, receipt unreadable)
- *   disproven   -> manual_review: the authorization slot is consumed but two
- *                  hosts show no matching transfer in the payment window.
- * fromManualReview: the late-execution re-check (loud alert on paid).
+ * The nonce quorum reads used (2+ hosts used, none unused). Require the
+ * authorization-bound transfer proof from 2+ hosts (readBitrefillTransferProof):
+ *   proven      -> paid, delivered report (loud alert when coming from manual_review)
+ *   disproven   -> manual_review, loud alert, stop re-checking
+ *   unavailable -> never paid. Before deadline + grace: no change. After it
+ *                  (unknown records only): manual_review, keep re-checking,
+ *                  alert once. Already in manual_review: no change.
  */
 async function applyChainUsed(
   env: Env,
@@ -970,56 +1004,76 @@ async function applyChainUsed(
   rec: FulfillmentRecord,
   now: number,
   read: AuthorizationQuorumRead,
+  nonce: string,
   fromManualReview: boolean,
+  pastDeadline: boolean,
 ): Promise<void> {
-  const proof = await readBitrefillTransferProof(env, rec, now)
-  if (proof.result === 'retry') return
+  const proof = await readBitrefillTransferProof(env, rec, now, nonce)
   const nowIso = new Date(now).toISOString()
   const from = rec.status
   const usedReads = read.answers.filter((a) => a.used === true).map((a) => a.endpoint)
-  const detail = { from, usedReads, proof: proof.result, via: proof.via ?? null, notes: proof.notes }
+  const detail = { from, usedReads, proof: proof.result, transaction: proof.transaction ?? null, notes: proof.notes }
+  if (proof.result === 'unavailable') {
+    if (fromManualReview || !pastDeadline) return
+    rec.status = 'manual_review'
+    rec.failureReason = 'nonce reads used on chain but the transfer could not be proven automatically'
+    rec.bitrefillUnknownOrigin = true // keep trying to obtain the proof
+    const alert = !rec.alertedManualReview
+    rec.alertedManualReview = true
+    rec.events.push({ kind: 'sweep_bitrefill_nonce_used_unproven', at: nowIso, detail })
+    await saveRecordGuarded(env, plId, rec)
+    if (alert) {
+      await sendBitrefillAlert(env, [
+        '[MPP Router] 🚨 Bitrefill invoice needs a human: nonce is used, transfer could not be proven automatically',
+        `Invoice: ${plId} (${fmt(rec.invoiceAmountAtomic)} USDC), was ${from}`,
+        'Check the chain by hand. Do NOT refund, do NOT re-pay. The sweep keeps trying to prove the transfer and marks it paid if it can.',
+      ])
+    }
+    return
+  }
   if (proof.result === 'disproven') {
     rec.status = 'manual_review'
-    rec.failureReason = 'nonce reads used on chain but no exact Base USDC transfer to the invoice address was found'
-    rec.bitrefillUnknownOrigin = false // stop the late-execution re-check
+    rec.failureReason = 'nonce consumed by a transaction that did not pay this invoice (no matching Transfer in the AuthorizationUsed transaction)'
+    rec.bitrefillUnknownOrigin = false // stop re-checking
     rec.alertedManualReview = true
     rec.events.push({ kind: 'sweep_bitrefill_nonce_used_no_transfer', at: nowIso, detail })
     await saveRecordGuarded(env, plId, rec)
     await sendBitrefillAlert(env, [
-      '[MPP Router] 🚨 Bitrefill invoice needs a human: nonce used on chain, no matching transfer found',
-      `Invoice: ${plId} (${fmt(rec.invoiceAmountAtomic)} USDC), was ${from}`,
-      'Two RPC sources read the authorization nonce used, but two RPC sources show no Base USDC Transfer from the funder to the invoice address for the invoice amount in the payment window. Check the chain by hand (who executed the authorization, to which address, how much). Do not re-pay and do not refund until checked.',
+      '[MPP Router] 🚨🚨 Bitrefill invoice needs a human: nonce consumed by something that did not pay this invoice',
+      `Invoice: ${plId} (${fmt(rec.invoiceAmountAtomic)} USDC), was ${from}, transaction ${proof.transaction ?? '?'}`,
+      'Two RPC sources show the AuthorizationUsed transaction for this nonce without a Base USDC Transfer from the funder to the invoice address for the invoice amount. Check the chain by hand. Do not re-pay, do not refund until checked.',
     ])
     return
   }
   rec.status = 'paid'
   rec.paidAt = rec.paidAt ?? nowIso
+  if (rec.bitrefill && proof.transaction) rec.bitrefill.transaction = proof.transaction
   rec.events.push({ kind: fromManualReview ? 'sweep_bitrefill_late_execution' : 'sweep_bitrefill_authorization_used', at: nowIso, detail })
   const saved = await saveRecordGuarded(env, plId, rec)
   if (fromManualReview) {
     await sendBitrefillAlert(env, [
       '[MPP Router] 🚨🚨 Bitrefill invoice was manual_review, chain now shows paid',
-      `Invoice: ${plId} (${fmt(rec.invoiceAmountAtomic)} USDC), Rozo payment ${(rec.rozoPaymentId ?? '?').slice(0, 8)}`,
-      `authorizationState(funder, nonce) now reads used on ${usedReads.length} RPC sources (transfer proof: ${proof.result}${proof.via ? ' via ' + proof.via : ''}): the funder paid Bitrefill after the record went to manual review. If a refund was already sent to the payer, recover it.`,
+      `Invoice: ${plId} (${fmt(rec.invoiceAmountAtomic)} USDC), Rozo payment ${(rec.rozoPaymentId ?? '?').slice(0, 8)}, transaction ${proof.transaction ?? '?'}`,
+      `Two RPC sources show the authorization for this nonce executed with the exact transfer to the invoice address: the funder paid Bitrefill after the record went to manual review. If a refund was already sent to the payer, recover it.`,
     ])
   }
   if (saved.status === 'paid') await reportDelivered(env, plId, saved, now)
 }
 
 /**
- * manual_review records that came from an unknown outcome: re-read the nonce
- * under the same symmetric quorum and transfer-proof rule. If it now reads
- * used, the authorization executed late: the record becomes paid
- * (manual_review -> paid is a rank increase, so saveRecordGuarded allows it;
- * this re-check is the only Bitrefill path that writes it), a loud alert goes
- * out and delivery is reported. Unused, mixed or undecided: no change.
+ * manual_review records that came from an unknown outcome (or whose transfer
+ * could not be proven yet): re-read under the same rule. Only an
+ * authorization-bound proof from 2+ hosts moves it to paid (manual_review ->
+ * paid is a rank increase, so saveRecordGuarded allows it; this re-check is
+ * the only Bitrefill path that writes it). Unused, mixed, undecided or
+ * unproven: no change.
  */
 export async function recheckBitrefillManualReview(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
   if (rec.status !== 'manual_review' || !rec.bitrefillUnknownOrigin) return
   const nonce = rec.bitrefill?.nonce ?? bitrefillNonce(invoiceIdOf(plId))
   const read = await readAuthorizationQuorum(env, FUNDER_WALLET, nonce)
   if (read.used !== true) return
-  await applyChainUsed(env, plId, rec, now, read, true)
+  await applyChainUsed(env, plId, rec, now, read, nonce, true, true)
 }
 
 async function redriveDeferredPayout(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {

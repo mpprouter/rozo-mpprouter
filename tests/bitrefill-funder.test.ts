@@ -412,13 +412,35 @@ async function signedEvent(type = 'payment_payout_completed', data: Record<strin
   })
 }
 
+// Synthesized chain answers for the authorization-bound transfer proof.
+// tx hash = the nonce topic (one transaction per nonce), amount 204 USDC to RECEIVER.
+type ProofMode = 'prove' | 'noTransfer' | 'none' | 'fail'
+const AU_TOPIC = '0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5'
+const TR_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+const USDC_ADDR = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
+const pad32 = (a: string) => '0x' + a.toLowerCase().replace(/^0x/, '').padStart(64, '0')
+const authLog = (nonce: string, tx: string) => ({ address: USDC_ADDR, topics: [AU_TOPIC, pad32(FUNDER_WALLET), nonce.toLowerCase()], data: '0x', transactionHash: tx, removed: false })
+const transferLog = (amount = 204_000_000n, to = RECEIVER) => ({ address: USDC_ADDR, topics: [TR_TOPIC, pad32(FUNDER_WALLET), pad32(to)], data: '0x' + amount.toString(16).padStart(64, '0'), removed: false })
+function proofAnswer(mode: ProofMode, method: string, params: any[]): Response | null {
+  if (method !== 'eth_getLogs' && method !== 'eth_getTransactionReceipt' && method !== 'eth_blockNumber') return null
+  if (method === 'eth_blockNumber') return Response.json({ jsonrpc: '2.0', id: 1, result: '0x1000000' })
+  if (mode === 'fail') return Response.json({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'limit' } })
+  if (method === 'eth_getLogs') {
+    const nonce = String(params?.[0]?.topics?.[2] ?? '')
+    return Response.json({ jsonrpc: '2.0', id: 1, result: mode === 'none' ? [] : [authLog(nonce, nonce)] })
+  }
+  const tx = String(params?.[0] ?? '')
+  if (mode === 'none') return Response.json({ jsonrpc: '2.0', id: 1, result: null })
+  const logs = mode === 'prove' ? [authLog(tx, tx), transferLog()] : [authLog(tx, tx), transferLog(204_000_000n, '0x' + '99'.repeat(20))]
+  return Response.json({ jsonrpc: '2.0', id: 1, result: { status: '0x1', transactionHash: tx, logs } })
+}
+
 interface Up {
   order: any
   pay: Array<{ status: number; body: unknown } | 'throw'>
   authUsed: boolean | 'fail'
   balance: bigint
-  receipt?: any
-  logs?: any[] | 'unsupported'
+  proof?: ProofMode
 }
 
 function stub(cfg: Partial<Up> = {}) {
@@ -451,13 +473,10 @@ function stub(cfg: Partial<Up> = {}) {
         return up.order ? Response.json(up.order) : new Response('nf', { status: 404 })
       }
       const rpc = JSON.parse(String(init?.body ?? '{}'))
-      if (rpc?.method === 'eth_getTransactionReceipt') return Response.json({ jsonrpc: '2.0', id: 1, result: up.receipt ?? null })
-      if (rpc?.method === 'eth_blockNumber') return Response.json({ jsonrpc: '2.0', id: 1, result: '0x1000000' })
-      if (rpc?.method === 'eth_getLogs') {
-        const l = up.logs ?? 'unsupported'
-        return l === 'unsupported'
-          ? Response.json({ jsonrpc: '2.0', id: 1, error: { code: -32600, message: 'range not supported' } })
-          : Response.json({ jsonrpc: '2.0', id: 1, result: l })
+      const pr = proofAnswer(up.proof ?? 'prove', rpc?.method, rpc?.params)
+      if (pr) {
+        calls.log.push('proof')
+        return pr
       }
       const data: string = rpc?.params?.[0]?.data ?? ''
       if (data.startsWith(AUTHORIZATION_STATE_SELECTOR)) {
@@ -950,7 +969,7 @@ describe('settle: allowlist, signer codes, gate and ledger order', () => {
 describe('chain quorum and late execution (F2)', () => {
   function rpcStub(
     answers: Record<string, boolean | 'fail' | 'rpcerror'>,
-    opts: { receipt?: Record<string, any>; logs?: Record<string, any[] | 'fail'> } = {},
+    opts: { proof?: Record<string, ProofMode> } = {},
   ) {
     const calls = { alerts: [] as string[], delivered: 0, hosts: [] as string[], methods: [] as string[] }
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -966,17 +985,8 @@ describe('chain quorum and late execution (F2)', () => {
       const host = new URL(url).host
       const method = JSON.parse(String(init?.body ?? '{}')).method
       calls.methods.push(`${method}@${host}`)
-      if (method === 'eth_getTransactionReceipt') {
-        const r = opts.receipt?.[host]
-        if (r === undefined || r === 'fail') return new Response('down', { status: 503 })
-        return Response.json({ jsonrpc: '2.0', id: 1, result: r })
-      }
-      if (method === 'eth_blockNumber') return Response.json({ jsonrpc: '2.0', id: 1, result: '0x1000000' })
-      if (method === 'eth_getLogs') {
-        const l = opts.logs?.[host]
-        if (l === undefined || l === 'fail') return Response.json({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'limit' } })
-        return Response.json({ jsonrpc: '2.0', id: 1, result: l })
-      }
+      const pr = proofAnswer(opts.proof?.[host] ?? 'fail', method, JSON.parse(String(init?.body ?? '{}')).params)
+      if (pr) return pr
       calls.hosts.push(host)
       const a = answers[host] ?? 'fail'
       if (a === 'fail') return new Response('down', { status: 503 })
@@ -1048,7 +1058,11 @@ describe('chain quorum and late execution (F2)', () => {
     c = rpcStub({ 'base.llamarpc.com': true, 'base.drpc.org': true, 'rpc.test': false })
     await sweepBitrefillFulfillments(env)
     expect(rec(kv).status).toBe('manual_review')
+    // Two used, no proof: still no change (never paid on the quorum alone).
     c = rpcStub({ 'base.llamarpc.com': true, 'base.drpc.org': true })
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('manual_review')
+    c = rpcStub({ 'base.llamarpc.com': true, 'base.drpc.org': true }, { proof: { 'base.llamarpc.com': 'prove', 'base.drpc.org': 'prove' } })
     await sweepBitrefillFulfillments(env)
     expect(rec(kv).status).toBe('paid')
     expect(rec(kv).events.some((e) => e.kind === 'sweep_bitrefill_late_execution')).toBe(true)
@@ -1069,13 +1083,7 @@ describe('chain quorum and late execution (F2)', () => {
   })
 })
 
-describe('round 2: chain evidence for paid (P0)', () => {
-  const T = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-  const pad = (a: string) => '0x' + a.toLowerCase().replace(/^0x/, '').padStart(64, '0')
-  const USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
-  const transferLog = (amount: bigint, to = RECEIVER, from = FUNDER_WALLET) => ({
-    address: USDC, topics: [T, pad(from), pad(to)], data: '0x' + amount.toString(16).padStart(64, '0'), removed: false,
-  })
+describe('round 3: authorization-bound transfer proof (rule A)', () => {
   function seedU(kv: ReturnType<typeof makeKv>, r: Partial<FulfillmentRecord> = {}, b: Record<string, unknown> = {}) {
     kv._store.set(KEY, JSON.stringify({
       status: 'pay_invoice_unknown', pl_id: PL, rozoPaymentId: ROZO_ID, invoiceAmountAtomic: '204000000',
@@ -1085,7 +1093,8 @@ describe('round 2: chain evidence for paid (P0)', () => {
       ...r,
     }))
   }
-  function chain(cfg: { used: Record<string, boolean | 'fail'>; receipt?: Record<string, any>; logs?: Record<string, any[] | 'fail'> }) {
+  // used: per-host nonce answer; proof: per-host proof mode (default fail).
+  function chain(used: Record<string, boolean | 'fail'>, proof: Record<string, ProofMode> = {}, receiptOverride?: (host: string, tx: string) => any) {
     const calls = { alerts: [] as string[], delivered: 0, methods: [] as string[] }
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input instanceof Request ? input.url : input)
@@ -1098,116 +1107,154 @@ describe('round 2: chain evidence for paid (P0)', () => {
         return new Response('{}', { status: 200 })
       }
       const host = new URL(url).host
-      const m = JSON.parse(String(init?.body ?? '{}')).method
-      calls.methods.push(`${m}@${host}`)
-      const pick = (o: Record<string, any> | undefined) => (o ? o[host] : undefined)
-      if (m === 'eth_getTransactionReceipt') {
-        const r = pick(cfg.receipt)
-        return r === undefined || r === 'fail' ? new Response('down', { status: 502 }) : Response.json({ jsonrpc: '2.0', id: 1, result: r })
+      const body = JSON.parse(String(init?.body ?? '{}'))
+      calls.methods.push(`${body.method}@${host}`)
+      if (receiptOverride && body.method === 'eth_getTransactionReceipt') {
+        const r = receiptOverride(host, body.params[0])
+        if (r !== undefined) return r === 'fail' ? new Response('down', { status: 502 }) : Response.json({ jsonrpc: '2.0', id: 1, result: r })
       }
-      if (m === 'eth_blockNumber') return Response.json({ jsonrpc: '2.0', id: 1, result: '0x1000000' })
-      if (m === 'eth_getLogs') {
-        const l = pick(cfg.logs)
-        return l === undefined || l === 'fail'
-          ? Response.json({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'limit' } })
-          : Response.json({ jsonrpc: '2.0', id: 1, result: l })
-      }
-      const a = cfg.used[host] ?? 'fail'
+      const pr = proofAnswer(proof[host] ?? 'fail', body.method, body.params)
+      if (pr) return pr
+      const a = used[host] ?? 'fail'
       if (a === 'fail') return new Response('down', { status: 503 })
       return Response.json({ jsonrpc: '2.0', id: 1, result: '0x' + (a ? '1' : '0').padStart(64, '0') })
     }))
     return calls
   }
-  const TWO = { 'rpc.test': true, 'base.drpc.org': true } as const
+  const USED2 = { 'rpc.test': true, 'base.drpc.org': true } as const
+  const PROOF2 = { 'rpc.test': 'prove', 'base.drpc.org': 'prove' } as const
+  const PAST = () => Date.now() + 40 * 60_000 // past expiry - 60 s + grace
 
-  it('one host true -> no change; two true + one false -> no change; two true (no proof available) -> paid on the quorum, detail says so', async () => {
+  it('AuthorizationUsed topic constant equals keccak256 of the event signature', async () => {
+    const { keccak256, stringToHex } = await import('viem')
+    const mod = await import('../src/routes/bitrefill-settle')
+    expect(mod.AUTHORIZATION_USED_TOPIC).toBe(keccak256(stringToHex('AuthorizationUsed(address,bytes32)')))
+    expect(mod.ERC20_TRANSFER_TOPIC).toBe(keccak256(stringToHex('Transfer(address,address,uint256)')))
+  })
+
+  it('nonce quorum + proof from two hosts -> paid, transaction stored, delivered', async () => {
     const { env, kv } = makeEnv()
     seedU(kv)
-    chain({ used: { 'rpc.test': true } })
-    await sweepBitrefillFulfillments(env)
-    expect(rec(kv).status).toBe('pay_invoice_unknown')
-    chain({ used: { ...TWO, 'mainnet.base.org': false } })
-    await sweepBitrefillFulfillments(env)
-    expect(rec(kv).status).toBe('pay_invoice_unknown')
-    const c = chain({ used: TWO })
+    const c = chain(USED2, PROOF2)
     await sweepBitrefillFulfillments(env)
     expect(rec(kv).status).toBe('paid')
+    expect(rec(kv).bitrefill?.transaction).toBe(bitrefillNonce(INVOICE).toLowerCase())
     const ev = rec(kv).events.find((e) => e.kind === 'sweep_bitrefill_authorization_used') as any
-    expect(ev.detail.proof).toBe('unavailable')
-    expect(ev.detail.notes.join(' ')).toMatch(/nonce quorum only/)
+    expect(ev.detail.proof).toBe('proven')
     expect(c.delivered).toBe(1)
   })
 
-  it('receipt proof: recorded tx with the exact transfer -> paid via receipt', async () => {
+  it('nonce quorum without any proof is never paid: no change before the deadline', async () => {
     const { env, kv } = makeEnv()
-    seedU(kv, {}, { transaction: TX })
-    chain({ used: TWO, receipt: { 'rpc.test': { status: '0x1', logs: [transferLog(204_000_000n)] } } })
-    await sweepBitrefillFulfillments(env)
-    expect(rec(kv).status).toBe('paid')
-    const ev = rec(kv).events.find((e) => e.kind === 'sweep_bitrefill_authorization_used') as any
-    expect(ev.detail).toMatchObject({ proof: 'proven', via: 'receipt' })
-  })
-
-  it('recorded tx whose receipt cannot be read anywhere -> no change (RPC errors are no evidence)', async () => {
-    const { env, kv } = makeEnv()
-    seedU(kv, {}, { transaction: TX })
-    chain({ used: TWO })
+    seedU(kv)
+    chain(USED2)
     await sweepBitrefillFulfillments(env)
     expect(rec(kv).status).toBe('pay_invoice_unknown')
   })
 
-  it('receipt without the exact transfer, two hosts with no matching log -> manual_review (nonce used, no transfer), not re-read', async () => {
+  it('proof from a single host is not enough', async () => {
     const { env, kv } = makeEnv()
-    seedU(kv, {}, { transaction: TX })
-    const c = chain({
-      used: TWO,
-      receipt: { 'rpc.test': { status: '0x1', logs: [transferLog(204_000_001n), transferLog(204_000_000n, '0x' + '99'.repeat(20))] } },
-      logs: { 'rpc.test': [transferLog(1n)], 'base.drpc.org': [] },
-    })
+    seedU(kv)
+    chain(USED2, { 'rpc.test': 'prove', 'base.drpc.org': 'none' })
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+  })
+
+  it('one host true -> no change; two true + one false -> no change, even with proof', async () => {
+    const { env, kv } = makeEnv()
+    seedU(kv)
+    chain({ 'rpc.test': true }, PROOF2)
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+    chain({ ...USED2, 'mainnet.base.org': false }, PROOF2)
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+  })
+
+  it('empty logs are never disproven: past the deadline -> manual_review "could not be proven", keep re-checking, alert once; later proof -> paid', async () => {
+    const { env, kv } = makeEnv()
+    seedU(kv)
+    let c = chain(USED2, { 'rpc.test': 'none', 'base.drpc.org': 'none', 'mainnet.base.org': 'none' })
+    await sweepBitrefillFulfillments(env, PAST())
+    expect(rec(kv).status).toBe('manual_review')
+    expect(rec(kv).bitrefillUnknownOrigin).toBe(true)
+    expect(rec(kv).events.some((e) => e.kind === 'sweep_bitrefill_nonce_used_no_transfer')).toBe(false)
+    expect(c.alerts.filter((a) => a.includes('could not be proven automatically'))).toHaveLength(1)
+    expect(c.alerts[0]).toMatch(/Do NOT refund, do NOT re-pay/)
+    await sweepBitrefillFulfillments(env, PAST())
+    expect(c.alerts.filter((a) => a.includes('could not be proven automatically'))).toHaveLength(1)
+    c = chain(USED2, PROOF2)
+    await sweepBitrefillFulfillments(env, PAST())
+    expect(rec(kv).status).toBe('paid')
+    expect(c.alerts.some((a) => a.includes('chain now shows paid'))).toBe(true)
+  })
+
+  it('disproven by two hosts (the AuthorizationUsed transaction has no matching Transfer) -> manual_review, loud alert, no more re-checks', async () => {
+    const { env, kv } = makeEnv()
+    seedU(kv)
+    const c = chain(USED2, { 'rpc.test': 'noTransfer', 'base.drpc.org': 'noTransfer' })
     await sweepBitrefillFulfillments(env)
     expect(rec(kv).status).toBe('manual_review')
     expect(rec(kv).bitrefillUnknownOrigin).toBe(false)
-    expect(rec(kv).events.some((e) => e.kind === 'sweep_bitrefill_nonce_used_no_transfer')).toBe(true)
-    expect(c.alerts.some((a) => a.includes('no matching transfer found'))).toBe(true)
+    expect(c.alerts.some((a) => a.includes('nonce consumed by something that did not pay this invoice'))).toBe(true)
     expect(c.delivered).toBe(0)
   })
 
-  it('log proof without a tx hash: one host with the exact transfer -> paid via logs; one empty host only -> paid on the quorum', async () => {
-    let { env, kv } = makeEnv()
-    seedU(kv)
-    chain({ used: TWO, logs: { 'base.drpc.org': [transferLog(204_000_000n)] } })
-    await sweepBitrefillFulfillments(env)
-    let ev = rec(kv).events.find((e) => e.kind === 'sweep_bitrefill_authorization_used') as any
-    expect(ev.detail).toMatchObject({ proof: 'proven', via: 'logs' })
-    ;({ env, kv } = makeEnv())
-    seedU(kv)
-    chain({ used: TWO, logs: { 'rpc.test': [] } })
-    await sweepBitrefillFulfillments(env)
-    expect(rec(kv).status).toBe('paid')
-    ev = rec(kv).events.find((e) => e.kind === 'sweep_bitrefill_authorization_used') as any
-    expect(ev.detail.proof).toBe('unavailable')
-  })
-
-  it('log window too old -> no logs call, paid on the quorum with the reason recorded', async () => {
+  it('a same-address same-amount Transfer in a different transaction is not proof', async () => {
     const { env, kv } = makeEnv()
-    seedU(kv, { payingAt: new Date(Date.now() - 10 * 3_600_000).toISOString() })
-    const c = chain({ used: TWO, logs: { 'rpc.test': [], 'base.drpc.org': [] } })
-    await sweepBitrefillFulfillments(env)
-    expect(rec(kv).status).toBe('paid')
-    expect(c.methods.some((m) => m.startsWith('eth_getLogs'))).toBe(false)
-    const ev = rec(kv).events.find((e) => e.kind === 'sweep_bitrefill_authorization_used') as any
-    expect(ev.detail.notes.join(' ')).toMatch(/exceeds/)
-  })
-
-  it('late execution re-check from manual_review obeys the same rule (disproven stays manual_review, no paid alert)', async () => {
-    const { env, kv } = makeEnv()
-    seedU(kv, { status: 'manual_review', bitrefillUnknownOrigin: true, alertedManualReview: true })
-    const c = chain({ used: TWO, logs: { 'rpc.test': [], 'base.drpc.org': [] } })
+    seedU(kv)
+    // The AuthorizationUsed transaction carries no Transfer; the exact Transfer
+    // lives in another transaction (never consulted).
+    chain(USED2, PROOF2, (_h, tx) => ({ status: '0x1', transactionHash: tx, logs: [authLog(tx, tx)] }))
     await sweepBitrefillFulfillments(env)
     expect(rec(kv).status).toBe('manual_review')
-    expect(rec(kv).bitrefillUnknownOrigin).toBe(false)
-    expect(c.alerts.some((a) => a.includes('chain now shows paid'))).toBe(false)
-    expect(c.alerts.some((a) => a.includes('no matching transfer found'))).toBe(true)
+    expect(rec(kv).events.some((e) => e.kind === 'sweep_bitrefill_nonce_used_no_transfer')).toBe(true)
+  })
+
+  it('hosts disagree (one proven, one disproven) -> unavailable, no change', async () => {
+    const { env, kv } = makeEnv()
+    seedU(kv)
+    chain(USED2, { 'rpc.test': 'prove', 'base.drpc.org': 'noTransfer' })
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+  })
+
+  it('recorded transaction: its receipt proven on two hosts -> paid; those hosts run no log query', async () => {
+    const { env, kv } = makeEnv()
+    const tx = bitrefillNonce(INVOICE).toLowerCase()
+    seedU(kv, {}, { transaction: tx })
+    const c = chain(USED2, PROOF2)
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('paid')
+    expect(c.methods).toContain('eth_getTransactionReceipt@rpc.test')
+    expect(c.methods.filter((m) => m === 'eth_getLogs@rpc.test' || m === 'eth_getLogs@base.drpc.org')).toHaveLength(0)
+  })
+
+  it('receipts unreadable and logs refused -> unavailable, no change before the deadline', async () => {
+    const { env, kv } = makeEnv()
+    seedU(kv, {}, { transaction: TX })
+    chain(USED2, {})
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+  })
+
+  it('log window over the cap -> no log query, never paid; past the deadline -> manual_review unproven', async () => {
+    const { env, kv } = makeEnv()
+    seedU(kv, { payingAt: new Date(Date.now() - 10 * 3_600_000).toISOString() })
+    const c = chain(USED2, PROOF2)
+    await sweepBitrefillFulfillments(env, PAST())
+    expect(c.methods.some((m) => m.startsWith('eth_getLogs'))).toBe(false)
+    expect(rec(kv).status).toBe('manual_review')
+    expect(rec(kv).bitrefillUnknownOrigin).toBe(true)
+  })
+
+  it('manual_review re-check without proof -> no change, no alert', async () => {
+    const { env, kv } = makeEnv()
+    seedU(kv, { status: 'manual_review', bitrefillUnknownOrigin: true, alertedManualReview: true })
+    const c = chain(USED2, { 'rpc.test': 'none', 'base.drpc.org': 'fail' })
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('manual_review')
+    expect(c.alerts).toHaveLength(0)
   })
 
   it('the signer 200 paid answer stays sufficient (no chain read at settle)', async () => {
@@ -1216,6 +1263,70 @@ describe('round 2: chain evidence for paid (P0)', () => {
     await run(await signedEvent(), env)
     expect(rec(kv).status).toBe('paid')
     expect(calls.auth).toBe(0)
+  })
+})
+
+describe('round 3: signer answers (rule C)', () => {
+  const tagged = (status: number, code: string) => ({ status, body: { provider: 'bitrefill', ok: false, code, signed: false } })
+
+  it('maps NONCE_USED_TRANSFER_NOT_PROVEN and TRANSFER_PROOF_UNAVAILABLE', () => {
+    expect(classifyBitrefillPayResult(tagged(409, 'NONCE_USED_TRANSFER_NOT_PROVEN'))).toBe('nonce_used_unlogged')
+    expect(classifyBitrefillPayResult(tagged(503, 'TRANSFER_PROOF_UNAVAILABLE'))).toBe('unknown')
+    expect(classifyBitrefillPayResult(tagged(503, 'RPC_UNAVAILABLE'))).toBe('presign_transient')
+  })
+
+  it('409 NONCE_USED_TRANSFER_NOT_PROVEN -> manual_review, gate and reservation kept, alert', async () => {
+    const { env, kv } = makeEnv()
+    const { calls } = stub({ order: await frozenOrder(), pay: [tagged(409, 'NONCE_USED_TRANSFER_NOT_PROVEN')] })
+    await run(await signedEvent(), env)
+    expect(rec(kv).status).toBe('manual_review')
+    expect(rec(kv).bitrefillUnknownOrigin).toBeFalsy()
+    expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
+    expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(204_000_000n)
+    expect(calls.alerts.some((a) => a.includes('nonce consumed, transfer not proven') && a.includes('do not refund until checked'))).toBe(true)
+  })
+
+  it('503 TRANSFER_PROOF_UNAVAILABLE -> pay_invoice_unknown, no immediate retry, gate and reservation kept', async () => {
+    const { env, kv } = makeEnv()
+    const { calls } = stub({ order: await frozenOrder(), pay: [tagged(503, 'TRANSFER_PROOF_UNAVAILABLE')] })
+    await run(await signedEvent(), env)
+    expect(calls.pay).toBe(1)
+    expect(rec(kv).status).toBe('pay_invoice_unknown')
+    expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
+    expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(204_000_000n)
+  })
+
+  it('200 already_paid stores its transaction hash', async () => {
+    const { env, kv } = makeEnv()
+    stub({ order: await frozenOrder(), pay: [{ status: 200, body: { provider: 'bitrefill', ok: true, status: 'already_paid', signed: false, nonce: bitrefillNonce(INVOICE), transaction: TX } }] })
+    await run(await signedEvent(), env)
+    expect(rec(kv).status).toBe('paid')
+    expect(rec(kv).bitrefill?.transaction).toBe(TX)
+  })
+})
+
+describe('round 3: bitrefill ledger fails closed (rule B)', () => {
+  it('absent = 0, plain integer = total, anything else present throws', async () => {
+    const ledger = await import('../src/routes/stripe-fulfillment')
+    expect(ledger.parseBitrefillLedger(null).total).toBe(0n)
+    expect(ledger.parseBitrefillLedger('123').total).toBe(123n)
+    expect(ledger.parseBitrefillLedger('{"t":"5","h":{"bitrefill_a":"5"}}').holds).toEqual({ bitrefill_a: '5' })
+    for (const bad of ['', 'garbage', '{', '[]', 'null', '{"t":5,"h":{}}', '{"t":"-1","h":{}}', '{"t":"5"}', '{"t":"5","h":[]}', '{"t":"5","h":{"x":5}}', '1.5']) {
+      expect(() => ledger.parseBitrefillLedger(bad), bad).toThrow()
+    }
+  })
+
+  it('a corrupted ledger value defers the payout: nothing reserved or sent, gate released', async () => {
+    const { env, kv } = makeEnv()
+    const { calls } = stub({ order: await frozenOrder() })
+    const atomic = await import('../src/routes/stripe-atomic')
+    await atomic.casUpdate(env, (await import('../src/routes/stripe-fulfillment')).dailySpentKey(new Date(), 'bitrefill'), () => ({ op: 'set', value: '{"t":"oops"}', result: true }))
+    const out = await run(await signedEvent(), env)
+    expect(out.deferred).toBe('daily_cap_unavailable')
+    expect(calls.pay).toBe(0)
+    expect(rec(kv).status).toBe('payin_seen')
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+    await expect(readDailySpentAtomic(env, new Date(), 'bitrefill')).rejects.toThrow()
   })
 })
 
