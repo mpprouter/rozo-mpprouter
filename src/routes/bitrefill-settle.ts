@@ -557,6 +557,14 @@ export async function settleBitrefillFunderEvent(
     rec.events.push({ kind: 'bitrefill_late_payin', at: nowIso(), detail })
   } else if (verdict === 'nonce_used_unlogged') {
     // Gate and ledger kept: the authorization slot is consumed on chain.
+    // The sweep keeps re-checking (rule A): only a transfer proof bound to
+    // this authorization (AuthorizationUsed(funder, nonce) and the exact
+    // Transfer to the frozen address in one successful transaction, two
+    // hosts) can flip it to paid. That proof shows the invoice WAS paid by
+    // this nonce, whatever pay-invoice's log or own proof said, so it is
+    // safe for both NONCE_USED_WITHOUT_PAY_LOG and
+    // NONCE_USED_TRANSFER_NOT_PROVEN; a disproof stops the re-check.
+    rec.bitrefillUnknownOrigin = true
     rec.status = 'manual_review'
     rec.failureReason = result.body?.code === 'NONCE_USED_TRANSFER_NOT_PROVEN'
       ? 'pay-invoice: nonce consumed on chain, transfer not proven (NONCE_USED_TRANSFER_NOT_PROVEN)'
@@ -671,10 +679,18 @@ const BASE_BLOCK_MS = 2_000
 const LOG_WINDOW_LEAD_MS = 10 * 60 * 1000
 /** Further safety margin in blocks below that lower bound. */
 const LOG_WINDOW_MARGIN_BLOCKS = 600
+/** The log window ends this long after the authorization deadline (plus a block margin). */
+const LOG_WINDOW_TAIL_MS = 5 * 60 * 1000
+const LOG_WINDOW_TAIL_BLOCKS = 150
+/** Total time one host may spend on one record's proof (each call also has its own 10 s timeout). */
+export const BITREFILL_PROOF_HOST_BUDGET_MS = 20 * 1000
 /**
- * Widest eth_getLogs window we ask for (~5 h of Base blocks). Public RPC log
- * range limits are unverified. A wider window is "proof unavailable" (never
- * paid); a recorded transaction hash needs no window.
+ * Widest eth_getLogs window we ask for (~5 h of Base blocks). The window is
+ * anchored to the payment ([payingAt - 10 min, deadline + 5 min] plus block
+ * margins, see paymentLogWindow), so for a 60-minute invoice it is about
+ * 3,000 blocks however old the record is. Public RPC log range limits are
+ * unverified. A wider window is "proof unavailable" (never paid); a recorded
+ * transaction hash needs no window.
  */
 export const BITREFILL_LOG_MAX_BLOCKS = 9_000
 
@@ -798,6 +814,75 @@ export type TransferProof = {
 
 type HostProof = { host: string; verdict: 'proven' | 'disproven' | 'unavailable'; tx?: string; note?: string }
 
+/** Bound one host's proof work; running out of time = unavailable for that host. */
+async function withHostBudget(host: string, work: Promise<HostProof>): Promise<HostProof> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<HostProof>((resolve) => {
+    timer = setTimeout(() => resolve({ host, verdict: 'unavailable', note: 'host proof budget exceeded' }), BITREFILL_PROOF_HOST_BUDGET_MS)
+  })
+  try {
+    return await Promise.race([work, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+async function blockTimestampMs(url: string, n: bigint): Promise<number | null> {
+  const r = await rpcCall(url, 'eth_getBlockByNumber', ['0x' + n.toString(16), false])
+  const ts = (r.ok && r.result && typeof r.result === 'object' ? (r.result as any).timestamp : null) as unknown
+  if (typeof ts !== 'string' || !/^0x[0-9a-fA-F]+$/.test(ts)) return null
+  return Number(BigInt(ts)) * 1000
+}
+
+/**
+ * Block range covering [lowMs, highMs], anchored to the payment (not to
+ * `latest`), so its size is bounded by the invoice lifetime however old the
+ * record is. Block numbers are estimated at 2 s per block from the latest
+ * block's real timestamp, then VERIFIED with real block timestamps:
+ * ts(from) <= lowMs and (to == latest or ts(to) >= highMs). Each bound may
+ * step once (twice the measured shortfall plus a margin); still unproven
+ * coverage = not ok (the caller treats it as unavailable, never disproven).
+ */
+async function paymentLogWindow(
+  url: string,
+  lowMs: number,
+  highMs: number,
+): Promise<{ ok: true; from: bigint; to: bigint } | { ok: false; note: string }> {
+  const head = await rpcCall(url, 'eth_blockNumber', [])
+  if (!head.ok || typeof head.result !== 'string' || !/^0x[0-9a-fA-F]+$/.test(head.result)) return { ok: false, note: 'block number unreadable' }
+  const latest = BigInt(head.result)
+  const latestTs = await blockTimestampMs(url, latest)
+  if (latestTs === null) return { ok: false, note: 'latest block timestamp unreadable' }
+  const blocksBack = (ms: number) => BigInt(Math.max(0, Math.ceil(ms / BASE_BLOCK_MS)))
+  const clamp = (n: bigint) => (n < 0n ? 0n : n > latest ? latest : n)
+
+  let from = clamp(latest - blocksBack(latestTs - lowMs) - BigInt(LOG_WINDOW_MARGIN_BLOCKS))
+  let fromTs = await blockTimestampMs(url, from)
+  if (fromTs === null) return { ok: false, note: 'fromBlock timestamp unreadable' }
+  if (fromTs > lowMs && from > 0n) {
+    from = clamp(from - 2n * blocksBack(fromTs - lowMs) - BigInt(LOG_WINDOW_MARGIN_BLOCKS))
+    fromTs = await blockTimestampMs(url, from)
+    if (fromTs === null) return { ok: false, note: 'fromBlock timestamp unreadable' }
+  }
+  if (fromTs > lowMs) return { ok: false, note: 'fromBlock does not reach back to payingAt - 10 min' }
+
+  let to = latestTs <= highMs ? latest : clamp(latest - blocksBack(latestTs - highMs) + BigInt(LOG_WINDOW_TAIL_BLOCKS))
+  if (to < latest) {
+    let toTs = await blockTimestampMs(url, to)
+    if (toTs === null) return { ok: false, note: 'toBlock timestamp unreadable' }
+    if (toTs < highMs) {
+      to = clamp(to + 2n * blocksBack(highMs - toTs) + BigInt(LOG_WINDOW_TAIL_BLOCKS))
+      if (to < latest) {
+        toTs = await blockTimestampMs(url, to)
+        if (toTs === null || toTs < highMs) return { ok: false, note: 'toBlock does not reach the deadline + 5 min' }
+      }
+    }
+  }
+  if (to < from) return { ok: false, note: 'empty block window' }
+  if (to - from > BigInt(BITREFILL_LOG_MAX_BLOCKS)) return { ok: false, note: `log window ${to - from} blocks over the ${BITREFILL_LOG_MAX_BLOCKS} cap` }
+  return { ok: true, from, to }
+}
+
 /**
  * Look, on each host independently, for the transaction that consumed this
  * invoice's authorization: the recorded transaction hash if any, else
@@ -813,7 +898,7 @@ export async function readBitrefillTransferProof(env: Env, rec: FulfillmentRecor
   }
   const recorded = typeof b.transaction === 'string' && /^0x[0-9a-fA-F]{64}$/.test(b.transaction) ? b.transaction.toLowerCase() : null
   const startMs = msOf(rec.payingAt ?? null)
-  const span = startMs === null ? null : Math.ceil(Math.max(0, now - (startMs - LOG_WINDOW_LEAD_MS)) / BASE_BLOCK_MS) + LOG_WINDOW_MARGIN_BLOCKS
+  const deadlineMs = authorizationDeadlineMs(rec)
 
   const checkReceipt = async (url: string, tx: string): Promise<HostProof['verdict'] | 'no_auth'> => {
     const r = await rpcCall(url, 'eth_getTransactionReceipt', [tx])
@@ -825,25 +910,23 @@ export async function readBitrefillTransferProof(env: Env, rec: FulfillmentRecor
   }
 
   const perHost = await Promise.all(
-    rpcEndpoints(env).map(async ({ host, url }): Promise<HostProof> => {
+    rpcEndpoints(env).map(({ host, url }) => withHostBudget(host, (async (): Promise<HostProof> => {
       if (recorded) {
         const v = await checkReceipt(url, recorded)
         if (v === 'proven' || v === 'disproven') return { host, verdict: v, tx: recorded }
         // Recorded tx unreadable here or did not consume this authorization:
         // look the authorization up by its log instead.
       }
-      if (span === null) return { host, verdict: 'unavailable', note: 'no payingAt: log window unknown' }
-      if (span > BITREFILL_LOG_MAX_BLOCKS) return { host, verdict: 'unavailable', note: `log window ${span} blocks over the ${BITREFILL_LOG_MAX_BLOCKS} cap` }
-      const head = await rpcCall(url, 'eth_blockNumber', [])
-      if (!head.ok || typeof head.result !== 'string' || !/^0x[0-9a-fA-F]+$/.test(head.result)) return { host, verdict: 'unavailable', note: 'block number unreadable' }
-      const latest = BigInt(head.result)
-      const from = latest > BigInt(span) ? latest - BigInt(span) : 0n
+      if (startMs === null || deadlineMs === null) return { host, verdict: 'unavailable', note: 'no payingAt or deadline: log window unknown' }
+      const w = await paymentLogWindow(url, startMs - LOG_WINDOW_LEAD_MS, deadlineMs + LOG_WINDOW_TAIL_MS)
+      if (!w.ok) return { host, verdict: 'unavailable', note: w.note }
+      const { from, to } = w
       const logs = await rpcCall(url, 'eth_getLogs', [
         {
           address: BASE_USDC,
           topics: [AUTHORIZATION_USED_TOPIC, pad32(FUNDER_WALLET), pad32(nonce)],
           fromBlock: '0x' + from.toString(16),
-          toBlock: '0x' + latest.toString(16),
+          toBlock: '0x' + to.toString(16),
         },
       ])
       if (!logs.ok || !Array.isArray(logs.result)) return { host, verdict: 'unavailable', note: 'eth_getLogs refused or unsupported' }
@@ -854,7 +937,7 @@ export async function readBitrefillTransferProof(env: Env, rec: FulfillmentRecor
       const v = await checkReceipt(url, tx)
       if (v === 'proven' || v === 'disproven') return { host, verdict: v, tx }
       return { host, verdict: 'unavailable', tx, note: 'receipt of the AuthorizationUsed transaction unreadable' }
-    }),
+    })())),
   )
 
   const notes = perHost.map((h) => `${h.host}:${h.verdict}${h.tx ? '@' + h.tx.slice(0, 10) : ''}${h.note ? ' (' + h.note + ')' : ''}`)
@@ -1153,7 +1236,10 @@ export async function sweepBitrefillFulfillments(
       // A re-drive can take ~2 minutes (pay-invoice timeout + retry): stop
       // starting new ones once the run has used its wall budget so it does not
       // overlap the next cron tick. Skipped ones are picked up by a later run.
-      if (action === 'redrive' && clock() - startedAt > BITREFILL_SWEEP_REDRIVE_BUDGET_MS) continue
+      // Same wall budget for the chain reads (resolve / recheck): one record
+      // costs at most BITREFILL_PROOF_HOST_BUDGET_MS per host (hosts run in
+      // parallel) on top of the nonce quorum (10 s per host, parallel).
+      if (action !== 'deliver' && clock() - startedAt > BITREFILL_SWEEP_REDRIVE_BUDGET_MS) continue
       acted++
       try {
         if (action === 'resolve') await resolveBitrefillUnknown(env, plId, rec, now)

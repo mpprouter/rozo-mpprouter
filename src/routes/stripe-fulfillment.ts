@@ -482,9 +482,10 @@ interface BitrefillLedger {
 /**
  * Fail closed: only an absent key is zero; a legacy plain integer keeps its
  * total with no holds. A present value that does not parse, or parses to the
- * wrong shape (t not a digit string, h not a plain object of digit strings),
- * THROWS, so reserve/release/read surface as "ledger unavailable" (the settle
- * path defers) instead of silently resetting the day to zero.
+ * wrong shape (t not a digit string, h not a plain object of digit strings,
+ * or a total below the sum of its holds) THROWS, so reserve/release/read
+ * surface as "ledger unavailable" (the settle path defers) instead of
+ * silently resetting the day to zero.
  */
 export function parseBitrefillLedger(raw: string | null): BitrefillLedger {
   if (raw === null || raw === undefined) return { total: 0n, holds: {} }
@@ -504,7 +505,11 @@ export function parseBitrefillLedger(raw: string | null): BitrefillLedger {
     if (typeof v !== 'string' || !/^\d+$/.test(v)) throw new Error('bitrefill daily ledger hold is invalid')
     holds[k] = v
   }
-  return { total: BigInt(t), holds }
+  const total = BigInt(t)
+  let held = 0n
+  for (const v of Object.values(holds)) held += BigInt(v)
+  if (held > total) throw new Error('bitrefill daily ledger total is below the sum of its holds')
+  return { total, holds }
 }
 
 function serializeBitrefillLedger(l: BitrefillLedger): string {

@@ -113,6 +113,8 @@ async function frozenOrder(over: Record<string, unknown> = {}, factOver: Record<
 }
 
 afterEach(() => {
+  CHAIN.blockSec = 2
+  CHAIN.brokenTimestamps = false
   vi.unstubAllGlobals()
   vi.restoreAllMocks()
   vi.useRealTimers()
@@ -421,9 +423,17 @@ const USDC_ADDR = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
 const pad32 = (a: string) => '0x' + a.toLowerCase().replace(/^0x/, '').padStart(64, '0')
 const authLog = (nonce: string, tx: string) => ({ address: USDC_ADDR, topics: [AU_TOPIC, pad32(FUNDER_WALLET), nonce.toLowerCase()], data: '0x', transactionHash: tx, removed: false })
 const transferLog = (amount = 204_000_000n, to = RECEIVER) => ({ address: USDC_ADDR, topics: [TR_TOPIC, pad32(FUNDER_WALLET), pad32(to)], data: '0x' + amount.toString(16).padStart(64, '0'), removed: false })
+// Synthetic chain clock: latest block 0x1000000 at "now", CHAIN.blockSec per block.
+const CHAIN = { latest: 0x1000000, blockSec: 2, brokenTimestamps: false }
 function proofAnswer(mode: ProofMode, method: string, params: any[]): Response | null {
-  if (method !== 'eth_getLogs' && method !== 'eth_getTransactionReceipt' && method !== 'eth_blockNumber') return null
-  if (method === 'eth_blockNumber') return Response.json({ jsonrpc: '2.0', id: 1, result: '0x1000000' })
+  if (!['eth_getLogs', 'eth_getTransactionReceipt', 'eth_blockNumber', 'eth_getBlockByNumber'].includes(method)) return null
+  if (method === 'eth_blockNumber') return Response.json({ jsonrpc: '2.0', id: 1, result: '0x' + CHAIN.latest.toString(16) })
+  if (method === 'eth_getBlockByNumber') {
+    const n = Number(BigInt(String(params?.[0])))
+    const nowSec = Math.floor(Date.now() / 1000)
+    const ts = CHAIN.brokenTimestamps ? nowSec : nowSec - (CHAIN.latest - n) * CHAIN.blockSec
+    return Response.json({ jsonrpc: '2.0', id: 1, result: { number: '0x' + n.toString(16), timestamp: '0x' + ts.toString(16) } })
+  }
   if (mode === 'fail') return Response.json({ jsonrpc: '2.0', id: 1, error: { code: -32005, message: 'limit' } })
   if (method === 'eth_getLogs') {
     const nonce = String(params?.[0]?.topics?.[2] ?? '')
@@ -864,18 +874,32 @@ describe('settle: allowlist, signer codes, gate and ledger order', () => {
     expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(204_000_000n)
   })
 
-  it('409 NONCE_USED_WITHOUT_PAY_LOG -> manual_review with an alert, gate kept, never re-read as a late execution', async () => {
+  it('409 NONCE_USED_WITHOUT_PAY_LOG -> manual_review with an alert, gate kept; re-checked, paid only with a two-host bound proof', async () => {
     const { env, kv } = makeEnv()
-    const { calls } = stub({ order: await frozenOrder(), authUsed: true, pay: [{ status: 409, body: { provider: 'bitrefill', ok: false, code: 'NONCE_USED_WITHOUT_PAY_LOG', signed: false } }] })
+    const { up, calls } = stub({ order: await frozenOrder(), authUsed: true, proof: 'none', pay: [{ status: 409, body: { provider: 'bitrefill', ok: false, code: 'NONCE_USED_WITHOUT_PAY_LOG', signed: false } }] })
     await run(await signedEvent(), env)
     expect(rec(kv).status).toBe('manual_review')
-    expect(rec(kv).bitrefillUnknownOrigin).toBeFalsy()
+    expect(rec(kv).bitrefillUnknownOrigin).toBe(true)
     expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
     expect(calls.alerts.some((a) => a.includes('without a pay log row'))).toBe(true)
-    const authBefore = calls.auth
+    // No proof: re-read, no change.
     await sweepBitrefillFulfillments(env)
-    expect(calls.auth).toBe(authBefore)
     expect(rec(kv).status).toBe('manual_review')
+    // Disproven (AuthorizationUsed transaction without the Transfer): stays, re-check stops.
+    up.proof = 'noTransfer'
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('manual_review')
+    expect(rec(kv).bitrefillUnknownOrigin).toBe(false)
+  })
+
+  it('409 NONCE_USED_WITHOUT_PAY_LOG later proven by two hosts -> paid + delivered', async () => {
+    const { env, kv } = makeEnv()
+    const { up, calls } = stub({ order: await frozenOrder(), authUsed: true, proof: 'none', pay: [{ status: 409, body: { provider: 'bitrefill', ok: false, code: 'NONCE_USED_WITHOUT_PAY_LOG', signed: false } }] })
+    await run(await signedEvent(), env)
+    up.proof = 'prove'
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('paid')
+    expect(calls.delivered).toBe(1)
   })
 
   it('422 PAYOUT_NOT_PROVEN_ON_CHAIN and the signer allowlist refusal -> failed_pay_invoice, ledger released; text has no admin-route clearing', async () => {
@@ -1248,6 +1272,64 @@ describe('round 3: authorization-bound transfer proof (rule A)', () => {
     expect(rec(kv).bitrefillUnknownOrigin).toBe(true)
   })
 
+  it('old record (payment older than 9,000 blocks, no tx hash) is still provable: window anchored to the payment', async () => {
+    const { env, kv } = makeEnv()
+    const paying = Date.now() - 12 * 3_600_000
+    seedU(kv, { status: 'manual_review', bitrefillUnknownOrigin: true, alertedManualReview: true, payingAt: new Date(paying).toISOString() }, { expiresAt: new Date(paying + 40 * 60_000).toISOString() })
+    const calls: any[] = []
+    const c = chain(USED2, PROOF2)
+    const f = globalThis.fetch as any
+    vi.stubGlobal('fetch', vi.fn(async (input: any, init?: any) => {
+      const b = JSON.parse(String(init?.body ?? '{}'))
+      if (b.method === 'eth_getLogs') calls.push(b.params[0])
+      return f(input, init)
+    }))
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('paid')
+    expect(c.alerts.some((a) => a.includes('chain now shows paid'))).toBe(true)
+    // Every log query is bounded by the payment, far below latest and the cap.
+    expect(calls.length).toBeGreaterThan(0)
+    for (const q of calls) {
+      const from = Number(BigInt(q.fromBlock))
+      const to = Number(BigInt(q.toBlock))
+      expect(to - from).toBeLessThan(9_000)
+      expect(to).toBeLessThan(CHAIN.latest - 10_000)
+    }
+  })
+
+  it('block timestamps verify the window: a faster chain than 2 s/block makes fromBlock too late, it steps back once and still proves', async () => {
+    CHAIN.blockSec = 1
+    const blockCalls: number[] = []
+    const { env, kv } = makeEnv()
+    const paying = Date.now() - 3 * 3_600_000
+    seedU(kv, { payingAt: new Date(paying).toISOString() }, { expiresAt: new Date(paying + 40 * 60_000).toISOString() })
+    chain(USED2, PROOF2)
+    const f = globalThis.fetch as any
+    vi.stubGlobal('fetch', vi.fn(async (input: any, init?: any) => {
+      const b = JSON.parse(String(init?.body ?? '{}'))
+      if (b.method === 'eth_getBlockByNumber' && String(input).includes('rpc.test')) blockCalls.push(Number(BigInt(b.params[0])))
+      return f(input, init)
+    }))
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('paid')
+    // latest, first fromBlock estimate, stepped-back fromBlock, toBlock.
+    expect(blockCalls.length).toBe(4)
+    expect(blockCalls[2]).toBeLessThan(blockCalls[1])
+  })
+
+  it('unverifiable coverage (block timestamps unusable) -> unavailable, never disproven, never paid', async () => {
+    CHAIN.brokenTimestamps = true
+    const { env, kv } = makeEnv()
+    const paying = Date.now() - 3 * 3_600_000
+    seedU(kv, { payingAt: new Date(paying).toISOString() }, { expiresAt: new Date(paying + 40 * 60_000).toISOString() })
+    const c = chain(USED2, { 'rpc.test': 'noTransfer', 'base.drpc.org': 'noTransfer' })
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('manual_review') // past the deadline, proof unavailable
+    expect(rec(kv).bitrefillUnknownOrigin).toBe(true)
+    expect(c.alerts.some((a) => a.includes('could not be proven automatically'))).toBe(true)
+    expect(rec(kv).events.some((e) => e.kind === 'sweep_bitrefill_nonce_used_no_transfer')).toBe(false)
+  })
+
   it('manual_review re-check without proof -> no change, no alert', async () => {
     const { env, kv } = makeEnv()
     seedU(kv, { status: 'manual_review', bitrefillUnknownOrigin: true, alertedManualReview: true })
@@ -1277,10 +1359,17 @@ describe('round 3: signer answers (rule C)', () => {
 
   it('409 NONCE_USED_TRANSFER_NOT_PROVEN -> manual_review, gate and reservation kept, alert', async () => {
     const { env, kv } = makeEnv()
-    const { calls } = stub({ order: await frozenOrder(), pay: [tagged(409, 'NONCE_USED_TRANSFER_NOT_PROVEN')] })
+    const { up, calls } = stub({ order: await frozenOrder(), authUsed: true, proof: 'none', pay: [tagged(409, 'NONCE_USED_TRANSFER_NOT_PROVEN')] })
     await run(await signedEvent(), env)
     expect(rec(kv).status).toBe('manual_review')
-    expect(rec(kv).bitrefillUnknownOrigin).toBeFalsy()
+    expect(rec(kv).bitrefillUnknownOrigin).toBe(true)
+    // The sweep keeps trying; a two-host bound proof flips it to paid + delivered.
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('manual_review')
+    up.proof = 'prove'
+    await sweepBitrefillFulfillments(env)
+    expect(rec(kv).status).toBe('paid')
+    expect(calls.delivered).toBe(1)
     expect(await readCoinbaseExecGate(env, PL)).not.toBeNull()
     expect(await readDailySpentAtomic(env, new Date(), 'bitrefill')).toBe(204_000_000n)
     expect(calls.alerts.some((a) => a.includes('nonce consumed, transfer not proven') && a.includes('do not refund until checked'))).toBe(true)
@@ -1311,7 +1400,8 @@ describe('round 3: bitrefill ledger fails closed (rule B)', () => {
     expect(ledger.parseBitrefillLedger(null).total).toBe(0n)
     expect(ledger.parseBitrefillLedger('123').total).toBe(123n)
     expect(ledger.parseBitrefillLedger('{"t":"5","h":{"bitrefill_a":"5"}}').holds).toEqual({ bitrefill_a: '5' })
-    for (const bad of ['', 'garbage', '{', '[]', 'null', '{"t":5,"h":{}}', '{"t":"-1","h":{}}', '{"t":"5"}', '{"t":"5","h":[]}', '{"t":"5","h":{"x":5}}', '1.5']) {
+    expect(ledger.parseBitrefillLedger('{"t":"9","h":{"a":"4","b":"5"}}').total).toBe(9n)
+    for (const bad of ['', 'garbage', '{', '[]', 'null', '{"t":5,"h":{}}', '{"t":"-1","h":{}}', '{"t":"5"}', '{"t":"5","h":[]}', '{"t":"5","h":{"x":5}}', '1.5', '{"t":"8","h":{"a":"4","b":"5"}}', '{"t":"0","h":{"a":"1"}}']) {
       expect(() => ledger.parseBitrefillLedger(bad), bad).toThrow()
     }
   })
