@@ -24,6 +24,7 @@ let createdIntent: any = null
 let posts = 0
 let existingOrder: any = null
 let seenKeys: string[] = []
+let rozoExpiresAt = '2999-01-01T12:00:00.000Z'
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 
 beforeEach(() => {
@@ -31,6 +32,7 @@ beforeEach(() => {
   posts = 0
   existingOrder = null
   seenKeys = []
+  rozoExpiresAt = '2999-01-01T12:00:00.000Z'
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     seenKeys.push(new Headers(init?.headers).get('X-API-Key') ?? '')
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -45,7 +47,7 @@ beforeEach(() => {
       return new Response(JSON.stringify({
         id: 'rozo-pay-bitrefill',
         paymentLink: 'https://pay.rozo.ai/b',
-        expiresAt: '2999-01-01T12:00:00.000Z',
+        expiresAt: rozoExpiresAt,
         source: { amount: '12.37', chainId: '1500' },
       }), { status: 200 })
     }
@@ -134,6 +136,21 @@ describe('create-invoice provider=bitrefill', () => {
     expect(json.expiresAt).toBe(exp)
   })
 
+  it.each([6, 15, 45, 59, 60])('accepts a Bitrefill invoice with %i minutes left', async (m) => {
+    const exp = inMinutes(m)
+    const { status, json } = await post(body({}, { expiresAt: exp }))
+    expect(status).toBe(200)
+    expect(json.expiresAt).toBe(exp)
+    expect(posts).toBe(1)
+  })
+
+  it('returns the Rozo deposit expiry when it is earlier than Bitrefill\'s', async () => {
+    rozoExpiresAt = inMinutes(58)
+    const { status, json } = await post(body({}, { expiresAt: inMinutes(60) }))
+    expect(status).toBe(200)
+    expect(json.expiresAt).toBe(rozoExpiresAt)
+  })
+
   it('is off by default (flag unset or false)', async () => {
     for (const env of [makeEnv({ BITREFILL_ENABLED: 'false' }), makeEnv({ BITREFILL_ENABLED: undefined as any })]) {
       const { status, json } = await post(body(), env)
@@ -157,7 +174,9 @@ describe('create-invoice provider=bitrefill', () => {
     [{ address: '0x8fe7155119d2975780c9e19b07dd98393965bc2a' }, 'BLOCKED_ADDRESS'],
     [{ address: '0xFD0E6FA2ABA8436E95F3FB3523AC14BA299C0E79' }, 'BLOCKED_ADDRESS'],
     [{ expiresAt: inMinutes(1) }, 'INVOICE_EXPIRING'],
-    [{ expiresAt: inMinutes(45) }, 'INVALID_INPUT'],
+    [{ expiresAt: inMinutes(4) }, 'INVOICE_EXPIRING'],
+    [{ expiresAt: inMinutes(61.5) }, 'INVALID_INPUT'],
+    [{ expiresAt: inMinutes(90) }, 'INVALID_INPUT'],
     [{ expiresAt: undefined }, 'INVALID_INPUT'],
     [{ expiresAt: 'soon' }, 'INVALID_INPUT'],
     [{ invoiceId: '../etc' }, 'INVALID_INPUT'],
@@ -286,6 +305,18 @@ describe('create-invoice provider=bitrefill', () => {
     expect(json).toMatchObject({ ok: false, error: 'DUPLICATE_INVOICE', rozoPaymentId: 'rozo-existing' })
     expect(json.paymentLink).toBeUndefined()
     expect(posts).toBe(0)
+  })
+
+  it('409 DUPLICATE_INVOICE reports the earlier of the stored Bitrefill and Rozo expiry', async () => {
+    const bitrefillExp = inMinutes(60)
+    const rozoExp = inMinutes(55)
+    existingOrder = { id: 'rozo-existing', expiresAt: rozoExp, metadata: { bitrefillExpiresAt: bitrefillExp } }
+    let r = await post(body())
+    expect(r.status).toBe(409)
+    expect(r.json.expiresAt).toBe(rozoExp)
+    existingOrder = { id: 'rozo-existing', expiresAt: inMinutes(65), metadata: { bitrefillExpiresAt: bitrefillExp } }
+    r = await post(body())
+    expect(r.json.expiresAt).toBe(bitrefillExp)
   })
 
   it('tags orderIds so the webhook skips router settlement', () => {
