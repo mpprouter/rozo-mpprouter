@@ -35,8 +35,13 @@ const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 export const BITREFILL_MAX_USDC = 200
 /** Minimum time left on the Bitrefill invoice before we open a deposit. */
 export const BITREFILL_MIN_REMAINING_MS = 5 * 60 * 1000
-/** Bitrefill invoices live ~15 min; anything further out is not one. */
-export const BITREFILL_MAX_REMAINING_MS = 30 * 60 * 1000
+/**
+ * Bitrefill invoices live 60 min (measured on real invoices 2026-11-11; the
+ * earlier ~15 min assumption was wrong and rejected freshly created invoices).
+ * Anything further out is not a Bitrefill expiry. The extra minute absorbs
+ * clock skew between Bitrefill, the caller and this Worker.
+ */
+export const BITREFILL_MAX_REMAINING_MS = 61 * 60 * 1000
 /** orderId prefix; the webhook uses it to skip router-side settlement. */
 export const BITREFILL_ORDER_PREFIX = 'bitrefill_'
 
@@ -58,6 +63,14 @@ const BLOCKED_ADDRESSES: ReadonlySet<string> = new Set(
 )
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
+
+/** Earliest parseable ISO timestamp among the inputs, or null if none parse. */
+export function earlierIso(...values: unknown[]): string | null {
+  const ts = values
+    .map((v) => (typeof v === 'string' ? Date.parse(v) : NaN))
+    .filter(Number.isFinite)
+  return ts.length ? new Date(Math.min(...ts)).toISOString() : null
+}
 const AMOUNT_RE = /^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/
 const INVOICE_ID_RE = /^[A-Za-z0-9_-]{1,128}$/
 
@@ -151,8 +164,9 @@ export async function handleBitrefillCreateInvoice(
     return fail(400, 'AMOUNT_OUT_OF_RANGE', `bitrefill.amount must be at most ${BITREFILL_MAX_USDC} USDC.`)
   }
   // expiresAt is required. Rozo's deposit TTL is fixed at ~1h by payment-api
-  // and cannot be shortened by the caller, so the deposit stays payable after
-  // the Bitrefill invoice dies. The CLIENT must stop the payment at the
+  // and cannot be shortened by the caller, so the deposit can stay payable
+  // after the Bitrefill invoice dies (always when less than an hour was left
+  // at create time). The CLIENT must stop the payment at the
   // returned expiresAt; funds sent later still reach the (dead) invoice
   // address and need Bitrefill support to recover.
   const t = typeof expiresAt === 'string' ? Date.parse(expiresAt) : NaN
@@ -164,7 +178,7 @@ export async function handleBitrefillCreateInvoice(
     return fail(400, 'INVOICE_EXPIRING', 'The Bitrefill invoice expires in under 5 minutes. Create a new invoice.')
   }
   if (remaining > BITREFILL_MAX_REMAINING_MS) {
-    return fail(400, 'INVALID_INPUT', 'bitrefill.expiresAt is more than 30 minutes away; pass the Bitrefill invoice expiry.')
+    return fail(400, 'INVALID_INPUT', 'bitrefill.expiresAt is more than 60 minutes away; pass the Bitrefill invoice expiry.')
   }
   const expiresAtIso = new Date(t).toISOString()
 
@@ -203,8 +217,10 @@ export async function handleBitrefillCreateInvoice(
       : fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
       invoiceId,
       rozoPaymentId: row?.id ?? null,
-      // Prefer the Bitrefill expiry stored at create time over Rozo's ~1h one.
-      expiresAt: row?.metadata?.bitrefillExpiresAt ?? row?.expiresAt ?? null,
+      // Effective expiry: the earlier of the Bitrefill expiry stored at create
+      // time and the Rozo deposit's (~1h). Both are now about an hour, so either
+      // can come first.
+      expiresAt: earlierIso(row?.metadata?.bitrefillExpiresAt, row?.expiresAt),
       ...(row?.source ? { source: row.source } : {}),
     })
 
@@ -312,10 +328,7 @@ export async function handleBitrefillCreateInvoice(
   }
 
   // Effective expiry: the earlier of Bitrefill's and the Rozo deposit's.
-  const rozoExp = typeof created?.expiresAt === 'string' ? Date.parse(created.expiresAt) : NaN
-  const bitrefillExp = Date.parse(expiresAtIso)
-  const candidates = [rozoExp, bitrefillExp].filter(Number.isFinite)
-  const effectiveExpiresAt = candidates.length ? new Date(Math.min(...candidates)).toISOString() : null
+  const effectiveExpiresAt = earlierIso(expiresAtIso, created?.expiresAt)
 
   return ok({
     provider: 'bitrefill',
@@ -324,7 +337,7 @@ export async function handleBitrefillCreateInvoice(
     destination: { chainId: BASE_CHAIN_ID, tokenSymbol: 'USDC', address, amount },
     expiresAt: effectiveExpiresAt,
     // Rozo's hosted paymentLink is intentionally withheld: that page stays
-    // payable ~1h, long after the Bitrefill invoice expires.
+    // payable on Rozo's own ~1h clock, which can outlive the Bitrefill invoice.
     ...(created?.source ? { source: created.source } : {}),
   })
 }
