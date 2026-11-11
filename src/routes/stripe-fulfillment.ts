@@ -72,7 +72,8 @@ export function stripeKvKey(invoiceKey: string): string {
 // Each settlement channel has its own ledger. 'stripe' (default) is the
 // original key shared by the Stripe webhook, UPI and Stripe coupon paths.
 // 'coinbase' is the Coinbase settle path (webhook.ts settleCoinbaseEvent).
-export type DailySpendLedger = 'stripe' | 'coinbase'
+// 'bitrefill' is the Bitrefill funder send (bitrefill-settle.ts).
+export type DailySpendLedger = 'stripe' | 'coinbase' | 'bitrefill'
 
 export function dailySpentKey(date: Date, ledger: DailySpendLedger = 'stripe'): string {
   const y = date.getUTCFullYear()
@@ -397,7 +398,20 @@ export function coinbaseDailyCapAtomic(env: Env): bigint | null {
   return BigInt(Math.floor(n * 1_000_000))
 }
 
+/** Proposed, not approved: 2,000 USD per UTC day for Bitrefill funder payments. */
+export const DEFAULT_BITREFILL_DAILY_CAP_ATOMIC = 2_000_000_000n
+
+/** Cap for the 'bitrefill' ledger (BITREFILL_SETTLE_DAILY_CAP_USD). Malformed = 0, fail closed. */
+export function bitrefillDailyCapAtomic(env: Env): bigint {
+  const raw = env.BITREFILL_SETTLE_DAILY_CAP_USD
+  if (raw === undefined || raw === '') return DEFAULT_BITREFILL_DAILY_CAP_ATOMIC
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return 0n
+  return BigInt(Math.floor(n * 1_000_000))
+}
+
 function ledgerCapAtomic(env: Env, ledger: DailySpendLedger): bigint | null {
+  if (ledger === 'bitrefill') return bitrefillDailyCapAtomic(env)
   return ledger === 'coinbase' ? coinbaseDailyCapAtomic(env) : dailyCapAtomic(env)
 }
 

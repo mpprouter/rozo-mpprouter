@@ -18,7 +18,25 @@ import { forwardedClientHintHeader, withForwardedClientHint } from './client-hin
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
 import { isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
-import { normalizeCheckoutClient } from './checkout-web-pricing'
+import {
+  CHECKOUT_PRICING_VERSION,
+  type CheckoutPricing,
+  buildCheckoutTitle,
+  computeServiceFeeAtomic,
+  formatUsdcAtomic,
+  normalizeCheckoutClient,
+  parseUsdcAtomic,
+} from './checkout-web-pricing'
+import { OPENROUTER_APP_ID } from './existing-order'
+import { casUpdate } from './stripe-atomic'
+import {
+  BITREFILL_FEE_BPS,
+  BITREFILL_FUNDER,
+  bitrefillMetadataBlock,
+  bitrefillReceiverRefusal,
+  isBitrefillUuid,
+  readBitrefillFacts,
+} from './bitrefill-binding'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 // Dedicated WALLET-type account. It must not be a merchant account: payment-api
@@ -143,6 +161,11 @@ export async function handleBitrefillCreateInvoice(
   if (String(env.BITREFILL_ENABLED ?? 'false').toLowerCase() !== 'true') {
     return fail(403, 'BITREFILL_DISABLED', 'Bitrefill invoice payment is not enabled.')
   }
+  // Funder model (founder 2026-11-11): order under merchant_openrouter, 1% fee
+  // in the price, the funder pays Bitrefill. Off = today's direct model below.
+  if (bitrefillFunderSendEnabled(env)) {
+    return handleBitrefillFunderCreate(request, env, parsed, resolveSource, contactEmail)
+  }
   // Never fall back to the OpenRouter key: payment-api derives the merchant
   // from the key, so that would file these orders under merchant_openrouter.
   const apiKey = env.ROZO_BITREFILL_API_KEY
@@ -232,7 +255,16 @@ export async function handleBitrefillCreateInvoice(
       ...(row?.source ? { source: row.source } : {}),
     })
 
-  const existing = await lookupExisting()
+  // One order per invoice across BOTH accounts (direct and funder model): a
+  // switch flip must never open a second payable order for the same invoice.
+  const claim = await claimInvoiceAccount(env, invoiceId, BITREFILL_APP_ID)
+  if (claim === 'error') {
+    return fail(503, 'RETRY_LATER', 'Could not reserve this Bitrefill invoice. Retry shortly; do not pay yet.')
+  }
+  const existing = await lookupAnyAccount(env, invoiceId)
+  if (claim !== BITREFILL_APP_ID && existing.state !== 'found') {
+    return fail(409, 'DUPLICATE_INVOICE', 'A payment for this Bitrefill invoice was started under another checkout model. Resume it instead of paying again.', { invoiceId })
+  }
   if (existing.state === 'found') return duplicate(existing.row)
   if (existing.state === 'error') {
     return fail(502, 'INTENTS_API_FAILED', 'Could not check for an existing payment for this invoice. Retry shortly.')
@@ -346,6 +378,313 @@ export async function handleBitrefillCreateInvoice(
     expiresAt: effectiveExpiresAt,
     // Rozo's hosted paymentLink is intentionally withheld: that page stays
     // payable on Rozo's own ~1h clock, which can outlive the Bitrefill invoice.
+    ...(created?.source ? { source: created.source } : {}),
+  })
+}
+
+// ── Funder model (BITREFILL_FUNDER_SEND_ENABLED=true) ───────────────────────
+//
+// One Rozo Intents order per Bitrefill invoice under merchant_openrouter (the
+// OpenRouter API key; payment-api rewrites the destination to the funder).
+// exactOut: the funder receives exactly callerPays = invoice + 1% in Base
+// USDC, the bridge fee is added on the source side. The facts the funder pays
+// from are frozen into metadata.bitrefill with an HMAC binding
+// (bitrefill-binding.ts); the webhook (bitrefill-settle.ts) asks pay-invoice
+// to pay the invoice amount once the order is paid out to the funder.
+//
+// Idempotency: orderId bitrefill_<uuid> cannot collide with a Coinbase orderId
+// (pl_*, paymentSession_*, rozotest_*, mpprouter-*). Before creating, both the
+// merchant_openrouter slot and the legacy wallet_bitrefillpay slot are read:
+// an invoice that already has an order under either account is never given a
+// second one.
+
+export function bitrefillFunderSendEnabled(env: Env): boolean {
+  return String(env.BITREFILL_FUNDER_SEND_ENABLED ?? '').toLowerCase() === 'true'
+}
+
+const BASE_USDC_TOKEN = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
+
+type Lookup = { state: 'found'; row: any } | { state: 'missing' } | { state: 'error' }
+
+async function lookupOrder(env: Env, appId: string, apiKey: string | undefined, orderId: string): Promise<Lookup> {
+  try {
+    const r = await fetch(
+      `${intentsReadBase(env)}/payments/order/${encodeURIComponent(appId)}/${encodeURIComponent(orderId)}`,
+      // A key scopes the read to ITS app (payment-api overrides the path
+      // appId), so each account is read with its own key, or keyless.
+      { method: 'GET', headers: apiKey ? { 'X-API-Key': apiKey } : {} },
+    )
+    if (r.status === 404) return (await isIntentsPaymentNotFound(r)) ? { state: 'missing' } : { state: 'error' }
+    if (!r.ok) return { state: 'error' }
+    const row = await r.json().catch(() => undefined)
+    return row === undefined ? { state: 'error' } : { state: 'found', row }
+  } catch {
+    return { state: 'error' }
+  }
+}
+
+/**
+ * Permanently bind a Bitrefill invoice (normalized lowercase id) to the ONE
+ * account its order may live under (DO CAS, linearizable). Upstream enforces
+ * one order per (app_id, order_id), so binding the account closes the race
+ * where a direct-model and a funder-model request for the same invoice both
+ * pass the lookups during a switch flip. Returns the bound account, or
+ * 'error' when the claim store is unavailable (caller must not create).
+ */
+export async function claimInvoiceAccount(env: Env, invoiceId: string, appId: string): Promise<string | 'error'> {
+  try {
+    return await casUpdate<string>(env, `bitrefill-invoice-account:v1:${invoiceId.trim().toLowerCase()}`, (raw) => {
+      if (raw) return { op: 'noop', result: raw }
+      return { op: 'set', value: appId, result: appId }
+    })
+  } catch {
+    return 'error'
+  }
+}
+
+/**
+ * Existing order for this Bitrefill invoice under either account, checking the
+ * id as given and lowercased (the funder model stores lowercase UUIDs, the
+ * direct model the id as sent). Any read that cannot answer = error: the
+ * caller must not create.
+ */
+export async function lookupAnyAccount(env: Env, rawInvoiceId: string): Promise<Lookup> {
+  if (!env.ROZO_INTENTS_API_KEY) return { state: 'error' }
+  // Legacy orders kept the id as sent. Bitrefill issues lowercase UUIDs, so
+  // as-sent, lowercase and uppercase cover every real legacy spelling; the
+  // account claim above covers every order created after this release.
+  const ids = Array.from(new Set([rawInvoiceId, rawInvoiceId.toLowerCase(), rawInvoiceId.toUpperCase()])).map(bitrefillOrderId)
+  const reads: Array<Promise<Lookup>> = []
+  for (const id of ids) {
+    reads.push(lookupOrder(env, OPENROUTER_APP_ID, env.ROZO_INTENTS_API_KEY, id))
+    reads.push(lookupOrder(env, BITREFILL_APP_ID, env.ROZO_BITREFILL_API_KEY, id))
+  }
+  const results = await Promise.all(reads)
+  const found = results.find((r) => r.state === 'found')
+  if (found) return found
+  return results.some((r) => r.state === 'error') ? { state: 'error' } : { state: 'missing' }
+}
+
+function funderPricingFields(row: any): Record<string, unknown> {
+  const f = readBitrefillFacts(row)
+  if (!f) return { original: null, serviceFee: null, feeBps: null, callerPays: null, callerPaysAtomicUsdc: null }
+  return {
+    original: formatUsdcAtomic(f.amountAtomic),
+    serviceFee: formatUsdcAtomic(f.serviceFeeAtomic),
+    feeBps: f.feeBps,
+    callerPays: formatUsdcAtomic(f.callerPaysAtomic),
+    callerPaysAtomicUsdc: f.callerPaysAtomic.toString(),
+  }
+}
+
+export async function handleBitrefillFunderCreate(
+  request: Request,
+  env: Env,
+  parsed: Record<string, unknown>,
+  resolveSource: ResolveSource,
+  contactEmail: string | null = null,
+): Promise<Response> {
+  const apiKey = env.ROZO_INTENTS_API_KEY
+  if (!apiKey || !env.PAYINVOICE_ADMIN_SECRET) {
+    return fail(503, 'BITREFILL_NOT_CONFIGURED', 'Bitrefill invoice payment is not configured.')
+  }
+  const br = parsed.bitrefill
+  if (!br || typeof br !== 'object' || Array.isArray(br)) {
+    return fail(400, 'INVALID_INPUT', 'bitrefill must be an object with invoiceId, address and amount.')
+  }
+  const { invoiceId: rawId, address, amount, expiresAt } = br as Record<string, unknown>
+  const invoiceId = typeof rawId === 'string' ? rawId.trim().toLowerCase() : ''
+  if (!isBitrefillUuid(invoiceId)) {
+    return fail(400, 'INVALID_INPUT', 'bitrefill.invoiceId must be the Bitrefill invoice UUID.')
+  }
+  const refusal = bitrefillReceiverRefusal(address)
+  if (refusal) {
+    return refusal.startsWith('not a')
+      ? fail(400, 'INVALID_ADDRESS', 'bitrefill.address must be a 0x-prefixed 40-hex Base address.')
+      : fail(400, 'BLOCKED_ADDRESS', 'This receiving address is not allowed.')
+  }
+  if (typeof amount !== 'string' || !AMOUNT_RE.test(amount) || Number(amount) <= 0) {
+    return fail(400, 'INVALID_AMOUNT', 'bitrefill.amount must be a positive decimal string with at most 6 decimals.')
+  }
+  const invoiceAtomic = parseUsdcAtomic(amount)
+  if (invoiceAtomic <= 0n) {
+    return fail(400, 'INVALID_AMOUNT', 'bitrefill.amount must be a positive decimal string with at most 6 decimals.')
+  }
+  if (invoiceAtomic > BigInt(BITREFILL_MAX_USDC) * 1_000_000n) {
+    return fail(400, 'AMOUNT_OUT_OF_RANGE', `bitrefill.amount (the invoice amount) must be at most ${BITREFILL_MAX_USDC} USDC.`)
+  }
+  const t = typeof expiresAt === 'string' ? Date.parse(expiresAt) : NaN
+  if (!Number.isFinite(t)) {
+    return fail(400, 'INVALID_INPUT', 'bitrefill.expiresAt is required and must be an ISO-8601 timestamp.')
+  }
+  const remaining = t - Date.now()
+  if (remaining < BITREFILL_MIN_REMAINING_MS) {
+    return fail(400, 'INVOICE_EXPIRING', 'The Bitrefill invoice expires in under 5 minutes. Create a new invoice.')
+  }
+  if (remaining > BITREFILL_MAX_REMAINING_MS) {
+    return fail(400, 'INVALID_INPUT', 'bitrefill.expiresAt is more than 60 minutes away; pass the Bitrefill invoice expiry.')
+  }
+  const expiresAtIso = new Date(t).toISOString()
+
+  // Same sources as the Coinbase line (USDC/USDT chains, Lightning, the native
+  // coins NATIVE_SOURCES opens). Beta coins (ZEC) are not offered: their
+  // 1Click window outlives a 60-minute Bitrefill invoice.
+  const src = resolveSource(parsed.source, parseNativeSources(env.NATIVE_SOURCES))
+  if (!src.resolved) {
+    return fail(400, 'UNSUPPORTED_SOURCE', src.error?.message ?? 'Unsupported source.', { supported: src.error?.supported })
+  }
+  const source = src.resolved
+  if (source.tokenSymbol === 'ZEC') {
+    return fail(400, 'UNSUPPORTED_SOURCE', 'ZEC is not available for Bitrefill invoices.')
+  }
+
+  const serviceFeeAtomic = computeServiceFeeAtomic(invoiceAtomic, BITREFILL_FEE_BPS)
+  const callerPaysAtomic = invoiceAtomic + serviceFeeAtomic
+  const pricing: CheckoutPricing = {
+    originalAtomic: invoiceAtomic,
+    serviceFeeAtomic,
+    callerPaysAtomic,
+    feeBps: BITREFILL_FEE_BPS,
+    pricingVersion: CHECKOUT_PRICING_VERSION,
+  }
+  const isNative = isNativeSymbol(source.chainId, source.tokenSymbol)
+  if (isNative && Number(callerPaysAtomic) / 1e6 > nativeMaxUsd(env.NATIVE_MAX_USD)) {
+    return fail(400, 'AMOUNT_OUT_OF_RANGE', `Native coin payment is limited to $${nativeMaxUsd(env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`)
+  }
+
+  const orderId = bitrefillOrderId(invoiceId)
+  const duplicate = (row: any) =>
+    !row?.id
+      ? fail(503, 'RETRY_LATER', 'A payment for this Bitrefill invoice is being created. Retry in a few seconds to get its id; do not pay yet.')
+      : fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
+        invoiceId,
+        rozoPaymentId: row?.id ?? null,
+        expiresAt: earlierIso(row?.metadata?.bitrefillExpiresAt, row?.expiresAt),
+        ...funderPricingFields(row),
+        ...(row?.source ? { source: row.source } : {}),
+      })
+
+  const claim = await claimInvoiceAccount(env, invoiceId, OPENROUTER_APP_ID)
+  if (claim === 'error') {
+    return fail(503, 'RETRY_LATER', 'Could not reserve this Bitrefill invoice. Retry shortly; do not pay yet.')
+  }
+  // Orders created before the switch live under the legacy wallet account;
+  // both accounts are always checked (keyless when the legacy key is unset).
+  const existing = await lookupAnyAccount(env, typeof rawId === 'string' ? rawId.trim() : invoiceId)
+  if (existing.state === 'found') return duplicate(existing.row)
+  if (claim !== OPENROUTER_APP_ID && existing.state === 'missing') {
+    return fail(409, 'DUPLICATE_INVOICE', 'A payment for this Bitrefill invoice was started under another checkout model. Resume it instead of paying again.', { invoiceId })
+  }
+  if (existing.state === 'error') {
+    return fail(502, 'INTENTS_API_FAILED', 'Could not check for an existing payment for this invoice. Retry shortly.')
+  }
+
+  const client = normalizeCheckoutClient(parsed.client)
+  const attribution = parsed.attribution
+  const attributionField =
+    attribution && typeof attribution === 'object' && !Array.isArray(attribution) ? { attribution } : {}
+  const bitrefillBlock = await bitrefillMetadataBlock(env.PAYINVOICE_ADMIN_SECRET, {
+    invoiceId,
+    address: (address as string).toLowerCase(),
+    amountAtomic: invoiceAtomic,
+    expiresAt: expiresAtIso,
+    feeBps: BITREFILL_FEE_BPS,
+    serviceFeeAtomic,
+    callerPaysAtomic,
+  })
+  const callerPays = formatUsdcAtomic(callerPaysAtomic)
+
+  const intentsBody = {
+    appId: OPENROUTER_APP_ID,
+    orderId,
+    type: 'exactOut',
+    display: {
+      title: buildCheckoutTitle('Bitrefill', pricing),
+      currency: 'USD',
+      merchantName: 'Bitrefill',
+      merchantDescription: 'Bitrefill via ROZO Checkout',
+    },
+    source: source.chainId === 'lightning'
+      ? { chainId: 'lightning', tokenSymbol: 'BTC' }
+      : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
+    destination: {
+      chainId: BASE_CHAIN_ID,
+      receiverAddress: BITREFILL_FUNDER,
+      tokenSymbol: 'USDC',
+      tokenAddress: BASE_USDC_TOKEN,
+      amount: callerPays,
+    },
+    ...attributionField,
+    ...(contactEmail ? { email: contactEmail } : {}),
+    metadata: {
+      source: 'mpprouter-create-invoice',
+      provider: 'bitrefill',
+      bitrefillInvoiceId: invoiceId,
+      bitrefillExpiresAt: expiresAtIso,
+      original: formatUsdcAtomic(invoiceAtomic),
+      serviceFee: formatUsdcAtomic(serviceFeeAtomic),
+      callerPays,
+      feeBps: BITREFILL_FEE_BPS,
+      pricingVersion: CHECKOUT_PRICING_VERSION,
+      bitrefill: bitrefillBlock,
+      ...(client ? { client } : {}),
+    },
+  }
+
+  let resp: Response
+  try {
+    resp = await fetch(ROZO_INTENTS_URL, {
+      method: 'POST',
+      headers: withForwardedClientHint(
+        { 'content-type': 'application/json', 'X-API-Key': apiKey },
+        forwardedClientHintHeader(request, client),
+      ),
+      body: JSON.stringify(intentsBody),
+    })
+  } catch {
+    return fail(502, 'INTENTS_API_FAILED', 'Rozo intents API unreachable.')
+  }
+  const text = await resp.text()
+  if (!resp.ok) {
+    const rateLimited = relayUpstreamRateLimit(resp, text, { error: 'RATE_LIMITED' })
+    if (rateLimited) return rateLimited
+    if (resp.status === 409 && /orderIdConflict/i.test(text)) {
+      const raced = await lookupOrder(env, OPENROUTER_APP_ID, apiKey, orderId)
+      return duplicate(raced.state === 'found' ? raced.row : null)
+    }
+    const upstream = upstreamError(text)
+    if ((resp.status === 400 || resp.status === 422) && upstream && CALLER_ERROR_CODES.has(upstream.code)) {
+      const extra = { upstream_code: upstream.code, upstream_message: upstream.message }
+      if (upstream.code === 'amountTooLow' || upstream.code === 'amountTooHigh') {
+        return fail(400, 'AMOUNT_OUT_OF_RANGE', upstream.message || 'Amount is out of range for this source.', extra)
+      }
+      return fail(400, 'INTENTS_API_REJECTED', upstream.message || `Rozo intents API rejected the request (${resp.status}).`, extra)
+    }
+    return fail(502, 'INTENTS_API_FAILED', `Rozo intents API returned ${resp.status}.`, {
+      upstream_status: resp.status,
+      ...(upstream ? { upstream_code: upstream.code } : {}),
+    })
+  }
+  let created: any
+  try {
+    created = JSON.parse(text)
+  } catch {
+    return fail(502, 'INTENTS_API_FAILED', 'Rozo intents API returned a malformed body.')
+  }
+
+  return ok({
+    provider: 'bitrefill',
+    model: 'funder',
+    invoiceId,
+    rozoPaymentId: created?.id ?? null,
+    destination: { chainId: BASE_CHAIN_ID, tokenSymbol: 'USDC', address: (address as string), amount },
+    original: formatUsdcAtomic(invoiceAtomic),
+    serviceFee: formatUsdcAtomic(serviceFeeAtomic),
+    feeBps: BITREFILL_FEE_BPS,
+    callerPays,
+    callerPaysAtomicUsdc: callerPaysAtomic.toString(),
+    pricingVersion: CHECKOUT_PRICING_VERSION,
+    expiresAt: earlierIso(expiresAtIso, created?.expiresAt),
     ...(created?.source ? { source: created.source } : {}),
   })
 }

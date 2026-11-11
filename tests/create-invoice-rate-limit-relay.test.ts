@@ -52,6 +52,7 @@ function makeEnv(extra: Record<string, unknown> = {}): Env {
     ROZO_INTENTS_API_KEY: 'test-key',
     BITREFILL_ENABLED: 'true',
     ROZO_BITREFILL_API_KEY: 'bitrefill-key',
+    ATOMIC_STORE: makeAtomicStoreMock(),
     MPP_STORE: {
       get: async (k: string) => store.get(k) ?? null,
       put: async (k: string, v: string) => void store.set(k, v),

@@ -26,6 +26,7 @@ import { handleProxy } from './routes/proxy'
 import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './routes/job-status'
 import { sweepInFlightStripeRecords, sweepStripeSessionIndex, sweepManualReviewOnchain } from './routes/stripe-fulfillment'
 import { sweepCoinbaseFulfillments } from './routes/coinbase-sweep'
+import { sweepBitrefillFulfillments } from './routes/bitrefill-settle'
 import { INTENTS_WARMUP_CRON, warmIntentsPaymentApi } from './utils/intents-warmup'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
@@ -417,6 +418,14 @@ export interface Env {
   //   wrangler secret put ROZO_BITREFILL_API_KEY
   // Missing while BITREFILL_ENABLED=true => 503 BITREFILL_NOT_CONFIGURED.
   ROZO_BITREFILL_API_KEY?: string
+  // Bitrefill funder model (founder 2026-11-11): "true" = new Bitrefill orders
+  // go under merchant_openrouter priced invoice + 1%, and the webhook asks
+  // pay-invoice (provider "bitrefill") to pay the invoice from the funder.
+  // Anything else = today's direct wallet_bitrefillpay model, no funder send.
+  BITREFILL_FUNDER_SEND_ENABLED?: string
+  // Router-side daily cap for Bitrefill funder payments, USD. Unset = 2000
+  // (proposed, not approved). Malformed = 0 (nothing is paid).
+  BITREFILL_SETTLE_DAILY_CAP_USD?: string
   ROZO_TEST_LINK_SECRET?: string
 
   // Default fee for browser checkout endpoints. Plain integer basis points;
@@ -744,6 +753,9 @@ export default {
     // alert on payouts that never reached pay-invoice, and report delivery to
     // Rozo. Reads Coinbase only; never calls pay-invoice.
     ctx.waitUntil(sweepCoinbaseFulfillments(env))
+    // Bitrefill funder model: resolve `paying` / `pay_invoice_unknown` from
+    // USDC.authorizationState(funder, nonce) and report delivery. Never pays.
+    ctx.waitUntil(sweepBitrefillFulfillments(env))
     // One-time backfill of the pay-URL → session index for records created
     // before the index existed (bounded per run; no-op once caught up).
     ctx.waitUntil(sweepStripeSessionIndex(env))
