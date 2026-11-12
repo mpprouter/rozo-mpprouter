@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { handleCreateInvoice } from '../src/routes/create-invoice'
 import { BITREFILL_MAX_USDC, isBitrefillOrderId } from '../src/routes/bitrefill-invoice'
 import type { Env } from '../src/index'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 const ADDR = '0x1111111111111111111111111111111111111111'
 
@@ -12,6 +13,7 @@ function makeEnv(extra: Record<string, string> = {}): Env {
     ROZO_INTENTS_API_KEY: 'test-key',
     BITREFILL_ENABLED: 'true',
     ROZO_BITREFILL_API_KEY: 'bitrefill-key',
+    ATOMIC_STORE: makeAtomicStoreMock(),
     MPP_STORE: {
       get: async (k: string) => store.get(k) ?? null,
       put: async (k: string, v: string) => void store.set(k, v),
@@ -126,7 +128,11 @@ describe('create-invoice provider=bitrefill', () => {
     expect(json.source).toMatchObject({ amount: '12.37', chainId: '1500' })
     expect(typeof createdIntent.metadata.bitrefillExpiresAt).toBe('string')
     expect(seenKeys.length).toBeGreaterThan(0)
-    expect(seenKeys.every((k) => k === 'bitrefill-key')).toBe(true)
+    // Reads use each account's own key (the funder-model slot under
+    // merchant_openrouter is checked too, so one invoice never gets an order
+    // under both accounts); the create itself only ever uses the Bitrefill key.
+    expect(seenKeys.every((k) => k === 'bitrefill-key' || k === 'test-key')).toBe(true)
+    expect(seenKeys[seenKeys.length - 1]).toBe('bitrefill-key')
   })
 
   it('returns the earlier of Bitrefill and Rozo expiry', async () => {

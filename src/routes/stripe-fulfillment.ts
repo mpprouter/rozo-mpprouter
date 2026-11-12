@@ -72,7 +72,8 @@ export function stripeKvKey(invoiceKey: string): string {
 // Each settlement channel has its own ledger. 'stripe' (default) is the
 // original key shared by the Stripe webhook, UPI and Stripe coupon paths.
 // 'coinbase' is the Coinbase settle path (webhook.ts settleCoinbaseEvent).
-export type DailySpendLedger = 'stripe' | 'coinbase'
+// 'bitrefill' is the Bitrefill funder send (bitrefill-settle.ts).
+export type DailySpendLedger = 'stripe' | 'coinbase' | 'bitrefill'
 
 export function dailySpentKey(date: Date, ledger: DailySpendLedger = 'stripe'): string {
   const y = date.getUTCFullYear()
@@ -360,6 +361,7 @@ export async function readDailySpentAtomic(
   ledger: DailySpendLedger = 'stripe',
 ): Promise<bigint> {
   const { value } = await casRead(env, dailySpentKey(now, ledger))
+  if (ledger === 'bitrefill') return parseBitrefillLedger(value).total
   return parseAtomic(value)
 }
 
@@ -397,7 +399,20 @@ export function coinbaseDailyCapAtomic(env: Env): bigint | null {
   return BigInt(Math.floor(n * 1_000_000))
 }
 
+/** Proposed, not approved: 2,000 USD per UTC day for Bitrefill funder payments. */
+export const DEFAULT_BITREFILL_DAILY_CAP_ATOMIC = 2_000_000_000n
+
+/** Cap for the 'bitrefill' ledger (BITREFILL_SETTLE_DAILY_CAP_USD). Malformed = 0, fail closed. */
+export function bitrefillDailyCapAtomic(env: Env): bigint {
+  const raw = env.BITREFILL_SETTLE_DAILY_CAP_USD
+  if (raw === undefined || raw === '') return DEFAULT_BITREFILL_DAILY_CAP_ATOMIC
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n < 0) return 0n
+  return BigInt(Math.floor(n * 1_000_000))
+}
+
 function ledgerCapAtomic(env: Env, ledger: DailySpendLedger): bigint | null {
+  if (ledger === 'bitrefill') return bitrefillDailyCapAtomic(env)
   return ledger === 'coinbase' ? coinbaseDailyCapAtomic(env) : dailyCapAtomic(env)
 }
 
@@ -415,6 +430,8 @@ export async function reserveDailySpend(
   deltaAtomic: bigint,
   ledger: DailySpendLedger = 'stripe',
 ): Promise<bigint | null> {
+  // The bitrefill ledger stores per-invoice holds (reserveBitrefillDaily).
+  if (ledger === 'bitrefill') throw new Error('bitrefill ledger: use reserveBitrefillDaily')
   const cap = ledgerCapAtomic(env, ledger)
   return casUpdate<bigint | null>(env, dailySpentKey(now, ledger), (raw) => {
     const cur = parseAtomic(raw)
@@ -436,11 +453,105 @@ export async function releaseDailySpend(
   deltaAtomic: bigint,
   ledger: DailySpendLedger = 'stripe',
 ): Promise<void> {
+  if (ledger === 'bitrefill') throw new Error('bitrefill ledger: use releaseBitrefillDaily')
   await casUpdate<true>(env, dailySpentKey(now, ledger), (raw) => {
     const cur = parseAtomic(raw)
     const next = cur - deltaAtomic
     return { op: 'set', value: (next < 0n ? 0n : next).toString(), result: true }
   })
+}
+
+// ── Bitrefill daily ledger: attributable, idempotent per invoice ────────────
+//
+// Same DO key as the other ledgers (`bitrefill-daily-spent:<UTC day>`) but the
+// value is JSON { t: total atomic, h: { <plId>: atomic } }: every reservation
+// is held under its invoice and written in the SAME CAS as the total. So:
+//   - reserve is idempotent per invoice and day (a second reserve for the same
+//     plId is a no-op that answers 'replay', never a second increment);
+//   - release removes exactly what that invoice holds (no-op if nothing);
+//   - "reserve threw" is recoverable: the CAS either committed the hold or
+//     not, and a release (or the next attempt's replay) settles it either way.
+// A plain integer value (never written for this ledger) is read as a total
+// with no holds. The 'stripe' and 'coinbase' ledgers are unchanged.
+
+interface BitrefillLedger {
+  total: bigint
+  holds: Record<string, string>
+}
+
+/**
+ * Fail closed: only an absent key is zero; a legacy plain integer keeps its
+ * total with no holds. A present value that does not parse, or parses to the
+ * wrong shape (t not a digit string, h not a plain object of digit strings,
+ * or a total below the sum of its holds) THROWS, so reserve/release/read
+ * surface as "ledger unavailable" (the settle path defers) instead of
+ * silently resetting the day to zero.
+ */
+export function parseBitrefillLedger(raw: string | null): BitrefillLedger {
+  if (raw === null || raw === undefined) return { total: 0n, holds: {} }
+  if (/^\d+$/.test(raw)) return { total: BigInt(raw), holds: {} }
+  let j: unknown
+  try {
+    j = JSON.parse(raw)
+  } catch {
+    throw new Error('bitrefill daily ledger value is not parseable')
+  }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('bitrefill daily ledger value is not an object')
+  const { t, h } = j as { t?: unknown; h?: unknown }
+  if (typeof t !== 'string' || !/^\d+$/.test(t)) throw new Error('bitrefill daily ledger total is invalid')
+  if (!h || typeof h !== 'object' || Array.isArray(h)) throw new Error('bitrefill daily ledger holds are invalid')
+  const holds: Record<string, string> = {}
+  for (const [k, v] of Object.entries(h as Record<string, unknown>)) {
+    if (typeof v !== 'string' || !/^\d+$/.test(v)) throw new Error('bitrefill daily ledger hold is invalid')
+    holds[k] = v
+  }
+  const total = BigInt(t)
+  let held = 0n
+  for (const v of Object.values(holds)) held += BigInt(v)
+  if (held > total) throw new Error('bitrefill daily ledger total is below the sum of its holds')
+  return { total, holds }
+}
+
+function serializeBitrefillLedger(l: BitrefillLedger): string {
+  return JSON.stringify({ t: l.total.toString(), h: l.holds })
+}
+
+/** 'ok' = newly reserved, 'replay' = this invoice already holds it today, null = over the cap. */
+export async function reserveBitrefillDaily(
+  env: Env,
+  now: Date,
+  plId: string,
+  deltaAtomic: bigint,
+): Promise<'ok' | 'replay' | null> {
+  const cap = bitrefillDailyCapAtomic(env)
+  return casUpdate<'ok' | 'replay' | null>(env, dailySpentKey(now, 'bitrefill'), (raw) => {
+    const l = parseBitrefillLedger(raw)
+    if (l.holds[plId] !== undefined) return { op: 'noop', result: 'replay' }
+    if (l.total + deltaAtomic > cap) return { op: 'noop', result: null }
+    l.holds[plId] = deltaAtomic.toString()
+    l.total += deltaAtomic
+    return { op: 'set', value: serializeBitrefillLedger(l), result: 'ok' }
+  })
+}
+
+/** Release exactly what `plId` holds on that day. true = something was released. */
+export async function releaseBitrefillDaily(env: Env, now: Date, plId: string): Promise<boolean> {
+  return casUpdate<boolean>(env, dailySpentKey(now, 'bitrefill'), (raw) => {
+    const l = parseBitrefillLedger(raw)
+    const held = l.holds[plId]
+    if (held === undefined) return { op: 'noop', result: false }
+    delete l.holds[plId]
+    const next = l.total - BigInt(held)
+    l.total = next < 0n ? 0n : next
+    return { op: 'set', value: serializeBitrefillLedger(l), result: true }
+  })
+}
+
+/** The amount `plId` holds on that day, or null. */
+export async function readBitrefillDailyHold(env: Env, now: Date, plId: string): Promise<bigint | null> {
+  const { value } = await casRead(env, dailySpentKey(now, 'bitrefill'))
+  const held = parseBitrefillLedger(value).holds[plId]
+  return held === undefined ? null : BigInt(held)
 }
 
 // ── pay-invoice call (Stripe body) ──────────────────────────────────────────

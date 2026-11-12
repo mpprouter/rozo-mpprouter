@@ -3,6 +3,7 @@
 import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import type { Env } from '../src/index'
 import {
   ROZO_INTENTS_BASE,
@@ -255,6 +256,7 @@ describe('bitrefill-invoice.ts lookupExisting', () => {
       ROZO_INTENTS_API_KEY: 'test-key',
       BITREFILL_ENABLED: 'true',
       ROZO_BITREFILL_API_KEY: 'bitrefill-key',
+      ATOMIC_STORE: makeAtomicStoreMock(),
       MPP_STORE: {
         get: async (k: string) => store.get(k) ?? null,
         put: async (k: string, v: string) => void store.set(k, v),

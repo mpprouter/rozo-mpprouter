@@ -1,6 +1,7 @@
 import type { Env } from '../index'
 import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, isTestPaymentId } from './native-sources'
 import { isBitrefillOrderId } from './bitrefill-invoice'
+import { settleBitrefillFunderEvent } from './bitrefill-settle'
 import { ROZO_INTENTS_BASE, intentsReadBase } from './intents-base'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { baseLinkIdOf } from '../mpp/contract-variant'
@@ -173,6 +174,24 @@ export interface FulfillmentRecord {
   alertedQueryFailing?: boolean
   coinbaseQueryFailingSince?: string | null
   stuckSince?: string | null
+  // Bitrefill funder model only (bitrefill-settle.ts): the frozen facts the
+  // send used and the authorization identity the sweep resolves by.
+  // Sweep re-drives of a Bitrefill payout whose pre-send check was deferred.
+  bitrefillRedrives?: number
+  // Set when a Bitrefill record moved to manual_review FROM pay_invoice_unknown
+  // or paying (a signature may exist). The sweep keeps re-reading the nonce
+  // for such records; if it later reads used, the record becomes paid
+  // (manual_review -> paid is a rank increase, allowed by saveRecordGuarded).
+  bitrefillUnknownOrigin?: boolean
+  bitrefill?: {
+    invoiceId: string
+    nonce: string
+    address: string
+    amountAtomic: string
+    expiresAt: string
+    validBefore?: number | null
+    transaction?: string | null
+  }
 }
 
 // Statuses from which no path may call pay-invoice again. A non-terminal
@@ -194,6 +213,11 @@ export function fulfillmentKvKey(plId: string) {
 
 function eventKvKey(eventId: string) {
   return `webhook-event:${eventId}`
+}
+
+/** Forget an event's dedup marker so a resend is processed again. Never throws. */
+export async function forgetWebhookEvent(env: Env, eventId: string): Promise<void> {
+  await env.MPP_STORE.delete(eventKvKey(eventId)).catch(() => undefined)
 }
 
 export async function loadRecord(env: Env, plId: string): Promise<FulfillmentRecord | null> {
@@ -322,7 +346,7 @@ export async function saveRecordGuarded(
   return out
 }
 
-function emptyRecord(plId: string): FulfillmentRecord {
+export function emptyRecord(plId: string): FulfillmentRecord {
   return {
     status: 'payin_seen',
     pl_id: plId,
@@ -588,10 +612,12 @@ export async function handleRozoWebhook(
     })
   }
 
-  // 5a. Bitrefill orders settle directly (Rozo pays the Bitrefill address);
-  // there is nothing for the router to pay, so never fall into Coinbase
-  // settlement for them.
-  if (isBitrefillOrderId(plId)) {
+  // 5a. Legacy Bitrefill orders (wallet_bitrefillpay, created before the
+  // funder model) settle directly: Rozo pays the Bitrefill address and there
+  // is nothing for the router to pay. Funder-model orders live under
+  // merchant_openrouter and go through settleCoinbaseEvent, which hands them
+  // to bitrefill-settle.ts (never to Coinbase settlement).
+  if (isBitrefillOrderId(plId) && evt.data?.appId && evt.data.appId !== OPENROUTER_APP_ID) {
     return json(200, { ok: true, ignored: 'bitrefill order settles directly', eventId, eventType, plId })
   }
 
@@ -733,7 +759,7 @@ export function deliveredReportStillPending(
 // The checkout emergency stop refused this delivery: keep the record in its
 // pre-pay status (payin_seen / failed_insufficient_balance), note why, and
 // index it so `admin resume checkout` can re-drive it. Not a failure.
-async function deferForCheckoutPause(
+export async function deferForCheckoutPause(
   env: Env,
   plId: string,
   rec: FulfillmentRecord,
@@ -770,6 +796,10 @@ export async function settleCoinbaseEvent(
   input: CoinbaseEventInput,
 ): Promise<Record<string, unknown>> {
   const { eventId, eventType, plId, rozoPaymentId, evt, now, waitUntil } = input
+
+  // Bitrefill funder-model orders share the merchant_openrouter appId and this
+  // entry point (webhook, checkout resume) but never Coinbase settlement.
+  if (isBitrefillOrderId(plId)) return settleBitrefillFunderEvent(env, input)
 
   // Load or create fulfillment record.
   let rec = await loadRecord(env, plId)
