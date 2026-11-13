@@ -1839,7 +1839,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   } else {
     let payResult: { ok: boolean; status: number; body: any }
     try {
-      payResult = await callAgentApiPayInvoice(env, plId)
+      payResult = await callAgentApiPayInvoice(env, plId, undefined, { line: 'coupon' })
     } catch (err: any) {
       payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }
     }

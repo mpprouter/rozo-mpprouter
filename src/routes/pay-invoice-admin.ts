@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { watchSignedCollector } from './coinbase-collector-watch'
 import {
   ALL_NATIVE_SOURCES,
   STABLE_SOURCES,
@@ -601,6 +602,20 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
   }
 
   const upstreamText = await upstream.text()
+  if (coinbaseId) {
+    // Alert only (never blocks, never throws): signer signed for a Coinbase
+    // token collector we have not seen.
+    try {
+      await watchSignedCollector(env, {
+        invoiceId: coinbaseId,
+        line: 'admin_pay',
+        signerStatus: upstream.status,
+        body: JSON.parse(upstreamText),
+      })
+    } catch {
+      // unparseable body or watch failure: ignore
+    }
+  }
   if (coinbaseId && attemptRef) {
     // 5xx can still mean the executor paid: only a 4xx is a definite failure.
     const status: AdminPayAttemptStatus = upstream.ok

@@ -925,7 +925,7 @@ async function executeCoinbase(
 ): Promise<void> {
   let result: { ok: boolean; status: number; body: unknown }
   try {
-    result = await callAgentApiPayInvoice(env, invoiceKey)
+    result = await callAgentApiPayInvoice(env, invoiceKey, undefined, { line: 'upi_v1', ref: orderId })
   } catch {
     // Transport failure: the executor MAY have paid. Ambiguous → unknown.
     await transition(env, orderId, 'unknown', {
