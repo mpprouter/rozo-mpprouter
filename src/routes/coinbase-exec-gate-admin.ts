@@ -26,10 +26,12 @@
 // deliberate step (see the runbook in the fulfillment techdoc).
 
 import type { Env } from '../index'
-import { casUpdate } from './stripe-atomic'
-import { readCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
+import { casRead, casUpdate } from './stripe-atomic'
+import { coinbaseExplicitlyUnsettled, readCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead as couponCasRead, couponKey, parseRecord as parseCouponRecord } from './coupon'
 import { fetchCoinbasePayment, isCoinbasePaymentId, loadRecord, saveRecordGuarded } from './webhook'
+import { handOverCryptoClaim, readInvoiceClaim, type HandOverResult } from './invoice-claim'
+import { ADMIN_PAY_HOLDER_RE, readAdminPayAttempt } from './pay-invoice-admin'
 import { timingSafeEqualStr } from '../utils/timing-safe'
 
 function json(status: number, payload: unknown): Response {
@@ -44,27 +46,28 @@ const MAX_EVIDENCE_CHARS = 1000
 
 const COUPON_HOLDER_RE = /^coupon:(\d{8}|\d{10}):(.+)$/
 const WEBHOOK_CLEARABLE = new Set(['manual_review', 'failed_pay_invoice'])
+// A manual pay whose outcome is unknown (request threw or 5xx) is clearable only
+// after this long, mirroring the webhook rule that an unknown outcome waits for
+// the sweep. Operational number, agent-set.
+export const ADMIN_PAY_UNKNOWN_CLEAR_AFTER_MS = 60 * 60 * 1000
 
-/**
- * Explicit NOT-settled recognition from the raw public Coinbase object.
- * Returns the status label when recognized as unsettled, null otherwise
- * (settled, unknown, empty or unparseable — all refuse).
- */
-export function coinbaseExplicitlyUnsettled(raw: any): string | null {
-  if (!raw || typeof raw !== 'object') return null
-  if (typeof raw.paymentSessionId === 'string') {
-    return raw.status === 'PAYMENT_SESSION_STATUS_CREATED' ? raw.status : null
-  }
-  const used = raw.usageCount
-  const max = raw.maxUsage
-  if (typeof used === 'number' && typeof max === 'number' && Number.isFinite(used) && Number.isFinite(max) && used < max) {
-    return `v1 usage ${used}/${max}`
-  }
-  return null
-}
+// Moved to coinbase-exec-gate.ts (coupon.ts needs it and coupon.ts is
+// imported by this module); re-exported so existing importers keep working.
+export { coinbaseExplicitlyUnsettled }
 
 export function coinbaseExecGateClearLogKey(plId: string): string {
   return `coinbase-pay-exec-clear-log:v1:${plId}`
+}
+
+async function lastClearLogEntry(env: Env, plId: string): Promise<any | null> {
+  const { value } = await casRead(env, coinbaseExecGateClearLogKey(plId))
+  if (!value) return null
+  try {
+    const log = JSON.parse(value)
+    return Array.isArray(log) && log.length ? log[log.length - 1] : null
+  } catch {
+    return null
+  }
 }
 
 export async function handleCoinbaseExecGateClear(request: Request, env: Env): Promise<Response> {
@@ -94,7 +97,24 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
   if (!expectedHolder) return json(400, { error: 'expectedHolder is required (the holder you verified)' })
 
   const holder = await readCoinbaseExecGate(env, plId)
-  if (!holder) return json(200, { ok: true, changed: false, reason: 'gate not held', plId })
+  if (!holder) {
+    // Read-back for a clear whose response was lost: the gate is already free
+    // and the invoice claim is still parked on the re-pay ref the last clear
+    // logged. No pay ran under that ref (it would hold the gate again), so the
+    // same ref is returned instead of leaving the claim on a ref nobody knows.
+    const last = await lastClearLogEntry(env, plId)
+    const claim = await readInvoiceClaim(env, plId)
+    if (
+      last &&
+      typeof last.repayRef === 'string' &&
+      last.previousHolder?.holder === expectedHolder &&
+      claim?.channel === 'crypto' &&
+      claim.ref === last.repayRef
+    ) {
+      return json(200, { ok: true, changed: false, reason: 'already cleared; re-pay ref unused', plId, repayRef: last.repayRef })
+    }
+    return json(200, { ok: true, changed: false, reason: 'gate not held', plId })
+  }
   if (holder.holder !== expectedHolder) {
     return json(409, { error: 'gate holder does not match expectedHolder', plId, holder: holder.holder })
   }
@@ -109,6 +129,28 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
         error: 'coupon record is not in manual_review for this attempt and link; refusing to clear',
         plId,
         couponStatus: coupon?.status ?? null,
+      })
+    }
+  } else if (ADMIN_PAY_HOLDER_RE.test(expectedHolder)) {
+    // Manual /admin/pay-invoice holder: its own attempt record must exist for
+    // this holder and be a definite failure, or an unknown outcome old enough.
+    // An attempt record that is missing or names another ref means this
+    // holder's "sent" marker was never written, so its request never went out
+    // (the marker is written before the fetch). That case, like an unknown
+    // outcome, waits until the gate is old enough that no request taken under
+    // it can still be running.
+    const attempt = await readAdminPayAttempt(env, plId)
+    const ownAttempt = !!attempt && attempt.ref === expectedHolder
+    const age = ownAttempt ? Date.now() - Date.parse(attempt!.at) : Date.now() - Date.parse(holder.at)
+    const parked = ownAttempt
+      ? attempt!.status === 'failed' ||
+        ((attempt!.status === 'unknown' || attempt!.status === 'sent') && age >= ADMIN_PAY_UNKNOWN_CLEAR_AFTER_MS)
+      : age >= ADMIN_PAY_UNKNOWN_CLEAR_AFTER_MS
+    if (!parked) {
+      return json(409, {
+        error: 'manual pay attempt is not a definite failure (or an unknown outcome older than 1 h); refusing to clear',
+        plId,
+        attemptStatus: attempt?.status ?? null,
       })
     }
   } else {
@@ -135,23 +177,45 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
     })
   }
 
-  // (c) Single CAS: clears only if the stored holder still equals expectedHolder.
-  const cleared = await releaseCoinbaseExecGate(env, plId, expectedHolder)
-  if (!cleared) return json(409, { error: 'gate holder changed during the request; nothing cleared', plId })
+  // (c) Verified recovery path for a manual /admin/pay-invoice re-pay: the
+  // per-invoice claim taken by the failed manual attempt would otherwise refuse
+  // every later payment for good. Hand that crypto claim to a fresh re-pay ref;
+  // /admin/pay-invoice accepts it as `repay_ref`. Only for admin-pay holders:
+  // a coupon re-pay (release + redeem) and a webhook record re-enter their own
+  // claim, so theirs is left untouched. A UPI claim is never taken over.
+  // Order: hand over, log, then release the gate. A crash before the release
+  // leaves the gate held, so a retry of this clear redoes every step; a crash
+  // or lost response after it is answered by the read-back above.
+  const isAdminPayHolder = ADMIN_PAY_HOLDER_RE.test(expectedHolder)
+  const repayRef = `admin-repay:${crypto.randomUUID()}`
+  const handover: HandOverResult | null = isAdminPayHolder ? await handOverCryptoClaim(env, plId, repayRef) : null
 
   const at = new Date().toISOString()
-  const entry = { at, clearedBy, evidence, previousHolder: holder, coinbaseStatus: unsettled }
+  const entry = {
+    at,
+    clearedBy,
+    evidence,
+    previousHolder: holder,
+    coinbaseStatus: unsettled,
+    repayRef: handover?.ok ? repayRef : null,
+    previousClaim: handover ? (handover.ok ? handover.previous : handover.holder) : null,
+  }
   await casUpdate<null>(env, coinbaseExecGateClearLogKey(plId), (cur) => {
     let log: unknown[] = []
     try {
       const parsed = cur ? JSON.parse(cur) : []
       if (Array.isArray(parsed)) log = parsed
     } catch {
-      /* corrupt log — start fresh, the new entry is still recorded */
+      /* corrupt log: start fresh, the new entry is still recorded */
     }
     log.push(entry)
     return { op: 'set', value: JSON.stringify(log), result: null }
   })
+
+  // (d) Single CAS: clears only if the stored holder still equals expectedHolder.
+  const cleared = await releaseCoinbaseExecGate(env, plId, expectedHolder)
+  if (!cleared) return json(409, { error: 'gate holder changed during the request; gate not released', plId })
+
   const rec = await loadRecord(env, plId)
   if (rec) {
     rec.events.push({ kind: 'exec_gate_cleared_by_admin', at, detail: entry })
@@ -159,5 +223,13 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
   }
   console.log(`[coinbase-exec-gate] cleared by admin: ${JSON.stringify({ plId, clearedBy, at, coinbaseStatus: entry.coinbaseStatus })}`)
 
-  return json(200, { ok: true, changed: cleared, plId, clearedAt: at, coinbaseStatus: entry.coinbaseStatus })
+  return json(200, {
+    ok: true,
+    changed: cleared,
+    plId,
+    clearedAt: at,
+    coinbaseStatus: entry.coinbaseStatus,
+    repayRef: entry.repayRef,
+    ...(handover && !handover.ok ? { claimHeldBy: handover.holder.channel } : {}),
+  })
 }
