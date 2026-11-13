@@ -10,6 +10,8 @@ import {
   hmacSha256Hex,
   loadFulfillment,
   fulfillmentKey,
+  checkUpiV2Config,
+  sanitizeDownstreamReason,
 } from '../src/routes/upi-invoice'
 import { claimInvoiceKey, readInvoiceClaim } from '../src/routes/invoice-claim'
 import { stopCheckout } from '../src/routes/checkout-control'
@@ -76,6 +78,8 @@ interface World {
   payCalls: Array<any>
   approval: Answer | 'auto-approve'
   approvalCalls: Array<{ headers: Record<string, string>; body: any; sigOk: boolean }>
+  alerts: string[]
+  alertDown: boolean
 }
 
 let world: World
@@ -103,6 +107,10 @@ function installFetch() {
     if (url === 'https://agentapi.rozo.ai/pay-invoice') {
       world.payCalls.push(JSON.parse(String(init?.body ?? '{}')))
       return respond(world.payInvoice)
+    }
+    if (url.startsWith('https://oapi.dingtalk.com/')) {
+      world.alerts.push(String(init?.body ?? ''))
+      return world.alertDown ? new Response('down', { status: 503 }) : Response.json({ errcode: 0 })
     }
     if (url === APPROVAL_URL) {
       const h = new Headers(init?.headers)
@@ -229,6 +237,8 @@ beforeEach(() => {
     payCalls: [],
     approval: 'auto-approve',
     approvalCalls: [],
+    alerts: [],
+    alertDown: false,
   }
   installFetch()
 })
@@ -700,5 +710,169 @@ describe('verified-funding: one claim namespace shared with v1, crypto and coupo
     expect(world.payCalls.length).toBe(1)
     // v1 status payload keeps its original shape.
     expect(Object.keys((await status(env)).body).sort()).toEqual(['execution_ref', 'provider_final_state', 'state', 'updated_at'])
+  })
+})
+
+// ── Operational alerts (2026-11-13 incident follow-up) ──────────────────────
+
+const ALERTING = { DINGTALK_ACCESS_TOKEN: 'dt-test-token' } as Partial<Env>
+
+describe('verified-funding: pre-sign refusal reason and alert', () => {
+  it('persists the sanitized downstream reason, exposes it in reason, alerts once', async () => {
+    const env = makeEnv(ALERTING)
+    const q = await quote(env, PS_URL)
+    world.payInvoice = {
+      status: 422,
+      body: { error_code: 'PRE_SIGN_BINDING_MISMATCH', payment_attempted: false, reason: 'Fingerprint Mismatch' },
+    }
+    const r = await fund(env, creditBody(q))
+    expect(r.status).toBe(202)
+    expect(r.body).toMatchObject({
+      state: 'failed',
+      execution_phase: 'terminal',
+      failure_class: 'definite_not_paid',
+      reason: 'pre_sign_binding_mismatch:fingerprint_mismatch',
+    })
+    const rec = (await loadFulfillment(env, ORDER))!
+    expect(rec.failureReason).toBe('pre_sign_binding_mismatch')
+    expect(rec.downstreamReason).toBe('fingerprint_mismatch')
+    const ev = rec.events.find((e) => e.kind === 'pre_sign_binding_mismatch')
+    expect(ev?.detail).toEqual({ status: 422, reason: 'fingerprint_mismatch' })
+    expect(await readInvoiceClaim(env, 'paymentSession_xyz789')).toBeNull()
+
+    expect(world.alerts.length).toBe(1)
+    expect(world.alerts[0]).toContain('REFUSED before signing')
+    expect(world.alerts[0]).toContain('fingerprint_mismatch')
+    expect(world.alerts[0]).toContain('auto-refunds the customer')
+    expect(world.alerts[0]).toContain(ORDER)
+
+    // Status keeps the same shape; replays neither re-call nor re-alert.
+    const st = (await status(env)).body
+    expect(st).toMatchObject({ failure_class: 'definite_not_paid', reason: 'pre_sign_binding_mismatch:fingerprint_mismatch' })
+    await fund(env, creditBody(q))
+    expect(world.payCalls.length).toBe(1)
+    expect(world.alerts.length).toBe(1)
+  })
+
+  it('a refusal without a usable reason keeps the plain code and still alerts', async () => {
+    const env = makeEnv(ALERTING)
+    const q = await quote(env, PS_URL)
+    world.payInvoice = { status: 422, body: { error_code: 'PRE_SIGN_BINDING_MISMATCH', payment_attempted: false, reason: { x: 1 } } }
+    const r = await fund(env, creditBody(q))
+    expect(r.body).toMatchObject({ failure_class: 'definite_not_paid', reason: 'pre_sign_binding_mismatch' })
+    expect((await loadFulfillment(env, ORDER))!.downstreamReason).toBeNull()
+    expect(world.alerts.length).toBe(1)
+    expect(world.alerts[0]).toContain('no reason given')
+  })
+
+  it('sanitizes downstream reasons to short [a-z0-9_] identifiers', () => {
+    expect(sanitizeDownstreamReason('amount_mismatch')).toBe('amount_mismatch')
+    expect(sanitizeDownstreamReason('Target changed: 0xABC!')).toBe('target_changed_0xabc')
+    expect(sanitizeDownstreamReason('<script>alert(1)</script>')).toBe('script_alert_1_script')
+    expect(sanitizeDownstreamReason('a'.repeat(500))).toBe('a'.repeat(64))
+    expect(sanitizeDownstreamReason('x'.repeat(63) + ' yyy')).toBe('x'.repeat(63))
+    expect(sanitizeDownstreamReason('!!!')).toBeNull()
+    expect(sanitizeDownstreamReason('')).toBeNull()
+    expect(sanitizeDownstreamReason(42)).toBeNull()
+    expect(sanitizeDownstreamReason(null)).toBeNull()
+  })
+
+  it('ambiguous executor answers keep their existing alert and no reason field change', async () => {
+    const env = makeEnv(ALERTING)
+    const q = await quote(env, PS_URL)
+    world.payInvoice = { status: 500, body: { error: 'boom', reason: 'whatever' } }
+    const r = await fund(env, creditBody(q))
+    expect(r.body).toMatchObject({ state: 'unknown', failure_class: 'ambiguous', reason: 'executor status 500' })
+    expect(world.alerts.length).toBe(1)
+    expect(world.alerts[0]).not.toContain('REFUSED before signing')
+    expect((await loadFulfillment(env, ORDER))!.downstreamReason).toBeUndefined()
+  })
+})
+
+describe('verified-funding: approval config gap alert', () => {
+  it('queues and alerts immediately, at most once per hour across orders', async () => {
+    const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined })
+    const q = await quote(env, PS_URL)
+    const r1 = await fund(env, creditBody(q))
+    expect(r1.body).toMatchObject({ state: 'queued', execution_phase: 'not_started', failure_class: null, reason: 'eligibility_unavailable' })
+    expect(world.payCalls.length).toBe(0)
+    expect(world.alerts.length).toBe(1)
+    expect(world.alerts[0]).toContain('approval check is not configured')
+    expect(world.alerts[0]).toContain(ORDER)
+
+    // Same order replayed and a second order: still queued, no new alert.
+    await fund(env, creditBody(q))
+    const r2 = await fund(env, creditBody(q, { order_id: ORDER2 }), { idem: ORDER2 })
+    expect(r2.body).toMatchObject({ state: 'queued', reason: 'eligibility_unavailable' })
+    expect(world.alerts.length).toBe(1)
+    expect(world.payCalls.length).toBe(0)
+  })
+
+  it('a transient approval outage queues without the config alert', async () => {
+    const env = makeEnv(ALERTING)
+    const q = await quote(env, PS_URL)
+    world.approval = { status: 503, body: {} }
+    const r = await fund(env, creditBody(q))
+    expect(r.body).toMatchObject({ state: 'queued', reason: 'eligibility_unavailable' })
+    expect(world.alerts.length).toBe(0)
+  })
+})
+
+describe('checkUpiV2Config (cron self-check)', () => {
+  it('alerts when v2 is on and the MuggleLink origin is missing, deduped', async () => {
+    const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined })
+    await checkUpiV2Config(env)
+    expect(world.alerts.length).toBe(1)
+    expect(world.alerts[0]).toContain('approval check is not configured')
+    expect(world.alerts[0]).toContain('self-check')
+    await checkUpiV2Config(env)
+    await checkUpiV2Config(env)
+    expect(world.alerts.length).toBe(1)
+  })
+
+  it('treats a non-https origin as missing', async () => {
+    const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: 'http://mugglelink.test' })
+    await checkUpiV2Config(env)
+    expect(world.alerts.length).toBe(1)
+  })
+
+  it('is silent when v2 is off or the config is complete', async () => {
+    await checkUpiV2Config(makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined, UPI_VERIFIED_FUNDING_V2_ENABLED: 'false' }))
+    await checkUpiV2Config(makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined, UPI_VERIFIED_FUNDING_V2_ENABLED: undefined }))
+    await checkUpiV2Config(makeEnv(ALERTING))
+    expect(world.alerts.length).toBe(0)
+  })
+
+  it('concurrent callers send one alert (atomic claim)', async () => {
+    const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined })
+    await Promise.all(Array.from({ length: 8 }, () => checkUpiV2Config(env)))
+    expect(world.alerts.length).toBe(1)
+  })
+
+  it('a failed delivery shortens the window so the alert is retried later', async () => {
+    const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined })
+    world.alertDown = true
+    const t0 = Date.now()
+    await checkUpiV2Config(env)
+    const tried = world.alerts.length
+    expect(tried).toBeGreaterThan(0)
+    await checkUpiV2Config(env) // still inside the short retry window
+    expect(world.alerts.length).toBe(tried)
+    world.alertDown = false
+    const realNow = Date.now
+    Date.now = () => t0 + 11 * 60 * 1000
+    try {
+      await checkUpiV2Config(env)
+    } finally {
+      Date.now = realNow
+    }
+    expect(world.alerts.length).toBe(tried + 1)
+  })
+
+  it('never throws, even when the atomic store fails', async () => {
+    const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined })
+    ;(env as any).ATOMIC_STORE = { idFromName: () => { throw new Error('do down') }, get: () => { throw new Error('do down') } }
+    await expect(checkUpiV2Config(env)).resolves.toBeUndefined()
+    expect(world.alerts.length).toBe(0)
   })
 })

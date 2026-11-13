@@ -34,6 +34,9 @@ export const APPROVAL_VERIFY_PURPOSE = 'approval-verify:v1'
 // Network deadline for one verification call. Not a business window: a
 // timeout only keeps the order queued for a later retry.
 const APPROVAL_VERIFY_TIMEOUT_MS = 10_000
+// `unavailable` detail for a configuration gap (as opposed to a transient
+// network/5xx answer). Callers alert on it: it never heals by waiting.
+export const APPROVAL_NOT_CONFIGURED_DETAIL = 'approval verification is not configured'
 
 export interface ApprovalVerifyRequest {
   approval_id: string
@@ -74,6 +77,12 @@ function baseUrl(env: Env): string | null {
   }
 }
 
+/** True when the approval check can run at all (secret present, https origin). */
+export function approvalVerifyConfigured(env: Env): boolean {
+  const secret = env.UPI_INTERNAL_KEY
+  return !!secret && secret.length >= 16 && baseUrl(env) !== null
+}
+
 export async function verifyInvoiceApproval(
   env: Env,
   req: ApprovalVerifyRequest,
@@ -82,7 +91,7 @@ export async function verifyInvoiceApproval(
   const secret = env.UPI_INTERNAL_KEY
   const origin = baseUrl(env)
   if (!secret || secret.length < 16 || !origin) {
-    return { kind: 'unavailable', detail: 'approval verification is not configured' }
+    return { kind: 'unavailable', detail: APPROVAL_NOT_CONFIGURED_DETAIL }
   }
   const rawBody = JSON.stringify(req)
   const timestamp = String(Math.floor(nowMs / 1000))

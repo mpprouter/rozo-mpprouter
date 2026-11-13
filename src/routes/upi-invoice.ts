@@ -69,7 +69,13 @@ import {
   canonicalInteger,
   rewardBindingFromCoinbase,
 } from '../utils/upi-reward-binding'
-import { verifyInvoiceApproval } from './upi-approval-verify'
+import {
+  APPROVAL_NOT_CONFIGURED_DETAIL,
+  approvalVerifyConfigured,
+  verifyInvoiceApproval,
+} from './upi-approval-verify'
+import { alertSinkConfigured, sendAlert } from '../utils/alert'
+import { redactForAlert } from '../utils/alert-redaction'
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
@@ -103,6 +109,9 @@ export interface UpiFulfillmentRecord {
   // Why a not_started v2 record is still queued (e.g. eligibility_unavailable).
   queuedReason?: string | null
   binding?: V2FrozenBinding | null
+  // Sanitized `reason` from a structured pre-sign refusal (422
+  // PRE_SIGN_BINDING_MISMATCH), so the cause survives in the record.
+  downstreamReason?: string | null
 }
 
 // v2 execution bookkeeping (design §5.4 / §6):
@@ -444,6 +453,11 @@ function statusPayload(rec: UpiFulfillmentRecord) {
 
 function v2Reason(rec: UpiFulfillmentRecord): string | null {
   if (rec.state === 'queued') return rec.queuedReason ?? null
+  // Same `<code>:<detail>` shape as merchant_not_approved:<reason>. Callers
+  // key on failure_class, never on this string.
+  if (rec.failureReason === 'pre_sign_binding_mismatch' && rec.downstreamReason) {
+    return `${rec.failureReason}:${rec.downstreamReason}`
+  }
   return rec.failureReason
 }
 
@@ -1543,7 +1557,7 @@ async function runV2(
   // 2. Live quote, binding fingerprint and merchant approval.
   const g1 = await v2Gate(env, body, rec.binding, nowMs)
   if (g1.kind === 'refuse') return refuse(g1.code, g1)
-  if (g1.kind === 'unavailable') return v2Response(await v2Queue(env, orderId, g1.reason, g1.extra))
+  if (g1.kind === 'unavailable') return queueUnavailable(env, body, g1)
   const frozen = await casV2(env, orderId, (r) => {
     if (!isV2Open(r)) return false
     if (r.binding && r.binding.fingerprint !== g1.binding.fingerprint) return false
@@ -1570,7 +1584,7 @@ async function runV2(
   //    approval still valid (design §6.1).
   const g2 = await v2Gate(env, body, frozen.rec.binding, nowMs)
   if (g2.kind === 'refuse') return refuse(g2.code, g2)
-  if (g2.kind === 'unavailable') return v2Response(await v2Queue(env, orderId, g2.reason, g2.extra))
+  if (g2.kind === 'unavailable') return queueUnavailable(env, body, g2)
 
   // 5. Wallet inventory gate, as v1. Unreadable → attempt (executor re-checks).
   const invoiceAtomic = BigInt(g2.inv.stablecoinAmountAtomic)
@@ -1616,6 +1630,118 @@ async function runV2(
   }
   await run
   return v2Response((await loadFulfillment(env, orderId)) ?? acquired.rec)
+}
+
+/**
+ * Downstream refusal reasons are stored and alerted, so keep them to a short
+ * identifier: lowercase [a-z0-9_], at most 64 chars. Anything else → null.
+ */
+export function sanitizeDownstreamReason(v: unknown): string | null {
+  if (typeof v !== 'string') return null
+  const s = v
+    .slice(0, 256)
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64)
+    .replace(/_+$/, '')
+  return s.length > 0 ? s : null
+}
+
+// ── v2 operational alerts (deduped in KV; never affect the order) ───────────
+
+const V2_APPROVAL_GAP_ALERT_KEY = 'upi-v2-alert:approval_not_configured'
+const V2_APPROVAL_GAP_ALERT_TTL_S = 60 * 60
+const V2_CONFIG_SELFCHECK_ALERT_KEY = 'upi-v2-alert:config_selfcheck'
+const V2_CONFIG_SELFCHECK_ALERT_TTL_S = 6 * 60 * 60
+
+// After a failed delivery the window shrinks to this, so a recovered alert
+// channel hears about a still-open gap soon, without a 2-minute cron storm.
+const V2_ALERT_RETRY_AFTER_FAILED_DELIVERY_S = 10 * 60
+
+/**
+ * Send at most one alert per `key` per `ttlS`. The send right is taken with
+ * one atomic CAS on the Durable Object store (value = window end, ISO), so
+ * concurrent callers cannot all fire. If no channel confirms delivery the
+ * window is cut to V2_ALERT_RETRY_AFTER_FAILED_DELIVERY_S. Never throws.
+ */
+async function alertOnce(env: Env, key: string, ttlS: number, text: string): Promise<void> {
+  try {
+    if (!alertSinkConfigured(env)) {
+      console.warn(`[upi-v2] alert SKIPPED (no alert channel configured): ${key}`)
+      return
+    }
+    const nowMs = Date.now()
+    const until = new Date(nowMs + ttlS * 1000).toISOString()
+    const won = await casUpdate<boolean>(env, key, (cur) => {
+      const end = cur ? Date.parse(cur) : NaN
+      if (Number.isFinite(end) && end > nowMs) return { op: 'noop', result: false }
+      return { op: 'set', value: until, result: true }
+    })
+    if (!won) return
+    const delivered = await sendAlert(env, redactForAlert(text))
+    if (!delivered) {
+      const retryAt = new Date(nowMs + V2_ALERT_RETRY_AFTER_FAILED_DELIVERY_S * 1000).toISOString()
+      await casUpdate<void>(env, key, (cur) =>
+        cur === until ? { op: 'set', value: retryAt, result: undefined } : { op: 'noop', result: undefined },
+      )
+    }
+  } catch (e) {
+    console.warn(`[upi-v2] alert error (non-fatal): ${e instanceof Error ? e.message : String(e)}`)
+  }
+}
+
+function approvalGapAlertText(where: string): string {
+  return [
+    '[MPP Router] 🚨 UPI reward orders QUEUED: merchant approval check is not configured',
+    where,
+    'UPI_MUGGLELINK_BASE_URL (https origin) or UPI_INTERNAL_KEY is missing or invalid while UPI_VERIFIED_FUNDING_V2_ENABLED=true.',
+    'Credit-funded orders stay queued (eligibility_unavailable); nothing is paid and nothing is refunded until the configuration is fixed.',
+    `At: ${new Date().toISOString()}`,
+  ].join('\n')
+}
+
+/** A v2 order was just queued because the approval check cannot run at all. */
+async function alertApprovalNotConfigured(env: Env, orderId: string, invoiceKey: string): Promise<void> {
+  await alertOnce(
+    env,
+    V2_APPROVAL_GAP_ALERT_KEY,
+    V2_APPROVAL_GAP_ALERT_TTL_S,
+    approvalGapAlertText(`Order: ${orderId} (invoice ${invoiceKey}). Further orders within 1h are not re-alerted.`),
+  )
+}
+
+async function queueUnavailable(
+  env: Env,
+  body: VerifiedFundingBody,
+  g: { reason: string; extra?: unknown },
+): Promise<Response> {
+  const rec = await v2Queue(env, body.order_id, g.reason, g.extra)
+  const detail = (g.extra as { detail?: unknown } | undefined)?.detail
+  if (detail === APPROVAL_NOT_CONFIGURED_DETAIL) {
+    await alertApprovalNotConfigured(env, body.order_id, body.invoice_key)
+  }
+  return v2Response(rec)
+}
+
+/**
+ * Cron self-check (scheduled handler): v2 switched on but the approval check
+ * cannot run means every credit order would sit queued. Alert at most once
+ * per 6h. Read-only; never touches a record. Never throws.
+ */
+export async function checkUpiV2Config(env: Env): Promise<void> {
+  try {
+    if (env.UPI_VERIFIED_FUNDING_V2_ENABLED !== 'true') return
+    if (approvalVerifyConfigured(env)) return
+    await alertOnce(
+      env,
+      V2_CONFIG_SELFCHECK_ALERT_KEY,
+      V2_CONFIG_SELFCHECK_ALERT_TTL_S,
+      approvalGapAlertText('Found by the scheduled self-check (re-alerted at most every 6h).'),
+    )
+  } catch (e) {
+    console.warn(`[upi-v2] config self-check error (non-fatal): ${e instanceof Error ? e.message : String(e)}`)
+  }
 }
 
 function isPreSignBindingMismatch(result: { status: number; body: unknown }): boolean {
@@ -1669,13 +1795,24 @@ async function executeCoinbaseV2(
   if (isPreSignBindingMismatch(result)) {
     // Trusted, structured downstream answer: refused before any signature or
     // submission. The only post-call failure that is definite.
+    const downstream = sanitizeDownstreamReason((result.body as Record<string, unknown>).reason)
     const out = await mark('pre_sign_binding_mismatch', (r) => {
       r.state = 'failed'
       r.executionPhase = 'terminal'
       r.failureClass = 'definite_not_paid'
       r.failureReason = 'pre_sign_binding_mismatch'
-    }, { status: result.status })
-    if (out.applied) await releaseInvoiceClaim(env, invoiceKey, 'upi', orderId)
+      r.downstreamReason = downstream
+    }, { status: result.status, reason: downstream })
+    if (out.applied) {
+      await releaseInvoiceClaim(env, invoiceKey, 'upi', orderId)
+      await sendInvoiceFailureAlert(env, {
+        kind: 'upi_refused_before_signing',
+        plId: `${invoiceKey} (UPI reward order ${orderId})`,
+        invoiceAtomic,
+        funderBalanceAtomic: null,
+        failureReason: `pre_sign_binding_mismatch: ${downstream ?? 'no reason given'}`,
+      })
+    }
     return
   }
   // Any other post-call answer (4xx/5xx/unknown JSON) cannot rule out a spend.
