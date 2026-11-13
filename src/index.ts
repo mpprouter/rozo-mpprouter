@@ -126,6 +126,7 @@ import {
   handleUpiVerifiedPayIn,
   handleUpiVerifiedFunding,
   handleUpiFulfillmentStatus,
+  checkUpiV2Config,
 } from './routes/upi-invoice'
 import { handlePreflight, withCors } from './utils/cors'
 import { scrubErrorResponse, stellarRpcUrl } from './utils/stellar-rpc'
@@ -603,7 +604,8 @@ export interface Env {
   // ---- UPI rewards: POST /api/invoice/verified-funding (v2) -------------
   // Master switch for v2. Exactly "true" enables it; anything else refuses
   // every new v2 order with a persistent pre-execution refusal (fail closed).
-  // Plain var. See routes/upi-invoice.ts.
+  // Set as a Worker secret (wrangler secret put), not in wrangler.toml.
+  // See routes/upi-invoice.ts.
   UPI_VERIFIED_FUNDING_V2_ENABLED?: string
   // Optional per-order ceiling on reward credit spent through v2, in
   // micro-USD (decimal integer string). Unset ⇒ no extra ceiling (same
@@ -611,7 +613,9 @@ export interface Env {
   UPI_V2_MAX_CREDIT_MICRO?: string
   // MuggleLink origin for the internal merchant-approval check
   // (POST /api/internal/rewards/verify-invoice-approval), https only. Unset ⇒
-  // approval is unavailable and credit orders stay queued. Plain var.
+  // approval is unavailable and credit orders stay queued; that queue path and
+  // the cron self-check (checkUpiV2Config) both alert. Set as a Worker secret
+  // (wrangler secret put), not in wrangler.toml.
   UPI_MUGGLELINK_BASE_URL?: string
 
   // Caller-side daily-spend cap for Stripe fulfillment, in whole USD (e.g.
@@ -810,6 +814,9 @@ export default {
         console.warn(`[x402-reconcile] skipped: ${(err as Error).message}`)
       }))
     }
+    // UPI rewards (v2) config self-check: v2 on but the merchant approval
+    // check cannot run → alert (KV-deduped to once per 6h). Never throws.
+    ctx.waitUntil(checkUpiV2Config(env))
     // Checkout feedback → Feishu queue (retries, quiet hours, dedup by id).
     ctx.waitUntil(drainCheckoutFeedbackNotifications(env))
     // Free 402 probes only. Scheduled health monitoring never spends money.

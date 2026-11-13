@@ -474,6 +474,14 @@ PLAYGROUND_CHANNEL_WASM_HASH = "d6717aa80e0a1e6f5e6e6b5a8a4c00219ecbd1d3c5be61a4
 #                                  those routes answer 503. Own secret so it
 #                                  rotates independently of
 #                                  PAYINVOICE_ADMIN_SECRET.
+# UPI_VERIFIED_FUNDING_V2_ENABLED — "true" enables UPI rewards (v2,
+#                                  /api/invoice/verified-funding). Set as a
+#                                  secret, not a [vars] entry.
+# UPI_MUGGLELINK_BASE_URL        — https MuggleLink origin for the v2 merchant
+#                                  approval check. Set as a secret. Missing
+#                                  while v2 is on ⇒ credit orders stay queued;
+#                                  the queue path and the 2-minute cron
+#                                  self-check alert (KV-deduped).
 # REFUND_EXECUTOR_TOKEN          — dedicated bearer token for the pull-only
 #                                  refund executor admin endpoints.
 # MERCURYDATA_MAINNET_JWT        — Mercury (Stellar indexer, xycloo Labs) scoped

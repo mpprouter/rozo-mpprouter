@@ -396,6 +396,7 @@ export interface InvoiceFailureAlertParams {
     | 'pay_invoice_unknown'
     | 'order_binding_failed'
     | 'daily_cap_reached'
+    | 'upi_refused_before_signing'
   plId: string
   invoiceAtomic: bigint | null
   funderBalanceAtomic: bigint | null
@@ -412,7 +413,9 @@ function fmtUsdcAtomic(atomic: bigint | null | undefined): string {
 export function buildInvoiceFailureAlert(params: InvoiceFailureAlertParams): string {
   const funderMasked = maskAddresses(FUNDER_WALLET)
   const headline =
-    params.kind === 'failed_insufficient_balance'
+    params.kind === 'upi_refused_before_signing'
+      ? '🚨 UPI reward order REFUSED before signing: pay-invoice binding mismatch'
+      : params.kind === 'failed_insufficient_balance'
       ? '🚨 Invoice fulfillment BLOCKED: insufficient funder balance'
       : params.kind === 'order_binding_failed'
         ? '🚨 Invoice fulfillment REFUSED: Rozo order does not match the invoice'
@@ -422,7 +425,9 @@ export function buildInvoiceFailureAlert(params: InvoiceFailureAlertParams): str
             ? '🚨 Invoice fulfillment UNKNOWN: pay-invoice was sent, outcome not known'
             : '🚨 Invoice fulfillment FAILED: pay-invoice call did not succeed'
   const action =
-    params.kind === 'failed_insufficient_balance'
+    params.kind === 'upi_refused_before_signing'
+      ? 'Nothing was paid (refused before any signature). The order is recorded definite_not_paid, so MuggleLink auto-refunds the customer. Do NOT pay this invoice by hand; check why the invoice no longer matches its frozen binding.'
+      : params.kind === 'failed_insufficient_balance'
       ? 'Caller already paid — top up the funder wallet, then replay the webhook.'
       : params.kind === 'order_binding_failed'
         ? 'Nothing was paid. Check the Rozo order against the invoice by hand before any manual payment.'
