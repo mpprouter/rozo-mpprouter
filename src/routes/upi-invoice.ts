@@ -1650,14 +1650,20 @@ export function sanitizeDownstreamReason(v: unknown): string | null {
 
 // ── v2 operational alerts (deduped in KV; never affect the order) ───────────
 
-const V2_APPROVAL_GAP_ALERT_KEY = 'upi:v2:alert:approval_not_configured'
+const V2_APPROVAL_GAP_ALERT_KEY = 'upi-v2-alert:approval_not_configured'
 const V2_APPROVAL_GAP_ALERT_TTL_S = 60 * 60
-const V2_CONFIG_SELFCHECK_ALERT_KEY = 'upi:v2:alert:config_selfcheck'
+const V2_CONFIG_SELFCHECK_ALERT_KEY = 'upi-v2-alert:config_selfcheck'
 const V2_CONFIG_SELFCHECK_ALERT_TTL_S = 6 * 60 * 60
 
+// After a failed delivery the window shrinks to this, so a recovered alert
+// channel hears about a still-open gap soon, without a 2-minute cron storm.
+const V2_ALERT_RETRY_AFTER_FAILED_DELIVERY_S = 10 * 60
+
 /**
- * Send at most one alert per `key` per `ttlS`. The key is taken before
- * sending so concurrent callers cannot all fire. Never throws.
+ * Send at most one alert per `key` per `ttlS`. The send right is taken with
+ * one atomic CAS on the Durable Object store (value = window end, ISO), so
+ * concurrent callers cannot all fire. If no channel confirms delivery the
+ * window is cut to V2_ALERT_RETRY_AFTER_FAILED_DELIVERY_S. Never throws.
  */
 async function alertOnce(env: Env, key: string, ttlS: number, text: string): Promise<void> {
   try {
@@ -1665,9 +1671,21 @@ async function alertOnce(env: Env, key: string, ttlS: number, text: string): Pro
       console.warn(`[upi-v2] alert SKIPPED (no alert channel configured): ${key}`)
       return
     }
-    if (await env.MPP_STORE.get(key)) return
-    await env.MPP_STORE.put(key, new Date().toISOString(), { expirationTtl: ttlS })
-    await sendAlert(env, redactForAlert(text))
+    const nowMs = Date.now()
+    const until = new Date(nowMs + ttlS * 1000).toISOString()
+    const won = await casUpdate<boolean>(env, key, (cur) => {
+      const end = cur ? Date.parse(cur) : NaN
+      if (Number.isFinite(end) && end > nowMs) return { op: 'noop', result: false }
+      return { op: 'set', value: until, result: true }
+    })
+    if (!won) return
+    const delivered = await sendAlert(env, redactForAlert(text))
+    if (!delivered) {
+      const retryAt = new Date(nowMs + V2_ALERT_RETRY_AFTER_FAILED_DELIVERY_S * 1000).toISOString()
+      await casUpdate<void>(env, key, (cur) =>
+        cur === until ? { op: 'set', value: retryAt, result: undefined } : { op: 'noop', result: undefined },
+      )
+    }
   } catch (e) {
     console.warn(`[upi-v2] alert error (non-fatal): ${e instanceof Error ? e.message : String(e)}`)
   }

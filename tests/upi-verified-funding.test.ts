@@ -79,6 +79,7 @@ interface World {
   approval: Answer | 'auto-approve'
   approvalCalls: Array<{ headers: Record<string, string>; body: any; sigOk: boolean }>
   alerts: string[]
+  alertDown: boolean
 }
 
 let world: World
@@ -109,7 +110,7 @@ function installFetch() {
     }
     if (url.startsWith('https://oapi.dingtalk.com/')) {
       world.alerts.push(String(init?.body ?? ''))
-      return Response.json({ errcode: 0 })
+      return world.alertDown ? new Response('down', { status: 503 }) : Response.json({ errcode: 0 })
     }
     if (url === APPROVAL_URL) {
       const h = new Headers(init?.headers)
@@ -237,6 +238,7 @@ beforeEach(() => {
     approval: 'auto-approve',
     approvalCalls: [],
     alerts: [],
+    alertDown: false,
   }
   installFetch()
 })
@@ -841,9 +843,36 @@ describe('checkUpiV2Config (cron self-check)', () => {
     expect(world.alerts.length).toBe(0)
   })
 
-  it('never throws, even when KV fails', async () => {
+  it('concurrent callers send one alert (atomic claim)', async () => {
     const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined })
-    ;(env as any).MPP_STORE = { get: async () => { throw new Error('kv down') }, put: async () => {}, delete: async () => {} }
+    await Promise.all(Array.from({ length: 8 }, () => checkUpiV2Config(env)))
+    expect(world.alerts.length).toBe(1)
+  })
+
+  it('a failed delivery shortens the window so the alert is retried later', async () => {
+    const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined })
+    world.alertDown = true
+    const t0 = Date.now()
+    await checkUpiV2Config(env)
+    const tried = world.alerts.length
+    expect(tried).toBeGreaterThan(0)
+    await checkUpiV2Config(env) // still inside the short retry window
+    expect(world.alerts.length).toBe(tried)
+    world.alertDown = false
+    const realNow = Date.now
+    Date.now = () => t0 + 11 * 60 * 1000
+    try {
+      await checkUpiV2Config(env)
+    } finally {
+      Date.now = realNow
+    }
+    expect(world.alerts.length).toBe(tried + 1)
+  })
+
+  it('never throws, even when the atomic store fails', async () => {
+    const env = makeEnv({ ...ALERTING, UPI_MUGGLELINK_BASE_URL: undefined })
+    ;(env as any).ATOMIC_STORE = { idFromName: () => { throw new Error('do down') }, get: () => { throw new Error('do down') } }
     await expect(checkUpiV2Config(env)).resolves.toBeUndefined()
+    expect(world.alerts.length).toBe(0)
   })
 })
