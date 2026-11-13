@@ -378,6 +378,11 @@ export interface Env {
   // pay-invoice posture. "true" in wrangler.toml [vars]; flip + redeploy to
   // stop issuance instantly without touching secrets.
   COUPON_ENDPOINT_ENABLED?: string
+  // "true" makes `kind` ("standard" | "makewhole") mandatory on
+  // POST /admin/coupon/issue, so a caller that forgets to mark a make-whole
+  // request cannot mint an unkeyed coupon. Unset ⇒ a body without `kind` and
+  // without idempotencyKey is a standard coupon (backward compatible).
+  COUPON_ISSUE_REQUIRE_KIND?: string
   // "true" enables delivery reports to Rozo (POST /payments/<id>/delivered)
   // from the Coinbase webhook and cron sweep. See wrangler.toml.
   ROZO_DELIVERED_REPORT_ENABLED?: string

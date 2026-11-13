@@ -85,3 +85,21 @@ export async function releaseCoinbaseExecGate(env: Env, plId: string, holder: st
     return { op: 'set', value: '', result: true }
   })
 }
+
+/**
+ * Explicit NOT-settled recognition from the raw public Coinbase object.
+ * Returns the status label when recognized as unsettled, null otherwise
+ * (settled, unknown, empty or unparseable: all refuse).
+ */
+export function coinbaseExplicitlyUnsettled(raw: any): string | null {
+  if (!raw || typeof raw !== 'object') return null
+  if (typeof raw.paymentSessionId === 'string') {
+    return raw.status === 'PAYMENT_SESSION_STATUS_CREATED' ? raw.status : null
+  }
+  const used = raw.usageCount
+  const max = raw.maxUsage
+  if (typeof used === 'number' && typeof max === 'number' && Number.isFinite(used) && Number.isFinite(max) && used < max) {
+    return `v1 usage ${used}/${max}`
+  }
+  return null
+}

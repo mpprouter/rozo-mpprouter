@@ -27,9 +27,11 @@
 
 import type { Env } from '../index'
 import { casUpdate } from './stripe-atomic'
-import { readCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
+import { coinbaseExplicitlyUnsettled, readCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead as couponCasRead, couponKey, parseRecord as parseCouponRecord } from './coupon'
 import { fetchCoinbasePayment, isCoinbasePaymentId, loadRecord, saveRecordGuarded } from './webhook'
+import { handOverCryptoClaim } from './invoice-claim'
+import { ADMIN_PAY_HOLDER_RE, readAdminPayAttempt } from './pay-invoice-admin'
 import { timingSafeEqualStr } from '../utils/timing-safe'
 
 function json(status: number, payload: unknown): Response {
@@ -44,24 +46,14 @@ const MAX_EVIDENCE_CHARS = 1000
 
 const COUPON_HOLDER_RE = /^coupon:(\d{8}|\d{10}):(.+)$/
 const WEBHOOK_CLEARABLE = new Set(['manual_review', 'failed_pay_invoice'])
+// A manual pay whose outcome is unknown (request threw or 5xx) is clearable only
+// after this long, mirroring the webhook rule that an unknown outcome waits for
+// the sweep. Operational number, agent-set.
+export const ADMIN_PAY_UNKNOWN_CLEAR_AFTER_MS = 60 * 60 * 1000
 
-/**
- * Explicit NOT-settled recognition from the raw public Coinbase object.
- * Returns the status label when recognized as unsettled, null otherwise
- * (settled, unknown, empty or unparseable — all refuse).
- */
-export function coinbaseExplicitlyUnsettled(raw: any): string | null {
-  if (!raw || typeof raw !== 'object') return null
-  if (typeof raw.paymentSessionId === 'string') {
-    return raw.status === 'PAYMENT_SESSION_STATUS_CREATED' ? raw.status : null
-  }
-  const used = raw.usageCount
-  const max = raw.maxUsage
-  if (typeof used === 'number' && typeof max === 'number' && Number.isFinite(used) && Number.isFinite(max) && used < max) {
-    return `v1 usage ${used}/${max}`
-  }
-  return null
-}
+// Moved to coinbase-exec-gate.ts (coupon.ts needs it and coupon.ts is
+// imported by this module); re-exported so existing importers keep working.
+export { coinbaseExplicitlyUnsettled }
 
 export function coinbaseExecGateClearLogKey(plId: string): string {
   return `coinbase-pay-exec-clear-log:v1:${plId}`
@@ -111,6 +103,23 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
         couponStatus: coupon?.status ?? null,
       })
     }
+  } else if (ADMIN_PAY_HOLDER_RE.test(expectedHolder)) {
+    // Manual /admin/pay-invoice holder: its own attempt record must exist for
+    // this holder and be a definite failure, or an unknown outcome old enough.
+    const attempt = await readAdminPayAttempt(env, plId)
+    const age = attempt ? Date.now() - Date.parse(attempt.at) : 0
+    const parked =
+      !!attempt &&
+      attempt.ref === expectedHolder &&
+      (attempt.status === 'failed' ||
+        ((attempt.status === 'unknown' || attempt.status === 'sent') && age >= ADMIN_PAY_UNKNOWN_CLEAR_AFTER_MS))
+    if (!parked) {
+      return json(409, {
+        error: 'manual pay attempt is not a definite failure (or an unknown outcome older than 1 h); refusing to clear',
+        plId,
+        attemptStatus: attempt?.status ?? null,
+      })
+    }
   } else {
     const rec = await loadRecord(env, plId)
     if (!rec || !WEBHOOK_CLEARABLE.has(rec.status)) {
@@ -139,8 +148,23 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
   const cleared = await releaseCoinbaseExecGate(env, plId, expectedHolder)
   if (!cleared) return json(409, { error: 'gate holder changed during the request; nothing cleared', plId })
 
+  // Verified recovery path for the manual re-pay: the per-invoice claim taken
+  // by the failed attempt would otherwise refuse every later payment for good.
+  // Hand the crypto claim to a fresh re-pay ref; /admin/pay-invoice accepts it
+  // as `repay_ref`. A UPI claim is left alone (repayRef null).
+  const repayRef = `admin-repay:${crypto.randomUUID()}`
+  const handover = await handOverCryptoClaim(env, plId, repayRef)
+
   const at = new Date().toISOString()
-  const entry = { at, clearedBy, evidence, previousHolder: holder, coinbaseStatus: unsettled }
+  const entry = {
+    at,
+    clearedBy,
+    evidence,
+    previousHolder: holder,
+    coinbaseStatus: unsettled,
+    repayRef: handover.ok ? repayRef : null,
+    previousClaim: handover.ok ? handover.previous : handover.holder,
+  }
   await casUpdate<null>(env, coinbaseExecGateClearLogKey(plId), (cur) => {
     let log: unknown[] = []
     try {
@@ -159,5 +183,13 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
   }
   console.log(`[coinbase-exec-gate] cleared by admin: ${JSON.stringify({ plId, clearedBy, at, coinbaseStatus: entry.coinbaseStatus })}`)
 
-  return json(200, { ok: true, changed: cleared, plId, clearedAt: at, coinbaseStatus: entry.coinbaseStatus })
+  return json(200, {
+    ok: true,
+    changed: cleared,
+    plId,
+    clearedAt: at,
+    coinbaseStatus: entry.coinbaseStatus,
+    repayRef: entry.repayRef,
+    ...(handover.ok ? {} : { claimHeldBy: handover.holder.channel }),
+  })
 }

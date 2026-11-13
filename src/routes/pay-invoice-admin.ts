@@ -25,6 +25,9 @@ import {
 } from './checkout-web-pricing'
 import { checkoutDeliveryPaused, checkoutPausedResponse } from './checkout-control'
 import { timingSafeEqualStr } from '../utils/timing-safe'
+import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
+import { acquireCoinbaseExecGate } from './coinbase-exec-gate'
+import { casRead, casUpdate } from './stripe-atomic'
 
 // ── Error code constants ─────────────────────────────────────────────────────
 
@@ -35,6 +38,7 @@ export type PayInvoiceErrorCode =
   | 'LINK_NOT_FOUND'
   | 'LINK_NOT_PAYABLE'
   | 'UPSTREAM_ERROR'
+  | 'LINK_CLAIMED'
 
 export interface PayInvoiceError {
   code: PayInvoiceErrorCode
@@ -402,6 +406,45 @@ function errorResponse(status: number, err: PayInvoiceError): Response {
   return json(status, { error: err.message, ...err })
 }
 
+// ── Manual pay attempt record ─────────────────────────────────────────────────
+// Persisted next to the gate so a human can later prove the manual attempt is
+// no longer in flight (/admin/coinbase-exec-gate/clear, admin-pay holders).
+// status: sent (request about to go out / outcome not yet written), unknown
+// (the request threw: it may still land), failed (definite non-2xx), succeeded.
+
+export type AdminPayAttemptStatus = 'sent' | 'unknown' | 'failed' | 'succeeded'
+export interface AdminPayAttempt {
+  ref: string
+  status: AdminPayAttemptStatus
+  at: string
+  upstreamStatus?: number
+}
+
+export const ADMIN_PAY_HOLDER_RE = /^admin-(?:re)?pay:[0-9a-f-]{36}$/
+export const ADMIN_REPAY_REF_RE = /^admin-repay:[0-9a-f-]{36}$/
+
+export function adminPayAttemptKey(plId: string): string {
+  return `admin-pay-attempt:v1:${plId}`
+}
+
+export function parseAdminPayAttempt(raw: string | null): AdminPayAttempt | null {
+  if (!raw) return null
+  try {
+    const a = JSON.parse(raw) as AdminPayAttempt
+    return typeof a.ref === 'string' && typeof a.status === 'string' && typeof a.at === 'string' ? a : null
+  } catch {
+    return null
+  }
+}
+
+export async function readAdminPayAttempt(env: Env, plId: string): Promise<AdminPayAttempt | null> {
+  return parseAdminPayAttempt((await casRead(env, adminPayAttemptKey(plId))).value)
+}
+
+async function writeAdminPayAttempt(env: Env, plId: string, a: AdminPayAttempt): Promise<void> {
+  await casUpdate<null>(env, adminPayAttemptKey(plId), () => ({ op: 'set', value: JSON.stringify(a), result: null }))
+}
+
 // ── handleAdminPayInvoice ─────────────────────────────────────────────────────
 
 export async function handleAdminPayInvoice(request: Request, env: Env): Promise<Response> {
@@ -448,6 +491,70 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
   // Checkout emergency stop (checkout-control.ts): a manual pay is a delivery too.
   if (await checkoutDeliveryPaused(env)) return checkoutPausedResponse()
 
+  // Per-invoice at-most-once (2026-11-12, make-whole executor design §4.5):
+  // a manual pay of a Coinbase invoice takes the same cross-channel claim and
+  // non-re-entrant execution gate as the webhook fulfillment and coupon
+  // redemption, so it can never pay an invoice another path is paying or has
+  // paid. Once the request below is sent neither is released, whatever the
+  // outcome; a human clears the gate (/admin/coinbase-exec-gate/clear runbook)
+  // before a deliberate re-pay. Stripe links are not covered here (their key is
+  // only known after resolving the session).
+  const normalizedId = (normalized as { payment_id?: string }).payment_id
+  const normalizedUrl = (normalized as { url?: string }).url
+  const coinbaseId =
+    typeof normalizedId === 'string'
+      ? /^(?:pl_|paymentSession_)[A-Za-z0-9_-]+$/.test(normalizedId)
+        ? normalizedId
+        : null
+      : typeof normalizedUrl === 'string'
+        ? extractCoinbaseCheckoutId(normalizedUrl)
+        : null
+  // A deliberate re-pay after a verified clear passes the `repay_ref` that
+  // /admin/coinbase-exec-gate/clear returned: the clear handed the invoice
+  // claim to that ref, so the claim re-enters and the (cleared) gate is taken
+  // under it. Without it every manual pay gets a fresh ref and an invoice that
+  // another path already claimed is refused.
+  const repayRef =
+    parsed && typeof parsed === 'object' && typeof (parsed as any).repay_ref === 'string'
+      ? String((parsed as any).repay_ref).trim()
+      : ''
+  if (repayRef && !ADMIN_REPAY_REF_RE.test(repayRef)) {
+    return errorResponse(400, {
+      code: 'INVALID_INPUT',
+      message: 'repay_ref must be the admin-repay:<uuid> returned by /admin/coinbase-exec-gate/clear.',
+      normalized_input: normalized,
+      link_id_detected,
+    })
+  }
+  let attemptRef: string | null = null
+  if (coinbaseId) {
+    const ref = repayRef || `admin-pay:${crypto.randomUUID()}`
+    const claim = await claimInvoiceKey(env, coinbaseId, 'crypto', ref)
+    if (!claim.ok) {
+      return errorResponse(409, {
+        code: 'LINK_CLAIMED',
+        message: `Invoice is already claimed by the ${claim.holder.channel} channel; refusing a second payment.`,
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    const gate = await acquireCoinbaseExecGate(env, coinbaseId, ref)
+    if (!gate.ok) {
+      // Nothing was sent: give the claim back, but only if this request created
+      // it. A re-entered claim (handed over by a verified clear) belongs to the
+      // concurrent re-pay that holds the gate and must stay.
+      if (claim.created) await releaseInvoiceClaim(env, coinbaseId, 'crypto', ref)
+      return errorResponse(409, {
+        code: 'LINK_CLAIMED',
+        message: 'A pay request for this invoice was already sent; refusing a second payment.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    attemptRef = ref
+    await writeAdminPayAttempt(env, coinbaseId, { ref, status: 'sent', at: new Date().toISOString() })
+  }
+
   let upstream: Response
   try {
     upstream = await fetch('https://agentapi.rozo.ai/pay-invoice', {
@@ -459,6 +566,9 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
       body: JSON.stringify(normalized),
     })
   } catch (err: any) {
+    if (coinbaseId && attemptRef) {
+      await writeAdminPayAttempt(env, coinbaseId, { ref: attemptRef, status: 'unknown', at: new Date().toISOString() })
+    }
     return errorResponse(502, {
       code: 'UPSTREAM_ERROR',
       message: `Upstream call failed: ${err?.message ?? 'unknown error'}`,
@@ -469,6 +579,20 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
   }
 
   const upstreamText = await upstream.text()
+  if (coinbaseId && attemptRef) {
+    // 5xx can still mean the executor paid: only a 4xx is a definite failure.
+    const status: AdminPayAttemptStatus = upstream.ok
+      ? 'succeeded'
+      : upstream.status >= 400 && upstream.status < 500
+        ? 'failed'
+        : 'unknown'
+    await writeAdminPayAttempt(env, coinbaseId, {
+      ref: attemptRef,
+      status,
+      at: new Date().toISOString(),
+      upstreamStatus: upstream.status,
+    })
+  }
 
   // Detect deterministic link states from upstream status codes
   if (upstream.status === 409 || upstream.status === 410) {

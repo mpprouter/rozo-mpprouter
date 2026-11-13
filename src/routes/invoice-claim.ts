@@ -106,3 +106,25 @@ export async function releaseInvoiceClaim(
     return { op: 'set', value: '', result: true }
   })
 }
+
+/**
+ * Hand a crypto-channel claim to a fresh re-pay ref. ONLY called by the
+ * verified gate clear (/admin/coinbase-exec-gate/clear), after it proved the
+ * gate holder's attempt is parked for a human and Coinbase explicitly reports
+ * the invoice unsettled. A UPI claim is never taken over (that flow does not go
+ * through the Coinbase execution gate the clear just verified). An absent claim
+ * is created for the re-pay ref.
+ */
+export async function handOverCryptoClaim(
+  env: Env,
+  invoiceKey: string,
+  toRef: string,
+  now: Date = new Date(),
+): Promise<{ ok: true; previous: InvoiceClaim | null } | { ok: false; holder: InvoiceClaim }> {
+  return casUpdate(env, invoiceClaimKey(invoiceKey), (raw) => {
+    const holder = parseClaim(raw)
+    if (holder && holder.channel !== 'crypto') return { op: 'noop', result: { ok: false as const, holder } }
+    const claim: InvoiceClaim = { channel: 'crypto', ref: toRef, claimedAt: now.toISOString() }
+    return { op: 'set', value: JSON.stringify(claim), result: { ok: true as const, previous: holder } }
+  })
+}

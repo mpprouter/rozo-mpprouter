@@ -67,9 +67,13 @@ import {
 } from './stripe-fulfillment'
 import { encryptCapability } from './invoice-capability-crypto'
 import { parseUsdc, formatUsdc } from './create-invoice'
-import { callAgentApiPayInvoice, FUNDER_WALLET } from './webhook'
+import { callAgentApiPayInvoice, fetchCoinbasePayment, FUNDER_WALLET } from './webhook'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
-import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
+import {
+  acquireCoinbaseExecGate,
+  coinbaseExplicitlyUnsettled,
+  releaseCoinbaseExecGate,
+} from './coinbase-exec-gate'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { identifierKeys } from '../utils/redact'
@@ -246,6 +250,25 @@ export interface CouponRecord {
   paidAmountAtomic?: string | null
   merchantAccount?: string | null
   stripeUrlEncrypted?: string | null
+  /**
+   * Make-whole fields (2026-11-12, ainative
+   * docs/design/20261112-makewhole-coupon-executor.zh.md §4). Absent on every
+   * standard (marketing / partner / legacy admin) coupon; readers must
+   * tolerate that.
+   *   kind              : 'makewhole' for a coupon that compensates one
+   *                        specific unpaid merchant invoice
+   *   makewholeKey      : `MW-1:<invoice id>`, the issuance idempotency key
+   *   makewholeInvoiceId: the Coinbase pl_/paymentSession_ id this coupon
+   *                        may pay; redeem refuses any other link
+   *   issueSource       : informational: which caller issued it
+   *   voidedFromStatus  : status the coupon had when an admin voided it
+   *                        (decides whether the invoice reservation is freed)
+   */
+  kind?: 'makewhole'
+  makewholeKey?: string | null
+  makewholeInvoiceId?: string | null
+  issueSource?: string | null
+  voidedFromStatus?: CouponStatus | null
 }
 
 // ── JSON helpers ─────────────────────────────────────────────────────────────
@@ -637,7 +660,274 @@ function adminAuthorized(request: Request, env: Env): Response | null {
   return null
 }
 
+// ── Make-whole coupons: one live coupon per merchant invoice ─────────────────
+//
+// A make-whole coupon compensates a customer whose payment reached us but whose
+// merchant invoice was never paid. Three callers can decide to issue one for
+// the same invoice (the ainative executor, the Hermes support bot, an agent
+// session running skills/coupon-issue), so the at-most-one guarantee lives
+// HERE, on the server, not in any caller's local ledger:
+//
+//   * The idempotency key is `MW-1:<invoice id>` (Coinbase pl_ /
+//     paymentSession_ only). The invoice id is the reservation key, so every
+//     caller that names the same invoice contends on the same DO key.
+//   * Issuance first CASes a reservation record on the coupon DO
+//     (`makewhole-invoice:v1:<invoice id>`) that names the coupon code. Only
+//     one reservation can be `active` per invoice; a second request (same key,
+//     any caller) reads the active reservation and gets the SAME code back.
+//   * The coupon record is then created at that code, create-if-absent. A
+//     crash between the two writes is repaired by the next request with the
+//     same key (it creates the record the reservation already names).
+//   * The reservation is freed only when an admin voids the coupon before it
+//     ever entered `paying` (status issued or redeeming, no `paying` event).
+//     A coupon that reached `paying` keeps its invoice reserved forever: a
+//     second coupon for an invoice that may already be paid is exactly the
+//     double payment this exists to stop.
+//   * The coupon is bound to the invoice: redeem refuses any other link, and
+//     re-reads the Coinbase status right before paying (fail closed).
+//
+// The payment side (coupon redeem vs. the normal webhook fulfillment vs.
+// UPI / Bitrefill / admin pay-invoice) is serialized by the per-invoice
+// cross-channel claim (invoice-claim.ts) and the non-re-entrant execution gate
+// (coinbase-exec-gate.ts); neither is released once a pay request was sent.
+
+export const MAKEWHOLE_KEY_PREFIX = 'MW-1:'
+const MAKEWHOLE_INVOICE_ID_RE = /^(?:pl_[A-Za-z0-9_-]{1,128}|paymentSession_[A-Za-z0-9_-]{1,128})$/
+// Free-text proof that names a Coinbase invoice or an MW-1 key is a make-whole
+// request in disguise: it must go through the keyed path.
+const MAKEWHOLE_LIKE_PROOF_RE = /MW-1:|\bpl_[A-Za-z0-9_-]{6,}|\bpaymentSession_[A-Za-z0-9_-]{6,}/
+const MAX_PROOF_CHARS = 500
+const MAX_SOURCE_CHARS = 64
+
+export function makewholeReservationKey(invoiceId: string): string {
+  return `makewhole-invoice:v1:${invoiceId}`
+}
+
+/** `MW-1:<invoice id>` → invoice id, or null when the key is malformed. */
+export function parseMakewholeKey(key: unknown): string | null {
+  if (typeof key !== 'string' || !key.startsWith(MAKEWHOLE_KEY_PREFIX)) return null
+  const invoiceId = key.slice(MAKEWHOLE_KEY_PREFIX.length)
+  return MAKEWHOLE_INVOICE_ID_RE.test(invoiceId) ? invoiceId : null
+}
+
+export interface MakewholeReservation {
+  v: 1
+  idempotencyKey: string
+  invoiceId: string
+  code: string
+  amountAtomic: string
+  amountUsd: string
+  expiresAt: string
+  reservedAt: string
+  paymentProof: string
+  issueSource: string | null
+  state: 'active' | 'released'
+  releasedAt?: string
+  releaseReason?: string
+  /** Earlier reservations of this invoice that were released (audit trail). */
+  history: Array<{ code: string; reservedAt: string; releasedAt: string; reason: string }>
+}
+
+export function parseReservation(raw: string | null): MakewholeReservation | null {
+  if (!raw) return null
+  try {
+    const r = JSON.parse(raw) as MakewholeReservation
+    if (r && r.v === 1 && typeof r.code === 'string' && typeof r.invoiceId === 'string') return r
+    return null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * True only when voiding `rec` proves no pay request was ever sent for it:
+ * voided from issued/redeeming AND it never entered `paying` (a coupon that
+ * was released from manual_review back to issued still carries that event).
+ */
+export function voidFreesMakewholeReservation(rec: CouponRecord): boolean {
+  if (rec.status !== 'void') return false
+  if (rec.voidedFromStatus !== 'issued' && rec.voidedFromStatus !== 'redeeming') return false
+  return !rec.events.some((e) => e.kind === 'paying')
+}
+
+/** Free the active reservation for `invoiceId` iff it still names `code`. */
+async function releaseMakewholeReservation(
+  env: Env,
+  invoiceId: string,
+  code: string,
+  reason: string,
+): Promise<boolean> {
+  return casUpdate<boolean>(env, makewholeReservationKey(invoiceId), (raw) => {
+    const res = parseReservation(raw)
+    if (!res || res.state !== 'active' || res.code !== code) return { op: 'noop', result: false }
+    const at = new Date().toISOString()
+    res.state = 'released'
+    res.releasedAt = at
+    res.releaseReason = reason
+    return { op: 'set', value: JSON.stringify(res), result: true }
+  })
+}
+
+function makewholeRecord(res: MakewholeReservation): CouponRecord {
+  return {
+    code: res.code,
+    amountUsd: res.amountUsd,
+    amountAtomic: res.amountAtomic,
+    status: 'issued',
+    issuedAt: res.reservedAt,
+    expiresAt: res.expiresAt,
+    paymentProof: res.paymentProof,
+    redeemingAt: null,
+    attemptId: null,
+    plId: null,
+    redeemedAt: null,
+    coinbaseResult: null,
+    failureReason: null,
+    events: [{ kind: 'issued', at: res.reservedAt, detail: { makewholeKey: res.idempotencyKey } }],
+    kind: 'makewhole',
+    makewholeKey: res.idempotencyKey,
+    makewholeInvoiceId: res.invoiceId,
+    issueSource: res.issueSource,
+  }
+}
+
+interface MakewholeIssueInput {
+  idempotencyKey: string
+  invoiceId: string
+  amountAtomic: bigint
+  expiresInMinutes: number
+  paymentProof: string
+  issueSource: string | null
+}
+
+async function issueMakewholeCoupon(env: Env, input: MakewholeIssueInput): Promise<Response> {
+  const resKey = makewholeReservationKey(input.invoiceId)
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const candidate = generateCouponCode()
+    const nowMs = Date.now()
+    // 1. Reserve the invoice (or read the live reservation). One CAS: the
+    //    check "no active reservation" and the insert commit together.
+    const step = await casUpdate<{ reserved: boolean; res: MakewholeReservation }>(env, resKey, (raw) => {
+      const cur = parseReservation(raw)
+      if (cur && cur.state === 'active') return { op: 'noop', result: { reserved: false, res: cur } }
+      const reservedAt = new Date(nowMs).toISOString()
+      const res: MakewholeReservation = {
+        v: 1,
+        idempotencyKey: input.idempotencyKey,
+        invoiceId: input.invoiceId,
+        code: candidate,
+        amountAtomic: input.amountAtomic.toString(),
+        amountUsd: formatUsdc(input.amountAtomic),
+        expiresAt: new Date(nowMs + input.expiresInMinutes * 60_000).toISOString(),
+        reservedAt,
+        paymentProof: input.paymentProof,
+        issueSource: input.issueSource,
+        state: 'active',
+        history: cur
+          ? [
+              ...(cur.history ?? []),
+              {
+                code: cur.code,
+                reservedAt: cur.reservedAt,
+                releasedAt: cur.releasedAt ?? reservedAt,
+                reason: cur.releaseReason ?? 'released',
+              },
+            ]
+          : [],
+      }
+      return { op: 'set', value: JSON.stringify(res), result: { reserved: true, res } }
+    })
+    const res = step.res
+
+    // Same key, different face value: a caller bug or two callers that
+    // disagree about the amount. Never issue a second code; surface it.
+    if (res.amountAtomic !== input.amountAtomic.toString()) {
+      return json(409, {
+        error: 'IDEMPOTENCY_CONFLICT',
+        message: `A make-whole coupon for this invoice already exists with face value ${res.amountUsd} USD.`,
+        idempotencyKey: res.idempotencyKey,
+        invoiceId: res.invoiceId,
+        existingAmountUsd: res.amountUsd,
+      })
+    }
+
+    // 2. Make sure the coupon record the reservation names exists.
+    type Ensure =
+      | { kind: 'created'; rec: CouponRecord }
+      | { kind: 'present'; rec: CouponRecord }
+      | { kind: 'collision' }
+    const ensured = await casUpdate<Ensure>(env, couponKey(res.code), (raw) => {
+      const rec = parseRecord(raw)
+      if (!rec) {
+        const fresh = makewholeRecord(res)
+        return { op: 'set', value: JSON.stringify(fresh), result: { kind: 'created', rec: fresh } }
+      }
+      if (rec.makewholeKey === res.idempotencyKey && rec.makewholeInvoiceId === res.invoiceId) {
+        return { op: 'noop', result: { kind: 'present', rec } }
+      }
+      // The random code is already taken by an unrelated coupon (or the stored
+      // record is unparseable). No coupon of ours exists under this code, so
+      // freeing the reservation is safe; the next round reserves a new code.
+      return { op: 'noop', result: { kind: 'collision' } }
+    })
+
+    if (ensured.kind === 'collision') {
+      await releaseMakewholeReservation(env, res.invoiceId, res.code, 'code_collision')
+      continue
+    }
+
+    const rec = ensured.rec
+    if (rec.status === 'void') {
+      // Crash recovery: an admin void that proved no payment was attempted
+      // should have freed the reservation; finish that and reserve anew.
+      if (voidFreesMakewholeReservation(rec)) {
+        await releaseMakewholeReservation(env, res.invoiceId, res.code, 'void_before_payment')
+        continue
+      }
+      return json(409, {
+        error: 'MAKEWHOLE_RESERVATION_HELD',
+        message:
+          'The make-whole coupon for this invoice was voided after a payment attempt. The invoice stays reserved; reconcile it manually before compensating again.',
+        idempotencyKey: res.idempotencyKey,
+        invoiceId: res.invoiceId,
+        code: rec.code,
+        status: rec.status,
+      })
+    }
+
+    return json(200, {
+      ok: true,
+      kind: 'makewhole',
+      // True only for the request that won the invoice reservation; every
+      // other caller (retry, racing caller, crash repair) gets false.
+      created: step.reserved,
+      idempotencyKey: res.idempotencyKey,
+      invoiceId: res.invoiceId,
+      code: rec.code,
+      amountUsd: rec.amountUsd,
+      expiresAt: rec.expiresAt,
+      expired: rec.status === 'issued' && Date.parse(rec.expiresAt) < Date.now(),
+      status: rec.status,
+      claimUrl: `https://open.rozo.ai/claim?code=${rec.code}`,
+    })
+  }
+  return json(500, { error: 'Could not allocate a unique coupon code. Retry with the same idempotencyKey.' })
+}
+
 // ── POST /admin/coupon/issue ─────────────────────────────────────────────────
+//
+// Two kinds:
+//   standard (default; body without `kind` or with kind="standard"): the
+//     original behaviour, every call mints a new code. Unchanged for
+//     marketing / ops coupons, EXCEPT that a paymentProof naming a Coinbase
+//     invoice id or an MW-1 key is refused (it is a make-whole request and
+//     must carry the key).
+//   makewhole (kind="makewhole", or any body carrying idempotencyKey):
+//     requires idempotencyKey `MW-1:<pl_… | paymentSession_…>` and a
+//     paymentProof (the order reference); one live coupon per invoice, the
+//     same key returns the same code.
+// COUPON_ISSUE_REQUIRE_KIND=true makes `kind` mandatory on every request, so
+// a caller that forgot to say "makewhole" cannot fall into the standard path.
 
 export async function handleIssueCoupon(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
@@ -672,6 +962,72 @@ export async function handleIssueCoupon(request: Request, env: Env): Promise<Res
       ? Math.min(body.expiresInMinutes, 60 * 24 * 14) // hard cap: 14 days (2026-08-07)
       : DEFAULT_EXPIRES_MINUTES
   const paymentProof = typeof body?.paymentProof === 'string' ? body.paymentProof : null
+
+  // ── Kind selection (make-whole vs standard) ──
+  const kindRaw = body?.kind
+  const hasKey = body?.idempotencyKey !== undefined && body?.idempotencyKey !== null
+  if (kindRaw !== undefined && kindRaw !== 'standard' && kindRaw !== 'makewhole') {
+    return json(400, { error: 'INVALID_KIND', message: 'kind must be "standard" or "makewhole"' })
+  }
+  if (kindRaw === undefined && !hasKey && env.COUPON_ISSUE_REQUIRE_KIND === 'true') {
+    return json(400, { error: 'KIND_REQUIRED', message: 'kind is required: "standard" or "makewhole"' })
+  }
+  const isMakewhole = kindRaw === 'makewhole' || (kindRaw === undefined && hasKey)
+  if (kindRaw === 'standard' && hasKey) {
+    return json(400, {
+      error: 'INVALID_IDEMPOTENCY_KEY',
+      message: 'idempotencyKey is only supported for kind="makewhole"',
+    })
+  }
+
+  if (isMakewhole) {
+    if (!hasKey) {
+      return json(400, {
+        error: 'MAKEWHOLE_KEY_REQUIRED',
+        message: 'A make-whole coupon requires idempotencyKey "MW-1:<invoice id>"',
+      })
+    }
+    const invoiceId = parseMakewholeKey(body.idempotencyKey)
+    if (!invoiceId) {
+      return json(400, {
+        error: 'INVALID_IDEMPOTENCY_KEY',
+        message: 'idempotencyKey must be "MW-1:" followed by a Coinbase pl_… or paymentSession_… id',
+      })
+    }
+    if (body?.invoiceId !== undefined && body.invoiceId !== invoiceId) {
+      return json(400, {
+        error: 'INVALID_IDEMPOTENCY_KEY',
+        message: 'invoiceId does not match the invoice named by idempotencyKey',
+      })
+    }
+    const proof = paymentProof?.trim() ?? ''
+    if (!proof || proof.length > MAX_PROOF_CHARS) {
+      return json(400, {
+        error: 'PAYMENT_PROOF_REQUIRED',
+        message: `paymentProof (the order reference, at most ${MAX_PROOF_CHARS} chars) is required for a make-whole coupon`,
+      })
+    }
+    const source =
+      typeof body?.source === 'string' && body.source.trim()
+        ? body.source.trim().slice(0, MAX_SOURCE_CHARS)
+        : null
+    return issueMakewholeCoupon(env, {
+      idempotencyKey: body.idempotencyKey,
+      invoiceId,
+      amountAtomic,
+      expiresInMinutes,
+      paymentProof: proof,
+      issueSource: source,
+    })
+  }
+
+  if (paymentProof && MAKEWHOLE_LIKE_PROOF_RE.test(paymentProof)) {
+    return json(400, {
+      error: 'MAKEWHOLE_KEY_REQUIRED',
+      message:
+        'paymentProof names a merchant invoice: issue it as kind="makewhole" with idempotencyKey "MW-1:<invoice id>"',
+    })
+  }
 
   const now = Date.now()
   const record: CouponRecord = {
@@ -756,6 +1112,9 @@ export async function handleResolveCoupon(request: Request, env: Env): Promise<R
       if (!rec) return { op: 'noop', result: { ok: false, error: 'not found' } }
       const at = new Date().toISOString()
       if (action === 'void') {
+        // Remember what was voided (a re-void keeps the first answer): it
+        // decides whether a make-whole invoice reservation may be freed.
+        if (rec.status !== 'void') rec.voidedFromStatus = rec.status
         rec.status = 'void'
         // Fence out any in-flight redeem request holding the old claim.
         rec.attemptId = null
@@ -788,6 +1147,19 @@ export async function handleResolveCoupon(request: Request, env: Env): Promise<R
   )
 
   if (!outcome.ok) return json(409, { error: outcome.error })
+
+  // Make-whole: a void that proves no pay request was ever sent frees the
+  // invoice so a new coupon may be issued for it; any other void keeps the
+  // invoice reserved (the old coupon may have paid it).
+  const voided = outcome.record
+  if (action === 'void' && voided?.kind === 'makewhole' && voided.makewholeInvoiceId) {
+    // A re-void finds the reservation already released (CAS no-op): still freed.
+    const freed = voidFreesMakewholeReservation(voided)
+    if (freed) {
+      await releaseMakewholeReservation(env, voided.makewholeInvoiceId, voided.code, 'void_before_payment')
+    }
+    return json(200, { ok: true, coupon: voided, makewholeReservation: freed ? 'released' : 'held' })
+  }
   return json(200, { ok: true, coupon: outcome.record })
 }
 
@@ -983,6 +1355,11 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   const claim = await casUpdate<ClaimResult>(env, couponKey(code), (raw) => {
     const rec = parseRecord(raw)
     if (!rec) return { op: 'noop', result: { kind: 'rejected' } }
+    // A make-whole coupon pays exactly its own invoice. Any other link gets
+    // the uniform error (it must not reveal that the code is live).
+    if (rec.kind === 'makewhole' && rec.makewholeInvoiceId !== plId) {
+      return { op: 'noop', result: { kind: 'rejected' } }
+    }
 
     const now = Date.now()
     if (rec.status === 'issued') {
@@ -1226,6 +1603,24 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // collides with the Stripe webhook (ref stripe_crypto_cpis_*) and the UPI
   // channel, which both claim the bare cpis_ id.
   const execKey = isStripe ? stripeInv!.invoiceKey : plId
+
+  // Step 2a (make-whole only): read the merchant invoice straight from
+  // Coinbase and pay only when it is explicitly NOT settled (v3 CREATED, v1
+  // usage below max). Settled, unknown or unreadable → nothing claimed or sent,
+  // coupon back to issued. This is a second gate beside the per-invoice claim
+  // and exec gate below: a normal fulfillment that already captured the
+  // invoice must stop the coupon here even if its gate was cleared.
+  if (rec.kind === 'makewhole') {
+    const raw = await fetchCoinbasePayment(plId)
+    if (!raw) {
+      await rollbackToIssued('makewhole: coinbase status unreadable')
+      return done(quoteUnavailable(), 'rejected', 'coinbase_status_unreadable')
+    }
+    if (!coinbaseExplicitlyUnsettled(raw)) {
+      await rollbackToIssued('makewhole: coinbase invoice not explicitly unsettled')
+      return done(linkUsedOrExpired(409), 'rejected', 'coinbase_not_unsettled')
+    }
+  }
 
   // Step 2b — checkout emergency stop (checkout-control.ts). Nothing reserved,
   // claimed or sent yet: give the coupon back, the customer retries later.
