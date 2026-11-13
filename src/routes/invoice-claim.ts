@@ -107,6 +107,8 @@ export async function releaseInvoiceClaim(
   })
 }
 
+export type HandOverResult = { ok: true; previous: InvoiceClaim | null } | { ok: false; holder: InvoiceClaim }
+
 /**
  * Hand a crypto-channel claim to a fresh re-pay ref. ONLY called by the
  * verified gate clear (/admin/coinbase-exec-gate/clear), after it proved the
@@ -120,11 +122,11 @@ export async function handOverCryptoClaim(
   invoiceKey: string,
   toRef: string,
   now: Date = new Date(),
-): Promise<{ ok: true; previous: InvoiceClaim | null } | { ok: false; holder: InvoiceClaim }> {
-  return casUpdate(env, invoiceClaimKey(invoiceKey), (raw) => {
+): Promise<HandOverResult> {
+  return casUpdate<HandOverResult>(env, invoiceClaimKey(invoiceKey), (raw) => {
     const holder = parseClaim(raw)
-    if (holder && holder.channel !== 'crypto') return { op: 'noop', result: { ok: false as const, holder } }
+    if (holder && holder.channel !== 'crypto') return { op: 'noop', result: { ok: false, holder } }
     const claim: InvoiceClaim = { channel: 'crypto', ref: toRef, claimedAt: now.toISOString() }
-    return { op: 'set', value: JSON.stringify(claim), result: { ok: true as const, previous: holder } }
+    return { op: 'set', value: JSON.stringify(claim), result: { ok: true, previous: holder } }
   })
 }
