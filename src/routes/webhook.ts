@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { watchSignedCollector, type PayLine } from './coinbase-collector-watch'
 import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, isTestPaymentId } from './native-sources'
 import { isBitrefillOrderId } from './bitrefill-invoice'
 import { settleBitrefillFunderEvent } from './bitrefill-settle'
@@ -517,6 +518,7 @@ export async function callAgentApiPayInvoice(
   env: Env,
   plId: string,
   expectedBinding?: PayInvoiceExpectedBinding,
+  watch?: { line: PayLine; ref?: string; waitUntil?: (p: Promise<unknown>) => void },
 ): Promise<{ ok: boolean; status: number; body: any }> {
   // Hard fund-safety guard: a test order is paid by nobody. Thrown (not a
   // soft failure) so no caller can mistake it for a retryable error.
@@ -538,6 +540,24 @@ export async function callAgentApiPayInvoice(
     parsed = JSON.parse(text)
   } catch {
     parsed = { raw: text }
+  }
+  // Cash calls only: alert (never block) when the signer signed for a Coinbase
+  // token collector we have not seen. Never throws; bounded wait.
+  // The extra try/catch matters: a throw here would turn a real signer answer
+  // into the caller's "transport error" branch.
+  if (!expectedBinding && watch) {
+    try {
+      await watchSignedCollector(env, {
+        invoiceId: plId,
+        line: watch.line,
+        ref: watch.ref,
+        signerStatus: resp.status,
+        body: parsed,
+        waitUntil: watch.waitUntil,
+      })
+    } catch {
+      // never affects the payment result
+    }
   }
   return { ok: resp.ok, status: resp.status, body: parsed }
 }
@@ -1180,7 +1200,7 @@ export async function settleCoinbaseEvent(
   // 10. Trigger pay-invoice. From here the gate is never released.
   let payResult: { ok: boolean; status: number; body: any }
   try {
-    payResult = await callAgentApiPayInvoice(env, plId)
+    payResult = await callAgentApiPayInvoice(env, plId, undefined, { line: 'checkout', waitUntil })
   } catch (err: any) {
     payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }
   }
