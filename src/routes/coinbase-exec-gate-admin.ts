@@ -30,7 +30,7 @@ import { casRead, casUpdate } from './stripe-atomic'
 import { coinbaseExplicitlyUnsettled, readCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead as couponCasRead, couponKey, parseRecord as parseCouponRecord } from './coupon'
 import { fetchCoinbasePayment, isCoinbasePaymentId, loadRecord, saveRecordGuarded } from './webhook'
-import { handOverCryptoClaim, readInvoiceClaim } from './invoice-claim'
+import { handOverCryptoClaim, readInvoiceClaim, type HandOverResult } from './invoice-claim'
 import { ADMIN_PAY_HOLDER_RE, readAdminPayAttempt } from './pay-invoice-admin'
 import { timingSafeEqualStr } from '../utils/timing-safe'
 
@@ -177,15 +177,18 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
     })
   }
 
-  // (c) Verified recovery path for the manual re-pay: the per-invoice claim
-  // taken by the failed attempt would otherwise refuse every later payment for
-  // good. Hand the crypto claim to a fresh re-pay ref; /admin/pay-invoice
-  // accepts it as `repay_ref`. A UPI claim is left alone (repayRef null).
+  // (c) Verified recovery path for a manual /admin/pay-invoice re-pay: the
+  // per-invoice claim taken by the failed manual attempt would otherwise refuse
+  // every later payment for good. Hand that crypto claim to a fresh re-pay ref;
+  // /admin/pay-invoice accepts it as `repay_ref`. Only for admin-pay holders:
+  // a coupon re-pay (release + redeem) and a webhook record re-enter their own
+  // claim, so theirs is left untouched. A UPI claim is never taken over.
   // Order: hand over, log, then release the gate. A crash before the release
   // leaves the gate held, so a retry of this clear redoes every step; a crash
   // or lost response after it is answered by the read-back above.
+  const isAdminPayHolder = ADMIN_PAY_HOLDER_RE.test(expectedHolder)
   const repayRef = `admin-repay:${crypto.randomUUID()}`
-  const handover = await handOverCryptoClaim(env, plId, repayRef)
+  const handover: HandOverResult | null = isAdminPayHolder ? await handOverCryptoClaim(env, plId, repayRef) : null
 
   const at = new Date().toISOString()
   const entry = {
@@ -194,8 +197,8 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
     evidence,
     previousHolder: holder,
     coinbaseStatus: unsettled,
-    repayRef: handover.ok ? repayRef : null,
-    previousClaim: handover.ok ? handover.previous : handover.holder,
+    repayRef: handover?.ok ? repayRef : null,
+    previousClaim: handover ? (handover.ok ? handover.previous : handover.holder) : null,
   }
   await casUpdate<null>(env, coinbaseExecGateClearLogKey(plId), (cur) => {
     let log: unknown[] = []
@@ -227,6 +230,6 @@ export async function handleCoinbaseExecGateClear(request: Request, env: Env): P
     clearedAt: at,
     coinbaseStatus: entry.coinbaseStatus,
     repayRef: entry.repayRef,
-    ...(handover.ok ? {} : { claimHeldBy: handover.holder.channel }),
+    ...(handover && !handover.ok ? { claimHeldBy: handover.holder.channel } : {}),
   })
 }
