@@ -26,7 +26,7 @@ import {
 import { checkoutDeliveryPaused, checkoutPausedResponse } from './checkout-control'
 import { timingSafeEqualStr } from '../utils/timing-safe'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
-import { acquireCoinbaseExecGate } from './coinbase-exec-gate'
+import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead, casUpdate } from './stripe-atomic'
 
 // ── Error code constants ─────────────────────────────────────────────────────
@@ -538,7 +538,18 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
         link_id_detected,
       })
     }
-    const gate = await acquireCoinbaseExecGate(env, coinbaseId, ref)
+    // The gate and the "sent" marker are separate writes. If either throws,
+    // nothing was sent yet, so undo what this request took (a definite
+    // pre-send failure is the one case where release is allowed). A hard
+    // isolate kill in between is covered by the clear endpoint, which accepts
+    // an admin-pay gate with no matching marker once it is old enough.
+    let gate: Awaited<ReturnType<typeof acquireCoinbaseExecGate>>
+    try {
+      gate = await acquireCoinbaseExecGate(env, coinbaseId, ref)
+    } catch (err) {
+      if (claim.created) await releaseInvoiceClaim(env, coinbaseId, 'crypto', ref).catch(() => false)
+      throw err
+    }
     if (!gate.ok) {
       // Nothing was sent: give the claim back, but only if this request created
       // it. A re-entered claim (handed over by a verified clear) belongs to the
@@ -551,8 +562,19 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
         link_id_detected,
       })
     }
+    try {
+      await writeAdminPayAttempt(env, coinbaseId, { ref, status: 'sent', at: new Date().toISOString() })
+    } catch (err) {
+      await releaseCoinbaseExecGate(env, coinbaseId, ref).catch(() => false)
+      if (claim.created) await releaseInvoiceClaim(env, coinbaseId, 'crypto', ref).catch(() => false)
+      return errorResponse(503, {
+        code: 'UPSTREAM_ERROR',
+        message: `Could not record the manual pay attempt; nothing was sent: ${(err as Error)?.message ?? 'unknown error'}`,
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
     attemptRef = ref
-    await writeAdminPayAttempt(env, coinbaseId, { ref, status: 'sent', at: new Date().toISOString() })
   }
 
   let upstream: Response

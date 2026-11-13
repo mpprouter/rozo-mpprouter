@@ -30,8 +30,8 @@ import {
   type MakewholeReservation,
 } from '../src/routes/coupon'
 import { settleCoinbaseEvent, type FulfillmentRecord } from '../src/routes/webhook'
-import { readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
-import { readInvoiceClaim } from '../src/routes/invoice-claim'
+import { acquireCoinbaseExecGate, readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
+import { claimInvoiceKey, readInvoiceClaim } from '../src/routes/invoice-claim'
 import { handleAdminPayInvoice, readAdminPayAttempt } from '../src/routes/pay-invoice-admin'
 import { handleCoinbaseExecGateClear } from '../src/routes/coinbase-exec-gate-admin'
 import type { Env } from '../src/index'
@@ -696,6 +696,52 @@ describe('manual pay keeps a verified recovery path (codex P1)', () => {
     const holder = (await readCoinbaseExecGate(env, PL))!.holder
     up.coinbase = boundCoinbaseLink(PL, '20', { usageCount: 1, maxUsage: 1 })
     expect((await handleCoinbaseExecGateClear(gateClearReq(holder), env)).status).toBe(409)
+  })
+
+  it('a clear whose response was lost returns the same unused repay_ref on retry (codex P1 round 1)', async () => {
+    const { env, calls } = setup({ payStatus: 400, payBody: { error: 'bad request' } })
+    await handleAdminPayInvoice(adminPayReq(PL), env)
+    const holder = (await readCoinbaseExecGate(env, PL))!.holder
+    const first = (await (await handleCoinbaseExecGateClear(gateClearReq(holder), env)).json()) as any
+    expect(first.repayRef).toMatch(/^admin-repay:/)
+    const again = await handleCoinbaseExecGateClear(gateClearReq(holder), env)
+    expect(again.status).toBe(200)
+    const body = (await again.json()) as any
+    expect(body.changed).toBe(false)
+    expect(body.repayRef).toBe(first.repayRef)
+    expect(calls.pay).toBe(1)
+  })
+
+  it('once the re-pay ran, a retried clear no longer hands out its ref', async () => {
+    const { env, up } = setup({ payStatus: 400, payBody: { error: 'bad request' } })
+    await handleAdminPayInvoice(adminPayReq(PL), env)
+    const holder = (await readCoinbaseExecGate(env, PL))!.holder
+    const { repayRef } = (await (await handleCoinbaseExecGateClear(gateClearReq(holder), env)).json()) as any
+    up.payStatus = 200
+    up.payBody = CAPTURED
+    expect((await handleAdminPayInvoice(adminPayReq(PL, { repay_ref: repayRef }), env)).status).toBe(200)
+    // The gate is held by the re-pay now: the old holder no longer matches.
+    const retry = await handleCoinbaseExecGateClear(gateClearReq(holder), env)
+    expect(retry.status).toBe(409)
+  })
+
+  it('an admin-pay gate with no "sent" marker (crash before it) is clearable only once old (codex P1 round 1)', async () => {
+    const { env } = setup()
+    const ref = 'admin-pay:11111111-2222-3333-4444-555555555555'
+    expect((await claimInvoiceKey(env, PL, 'crypto', ref)).ok).toBe(true)
+    expect((await acquireCoinbaseExecGate(env, PL, ref, new Date(Date.now() - 5 * 60_000))).ok).toBe(true)
+    expect(await readAdminPayAttempt(env, PL)).toBeNull()
+    expect((await handleCoinbaseExecGateClear(gateClearReq(ref), env)).status).toBe(409)
+    expect((await readCoinbaseExecGate(env, PL))?.holder).toBe(ref)
+
+    const { env: env2, calls: calls2 } = setup()
+    expect((await claimInvoiceKey(env2, PL, 'crypto', ref)).ok).toBe(true)
+    expect((await acquireCoinbaseExecGate(env2, PL, ref, new Date(Date.now() - 2 * 3600_000))).ok).toBe(true)
+    const cleared = await handleCoinbaseExecGateClear(gateClearReq(ref), env2)
+    expect(cleared.status).toBe(200)
+    const { repayRef } = (await cleared.json()) as any
+    expect((await readInvoiceClaim(env2, PL))?.ref).toBe(repayRef)
+    expect(calls2.pay).toBe(0)
   })
 
   it('a malformed repay_ref is rejected before anything is claimed', async () => {
