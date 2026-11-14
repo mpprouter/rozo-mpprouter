@@ -67,7 +67,10 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
     symbol: 'ZEC',
     tokenAddress: '',
     provider: 'near',
-    maxUsd: 3500, // founder 2026-10-23 (was 3200 from 2026-10-21, 2000 before)
+    // Strictly below $3,200 like the custody rail: rozo-intents-api refuses
+    // ZEC from $3,200 (founder 2026-11-14 bug fix; the router said 3500 since
+    // 2026-10-23, 3200 from 2026-10-21, 2000 before).
+    maxUsd: 3199.99,
     etaSeconds: 480,
     refundAddressRequired: true,
     beta: true,
@@ -83,7 +86,8 @@ const nativeKey = (chainId: string, d: NativeSourceDef) => `${d.symbol}@${chainI
 // one for the metadata and pre-checks shown before create:
 //   near    (default) NEAR 1Click deposit address; today's behaviour unchanged.
 //   custody Rozo self-custody rail: a per-order t1 address on our own HD
-//           wallet, 1 confirmation below $110 and 2 from $110, G < $3500 (founder 2026-10-23; was $3200 from 2026-10-21, $1100 before).
+//           wallet, 1 confirmation below $110 and 2 from $110, G < $3200 (founder 2026-11-14, matching
+//           rozo-intents-api zec_custody_reserve; the router said $3500 from 2026-10-23, $1100 before 2026-10-21).
 // rozo-intents-api stays the final gate either way.
 
 export type ZecRailMode = 'near' | 'custody'
@@ -102,13 +106,16 @@ export const ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN = 10
 export const ZEC_BLOCK_TARGET_SECONDS = 75
 
 /**
- * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below $3500 (founder 2026-10-23; was $3200 from 2026-10-21, $1100 before).
+ * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below $3200:
+ * rozo-intents-api zec_custody_reserve() rejects p_g_usd >= 3200 and prod
+ * NATIVE_MAX_ORDER_USD_ZEC = 3200 (founder 2026-11-14 bug fix; the router said
+ * 3499.99 from 2026-10-23, $1100 before 2026-10-21).
  * No arrival estimate: block times vary and the checkout must not promise one,
  * so sourceMeta omits eta_seconds for this rail.
  */
 const ZEC_CUSTODY_OVERRIDE: Partial<NativeSourceDef> = {
   provider: 'rozo',
-  maxUsd: 3499.99,
+  maxUsd: 3199.99,
   etaSeconds: undefined,
   // Founder 2026-10-13: the deposit address is our own wallet, so the payer's
   // refund address is optional (late or short payments handled manually).
