@@ -190,8 +190,10 @@ describe('ZEC source table', () => {
     })
   })
 
-  it('caps ZEC at $3500 even if NATIVE_MAX_USD is higher', () => {
-    expect(nativeMaxUsdFor('9133', '5000')).toBe(3500)
+  it('caps ZEC below $3200 even if NATIVE_MAX_USD is higher', () => {
+    expect(nativeMaxUsdFor('9133', '5000')).toBe(3199.99)
+    expect(nativeMaxUsdFor('9133', undefined)).toBe(3199.99)
+    expect(nativeMaxUsdFor('8453', undefined)).toBe(3500)
     expect(nativeMaxUsdFor('9133', '100')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000')).toBe(5000)
   })
@@ -560,7 +562,7 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(JSON.stringify(sourceMeta(open, 'near'))).toBe(
       '{"ZEC@9133":{"eta_seconds":480,"refund_address_required":true,"beta":true,"address_single_use":true}}',
     )
-    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(3500)
+    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(3199.99)
     expect(zecMinLinkLifeMs('near')).toBe(ZEC_MIN_LINK_LIFE_MS)
   })
 
@@ -571,20 +573,23 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(sourceMeta(parseNativeSources(PROD_NATIVE), 'custody')).toEqual({})
   })
 
-  it('custody caps ZEC below $3500 and leaves other coins alone', () => {
-    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(3499.99)
-    expect(nativeMaxUsdFor('9133', '5000', 'custody')).toBe(3499.99)
+  it('custody caps ZEC below $3200 and leaves other coins alone', () => {
+    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(3199.99)
+    expect(nativeMaxUsdFor('9133', '5000', 'custody')).toBe(3199.99)
+    expect(nativeMaxUsdFor('8453', undefined, 'custody')).toBe(3500)
     expect(nativeMaxUsdFor('9133', '100', 'custody')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000', 'custody')).toBe(5000)
   })
 
   // Boundary at the ZEC caps through create-invoice: callerPays > cap is rejected.
   it.each([
-    ['near', '3499.99', 200],
-    ['near', '3500', 200],
-    ['near', '3500.01', 400],
-    ['custody', '3499.98', 200],
-    ['custody', '3499.99', 200],
+    ['near', '3199.99', 200],
+    ['near', '3200', 400],
+    ['near', '3250', 400],
+    ['custody', '3199.98', 200],
+    ['custody', '3199.99', 200],
+    ['custody', '3200', 400],
+    ['custody', '3250', 400],
     ['custody', '3500', 400],
   ] as const)('ZEC %s rail: callerPays %s -> %i', async (rail, amount, expected) => {
     quoteAmount = amount
