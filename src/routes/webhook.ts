@@ -1802,6 +1802,10 @@ export function pickRozoCallerSafe(rp: any) {
             detected: true,
             chainId: typeof rp.earlierPayment.chainId === 'string' ? rp.earlierPayment.chainId : null,
             chainName: typeof rp.earlierPayment.chainName === 'string' ? rp.earlierPayment.chainName : null,
+            // Rozo saw the earlier payment but it is still confirming on chain.
+            // Relayed only when strictly `true`; absent in every other case so
+            // the response stays byte-identical for older Rozo deploys.
+            ...(rp.earlierPayment.confirming === true ? { confirming: true } : {}),
           },
         }
       : {}),
