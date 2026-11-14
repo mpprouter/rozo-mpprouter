@@ -1969,10 +1969,11 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
   // Shielded ZEC orders have their own cap (ZEC_SHIELDED_MAX_USD, default
-  // $1,200 = intents ZEC_SHIELD_CAPS.max_order_usd), checked right before a
+  // $3,500, capped by the custody cap 3499.99 = intents
+  // ZEC_SHIELD_CAPS.max_order_usd since 2026-11-14), checked right before a
   // FRESH shielded create (shieldedCapBlock below) so that an existing order
   // of the other mode is still reported as a mode mismatch first. The
-  // transparent custody cap (3499.99) is untouched. rozo-intents-api stays
+  // transparent custody cap (3499.99) is unchanged. rozo-intents-api stays
   // the final gate.
   const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail)
   const shieldedCap = Math.min(zecShieldedMaxUsd(env.ZEC_SHIELDED_MAX_USD), nativeCap)
