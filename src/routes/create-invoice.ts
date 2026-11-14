@@ -21,6 +21,7 @@ import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { StageTimer } from '../utils/stage-timer'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase } from './intents-base'
+import { deviceIdField, readDeviceId } from './device-id-forward'
 import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import {
   OPENROUTER_APP_ID,
@@ -1488,6 +1489,11 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     return errorResponse(400, { code: 'INVALID_EMAIL', message: emailResult.message })
   }
   const emailField = emailResult.email ? { email: emailResult.email } : {}
+  // Optional browser device id (see device-id-forward.ts). Never fails the
+  // request: a missing or malformed value is dropped. Forwarded on create
+  // only, so payment-api can record that this browser created the order.
+  const deviceId = readDeviceId(parsed)
+  const deviceField = deviceIdField(deviceId)
 
   // Bitrefill: direct exactOut to the Bitrefill receiving address (no funder).
   if (
@@ -1500,6 +1506,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       parsed as Record<string, unknown>,
       resolveSource,
       emailResult.email,
+      deviceId,
     )
   }
 
@@ -1680,6 +1687,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       orderAttribution,
       emailResult.email,
       timer,
+      deviceId,
     )
   }
 
@@ -2587,6 +2595,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         },
         ...attributionField,
         ...emailField,
+        ...deviceField,
         metadata: {
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
@@ -2628,6 +2637,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         },
         ...attributionField,
         ...emailField,
+        ...deviceField,
         metadata: {
           source: 'mpprouter-create-invoice',
           coinbasePaymentLinkId: linkId,
@@ -3012,6 +3022,9 @@ export async function handleStripeCreateInvoice(
   contactEmail: string | null = null,
   // Stage timings for handleCreateInvoice's Server-Timing header.
   timer?: StageTimer,
+  // Optional browser device id, already validated by handleCreateInvoice
+  // (device-id-forward.ts). Written on create only, never logged.
+  deviceId: string | null = null,
 ): Promise<Response> {
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
@@ -3353,6 +3366,7 @@ export async function handleStripeCreateInvoice(
             amount: callerPays,
           },
           ...(contactEmail ? { email: contactEmail } : {}),
+          ...deviceIdField(deviceId),
           metadata: lockedMetadata,
         }
       : {
@@ -3373,6 +3387,7 @@ export async function handleStripeCreateInvoice(
             tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
           },
           ...(contactEmail ? { email: contactEmail } : {}),
+          ...deviceIdField(deviceId),
           metadata: lockedMetadata,
           // Optional Stellar contract pay-in — validated by handleCreateInvoice
           // (Stellar source only). Same field the Coinbase branch sends.

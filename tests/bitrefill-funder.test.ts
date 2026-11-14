@@ -231,6 +231,20 @@ describe('create (funder model)', () => {
     })
   })
 
+  it('forwards a well-formed deviceId on the funder create, drops a malformed one', async () => {
+    const DEVICE_ID = '3f2b8c1e-7a4d-4e9b-9c2a-1d5e6f7a8b9c'
+    const ok = await post(body({}, { deviceId: DEVICE_ID }))
+    expect(ok.status).toBe(200)
+    expect(created.deviceId).toBe(DEVICE_ID)
+    expect(JSON.stringify(created.metadata)).not.toContain(DEVICE_ID)
+    expect(JSON.stringify(ok.json)).not.toContain(DEVICE_ID)
+
+    created = null
+    const bad = await post(body({}, { deviceId: 'ab'.repeat(32) }))
+    expect(bad.status).toBe(200)
+    expect('deviceId' in created).toBe(false)
+  })
+
   it('fee rounds up to the cent (204.37 -> 2.05)', async () => {
     const { json } = await post(body({ amount: '204.37' }))
     expect(json.serviceFee).toBe('2.05')

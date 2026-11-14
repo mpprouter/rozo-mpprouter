@@ -17,6 +17,7 @@ import type { Env } from '../index'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
+import { deviceIdField } from './device-id-forward'
 import { isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
 import {
   CHECKOUT_PRICING_VERSION,
@@ -138,6 +139,9 @@ export async function handleBitrefillCreateInvoice(
   resolveSource: ResolveSource,
   // Optional payer contact email, already normalized by handleCreateInvoice.
   contactEmail: string | null = null,
+  // Optional browser device id, already validated by handleCreateInvoice
+  // (device-id-forward.ts). Written on create only, never logged.
+  deviceId: string | null = null,
 ): Promise<Response> {
   if (String(env.BITREFILL_ENABLED ?? 'false').toLowerCase() !== 'true') {
     return fail(403, 'BITREFILL_DISABLED', 'Bitrefill invoice payment is not enabled.')
@@ -145,7 +149,7 @@ export async function handleBitrefillCreateInvoice(
   // Funder model (founder 2026-11-11): order under merchant_openrouter, 1% fee
   // in the price, the funder pays Bitrefill. Off = today's direct model below.
   if (bitrefillFunderSendEnabled(env)) {
-    return handleBitrefillFunderCreate(request, env, parsed, resolveSource, contactEmail)
+    return handleBitrefillFunderCreate(request, env, parsed, resolveSource, contactEmail, deviceId)
   }
   // Never fall back to the OpenRouter key: payment-api derives the merchant
   // from the key, so that would file these orders under merchant_openrouter.
@@ -280,6 +284,7 @@ export async function handleBitrefillCreateInvoice(
     },
     ...attributionField,
     ...(contactEmail ? { email: contactEmail } : {}),
+    ...deviceIdField(deviceId),
     metadata: {
       source: 'mpprouter-create-invoice',
       provider: 'bitrefill',
@@ -498,6 +503,7 @@ export async function handleBitrefillFunderCreate(
   parsed: Record<string, unknown>,
   resolveSource: ResolveSource,
   contactEmail: string | null = null,
+  deviceId: string | null = null,
 ): Promise<Response> {
   const apiKey = env.ROZO_INTENTS_API_KEY
   if (!apiKey || !env.PAYINVOICE_ADMIN_SECRET) {
@@ -640,6 +646,7 @@ export async function handleBitrefillFunderCreate(
     },
     ...attributionField,
     ...(contactEmail ? { email: contactEmail } : {}),
+    ...deviceIdField(deviceId),
     metadata: {
       source: 'mpprouter-create-invoice',
       provider: 'bitrefill',

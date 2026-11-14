@@ -268,6 +268,35 @@ describe('Stripe create-invoice — source is honored, not swallowed', () => {
     expect(createdIntent.email).toBe('ln@example.com')
   })
 
+  it('forwards a well-formed deviceId on both Stripe bodies, drops a malformed one', async () => {
+    const DEVICE_ID = '3f2b8c1e-7a4d-4e9b-9c2a-1d5e6f7a8b9c'
+    const exactIn = await createInvoice({ url: STRIPE_URL, deviceId: DEVICE_ID.toUpperCase() })
+    expect(exactIn.status).toBe(200)
+    expect(createdIntent.deviceId).toBe(DEVICE_ID)
+    expect(JSON.stringify(createdIntent.metadata)).not.toContain(DEVICE_ID)
+    expect(JSON.stringify(exactIn.json).toLowerCase()).not.toContain(DEVICE_ID)
+
+    createdIntent = null
+    const ln = await createInvoice({
+      url: STRIPE_URL,
+      source: { chainId: 'lightning', tokenSymbol: 'BTC' },
+      deviceId: DEVICE_ID,
+    })
+    expect(ln.status).toBe(200)
+    expect(createdIntent.type).toBe('exactOut')
+    expect(createdIntent.deviceId).toBe(DEVICE_ID)
+
+    createdIntent = null
+    const bad = await createInvoice({ url: STRIPE_URL, deviceId: 'ab'.repeat(32) })
+    expect(bad.status).toBe(200)
+    expect('deviceId' in createdIntent).toBe(false)
+
+    createdIntent = null
+    const none = await createInvoice({ url: STRIPE_URL })
+    expect(none.status).toBe(200)
+    expect('deviceId' in createdIntent).toBe(false)
+  })
+
   it('omits email from the Stripe body when none is given', async () => {
     const { status } = await createInvoice({ url: STRIPE_URL })
     expect(status).toBe(200)
