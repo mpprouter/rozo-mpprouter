@@ -202,8 +202,10 @@ export function zecShieldedAvailable(
   return zecRail === 'custody' && nativeAllowed.has('ZEC@9133') && zecShieldedRequested(requestUrl)
 }
 
-/** Per-invoice cap for a shielded ZEC order (ZEC_SHIELDED_MAX_USD, default $1,200: founder 2026-11-02, = intents ZEC_SHIELD_CAPS.max_order_usd). */
-export const ZEC_SHIELDED_MAX_USD_DEFAULT = 1200
+/** Per-invoice cap for a shielded ZEC order (ZEC_SHIELDED_MAX_USD, default $3,500: founder 2026-11-14, aligned with
+ *  transparent ZEC, so the effective cap is min(3500, custody 3499.99) = G < $3,500; was $1,200 from 2026-11-02).
+ *  Mirrors intents ZEC_SHIELD_CAPS.max_order_usd (3499.99). */
+export const ZEC_SHIELDED_MAX_USD_DEFAULT = 3500
 export function zecShieldedMaxUsd(raw: string | undefined): number {
   const n = Number(raw)
   return Number.isFinite(n) && n > 0 ? n : ZEC_SHIELDED_MAX_USD_DEFAULT

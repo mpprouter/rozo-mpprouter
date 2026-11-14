@@ -797,9 +797,9 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(zecShieldedAvailable(open, 'near', 'https://x/?beta=zec,zec_shielded')).toBe(false)
     expect(zecShieldedAvailable(open, 'custody', 'https://x/?beta=zec')).toBe(false)
     expect(zecShieldedAvailable(parseNativeSources(PROD_NATIVE), 'custody', 'https://x/?beta=zec,zec_shielded')).toBe(false)
-    expect(zecShieldedMaxUsd(undefined)).toBe(1200)
+    expect(zecShieldedMaxUsd(undefined)).toBe(3500)
     expect(zecShieldedMaxUsd('50')).toBe(50)
-    expect(zecShieldedMaxUsd('-1')).toBe(1200)
+    expect(zecShieldedMaxUsd('-1')).toBe(3500)
   })
 
   it('sourceMeta marks shieldedAvailable only on custody with the flag', () => {
@@ -895,11 +895,14 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
   })
 
   it.each([
-    ['1200', undefined, 200],
-    ['1200.01', undefined, 400],
-    ['50', '50', 200],
-    ['50.01', '50', 400],
-  ] as const)('shielded cap: callerPays %s with ZEC_SHIELDED_MAX_USD=%s -> %i', async (amount, cap, expected) => {
+    // Default cap 3500 is bounded by the custody cap 3499.99 (G < $3,500, same as transparent ZEC),
+    // so 3500 is refused by the native-coin check first.
+    ['3499.99', undefined, 200, ''],
+    ['3500', undefined, 400, 'Native coin'],
+    ['1200.01', '1200', 400, 'Shielded ZEC'],
+    ['50', '50', 200, ''],
+    ['50.01', '50', 400, 'Shielded ZEC'],
+  ] as const)('shielded cap: callerPays %s with ZEC_SHIELDED_MAX_USD=%s -> %i', async (amount, cap, expected, msg) => {
     quoteAmount = amount
     createAnswer = shieldedCreate
     const env = custodyEnv(cap ? { ZEC_SHIELDED_MAX_USD: cap } : {})
@@ -907,7 +910,7 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(status).toBe(expected)
     if (expected === 400) {
       expect(json.code).toBe('UNSUPPORTED_SOURCE')
-      expect(json.message).toContain('Shielded ZEC')
+      expect(json.message).toContain(msg)
       expect(createCalls).toBe(0)
     }
   })
