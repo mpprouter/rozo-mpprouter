@@ -240,6 +240,25 @@ describe('tron-ton-alpha option: one order per Coinbase invoice', () => {
     expect(call.body.providerInvoiceKey).toBe(PL)
   })
 
+  it('forwards a well-formed deviceId on the business order create only', async () => {
+    const DEVICE_ID = '3f2b8c1e-7a4d-4e9b-9c2a-1d5e6f7a8b9c'
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT', deviceId: DEVICE_ID }), makeEnv())
+    expect(r.status).toBe(200)
+    expect(intents.creates.length).toBe(1)
+    expect(intents.creates[0].deviceId).toBe(DEVICE_ID)
+    expect(JSON.stringify(intents.creates[0].metadata)).not.toContain(DEVICE_ID)
+    // Never sent to the alpha allocator, never echoed back.
+    for (const c of up.calls) expect(JSON.stringify(c.body)).not.toContain(DEVICE_ID)
+    expect(JSON.stringify(await r.json())).not.toContain(DEVICE_ID)
+  })
+
+  it('drops a malformed deviceId and still creates the business order', async () => {
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT', deviceId: 'ab'.repeat(32) }), makeEnv())
+    expect(r.status).toBe(200)
+    expect(intents.creates.length).toBe(1)
+    expect('deviceId' in intents.creates[0]).toBe(false)
+  })
+
   it('accepts v3 payment sessions (full URL) and keys them by the session id', async () => {
     quoteLinkId = SESSION
     const r: any = await (await handleTronTonAlphaOption(optionReq({ url: `https://payments.coinbase.com/payment-sessions/${SESSION}`, network: 'ton', token: 'USDT' }), makeEnv())).json()

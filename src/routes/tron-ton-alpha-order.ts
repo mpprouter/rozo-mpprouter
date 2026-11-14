@@ -34,6 +34,7 @@ import {
 import { buildCheckoutTitle, type CheckoutPricing } from './checkout-web-pricing'
 import { withForwardedClientHint } from './client-hint-forward'
 import { coinbaseLinkFromId, saveOriginalPaymentLink } from './payment-link-store'
+import { deviceIdField } from './device-id-forward'
 
 const ORDER_TIMEOUT_MS = 8_000
 // Set once the order is known to exist; later polls of the same invoice skip
@@ -74,6 +75,8 @@ export interface AlphaOrderArgs {
   merchant: string
   pricing: CheckoutPricing
   test: boolean
+  /** Browser device id, validated by readDeviceId (device-id-forward.ts). Never logged. */
+  deviceId?: string | null
 }
 
 /** The payment-api create body. Pure; mirrors create-invoice's default (Base USDC, exactIn) order. */
@@ -101,6 +104,7 @@ export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs): Record<string, u
       tokenSymbol: 'USDC',
       tokenAddress: BASE_USDC_ADDRESS,
     },
+    ...deviceIdField(a.deviceId),
     metadata: {
       source: 'mpprouter-tron-ton-alpha',
       coinbasePaymentLinkId: a.invoiceKey,

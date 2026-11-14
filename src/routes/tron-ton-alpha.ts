@@ -37,6 +37,7 @@ import { resolveCoinbaseLinkExpiry } from './create-invoice'
 import { isTestPaymentId, TEST_MERCHANT_NAME, verifyTestPaymentId } from './native-sources'
 import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
 import { forwardedClientHintHeader } from './client-hint-forward'
+import { readDeviceId } from './device-id-forward'
 
 export const TRON_TON_ALPHA_CAPABILITY_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/capability'
 export const TRON_TON_ALPHA_OPTION_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/option'
@@ -269,7 +270,9 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   }
 
   // Only the invoice reference is read from the body. Any orderId-like field
-  // the caller sends is ignored: the order key is the invoice id below.
+  // the caller sends is ignored: the order key is the invoice id below. (The
+  // optional browser `deviceId` is read further down, only for the business
+  // order create; see device-id-forward.ts.)
   const { normalized, error, provider_detected } = normalizePayInvoiceBody({
     url: parsed.url,
     payment_id: parsed.payment_id,
@@ -406,7 +409,7 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   // next read retries it (later reads hit the KV marker, no extra calls).
   const order = await ensureAlphaBusinessOrder(
     env,
-    { invoiceKey, merchant, pricing, test: testId !== null },
+    { invoiceKey, merchant, pricing, test: testId !== null, deviceId: readDeviceId(parsed) },
     forwardedClientHintHeader(request, null),
   ).catch(() => ({ ok: false as const, reason: 'create_failed' as const }))
   if (!order.ok) {

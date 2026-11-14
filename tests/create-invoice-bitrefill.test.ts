@@ -98,6 +98,25 @@ describe('create-invoice provider=bitrefill', () => {
     expect(createdIntent).toBeNull()
   })
 
+  it('forwards a well-formed deviceId, drops a malformed one and still creates', async () => {
+    const DEVICE_ID = '3f2b8c1e-7a4d-4e9b-9c2a-1d5e6f7a8b9c'
+    const ok = await post(body({ deviceId: DEVICE_ID }))
+    expect(ok.status).toBe(200)
+    expect(createdIntent.deviceId).toBe(DEVICE_ID)
+    expect(JSON.stringify(createdIntent.metadata)).not.toContain(DEVICE_ID)
+    expect(JSON.stringify(ok.json)).not.toContain(DEVICE_ID)
+
+    createdIntent = null
+    const bad = await post(body({ deviceId: 'nope' }))
+    expect(bad.status).toBe(200)
+    expect('deviceId' in createdIntent).toBe(false)
+
+    createdIntent = null
+    const none = await post(body())
+    expect(none.status).toBe(200)
+    expect('deviceId' in createdIntent).toBe(false)
+  })
+
   it('creates an exactOut intent straight to the Bitrefill address', async () => {
     const { status, json } = await post(body({ client: 'rozo-checkout' }))
     expect(status).toBe(200)
