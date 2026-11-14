@@ -408,7 +408,8 @@ export interface Env {
   /** Expected rail for new ZEC orders: 'near' (default) | 'custody'. */
   ZEC_RAIL?: string
   NATIVE_MAX_USD?: string
-  /** Per-invoice cap in USD for a shielded ZEC order (default 1200 = intents ZEC_SHIELD_CAPS.max_order_usd, founder 2026-11-02). */
+  /** Per-invoice cap in USD for a shielded ZEC order (default 3500, bounded by the custody cap 3499.99 = intents
+   *  ZEC_SHIELD_CAPS.max_order_usd, founder 2026-11-14; was 1200 from 2026-11-02). */
   ZEC_SHIELDED_MAX_USD?: string
   // "true" lets create-invoice rotate an unpaid Lightning order out to another
   // source via /checkout. Flip only after rozo-intents-api #672 and #674 are
