@@ -14,7 +14,7 @@ import {
   verifyTestPaymentId,
   withBetaSources,
 } from './native-sources'
-import { createQuoteReceipt } from './quote-receipt'
+import { createQuoteReceipt, quoteIdentity } from './quote-receipt'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { invoiceResolveRateLimit } from './invoice-details'
 import {
@@ -867,6 +867,9 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       pricingVersion: pricing.pricingVersion,
     },
     quoteReceipt,
+    // G5: a stable public id for this quote and when it stops being honoured
+    // (the receipt's exp). Additive; nothing reads them back on create.
+    ...((await quoteIdentity(quoteReceipt)) ?? {}),
   })
 }
 

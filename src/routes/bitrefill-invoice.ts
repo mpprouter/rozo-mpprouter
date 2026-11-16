@@ -30,6 +30,7 @@ import {
 } from './checkout-web-pricing'
 import { OPENROUTER_APP_ID } from './existing-order'
 import { casUpdate } from './stripe-atomic'
+import { claimInvoiceKey } from './invoice-claim'
 import {
   BITREFILL_FEE_BPS,
   BITREFILL_FUNDER,
@@ -250,6 +251,8 @@ export async function handleBitrefillCreateInvoice(
   if (claim === 'error') {
     return fail(503, 'RETRY_LATER', 'Could not reserve this Bitrefill invoice. Retry shortly; do not pay yet.')
   }
+  const crossEntry = await claimBitrefillCrossEntry(env, invoiceId)
+  if (crossEntry) return crossEntry
   const existing = await lookupAnyAccount(env, invoiceId)
   if (claim !== BITREFILL_APP_ID && existing.state !== 'found') {
     return fail(409, 'DUPLICATE_INVOICE', 'A payment for this Bitrefill invoice was started under another checkout model. Resume it instead of paying again.', { invoiceId })
@@ -462,6 +465,30 @@ export async function claimInvoiceAccount(env: Env, invoiceId: string, appId: st
   }
 }
 
+/** Cross-entry invoice-claim key for a Bitrefill invoice (Agent Checkout G8). */
+export function bitrefillClaimInvoiceKey(invoiceId: string): string {
+  return `bitrefill:${invoiceId.trim().toLowerCase()}`
+}
+
+/**
+ * Agent Checkout G8: put a Bitrefill invoice under the same cross-entry claim
+ * (invoice-claim.ts, DO CAS) every Coinbase entry uses, so a future second
+ * payer (balance execution) cannot pay an invoice this order already covers.
+ * Both checkout models claim as channel 'crypto' with the same ref, so either
+ * may re-enter; any other holder is refused. Store unavailable = do not create.
+ * Returns the refusal Response, or null when the claim is held by this flow.
+ */
+async function claimBitrefillCrossEntry(env: Env, invoiceId: string): Promise<Response | null> {
+  const ref = bitrefillOrderId(invoiceId.trim().toLowerCase())
+  try {
+    const r = await claimInvoiceKey(env, bitrefillClaimInvoiceKey(invoiceId), 'crypto', ref)
+    if (r.ok) return null
+    return fail(409, 'INVOICE_CLAIMED', 'This Bitrefill invoice is already being paid through another ROZO checkout. Do not pay it again here.', { invoiceId })
+  } catch {
+    return fail(503, 'RETRY_LATER', 'Could not reserve this Bitrefill invoice. Retry shortly; do not pay yet.')
+  }
+}
+
 /**
  * Existing order for this Bitrefill invoice under either account, checking the
  * id as given and lowercased (the funder model stores lowercase UUIDs, the
@@ -598,6 +625,8 @@ export async function handleBitrefillFunderCreate(
   if (claim === 'error') {
     return fail(503, 'RETRY_LATER', 'Could not reserve this Bitrefill invoice. Retry shortly; do not pay yet.')
   }
+  const crossEntry = await claimBitrefillCrossEntry(env, invoiceId)
+  if (crossEntry) return crossEntry
   // Orders created before the switch live under the legacy wallet account;
   // both accounts are always checked (keyless when the legacy key is unset).
   const existing = await lookupAnyAccount(env, typeof rawId === 'string' ? rawId.trim() : invoiceId)
