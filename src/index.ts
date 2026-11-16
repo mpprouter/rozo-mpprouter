@@ -65,6 +65,8 @@ import { handleStripeFulfillmentResolve, handleStripeFulfillmentRetry } from './
 import { handleCoinbaseExecGateClear } from './routes/coinbase-exec-gate-admin'
 import { handleCheckoutControl } from './routes/checkout-control-admin'
 import { handleCreateInvoice } from './routes/create-invoice'
+import { AC_PREFIX, handleAgentCheckout } from './agent-checkout/routes'
+import { withAgentCheckoutLink } from './agent-checkout/link-order'
 import { FEEDBACK_PATH, handleCheckoutFeedback, withFeedbackToken, drainCheckoutFeedbackNotifications } from './routes/checkout-feedback'
 import {
   handleIssueCoupon,
@@ -533,6 +535,25 @@ export interface Env {
   // on the Intents side). URL / anon key fall back to ALERT_LOG_SUPABASE_*.
   //   wrangler secret put X402_LEDGER_RPC_SECRET
   X402_LEDGER_RPC_SECRET?: string
+
+  // ---- Agent Checkout spend requests (src/agent-checkout/, PR-5) -----------
+  // Every /v1/agent-checkout/* route 404s unless AC_REQUESTS_ENABLED is
+  // exactly 'true'; the Intents switch app_config.AC_REQUESTS_MODE (default
+  // off) then refuses every RPC as well. RPC access: anon key + Vault secret
+  // ac_rpc_secret (URL / anon key fall back to X402_LEDGER_* / ALERT_LOG_*).
+  //   wrangler secret put AC_RPC_SECRET
+  //   wrangler secret put AC_SERVICE_KEY   (chat-pay -> X-Rozo-Service-Auth)
+  // AC_ENVIRONMENT: prod (default) | test, the environment of service calls.
+  // AC_CREATE_LIMIT_PER_HOUR / AC_CLAIM_IP_LIMIT_PER_HOUR: unset = those
+  // routes answer 503 AC_NOT_CONFIGURED (no built-in default).
+  AC_REQUESTS_ENABLED?: string
+  AC_RPC_SECRET?: string
+  AC_SUPABASE_URL?: string
+  AC_SUPABASE_ANON_KEY?: string
+  AC_SERVICE_KEY?: string
+  AC_ENVIRONMENT?: string
+  AC_CREATE_LIMIT_PER_HOUR?: string
+  AC_CLAIM_IP_LIMIT_PER_HOUR?: string
   X402_LEDGER_SUPABASE_URL?: string
   X402_LEDGER_SUPABASE_ANON_KEY?: string
   // Signer for (exact, eip155:8453): a REMOTE service on the pay-invoice
@@ -1052,6 +1073,13 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
 
       // x402 PAYER (we sign x402 payments for agents from a prepaid balance).
       // Not the x402 SERVER branch above. Switch: app_config.X402_PAYER.
+      // Agent Checkout spend requests (src/agent-checkout/routes.ts). 404 unless
+      // AC_REQUESTS_ENABLED=true. No route here moves money.
+      if (url.pathname.startsWith(AC_PREFIX)) {
+        const res = await handleAgentCheckout(request, env)
+        if (res) return res
+      }
+
       if (X402_PATHS.has(url.pathname)) {
         const res = await handleX402Payer(request, env)
         if (res) return res
@@ -1315,7 +1343,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // applies the router's discount (max $5 off, capped at ~4.76%), and
       // creates a Rozo intent so the caller can pay the discounted amount.
       if (url.pathname === '/v1/services/rozo-agent-api/create-invoice') {
-        return withFeedbackToken(await handleCreateInvoice(request, env, ctx), env)
+        return withFeedbackToken(
+          await withAgentCheckoutLink(request, env, ctx, (req) => handleCreateInvoice(req, env, ctx)),
+          env,
+        )
       }
 
       // Optional post-payment feedback from checkout.rozo.ai: one free-text

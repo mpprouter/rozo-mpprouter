@@ -139,3 +139,22 @@ export async function verifyQuoteReceipt(
     return null
   }
 }
+
+/**
+ * Public quote identity (Agent Checkout G5): a non-secret id derived from the
+ * signed receipt and the receipt's own expiry. Same receipt -> same id, so a
+ * spend-request snapshot can tell whether the quote it was built from changed.
+ * Reads the payload of a receipt this Worker just signed; it does not verify.
+ */
+export async function quoteIdentity(receipt: string): Promise<{ quoteId: string; quoteExpiresAt: string } | null> {
+  const [encodedPayload] = receipt.split('.')
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(encodedPayload))) as { exp?: unknown }
+    if (typeof payload.exp !== 'number') return null
+    const d = new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(receipt)))
+    const hex = Array.from(d, (b) => b.toString(16).padStart(2, '0')).join('')
+    return { quoteId: `q_${hex.slice(0, 32)}`, quoteExpiresAt: new Date(payload.exp * 1000).toISOString() }
+  } catch {
+    return null
+  }
+}
