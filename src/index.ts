@@ -67,6 +67,7 @@ import { handleCheckoutControl } from './routes/checkout-control-admin'
 import { handleCreateInvoice } from './routes/create-invoice'
 import { AC_PREFIX, handleAgentCheckout } from './agent-checkout/routes'
 import { withAgentCheckoutLink } from './agent-checkout/link-order'
+import { CLIENT_REPORT_PATH, handleClientReport } from './routes/client-report'
 import { FEEDBACK_PATH, handleCheckoutFeedback, withFeedbackToken, drainCheckoutFeedbackNotifications } from './routes/checkout-feedback'
 import {
   handleIssueCoupon,
@@ -554,6 +555,15 @@ export interface Env {
   AC_ENVIRONMENT?: string
   AC_CREATE_LIMIT_PER_HOUR?: string
   AC_CLAIM_IP_LIMIT_PER_HOUR?: string
+
+  // ---- Agent Checkout B9: client outcome reports (routes/client-report.ts) --
+  // POST /v1/checkout/client-report 404s unless CLIENT_REPORTS_ENABLED is
+  // exactly 'true'. Needs ROUTE_METRICS_DB with migrations-metrics/0005 and
+  // CLIENT_REPORTS_IP_LIMIT_PER_HOUR and CLIENT_REPORTS_GLOBAL_LIMIT_PER_HOUR
+  // (unset = 503, no built-in default).
+  CLIENT_REPORTS_ENABLED?: string
+  CLIENT_REPORTS_IP_LIMIT_PER_HOUR?: string
+  CLIENT_REPORTS_GLOBAL_LIMIT_PER_HOUR?: string
   X402_LEDGER_SUPABASE_URL?: string
   X402_LEDGER_SUPABASE_ANON_KEY?: string
   // Signer for (exact, eip155:8453): a REMOTE service on the pay-invoice
@@ -1075,6 +1085,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
       // Not the x402 SERVER branch above. Switch: app_config.X402_PAYER.
       // Agent Checkout spend requests (src/agent-checkout/routes.ts). 404 unless
       // AC_REQUESTS_ENABLED=true. No route here moves money.
+      if (url.pathname === CLIENT_REPORT_PATH) {
+        return handleClientReport(request, env, ctx)
+      }
+
       if (url.pathname.startsWith(AC_PREFIX)) {
         const res = await handleAgentCheckout(request, env)
         if (res) return res
