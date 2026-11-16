@@ -36,13 +36,13 @@ const DO_SINGLETON = 'stripe-fulfillment'
 // net. Failing an operation is safer than looping forever or racing.
 const MAX_CAS_RETRIES = 6
 
-function stub(env: Env) {
+function stub(env: Env, instance: string = DO_SINGLETON) {
   const ns = env.ATOMIC_STORE
-  return ns.get(ns.idFromName(DO_SINGLETON))
+  return ns.get(ns.idFromName(instance))
 }
 
-async function doPost<T>(env: Env, path: string, payload: unknown): Promise<T> {
-  const resp = await stub(env).fetch(
+async function doPost<T>(env: Env, path: string, payload: unknown, instance?: string): Promise<T> {
+  const resp = await stub(env, instance).fetch(
     new Request(`${DO_ORIGIN}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -57,8 +57,8 @@ async function doPost<T>(env: Env, path: string, payload: unknown): Promise<T> {
 }
 
 /** Read the raw value + version for a key from the DO. Absent ≡ { value: null, version: 0 }. */
-export async function casRead(env: Env, key: string): Promise<{ value: string | null; version: number }> {
-  const r = await doPost<ReadResponse>(env, '/read', { key })
+export async function casRead(env: Env, key: string, instance?: string): Promise<{ value: string | null; version: number }> {
+  const r = await doPost<ReadResponse>(env, '/read', { key }, instance)
   return { value: r.value, version: r.version }
 }
 
@@ -80,9 +80,12 @@ export async function casUpdate<R>(
   env: Env,
   key: string,
   fn: (current: string | null) => CasChange<R>,
+  // Separate DO instance for traffic that must not load the payment
+  // coordinator (default: the stripe-fulfillment singleton, unchanged).
+  instance?: string,
 ): Promise<R> {
   for (let attempt = 0; attempt < MAX_CAS_RETRIES; attempt++) {
-    const { value, version } = await casRead(env, key)
+    const { value, version } = await casRead(env, key, instance)
     const change = fn(value)
     if (change.op === 'noop') return change.result
     const commit = await doPost<CommitResponse>(env, '/commit', {
@@ -90,7 +93,7 @@ export async function casUpdate<R>(
       expectedVersion: version,
       op: 'set',
       value: change.value,
-    })
+    }, instance)
     if (commit.ok) return change.result
     // Conflict — another isolate won the write between our read and commit.
     // Loop: re-read the fresh value and re-run fn.
