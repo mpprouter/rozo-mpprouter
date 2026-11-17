@@ -19,6 +19,8 @@ import {
   probeTronTonAlpha,
   resetTronTonAlphaCapabilityCache,
   tonRawToFriendly,
+  CAPABILITY_LAST_KNOWN_KEY,
+  CAPABILITY_STALE_MAX_MS,
 } from '../src/routes/tron-ton-alpha'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
@@ -197,12 +199,114 @@ describe('tron-ton-alpha capability', () => {
     expect(await probeTronTonAlpha(makeEnv())).toBe(false)
   })
 
-  it('is off when upstream is unreachable, and caches the answer', async () => {
+  it('is off when upstream is unreachable and nothing is known, and retries soon', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
     up.reply = () => { throw new Error('down') }
     expect(await probeTronTonAlpha(makeEnv())).toBe(false)
-    up.reply = undefined
     expect(await probeTronTonAlpha(makeEnv())).toBe(false)
     expect(up.calls).toHaveLength(1)
+    up.reply = undefined
+    now.mockReturnValue(t0 + 11_000)
+    expect(await probeTronTonAlpha(makeEnv())).toBe(true)
+    expect(up.calls).toHaveLength(2)
+  })
+
+  it.each([
+    ['a timeout', () => { throw new DOMException('timed out', 'TimeoutError') }],
+    ['a 5xx', () => new Response('boom', { status: 503 })],
+    ['a 546 worker limit', () => new Response('{}', { status: 546 })],
+    ['a 429', () => new Response('{}', { status: 429 })],
+  ])('keeps the last definitive answer through %s (same isolate)', async (_label, reply) => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    now.mockReturnValue(t0 + 61_000)
+    up.reply = reply as any
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    const r = await handleTronTonAlphaCapability(new Request('https://x/cap'), env)
+    const j: any = await r.json()
+    expect(j.enabled).toBe(true)
+    expect(j.options).toHaveLength(3)
+  })
+
+  it('a fresh isolate whose first probe fails uses the shared last-known answer', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    expect(JSON.parse((env.MPP_STORE as any).map.get(CAPABILITY_LAST_KNOWN_KEY))).toEqual({ enabled: true, at: t0 })
+    resetTronTonAlphaCapabilityCache() // new isolate, same KV
+    now.mockReturnValue(t0 + 5_000)
+    up.reply = () => { throw new DOMException('timed out', 'TimeoutError') }
+    expect(await probeTronTonAlpha(env)).toBe(true)
+  })
+
+  it('a definitive off is not masked by an older on', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    now.mockReturnValue(t0 + 61_000)
+    up.reply = () => new Response(JSON.stringify({ error: 'alpha_disabled' }), { status: 403 })
+    expect(await probeTronTonAlpha(env)).toBe(false)
+    expect(JSON.parse((env.MPP_STORE as any).map.get(CAPABILITY_LAST_KNOWN_KEY)).enabled).toBe(false)
+    resetTronTonAlphaCapabilityCache()
+    now.mockReturnValue(t0 + 62_000)
+    up.reply = () => new Response('boom', { status: 502 })
+    expect(await probeTronTonAlpha(env)).toBe(false)
+  })
+
+  it('a last-known answer older than the stale window no longer counts', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    now.mockReturnValue(t0 + CAPABILITY_STALE_MAX_MS + 1)
+    up.reply = () => new Response('boom', { status: 503 })
+    expect(await probeTronTonAlpha(env)).toBe(false)
+  })
+
+  it('does not rewrite the shared copy on every probe while unchanged', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    const put = vi.spyOn(env.MPP_STORE as any, 'put')
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    now.mockReturnValue(t0 + 61_000)
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    expect(put.mock.calls.filter((c) => c[0] === CAPABILITY_LAST_KNOWN_KEY)).toHaveLength(1)
+    now.mockReturnValue(t0 + 6 * 60_000)
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    expect(put.mock.calls.filter((c) => c[0] === CAPABILITY_LAST_KNOWN_KEY)).toHaveLength(2)
+  })
+
+  it('a 400 whose body cannot be read is unknown, not off', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    now.mockReturnValue(t0 + 61_000)
+    up.reply = () => new Response('<html>gateway</html>', { status: 400 })
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    expect(JSON.parse((env.MPP_STORE as any).map.get(CAPABILITY_LAST_KNOWN_KEY)).enabled).toBe(true)
+  })
+
+  it('a late probe does not overwrite a newer shared answer', async () => {
+    const t0 = 1_800_000_000_000
+    vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    ;(env.MPP_STORE as any).map.set(CAPABILITY_LAST_KNOWN_KEY, JSON.stringify({ enabled: false, at: t0 + 1_000 }))
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    expect(JSON.parse((env.MPP_STORE as any).map.get(CAPABILITY_LAST_KNOWN_KEY))).toEqual({ enabled: false, at: t0 + 1_000 })
+  })
+
+  it('a garbled shared copy is ignored', async () => {
+    const env = makeEnv()
+    ;(env.MPP_STORE as any).map.set(CAPABILITY_LAST_KNOWN_KEY, 'not json')
+    up.reply = () => new Response('boom', { status: 503 })
+    expect(await probeTronTonAlpha(env)).toBe(false)
   })
 })
 

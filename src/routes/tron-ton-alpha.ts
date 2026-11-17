@@ -45,7 +45,7 @@ export const TRON_TON_ALPHA_OPTION_PATH = '/v1/services/rozo-agent-api/tron-ton-
 export const TRON_TON_ALPHA_URL = 'https://intentapiv4.rozo.ai/functions/v1/tron-ton-alpha'
 const QUOTE_INVOICE_URL = 'https://agentapi.rozo.ai/quote-invoice'
 const UPSTREAM_TIMEOUT_MS = 8_000
-const CAPABILITY_TIMEOUT_MS = 3_000
+const CAPABILITY_TIMEOUT_MS = 5_000
 const CAPABILITY_TTL_MS = 60_000
 // One waiting tab re-reads 120 times an hour; the IP cap leaves room for a few
 // tabs behind one NAT. Global is a botnet backstop, not a business limit.
@@ -128,24 +128,36 @@ export function tonRawToFriendly(raw: string, bounceable = false): string | null
 
 // ── Capability ───────────────────────────────────────────────────────────────
 
-let capabilityCache: { at: number; enabled: boolean } | null = null
+// Per isolate. `at` is when the cached answer should next be re-probed from;
+// `knownAt` is when the upstream last gave a definitive answer.
+let capabilityCache: { at: number; enabled: boolean; knownAt: number } | null = null
 
 /** Test hook. */
 export function resetTronTonAlphaCapabilityCache(): void {
   capabilityCache = null
 }
 
+// Shared last definitive answer, so a fresh isolate whose first probe times
+// out does not report the route as off (2026-11-17 flapping: capability read
+// true / false on alternate requests while the backend switch was on).
+export const CAPABILITY_LAST_KNOWN_KEY = 'tta:capability:last-known'
+// How long a definitive answer may stand in for probes that fail transiently.
+export const CAPABILITY_STALE_MAX_MS = 30 * 60_000
+// After a failed probe, try again this soon instead of waiting the full TTL.
+const CAPABILITY_RETRY_MS = 10_000
+// Refresh the shared copy at most this often while the answer is unchanged.
+const CAPABILITY_KV_REFRESH_MS = 5 * 60_000
+
+type ProbeOutcome = 'on' | 'off' | 'unknown'
+
 /**
- * Whether the alpha is on for this router's app. The upstream function checks
- * its switch and app allowlist before it reads the body, so an empty body is a
- * read-only probe: 403 alpha_disabled / app_not_allowed = off, 400
- * unsupported_asset = on (nothing is allocated). Anything else, including a
- * timeout or the function not being deployed yet, is off.
+ * One upstream probe. The function checks its switch and app allowlist before
+ * it reads the body, so an empty body is read-only: 400 unsupported_asset = on
+ * (nothing is allocated); any other definitive client-error answer (403
+ * alpha_disabled / app_not_allowed, 404 not deployed, ...) = off. Timeouts,
+ * network errors, 408 / 429 and 5xx say nothing about the switch = unknown.
  */
-export async function probeTronTonAlpha(env: Env, fetchImpl: typeof fetch = fetch): Promise<boolean> {
-  const now = Date.now()
-  if (capabilityCache && now - capabilityCache.at < CAPABILITY_TTL_MS) return capabilityCache.enabled
-  let enabled = false
+async function probeOnce(env: Env, fetchImpl: typeof fetch): Promise<ProbeOutcome> {
   try {
     const r = await fetchImpl(TRON_TON_ALPHA_URL, {
       method: 'POST',
@@ -154,13 +166,72 @@ export async function probeTronTonAlpha(env: Env, fetchImpl: typeof fetch = fetc
       signal: AbortSignal.timeout(CAPABILITY_TIMEOUT_MS),
     })
     if (r.status === 400) {
-      const body = (await r.json().catch(() => null)) as { error?: unknown } | null
-      enabled = body?.error === 'unsupported_asset'
+      // A body that cannot be read (timeout, reset, not JSON) says nothing.
+      const body = (await r.json().catch(() => undefined)) as { error?: unknown } | null | undefined
+      if (body === undefined) {
+        console.warn('[tron-ton-alpha] capability probe body unreadable', r.status)
+        return 'unknown'
+      }
+      return body?.error === 'unsupported_asset' ? 'on' : 'off'
     }
-  } catch {
-    enabled = false
+    if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) return 'off'
+    console.warn('[tron-ton-alpha] capability probe inconclusive', r.status)
+    return 'unknown'
+  } catch (e) {
+    console.warn('[tron-ton-alpha] capability probe failed', e instanceof Error ? e.name : 'error')
+    return 'unknown'
   }
-  capabilityCache = { at: now, enabled }
+}
+
+async function readLastKnown(env: Env): Promise<{ enabled: boolean; at: number } | null> {
+  try {
+    const raw = await env.MPP_STORE?.get(CAPABILITY_LAST_KNOWN_KEY)
+    if (!raw) return null
+    const v = JSON.parse(raw) as { enabled?: unknown; at?: unknown }
+    if (typeof v.enabled !== 'boolean' || typeof v.at !== 'number' || !Number.isFinite(v.at)) return null
+    return { enabled: v.enabled, at: v.at }
+  } catch {
+    return null
+  }
+}
+
+async function writeLastKnown(env: Env, enabled: boolean, at: number): Promise<void> {
+  try {
+    const prev = await readLastKnown(env)
+    if (prev && prev.enabled === enabled && at - prev.at < CAPABILITY_KV_REFRESH_MS) return
+    // A late probe must not overwrite a newer answer another request stored.
+    if (prev && prev.at > at) return
+    await env.MPP_STORE?.put(CAPABILITY_LAST_KNOWN_KEY, JSON.stringify({ enabled, at }))
+  } catch {
+    // best effort: the in-isolate cache still holds the answer
+  }
+}
+
+/**
+ * Whether the alpha is on for this router's app. A definitive upstream answer
+ * is cached for CAPABILITY_TTL_MS and shared through KV. A transient probe
+ * failure does not turn the route off: the last definitive answer (this
+ * isolate's, else the shared one) stands for up to CAPABILITY_STALE_MAX_MS and
+ * the probe is retried after CAPABILITY_RETRY_MS. With no definitive answer in
+ * that window the route is reported off, as before.
+ */
+export async function probeTronTonAlpha(env: Env, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  const now = Date.now()
+  if (capabilityCache && now < capabilityCache.at) return capabilityCache.enabled
+  const outcome = await probeOnce(env, fetchImpl)
+  if (outcome !== 'unknown') {
+    const enabled = outcome === 'on'
+    capabilityCache = { at: now + CAPABILITY_TTL_MS, enabled, knownAt: now }
+    await writeLastKnown(env, enabled, now)
+    return enabled
+  }
+  let fallback: { enabled: boolean; at: number } | null =
+    capabilityCache ? { enabled: capabilityCache.enabled, at: capabilityCache.knownAt } : null
+  const shared = await readLastKnown(env)
+  if (shared && (!fallback || shared.at > fallback.at)) fallback = shared
+  const usable = fallback && now - fallback.at <= CAPABILITY_STALE_MAX_MS ? fallback : null
+  const enabled = usable ? usable.enabled : false
+  capabilityCache = { at: now + CAPABILITY_RETRY_MS, enabled, knownAt: usable ? usable.at : 0 }
   return enabled
 }
 
