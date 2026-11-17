@@ -14,7 +14,7 @@
 import type { Env } from '../index'
 import { contractVariantIds, retryOrderIds } from '../mpp/contract-variant'
 import { stripeOrderId } from './stripe-fulfillment'
-import { rowFundingEvidence, zecQuoteExpiredUnfunded } from './relink-guard'
+import { custodyQuoteExpiredUnfunded, rowFundingEvidence } from './relink-guard'
 
 import { ROZO_INTENTS_BASE, intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
 
@@ -153,12 +153,12 @@ export function isLookupTargetValid(target: ExistingOrderTarget): boolean {
 }
 
 /**
- * Live = still payable: expiresAt in the future, and not a ZEC custody order
- * whose quote expired unfunded (zecQuoteExpiredUnfunded).
+ * Live = still payable: expiresAt in the future, and not a custody order (ZEC
+ * or on-chain BTC) whose quote expired unfunded (custodyQuoteExpiredUnfunded).
  */
 export function isLive(row: any): boolean {
   const exp = Date.parse(row?.expiresAt ?? '')
-  return Number.isFinite(exp) && exp > Date.now() && !zecQuoteExpiredUnfunded(row)
+  return Number.isFinite(exp) && exp > Date.now() && !custodyQuoteExpiredUnfunded(row)
 }
 
 export function classifyOrderState(row: any): ExistingOrderState {

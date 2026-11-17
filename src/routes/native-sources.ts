@@ -13,7 +13,11 @@
 // create-invoice both read it). Without the param they are invisible and
 // rejected as UNSUPPORTED_SOURCE.
 
-export type NativeSymbol = 'ETH' | 'BNB' | 'POL' | 'SOL' | 'ZEC'
+// BTC here is on-chain Bitcoin (chain 9000, Beta). Lightning BTC is NOT a
+// native source: it uses chainId 'lightning' and its own path in
+// create-invoice. Anything that branches on the symbol 'BTC' must also check
+// the chain (isBtcOnchain).
+export type NativeSymbol = 'ETH' | 'BNB' | 'POL' | 'SOL' | 'ZEC' | 'BTC'
 
 /** Stablecoin sources every checkout accepts (moved from create-invoice so the
  * quote route can report the same table without an import cycle). */
@@ -75,6 +79,60 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
     refundAddressRequired: true,
     beta: true,
   },
+  // On-chain Bitcoin (Beta test version, founder 2026-11-18 "开"), internal
+  // chain id 9000. rozo-intents-api custody rail: a per-order bc1q (P2WPKH)
+  // address on our own wallet, 1 confirmation, exactOut to Base USDC. Opened
+  // only through NATIVE_SOURCES_BETA "BTC@9000" + `?beta=btc`; rozo-intents-api
+  // keeps its own switch (BTC_CUSTODY_MODE=test_only + app allowlist). Never
+  // the Lightning path (chainId 'lightning'). Test-period per-invoice band is
+  // $0.50 to $1.00 gross (BTC_ONCHAIN_MIN_USD / BTC_ONCHAIN_MAX_USD).
+  '9000': {
+    symbol: 'BTC',
+    tokenAddress: '',
+    provider: 'rozo',
+    maxUsd: 1,
+    refundAddressRequired: false,
+    beta: true,
+  },
+}
+
+// ── On-chain BTC (chain 9000, Beta) ─────────────────────────────────────────
+
+export const BTC_ONCHAIN_CHAIN_ID = '9000'
+export const BTC_ONCHAIN_KEY = 'BTC@9000'
+/** Test-period band per invoice, gross USD (callerPays, fee included). Code constants. */
+export const BTC_ONCHAIN_MIN_USD = 0.5
+export const BTC_ONCHAIN_MAX_USD = 1
+/** Confirmations rozo-intents-api waits for before the order counts as paid. */
+export const BTC_ONCHAIN_REQUIRED_CONFIRMATIONS = 1
+/** BTC has 8 decimals; the payer is asked for an amount with at most this many. */
+export const BTC_DECIMALS = 8
+
+/** True only for on-chain BTC (chain 9000). Lightning BTC ('lightning') is false. */
+export function isBtcOnchain(chainId: unknown, tokenSymbol: unknown): boolean {
+  return String(chainId ?? '') === BTC_ONCHAIN_CHAIN_ID && String(tokenSymbol ?? '').toUpperCase() === 'BTC'
+}
+
+/**
+ * Per-invoice cap for on-chain BTC. The code constant is the ceiling; the
+ * BTC_ONCHAIN_MAX_USD var may only lower it (a higher, zero, negative or
+ * unparseable value is ignored).
+ */
+export function btcOnchainMaxUsd(raw: string | undefined): number {
+  const n = Number(raw)
+  return Number.isFinite(n) && n > 0 && n < BTC_ONCHAIN_MAX_USD ? n : BTC_ONCHAIN_MAX_USD
+}
+
+/** P2WPKH mainnet address: bc1q + 38 bech32 characters (42 total), one case. */
+const BC1Q_P2WPKH_RE = /^bc1q[02-9ac-hj-np-z]{38}$/
+export function isBtcP2wpkhAddress(addr: unknown): boolean {
+  return typeof addr === 'string' && BC1Q_P2WPKH_RE.test(addr)
+}
+
+/** Any on-chain Bitcoin address shape (bech32 bc1/tb1, legacy 1/3). Used to keep them off Lightning orders. */
+export function looksLikeBtcOnchainAddress(addr: unknown): boolean {
+  if (typeof addr !== 'string') return false
+  return /^(bc1|tb1|bcrt1)[0-9a-z]{8,90}$/i.test(addr) || /^[13][1-9A-HJ-NP-Za-km-z]{25,34}$/.test(addr)
 }
 
 const nativeKey = (chainId: string, d: NativeSourceDef) => `${d.symbol}@${chainId}`
@@ -247,6 +305,11 @@ export interface NativeSourceMeta {
   confirmations?: { under110: number; from110: number }
   /** Custody ZEC with `?beta=zec_shielded`: a shielded-balance pay-in may be requested (source.shielded=true). */
   shieldedAvailable?: true
+  /** On-chain BTC only: confirmations before the order counts as paid. */
+  required_confirmations?: number
+  /** On-chain BTC only: test-period per-invoice band, gross USD. */
+  min_usd?: number
+  max_usd?: number
 }
 
 /**
@@ -258,6 +321,7 @@ export function sourceMeta(
   nativeAllowed: ReadonlySet<string> = new Set(),
   zecRail: ZecRailMode = 'near',
   shieldedRequested = false,
+  btcMaxRaw?: string,
 ): Record<string, NativeSourceMeta> {
   const out: Record<string, NativeSourceMeta> = {}
   for (const chainId of Object.keys(NATIVE_SOURCE_DEFS)) {
@@ -272,8 +336,15 @@ export function sourceMeta(
       // near 1Click deposit addresses are single-quote, single-use; custody
       // addresses are derived per order and watched for that order only.
       address_single_use: d.provider === 'near' || d.provider === 'rozo',
-      ...(d.provider === 'rozo' ? { confirmations: { ...ZEC_CUSTODY_CONFIRMATIONS } } : {}),
-      ...(d.provider === 'rozo' && shieldedRequested ? { shieldedAvailable: true as const } : {}),
+      ...(d.provider === 'rozo' && d.symbol === 'ZEC' ? { confirmations: { ...ZEC_CUSTODY_CONFIRMATIONS } } : {}),
+      ...(d.provider === 'rozo' && d.symbol === 'ZEC' && shieldedRequested ? { shieldedAvailable: true as const } : {}),
+      ...(isBtcOnchain(chainId, d.symbol)
+        ? {
+            required_confirmations: BTC_ONCHAIN_REQUIRED_CONFIRMATIONS,
+            min_usd: BTC_ONCHAIN_MIN_USD,
+            max_usd: btcOnchainMaxUsd(btcMaxRaw),
+          }
+        : {}),
     }
   }
   return out
@@ -296,6 +367,7 @@ export const NATIVE_MIN_USD: Readonly<Record<string, number>> = {
   '56': 0.1,
   '137': 0.1,
   '900': 1, // Solana (founder 2026-07-10)
+  '9000': BTC_ONCHAIN_MIN_USD, // On-chain BTC test period (founder 2026-11-18)
 }
 
 /**

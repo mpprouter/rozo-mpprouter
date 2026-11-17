@@ -1751,6 +1751,42 @@ export function pickZecCustodyStatus(z: any) {
   }
 }
 
+const SAT_RE = /^\d{1,20}$/
+
+/**
+ * Whitelist the on-chain BTC custody status block (rozo-intents-api
+ * source.btc, chain 9000). Contract assumed isomorphic to the ZEC custody
+ * block with sat in place of zat and a single confirmation tier:
+ * { rail: 'btc_custody', requiredConfirmations: 1, confirmations,
+ *   requiredSat, receivedSat, payinState, quoteExpiresAt }. Null unless the
+ * whole block is well-formed and the order really is on-chain BTC, so a
+ * Lightning order never carries it. Extra keys are dropped.
+ */
+export function pickBtcCustodyStatus(b: any, source?: any) {
+  if (source !== undefined) {
+    if (String(source?.chainId ?? '') !== '9000') return null
+    if (String(source?.tokenSymbol ?? '').toUpperCase() !== 'BTC') return null
+  }
+  if (!b || typeof b !== 'object') return null
+  if (b.rail !== 'btc_custody') return null
+  if (b.requiredConfirmations !== 1) return null
+  if (!Number.isInteger(b.confirmations) || b.confirmations < 0 || b.confirmations > 1_000_000) return null
+  if (typeof b.requiredSat !== 'string' || !SAT_RE.test(b.requiredSat)) return null
+  if (typeof b.receivedSat !== 'string' || !SAT_RE.test(b.receivedSat)) return null
+  if (typeof b.payinState !== 'string' || !ZEC_PAYIN_STATES.has(b.payinState)) return null
+  const quoteExpiresAt = safeIso(b.quoteExpiresAt)
+  if (!quoteExpiresAt) return null
+  return {
+    rail: 'btc_custody' as const,
+    requiredConfirmations: 1 as const,
+    confirmations: b.confirmations as number,
+    requiredSat: b.requiredSat as string,
+    receivedSat: b.receivedSat as string,
+    payinState: b.payinState as string,
+    quoteExpiresAt,
+  }
+}
+
 /** ZIP-321 payment URI of a shielded ZEC order (rozo-intents-api source.paymentUri), or null. */
 export function pickZecPaymentUri(source: any): string | null {
   const u = source?.paymentUri
@@ -1848,6 +1884,11 @@ export function pickRozoCallerSafe(rp: any) {
           ...(() => {
             const paymentUri = pickZecPaymentUri(rp.source)
             return paymentUri ? { paymentUri } : {}
+          })(),
+          // On-chain BTC (chain 9000) custody progress; never on Lightning rows.
+          ...(() => {
+            const btc = pickBtcCustodyStatus(rp.source.btc, rp.source)
+            return btc ? { btc } : {}
           })(),
         }
       : null,

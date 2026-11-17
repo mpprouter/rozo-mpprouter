@@ -125,6 +125,36 @@ export function zecQuoteExpiredUnfunded(row: any): boolean {
   return rowFundingEvidence(row) === null
 }
 
+/**
+ * On-chain BTC twin of zecQuoteExpiredUnfunded (chain 9000, rozo-intents-api
+ * source.btc, rail btc_custody; contract inferred from the ZEC custody block
+ * with sat in place of zat). An unpaid on-chain BTC order whose quote expired
+ * with nothing received, nothing confirmed and no funding evidence is not
+ * live: a fresh order may replace it. Anything else stays live / blocking.
+ * Never true for a Lightning order (chainId 'lightning').
+ */
+export function btcQuoteExpiredUnfunded(row: any): boolean {
+  const status = row?.status ?? row?.payment_status ?? null
+  if (status !== 'payment_unpaid') return false
+  const src = row?.source
+  if (String(src?.chainId ?? src?.source_chain_id ?? '') !== '9000') return false
+  if (String(src?.tokenSymbol ?? '').toUpperCase() !== 'BTC') return false
+  const b = src?.btc
+  if (!b || typeof b !== 'object') return false
+  if (b.rail !== 'btc_custody') return false
+  if (b.requiredConfirmations !== 1) return false
+  if (typeof b.requiredSat !== 'string' || !/^\d{1,20}$/.test(b.requiredSat)) return false
+  if (typeof b.quoteExpiresAt !== 'string' || !Number.isFinite(Date.parse(b.quoteExpiresAt))) return false
+  if (b.payinState !== 'expired' || b.receivedSat !== '0' || b.confirmations !== 0) return false
+  if (Date.parse(b.quoteExpiresAt) > Date.now()) return false
+  return rowFundingEvidence(row) === null
+}
+
+/** A custody-rail order (ZEC or on-chain BTC) whose quote expired unfunded. */
+export function custodyQuoteExpiredUnfunded(row: any): boolean {
+  return zecQuoteExpiredUnfunded(row) || btcQuoteExpiredUnfunded(row)
+}
+
 function blocked(row: any, reason: RelinkBlockReason): RelinkCheck {
   return {
     ok: false,
@@ -169,7 +199,7 @@ export async function checkPreviousOrderUnfunded(_env: Env, row: any): Promise<R
   // ZEC custody order whose quote expired unfunded: the custody ledger (not
   // the EVM omni scan, which never covers Zcash) is the authority, and it
   // reports nothing received. Late funds there become anomaly funds.
-  if (id && zecQuoteExpiredUnfunded(row)) return { ok: true }
+  if (id && custodyQuoteExpiredUnfunded(row)) return { ok: true }
   if (status !== 'payment_expired' || !id) return blocked(row, 'previous_order_not_closed')
   const verdict = await scanVerdict(id)
   if (verdict === 'nothing_found') return { ok: true }

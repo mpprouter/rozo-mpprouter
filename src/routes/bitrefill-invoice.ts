@@ -18,7 +18,7 @@ import { forwardedClientHintHeader, withForwardedClientHint } from './client-hin
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
 import { deviceIdField } from './device-id-forward'
-import { isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
+import { isBtcOnchain, isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
 import {
   CHECKOUT_PRICING_VERSION,
   type CheckoutPricing,
@@ -593,6 +593,12 @@ export async function handleBitrefillFunderCreate(
   const source = src.resolved
   if (source.tokenSymbol === 'ZEC') {
     return fail(400, 'UNSUPPORTED_SOURCE', 'ZEC is not available for Bitrefill invoices.')
+  }
+  // On-chain BTC (chain 9000, Beta) is never offered here (beta coins are not
+  // in NATIVE_SOURCES, so resolveSource already refuses it; kept explicit).
+  // Lightning BTC ('lightning') is unaffected.
+  if (isBtcOnchain(source.chainId, source.tokenSymbol)) {
+    return fail(400, 'UNSUPPORTED_SOURCE', 'On-chain BTC is not available for Bitrefill invoices.')
   }
 
   const serviceFeeAtomic = computeServiceFeeAtomic(invoiceAtomic, BITREFILL_FEE_BPS)
