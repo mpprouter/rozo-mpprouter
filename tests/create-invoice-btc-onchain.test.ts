@@ -426,7 +426,6 @@ describe('I1: the BTC rail invariant on what rozo-intents-api returns', () => {
     ['a BOLT11 on an on-chain order', btcAnswer({ lnInvoice: LNBC })],
     ['a non-bc1q address', btcAnswer({}, { receiverAddress: '3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy' })],
     ['a taproot address', btcAnswer({}, { receiverAddress: 'bc1p' + BC1Q.slice(4) })],
-    ['no address', btcAnswer({}, { receiverAddress: null })],
     ['the lightning chain', btcAnswer({}, { chainId: 'lightning' })],
     ['an amount with 9 decimals', btcAnswer({}, { amount: '0.000012001' })],
     ['a zero amount', btcAnswer({}, { amount: '0' })],
@@ -442,6 +441,15 @@ describe('I1: the BTC rail invariant on what rozo-intents-api returns', () => {
       expect(r.json.raw).toBeUndefined()
     })
   }
+
+  it('a blank address (no instructions, upstream not safely payable) passes through as blank', async () => {
+    for (const blank of [null, '']) {
+      createAnswer = btcAnswer({}, { receiverAddress: blank })
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { query: '?beta=btc' })
+      expect(r.status).toBe(200)
+      expect(r.json.raw.source.receiverAddress).toBe(blank)
+    }
+  })
 
   it('Lightning create: body unchanged by ?beta=btc and never on chain 9000', async () => {
     createAnswer = lnAnswer()

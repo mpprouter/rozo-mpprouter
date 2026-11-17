@@ -739,9 +739,10 @@ const BTC_AMOUNT_RE = new RegExp(`^\\d{1,8}(\\.\\d{1,${BTC_DECIMALS}})?$`)
 /**
  * The BTC rail invariant for an order row about to be handed to a payer.
  * `requested` is the source the caller asked for (or the row's own chain).
- *   - An on-chain BTC row (chain 9000) must carry a bc1q P2WPKH deposit
- *     address and a plain BTC amount with at most 8 decimals, and never a
- *     BOLT11 invoice or a 'lightning' chain.
+ *   - An on-chain BTC row (chain 9000) never carries a BOLT11 invoice or the
+ *     'lightning' chain; any deposit address it hands out is bc1q P2WPKH with
+ *     a plain BTC amount of at most 8 decimals (a blank address = no
+ *     instructions, allowed).
  *   - A Lightning row never carries an on-chain Bitcoin address or chain 9000.
  * Returns a short reason, or null when the row is fine (or neither rail).
  * Only the order row from rozo-intents-api is read; nothing the client sent.
@@ -756,11 +757,14 @@ export function btcRailViolation(requested: { chainId: string }, row: any): stri
     if (rowChain !== BTC_ONCHAIN_CHAIN_ID) return 'btc_onchain_wrong_chain'
     if (String(src.tokenSymbol ?? '').toUpperCase() !== 'BTC') return 'btc_onchain_wrong_token'
     if (typeof row?.lnInvoice === 'string' && row.lnInvoice) return 'btc_onchain_has_ln_invoice'
-    const unpaid = (row?.status ?? row?.payment_status) === 'payment_unpaid'
-    if (unpaid || src.receiverAddress != null) {
-      if (!isBtcP2wpkhAddress(src.receiverAddress)) return 'btc_onchain_bad_address'
-    }
-    if (unpaid && !(typeof src.amount === 'string' && BTC_AMOUNT_RE.test(src.amount) && Number(src.amount) > 0)) {
+    // A blank address (null or "") carries no payment instructions: upstream
+    // blanks it once an order is not safely payable (funds seen, expired),
+    // like the ZEC custody rail. Any address that IS handed out must be bc1q,
+    // with a plain BTC amount of at most 8 decimals.
+    const addr = src.receiverAddress
+    if (addr === null || addr === undefined || addr === '') return null
+    if (!isBtcP2wpkhAddress(addr)) return 'btc_onchain_bad_address'
+    if (!(typeof src.amount === 'string' && BTC_AMOUNT_RE.test(src.amount) && Number(src.amount) > 0)) {
       return 'btc_onchain_bad_amount'
     }
     return null
