@@ -166,7 +166,12 @@ async function probeOnce(env: Env, fetchImpl: typeof fetch): Promise<ProbeOutcom
       signal: AbortSignal.timeout(CAPABILITY_TIMEOUT_MS),
     })
     if (r.status === 400) {
-      const body = (await r.json().catch(() => null)) as { error?: unknown } | null
+      // A body that cannot be read (timeout, reset, not JSON) says nothing.
+      const body = (await r.json().catch(() => undefined)) as { error?: unknown } | null | undefined
+      if (body === undefined) {
+        console.warn('[tron-ton-alpha] capability probe body unreadable', r.status)
+        return 'unknown'
+      }
       return body?.error === 'unsupported_asset' ? 'on' : 'off'
     }
     if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) return 'off'
@@ -194,6 +199,8 @@ async function writeLastKnown(env: Env, enabled: boolean, at: number): Promise<v
   try {
     const prev = await readLastKnown(env)
     if (prev && prev.enabled === enabled && at - prev.at < CAPABILITY_KV_REFRESH_MS) return
+    // A late probe must not overwrite a newer answer another request stored.
+    if (prev && prev.at > at) return
     await env.MPP_STORE?.put(CAPABILITY_LAST_KNOWN_KEY, JSON.stringify({ enabled, at }))
   } catch {
     // best effort: the in-isolate cache still holds the answer

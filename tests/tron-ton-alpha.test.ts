@@ -282,6 +282,26 @@ describe('tron-ton-alpha capability', () => {
     expect(put.mock.calls.filter((c) => c[0] === CAPABILITY_LAST_KNOWN_KEY)).toHaveLength(2)
   })
 
+  it('a 400 whose body cannot be read is unknown, not off', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    now.mockReturnValue(t0 + 61_000)
+    up.reply = () => new Response('<html>gateway</html>', { status: 400 })
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    expect(JSON.parse((env.MPP_STORE as any).map.get(CAPABILITY_LAST_KNOWN_KEY)).enabled).toBe(true)
+  })
+
+  it('a late probe does not overwrite a newer shared answer', async () => {
+    const t0 = 1_800_000_000_000
+    vi.spyOn(Date, 'now').mockReturnValue(t0)
+    const env = makeEnv()
+    ;(env.MPP_STORE as any).map.set(CAPABILITY_LAST_KNOWN_KEY, JSON.stringify({ enabled: false, at: t0 + 1_000 }))
+    expect(await probeTronTonAlpha(env)).toBe(true)
+    expect(JSON.parse((env.MPP_STORE as any).map.get(CAPABILITY_LAST_KNOWN_KEY))).toEqual({ enabled: false, at: t0 + 1_000 })
+  })
+
   it('a garbled shared copy is ignored', async () => {
     const env = makeEnv()
     ;(env.MPP_STORE as any).map.set(CAPABILITY_LAST_KNOWN_KEY, 'not json')
