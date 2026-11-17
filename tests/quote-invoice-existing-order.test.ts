@@ -554,7 +554,8 @@ describe('classifyOrderState', () => {
 
 describe('quote-invoice nativeMinUsd', () => {
   it('mirrors the rozo-intents-api built-in native minimums', () => {
-    expect(NATIVE_MIN_USD).toEqual({ '1': 1, '8453': 0.1, '42161': 0.1, '56': 0.1, '137': 0.1, '900': 1 })
+    // '9000' is the on-chain BTC (Beta) test-period floor, a router constant (BTC_ONCHAIN_MIN_USD).
+    expect(NATIVE_MIN_USD).toEqual({ '1': 1, '8453': 0.1, '42161': 0.1, '56': 0.1, '137': 0.1, '900': 1, '9000': 0.5 })
   })
 
   it('lists only open coins, keyed by chain and symbol', () => {

@@ -40,13 +40,20 @@ import {
   PREVIOUS_ORDER_FUNDED_MESSAGE,
   PREVIOUS_ORDER_PENDING_MESSAGE,
   type RelinkCheck,
-  zecQuoteExpiredUnfunded,
+  custodyQuoteExpiredUnfunded,
 } from './relink-guard'
 import { verifyQuoteReceipt, type QuoteReceiptPayload } from './quote-receipt'
 import {
   ALL_NATIVE_SOURCES,
+  BTC_DECIMALS,
+  BTC_ONCHAIN_CHAIN_ID,
+  BTC_ONCHAIN_MIN_USD,
   STABLE_SOURCES,
   NATIVE_SOURCE_DEFS,
+  btcOnchainMaxUsd,
+  isBtcOnchain,
+  isBtcP2wpkhAddress,
+  looksLikeBtcOnchainAddress,
   TEST_MERCHANT_NAME,
   isNativeSymbol,
   isTestPaymentId,
@@ -367,6 +374,18 @@ export function resolveSource(
   // chain's native sentinel. Only coins open for this request are accepted.
   if (isNativeSymbol(chainId, tokenSymbol)) {
     const def = nativeSourceFor(chainId, tokenSymbol, nativeAllowed)
+    if (!def && isBtcOnchain(chainId, tokenSymbol)) {
+      // On-chain BTC not open for this request (no NATIVE_SOURCES_BETA entry
+      // or no ?beta=btc): the same refusal as a chain we do not know, so a
+      // closed Beta never shows up as "exists but closed".
+      return {
+        error: {
+          code: 'UNSUPPORTED_SOURCE',
+          message: `chainId ${chainId} is not supported as a source. See "supported" for valid (chainId, tokenSymbol) pairs.`,
+          supported,
+        },
+      }
+    }
     if (!def) {
       return {
         error: {
@@ -472,6 +491,19 @@ export type CreateInvoiceErrorCode =
   | 'ZEC_CAPACITY_BUSY'
   | 'ZEC_PAUSED'
   | 'ZEC_MONITOR_STALE'
+  // On-chain BTC (chain 9000, Beta): rozo-intents-api refusals passed through (BTC_PASSTHROUGH_CODES).
+  | 'BTC_NOT_ENABLED'
+  | 'BTC_APP_NOT_ALLOWED'
+  | 'BTC_AMOUNT_TOO_LOW'
+  | 'BTC_AMOUNT_TOO_HIGH'
+  | 'BTC_CAPACITY_BUSY'
+  | 'BTC_PAUSED'
+  | 'BTC_MONITOR_STALE'
+  | 'BTC_UNAVAILABLE'
+  | 'BTC_RESERVE_FAILED'
+  | 'BTC_LINK_TOO_SOON'
+  | 'BTC_REQUIRES_EXACT_OUT'
+  | 'BTC_DESTINATION_UNSUPPORTED'
 
 // Resolver failure kind -> the error code a checkout UI keys its friendly copy
 // off. Without a code the UI renders the raw upstream string, so an expired
@@ -489,6 +521,9 @@ export type IntentsApiFailureStage =
   | 'create_unreachable'
   | 'create_http_error'
   | 'create_non_json'
+  // The order rozo-intents-api returned breaks the BTC rail invariant
+  // (on-chain BTC without a bc1q address, or Lightning with an on-chain one).
+  | 'btc_rail_mismatch'
 
 export interface CreateInvoiceError extends Omit<PayInvoiceError, 'code'> {
   code: CreateInvoiceErrorCode
@@ -592,13 +627,14 @@ export function checkZecLinkExpiry(
   linkExpiresAt: string | null,
   now: number = Date.now(),
   minLifeMs: number = ZEC_MIN_LINK_LIFE_MS,
+  coin: string = 'ZEC',
 ): { ok: true; iso: string } | { ok: false; message: string } {
   const exp = linkExpiresAt ? Date.parse(linkExpiresAt) : NaN
   if (!Number.isFinite(exp)) {
     return {
       ok: false,
       message:
-        'ZEC needs the payment link\'s expiry time, which could not be read right now. ' +
+        `${coin} needs the payment link's expiry time, which could not be read right now. ` +
         'Retry shortly, or pay with another coin.',
     }
   }
@@ -606,7 +642,7 @@ export function checkZecLinkExpiry(
     return {
       ok: false,
       message:
-        `This payment link expires too soon for ZEC (a ZEC payment needs at least ${Math.ceil(minLifeMs / 60_000)} minutes). ` +
+        `This payment link expires too soon for ${coin} (a ${coin} payment needs at least ${Math.ceil(minLifeMs / 60_000)} minutes). ` +
         'Pay with another coin, or create a new payment link.',
     }
   }
@@ -643,6 +679,131 @@ export const ZEC_CODE_MESSAGES: Readonly<Record<string, string>> = {
   ZEC_MONITOR_STALE:
     'ZEC payment tracking is catching up. Try again in a few minutes, or pay with another coin.',
   ZEC_NOT_ENABLED: 'ZEC payments are not available for this order. Pay with another coin.',
+}
+
+// ── On-chain BTC (chain 9000, Beta) ─────────────────────────────────────────
+
+/**
+ * Minimum merchant-link life for a new on-chain BTC order: rozo-intents-api
+ * #1110 requires metadata.merchant_link_expires_at >= now + 30 min quote lock
+ * (BTC_QUOTE_LOCK_MIN) + 20 min margin (BTC_LINK_MARGIN_MIN) = 50 min, and
+ * refuses with BTC_LINK_TOO_SOON. Same floor here; unknown expiry fails closed.
+ */
+export const BTC_ONCHAIN_MIN_LINK_LIFE_MS = (30 + 10 + 10) * 60_000
+
+/** rozo-intents-api codes an on-chain BTC create may answer with; passed through unchanged. */
+// rozo-intents-api #1110 (shared/btc-custody-quote.ts BTC_CUSTODY_ERROR and
+// the payment-api BTC branch): the code is in `data.errorCode` (errorResponse's
+// 4th argument), `error.code` is generic (amountTooLow, invalidRequest, ...).
+// Statuses: 400 (amount, link, exactOut, destination), 403 (not enabled, app
+// not allowed), 503 (capacity incl. exposure cap, paused, monitor stale,
+// unavailable, reserve failed).
+const BTC_PASSTHROUGH_CODES: ReadonlySet<string> = new Set([
+  'BTC_NOT_ENABLED',
+  'BTC_APP_NOT_ALLOWED',
+  'BTC_AMOUNT_TOO_LOW',
+  'BTC_AMOUNT_TOO_HIGH',
+  'BTC_CAPACITY_BUSY',
+  'BTC_PAUSED',
+  'BTC_MONITOR_STALE',
+  'BTC_UNAVAILABLE',
+  'BTC_RESERVE_FAILED',
+  'BTC_LINK_TOO_SOON',
+  'BTC_REQUIRES_EXACT_OUT',
+  'BTC_DESTINATION_UNSUPPORTED',
+])
+
+/** Router-owned copy for the on-chain BTC refusals (same tone as ZEC_CODE_MESSAGES). */
+export const BTC_CODE_MESSAGES: Readonly<Record<string, string>> = {
+  BTC_NOT_ENABLED: 'On-chain BTC payments are not available for this order. Pay with another coin.',
+  BTC_APP_NOT_ALLOWED: 'On-chain BTC payments are not available for this order. Pay with another coin.',
+  BTC_AMOUNT_TOO_LOW: `On-chain BTC payment (Beta) needs at least $${BTC_ONCHAIN_MIN_USD} per invoice. Pay with USDC/USDT instead.`,
+  BTC_AMOUNT_TOO_HIGH: 'This invoice is above the on-chain BTC (Beta) limit. Pay with USDC/USDT instead.',
+  BTC_CAPACITY_BUSY: 'On-chain BTC payments are at capacity right now. Try again later, or pay with another coin.',
+  BTC_PAUSED: 'On-chain BTC payments are paused for a safety check. Pay with another coin, or try again later.',
+  BTC_MONITOR_STALE: 'On-chain BTC payment tracking is catching up. Try again in a few minutes, or pay with another coin.',
+  BTC_UNAVAILABLE: 'On-chain BTC payments are temporarily unavailable. Try again later, or pay with another coin.',
+  BTC_RESERVE_FAILED: 'On-chain BTC payments are temporarily unavailable. Try again later, or pay with another coin.',
+  BTC_LINK_TOO_SOON: 'This payment link expires too soon for on-chain BTC. Pay with another coin, or create a new payment link.',
+  BTC_REQUIRES_EXACT_OUT: 'On-chain BTC payments are not available for this order. Pay with another coin.',
+  BTC_DESTINATION_UNSUPPORTED: 'On-chain BTC payments are not available for this order. Pay with another coin.',
+}
+
+/** The upstream refusal of a failed on-chain BTC create (4xx or 503), or null. */
+export function btcUpstreamError(
+  status: number,
+  text: string,
+): { code: CreateInvoiceErrorCode; message: string } | null {
+  if (!((status >= 400 && status < 500) || status === 503)) return null
+  let body: any
+  try {
+    body = JSON.parse(text)
+  } catch {
+    return null
+  }
+  const candidates = [body?.data?.errorCode, body?.error?.code, body?.errorCode, body?.code]
+  const code = candidates.find((c) => typeof c === 'string' && BTC_PASSTHROUGH_CODES.has(c))
+  if (!code) return null
+  const rawMessage = body?.error?.message ?? body?.message
+  const upstream = typeof rawMessage === 'string' && rawMessage ? rawMessage.substring(0, 300) : null
+  return {
+    code: code as CreateInvoiceErrorCode,
+    message: BTC_CODE_MESSAGES[code] ?? upstream ?? code,
+  }
+}
+
+const BTC_AMOUNT_RE = new RegExp(`^\\d{1,8}(\\.\\d{1,${BTC_DECIMALS}})?$`)
+
+/**
+ * The BTC rail invariant for an order row about to be handed to a payer.
+ * `requested` is the source the caller asked for (or the row's own chain).
+ *   - An on-chain BTC row (chain 9000) never carries a BOLT11 invoice or the
+ *     'lightning' chain; any deposit address it hands out is bc1q P2WPKH with
+ *     a plain BTC amount of at most 8 decimals (a blank address = no
+ *     instructions, allowed).
+ *   - A Lightning row never carries an on-chain Bitcoin address or chain 9000.
+ * Returns a short reason, or null when the row is fine (or neither rail).
+ * Only the order row from rozo-intents-api is read; nothing the client sent.
+ */
+export function btcRailViolation(requested: { chainId: string }, row: any): string | null {
+  const src = row?.source
+  if (!src || typeof src !== 'object') {
+    return requested.chainId === BTC_ONCHAIN_CHAIN_ID ? 'btc_onchain_row_without_source' : null
+  }
+  const rowChain = String(src.chainId ?? '')
+  if (requested.chainId === BTC_ONCHAIN_CHAIN_ID) {
+    if (rowChain !== BTC_ONCHAIN_CHAIN_ID) return 'btc_onchain_wrong_chain'
+    if (String(src.tokenSymbol ?? '').toUpperCase() !== 'BTC') return 'btc_onchain_wrong_token'
+    if (typeof row?.lnInvoice === 'string' && row.lnInvoice) return 'btc_onchain_has_ln_invoice'
+    // A blank address (null or "") carries no payment instructions: upstream
+    // blanks it once an order is not safely payable (funds seen, expired),
+    // like the ZEC custody rail. Any address that IS handed out must be bc1q,
+    // with a plain BTC amount of at most 8 decimals.
+    const addr = src.receiverAddress
+    if (addr === null || addr === undefined || addr === '') return null
+    if (!isBtcP2wpkhAddress(addr)) return 'btc_onchain_bad_address'
+    if (!(typeof src.amount === 'string' && BTC_AMOUNT_RE.test(src.amount) && Number(src.amount) > 0)) {
+      return 'btc_onchain_bad_amount'
+    }
+    return null
+  }
+  if (requested.chainId === 'lightning' || rowChain === 'lightning') {
+    if (rowChain === BTC_ONCHAIN_CHAIN_ID) return 'lightning_row_on_btc_onchain_chain'
+    if (looksLikeBtcOnchainAddress(src.receiverAddress)) return 'lightning_row_with_onchain_address'
+  }
+  return null
+}
+
+function btcRailViolationResponse(reason: string, normalized: any, linkDetected: any): Response {
+  console.error(`[create-invoice] btc rail invariant violated: ${reason}`)
+  return errorResponse(502, {
+    code: 'INTENTS_API_FAILED',
+    stage: 'btc_rail_mismatch',
+    upstream_status: null,
+    message: 'Rozo returned payment instructions that do not match the requested Bitcoin rail. Do not pay; retry shortly or pay with another coin.',
+    normalized_input: normalized,
+    link_id_detected: linkDetected,
+  })
 }
 
 /** Upstream statuses a ZEC refusal may carry: any 4xx, and 503 for a temporary stop. */
@@ -1603,6 +1764,9 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   }
   const source = sourceResult.resolved
   const nativeSource = isNativeSymbol(source.chainId, source.tokenSymbol)
+  // On-chain BTC (chain 9000, Beta). Lightning BTC has chainId 'lightning' and
+  // is never this; both are tokenSymbol 'BTC', so never branch on the symbol alone.
+  const btcOnchain = isBtcOnchain(source.chainId, source.tokenSymbol)
 
   // Echo of the invoice URL the CALLER supplied in THIS request (in its
   // normalized spelling: http upgraded to https, and a bare Coinbase id or the
@@ -1993,10 +2157,22 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           link_id_detected,
         })
       : null
-  if (nativeSource && Number(callerPays) > nativeCap) {
+  // On-chain BTC test period: $0.50 to $1.00 gross per invoice, code
+  // constants; BTC_ONCHAIN_MAX_USD may only lower the cap. Checked on
+  // callerPays (fee included), never on a client-sent amount.
+  const btcCap = Math.min(nativeCap, btcOnchainMaxUsd(env.BTC_ONCHAIN_MAX_USD))
+  if (btcOnchain && !(Number(callerPays) >= BTC_ONCHAIN_MIN_USD)) {
     return errorResponse(400, {
       code: 'UNSUPPORTED_SOURCE',
-      message: `Native coin payment is limited to $${nativeCap} per invoice. Pay with USDC/USDT instead.`,
+      message: `On-chain BTC payment (Beta) needs at least $${BTC_ONCHAIN_MIN_USD} per invoice. Pay with USDC/USDT instead.`,
+      normalized_input: normalized,
+      link_id_detected,
+    })
+  }
+  if (nativeSource && Number(callerPays) > (btcOnchain ? btcCap : nativeCap)) {
+    return errorResponse(400, {
+      code: 'UNSUPPORTED_SOURCE',
+      message: `Native coin payment is limited to $${btcOnchain ? btcCap : nativeCap} per invoice. Pay with USDC/USDT instead.`,
       normalized_input: normalized,
       link_id_detected,
     })
@@ -2081,7 +2257,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       })
     }
     const revivedIdx = nowStatuses.findIndex(
-      (st, i) => st !== 'payment_expired' && !zecQuoteExpiredUnfunded(nowRows[i]),
+      (st, i) => st !== 'payment_expired' && !custodyQuoteExpiredUnfunded(nowRows[i]),
     )
     if (revivedIdx < 0) return null
     const revived = replacedRows[revivedIdx]
@@ -2344,8 +2520,14 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       const refundAddressCoinInvolved =
         refundAddressCoin ||
         nativeRequiresRefundAddress(String(rowSource.chainId ?? ''), String(rowSource.tokenSymbol ?? ''))
+      // On-chain BTC orders are never rotated in place (to or from any coin,
+      // Lightning included): the custody address may already have been shown
+      // or paid, and upstream /checkout has no BTC custody rotation.
+      const btcOnchainInvolved = btcOnchain || isBtcOnchain(rowSource.chainId, rowSource.tokenSymbol)
       if (sourceDiffers(rowSource, source) && existing?.id) {
-        if (zecReceiveDiffers(rowSource, source)) {
+        if (btcOnchainInvolved) {
+          rotationFailure = 'native_not_rotatable'
+        } else if (zecReceiveDiffers(rowSource, source)) {
           // Same coin, other pay-in mode: never switched in place (the
           // existing address may already have been shown or funded).
           rotationFailure = 'zec_receive_mode_mismatch'
@@ -2440,6 +2622,12 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           status: postRotationStatus,
           expiresAt: row?.expiresAt ?? existingExpiresAt,
         })
+      }
+
+      // BTC rail invariant on the row we are about to hand back.
+      {
+        const violation = btcRailViolation(rowSource.chainId === source.chainId ? source : { chainId: String(rowSource.chainId ?? '') }, row)
+        if (violation) return btcRailViolationResponse(violation, normalized, link_id_detected)
       }
 
       const warnings = [...source.warnings]
@@ -2547,6 +2735,24 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
         : await linkExpiresAtPromise
     const check = checkZecLinkExpiry(linkExpiry, Date.now(), zecMinLinkLifeMs(zecRail))
+    if (!check.ok) {
+      return errorResponse(400, {
+        code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
+        message: check.message,
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    merchantLinkExpiresAt = check.iso
+  }
+  // On-chain BTC: same fail-closed rule with its own horizon (quote lock +
+  // margin + one block), so a confirmation never lands on a dead link.
+  if (btcOnchain) {
+    const linkExpiry =
+      testInvoiceCents !== null
+        ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
+        : await linkExpiresAtPromise
+    const check = checkZecLinkExpiry(linkExpiry, Date.now(), BTC_ONCHAIN_MIN_LINK_LIFE_MS, 'on-chain BTC')
     if (!check.ok) {
       return errorResponse(400, {
         code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
@@ -2683,6 +2889,18 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     // capacity / pause / stale monitor) are caller-actionable; pass status and
     // code through unchanged instead of a generic 502. Checked before the 429
     // relay so a custody refusal keeps its own code; anything else falls through.
+    if (btcOnchain) {
+      const btcErr = btcUpstreamError(intentsResp.status, intentsText)
+      if (btcErr) {
+        return errorResponse(intentsResp.status, {
+          code: btcErr.code,
+          message: btcErr.message,
+          upstream_status: intentsResp.status,
+          normalized_input: normalized,
+          link_id_detected,
+        })
+      }
+    }
     if (zecCoin) {
       const zecErr = zecUpstreamError(intentsResp.status, intentsText)
       if (zecErr) {
@@ -2749,7 +2967,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           winnerValid &&
           readPaymentStatus(winner) === REUSABLE_PAYMENT_STATUS &&
           // A quote-expired unfunded ZEC order is never handed back as live.
-          !zecQuoteExpiredUnfunded(winner)
+          !custodyQuoteExpiredUnfunded(winner)
         ) {
           // Same re-order race check as the successful-create path.
           const blocked = await replacedRowsBlock()
@@ -2773,6 +2991,27 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
             return pricingMismatchResponse({ linkId }, winner)
           }
           const winnerSource = readRowSource(winner)
+          // On-chain BTC: the winner must be the same rail (never rotated, see
+          // btcOnchainInvolved) and pass the rail invariant.
+          if (
+            (btcOnchain || isBtcOnchain(winnerSource.chainId, winnerSource.tokenSymbol)) &&
+            sourceDiffers(winnerSource, source)
+          ) {
+            return json(409, {
+              ok: false,
+              code: 'ORDER_CREATE_CONFLICT',
+              message: 'An order for this invoice was just created with another coin. Retry to load it.',
+              error: {
+                code: 'ORDER_CREATE_CONFLICT',
+                message: 'An order for this invoice was just created with another coin. Retry to load it.',
+              },
+              linkId,
+            })
+          }
+          {
+            const violation = btcRailViolation(source, winner)
+            if (violation) return btcRailViolationResponse(violation, normalized, link_id_detected)
+          }
           // A shielded winner binds no refund address; a transparent request
           // against it is reported as a mode mismatch below (same as reuse).
           if (refundAddressCoin && winnerSource.receive !== 'shielded') {
@@ -2860,6 +3099,13 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       normalized_input: normalized,
       link_id_detected,
     })
+  }
+
+  // BTC rail invariant: an on-chain BTC order is only handed out with a bc1q
+  // address and no BOLT11; a Lightning order never with an on-chain address.
+  {
+    const violation = btcRailViolation(source, intentsJson)
+    if (violation) return btcRailViolationResponse(violation, normalized, link_id_detected)
   }
 
   // Close the re-order race: a late payment can land on one of the expired

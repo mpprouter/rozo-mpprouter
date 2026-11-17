@@ -413,6 +413,8 @@ export interface Env {
   NATIVE_MAX_USD?: string
   /** Per-invoice cap in USD for a shielded ZEC order (default 1200 = intents ZEC_SHIELD_CAPS.max_order_usd, founder 2026-11-02). */
   ZEC_SHIELDED_MAX_USD?: string
+  /** On-chain BTC (BTC@9000, Beta) per-invoice cap in USD. May only LOWER the $1 code ceiling (native-sources.ts btcOnchainMaxUsd). */
+  BTC_ONCHAIN_MAX_USD?: string
   // "true" lets create-invoice rotate an unpaid Lightning order out to another
   // source via /checkout. Flip only after rozo-intents-api #672 and #674 are
   // deployed (they retire the old BOLT11 on rotation). Anything else = refuse.
