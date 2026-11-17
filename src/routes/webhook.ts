@@ -1752,13 +1752,18 @@ export function pickZecCustodyStatus(z: any) {
 }
 
 const SAT_RE = /^\d{1,20}$/
+/** rozo-intents-api #1110 btc-custody-rail.ts KNOWN_STATES (no 'confirming'; unknown upstream states read as manual_review). */
+const BTC_PAYIN_STATES: ReadonlySet<string> = new Set([
+  'awaiting', 'seen', 'eligible', 'underpaid', 'late_review', 'manual_review', 'reorged', 'expired',
+])
 
 /**
  * Whitelist the on-chain BTC custody status block (rozo-intents-api
  * source.btc, chain 9000). Contract assumed isomorphic to the ZEC custody
- * block with sat in place of zat and a single confirmation tier:
+ * block with sat in place of zat and a single confirmation tier, confirmed
+ * against rozo-intents-api #1110 btcCustodyStatusFromOrder:
  * { rail: 'btc_custody', requiredConfirmations: 1, confirmations,
- *   requiredSat, receivedSat, payinState, quoteExpiresAt }. Null unless the
+ *   requiredSat, receivedSat, payinState, quoteExpiresAt, txid }. Null unless the
  * whole block is well-formed and the order really is on-chain BTC, so a
  * Lightning order never carries it. Extra keys are dropped.
  */
@@ -1773,9 +1778,12 @@ export function pickBtcCustodyStatus(b: any, source?: any) {
   if (!Number.isInteger(b.confirmations) || b.confirmations < 0 || b.confirmations > 1_000_000) return null
   if (typeof b.requiredSat !== 'string' || !SAT_RE.test(b.requiredSat)) return null
   if (typeof b.receivedSat !== 'string' || !SAT_RE.test(b.receivedSat)) return null
-  if (typeof b.payinState !== 'string' || !ZEC_PAYIN_STATES.has(b.payinState)) return null
+  if (typeof b.payinState !== 'string' || !BTC_PAYIN_STATES.has(b.payinState)) return null
   const quoteExpiresAt = safeIso(b.quoteExpiresAt)
   if (!quoteExpiresAt) return null
+  // txid: the settling transaction (64 hex) or null; anything else is dropped
+  // as null rather than discarding the whole block.
+  const txid = typeof b.txid === 'string' && /^[0-9a-f]{64}$/.test(b.txid) ? b.txid : null
   return {
     rail: 'btc_custody' as const,
     requiredConfirmations: 1 as const,
@@ -1784,6 +1792,7 @@ export function pickBtcCustodyStatus(b: any, source?: any) {
     receivedSat: b.receivedSat as string,
     payinState: b.payinState as string,
     quoteExpiresAt,
+    txid,
   }
 }
 

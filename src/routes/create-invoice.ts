@@ -496,10 +496,14 @@ export type CreateInvoiceErrorCode =
   | 'BTC_APP_NOT_ALLOWED'
   | 'BTC_AMOUNT_TOO_LOW'
   | 'BTC_AMOUNT_TOO_HIGH'
-  | 'BTC_DAILY_CAP_REACHED'
   | 'BTC_CAPACITY_BUSY'
   | 'BTC_PAUSED'
   | 'BTC_MONITOR_STALE'
+  | 'BTC_UNAVAILABLE'
+  | 'BTC_RESERVE_FAILED'
+  | 'BTC_LINK_TOO_SOON'
+  | 'BTC_REQUIRES_EXACT_OUT'
+  | 'BTC_DESTINATION_UNSUPPORTED'
 
 // Resolver failure kind -> the error code a checkout UI keys its friendly copy
 // off. Without a code the UI renders the raw upstream string, so an expired
@@ -680,23 +684,33 @@ export const ZEC_CODE_MESSAGES: Readonly<Record<string, string>> = {
 // ── On-chain BTC (chain 9000, Beta) ─────────────────────────────────────────
 
 /**
- * Minimum merchant-link life for a new on-chain BTC order: 30 min quote lock
- * (same as the ZEC custody rail) + 10 min margin + one 10 min block. Unknown
- * expiry fails closed. rozo-intents-api re-checks (metadata.merchant_link_expires_at).
+ * Minimum merchant-link life for a new on-chain BTC order: rozo-intents-api
+ * #1110 requires metadata.merchant_link_expires_at >= now + 30 min quote lock
+ * (BTC_QUOTE_LOCK_MIN) + 20 min margin (BTC_LINK_MARGIN_MIN) = 50 min, and
+ * refuses with BTC_LINK_TOO_SOON. Same floor here; unknown expiry fails closed.
  */
 export const BTC_ONCHAIN_MIN_LINK_LIFE_MS = (30 + 10 + 10) * 60_000
 
 /** rozo-intents-api codes an on-chain BTC create may answer with; passed through unchanged. */
+// rozo-intents-api #1110 (shared/btc-custody-quote.ts BTC_CUSTODY_ERROR and
+// the payment-api BTC branch): the code is in `data.errorCode` (errorResponse's
+// 4th argument), `error.code` is generic (amountTooLow, invalidRequest, ...).
+// Statuses: 400 (amount, link, exactOut, destination), 403 (not enabled, app
+// not allowed), 503 (capacity incl. exposure cap, paused, monitor stale,
+// unavailable, reserve failed).
 const BTC_PASSTHROUGH_CODES: ReadonlySet<string> = new Set([
   'BTC_NOT_ENABLED',
   'BTC_APP_NOT_ALLOWED',
   'BTC_AMOUNT_TOO_LOW',
   'BTC_AMOUNT_TOO_HIGH',
-  'BTC_DAILY_CAP_REACHED',
   'BTC_CAPACITY_BUSY',
   'BTC_PAUSED',
   'BTC_MONITOR_STALE',
-  'MERCHANT_LINK_EXPIRES_TOO_SOON',
+  'BTC_UNAVAILABLE',
+  'BTC_RESERVE_FAILED',
+  'BTC_LINK_TOO_SOON',
+  'BTC_REQUIRES_EXACT_OUT',
+  'BTC_DESTINATION_UNSUPPORTED',
 ])
 
 /** Router-owned copy for the on-chain BTC refusals (same tone as ZEC_CODE_MESSAGES). */
@@ -705,10 +719,14 @@ export const BTC_CODE_MESSAGES: Readonly<Record<string, string>> = {
   BTC_APP_NOT_ALLOWED: 'On-chain BTC payments are not available for this order. Pay with another coin.',
   BTC_AMOUNT_TOO_LOW: `On-chain BTC payment (Beta) needs at least $${BTC_ONCHAIN_MIN_USD} per invoice. Pay with USDC/USDT instead.`,
   BTC_AMOUNT_TOO_HIGH: 'This invoice is above the on-chain BTC (Beta) limit. Pay with USDC/USDT instead.',
-  BTC_DAILY_CAP_REACHED: 'On-chain BTC payments have reached today\'s limit. Pay with another coin, or try again tomorrow.',
-  BTC_CAPACITY_BUSY: 'On-chain BTC payments are at capacity right now. Try again in a few minutes, or pay with another coin.',
+  BTC_CAPACITY_BUSY: 'On-chain BTC payments are at capacity right now. Try again later, or pay with another coin.',
   BTC_PAUSED: 'On-chain BTC payments are paused for a safety check. Pay with another coin, or try again later.',
   BTC_MONITOR_STALE: 'On-chain BTC payment tracking is catching up. Try again in a few minutes, or pay with another coin.',
+  BTC_UNAVAILABLE: 'On-chain BTC payments are temporarily unavailable. Try again later, or pay with another coin.',
+  BTC_RESERVE_FAILED: 'On-chain BTC payments are temporarily unavailable. Try again later, or pay with another coin.',
+  BTC_LINK_TOO_SOON: 'This payment link expires too soon for on-chain BTC. Pay with another coin, or create a new payment link.',
+  BTC_REQUIRES_EXACT_OUT: 'On-chain BTC payments are not available for this order. Pay with another coin.',
+  BTC_DESTINATION_UNSUPPORTED: 'On-chain BTC payments are not available for this order. Pay with another coin.',
 }
 
 /** The upstream refusal of a failed on-chain BTC create (4xx or 503), or null. */

@@ -85,7 +85,7 @@ let raceWinner: any = null
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 
 const btcBlock = (payinState: string, receivedSat = '0', confirmations = 0, quoteExpiresAt = '2999-01-01T01:00:00.000Z') => ({
-  rail: 'btc_custody', requiredConfirmations: 1, confirmations, requiredSat: '1200', receivedSat, payinState, quoteExpiresAt,
+  rail: 'btc_custody', requiredConfirmations: 1, confirmations, requiredSat: '1200', receivedSat, payinState, quoteExpiresAt, txid: null,
 })
 
 const btcAnswer = (over: Record<string, any> = {}, srcOver: Record<string, any> = {}) => () => new Response(JSON.stringify({
@@ -400,9 +400,17 @@ describe('create-invoice: on-chain BTC order', () => {
     expect(createdIntent.metadata.merchant_link_expires_at).toBeTruthy()
   })
 
-  it('passes rozo-intents-api BTC refusal codes through with their status', async () => {
-    for (const [status, code] of [[403, 'BTC_NOT_ENABLED'], [403, 'BTC_APP_NOT_ALLOWED'], [429, 'BTC_DAILY_CAP_REACHED'], [503, 'BTC_PAUSED'], [400, 'BTC_AMOUNT_TOO_HIGH']] as const) {
-      createAnswer = () => new Response(JSON.stringify({ error: { code, message: 'upstream text' } }), { status })
+  it('passes rozo-intents-api #1110 BTC refusal codes (data.errorCode) through with their status', async () => {
+    // Real shape (shared/cors.ts errorResponse): { error: { code: <generic>, message }, data: { errorCode, ... } }.
+    for (const [status, generic, code] of [
+      [403, 'BTC_NOT_ENABLED', 'BTC_NOT_ENABLED'], [403, 'BTC_APP_NOT_ALLOWED', 'BTC_APP_NOT_ALLOWED'],
+      [400, 'amountTooLow', 'BTC_AMOUNT_TOO_LOW'], [400, 'amountTooHigh', 'BTC_AMOUNT_TOO_HIGH'],
+      [503, 'BTC_CAPACITY_BUSY', 'BTC_CAPACITY_BUSY'], [503, 'BTC_PAUSED', 'BTC_PAUSED'],
+      [503, 'BTC_MONITOR_STALE', 'BTC_MONITOR_STALE'], [503, 'BTC_UNAVAILABLE', 'BTC_UNAVAILABLE'],
+      [503, 'BTC_RESERVE_FAILED', 'BTC_RESERVE_FAILED'], [400, 'BTC_LINK_TOO_SOON', 'BTC_LINK_TOO_SOON'],
+      [400, 'invalidRequest', 'BTC_REQUIRES_EXACT_OUT'], [400, 'invalidRequest', 'BTC_DESTINATION_UNSUPPORTED'],
+    ] as const) {
+      createAnswer = () => new Response(JSON.stringify({ error: { code: generic, message: 'upstream text' }, data: { errorCode: code }, requestId: 'r' }), { status })
       const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { query: '?beta=btc' })
       expect(r.status).toBe(status)
       expect(r.json.code).toBe(code)
@@ -587,7 +595,7 @@ describe('replay and out-of-order', () => {
     expect(btcQuoteExpiredUnfunded({ ...base, source: { ...base.source, chainId: 'lightning' } })).toBe(false)
     expect(btcQuoteExpiredUnfunded({ ...base, source: { ...base.source, btc: btcBlock('expired', '1200', 0, '2000-01-01T00:00:00.000Z') } })).toBe(false)
     expect(btcQuoteExpiredUnfunded({ ...base, source: { ...base.source, btc: btcBlock('expired', '0', 0) } })).toBe(false) // future quote
-    for (const st of ['awaiting', 'seen', 'confirming', 'underpaid', 'late_review', 'reorged', 'eligible']) {
+    for (const st of ['awaiting', 'seen', 'manual_review', 'underpaid', 'late_review', 'reorged', 'eligible']) {
       expect(btcQuoteExpiredUnfunded({ ...base, source: { ...base.source, btc: btcBlock(st, '0', 0, '2000-01-01T00:00:00.000Z') } })).toBe(false)
     }
     expect(btcQuoteExpiredUnfunded({ ...base, source: { ...base.source, txHash: 'ab'.repeat(32) } })).toBe(false)
@@ -613,21 +621,34 @@ describe('replay and out-of-order', () => {
 describe('invoice-status relays the on-chain BTC custody block (I3: from rozo-intents-api only)', () => {
   const ROW = {
     id: 'p1', status: 'payment_unpaid', provider: 'rozo', quoteExpiresAt: '2026-11-18T10:10:00.000Z',
-    source: { chainId: '9000', tokenSymbol: 'BTC', receiverAddress: BC1Q, amount: '0.00001200', btc: { ...btcBlock('confirming', '1200', 0), extra: 'dropped' } },
+    source: { chainId: '9000', tokenSymbol: 'BTC', receiverAddress: BC1Q, amount: '0.00001200', btc: { ...btcBlock('seen', '1200', 0), extra: 'dropped' } },
   }
 
   it('passes a well-formed block, drops extra keys, never relays a BOLT11 on an on-chain row', () => {
     const out: any = pickRozoCallerSafe({ ...ROW, lnInvoice: LNBC })
-    expect(out.source.btc).toEqual(btcBlock('confirming', '1200', 0))
+    expect(out.source.btc).toEqual(btcBlock('seen', '1200', 0))
     expect(out.lnInvoice).toBeUndefined()
     expect(out.source.receiverAddress).toBe(BC1Q)
   })
 
   it('drops a malformed block entirely', () => {
-    const b = btcBlock('confirming', '1200', 0)
-    for (const bad of [{ rail: 'zec_custody' }, { requiredConfirmations: 2 }, { confirmations: -1 }, { requiredSat: 1200 }, { receivedSat: 'x' }, { payinState: 'paid' }, { quoteExpiresAt: 'soon' }]) {
+    const b = btcBlock('seen', '1200', 0)
+    for (const bad of [{ rail: 'zec_custody' }, { requiredConfirmations: 2 }, { confirmations: -1 }, { requiredSat: 1200 }, { receivedSat: 'x' }, { payinState: 'paid' }, { payinState: 'confirming' }, { quoteExpiresAt: 'soon' }]) {
       expect(pickBtcCustodyStatus({ ...b, ...bad }, ROW.source)).toBeNull()
     }
+  })
+
+  it('#1110 shape: txid relayed (or nulled when malformed, block kept); manual_review accepted', () => {
+    const TX = 'ab'.repeat(32)
+    const withTx: any = pickRozoCallerSafe({ ...ROW, source: { ...ROW.source, btc: { ...btcBlock('eligible', '1200', 1), txid: TX } } })
+    expect(withTx.source.btc.txid).toBe(TX)
+    const badTx: any = pickRozoCallerSafe({ ...ROW, source: { ...ROW.source, btc: { ...btcBlock('eligible', '1200', 1), txid: 'nothex' } } })
+    expect(badTx.source.btc).toBeDefined()
+    expect(badTx.source.btc.txid).toBeNull()
+    const noTx: any = pickRozoCallerSafe({ ...ROW, source: { ...ROW.source, btc: (({ txid: _t, ...rest }) => rest)(btcBlock('seen', '1200')) } })
+    expect(noTx.source.btc.txid).toBeNull()
+    const mr: any = pickRozoCallerSafe({ ...ROW, source: { ...ROW.source, btc: btcBlock('manual_review', '1200') } })
+    expect(mr.source.btc.payinState).toBe('manual_review')
   })
 
   it('never on a Lightning row or a ZEC row, even when a btc block is present', () => {
