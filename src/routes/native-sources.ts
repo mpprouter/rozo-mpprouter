@@ -86,13 +86,15 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
   // address on our own wallet, 1 confirmation, exactOut to Base USDC. Opened
   // only through NATIVE_SOURCES_BETA "BTC@9000" + `?beta=btc`; rozo-intents-api
   // keeps its own switch (BTC_CUSTODY_MODE=test_only + app allowlist). Never
-  // the Lightning path (chainId 'lightning'). Test-period per-invoice band is
-  // $0.50 to $1.00 gross (BTC_ONCHAIN_MIN_USD / BTC_ONCHAIN_MAX_USD).
+  // the Lightning path (chainId 'lightning'). Per-invoice band comes from
+  // btcOnchainLimits (BTC_ONCHAIN_LIMITS): test_only $0.50 to $1.00 gross by
+  // default, beta $10 to $1,200. maxUsd here is only the code ceiling; the
+  // create path always applies the lower btcOnchainMaxUsd for the mode.
   '9000': {
     symbol: 'BTC',
     tokenAddress: '',
     provider: 'rozo',
-    maxUsd: 1,
+    maxUsd: 1200,
     refundAddressRequired: false,
     beta: true,
   },
@@ -102,11 +104,46 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
 
 export const BTC_ONCHAIN_CHAIN_ID = '9000'
 export const BTC_ONCHAIN_KEY = 'BTC@9000'
-/** Test-period band per invoice, gross USD (callerPays, fee included). Code constants. */
+/** Test-period (test_only) band per invoice, gross USD (callerPays, fee included). Code constants. */
 export const BTC_ONCHAIN_MIN_USD = 0.5
 export const BTC_ONCHAIN_MAX_USD = 1
-/** Confirmations rozo-intents-api waits for before the order counts as paid. */
+/**
+ * Beta band per invoice, gross USD (rozo-intents-api #1117, magic-numbers
+ * BETA-BTC-MIN and BETA-ORDER-CAP). Used only when BTC_ONCHAIN_LIMITS is
+ * exactly "beta"; the BTC_ONCHAIN_MAX_USD var may only lower the ceiling.
+ */
+export const BTC_ONCHAIN_BETA_MIN_USD = 10
+export const BTC_ONCHAIN_BETA_MAX_USD = 1200
+/** Confirmations rozo-intents-api waits for before a test_only order counts as paid. */
 export const BTC_ONCHAIN_REQUIRED_CONFIRMATIONS = 1
+/**
+ * Beta confirmation tiers (BETA-BTC-FRONT-CONF, mirrors rozo-intents-api
+ * #1117): value <= $100: 1, < $600: 2, otherwise 3. rozo-intents-api is the
+ * final judge (it also raises the tier on an overpay); the router only shows them.
+ */
+export const BTC_ONCHAIN_BETA_CONFIRMATION_TIERS: ReadonlyArray<{ max_usd: number | null; inclusive: boolean; confirmations: number }> = [
+  { max_usd: 100, inclusive: true, confirmations: 1 },
+  { max_usd: 600, inclusive: false, confirmations: 2 },
+  { max_usd: null, inclusive: false, confirmations: 3 },
+]
+
+/**
+ * Router limits profile for on-chain BTC, var BTC_ONCHAIN_LIMITS. Exactly
+ * "beta" selects the Beta band; anything else (unset, blank, typo, case
+ * variant) is test_only, so a missing or broken var can never raise a limit.
+ * rozo-intents-api keeps its own mode (app_config BTC_CUSTODY_MODE) and stays
+ * the final gate: a beta router in front of a test_only rozo-intents-api only
+ * refuses more.
+ */
+export type BtcOnchainLimitsMode = 'test_only' | 'beta'
+export function parseBtcOnchainLimits(raw: string | undefined): BtcOnchainLimitsMode {
+  return raw === 'beta' ? 'beta' : 'test_only'
+}
+
+/** Per-invoice minimum (gross USD) for the mode. */
+export function btcOnchainMinUsd(mode: BtcOnchainLimitsMode = 'test_only'): number {
+  return mode === 'beta' ? BTC_ONCHAIN_BETA_MIN_USD : BTC_ONCHAIN_MIN_USD
+}
 /** BTC has 8 decimals; the payer is asked for an amount with at most this many. */
 export const BTC_DECIMALS = 8
 
@@ -127,13 +164,24 @@ export function btcOnchainSwitchOn(betaRaw: string | undefined): boolean {
 }
 
 /**
- * Per-invoice cap for on-chain BTC. The code constant is the ceiling; the
- * BTC_ONCHAIN_MAX_USD var may only lower it (a higher, zero, negative or
- * unparseable value is ignored).
+ * Per-invoice cap for on-chain BTC. The code constant for the mode is the
+ * ceiling ($1 test_only, $1,200 beta); the BTC_ONCHAIN_MAX_USD var may only
+ * lower it (a higher, zero, negative or unparseable value is ignored).
  */
-export function btcOnchainMaxUsd(raw: string | undefined): number {
+export function btcOnchainMaxUsd(raw: string | undefined, mode: BtcOnchainLimitsMode = 'test_only'): number {
+  const ceiling = mode === 'beta' ? BTC_ONCHAIN_BETA_MAX_USD : BTC_ONCHAIN_MAX_USD
   const n = Number(raw)
-  return Number.isFinite(n) && n > 0 && n < BTC_ONCHAIN_MAX_USD ? n : BTC_ONCHAIN_MAX_USD
+  return Number.isFinite(n) && n > 0 && n < ceiling ? n : ceiling
+}
+
+/** Confirmations shown for a gross USD value under the mode (beta tiers; test_only always 1). */
+export function btcOnchainRequiredConfirmations(mode: BtcOnchainLimitsMode, grossUsd: number): number {
+  if (mode !== 'beta') return BTC_ONCHAIN_REQUIRED_CONFIRMATIONS
+  // Unknown or unreadable value: the deepest tier (same fail-safe as rozo-intents-api).
+  if (!Number.isFinite(grossUsd) || grossUsd < 0) return 3
+  if (grossUsd <= 100) return 1
+  if (grossUsd < 600) return 2
+  return 3
 }
 
 /** P2WPKH mainnet address shape: bc1q + 38 bech32 characters (42 total), lowercase. */
@@ -334,11 +382,13 @@ export interface NativeSourceMeta {
   confirmations?: { under110: number; from110: number }
   /** Custody ZEC with `?beta=zec_shielded`: a shielded-balance pay-in may be requested (source.shielded=true). */
   shieldedAvailable?: true
-  /** On-chain BTC only: confirmations before the order counts as paid. */
+  /** On-chain BTC only: confirmations before the order counts as paid (beta: the deepest tier, see confirmation_tiers). */
   required_confirmations?: number
-  /** On-chain BTC only: test-period per-invoice band, gross USD. */
+  /** On-chain BTC only: per-invoice band for the limits mode, gross USD. */
   min_usd?: number
   max_usd?: number
+  /** On-chain BTC, beta mode only: confirmations by order value (the order's own status block is authoritative). */
+  confirmation_tiers?: ReadonlyArray<{ max_usd: number | null; inclusive: boolean; confirmations: number }>
 }
 
 /**
@@ -351,6 +401,7 @@ export function sourceMeta(
   zecRail: ZecRailMode = 'near',
   shieldedRequested = false,
   btcMaxRaw?: string,
+  btcMode: BtcOnchainLimitsMode = 'test_only',
 ): Record<string, NativeSourceMeta> {
   const out: Record<string, NativeSourceMeta> = {}
   for (const chainId of Object.keys(NATIVE_SOURCE_DEFS)) {
@@ -368,11 +419,18 @@ export function sourceMeta(
       ...(d.provider === 'rozo' && d.symbol === 'ZEC' ? { confirmations: { ...ZEC_CUSTODY_CONFIRMATIONS } } : {}),
       ...(d.provider === 'rozo' && d.symbol === 'ZEC' && shieldedRequested ? { shieldedAvailable: true as const } : {}),
       ...(isBtcOnchain(chainId, d.symbol)
-        ? {
-            required_confirmations: BTC_ONCHAIN_REQUIRED_CONFIRMATIONS,
-            min_usd: BTC_ONCHAIN_MIN_USD,
-            max_usd: btcOnchainMaxUsd(btcMaxRaw),
-          }
+        ? btcMode === 'beta'
+          ? {
+              required_confirmations: btcOnchainRequiredConfirmations('beta', Number.POSITIVE_INFINITY),
+              min_usd: btcOnchainMinUsd('beta'),
+              max_usd: btcOnchainMaxUsd(btcMaxRaw, 'beta'),
+              confirmation_tiers: BTC_ONCHAIN_BETA_CONFIRMATION_TIERS,
+            }
+          : {
+              required_confirmations: BTC_ONCHAIN_REQUIRED_CONFIRMATIONS,
+              min_usd: BTC_ONCHAIN_MIN_USD,
+              max_usd: btcOnchainMaxUsd(btcMaxRaw),
+            }
         : {}),
     }
   }
@@ -407,11 +465,12 @@ export const NATIVE_MIN_USD: Readonly<Record<string, number>> = {
  */
 export function nativeMinUsd(
   nativeAllowed: ReadonlySet<string> = new Set(),
+  btcMode: BtcOnchainLimitsMode = 'test_only',
 ): Record<string, Record<string, number>> {
   const out: Record<string, Record<string, number>> = {}
   for (const [chainId, def] of Object.entries(NATIVE_SOURCE_DEFS)) {
     if (!nativeAllowed.has(nativeKey(chainId, def))) continue
-    const min = NATIVE_MIN_USD[chainId]
+    const min = chainId === BTC_ONCHAIN_CHAIN_ID ? btcOnchainMinUsd(btcMode) : NATIVE_MIN_USD[chainId]
     if (typeof min !== 'number') continue
     out[chainId] = { ...(out[chainId] ?? {}), [def.symbol]: min }
   }
