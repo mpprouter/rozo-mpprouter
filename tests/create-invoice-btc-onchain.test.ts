@@ -837,9 +837,10 @@ describe('PR-3 Beta constants: present, but the live band stays test_only until 
     expect([0.5, 1, 600, 1200].map((v) => btcOnchainRequiredConfirmations('test_only', v))).toEqual([1, 1, 1, 1])
   })
 
-  it('wrangler.toml does not set BTC_ONCHAIN_LIMITS, so deploying this change keeps test_only', () => {
+  it('wrangler.toml sets BTC_ONCHAIN_LIMITS exactly "beta" (founder T4 2026-11-19) and no BTC_ONCHAIN_MAX_USD', () => {
     const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8')
-    expect(toml.split('\n').some((l) => /^\s*BTC_ONCHAIN_LIMITS\s*=/.test(l))).toBe(false)
+    const lines = toml.split('\n').filter((l) => /^\s*BTC_ONCHAIN_LIMITS\s*=/.test(l))
+    expect(lines).toEqual(['BTC_ONCHAIN_LIMITS = "beta"'])
     expect(toml.split('\n').some((l) => /^\s*BTC_ONCHAIN_MAX_USD\s*=/.test(l))).toBe(false)
   })
 
