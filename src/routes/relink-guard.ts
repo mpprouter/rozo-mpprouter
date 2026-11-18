@@ -115,7 +115,7 @@ export function zecQuoteExpiredUnfunded(row: any): boolean {
   // pickZecCustodyStatus); anything missing or contradictory keeps it live.
   if (z.rail !== 'zec_custody') return false
   if (z.receive !== undefined && z.receive !== 'shielded' && z.receive !== 'transparent') return false
-  if (z.requiredConfirmations !== 1 && z.requiredConfirmations !== 2) return false
+  if (z.requiredConfirmations !== 1 && z.requiredConfirmations !== 2 && z.requiredConfirmations !== 3) return false
   if (typeof z.requiredZat !== 'string' || !/^\d{1,20}$/.test(z.requiredZat)) return false
   if (typeof z.quoteExpiresAt !== 'string' || !Number.isFinite(Date.parse(z.quoteExpiresAt))) return false
   // Closed pay-in with nothing received and nothing confirmed.

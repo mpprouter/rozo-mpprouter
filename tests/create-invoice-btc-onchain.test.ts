@@ -248,7 +248,7 @@ describe('on-chain BTC source table', () => {
       required_confirmations: 1, min_usd: 0.5, max_usd: 0.9,
     })
     expect(meta['ZEC@9133']).toEqual({
-      refund_address_required: false, beta: true, address_single_use: true, confirmations: { under110: 1, from110: 2 },
+      refund_address_required: false, beta: true, address_single_use: true, confirmations: { under110: 1, from110: 2, from3200: 3 },
     })
     expect(sourceMeta(new Set(['BTC@9000']), 'custody', true)['BTC@9000']).not.toHaveProperty('shieldedAvailable')
     expect(nativeMinUsd(new Set(['BTC@9000']))).toEqual({ '9000': { BTC: 0.5 } })

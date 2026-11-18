@@ -71,7 +71,7 @@ import {
   zecShieldedAvailable,
   zecShieldedMaxUsd,
   ZEC_BLOCK_TARGET_SECONDS,
-  ZEC_CUSTODY_CONFIRMATIONS,
+  ZEC_CUSTODY_MAX_CONFIRMATIONS,
   ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN,
   ZEC_CUSTODY_QUOTE_LOCK_MIN,
   type NativeSymbol,
@@ -561,12 +561,13 @@ export const ZEC_MIN_LINK_LIFE_MS = 75 * 60 * 1000
  * Custody rail (ZEC_RAIL=custody): the merchant link must outlive the 30 min
  * price lock, a 10 min safety margin and the confirmations at the 75 s block
  * target. The router does not know G's confirmation tier before create, so it
- * assumes the larger one (2 confirmations): 40 min + 150 s = 42.5 min.
+ * assumes the deepest one (3 confirmations from $3,200 since 2026-11-18):
+ * 40 min + 225 s = 43.75 min (was 2 confirmations, 42.5 min).
  * rozo-intents-api re-checks with the real tier (custodyLinkMarginMs).
  */
 export const ZEC_CUSTODY_MIN_LINK_LIFE_MS =
   (ZEC_CUSTODY_QUOTE_LOCK_MIN + ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN) * 60_000 +
-  ZEC_CUSTODY_CONFIRMATIONS.from110 * ZEC_BLOCK_TARGET_SECONDS * 1000
+  ZEC_CUSTODY_MAX_CONFIRMATIONS * ZEC_BLOCK_TARGET_SECONDS * 1000
 
 /** Minimum merchant-link life for a new ZEC order on the given rail. */
 export function zecMinLinkLifeMs(rail: ZecRailMode): number {
@@ -2147,7 +2148,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // $1,200 = intents ZEC_SHIELD_CAPS.max_order_usd), checked right before a
   // FRESH shielded create (shieldedCapBlock below) so that an existing order
   // of the other mode is still reported as a mode mismatch first. The
-  // transparent custody cap (3199.99) is untouched. rozo-intents-api stays
+  // transparent custody cap (11699.99) is untouched. rozo-intents-api stays
   // the final gate.
   const nativeCap = nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD, zecRail)
   const shieldedCap = Math.min(zecShieldedMaxUsd(env.ZEC_SHIELDED_MAX_USD), nativeCap)

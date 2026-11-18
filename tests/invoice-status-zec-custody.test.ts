@@ -53,10 +53,20 @@ describe('invoice-status relays the custody ZEC fields', () => {
     expect(out.source.zec.payinState).toBe('reorged')
   })
 
+  it('relays the 3-confirmation tier (G >= $3,200, intents #1126/#1127) unchanged', () => {
+    const z3 = { ...ZEC, requiredConfirmations: 3, confirmations: 2 }
+    expect(pickZecCustodyStatus(z3)).toEqual({ ...z3, receive: 'transparent' })
+    const out: any = pickRozoCallerSafe({ ...ROW, source: { ...ROW.source, zec: z3 } })
+    expect(out.source.zec.requiredConfirmations).toBe(3)
+    for (const n of [1, 2]) expect(pickZecCustodyStatus({ ...ZEC, requiredConfirmations: n })?.requiredConfirmations).toBe(n)
+  })
+
   it('drops a malformed zec block entirely', () => {
     const bad: any[] = [
       { ...ZEC, rail: 'near_direct' },
-      { ...ZEC, requiredConfirmations: 3 },
+      { ...ZEC, requiredConfirmations: 4 },
+      { ...ZEC, requiredConfirmations: 0 },
+      { ...ZEC, requiredConfirmations: '3' },
       { ...ZEC, confirmations: -1 },
       { ...ZEC, confirmations: 1.5 },
       { ...ZEC, requiredZat: 8143000 },

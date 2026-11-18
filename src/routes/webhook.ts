@@ -1728,7 +1728,8 @@ const PROVIDER_RE = /^[a-z0-9_]{1,32}$/
 export function pickZecCustodyStatus(z: any) {
   if (!z || typeof z !== 'object') return null
   if (z.rail !== 'zec_custody') return null
-  if (z.requiredConfirmations !== 1 && z.requiredConfirmations !== 2) return null
+  // 1 below $110, 2 from $110, 3 from $3,200 payable (intents #1126/#1127, 2026-11-18).
+  if (z.requiredConfirmations !== 1 && z.requiredConfirmations !== 2 && z.requiredConfirmations !== 3) return null
   if (!Number.isInteger(z.confirmations) || z.confirmations < 0 || z.confirmations > 1_000_000) return null
   if (typeof z.requiredZat !== 'string' || !ZAT_RE.test(z.requiredZat)) return null
   if (typeof z.receivedZat !== 'string' || !ZAT_RE.test(z.receivedZat)) return null
@@ -1742,7 +1743,7 @@ export function pickZecCustodyStatus(z: any) {
   return {
     rail: 'zec_custody' as const,
     receive: receive as 'shielded' | 'transparent',
-    requiredConfirmations: z.requiredConfirmations as 1 | 2,
+    requiredConfirmations: z.requiredConfirmations as 1 | 2 | 3,
     confirmations: z.confirmations as number,
     requiredZat: z.requiredZat as string,
     receivedZat: z.receivedZat as string,

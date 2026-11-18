@@ -18,7 +18,7 @@ import { forwardedClientHintHeader, withForwardedClientHint } from './client-hin
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase, isIntentsPaymentNotFound } from './intents-base'
 import { deviceIdField } from './device-id-forward'
-import { isBtcOnchain, isNativeSymbol, nativeMaxUsd, parseNativeSources } from './native-sources'
+import { isBtcOnchain, isNativeSymbol, nativeMaxUsdFor, parseNativeSources } from './native-sources'
 import {
   CHECKOUT_PRICING_VERSION,
   type CheckoutPricing,
@@ -57,7 +57,8 @@ const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
  * invoice amount Bitrefill receives on Base, NOT the larger amount the payer
  * sends (that adds the bridge fee). Bitrefill prices a card above its face
  * value (a 200 card is a 204 invoice), so 1050 covers cards up to the ~1,000
- * USD tier. Native sources are still bounded separately by NATIVE_MAX_USD,
+ * USD tier. Native sources are still bounded separately by the per-coin
+ * native cap (nativeMaxUsdFor: NATIVE_MAX_USD and the coin's own maxUsd),
  * and payment-api applies its own pay-in and liquidity caps upstream.
  */
 export const BITREFILL_MAX_USDC = 1050
@@ -210,8 +211,8 @@ export async function handleBitrefillCreateInvoice(
     })
   }
   const source = src.resolved
-  if (isNativeSymbol(source.chainId, source.tokenSymbol) && Number(amount) > nativeMaxUsd(env.NATIVE_MAX_USD)) {
-    return fail(400, 'AMOUNT_OUT_OF_RANGE', `Native coin payment is limited to $${nativeMaxUsd(env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`)
+  if (isNativeSymbol(source.chainId, source.tokenSymbol) && Number(amount) > nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD)) {
+    return fail(400, 'AMOUNT_OUT_OF_RANGE', `Native coin payment is limited to $${nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`)
   }
 
   const orderId = bitrefillOrderId(invoiceId)
@@ -611,8 +612,8 @@ export async function handleBitrefillFunderCreate(
     pricingVersion: CHECKOUT_PRICING_VERSION,
   }
   const isNative = isNativeSymbol(source.chainId, source.tokenSymbol)
-  if (isNative && Number(callerPaysAtomic) / 1e6 > nativeMaxUsd(env.NATIVE_MAX_USD)) {
-    return fail(400, 'AMOUNT_OUT_OF_RANGE', `Native coin payment is limited to $${nativeMaxUsd(env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`)
+  if (isNative && Number(callerPaysAtomic) / 1e6 > nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD)) {
+    return fail(400, 'AMOUNT_OUT_OF_RANGE', `Native coin payment is limited to $${nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`)
   }
 
   const orderId = bitrefillOrderId(invoiceId)
