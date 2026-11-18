@@ -195,6 +195,10 @@ INTENTS_WARMUP = "on"
 # only with ?beta=btc; rozo-intents-api keeps BTC_CUSTODY_MODE=test_only and an
 # app allowlist. Per invoice $0.50 to $1.00 gross (code constants in
 # native-sources.ts; optional BTC_ONCHAIN_MAX_USD may only lower the cap).
+# BTC_ONCHAIN_LIMITS is deliberately NOT set: unset = test_only band. Setting
+# it to exactly "beta" switches the band to $10 to $1,200 (BETA-BTC-MIN /
+# BETA-ORDER-CAP); do that only together with rozo-intents-api
+# BTC_CUSTODY_MODE=beta (founder-approved Beta launch). Rollback: remove it.
 # Lightning BTC (chainId "lightning") is not affected by this entry.
 # Rollback (BTC only): set NATIVE_SOURCES_BETA = "ZEC@9133" and redeploy.
 # Rollback: set NATIVE_SOURCES_BETA = "" and redeploy.

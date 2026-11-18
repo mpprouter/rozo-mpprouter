@@ -15,8 +15,10 @@
  * create, query after expiry).
  */
 
+import { readFileSync } from 'node:fs'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  BTC_CODE_MESSAGES,
   BTC_ONCHAIN_MIN_LINK_LIFE_MS,
   btcRailViolation,
   btcUpstreamError,
@@ -29,8 +31,15 @@ import { isLive } from '../src/routes/existing-order'
 import { handleInvoiceStatus, pickBtcCustodyStatus, pickRozoCallerSafe } from '../src/routes/webhook'
 import {
   ALL_NATIVE_SOURCES,
+  BTC_ONCHAIN_BETA_MAX_USD,
+  BTC_ONCHAIN_BETA_MIN_USD,
   BTC_ONCHAIN_MAX_USD,
   BTC_ONCHAIN_MIN_USD,
+  NATIVE_SOURCE_DEFS,
+  btcOnchainMinUsd,
+  btcOnchainRequiredConfirmations,
+  nativeMaxUsdFor,
+  parseBtcOnchainLimits,
   STABLE_SOURCES,
   btcOnchainMaxUsd,
   isBtcOnchain,
@@ -789,5 +798,145 @@ describe('reuse path honours the on-chain BTC switch (BTC@9000 in NATIVE_SOURCES
     expect(on.json.rozoPaymentId).toBe('rozo-pay-btc')
     expect(on.json.raw.source.receiverAddress).toBe(BC1Q)
     expect(createCalls).toBe(0)
+  })
+})
+
+describe('PR-3 Beta constants: present, but the live band stays test_only until BTC_ONCHAIN_LIMITS is exactly "beta"', () => {
+  const BETA = (extra: Record<string, string> = {}) => makeEnv({ BTC_ONCHAIN_LIMITS: 'beta', ...extra })
+
+  it('constants match rozo-intents-api #1117 (BETA-BTC-MIN 10, BETA-ORDER-CAP 1,200); test_only constants unchanged', () => {
+    expect([BTC_ONCHAIN_BETA_MIN_USD, BTC_ONCHAIN_BETA_MAX_USD]).toEqual([10, 1200])
+    expect([BTC_ONCHAIN_MIN_USD, BTC_ONCHAIN_MAX_USD]).toEqual([0.5, 1])
+    expect(NATIVE_SOURCE_DEFS['9000'].maxUsd).toBe(1200)
+  })
+
+  it('mode parse is fail closed: only the exact string "beta" selects beta', () => {
+    expect(parseBtcOnchainLimits('beta')).toBe('beta')
+    for (const raw of [undefined, '', 'Beta', 'BETA', ' beta', 'beta ', 'test_only', 'on', 'true', '1', 'off']) {
+      expect(parseBtcOnchainLimits(raw as string | undefined)).toBe('test_only')
+    }
+  })
+
+  it('effective band by mode; BTC_ONCHAIN_MAX_USD only lowers in both modes; default arguments are test_only', () => {
+    expect(btcOnchainMinUsd()).toBe(0.5)
+    expect(btcOnchainMinUsd('beta')).toBe(10)
+    expect(btcOnchainMaxUsd(undefined)).toBe(1)
+    expect(btcOnchainMaxUsd('1200')).toBe(1)
+    expect(btcOnchainMaxUsd(undefined, 'beta')).toBe(1200)
+    expect(btcOnchainMaxUsd('500', 'beta')).toBe(500)
+    for (const raw of ['5000', '1200', '0', '-1', 'abc']) expect(btcOnchainMaxUsd(raw, 'beta')).toBe(1200)
+    // The def ceiling alone never decides the cap: the create path takes min(nativeCap, btcOnchainMaxUsd).
+    expect(Math.min(nativeMaxUsdFor('9000', undefined), btcOnchainMaxUsd(undefined))).toBe(1)
+    expect(Math.min(nativeMaxUsdFor('9000', '5000'), btcOnchainMaxUsd(undefined))).toBe(1)
+  })
+
+  it('confirmation tiers (BETA-BTC-FRONT-CONF): <=100: 1, <600: 2, else 3; unreadable: 3; test_only always 1', () => {
+    expect([0, 10, 100, 100.000001, 599.99, 600, 1200].map((v) => btcOnchainRequiredConfirmations('beta', v))).toEqual([1, 1, 1, 2, 2, 3, 3])
+    expect(btcOnchainRequiredConfirmations('beta', Number.NaN)).toBe(3)
+    expect(btcOnchainRequiredConfirmations('beta', -1)).toBe(3)
+    expect([0.5, 1, 600, 1200].map((v) => btcOnchainRequiredConfirmations('test_only', v))).toEqual([1, 1, 1, 1])
+  })
+
+  it('wrangler.toml does not set BTC_ONCHAIN_LIMITS, so deploying this change keeps test_only', () => {
+    const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8')
+    expect(toml.split('\n').some((l) => /^\s*BTC_ONCHAIN_LIMITS\s*=/.test(l))).toBe(false)
+    expect(toml.split('\n').some((l) => /^\s*BTC_ONCHAIN_MAX_USD\s*=/.test(l))).toBe(false)
+  })
+
+  it('live env (no BTC_ONCHAIN_LIMITS): $1.01 still refused, $1.00 and $0.50 pass, $10 / $1,200 refused, no upstream create', async () => {
+    for (const [amount, ok] of [['1.01', false], ['10.00', false], ['1200.00', false], ['1.00', true], ['0.50', true], ['0.49', false]] as const) {
+      createCalls = 0
+      quoteAmount = amount
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { query: '?beta=btc' })
+      expect([amount, r.status]).toEqual([amount, ok ? 200 : 400])
+      expect(createCalls).toBe(ok ? 1 : 0)
+    }
+    // A broken mode value behaves exactly like unset.
+    quoteAmount = '10.00'
+    createCalls = 0
+    const typo = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: makeEnv({ BTC_ONCHAIN_LIMITS: 'Beta' }), query: '?beta=btc' })
+    expect(typo.status).toBe(400)
+    expect(typo.json.message).toBe('Native coin payment is limited to $1 per invoice. Pay with USDC/USDT instead.')
+    expect(createCalls).toBe(0)
+  })
+
+  it('beta mode: $9.99 refused (min $10), $10 and $1,200 pass, $1,200.01 refused, var lowers only, NATIVE_MAX_USD cannot raise', async () => {
+    for (const [amount, ok, msg] of [
+      ['9.99', false, 'at least $10 per invoice'], ['10.00', true, ''], ['1200.00', true, ''], ['1200.01', false, '$1200 per invoice'],
+    ] as const) {
+      createCalls = 0
+      quoteAmount = amount
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: BETA(), query: '?beta=btc' })
+      expect([amount, r.status]).toEqual([amount, ok ? 200 : 400])
+      if (!ok) expect(r.json.message).toContain(msg)
+      expect(createCalls).toBe(ok ? 1 : 0)
+    }
+    createCalls = 0
+    quoteAmount = '600.00'
+    const lowered = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: BETA({ BTC_ONCHAIN_MAX_USD: '500' }), query: '?beta=btc' })
+    expect(lowered.status).toBe(400)
+    expect(lowered.json.message).toContain('$500 per invoice')
+    quoteAmount = '1500.00'
+    for (const extra of [{ BTC_ONCHAIN_MAX_USD: '5000' }, { NATIVE_MAX_USD: '5000' }]) {
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: BETA(extra), query: '?beta=btc' })
+      expect(r.status).toBe(400)
+      expect(r.json.message).toContain('$1200 per invoice')
+    }
+    expect(createCalls).toBe(0)
+  })
+
+  it('beta mode never opens BTC by itself: without BTC@9000 in NATIVE_SOURCES_BETA or without ?beta=btc it is still an unknown coin', async () => {
+    quoteAmount = '50.00'
+    const noBeta = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: BETA() })
+    const noSwitch = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: BETA({ NATIVE_SOURCES_BETA: 'ZEC@9133' }), query: '?beta=btc' })
+    expect([noBeta.status, noSwitch.status]).toEqual([400, 400])
+    expect(createCalls).toBe(0)
+  })
+
+  it('quote-invoice: live env shows the test_only band; beta env shows the beta band and tiers', async () => {
+    const live = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: '?beta=btc' })
+    expect(live.json.sourceMeta['BTC@9000']).toEqual({
+      refund_address_required: false, beta: true, address_single_use: true, required_confirmations: 1, min_usd: 0.5, max_usd: 1,
+    })
+    expect(live.json.nativeMinUsd['9000']).toEqual({ BTC: 0.5 })
+    const beta = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: BETA(), query: '?beta=btc' })
+    expect(beta.json.sourceMeta['BTC@9000']).toMatchObject({ required_confirmations: 3, min_usd: 10, max_usd: 1200 })
+    expect(beta.json.sourceMeta['BTC@9000'].confirmation_tiers.map((t: any) => t.confirmations)).toEqual([1, 2, 3])
+    expect(beta.json.nativeMinUsd['9000']).toEqual({ BTC: 10 })
+    // ZEC meta is untouched by the BTC mode.
+    expect(beta.json.sourceMeta['ZEC@9133']).toEqual(live.json.sourceMeta['ZEC@9133'])
+  })
+
+  it('#1117 refusals: daily_cap -> BTC_CAPACITY_BUSY (503), loss_breaker -> BTC_PAUSED (503), passed through with router copy', async () => {
+    quoteAmount = '50.00'
+    for (const [reason, code] of [['daily_cap', 'BTC_CAPACITY_BUSY'], ['loss_breaker', 'BTC_PAUSED']] as const) {
+      createAnswer = () => new Response(JSON.stringify({
+        error: { code, message: 'BTC payins are paused. Please pay with USDC/USDT.' }, data: { errorCode: code, reason }, requestId: 'r',
+      }), { status: 503 })
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: BETA(), query: '?beta=btc' })
+      expect([reason, r.status, r.json.code]).toEqual([reason, 503, code])
+      expect(r.json.message).toBe(BTC_CODE_MESSAGES[code])
+    }
+    // The amount-too-low copy carries no number (it differs by mode on both sides).
+    expect(BTC_CODE_MESSAGES.BTC_AMOUNT_TOO_LOW).not.toMatch(/\$\d/)
+  })
+
+  it('replay: the same beta create twice reuses the first order (one upstream create)', async () => {
+    quoteAmount = '50.00'
+    const first = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: BETA(), query: '?beta=btc' })
+    expect(first.status).toBe(200)
+    expect(createCalls).toBe(1)
+    const intent = createdIntent
+    existingOrder = {
+      id: 'rozo-pay-btc', status: 'payment_unpaid', paymentLink: 'https://pay.rozo.ai/b', provider: 'rozo',
+      expiresAt: '2999-01-01T01:00:00.000Z', quoteExpiresAt: '2999-01-01T01:00:00.000Z',
+      source: { chainId: '9000', tokenSymbol: 'BTC', amount: '0.00060000', receiverAddress: BC1Q, btc: btcBlock('awaiting') },
+      destination: { ...intent.destination },
+      metadata: { ...intent.metadata },
+    }
+    const second = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: BETA(), query: '?beta=btc' })
+    expect(second.status).toBe(200)
+    expect(second.json.reused).toBe(true)
+    expect(createCalls).toBe(1)
   })
 })

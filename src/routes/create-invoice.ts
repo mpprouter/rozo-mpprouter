@@ -47,10 +47,11 @@ import {
   ALL_NATIVE_SOURCES,
   BTC_DECIMALS,
   BTC_ONCHAIN_CHAIN_ID,
-  BTC_ONCHAIN_MIN_USD,
   STABLE_SOURCES,
   NATIVE_SOURCE_DEFS,
   btcOnchainMaxUsd,
+  btcOnchainMinUsd,
+  parseBtcOnchainLimits,
   btcOnchainSwitchOn,
   isBtcOnchain,
   isBtcP2wpkhAddress,
@@ -718,7 +719,8 @@ const BTC_PASSTHROUGH_CODES: ReadonlySet<string> = new Set([
 export const BTC_CODE_MESSAGES: Readonly<Record<string, string>> = {
   BTC_NOT_ENABLED: 'On-chain BTC payments are not available for this order. Pay with another coin.',
   BTC_APP_NOT_ALLOWED: 'On-chain BTC payments are not available for this order. Pay with another coin.',
-  BTC_AMOUNT_TOO_LOW: `On-chain BTC payment (Beta) needs at least $${BTC_ONCHAIN_MIN_USD} per invoice. Pay with USDC/USDT instead.`,
+  // No number: the minimum depends on the limits mode on both sides (router BTC_ONCHAIN_LIMITS, intents BTC_CUSTODY_MODE).
+  BTC_AMOUNT_TOO_LOW: 'This invoice is below the on-chain BTC (Beta) minimum. Pay with USDC/USDT instead.',
   BTC_AMOUNT_TOO_HIGH: 'This invoice is above the on-chain BTC (Beta) limit. Pay with USDC/USDT instead.',
   BTC_CAPACITY_BUSY: 'On-chain BTC payments are at capacity right now. Try again later, or pay with another coin.',
   BTC_PAUSED: 'On-chain BTC payments are paused for a safety check. Pay with another coin, or try again later.',
@@ -2158,14 +2160,18 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           link_id_detected,
         })
       : null
-  // On-chain BTC test period: $0.50 to $1.00 gross per invoice, code
-  // constants; BTC_ONCHAIN_MAX_USD may only lower the cap. Checked on
-  // callerPays (fee included), never on a client-sent amount.
-  const btcCap = Math.min(nativeCap, btcOnchainMaxUsd(env.BTC_ONCHAIN_MAX_USD))
-  if (btcOnchain && !(Number(callerPays) >= BTC_ONCHAIN_MIN_USD)) {
+  // On-chain BTC band per invoice, code constants by limits mode
+  // (BTC_ONCHAIN_LIMITS: test_only $0.50 to $1.00 unless exactly "beta",
+  // then $10 to $1,200); BTC_ONCHAIN_MAX_USD may only lower the cap. Checked
+  // on callerPays (fee included), never on a client-sent amount.
+  // rozo-intents-api (BTC_CUSTODY_MODE) stays the final gate.
+  const btcMode = parseBtcOnchainLimits(env.BTC_ONCHAIN_LIMITS)
+  const btcMin = btcOnchainMinUsd(btcMode)
+  const btcCap = Math.min(nativeCap, btcOnchainMaxUsd(env.BTC_ONCHAIN_MAX_USD, btcMode))
+  if (btcOnchain && !(Number(callerPays) >= btcMin)) {
     return errorResponse(400, {
       code: 'UNSUPPORTED_SOURCE',
-      message: `On-chain BTC payment (Beta) needs at least $${BTC_ONCHAIN_MIN_USD} per invoice. Pay with USDC/USDT instead.`,
+      message: `On-chain BTC payment (Beta) needs at least $${btcMin} per invoice. Pay with USDC/USDT instead.`,
       normalized_input: normalized,
       link_id_detected,
     })
