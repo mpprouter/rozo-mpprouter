@@ -7,6 +7,7 @@ import {
   isTestPaymentId,
   parseNativeSources,
   nativeMinUsd,
+  nativeMaxUsdBySource,
   parseBtcOnchainLimits,
   parseZecRail,
   sourceMeta,
@@ -729,6 +730,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
       supportedSources: supportedSources(STABLE_SOURCES, testNative),
       sourceMeta: sourceMeta(testNative, parseZecRail(env.ZEC_RAIL), zecShieldedRequested(request.url), env.BTC_ONCHAIN_MAX_USD, parseBtcOnchainLimits(env.BTC_ONCHAIN_LIMITS)),
       nativeMinUsd: nativeMinUsd(testNative, parseBtcOnchainLimits(env.BTC_ONCHAIN_LIMITS)),
+      nativeMaxUsd: nativeMaxUsdBySource(testNative, env.NATIVE_MAX_USD, parseZecRail(env.ZEC_RAIL), env.BTC_ONCHAIN_MAX_USD, parseBtcOnchainLimits(env.BTC_ONCHAIN_LIMITS)),
       quoteReceipt,
     })
   }
@@ -859,6 +861,10 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     // A client compares callerPays against it before offering the coin;
     // supportedSources is unchanged.
     nativeMinUsd: nativeMinUsd(nativeAllowed, parseBtcOnchainLimits(env.BTC_ONCHAIN_LIMITS)),
+    // Maximum callerPays in USD per open native coin, same shape and the same
+    // caps create-invoice enforces (transparent ZEC; rozo-intents-api stays the
+    // final gate). Read-only; supportedSources is unchanged.
+    nativeMaxUsd: nativeMaxUsdBySource(nativeAllowed, env.NATIVE_MAX_USD, parseZecRail(env.ZEC_RAIL), env.BTC_ONCHAIN_MAX_USD, parseBtcOnchainLimits(env.BTC_ONCHAIN_LIMITS)),
     quote: {
       ...(quote?.quote && typeof quote.quote === 'object' ? quote.quote : {}),
       originalAtomicUsdc: pricing.originalAtomic.toString(),

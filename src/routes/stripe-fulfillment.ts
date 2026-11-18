@@ -382,7 +382,7 @@ function dailyCapAtomic(env: Env): bigint {
  * Cap for the 'coinbase' ledger, from COINBASE_SETTLE_DAILY_CAP_USD.
  *
  * No default value on purpose: the Stripe default ($200/day) is far below the
- * Coinbase line's normal daily volume (single orders go up to $3,500), so
+ * Coinbase line's normal daily volume (single native orders go up to $12,750), so
  * reusing it would stop OpenRouter delivery. Until the variable is set the
  * ledger runs in record-only mode: every settlement is still counted, nothing
  * is refused. A malformed value is treated as unset (logged), never as zero.

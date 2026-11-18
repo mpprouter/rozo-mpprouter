@@ -26,6 +26,7 @@ import { zecQuoteExpiredUnfunded } from '../src/routes/relink-guard'
 import {
   ALL_NATIVE_SOURCES,
   STABLE_SOURCES,
+  ZEC_CUSTODY_MAX_CONFIRMATIONS,
   betaParamSymbols,
   nativeMaxUsdFor,
   parseNativeSources,
@@ -190,10 +191,10 @@ describe('ZEC source table', () => {
     })
   })
 
-  it('caps ZEC below $3200 even if NATIVE_MAX_USD is higher', () => {
-    expect(nativeMaxUsdFor('9133', '5000')).toBe(3199.99)
-    expect(nativeMaxUsdFor('9133', undefined)).toBe(3199.99)
-    expect(nativeMaxUsdFor('8453', undefined)).toBe(3500)
+  it('caps ZEC below $11,700 even if NATIVE_MAX_USD is higher', () => {
+    expect(nativeMaxUsdFor('9133', '20000')).toBe(11699.99)
+    expect(nativeMaxUsdFor('9133', undefined)).toBe(11699.99)
+    expect(nativeMaxUsdFor('8453', undefined)).toBe(12750)
     expect(nativeMaxUsdFor('9133', '100')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000')).toBe(5000)
   })
@@ -545,7 +546,7 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     refund_address_required: false,
     beta: true,
     address_single_use: true,
-    confirmations: { under110: 1, from110: 2 },
+    confirmations: { under110: 1, from110: 2, from3200: 3 },
   }
 
   it('parseZecRail defaults to near for anything but an exact custody', () => {
@@ -562,7 +563,7 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(JSON.stringify(sourceMeta(open, 'near'))).toBe(
       '{"ZEC@9133":{"eta_seconds":480,"refund_address_required":true,"beta":true,"address_single_use":true}}',
     )
-    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(3199.99)
+    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(11699.99)
     expect(zecMinLinkLifeMs('near')).toBe(ZEC_MIN_LINK_LIFE_MS)
   })
 
@@ -573,24 +574,26 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(sourceMeta(parseNativeSources(PROD_NATIVE), 'custody')).toEqual({})
   })
 
-  it('custody caps ZEC below $3200 and leaves other coins alone', () => {
-    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(3199.99)
-    expect(nativeMaxUsdFor('9133', '5000', 'custody')).toBe(3199.99)
-    expect(nativeMaxUsdFor('8453', undefined, 'custody')).toBe(3500)
+  it('custody caps ZEC below $11,700 and leaves other coins alone', () => {
+    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(11699.99)
+    expect(nativeMaxUsdFor('9133', '20000', 'custody')).toBe(11699.99)
+    expect(nativeMaxUsdFor('8453', undefined, 'custody')).toBe(12750)
     expect(nativeMaxUsdFor('9133', '100', 'custody')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000', 'custody')).toBe(5000)
   })
 
   // Boundary at the ZEC caps through create-invoice: callerPays > cap is rejected.
   it.each([
-    ['near', '3199.99', 200],
-    ['near', '3200', 400],
-    ['near', '3250', 400],
-    ['custody', '3199.98', 200],
-    ['custody', '3199.99', 200],
-    ['custody', '3200', 400],
-    ['custody', '3250', 400],
-    ['custody', '3500', 400],
+    ['near', '3200', 200],
+    ['near', '11699.99', 200],
+    ['near', '11700', 400],
+    ['near', '12750', 400],
+    ['custody', '3200', 200],
+    ['custody', '11699.98', 200],
+    ['custody', '11699.99', 200],
+    ['custody', '11700', 400],
+    ['custody', '11750', 400],
+    ['custody', '12750', 400],
   ] as const)('ZEC %s rail: callerPays %s -> %i', async (rail, amount, expected) => {
     quoteAmount = amount
     const env = makeEnv({ ZEC_RAIL: rail })
@@ -605,14 +608,15 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     }
   })
 
-  it('custody link margin = 30 min lock + 10 min margin + 2 x 75 s', () => {
-    expect(ZEC_CUSTODY_MIN_LINK_LIFE_MS).toBe(42.5 * 60_000)
+  it('custody link margin = 30 min lock + 10 min margin + 3 x 75 s (deepest tier, from $3,200)', () => {
+    expect(ZEC_CUSTODY_MAX_CONFIRMATIONS).toBe(3)
+    expect(ZEC_CUSTODY_MIN_LINK_LIFE_MS).toBe(43.75 * 60_000)
     expect(zecMinLinkLifeMs('custody')).toBe(ZEC_CUSTODY_MIN_LINK_LIFE_MS)
     const now = Date.parse('2026-10-10T00:00:00.000Z')
-    expect(checkZecLinkExpiry('2026-10-10T00:42:30.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS).ok).toBe(true)
-    const short = checkZecLinkExpiry('2026-10-10T00:42:29.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS)
+    expect(checkZecLinkExpiry('2026-10-10T00:43:45.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS).ok).toBe(true)
+    const short = checkZecLinkExpiry('2026-10-10T00:43:44.000Z', now, ZEC_CUSTODY_MIN_LINK_LIFE_MS)
     expect(short.ok).toBe(false)
-    expect((short as any).message).toContain('43 minutes')
+    expect((short as any).message).toContain('44 minutes')
     expect(checkZecLinkExpiry(null, now, ZEC_CUSTODY_MIN_LINK_LIFE_MS).ok).toBe(false)
   })
 
@@ -899,9 +903,12 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(eth.json.warnings.join(' ')).toContain('source.shielded was ignored')
   })
 
+  // Shielded stays $1,200 although the transparent and native caps rose (2026-11-18).
   it.each([
     ['1200', undefined, 200],
     ['1200.01', undefined, 400],
+    ['3200', undefined, 400],
+    ['11699.99', undefined, 400],
     ['50', '50', 200],
     ['50.01', '50', 400],
   ] as const)('shielded cap: callerPays %s with ZEC_SHIELDED_MAX_USD=%s -> %i', async (amount, cap, expected) => {
@@ -1073,7 +1080,9 @@ describe('quote-expired unfunded ZEC custody order', () => {
     expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, chainId: '8453' } })).toBe(false)
     expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, tokenSymbol: 'ETH' } })).toBe(false)
     const z = zecBlock('transparent', 'expired')
-    for (const bad of [{ confirmations: 1 }, { receive: 'private' }, { requiredConfirmations: 3 }, { requiredZat: 'x' },
+    // the 3-confirmation tier (G >= $3,200, 2026-11-18) qualifies like 1 and 2
+    expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, zec: { ...zecBlock('transparent', 'expired'), requiredConfirmations: 3 } } })).toBe(true)
+    for (const bad of [{ confirmations: 1 }, { receive: 'private' }, { requiredConfirmations: 4 }, { requiredConfirmations: 0 }, { requiredConfirmations: '3' }, { requiredZat: 'x' },
                        { quoteExpiresAt: 'soon' }, { quoteExpiresAt: '2999-01-01T00:00:00.000Z' }, { receivedZat: 0 }]) {
       expect(zecQuoteExpiredUnfunded({ ...base, source: { ...base.source, zec: { ...z, ...bad } } })).toBe(false)
     }

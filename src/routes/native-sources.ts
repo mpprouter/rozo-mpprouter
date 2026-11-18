@@ -64,7 +64,9 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
   '56': { symbol: 'BNB', tokenAddress: '0x0000000000000000000000000000000000000000' },
   // Polygon POL (18 decimals). rozo-intents-api accepts it for opted-in
   // merchants (merchant_openrouter, rozoAgent) since 2026-10-10.
-  '137': { symbol: 'POL', tokenAddress: '0x0000000000000000000000000000000000000000' },
+  // POL keeps $3,500 per order when the native default rose to $12,750
+  // (founder 2026-11-18, ZEC/native 13,500 design: intents POL_MAX_USD=3500).
+  '137': { symbol: 'POL', tokenAddress: '0x0000000000000000000000000000000000000000', maxUsd: 3500 },
   '900': { symbol: 'SOL', tokenAddress: 'native' },
   // ZEC on Zcash (internal chain id 9133 = Zcash SLIP-44 coin type 133), routed
   // by rozo-intents-api through NEAR 1Click EXACT_OUTPUT to Base USDC. Beta
@@ -73,10 +75,11 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
     symbol: 'ZEC',
     tokenAddress: '',
     provider: 'near',
-    // Strictly below $3,200 like the custody rail: rozo-intents-api refuses
-    // ZEC from $3,200 (founder 2026-11-14 bug fix; the router said 3500 since
-    // 2026-10-23, 3200 from 2026-10-21, 2000 before).
-    maxUsd: 3199.99,
+    // Strictly below $11,700 like the custody rail: customer cap 11,000
+    // credits incl. fee (founder 2026-11-18, intents NATIVE_MAX_ORDER_USD_ZEC
+    // 11700 under the 13,500 hard cap). Was 3199.99 from 2026-11-14, 3500
+    // from 2026-10-23, 3200 from 2026-10-21, 2000 before.
+    maxUsd: 11699.99,
     etaSeconds: 480,
     refundAddressRequired: true,
     beta: true,
@@ -221,8 +224,8 @@ const nativeKey = (chainId: string, d: NativeSourceDef) => `${d.symbol}@${chainI
 // one for the metadata and pre-checks shown before create:
 //   near    (default) NEAR 1Click deposit address; today's behaviour unchanged.
 //   custody Rozo self-custody rail: a per-order t1 address on our own HD
-//           wallet, 1 confirmation below $110 and 2 from $110, G < $3200 (founder 2026-11-14, matching
-//           rozo-intents-api zec_custody_reserve; the router said $3500 from 2026-10-23, $1100 before 2026-10-21).
+//           wallet, 1 confirmation below $110, 2 from $110, 3 from $3,200, G < $11,700 (founder 2026-11-18;
+//           G < $3200 from 2026-11-14, $3500 from 2026-10-23, $1100 before 2026-10-21).
 // rozo-intents-api stays the final gate either way.
 
 export type ZecRailMode = 'near' | 'custody'
@@ -232,8 +235,15 @@ export function parseZecRail(raw: string | undefined): ZecRailMode {
   return (raw ?? '').trim().toLowerCase() === 'custody' ? 'custody' : 'near'
 }
 
-/** Confirmation tiers of the custody rail, by amount payable G in USD. */
-export const ZEC_CUSTODY_CONFIRMATIONS = { under110: 1, from110: 2 } as const
+/**
+ * Confirmation tiers of the custody rail, by amount payable G in USD
+ * (rozo-intents-api zec_custody_reserve: 3 confirmations from G >= $3,200,
+ * intents #1126/#1127, founder 2026-11-18).
+ */
+export const ZEC_CUSTODY_CONFIRMATIONS = { under110: 1, from110: 2, from3200: 3 } as const
+
+/** The deepest custody confirmation tier (what the router assumes before G is known). */
+export const ZEC_CUSTODY_MAX_CONFIRMATIONS = Math.max(...Object.values(ZEC_CUSTODY_CONFIRMATIONS))
 
 /** Custody quote lock, link safety margin and block target (rozo-intents-api shared/zec-custody.ts). */
 export const ZEC_CUSTODY_QUOTE_LOCK_MIN = 30 // founder 2026-10-15 (was 10)
@@ -241,16 +251,17 @@ export const ZEC_CUSTODY_LINK_SAFETY_MARGIN_MIN = 10
 export const ZEC_BLOCK_TARGET_SECONDS = 75
 
 /**
- * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below $3200:
- * rozo-intents-api zec_custody_reserve() rejects p_g_usd >= 3200 and prod
- * NATIVE_MAX_ORDER_USD_ZEC = 3200 (founder 2026-11-14 bug fix; the router said
- * 3499.99 from 2026-10-23, $1100 before 2026-10-21).
+ * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below the
+ * customer cap $11,700 (founder 2026-11-18: 11,000 credits incl. fee; intents
+ * NATIVE_MAX_ORDER_USD_ZEC = 11700 under the 13,500 hard cap). Until intents
+ * app_config is raised it still refuses from $3,200 and stays the final gate.
+ * Was 3199.99 from 2026-11-14, 3499.99 from 2026-10-23, $1100 before 2026-10-21.
  * No arrival estimate: block times vary and the checkout must not promise one,
  * so sourceMeta omits eta_seconds for this rail.
  */
 const ZEC_CUSTODY_OVERRIDE: Partial<NativeSourceDef> = {
   provider: 'rozo',
-  maxUsd: 3199.99,
+  maxUsd: 11699.99,
   etaSeconds: undefined,
   // Founder 2026-10-13: the deposit address is our own wallet, so the payer's
   // refund address is optional (late or short payments handled manually).
@@ -378,8 +389,8 @@ export interface NativeSourceMeta {
   beta: boolean
   /** The deposit address is valid for one payment only; never pay it twice. */
   address_single_use: boolean
-  /** Custody ZEC only: confirmations required below / from $110 payable. */
-  confirmations?: { under110: number; from110: number }
+  /** Custody ZEC only: confirmations required below $110 / from $110 / from $3,200 payable. */
+  confirmations?: { under110: number; from110: number; from3200: number }
   /** Custody ZEC with `?beta=zec_shielded`: a shielded-balance pay-in may be requested (source.shielded=true). */
   shieldedAvailable?: true
   /** On-chain BTC only: confirmations before the order counts as paid (beta: the deepest tier, see confirmation_tiers). */
@@ -510,11 +521,14 @@ export function isNativeSymbol(chainId: string, tokenSymbol: string): boolean {
   return !!def && def.symbol === tokenSymbol.toUpperCase()
 }
 
-/** Upper bound on callerPays for a native source (same as the backend cap,
- *  rozo-intents-api MAX_NATIVE_PAYIN_USD: $3,500 since 2026-10-23; $3,200 from 2026-10-20, $2,000 before). */
+/** Upper bound on callerPays for a native source: the customer cap $12,750
+ *  incl. fee (12,000 OpenRouter credits; founder 2026-11-18, intents
+ *  NATIVE_MAX_ORDER_USD_merchant_openrouter 12750 under the MAX_NATIVE_PAYIN_USD
+ *  13,500 hard cap). Coins with their own lower maxUsd (POL, ZEC, BTC) keep it
+ *  through nativeMaxUsdFor. Was $3,500 from 2026-10-23, $3,200 from 2026-10-20, $2,000 before. */
 export function nativeMaxUsd(raw: string | undefined): number {
   const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : 3500
+  return Number.isFinite(n) && n > 0 ? n : 12750
 }
 
 /** Cap for one native coin: the lower of its own maxUsd and NATIVE_MAX_USD. */
@@ -522,6 +536,30 @@ export function nativeMaxUsdFor(chainId: string, raw: string | undefined, zecRai
   const global = nativeMaxUsd(raw)
   const own = nativeSourceDef(chainId, zecRail)?.maxUsd
   return typeof own === 'number' && own > 0 ? Math.min(own, global) : global
+}
+
+/**
+ * Maximum callerPays in USD per open native coin ({ chainId: { SYMBOL: usd } }),
+ * the same caps create-invoice enforces before create: nativeMaxUsdFor, and for
+ * on-chain BTC the lower btcOnchainMaxUsd of the limits mode. Transparent ZEC
+ * only (a shielded order is further capped by ZEC_SHIELDED_MAX_USD).
+ * rozo-intents-api stays the final gate.
+ */
+export function nativeMaxUsdBySource(
+  nativeAllowed: ReadonlySet<string>,
+  rawNativeMax: string | undefined,
+  zecRail: ZecRailMode = 'near',
+  btcMaxRaw?: string,
+  btcMode: BtcOnchainLimitsMode = 'test_only',
+): Record<string, Record<string, number>> {
+  const out: Record<string, Record<string, number>> = {}
+  for (const [chainId, def] of Object.entries(NATIVE_SOURCE_DEFS)) {
+    if (!nativeAllowed.has(nativeKey(chainId, def))) continue
+    const cap = nativeMaxUsdFor(chainId, rawNativeMax, zecRail)
+    const max = isBtcOnchain(chainId, def.symbol) ? Math.min(cap, btcOnchainMaxUsd(btcMaxRaw, btcMode)) : cap
+    out[chainId] = { ...(out[chainId] ?? {}), [def.symbol]: max }
+  }
+  return out
 }
 
 /** True for a native coin that needs a payer refund address (ZEC). */
