@@ -663,3 +663,131 @@ describe('invoice-status relays the on-chain BTC custody block (I3: from rozo-in
     expect(out.source).not.toHaveProperty('btc')
   })
 })
+
+describe('reuse path honours the on-chain BTC switch (BTC@9000 in NATIVE_SOURCES_BETA)', () => {
+  const ON = () => makeEnv()
+  const OFF = () => makeEnv({ NATIVE_SOURCES_BETA: 'ZEC@9133' })
+  const USDC = { chainId: '8453', tokenSymbol: 'USDC' }
+
+  async function liveRow(srcOver: Record<string, unknown> = {}, id = 'rozo-pay-btc') {
+    existingOrder = null
+    createAnswer = null
+    await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { query: '?beta=btc' })
+    const intent = createdIntent
+    createCalls = 0
+    checkoutCalls = 0
+    createdIntent = null
+    createdIntents = []
+    return {
+      id, status: 'payment_unpaid', paymentLink: 'https://pay.rozo.ai/b', provider: 'rozo',
+      expiresAt: '2999-01-01T01:00:00.000Z', quoteExpiresAt: '2999-01-01T01:00:00.000Z',
+      source: { chainId: '9000', tokenSymbol: 'BTC', amount: '0.00001200', receiverAddress: BC1Q, btc: btcBlock('awaiting'), ...srcOver },
+      destination: { ...intent.destination },
+      metadata: { ...intent.metadata },
+    }
+  }
+
+  function expectNoInstructions(json: any) {
+    const text = JSON.stringify(json)
+    expect(text).not.toContain(BC1Q)
+    expect(text).not.toContain('pay.rozo.ai/b')
+    expect(text).not.toContain('0.00001200')
+    expect(json.raw).toBeUndefined()
+    expect(json.paymentLink).toBeUndefined()
+    expect(json.source).toBeUndefined()
+  }
+
+  it('switch off: a live BTC order is refused with 409 BTC_NOT_ENABLED and no address, for any requested coin', async () => {
+    existingOrder = await liveRow()
+    for (const [source, query] of [[USDC, ''], [USDC, '?beta=btc'], [LN, ''], [undefined, '']] as const) {
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, ...(source ? { source } : {}) }, { env: OFF(), query })
+      expect(r.status).toBe(409)
+      expect(r.json.ok).toBe(false)
+      expect(r.json.code).toBe('BTC_NOT_ENABLED')
+      expect(r.json.error.code).toBe('BTC_NOT_ENABLED')
+      expect(r.json.rozoPaymentId).toBe('rozo-pay-btc')
+      expectNoInstructions(r.json)
+    }
+    expect(createCalls).toBe(0)
+    expect(checkoutCalls).toBe(0)
+  })
+
+  it('switch off: a BTC request is refused before reuse (400 UNSUPPORTED_SOURCE), still no address', async () => {
+    existingOrder = await liveRow()
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: OFF(), query: '?beta=btc' })
+    expect(r.status).toBe(400)
+    expect(r.json.error?.code ?? r.json.code).toBe('UNSUPPORTED_SOURCE')
+    expect(JSON.stringify(r.json)).not.toContain(BC1Q)
+    expect(createCalls).toBe(0)
+  })
+
+  it('switch off: a BTC order with funds already seen is also refused without instructions', async () => {
+    existingOrder = await liveRow({ btc: btcBlock('seen', '1200', 0) })
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: USDC }, { env: OFF() })
+    expect(r.status).toBe(409)
+    expect(r.json.code).toBe('BTC_NOT_ENABLED')
+    expectNoInstructions(r.json)
+  })
+
+  it('switch on: reuse unchanged (BTC request gets the address; other coin gets the mismatch view)', async () => {
+    existingOrder = await liveRow()
+    const same = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: ON(), query: '?beta=btc' })
+    expect(same.status).toBe(200)
+    expect(same.json.reused).toBe(true)
+    expect(same.json.raw.source.receiverAddress).toBe(BC1Q)
+    const other = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: USDC }, { env: ON() })
+    expect(other.status).toBe(200)
+    expect(other.json.reused).toBe(true)
+    expect(other.json.sourceMismatch).toBe(true)
+    expect(other.json.source.chainId).toBe('9000')
+    expect(createCalls).toBe(0)
+  })
+
+  it('non-BTC live order: reuse unchanged with the switch off', async () => {
+    const base = await liveRow()
+    const usdcAddr = '0x' + '1'.repeat(40)
+    existingOrder = { ...base, id: 'rozo-pay-usdc', source: { chainId: '8453', tokenSymbol: 'USDC', amount: base.destination.amount, receiverAddress: usdcAddr } }
+    const off = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: USDC }, { env: OFF() })
+    const on = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: USDC }, { env: ON() })
+    expect(off.status).toBe(200)
+    expect(off.json.reused).toBe(true)
+    expect(off.json.raw.source.receiverAddress).toBe(usdcAddr)
+    expect(off.json).toEqual(on.json)
+    expect(createCalls).toBe(0)
+  })
+
+  it('replay: the same request twice with the switch off gives the same 409 body', async () => {
+    existingOrder = await liveRow()
+    const a = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: USDC }, { env: OFF() })
+    const b = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: USDC }, { env: OFF() })
+    expect(a.status).toBe(409)
+    expect(b.status).toBe(409)
+    expect(b.json).toEqual(a.json)
+    expect(createCalls).toBe(0)
+  })
+
+  it('switch on -> off between two requests: the second no longer hands out the address', async () => {
+    existingOrder = await liveRow()
+    const before = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: ON(), query: '?beta=btc' })
+    expect(before.status).toBe(200)
+    expect(before.json.raw.source.receiverAddress).toBe(BC1Q)
+    const after = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: USDC }, { env: OFF(), query: '?beta=btc' })
+    expect(after.status).toBe(409)
+    expect(after.json.code).toBe('BTC_NOT_ENABLED')
+    expect(after.json.rozoPaymentId).toBe(before.json.rozoPaymentId)
+    expectNoInstructions(after.json)
+    expect(createCalls).toBe(0)
+  })
+
+  it('switch off -> on (rollback) between two requests: the same order and address come back, no new order', async () => {
+    existingOrder = await liveRow()
+    const off = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: USDC }, { env: OFF() })
+    expect(off.status).toBe(409)
+    const on = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BTC }, { env: ON(), query: '?beta=btc' })
+    expect(on.status).toBe(200)
+    expect(on.json.reused).toBe(true)
+    expect(on.json.rozoPaymentId).toBe('rozo-pay-btc')
+    expect(on.json.raw.source.receiverAddress).toBe(BC1Q)
+    expect(createCalls).toBe(0)
+  })
+})

@@ -51,6 +51,7 @@ import {
   STABLE_SOURCES,
   NATIVE_SOURCE_DEFS,
   btcOnchainMaxUsd,
+  btcOnchainSwitchOn,
   isBtcOnchain,
   isBtcP2wpkhAddress,
   looksLikeBtcOnchainAddress,
@@ -2477,6 +2478,24 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
 
     if (existing) {
       const existingExpiresAt: string | null = existing?.expiresAt ?? null
+      // On-chain BTC switched off (BTC@9000 removed from NATIVE_SOURCES_BETA):
+      // a live BTC order must not hand its custody address or pay link out
+      // again, whatever coin this request asked for. The status stays
+      // pollable through rozoPaymentId; no address, amount or raw row here.
+      {
+        const existingSource = readRowSource(existing)
+        if (isBtcOnchain(existingSource.chainId, existingSource.tokenSymbol) && !btcOnchainSwitchOn(env.NATIVE_SOURCES_BETA)) {
+          return json(409, {
+            ok: false,
+            code: 'BTC_NOT_ENABLED',
+            message: BTC_CODE_MESSAGES.BTC_NOT_ENABLED,
+            error: { code: 'BTC_NOT_ENABLED', message: BTC_CODE_MESSAGES.BTC_NOT_ENABLED },
+            linkId,
+            rozoPaymentId: existing?.id ?? null,
+            status: readPaymentStatus(existing),
+          })
+        }
+      }
       if (!pendingPricingMatches(existing, pricing)) {
         return pricingMismatchResponse({ linkId }, existing)
       }

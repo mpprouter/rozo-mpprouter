@@ -17,6 +17,8 @@
 // native source: it uses chainId 'lightning' and its own path in
 // create-invoice. Anything that branches on the symbol 'BTC' must also check
 // the chain (isBtcOnchain).
+import { decodeSegwitAddress } from './bech32'
+
 export type NativeSymbol = 'ETH' | 'BNB' | 'POL' | 'SOL' | 'ZEC' | 'BTC'
 
 /** Stablecoin sources every checkout accepts (moved from create-invoice so the
@@ -114,6 +116,17 @@ export function isBtcOnchain(chainId: unknown, tokenSymbol: unknown): boolean {
 }
 
 /**
+ * The router's own on-chain BTC switch: BTC@9000 listed in NATIVE_SOURCES_BETA.
+ * Deployment-wide, independent of the per-request `?beta=btc` opt-in, so an
+ * order created with the opt-in stays reusable while the switch is on.
+ * rozo-intents-api keeps its own switch (app_config BTC_CUSTODY_MODE), which
+ * this Worker cannot read.
+ */
+export function btcOnchainSwitchOn(betaRaw: string | undefined): boolean {
+  return parseBetaNativeSources(betaRaw).has(BTC_ONCHAIN_KEY)
+}
+
+/**
  * Per-invoice cap for on-chain BTC. The code constant is the ceiling; the
  * BTC_ONCHAIN_MAX_USD var may only lower it (a higher, zero, negative or
  * unparseable value is ignored).
@@ -123,10 +136,26 @@ export function btcOnchainMaxUsd(raw: string | undefined): number {
   return Number.isFinite(n) && n > 0 && n < BTC_ONCHAIN_MAX_USD ? n : BTC_ONCHAIN_MAX_USD
 }
 
-/** P2WPKH mainnet address: bc1q + 38 bech32 characters (42 total), one case. */
+/** P2WPKH mainnet address shape: bc1q + 38 bech32 characters (42 total), lowercase. */
 const BC1Q_P2WPKH_RE = /^bc1q[02-9ac-hj-np-z]{38}$/
+/**
+ * P2WPKH mainnet address with a valid BIP173 checksum: lowercase bc1q shape,
+ * and it decodes as witness v0 (bech32, not bech32m) with a 20-byte program
+ * under HRP "bc". tb1/bcrt1, bc1p and a one-character typo are all refused.
+ */
 export function isBtcP2wpkhAddress(addr: unknown): boolean {
-  return typeof addr === 'string' && BC1Q_P2WPKH_RE.test(addr)
+  if (typeof addr !== 'string' || !BC1Q_P2WPKH_RE.test(addr)) return false
+  const dec = decodeSegwitAddress('bc', addr)
+  return dec !== null && dec.version === 0 && dec.program.length === 20
+}
+
+/**
+ * Any mainnet segwit address with a valid checksum: v0 bech32 (BIP173) or
+ * v1+ bech32m (BIP350, e.g. bc1p taproot). Accepts all-lowercase or
+ * all-uppercase; mixed case and other networks (tb1, bcrt1) are refused.
+ */
+export function isBtcMainnetSegwitAddress(addr: unknown): boolean {
+  return typeof addr === 'string' && decodeSegwitAddress('bc', addr) !== null
 }
 
 /** Any on-chain Bitcoin address shape (bech32 bc1/tb1, legacy 1/3). Used to keep them off Lightning orders. */
