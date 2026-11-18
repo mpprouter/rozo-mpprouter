@@ -147,6 +147,9 @@ migrations_dir = "migrations-metrics"
 
 # Public keys (not secrets, safe to commit)
 [vars]
+# Agent Checkout request creation fails closed when this ordinary runtime limit is absent.
+# Per owner (or bound agent), fixed one-hour window. No payment or balance limit changes.
+AC_CREATE_LIMIT_PER_HOUR = "60"
 PROVIDERS_ENDPOINT_ENABLED = "true"
 # Bitrefill invoice payment via create-invoice provider "bitrefill".
 BITREFILL_ENABLED = "true"
