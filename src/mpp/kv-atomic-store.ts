@@ -153,12 +153,13 @@ type KvAtomicParams = {
  * server constructors.
  *
  * @param ns - The `ATOMIC_STORE` `DurableObjectNamespace` from `env`.
+ * @param instanceName - An isolated Durable Object instance for non-MPP state.
  */
-export function doAtomicParams(ns: DurableObjectNamespace): KvAtomicParams {
-  // All mppx keys share a single DO instance, named "mppx".
+export function doAtomicParams(ns: DurableObjectNamespace, instanceName = 'mppx'): KvAtomicParams {
+  // All mppx keys share the default instance. Other callers supply their own instance name.
   // `idFromName` is deterministic and pure — the same name always resolves to
   // the same DO instance across all Worker isolates in all colos.
-  const stub = ns.get(ns.idFromName('mppx'))
+  const stub = ns.get(ns.idFromName(instanceName))
 
   /** Internal helper: POST to the DO and parse the JSON response. */
   async function doPost<T>(path: string, payload: unknown): Promise<T> {
