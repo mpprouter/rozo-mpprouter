@@ -28,6 +28,7 @@ import {
   normalizeCoinbasePayment,
 } from './invoice-provider'
 import { coinbaseDailyCapAtomic, releaseDailySpend, reserveDailySpend } from './stripe-fulfillment'
+import { celoGateAlertText, celoSettlementGate, isCeloChain, type CeloGateResult } from './celo-finality'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -161,6 +162,9 @@ export interface FulfillmentRecord {
   // settling-order.ts.
   settlingRozoPaymentId?: string | null
   duplicateRozoPaymentIds?: string[]
+  // Source chain of the payin as last seen on a webhook / order read. Lets
+  // the manual /admin/pay-invoice path apply the Celo gate (celo-finality.ts).
+  sourceChainId?: string | null
   deliveredReported?: boolean
   deliveredReportAttempts?: number
   // Last time Rozo answered the delivered report with the "payout not done
@@ -671,6 +675,8 @@ export async function handleRozoWebhook(
         rozoPaymentId,
         invoiceAmountStr:
           evt.data?.destination?.amount ?? evt.data?.source?.amount ?? null,
+        sourceChainId: evt.data?.source?.chainId,
+        sourceTxHash: evt.data?.source?.txHash ?? null,
       },
       new Date(now),
     )
@@ -802,6 +808,43 @@ export async function deferForCheckoutPause(
   return { ok: true, deferred: 'checkout_paused', plId }
 }
 
+/** Remembers a Celo source chain on the record (never forgets one). */
+export function noteSourceChain(rec: FulfillmentRecord, chainId: unknown): void {
+  if (chainId === undefined || chainId === null || chainId === '') return
+  if (isCeloChain(rec.sourceChainId)) return
+  rec.sourceChainId = String(chainId)
+}
+
+// The Celo settlement gate (celo-finality.ts) refused this payment: keep the
+// record in its pre-pay status, note why, forget the event's dedup marker so
+// the payout webhook / a resend / a replay is processed again, and alert on a
+// block-hash or chain disagreement. Nothing was sent.
+export async function deferForCeloGate(
+  env: Env,
+  plId: string,
+  rec: FulfillmentRecord,
+  eventId: string,
+  gate: Extract<CeloGateResult, { ok: false }>,
+): Promise<Record<string, unknown>> {
+  rec.events.push({
+    kind: 'celo_finality_deferred',
+    at: new Date().toISOString(),
+    event_id: eventId,
+    detail: { reason: gate.reason },
+  })
+  await saveRecordGuarded(env, plId, rec)
+  await forgetWebhookEvent(env, eventId)
+  if (gate.alert) {
+    try {
+      if (alertSinkConfigured(env)) await sendAlert(env, redactForAlert(celoGateAlertText(plId, gate.reason)))
+      else console.warn(`[webhook] celo gate alert SKIPPED (no alert channel configured) for ${plId}: ${gate.reason}`)
+    } catch (err) {
+      console.warn(`[webhook] celo gate alert error (non-fatal): ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  return { ok: true, deferred: 'celo_finality', reason: gate.reason, plId }
+}
+
 export interface CoinbaseEventInput {
   eventId: string
   eventType: string
@@ -872,6 +915,7 @@ export async function settleCoinbaseEvent(
       dest_tx: evt.data?.destination?.txHash,
     },
   })
+  noteSourceChain(rec, evt.data?.source?.chainId)
 
   // If already paid, submitted (capture_pending), parked or terminally
   // failed, just persist the event and 200. None of these may pay again.
@@ -1011,6 +1055,29 @@ export async function settleCoinbaseEvent(
     await env.MPP_STORE.delete(eventKvKey(eventId)).catch(() => undefined)
     return { ok: true, deferred: 'order_binding_unverified', reason: binding.reason, plId }
   }
+
+  // 7d. Celo settlement gate (celo-finality.ts). For an order whose source
+  // chain is Celo (42220), on payin AND payout events alike: the Celo pause
+  // switch must be "off" and the payin block must be finalized with the same
+  // hash on two RPCs, with a Transfer matching the order. Otherwise nothing is
+  // paid and the event is kept (the payout webhook, a resend or a replay
+  // re-runs this). Any other source chain: no read, no change.
+  noteSourceChain(rec, binding.order?.source?.chainId)
+  const celo = await celoSettlementGate(env, {
+    chainHints: [evt.data?.source?.chainId, rec.sourceChainId],
+    order: binding.order,
+    eventTxHash: evt.data?.source?.txHash ?? null,
+  })
+  if (celo.applies && !celo.ok) return deferForCeloGate(env, plId, rec, eventId, celo)
+  if (celo.applies && celo.ok) {
+    rec.events.push({
+      kind: 'celo_finality_verified',
+      at: new Date().toISOString(),
+      event_id: eventId,
+      detail: { tx: celo.txHash, block: celo.blockNumber, hash: celo.blockHash },
+    })
+  }
+
   const invoiceAtomic: bigint = binding.invoiceAtomic
   rec.invoiceAmountAtomic = invoiceAtomic.toString()
 
@@ -1337,7 +1404,7 @@ const ROZO_ORDER_NOT_YET_PAID_STATUSES: ReadonlySet<string> = new Set(['payment_
 const BINDING_READ_TIMEOUT_MS = 5000
 
 export type OrderBindingResult =
-  | { ok: true; invoiceAtomic: bigint; orderDestinationAtomic: bigint }
+  | { ok: true; invoiceAtomic: bigint; orderDestinationAtomic: bigint; order: any }
   // terminal: a definite mismatch, never pay. Not terminal: could not verify
   // right now (read failed, order still catching up); a later event retries.
   | { ok: false; terminal: boolean; reason: string; invoiceAtomic?: bigint | null }
@@ -1428,7 +1495,7 @@ async function verifyCoinbaseOrderBindingOnce(
       invoiceAtomic,
     }
   }
-  return { ok: true, invoiceAtomic, orderDestinationAtomic }
+  return { ok: true, invoiceAtomic, orderDestinationAtomic, order }
 }
 
 // ── Fast capture confirmation after pay-invoice ────────────────────────────

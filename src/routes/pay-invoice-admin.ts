@@ -31,6 +31,34 @@ import { timingSafeEqualStr } from '../utils/timing-safe'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead, casUpdate } from './stripe-atomic'
+import { fetchRozoPaymentById, loadRecord } from './webhook'
+import { celoSettlementGate } from './celo-finality'
+
+/**
+ * Celo settlement gate for a manual pay of a Coinbase invoice
+ * (celo-finality.ts). Returns a refusal reason, or null when the pay may go
+ * ahead. Applies when the invoice's fulfillment record (or its Rozo order)
+ * shows a Celo source chain. A record that names a Rozo order but no source
+ * chain (written before this gate existed) has its order read; if that read
+ * fails the source chain is unknown and the manual pay is refused.
+ */
+export async function celoManualPayRefusal(env: Env, coinbaseId: string): Promise<string | null> {
+  const rec = await loadRecord(env, coinbaseId)
+  if (!rec) return null
+  const rozoId = rec.settlingRozoPaymentId ?? rec.rozoPaymentId ?? null
+  let order: any | null = null
+  if (!rec.sourceChainId && rozoId) {
+    order = await fetchRozoPaymentById(env, rozoId)
+    if (!order || typeof order !== 'object') return 'source chain unknown: Rozo order unreadable'
+  }
+  const gate = await celoSettlementGate(env, {
+    chainHints: [rec.sourceChainId],
+    order,
+    loadOrder: rozoId ? () => fetchRozoPaymentById(env, rozoId) : undefined,
+  })
+  if (gate.applies && !gate.ok) return gate.reason
+  return null
+}
 
 // ── Error code constants ─────────────────────────────────────────────────────
 
@@ -42,6 +70,7 @@ export type PayInvoiceErrorCode =
   | 'LINK_NOT_PAYABLE'
   | 'UPSTREAM_ERROR'
   | 'LINK_CLAIMED'
+  | 'CELO_NOT_VERIFIED'
 
 export interface PayInvoiceError {
   code: PayInvoiceErrorCode
@@ -529,9 +558,25 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
       link_id_detected,
     })
   }
+  // Celo settlement gate (celo-finality.ts): a Celo-sourced invoice is paid by
+  // hand only after its payin block is finalized with the same hash on two
+  // RPCs and the Celo pause switch is "off". Nothing is taken or sent.
+  if (coinbaseId) {
+    const celoRefusal = await celoManualPayRefusal(env, coinbaseId)
+    if (celoRefusal) {
+      return errorResponse(409, {
+        code: 'CELO_NOT_VERIFIED',
+        message: `Celo payin not verified: ${celoRefusal}. Nothing was paid.`,
+        hint: 'Retry after the payin block is finalized (about 25 to 30 minutes), or check CELO_FULFILLMENT_PAUSED.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+  }
+
   let attemptRef: string | null = null
   if (coinbaseId) {
-    const ref = repayRef || `admin-pay:${crypto.randomUUID()}`
+    const ref =repayRef || `admin-pay:${crypto.randomUUID()}`
     const claim = await claimInvoiceKey(env, coinbaseId, 'crypto', ref)
     if (!claim.ok) {
       return errorResponse(409, {

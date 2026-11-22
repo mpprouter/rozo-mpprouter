@@ -268,12 +268,17 @@ async function replayOne(env: Env, entry: BacklogEntry, requestId: string): Prom
         orderId: entry.ref,
         rozoPaymentId: entry.rozoPaymentId,
         invoiceAmountStr: rozo.destination?.amount ?? rozo.source?.amount ?? null,
+        sourceChainId: rozo.source?.chainId,
+        sourceTxHash: rozo.source?.txHash ?? null,
       },
       new Date(now),
     )
   }
 
   if (summary.deferred === 'checkout_paused') return { ...base, outcome: 'still_paused', summary }
+  // Celo-sourced order whose payin is not finalized yet (or Celo paused):
+  // nothing was sent; keep the entry so a later replay re-drives it.
+  if (summary.deferred === 'celo_finality') return { ...base, outcome: 'not_ready', summary }
   // Any other answer means the normal path owns this order again (paid,
   // deferred for balance, in flight, terminal…); its own record, sweep and
   // alerts take it from here.

@@ -505,6 +505,17 @@ export interface Env {
   // Set via: wrangler secret put BASE_RPC_URL
   BASE_RPC_URL?: string
 
+  // Celo (source chain 42220) fulfillment pause (routes/celo-finality.ts).
+  // Fail-closed: only the exact value "off" lets a Celo-sourced order pay a
+  // Coinbase / Stripe / Bitrefill invoice; missing or any other value pauses.
+  // Has no effect on orders from any other source chain.
+  CELO_FULFILLMENT_PAUSED?: string
+  // Second, independent Celo mainnet RPC (Alchemy celo-mainnet) for the
+  // finality check; the first is the public forno.celo.org. Unset = every
+  // Celo-sourced order is deferred (never paid).
+  // Set via: wrangler secret put CELO_RPC_URL
+  CELO_RPC_URL?: string
+
   // DingTalk webhook token for operational alerts (low balance, etc.)
   // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
   DINGTALK_ACCESS_TOKEN?: string

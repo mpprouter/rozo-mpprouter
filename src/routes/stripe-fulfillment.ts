@@ -21,9 +21,12 @@ import type { Env } from '../index'
 import {
   deliveredReportEnabled,
   deliveredReportStillPending,
+  fetchRozoPaymentById,
+  forgetWebhookEvent,
   maskAddresses,
   reportDeliveredToRozo,
 } from './webhook'
+import { celoGateAlertText, celoSettlementGate } from './celo-finality'
 import { DELIVERED_MAX_ATTEMPTS } from './coinbase-sweep'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
@@ -648,6 +651,10 @@ interface StripeWebhookInput {
   orderId: string // stripe_crypto_cpis_*
   rozoPaymentId: string | null
   invoiceAmountStr: string | null // from webhook destination/source amount
+  // Source chain / payin tx of the Rozo order (webhook or replay). Drives the
+  // Celo settlement gate (celo-finality.ts); absent = not known to be Celo.
+  sourceChainId?: unknown
+  sourceTxHash?: string | null
 }
 
 // Handle a Rozo webhook event whose orderId is a Stripe Crypto invoice. Mirrors
@@ -664,6 +671,27 @@ export async function handleStripeWebhookEvent(
   const invoiceKey = invoiceKeyFromOrderId(input.orderId)
   const orderId = input.orderId
   const nowIso = now.toISOString()
+
+  // Celo settlement gate (celo-finality.ts), before anything is claimed: a
+  // Celo-sourced order settles only once its payin block is finalized with
+  // the same hash on two RPCs and the Celo pause switch is "off". Nothing is
+  // written; the event's dedup marker is forgotten so the payout webhook, a
+  // resend or a replay re-runs it. Other source chains: no read, no change.
+  if (input.eventType === 'payment_payin_completed' || input.eventType === 'payment_payout_completed') {
+    const rozoId = input.rozoPaymentId
+    const celo = await celoSettlementGate(env, {
+      chainHints: [input.sourceChainId],
+      loadOrder: rozoId ? () => fetchRozoPaymentById(env, rozoId) : undefined,
+      eventTxHash: input.sourceTxHash ?? null,
+    })
+    if (celo.applies && !celo.ok) {
+      await forgetWebhookEvent(env, input.eventId)
+      if (celo.alert && alertSinkConfigured(env)) {
+        await sendAlert(env, redactForAlert(celoGateAlertText(orderId, celo.reason))).catch(() => false)
+      }
+      return { ok: true, deferred: 'celo_finality', reason: celo.reason, orderId }
+    }
+  }
 
   // ── Phase 1: atomic CLAIM ──────────────────────────────────────────────────
   // A single linearizable CAS does event-dedup + state advance + guard check +
