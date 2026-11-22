@@ -37,7 +37,7 @@ import { fetchRozoPaymentById, loadRecord } from './webhook'
 // these with no payin tx does not block a manual pay of a sibling order.
 const CELO_EXEMPT_ENDED_STATUSES: ReadonlySet<string> = new Set(['payment_expired', 'payment_refunded', 'payment_bounced', 'payment_failed'])
 import { listLinkOrderRows, readPaymentStatus } from './existing-order'
-import { celoSettlementGate, isCeloChain } from './celo-finality'
+import { celoSettlementGate, isCeloChain, orderSourceChain } from './celo-finality'
 
 /**
  * Celo settlement gate for a manual pay of a Coinbase invoice
@@ -75,12 +75,12 @@ export async function celoManualPayRefusal(env: Env, coinbaseId: string): Promis
   // Every Celo order must pass the gate unless Rozo says it definitely ended
   // with no money kept and it carries no payin tx. Unpaid / started / unknown
   // statuses are NOT exempt (a payin may be on its way or not yet credited).
-  const celoLive = orders.filter((o) => {
-    if (!o || !isCeloChain(o.source?.chainId)) return false
+  const isLive = (o: any) => {
     const status = readPaymentStatus(o) ?? ''
-    const hasPayinTx = typeof o.source?.txHash === 'string' && o.source.txHash.length > 0
+    const hasPayinTx = typeof o?.source?.txHash === 'string' && o.source.txHash.length > 0
     return hasPayinTx || !CELO_EXEMPT_ENDED_STATUSES.has(status)
-  })
+  }
+  const celoLive = orders.filter((o) => o && isCeloChain(orderSourceChain(o)) && isLive(o))
   for (const order of celoLive) {
     const gate = await celoSettlementGate(env, { chainHints: [], order })
     if (gate.applies && !gate.ok) return gate.reason

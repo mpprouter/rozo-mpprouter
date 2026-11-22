@@ -55,6 +55,11 @@ export function isCeloChain(v: unknown): boolean {
   return s === CELO_CHAIN_ID || s === `eip155:${CELO_CHAIN_ID}` || s === '0xa4ec' || s === 'celo'
 }
 
+/** Source chain of a Rozo order row, in either spelling the API returns. */
+export function orderSourceChain(order: any): unknown {
+  return order?.source?.chainId ?? order?.source_chain_id ?? null
+}
+
 export type CeloGateResult =
   | { applies: false }
   | { applies: true; ok: true; txHash: string; blockNumber: string; blockHash: string }
@@ -87,7 +92,7 @@ export async function celoSettlementGate(
   input: CeloGateInput,
   deps: CeloGateDeps = {},
 ): Promise<CeloGateResult> {
-  const hints = [...input.chainHints, input.order?.source?.chainId]
+  const hints = [...input.chainHints, orderSourceChain(input.order)]
   if (!hints.some(isCeloChain)) return { applies: false }
 
   if (celoFulfillmentPaused(env)) {
@@ -105,7 +110,7 @@ export async function celoSettlementGate(
   if (!order || typeof order !== 'object') {
     return { applies: true, ok: false, reason: 'Rozo order unreadable', alert: false }
   }
-  if (!isCeloChain(order.source?.chainId)) {
+  if (!isCeloChain(orderSourceChain(order))) {
     return { applies: true, ok: false, reason: 'Rozo order source chain is not Celo but the event says Celo', alert: true }
   }
 

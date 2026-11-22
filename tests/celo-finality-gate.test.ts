@@ -538,6 +538,20 @@ describe('Celo gate: manual /admin/pay-invoice', () => {
     }
   })
 
+  it('chain given only as source_chain_id: manual pay still gated', async () => {
+    const o1 = celoOrder() as any
+    o1.source_chain_id = '42220'
+    delete o1.source.chainId
+    for (const order of [o1]) {
+      const { calls } = stub({ order, rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+      const { env } = makeEnv()
+      const res = await handleAdminPayInvoice(adminPay(), env)
+      expect(res.status).toBe(409)
+      expect(calls.pay).toBe(0)
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('an expired Celo order with no payin does not block the manual pay', async () => {
     const { calls } = stub({ order: celoOrder({ status: 'payment_expired' }, { txHash: null }) })
     const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
