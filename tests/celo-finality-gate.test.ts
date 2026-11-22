@@ -18,6 +18,14 @@ import { replayPausedDeliveries } from '../src/routes/checkout-control-admin'
 import { handleAdminPayInvoice } from '../src/routes/pay-invoice-admin'
 import { handleStripeWebhookEvent } from '../src/routes/stripe-fulfillment'
 import {
+  CELO_RETRY_DELAY_MS,
+  CELO_RETRY_MAX_PER_RUN,
+  enqueueCeloRetry,
+  listCeloRetries,
+  runCeloRetries,
+} from '../src/routes/celo-retry'
+import { sweepCeloRetries } from '../src/routes/celo-retry-run'
+import {
   CELO_TOKENS,
   celoFulfillmentPaused,
   celoPayinTerms,
@@ -632,6 +640,186 @@ describe('Celo gate: Stripe settle entry', () => {
     expect(summary.deferred).toBe('celo_finality')
     expect(calls.pay).toBe(0)
     expect([...kv._store.keys()].some((k) => k.startsWith('invoice-fulfillment:'))).toBe(false)
+  })
+})
+
+// ── Automatic retry queue ───────────────────────────────────────────────────
+
+describe('Celo retry queue (cron re-drive)', () => {
+  const MIN = 60_000
+
+  it('not finalized: enqueued; cron pays once after finality and leaves the queue empty', async () => {
+    const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env, kv } = makeEnv()
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    let q = await listCeloRetries(env)
+    expect(q).toHaveLength(1)
+    expect(q[0]).toMatchObject({ provider: 'coinbase', ref: PL, rozoPaymentId: ROZO_ID, attempts: 0 })
+    expect(Date.parse(q[0].nextAt) - t0).toBeGreaterThanOrEqual(2 * MIN - 1000)
+
+    // Not due yet.
+    let out = await sweepCeloRetries(env, new Date(t0 + MIN))
+    expect(out[0].outcome).toBe('not_due')
+    expect(calls.pay).toBe(0)
+
+    // Due, still not finalized: re-driven through the gate, rescheduled.
+    out = await sweepCeloRetries(env, new Date(t0 + 3 * MIN))
+    expect(out[0].outcome).toBe('still_deferred')
+    expect(calls.pay).toBe(0)
+    q = await listCeloRetries(env)
+    expect(q[0].attempts).toBe(1)
+
+    // Finalized: the next due run pays exactly once and clears the entry.
+    up.rpc1 = FINAL_OK
+    up.rpc2 = FINAL_OK
+    out = await sweepCeloRetries(env, new Date(t0 + 20 * MIN))
+    expect(out[0].outcome).toBe('handed_back')
+    expect(calls.pay).toBe(1)
+    expect(rec(kv).status).toBe('paid')
+    expect(await listCeloRetries(env)).toHaveLength(0)
+
+    // Repeated triggers are no-ops.
+    await sweepCeloRetries(env, new Date(t0 + 40 * MIN))
+    await handleRozoWebhook(await signed(event('payment_payout_completed')), env)
+    expect(calls.pay).toBe(1)
+  })
+
+  it('duplicate concurrent cron runs and a re-enqueue still pay once', async () => {
+    const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv()
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    up.rpc1 = FINAL_OK
+    up.rpc2 = FINAL_OK
+    await enqueueCeloRetry(env, { provider: 'coinbase', ref: PL, rozoPaymentId: ROZO_ID, eventType: 'payment_payin_completed', reason: 'dup' }, new Date(t0 - 10 * MIN))
+    await Promise.all([
+      sweepCeloRetries(env, new Date(t0 + 20 * MIN)),
+      sweepCeloRetries(env, new Date(t0 + 20 * MIN)),
+    ])
+    await sweepCeloRetries(env, new Date(t0 + 30 * MIN))
+    expect(calls.pay).toBe(1)
+  })
+
+  it('pause switch on: entries kept, never re-driven, never aged out', async () => {
+    const { calls } = stub()
+    const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    expect(await listCeloRetries(env)).toHaveLength(1)
+    const out = await sweepCeloRetries(env, new Date(t0 + 5 * 60 * MIN))
+    expect(out[0].outcome).toBe('paused_kept')
+    expect(calls.pay).toBe(0)
+    expect(calls.celoRpc).toBe(0)
+    expect(calls.alerts).toHaveLength(0)
+    expect(await listCeloRetries(env)).toHaveLength(1)
+  })
+
+  it('still not finalized after 3 hours: one alert, entry removed, nothing paid', async () => {
+    const { calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv()
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    const out = await sweepCeloRetries(env, new Date(t0 + 3 * 60 * MIN + MIN))
+    expect(out[0].outcome).toBe('gave_up')
+    expect(calls.pay).toBe(0)
+    expect(calls.alerts.filter((a) => a.includes('after 3 hours'))).toHaveLength(1)
+    expect(await listCeloRetries(env)).toHaveLength(0)
+  })
+
+  it('Rozo order unreadable during a retry: kept and rescheduled', async () => {
+    const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv()
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    up.order = null
+    const out = await sweepCeloRetries(env, new Date(t0 + 3 * MIN))
+    expect(out[0].outcome).toBe('still_deferred')
+    expect(calls.pay).toBe(0)
+    expect(await listCeloRetries(env)).toHaveLength(1)
+  })
+
+  it('backoff: 2, 3, 4, then 5 minutes', () => {
+    expect([0, 1, 2, 3, 4, 10].map((n) => CELO_RETRY_DELAY_MS(n) / MIN)).toEqual([2, 3, 4, 5, 5, 5])
+  })
+
+  it('per-run limit applies only to the Celo queue', async () => {
+    stub()
+    const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+    const t0 = new Date(Date.now() - 60 * MIN)
+    for (let i = 0; i < CELO_RETRY_MAX_PER_RUN + 3; i++) {
+      await enqueueCeloRetry(env, { provider: 'coinbase', ref: `pl_celoLimit${i}`, rozoPaymentId: null, eventType: 'payment_payin_completed', reason: 'x' }, t0)
+    }
+    expect(await listCeloRetries(env)).toHaveLength(CELO_RETRY_MAX_PER_RUN + 3)
+    let n = 0
+    const out = await runCeloRetries(
+      { ...(env as any), CELO_FULFILLMENT_PAUSED: 'off' } as Env,
+      async () => {
+        n++
+        return { deferred: 'celo_finality', reason: 'x' }
+      },
+      new Date(),
+    )
+    expect(n).toBe(CELO_RETRY_MAX_PER_RUN)
+    expect(out.filter((o) => o.outcome === 'still_deferred')).toHaveLength(CELO_RETRY_MAX_PER_RUN)
+  })
+
+  it('a Base order never enters the queue', async () => {
+    stub({ order: boundRozoOrder(ROZO_ID, PL) })
+    const { env } = makeEnv()
+    await handleRozoWebhook(
+      await signed({ ...event('payment_payout_completed'), data: { ...event('payment_payout_completed').data, source: { amount: '1.00', chainId: '8453', txHash: null } } }),
+      env,
+    )
+    expect(await listCeloRetries(env)).toHaveLength(0)
+  })
+})
+
+// ── Stripe manual pay ───────────────────────────────────────────────────────
+
+describe('Celo gate: manual /admin/pay-invoice for Stripe', () => {
+  const CPIS = 'cpis_celoManual1'
+
+  it('Stripe invoice whose order is Celo and not finalized: 409, nothing sent', async () => {
+    const { calls } = stub({ order: celoOrder({ orderId: `stripe_crypto_${CPIS}` }), rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv()
+    const res = await handleAdminPayInvoice(adminPay({ payment_id: CPIS }), env)
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as any).code).toBe('CELO_NOT_VERIFIED')
+    expect(calls.pay).toBe(0)
+  })
+
+  it('Stripe invoice whose order is Celo with the pause on: 409', async () => {
+    const { calls } = stub({ order: celoOrder({ orderId: `stripe_crypto_${CPIS}` }) })
+    const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+    const res = await handleAdminPayInvoice(adminPay({ payment_id: CPIS }), env)
+    expect(res.status).toBe(409)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('Stripe invoice whose order is Celo and finalized: forwarded once', async () => {
+    const { calls } = stub({ order: celoOrder({ orderId: `stripe_crypto_${CPIS}` }) })
+    const { env } = makeEnv()
+    const res = await handleAdminPayInvoice(adminPay({ payment_id: CPIS }), env)
+    expect(res.status).toBe(200)
+    expect(calls.pay).toBe(1)
+  })
+
+  it('Stripe invoice on Base: unchanged, forwarded, no Celo reads', async () => {
+    const { calls } = stub({ order: boundRozoOrder(ROZO_ID, `stripe_crypto_${CPIS}`) })
+    const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: undefined })
+    const res = await handleAdminPayInvoice(adminPay({ payment_id: CPIS }), env)
+    expect(res.status).toBe(200)
+    expect(calls.pay).toBe(1)
+    expect(calls.celoRpc).toBe(0)
+  })
+
+  it('Stripe link that cannot be mapped to an invoice: 409, nothing sent', async () => {
+    const { calls } = stub()
+    const { env } = makeEnv()
+    const res = await handleAdminPayInvoice(adminPay({ url: 'https://crypto.stripe.com/pay/unknownblob' }), env)
+    expect(res.status).toBe(409)
+    expect(calls.pay).toBe(0)
   })
 })
 

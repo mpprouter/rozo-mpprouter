@@ -27,6 +27,7 @@ import {
   reportDeliveredToRozo,
 } from './webhook'
 import { celoGateAlertText, celoSettlementGate } from './celo-finality'
+import { enqueueCeloRetry } from './celo-retry'
 import { DELIVERED_MAX_ATTEMPTS } from './coinbase-sweep'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
@@ -686,6 +687,14 @@ export async function handleStripeWebhookEvent(
     })
     if (celo.applies && !celo.ok) {
       await forgetWebhookEvent(env, input.eventId)
+      // Automatic re-drive by the cron (celo-retry.ts) through this same path.
+      await enqueueCeloRetry(env, {
+        provider: 'stripe',
+        ref: orderId,
+        rozoPaymentId: input.rozoPaymentId,
+        eventType: input.eventType,
+        reason: celo.reason,
+      })
       if (celo.alert && alertSinkConfigured(env)) {
         await sendAlert(env, redactForAlert(celoGateAlertText(orderId, celo.reason))).catch(() => false)
       }

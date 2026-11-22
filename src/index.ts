@@ -27,6 +27,7 @@ import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './ro
 import { sweepInFlightStripeRecords, sweepStripeSessionIndex, sweepManualReviewOnchain } from './routes/stripe-fulfillment'
 import { sweepCoinbaseFulfillments } from './routes/coinbase-sweep'
 import { sweepBitrefillFulfillments } from './routes/bitrefill-settle'
+import { sweepCeloRetries } from './routes/celo-retry-run'
 import { INTENTS_WARMUP_CRON, warmIntentsPaymentApi } from './utils/intents-warmup'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
@@ -825,6 +826,11 @@ export default {
     // directly; a bounded re-drive of a deferred payout runs the full settle
     // path (allowlist, exec gate, paying-before-call).
     ctx.waitUntil(sweepBitrefillFulfillments(env))
+    // Celo-sourced settlements the Celo finality gate deferred (celo-retry.ts):
+    // re-run the normal settle path (gate, claim, exec gate) every few minutes
+    // for up to 3 hours, then alert. Own queue and own per-run limit; no-op
+    // (one DO scan) when the queue is empty. Never calls pay-invoice itself.
+    ctx.waitUntil(sweepCeloRetries(env))
     // One-time backfill of the pay-URL → session index for records created
     // before the index existed (bounded per run; no-op once caught up).
     ctx.waitUntil(sweepStripeSessionIndex(env))

@@ -29,6 +29,7 @@ import {
 } from './invoice-provider'
 import { coinbaseDailyCapAtomic, releaseDailySpend, reserveDailySpend } from './stripe-fulfillment'
 import { celoGateAlertText, celoSettlementGate, type CeloGateResult } from './celo-finality'
+import { enqueueCeloRetry, type CeloRetryProvider } from './celo-retry'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -828,6 +829,7 @@ export async function deferForCeloGate(
   rec: FulfillmentRecord,
   eventId: string,
   gate: Extract<CeloGateResult, { ok: false }>,
+  retry: { provider: CeloRetryProvider; eventType: string; rozoPaymentId: string | null },
 ): Promise<Record<string, unknown>> {
   rec.events.push({
     kind: 'celo_finality_deferred',
@@ -837,6 +839,15 @@ export async function deferForCeloGate(
   })
   await saveRecordGuarded(env, plId, rec)
   await forgetWebhookEvent(env, eventId)
+  // Queue the automatic re-drive (celo-retry.ts): the cron re-runs this same
+  // settle path, and so this gate, every few minutes for up to 3 hours.
+  await enqueueCeloRetry(env, {
+    provider: retry.provider,
+    ref: plId,
+    rozoPaymentId: retry.rozoPaymentId ?? rec.settlingRozoPaymentId ?? rec.rozoPaymentId ?? null,
+    eventType: retry.eventType,
+    reason: gate.reason,
+  })
   if (gate.alert) {
     try {
       if (alertSinkConfigured(env)) await sendAlert(env, redactForAlert(celoGateAlertText(plId, gate.reason)))
@@ -1071,7 +1082,9 @@ export async function settleCoinbaseEvent(
     order: binding.order,
     eventTxHash: evt.data?.source?.txHash ?? null,
   })
-  if (celo.applies && !celo.ok) return deferForCeloGate(env, plId, rec, eventId, celo)
+  if (celo.applies && !celo.ok) {
+    return deferForCeloGate(env, plId, rec, eventId, celo, { provider: 'coinbase', eventType, rozoPaymentId })
+  }
   if (celo.applies && celo.ok) {
     rec.events.push({
       kind: 'celo_finality_verified',

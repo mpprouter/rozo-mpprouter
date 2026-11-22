@@ -288,7 +288,15 @@ export async function listLinkOrderRows(
   linkId: string,
   timeoutMs: number = EXISTING_ORDER_TIMEOUT_MS,
 ): Promise<any[] | null> {
-  const target: ExistingOrderTarget = { provider: 'coinbase', linkId }
+  return listOrderRows(env, { provider: 'coinbase', linkId }, timeoutMs)
+}
+
+/** listLinkOrderRows for any lookup target (Coinbase link or Stripe cpis_* key). */
+export async function listOrderRows(
+  env: Env,
+  target: ExistingOrderTarget,
+  timeoutMs: number = EXISTING_ORDER_TIMEOUT_MS,
+): Promise<any[] | null> {
   if (!isLookupTargetValid(target) || !env.ROZO_INTENTS_API_KEY) return null
   const controller = new AbortController()
   let timer: ReturnType<typeof setTimeout> | undefined

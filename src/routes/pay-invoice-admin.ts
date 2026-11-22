@@ -32,12 +32,18 @@ import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead, casUpdate } from './stripe-atomic'
 import { fetchRozoPaymentById, loadRecord } from './webhook'
+import { listLinkOrderRows, listOrderRows, readPaymentStatus } from './existing-order'
+import { celoSettlementGate, isCeloChain, orderSourceChain } from './celo-finality'
+import { lookupStripeSession } from './stripe-session-index'
+import { loadStripeRecordForStatus } from './stripe-fulfillment'
 
 // Rozo statuses that end an order with no money kept; a Celo order in one of
 // these with no payin tx does not block a manual pay of a sibling order.
 const CELO_EXEMPT_ENDED_STATUSES: ReadonlySet<string> = new Set(['payment_expired', 'payment_refunded', 'payment_bounced', 'payment_failed'])
-import { listLinkOrderRows, readPaymentStatus } from './existing-order'
-import { celoSettlementGate, isCeloChain, orderSourceChain } from './celo-finality'
+
+function uniqueIds(values: Array<string | null | undefined>): string[] {
+  return [...new Set(values.filter((v): v is string => typeof v === 'string' && v.length > 0))]
+}
 
 /**
  * Celo settlement gate for a manual pay of a Coinbase invoice
@@ -48,28 +54,53 @@ import { celoSettlementGate, isCeloChain, orderSourceChain } from './celo-finali
  * record alone: the Rozo orders named on the fulfillment record (settling,
  * first and duplicate orders) plus every order slot of the link (a Celo
  * sibling whose webhook has not arrived yet). Each Celo-sourced order that is
- * not definitely ended without a payin must pass the gate (pause switch "off", payin finalized with the
- * same hash on two RPCs, Transfer matching the order). If any of those reads
- * fails the source chain is unknown and the manual pay is refused.
+ * not definitely ended without a payin must pass the gate (pause switch "off",
+ * payin finalized with the same hash on two RPCs, Transfer matching the
+ * order). If any of those reads fails the source chain is unknown and the
+ * manual pay is refused.
  */
 export async function celoManualPayRefusal(env: Env, coinbaseId: string): Promise<string | null> {
   const rec = await loadRecord(env, coinbaseId)
-  const ids = [
-    ...new Set(
-      [rec?.settlingRozoPaymentId, rec?.rozoPaymentId, ...(rec?.duplicateRozoPaymentIds ?? [])].filter(
-        (v): v is string => typeof v === 'string' && v.length > 0,
-      ),
-    ),
-  ]
+  const ids = uniqueIds([rec?.settlingRozoPaymentId, rec?.rozoPaymentId, ...(rec?.duplicateRozoPaymentIds ?? [])])
+  return celoRefusalForOrders(env, ids, () => listLinkOrderRows(env, coinbaseId))
+}
+
+/**
+ * The same gate for a manual pay of a Stripe Crypto link. The pay URL is
+ * mapped to its cpis_* invoice through the session index (or, failing that,
+ * a read-only Stripe resolve); a link that cannot be mapped is refused, since
+ * its source chain cannot be known.
+ */
+export async function celoManualStripePayRefusal(env: Env, payUrl: string): Promise<string | null> {
+  let invoiceKey = payUrl.startsWith('cpis_') ? payUrl : await lookupStripeSession(env, payUrl)
+  if (!invoiceKey) {
+    try {
+      const inv = await resolveStripeInvoice(payUrl)
+      invoiceKey = typeof inv.invoiceKey === 'string' && inv.invoiceKey.startsWith('cpis_') ? inv.invoiceKey : null
+    } catch {
+      invoiceKey = null
+    }
+  }
+  if (!invoiceKey) return 'source chain unknown: Stripe link could not be mapped to an invoice'
+  const rec = await loadStripeRecordForStatus(env, invoiceKey)
+  const ids = uniqueIds([rec?.rozoPaymentId ?? null])
+  return celoRefusalForOrders(env, ids, () => listOrderRows(env, { provider: 'stripe_crypto', invoiceKey: invoiceKey as string }))
+}
+
+async function celoRefusalForOrders(
+  env: Env,
+  ids: string[],
+  scan: () => Promise<any[] | null>,
+): Promise<string | null> {
   const orders: any[] = []
   for (const id of ids) {
     const o = await fetchRozoPaymentById(env, id)
     if (!o || typeof o !== 'object') return 'source chain unknown: Rozo order unreadable'
     orders.push(o)
   }
-  // Always also scan every order slot of the link: a Celo sibling whose
+  // Always also scan every order slot of the invoice: a Celo sibling whose
   // webhook has not reached us is not named on the record.
-  const rows = await listLinkOrderRows(env, coinbaseId)
+  const rows = await scan()
   if (rows === null) return 'source chain unknown: Rozo orders for this invoice unreadable'
   orders.push(...rows)
   // Every Celo order must pass the gate unless Rozo says it definitely ended
@@ -589,8 +620,21 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
   // Celo settlement gate (celo-finality.ts): a Celo-sourced invoice is paid by
   // hand only after its payin block is finalized with the same hash on two
   // RPCs and the Celo pause switch is "off". Nothing is taken or sent.
-  if (coinbaseId) {
-    const celoRefusal = await celoManualPayRefusal(env, coinbaseId)
+  // Anything that is not a Coinbase id: a crypto.stripe.com URL, a bare
+  // cpis_* id, or any other id the signer might accept. It must map to a
+  // Stripe invoice whose orders pass the gate; an id that cannot be mapped is
+  // refused (its source chain is unknown).
+  const stripeUrl = coinbaseId
+    ? null
+    : typeof normalizedUrl === 'string' && detectProvider(normalizedUrl) === 'stripe_crypto'
+      ? normalizedUrl
+      : typeof normalizedId === 'string'
+        ? normalizedId
+        : null
+  if (coinbaseId || stripeUrl) {
+    const celoRefusal = coinbaseId
+      ? await celoManualPayRefusal(env, coinbaseId)
+      : await celoManualStripePayRefusal(env, stripeUrl as string)
     if (celoRefusal) {
       return errorResponse(409, {
         code: 'CELO_NOT_VERIFIED',
@@ -604,7 +648,7 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
 
   let attemptRef: string | null = null
   if (coinbaseId) {
-    const ref =repayRef || `admin-pay:${crypto.randomUUID()}`
+    const ref = repayRef || `admin-pay:${crypto.randomUUID()}`
     const claim = await claimInvoiceKey(env, coinbaseId, 'crypto', ref)
     if (!claim.ok) {
       return errorResponse(409, {

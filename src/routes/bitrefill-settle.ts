@@ -401,7 +401,9 @@ export async function settleBitrefillFunderEvent(
     loadOrder: rozoPaymentId ? () => fetchRozoPaymentById(env, rozoPaymentId) : undefined,
     eventTxHash: evt.data?.source?.txHash ?? null,
   })
-  if (celo.applies && !celo.ok) return deferForCeloGate(env, plId, rec, eventId, celo)
+  if (celo.applies && !celo.ok) {
+    return deferForCeloGate(env, plId, rec, eventId, celo, { provider: 'bitrefill', eventType, rozoPaymentId })
+  }
 
   const facts = check.facts
   rec.invoiceAmountAtomic = facts.amountAtomic.toString()

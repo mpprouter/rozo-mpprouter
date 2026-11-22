@@ -51,7 +51,7 @@ const MAX_LIST_PAGES = 5
 
 const PRE_PAY = new Set(['payin_seen', 'failed_insufficient_balance'])
 const STRIPE_PRE_PAY = new Set(['payin_seen', 'payout_seen', 'failed_insufficient_balance'])
-const PAYIN_LIKE = new Set([
+export const PAYIN_LIKE: ReadonlySet<string> = new Set([
   'payment_payin_completed',
   'payment_payout_started',
   'payment_bridging',
