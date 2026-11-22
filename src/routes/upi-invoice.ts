@@ -62,7 +62,7 @@ import {
 } from './stripe-fulfillment'
 import { getBaseUsdcBalance } from '../utils/base-usdc-balance'
 import { encryptCapability, decryptCapability } from './invoice-capability-crypto'
-import { checkoutDeliveryPaused } from './checkout-control'
+import { CHECKOUT_INTAKE_PAUSED_BODY, checkoutDeliveryPaused, checkoutIntakePaused } from './checkout-control'
 import {
   RewardBindingError,
   UPI_REWARD_BINDING_VERSION,
@@ -493,6 +493,16 @@ export async function handleUpiResolve(request: Request, env: Env): Promise<Resp
   if (request.method !== 'POST') return err(405, 'method_not_allowed', 'POST only')
   const unauthorized = checkInternalKey(request, env)
   if (unauthorized) return unauthorized
+
+  // `admin stop checkout-intake`: no new UPI quote. MuggleLink calls resolve
+  // before it opens a Razorpay order (prepare, and again on pay /
+  // funding-quote), and shows a 4xx message as is; `not_payable` is a code it
+  // knows. No quote record is written, and existing quotes are kept for the
+  // verified-pay-in of an order already captured (that is delivery, gated by
+  // the delivery switch, not by intake).
+  if (await checkoutIntakePaused(env)) {
+    return json(422, { error: 'not_payable', reason: 'intake_paused', message: CHECKOUT_INTAKE_PAUSED_BODY.message })
+  }
 
   let body: { pay_url?: unknown }
   try {

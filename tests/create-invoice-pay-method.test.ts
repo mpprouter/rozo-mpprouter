@@ -12,6 +12,7 @@ import {
   resolvePayMethod,
 } from '../src/routes/create-invoice'
 import type { Env } from '../src/index'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 describe('resolvePayMethod', () => {
   it('accepts only the enum', () => {
@@ -58,6 +59,7 @@ function makeEnv(): Env {
   return {
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     ROZO_INTENTS_API_KEY: 'test-key',
+    ATOMIC_STORE: makeAtomicStoreMock(),
     MPP_STORE: {
       get: async (k: string) => store.get(k) ?? null,
       put: async (k: string, v: string) => void store.set(k, v),

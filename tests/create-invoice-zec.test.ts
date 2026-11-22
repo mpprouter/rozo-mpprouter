@@ -40,6 +40,7 @@ import {
   zecShieldedRequested,
 } from '../src/routes/native-sources'
 import type { Env } from '../src/index'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 const SECRET = 'test-link-secret'
 const SESSION_ID = 'paymentSession_zec_test'
@@ -58,6 +59,7 @@ function makeEnv(extra: Record<string, string> = {}): Env {
   return {
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     ROZO_INTENTS_API_KEY: 'test-key',
+    ATOMIC_STORE: makeAtomicStoreMock(),
     ROZO_TEST_LINK_SECRET: SECRET,
     MPP_STORE: makeKvStub(),
     NATIVE_SOURCES: PROD_NATIVE,

@@ -21,6 +21,7 @@ import {
   resolveCheckoutPricing,
   resolveTrustedCheckoutChannel,
 } from '../src/routes/checkout-web-pricing'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 async function channelProof(ref: string, secret: string, now = Math.floor(Date.now() / 1000)): Promise<string> {
   const encoder = new TextEncoder()
@@ -631,6 +632,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     return {
       PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
       ROZO_INTENTS_API_KEY: 'test-key',
+      ATOMIC_STORE: makeAtomicStoreMock(),
       CHECKOUT_WEB_FEE_BPS: feeBps,
     } as unknown as import('../src/index').Env
   }
@@ -1411,6 +1413,7 @@ describe('handleCreateInvoice — already-paid vs expired', () => {
     return {
       PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
       ROZO_INTENTS_API_KEY: 'test-key',
+      ATOMIC_STORE: makeAtomicStoreMock(),
     } as unknown as import('../src/index').Env
   }
 
@@ -1524,6 +1527,7 @@ describe('handleCreateInvoice — Coinbase reuse gate', () => {
     return {
       PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
       ROZO_INTENTS_API_KEY: 'test-key',
+      ATOMIC_STORE: makeAtomicStoreMock(),
       CHECKOUT_WEB_FEE_BPS: feeBps,
       ...extra,
     } as unknown as import('../src/index').Env
@@ -1967,6 +1971,7 @@ describe('handleCreateInvoice — Coinbase rotation refused on the status gate',
         {
           PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
           ROZO_INTENTS_API_KEY: 'test-key',
+          ATOMIC_STORE: makeAtomicStoreMock(),
         } as unknown as import('../src/index').Env,
       )
       return { status: res.status, json: JSON.parse(await res.text()), refetchCount, createCalled }

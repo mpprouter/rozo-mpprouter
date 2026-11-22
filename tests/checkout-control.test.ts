@@ -171,8 +171,20 @@ describe('switch semantics', () => {
     const second = await stopCheckout(env, { ...REQ, reason: 'other', requestId: 'req-2' })
     expect(second.changed).toBe(false)
     const r2 = await readCheckoutControl(env)
-    expect(r2.version).toBe(r1.version)
+    // who/why kept; the version moves on so an older resume cannot override it.
+    expect(r2.version).toBeGreaterThan(r1.version)
+    expect(r2.paused).toBe(true)
     expect(r2.state?.reason).toBe('incident drill')
+  })
+
+  it('a repeated stop while paused invalidates a resume prepared before it', async () => {
+    const { env } = makeEnv()
+    await stopCheckout(env, REQ)
+    const seen = await readCheckoutControl(env)
+    await stopCheckout(env, { ...REQ, reason: 'still bad', requestId: 'req-3' })
+    const stale = await resumeCheckout(env, { ...REQ, requestId: 'req-r' }, seen.version)
+    expect(stale.ok).toBe(false)
+    expect((await readCheckoutControl(env)).paused).toBe(true)
   })
 
   it('fails closed on a corrupt value and on an unreadable store', async () => {

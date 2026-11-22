@@ -25,6 +25,7 @@ import {
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import { checkCreateInvoiceGate } from '../src/routes/create-invoice-gate'
+import { readCheckoutIntake, resumeCheckoutIntake, stopCheckout, stopCheckoutIntake } from '../src/routes/checkout-control'
 import { pendingPricingMatches } from '../src/routes/create-invoice'
 import { resolveCheckoutPricing } from '../src/routes/checkout-web-pricing'
 import { signTestPaymentId } from '../src/routes/native-sources'
@@ -450,6 +451,31 @@ describe('tron-ton-alpha option: rate limit', () => {
     }
     const ci = await checkCreateInvoiceGate(optionReq({}), env)
     expect(ci.ok).toBe(true)
+  })
+})
+
+describe('tron-ton-alpha option: checkout intake stop', () => {
+  it('answers 503 CHECKOUT_INTAKE_PAUSED before any upstream call, and allocates again after resume', async () => {
+    const env = makeEnv()
+    const req = { reason: 'drill', actor: 'test', requestId: 'i1' }
+    await stopCheckoutIntake(env, req)
+    const paused = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)
+    expect(paused.status).toBe(503)
+    expect(paused.headers.get('Retry-After')).toBe('300')
+    expect(((await paused.json()) as any).code).toBe('CHECKOUT_INTAKE_PAUSED')
+    expect(up.calls).toHaveLength(0)
+
+    const seen = await readCheckoutIntake(env)
+    await resumeCheckoutIntake(env, { ...req, requestId: 'i2' }, seen.version)
+    const ok: any = await (await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)).json()
+    expect(ok.ok).toBe(true)
+  })
+
+  it('the delivery stop alone does not block a new option', async () => {
+    const env = makeEnv()
+    await stopCheckout(env, { reason: 'drill', actor: 'test', requestId: 'd1' })
+    const ok: any = await (await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)).json()
+    expect(ok.ok).toBe(true)
   })
 })
 

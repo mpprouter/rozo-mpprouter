@@ -53,7 +53,7 @@ function record(reply: (url: string, method: string) => Response | Promise<Respo
 afterEach(() => vi.restoreAllMocks())
 
 const baseEnv = (extra: Record<string, string> = {}) =>
-  ({ ROZO_INTENTS_API_KEY: 'test-key', ...extra }) as unknown as Env
+  ({ ROZO_INTENTS_API_KEY: 'test-key', ATOMIC_STORE: makeAtomicStoreMock(), ...extra }) as unknown as Env
 
 describe('intentsReadBase', () => {
   it('defaults to payment-api (unset, empty, whitespace)', () => {
@@ -198,7 +198,7 @@ describe('create-invoice.ts rotation + refetchPaymentRow', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ payment_id: 'pl_test123', source: { chainId: '900', tokenSymbol: 'USDT' } }),
       }),
-      { PAYINVOICE_ADMIN_SECRET: 'test-admin-secret', ROZO_INTENTS_API_KEY: 'test-key', ...extra } as unknown as Env,
+      { PAYINVOICE_ADMIN_SECRET: 'test-admin-secret', ROZO_INTENTS_API_KEY: 'test-key', ATOMIC_STORE: makeAtomicStoreMock(), ...extra } as unknown as Env,
     )
     expect(res.status).toBe(502)
     return calls.filter((c) => c.url.includes('intentapiv4.rozo.ai'))
@@ -343,7 +343,7 @@ describe('create-invoice.ts order lookup 404 classification', () => {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ payment_id: 'pl_test404', source: { chainId: '1500', tokenSymbol: 'USDC' } }),
       }),
-      { PAYINVOICE_ADMIN_SECRET: 'test-admin-secret', ROZO_INTENTS_API_KEY: 'test-key', ...extra } as unknown as Env,
+      { PAYINVOICE_ADMIN_SECRET: 'test-admin-secret', ROZO_INTENTS_API_KEY: 'test-key', ATOMIC_STORE: makeAtomicStoreMock(), ...extra } as unknown as Env,
     )
     const creates = calls.filter((c) => c.method === 'POST' && c.url === `${OLD}/`)
     return { status: res.status, json: JSON.parse(await res.text()), creates: creates.length }
