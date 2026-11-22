@@ -396,7 +396,7 @@ export async function settleBitrefillFunderEvent(
   // pause switch is "off". Other source chains: no read, no change.
   noteSourceChain(rec, check.order?.source?.chainId)
   const celo = await celoSettlementGate(env, {
-    chainHints: [evt.data?.source?.chainId, rec.sourceChainId],
+    chainHints: [evt.data?.source?.chainId],
     order: check.order ?? null,
     loadOrder: rozoPaymentId ? () => fetchRozoPaymentById(env, rozoPaymentId) : undefined,
     eventTxHash: evt.data?.source?.txHash ?? null,

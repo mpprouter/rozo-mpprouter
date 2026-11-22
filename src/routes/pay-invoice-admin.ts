@@ -31,32 +31,51 @@ import { timingSafeEqualStr } from '../utils/timing-safe'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead, casUpdate } from './stripe-atomic'
-import { fetchRozoPaymentById, loadRecord } from './webhook'
-import { celoSettlementGate } from './celo-finality'
+import { ROZO_ORDER_PAID_STATUSES, fetchRozoPaymentById, loadRecord } from './webhook'
+import { listLinkOrderRows, readPaymentStatus } from './existing-order'
+import { celoSettlementGate, isCeloChain } from './celo-finality'
 
 /**
  * Celo settlement gate for a manual pay of a Coinbase invoice
  * (celo-finality.ts). Returns a refusal reason, or null when the pay may go
- * ahead. Applies when the invoice's fulfillment record (or its Rozo order)
- * shows a Celo source chain. A record that names a Rozo order but no source
- * chain (written before this gate existed) has its order read; if that read
+ * ahead.
+ *
+ * The source chain is always re-read from Rozo, never taken from the cached
+ * record alone: the Rozo orders named on the fulfillment record (settling,
+ * first and duplicate orders), or, when the record names none (no webhook
+ * reached us yet), every order slot of the link. Each paid Celo-sourced order
+ * among them must pass the gate (pause switch "off", payin finalized with the
+ * same hash on two RPCs, Transfer matching the order). If any of those reads
  * fails the source chain is unknown and the manual pay is refused.
  */
 export async function celoManualPayRefusal(env: Env, coinbaseId: string): Promise<string | null> {
   const rec = await loadRecord(env, coinbaseId)
-  if (!rec) return null
-  const rozoId = rec.settlingRozoPaymentId ?? rec.rozoPaymentId ?? null
-  let order: any | null = null
-  if (!rec.sourceChainId && rozoId) {
-    order = await fetchRozoPaymentById(env, rozoId)
-    if (!order || typeof order !== 'object') return 'source chain unknown: Rozo order unreadable'
+  const ids = [
+    ...new Set(
+      [rec?.settlingRozoPaymentId, rec?.rozoPaymentId, ...(rec?.duplicateRozoPaymentIds ?? [])].filter(
+        (v): v is string => typeof v === 'string' && v.length > 0,
+      ),
+    ),
+  ]
+  const orders: any[] = []
+  if (ids.length > 0) {
+    for (const id of ids) {
+      const o = await fetchRozoPaymentById(env, id)
+      if (!o || typeof o !== 'object') return 'source chain unknown: Rozo order unreadable'
+      orders.push(o)
+    }
+  } else {
+    const rows = await listLinkOrderRows(env, coinbaseId)
+    if (rows === null) return 'source chain unknown: Rozo orders for this invoice unreadable'
+    orders.push(...rows)
   }
-  const gate = await celoSettlementGate(env, {
-    chainHints: [rec.sourceChainId],
-    order,
-    loadOrder: rozoId ? () => fetchRozoPaymentById(env, rozoId) : undefined,
-  })
-  if (gate.applies && !gate.ok) return gate.reason
+  const celoPaid = orders.filter(
+    (o) => o && isCeloChain(o.source?.chainId) && ROZO_ORDER_PAID_STATUSES.has(readPaymentStatus(o) ?? ''),
+  )
+  for (const order of celoPaid) {
+    const gate = await celoSettlementGate(env, { chainHints: [], order })
+    if (gate.applies && !gate.ok) return gate.reason
+  }
   return null
 }
 

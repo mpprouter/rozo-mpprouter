@@ -277,6 +277,39 @@ export function pickCurrentOrder(entries: OrderSlotEntry[]): any | null {
   return found[found.length - 1].row
 }
 
+/**
+ * Every Rozo order row for a Coinbase link (base, contract and retry slots,
+ * create-invoice's slot set). Null when the answer is not known (no API key,
+ * a slot read failed, timeout): callers must not read that as "no order".
+ * Never throws.
+ */
+export async function listLinkOrderRows(
+  env: Env,
+  linkId: string,
+  timeoutMs: number = EXISTING_ORDER_TIMEOUT_MS,
+): Promise<any[] | null> {
+  const target: ExistingOrderTarget = { provider: 'coinbase', linkId }
+  if (!isLookupTargetValid(target) || !env.ROZO_INTENTS_API_KEY) return null
+  const controller = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<null>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort()
+      resolve(null)
+    }, timeoutMs)
+  })
+  try {
+    const work = scanOrderSlots(env, target, controller.signal).then((entries) =>
+      entries === null ? null : entries.filter((e) => e.row).map((e) => e.row),
+    )
+    return await Promise.race([work, timeout])
+  } catch {
+    return null
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
 export interface ExistingOrderOptions {
   timeoutMs?: number
 }

@@ -28,7 +28,7 @@ import {
   normalizeCoinbasePayment,
 } from './invoice-provider'
 import { coinbaseDailyCapAtomic, releaseDailySpend, reserveDailySpend } from './stripe-fulfillment'
-import { celoGateAlertText, celoSettlementGate, isCeloChain, type CeloGateResult } from './celo-finality'
+import { celoGateAlertText, celoSettlementGate, type CeloGateResult } from './celo-finality'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -162,8 +162,8 @@ export interface FulfillmentRecord {
   // settling-order.ts.
   settlingRozoPaymentId?: string | null
   duplicateRozoPaymentIds?: string[]
-  // Source chain of the payin as last seen on a webhook / order read. Lets
-  // the manual /admin/pay-invoice path apply the Celo gate (celo-finality.ts).
+  // Source chain of the payin as last seen on a webhook / order read.
+  // Informational (audit); the Celo gate (celo-finality.ts) never decides on it.
   sourceChainId?: string | null
   deliveredReported?: boolean
   deliveredReportAttempts?: number
@@ -808,10 +808,13 @@ export async function deferForCheckoutPause(
   return { ok: true, deferred: 'checkout_paused', plId }
 }
 
-/** Remembers a Celo source chain on the record (never forgets one). */
+/**
+ * Records the source chain of the order currently being settled (latest
+ * event / order read wins). Informational only: no gate decision reads it
+ * back; every gate re-derives the chain from the event and the Rozo order.
+ */
 export function noteSourceChain(rec: FulfillmentRecord, chainId: unknown): void {
   if (chainId === undefined || chainId === null || chainId === '') return
-  if (isCeloChain(rec.sourceChainId)) return
   rec.sourceChainId = String(chainId)
 }
 
@@ -1064,7 +1067,7 @@ export async function settleCoinbaseEvent(
   // re-runs this). Any other source chain: no read, no change.
   noteSourceChain(rec, binding.order?.source?.chainId)
   const celo = await celoSettlementGate(env, {
-    chainHints: [evt.data?.source?.chainId, rec.sourceChainId],
+    chainHints: [evt.data?.source?.chainId],
     order: binding.order,
     eventTxHash: evt.data?.source?.txHash ?? null,
   })

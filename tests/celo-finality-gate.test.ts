@@ -379,6 +379,18 @@ describe('Celo gate: webhook payin_completed', () => {
 // ── Other chains unchanged ──────────────────────────────────────────────────
 
 describe('Celo gate: other source chains', () => {
+  it('a record marked Celo by an earlier sibling event does not block a Base settling order', async () => {
+    const { calls } = stub({ order: boundRozoOrder(ROZO_ID, PL) })
+    const { env, kv } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+    seedRecord(kv, { sourceChainId: '42220', rozoPaymentId: null })
+    const evt = event('payment_payout_completed', { chainId: '8453', txHash: null })
+    await handleRozoWebhook(await signed(evt), env)
+    expect(calls.pay).toBe(1)
+    expect(calls.celoRpc).toBe(0)
+    expect(rec(kv).status).toBe('paid')
+    expect(rec(kv).sourceChainId).toBe('8453')
+  })
+
   it('a Base order pays as before, with no Celo reads, even with the Celo switch missing', async () => {
     const { calls } = stub({ order: boundRozoOrder(ROZO_ID, PL) })
     const { env, kv } = makeEnv({ CELO_FULFILLMENT_PAUSED: undefined, CELO_RPC_URL: undefined })
@@ -493,6 +505,40 @@ describe('Celo gate: manual /admin/pay-invoice', () => {
   it('Celo record, finalized: the manual pay goes out once', async () => {
     const { calls } = stub()
     const { env, kv } = makeEnv()
+    seedRecord(kv, { sourceChainId: '42220' })
+    const res = await handleAdminPayInvoice(adminPay(), env)
+    expect(res.status).toBe(200)
+    expect(calls.pay).toBe(1)
+  })
+
+  it('no record yet: scans the link orders; a paid Celo order not finalized blocks the pay', async () => {
+    const { calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv()
+    const res = await handleAdminPayInvoice(adminPay(), env)
+    expect(res.status).toBe(409)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('no record yet and the link orders unreadable: 409, nothing sent', async () => {
+    const { calls } = stub({ order: null })
+    const { env } = makeEnv()
+    const res = await handleAdminPayInvoice(adminPay(), env)
+    expect(res.status).toBe(409)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('a stale Base chain on the record does not bypass a Celo order', async () => {
+    const { calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env, kv } = makeEnv()
+    seedRecord(kv, { sourceChainId: '8453' })
+    const res = await handleAdminPayInvoice(adminPay(), env)
+    expect(res.status).toBe(409)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('a stale Celo chain on the record does not block a Base order', async () => {
+    const { calls } = stub({ order: boundRozoOrder(ROZO_ID, PL) })
+    const { env, kv } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
     seedRecord(kv, { sourceChainId: '42220' })
     const res = await handleAdminPayInvoice(adminPay(), env)
     expect(res.status).toBe(200)
