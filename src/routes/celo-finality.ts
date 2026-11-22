@@ -92,14 +92,29 @@ export async function celoSettlementGate(
   input: CeloGateInput,
   deps: CeloGateDeps = {},
 ): Promise<CeloGateResult> {
-  const hints = [...input.chainHints, orderSourceChain(input.order)]
+  let order = input.order ?? null
+  const hints = [...input.chainHints, orderSourceChain(order)]
+  // No source chain known at all (a caller that carries none, e.g. the Stripe
+  // ambiguous retry): the Rozo order is the authority. Read it before deciding
+  // whether the gate applies; unreadable = refuse (the chain is unknown).
+  const known = hints.some((h) => h !== undefined && h !== null && String(h).trim() !== '')
+  if (!known && !order && input.loadOrder) {
+    try {
+      order = await input.loadOrder()
+    } catch {
+      order = null
+    }
+    if (!order || typeof order !== 'object') {
+      return { applies: true, ok: false, reason: 'source chain unknown: Rozo order unreadable', alert: false }
+    }
+    hints.push(orderSourceChain(order))
+  }
   if (!hints.some(isCeloChain)) return { applies: false }
 
   if (celoFulfillmentPaused(env)) {
     return { applies: true, ok: false, reason: 'celo_fulfillment_paused', alert: false }
   }
 
-  let order = input.order ?? null
   if (!order && input.loadOrder) {
     try {
       order = await input.loadOrder()

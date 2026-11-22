@@ -186,6 +186,7 @@ function stub(cfg: Partial<Up> = {}) {
       if (url.startsWith(FORNO)) return chainAnswer(up.rpc1, JSON.parse(String(init?.body)))
       if (url.startsWith(CELO2)) return chainAnswer(up.rpc2, JSON.parse(String(init?.body)))
       if (url.includes('oapi.dingtalk.com')) {
+        if ((up as any).alertDown) return new Response('down', { status: 500 })
         calls.alerts.push(JSON.parse(String(init?.body)).text.content)
         return Response.json({ errcode: 0 })
       }
@@ -201,8 +202,8 @@ function stub(cfg: Partial<Up> = {}) {
         calls.orderGet++
         return up.order ? Response.json(up.order) : new Response('nf', { status: 404 })
       }
-      // Base funder balance: always ample.
-      return Response.json({ jsonrpc: '2.0', id: 1, result: hex(100_000_000n) })
+      // Base funder balance: ample unless the test says otherwise.
+      return Response.json({ jsonrpc: '2.0', id: 1, result: hex((up as any).lowBalance ? 1n : 100_000_000n) })
     }),
   )
   return { up, calls }
@@ -640,6 +641,26 @@ describe('Celo gate: Stripe settle entry', () => {
     expect(summary.deferred).toBe('celo_finality')
     expect(calls.pay).toBe(0)
     expect([...kv._store.keys()].some((k) => k.startsWith('invoice-fulfillment:'))).toBe(false)
+    expect((await listCeloRetries(env))[0]).toMatchObject({ provider: 'stripe', ref: 'stripe_crypto_cpis_celoTest' })
+  })
+
+  it('no source chain on the event (e.g. ambiguous retry): reads the order, Celo is gated', async () => {
+    const { calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv()
+    const summary = await handleStripeWebhookEvent(
+      env,
+      {
+        eventId: 'evt-stripe-nochain',
+        eventType: 'payment_payout_completed',
+        orderId: 'stripe_crypto_cpis_celoTest',
+        rozoPaymentId: ROZO_ID,
+        invoiceAmountStr: null,
+      },
+      new Date(),
+    )
+    expect(summary.deferred).toBe('celo_finality')
+    expect(calls.orderGet).toBeGreaterThan(0)
+    expect(calls.pay).toBe(0)
   })
 })
 
@@ -737,6 +758,41 @@ describe('Celo retry queue (cron re-drive)', () => {
     expect(out[0].outcome).toBe('still_deferred')
     expect(calls.pay).toBe(0)
     expect(await listCeloRetries(env)).toHaveLength(1)
+  })
+
+  it('finalized but funder short on a payin event: kept and retried, paid once the funder has funds', async () => {
+    const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env, kv } = makeEnv()
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    up.rpc1 = FINAL_OK
+    up.rpc2 = FINAL_OK
+    ;(up as any).lowBalance = true
+    let out = await sweepCeloRetries(env, new Date(t0 + 3 * MIN))
+    expect(out[0].outcome).toBe('still_deferred')
+    expect(calls.pay).toBe(0)
+    expect(rec(kv).status).toBe('payin_seen')
+    expect(await listCeloRetries(env)).toHaveLength(1)
+    ;(up as any).lowBalance = false
+    out = await sweepCeloRetries(env, new Date(t0 + 20 * MIN))
+    expect(out[0].outcome).toBe('handed_back')
+    expect(calls.pay).toBe(1)
+  })
+
+  it('give-up alert not delivered: entry kept, no payment, alert retried next run', async () => {
+    const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv()
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    ;(up as any).alertDown = true
+    let out = await sweepCeloRetries(env, new Date(t0 + 3 * 60 * MIN + MIN))
+    expect(out[0].outcome).toBe('error')
+    expect(await listCeloRetries(env)).toHaveLength(1)
+    ;(up as any).alertDown = false
+    out = await sweepCeloRetries(env, new Date(t0 + 4 * 60 * MIN))
+    expect(out[0].outcome).toBe('gave_up')
+    expect(await listCeloRetries(env)).toHaveLength(0)
+    expect(calls.pay).toBe(0)
   })
 
   it('backoff: 2, 3, 4, then 5 minutes', () => {

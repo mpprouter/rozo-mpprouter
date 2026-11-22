@@ -146,8 +146,10 @@ export interface CeloRetryRunResult {
 /**
  * Cron entry point. Never throws. Re-drives due entries through `redrive`
  * (the normal settle path). A summary still deferred by the Celo gate was
- * already rescheduled by that path (enqueueCeloRetry); any other answer means
- * the normal path owns the order again and the entry is removed.
+ * already rescheduled by that path (enqueueCeloRetry). A summary marked
+ * `celoRetryKeep` (record still pre-pay, nobody paged) or an unreadable order
+ * is rescheduled here. Anything else (paid, in flight, terminal, a human
+ * paged, or the checkout-pause backlog owns it) removes the entry.
  */
 export async function runCeloRetries(
   env: Env,
@@ -179,9 +181,16 @@ export async function runCeloRetries(
     try {
       const first = Date.parse(entry.firstAt)
       if (Number.isFinite(first) && nowMs - first > CELO_RETRY_MAX_AGE_MS) {
-        const cleared = await clearCeloRetry(env, entry.ref, entry)
-        if (cleared) await alertGaveUp(env, entry)
-        out.push({ ref: entry.ref, outcome: 'gave_up' })
+        // Stop paying attempts; drop the entry only once the alert is out. A
+        // failed alert keeps the entry (no further re-drive past the limit)
+        // and tries the alert again next run.
+        if (await alertGaveUp(env, entry)) {
+          await clearCeloRetry(env, entry.ref, entry)
+          out.push({ ref: entry.ref, outcome: 'gave_up' })
+        } else {
+          await enqueueCeloRetry(env, { ...entry, reason: entry.lastReason ?? 'give-up alert not delivered' }, now)
+          out.push({ ref: entry.ref, outcome: 'error', detail: 'give-up alert not delivered; kept' })
+        }
         continue
       }
       const eventId = `celo-retry:${entry.ref}:${entry.attempts + 1}:${crypto.randomUUID()}`
@@ -190,9 +199,11 @@ export async function runCeloRetries(
         out.push({ ref: entry.ref, outcome: 'still_deferred', detail: String(summary.reason ?? '') })
         continue
       }
-      // Transient: the order could not be read / verified right now. Keep it.
-      if (summary?.deferred === 'rozo_unreadable' || summary?.deferred === 'order_binding_unverified') {
-        const why = String(summary.reason ?? summary.deferred)
+      // Not paid and nothing else owns it yet (order unreadable, binding not
+      // verifiable right now, funder short on a payin event, daily cap...):
+      // keep it, with backoff, until it is paid or the 3 h limit alerts.
+      if (summary?.deferred === 'rozo_unreadable' || summary?.celoRetryKeep === true) {
+        const why = String(summary.reason ?? summary.deferred ?? summary.celoRetryRecordStatus ?? 'not paid yet')
         await enqueueCeloRetry(env, { ...entry, reason: why }, now)
         out.push({ ref: entry.ref, outcome: 'still_deferred', detail: why })
         continue
@@ -208,7 +219,8 @@ export async function runCeloRetries(
   return out
 }
 
-async function alertGaveUp(env: Env, e: CeloRetryEntry): Promise<void> {
+/** True once the alert is delivered (or no alert channel exists at all). */
+async function alertGaveUp(env: Env, e: CeloRetryEntry): Promise<boolean> {
   const text = [
     '[MPP Router] 🚨 Celo payin NOT paid after 3 hours of retries: needs a human',
     `Invoice: ${e.provider} ${e.ref}, Rozo payment ${(e.rozoPaymentId ?? '?').slice(0, 8)}`,
@@ -217,9 +229,13 @@ async function alertGaveUp(env: Env, e: CeloRetryEntry): Promise<void> {
     'Nothing was paid. Check the payin on Celo (finalized? same block hash on two RPCs? Transfer matches the order?). Pay by hand only after it is verified, or refund the payer.',
   ].join('\n')
   try {
-    if (alertSinkConfigured(env)) await sendAlert(env, redactForAlert(text))
-    else console.warn(`[celo-retry] give-up alert SKIPPED (no alert channel) for ${e.ref}`)
+    if (!alertSinkConfigured(env)) {
+      console.error(`[celo-retry] give-up alert SKIPPED (no alert channel) for ${e.ref}: ${text}`)
+      return true
+    }
+    return await sendAlert(env, redactForAlert(text))
   } catch (err) {
     console.warn(`[celo-retry] give-up alert error: ${err instanceof Error ? err.message : String(err)}`)
+    return false
   }
 }
