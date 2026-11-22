@@ -2131,6 +2131,26 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       ? Promise.resolve(null)
       : resolveCoinbaseLinkExpiry(linkId ?? normalizedPaymentId)
 
+  // Celo (beta): the payout waits for finality, so the merchant link must
+  // outlive it. Checked here, before ANY upstream operation (fresh create,
+  // reuse, or rotating a live order onto Celo). Unknown expiry fails closed.
+  // Checked only, not handed to rozo-intents-api (no Celo-side re-check there).
+  if (source.chainId === '42220') {
+    const linkExpiry =
+      testInvoiceCents !== null
+        ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
+        : await linkExpiresAtPromise
+    const check = checkZecLinkExpiry(linkExpiry, Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
+    if (!check.ok) {
+      return errorResponse(400, {
+        code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
+        message: check.message,
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+  }
+
   // Step 2: compute the browser-only fee (default off), or honor the exact
   // signed v3 quote snapshot when the same client submits it within its TTL.
   let invoiceAtomic: bigint
@@ -2813,23 +2833,6 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     }
     merchantLinkExpiresAt = check.iso
   }
-  // Celo (beta): the payout waits for finality, so the link must outlive it.
-  // Checked only, not handed to rozo-intents-api (no Celo-side re-check there).
-  if (source.chainId === '42220') {
-    const linkExpiry =
-      testInvoiceCents !== null
-        ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
-        : await linkExpiresAtPromise
-    const check = checkZecLinkExpiry(linkExpiry, Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
-    if (!check.ok) {
-      return errorResponse(400, {
-        code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
-        message: check.message,
-        normalized_input: normalized,
-        link_id_detected,
-      })
-    }
-  }
 
   // A fresh shielded order: the shielded per-invoice cap applies here (after
   // reuse, so an existing transparent order is reported as a mode mismatch).
@@ -3339,6 +3342,14 @@ export async function handleStripeCreateInvoice(
   // (device-id-forward.ts). Written on create only, never logged.
   deviceId: string | null = null,
 ): Promise<Response> {
+  // Celo (beta) is a Coinbase-checkout source only: the Stripe path has no
+  // Celo link-life check, so it never creates a Celo order.
+  if (source.chainId === '42220') {
+    return errorResponse(400, {
+      code: 'UNSUPPORTED_SOURCE',
+      message: 'Celo is not available for Stripe invoices. Pay with USDC/USDT on another chain.',
+    })
+  }
   // 1. Resolve the session (read-only).
   let invoice: NormalizedInvoice
   try {

@@ -49,11 +49,15 @@ function makeEnv(extra: Record<string, string> = {}): Env {
 let createdIntent: any = null
 let createCalls = 0
 let linkExpiresAt: string | null = null
+let checkoutCalls = 0
+let existingOrder: any = null
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 
 beforeEach(() => {
   createdIntent = null
   createCalls = 0
+  checkoutCalls = 0
+  existingOrder = null
   linkExpiresAt = inMinutes(24 * 60)
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -78,7 +82,12 @@ beforeEach(() => {
       return new Response(JSON.stringify({ invoice: { amount: '5.00' }, merchant: 'OpenRouter, Inc', linkId: SESSION_ID }), { status: 200 })
     }
     if (u.includes('/payments/order/')) {
+      if (existingOrder && u.endsWith(`/${SESSION_ID}`)) return new Response(JSON.stringify(existingOrder), { status: 200 })
       return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
+    }
+    if (u.includes('/checkout') && init?.method === 'POST') {
+      checkoutCalls++
+      return new Response('{"error":{"code":"invalidRequest"}}', { status: 400 })
     }
     if (u.includes('/payment-api') && init?.method === 'POST') {
       createCalls++
@@ -217,6 +226,31 @@ describe('create-invoice with Celo USDT', () => {
     const unknown = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO }, { query: '?beta=celo' })
     expect(unknown.status).toBe(400)
     expect(unknown.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+    expect(createCalls).toBe(0)
+  })
+
+  it('a live Base order is never rotated onto Celo when the link is too short: refused before /checkout', async () => {
+    existingOrder = {
+      id: 'rozo-pay-base',
+      appId: 'merchant_openrouter',
+      orderId: SESSION_ID,
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T01:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '5.05', receiverAddress: '0x2222222222222222222222222222222222222222' },
+      destination: { chainId: '8453', tokenSymbol: 'USDC', amount: '5.00' },
+    }
+    linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO }, { query: '?beta=celo' })
+    expect(r.status).toBe(400)
+    expect(r.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+    expect(checkoutCalls).toBe(0)
+    expect(createCalls).toBe(0)
+  })
+
+  it('a Stripe invoice never creates a Celo order', async () => {
+    const r = await post(handleCreateInvoice, { url: 'https://crypto.stripe.com/pay/cs_live_celotest', source: CELO }, { query: '?beta=celo' })
+    expect(r.status).toBe(400)
+    expect(r.json.code).toBe('UNSUPPORTED_SOURCE')
     expect(createCalls).toBe(0)
   })
 
