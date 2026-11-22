@@ -12,6 +12,8 @@
  *   POST /v1/services/rozo-agent-api/tron-ton-alpha/option
  *        { payment_id | url, network: 'tron'|'ton', token: 'USDT'|'TRX' }
  *        -> one payment option (exact amount, address, TON code, deadline)
+ *        Hidden beta: { network: 'ton', token: 'TON', beta: 'gram' } = native
+ *        TON (Gram); without `beta: 'gram'` it is refused as before.
  *
  * The business order key is derived HERE, never from the request body: the
  * Coinbase invoice id the quote resolves (`pl_*` or `paymentSession_*`) is
@@ -67,9 +69,9 @@ export const ALPHA_DESTINATION = Object.freeze({
 
 export interface AlphaOptionDef {
   network: 'tron' | 'ton'
-  token: 'USDT' | 'TRX'
+  token: 'USDT' | 'TRX' | 'TON'
   chainId: string
-  displayDecimals: 1 | 2
+  displayDecimals: 1 | 2 | 4
 }
 
 // Mirrors ALPHA_ASSETS in rozo-intents-api shared/tron-ton-alpha/chains.ts.
@@ -79,10 +81,71 @@ export const ALPHA_OPTIONS: readonly AlphaOptionDef[] = [
   { network: 'ton', token: 'USDT', chainId: '1600', displayDecimals: 2 },
 ]
 
-export function findAlphaOption(network: unknown, token: unknown): AlphaOptionDef | null {
+// Native TON (Gram), hidden Beta (ainative docs/design/20261122-ton-native-
+// payin-implementation.zh.md). Never listed by the capability route and only
+// accepted on /option when the body carries `beta: "gram"` (the /ton?beta=gram
+// page); without it the request gets the same UNSUPPORTED_SOURCE as before.
+// The upstream function has its own switch (off = 400 unsupported_asset).
+export const TON_NATIVE_BETA_PARAM = 'gram'
+export const TON_NATIVE_BETA_OPTION: AlphaOptionDef = Object.freeze({
+  network: 'ton', token: 'TON', chainId: '1600', displayDecimals: 4,
+})
+const TON_NATIVE_DECIMALS = 9
+
+export function findAlphaOption(network: unknown, token: unknown, beta?: unknown): AlphaOptionDef | null {
   const n = String(network ?? '').trim().toLowerCase()
   const t = String(token ?? '').trim().toUpperCase()
-  return ALPHA_OPTIONS.find((o) => o.network === n && o.token === t) ?? null
+  const listed = ALPHA_OPTIONS.find((o) => o.network === n && o.token === t)
+  if (listed) return listed
+  if (beta === TON_NATIVE_BETA_PARAM && n === TON_NATIVE_BETA_OPTION.network && t === TON_NATIVE_BETA_OPTION.token) {
+    return TON_NATIVE_BETA_OPTION
+  }
+  return null
+}
+
+/** Decimal string to integer units at `decimals`; null when it does not fit exactly. */
+function decimalToAtomic(s: string, decimals: number): bigint | null {
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(s)
+  if (!m) return null
+  const frac = m[2] ?? ''
+  if (frac.length > decimals) return null
+  return BigInt(m[1] + frac.padEnd(decimals, '0'))
+}
+
+export interface TonNativeChecked {
+  expected: string
+  expectedAtomic: string
+  rawAddress: string
+  addressDisplay: string
+  transferUri: string
+}
+
+/**
+ * Native TON answer from upstream, or null when any part of it cannot be
+ * shown to a payer: 4-decimal amount, nanoton atomic amount equal to it, no
+ * jetton, the per-order non-bounceable UQ address that is exactly the wallet
+ * form of the raw address (an EQ address to a fresh wallet bounces the
+ * coins), no code, and the transfer link rebuilt from those two values.
+ */
+export function checkTonNativeAnswer(data: Record<string, any>): TonNativeChecked | null {
+  if (data.network !== 'ton' || data.tokenSymbol !== 'TON' || data.tokenIdentity !== 'native') return null
+  if (Number(data.tokenDecimals) !== TON_NATIVE_DECIMALS) return null
+  if (data.displayDecimals != null && Number(data.displayDecimals) !== TON_NATIVE_BETA_OPTION.displayDecimals) return null
+  if (data.addressPerOrder !== true || data.paymentReference != null) return null
+  const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
+  if (!/^\d+\.\d{4}$/.test(expected)) return null
+  const atomic = decimalToAtomic(expected, TON_NATIVE_DECIMALS)
+  const expectedAtomic = typeof data.expectedAmountAtomic === 'string' ? data.expectedAmountAtomic : ''
+  if (atomic === null || atomic <= 0n || !/^[1-9]\d*$/.test(expectedAtomic) || BigInt(expectedAtomic) !== atomic) return null
+  const rawAddress = typeof data.receivingAddressRaw === 'string' ? data.receivingAddressRaw : ''
+  if (!/^0:[0-9a-f]{64}$/.test(rawAddress)) return null
+  const addressDisplay = tonRawToFriendly(rawAddress)
+  if (!addressDisplay || !/^UQ[A-Za-z0-9_-]{46}$/.test(addressDisplay)) return null
+  if (data.receivingAddressDisplay !== addressDisplay || data.receivingAddress !== addressDisplay) return null
+  const transferUri = `ton://transfer/${addressDisplay}?amount=${expectedAtomic}`
+  if (data.tonTransferUri !== transferUri) return null
+  if (!Number.isFinite(Date.parse(typeof data.expiresAt === 'string' ? data.expiresAt : ''))) return null
+  return { expected, expectedAtomic, rawAddress, addressDisplay, transferUri }
 }
 
 function json(status: number, payload: unknown): Response {
@@ -263,7 +326,12 @@ const UPSTREAM_ERRORS: Record<string, { status: number; code: string; message: s
   payment_reference_exhausted: { status: 503, code: 'ALPHA_CAPACITY', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' },
   increment_budget_unset: { status: 503, code: 'ALPHA_CAPACITY', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' },
   price_unavailable: { status: 503, code: 'ALPHA_PRICE_UNAVAILABLE', message: 'The TRX price is unavailable right now. Try again later or pay with USDT.' },
+  // Native TON (Gram) beta refusals (rozo-intents-api ton-native-create.ts).
+  ton_native_disabled: { status: 404, code: 'ALPHA_UNAVAILABLE', message: 'TRON and TON payments are not available.' },
+  order_already_fulfilled: { status: 409, code: 'ALPHA_ORDER_CLOSED', message: 'This TRON / TON order is closed.' },
+  exposure_full: { status: 503, code: 'ALPHA_CAPACITY', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' },
 }
+const TON_PRICE_UNAVAILABLE_MESSAGE = 'The TON price is unavailable right now. Try again later or pay with USDT.'
 const UPSTREAM_FALLBACK = { status: 502, code: 'ALPHA_UPSTREAM_FAILED', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' }
 
 /** Upstream gross_usd (numeric from SQL, string or number) to a cent string. */
@@ -307,6 +375,84 @@ export function buildAlphaUpstreamBody(
 
 const COINBASE_INVOICE_KEY = /^(pl_[A-Za-z0-9_-]+|paymentSession_[0-9a-fA-F-]{36})$/
 
+/** What the page is shown, after validation. */
+interface ShownOption {
+  expected: string
+  expectedAtomic: string
+  tokenIdentity: string
+  tokenIdentityDisplay: string | null
+  address: string
+  addressDisplay: string
+  ref: string | null
+  expiresAt: string
+  /** Extra response fields: native TON beta, TON USDT per-order address. */
+  extra: Record<string, unknown>
+}
+
+function nativeShown(data: Record<string, any>): ShownOption | null {
+  const c = checkTonNativeAnswer(data)
+  if (!c) return null
+  return {
+    expected: c.expected,
+    expectedAtomic: c.expectedAtomic,
+    tokenIdentity: 'native',
+    tokenIdentityDisplay: null,
+    address: c.rawAddress,
+    addressDisplay: c.addressDisplay,
+    ref: null,
+    expiresAt: data.expiresAt,
+    extra: {
+      tokenName: 'TON (Gram)',
+      tokenDecimals: TON_NATIVE_DECIMALS,
+      addressPerOrder: true,
+      tonTransferUri: c.transferUri,
+      beta: true,
+    },
+  }
+}
+
+/** TRON USDT, TRON TRX and TON USDT: the checks the route has always made. */
+function listedShown(option: AlphaOptionDef, data: Record<string, any>): ShownOption | null {
+  const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
+  const decimalsOk = new RegExp(`^\\d+\\.\\d{${option.displayDecimals}}$`).test(expected)
+  // Atomic amount (6 decimals) for wallet links (TON QR). Must be the same
+  // number as the displayed amount, or neither is shown.
+  const expectedAtomic = typeof data.expectedAmountAtomic === 'string' ? data.expectedAmountAtomic : ''
+  const atomicOk = decimalsOk && /^\d+$/.test(expectedAtomic) && parseUsdcAtomic(expected) === BigInt(expectedAtomic)
+  // TON: the USDT jetton master in wallet form for the transfer link.
+  const tokenIdentity = typeof data.tokenIdentity === 'string' ? data.tokenIdentity : ''
+  const tokenIdentityDisplay = option.network === 'ton' ? tonRawToFriendly(tokenIdentity, true) : tokenIdentity || null
+  // TON: upstream sends the wallet form in receivingAddress and the canonical
+  // raw form in receivingAddressRaw (rozo-intents-api #854). This route
+  // returns the raw form and derives the wallet form itself, so read the raw
+  // one; an older upstream that sent raw in receivingAddress still works.
+  const rawAddress = option.network === 'ton' && typeof data.receivingAddressRaw === 'string'
+    ? data.receivingAddressRaw
+    : data.receivingAddress
+  const address = typeof rawAddress === 'string' ? rawAddress : ''
+  const ref = data.paymentReference == null ? null : String(data.paymentReference)
+  const expiresAt = typeof data.expiresAt === 'string' ? data.expiresAt : ''
+  const addressDisplay = option.network === 'ton' ? tonRawToFriendly(address) : address
+  if (
+    !atomicOk || (option.network === 'ton' && !tokenIdentityDisplay) || !address || !addressDisplay || !Number.isFinite(Date.parse(expiresAt)) ||
+    data.network !== option.network || data.tokenSymbol !== option.token ||
+    (option.network === 'ton' ? !(ref && /^\d{6}$/.test(ref)) : ref !== null)
+  ) {
+    return null
+  }
+  // TON USDT per-order address (rozo-intents-api handler.ts optionResponse,
+  // ainative design 20261031-ton-usdt-per-order-address section 10): the
+  // address alone identifies the order, so the page hides the code box. The
+  // flag is passed on only when upstream's wallet form is exactly the one
+  // derived here; otherwise the answer is shown the way it always was.
+  const perOrder = option.network === 'ton' && data.addressPerOrder === true &&
+    typeof data.receivingAddressDisplay === 'string' && data.receivingAddressDisplay === addressDisplay
+  return {
+    expected, expectedAtomic, tokenIdentity, tokenIdentityDisplay, address, addressDisplay, ref, expiresAt,
+    extra: perOrder ? { addressPerOrder: true } : {},
+  }
+}
+
 export async function handleTronTonAlphaOption(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.ROZO_INTENTS_API_KEY || !env.PAYINVOICE_ADMIN_SECRET) {
@@ -339,7 +485,8 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     return fail(400, 'INVALID_INPUT', 'Invalid JSON body')
   }
 
-  const option = findAlphaOption(parsed.network, parsed.token)
+  const option = findAlphaOption(parsed.network, parsed.token, parsed.beta)
+  const native = option === TON_NATIVE_BETA_OPTION
   if (!option) {
     return fail(400, 'UNSUPPORTED_SOURCE', 'Unsupported network or token.', {
       supported: ALPHA_OPTIONS.map((o) => ({ network: o.network, token: o.token })),
@@ -439,37 +586,16 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     const mapped = UPSTREAM_ERRORS[reason] ?? UPSTREAM_FALLBACK
     // Reason code only: never the upstream body, the link or the key.
     console.warn('[tron-ton-alpha] option refused', upstream.status, reason || 'unknown')
-    return fail(mapped.status, mapped.code, mapped.message)
+    const message = native && reason === 'price_unavailable' ? TON_PRICE_UNAVAILABLE_MESSAGE : mapped.message
+    return fail(mapped.status, mapped.code, message)
   }
 
-  const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
-  const decimalsOk = new RegExp(`^\\d+\\.\\d{${option.displayDecimals}}$`).test(expected)
-  // Atomic amount (6 decimals) for wallet links (TON QR). Must be the same
-  // number as the displayed amount, or neither is shown.
-  const expectedAtomic = typeof data.expectedAmountAtomic === 'string' ? data.expectedAmountAtomic : ''
-  const atomicOk = decimalsOk && /^\d+$/.test(expectedAtomic) && parseUsdcAtomic(expected) === BigInt(expectedAtomic)
-  // TON: the USDT jetton master in wallet form for the transfer link.
-  const tokenIdentity = typeof data.tokenIdentity === 'string' ? data.tokenIdentity : ''
-  const tokenIdentityDisplay = option.network === 'ton' ? tonRawToFriendly(tokenIdentity, true) : tokenIdentity || null
-  // TON: upstream sends the wallet form in receivingAddress and the canonical
-  // raw form in receivingAddressRaw (rozo-intents-api #854). This route
-  // returns the raw form and derives the wallet form itself, so read the raw
-  // one; an older upstream that sent raw in receivingAddress still works.
-  const rawAddress = option.network === 'ton' && typeof data.receivingAddressRaw === 'string'
-    ? data.receivingAddressRaw
-    : data.receivingAddress
-  const address = typeof rawAddress === 'string' ? rawAddress : ''
-  const ref = data.paymentReference == null ? null : String(data.paymentReference)
-  const expiresAt = typeof data.expiresAt === 'string' ? data.expiresAt : ''
-  const addressDisplay = option.network === 'ton' ? tonRawToFriendly(address) : address
-  if (
-    !atomicOk || (option.network === 'ton' && !tokenIdentityDisplay) || !address || !addressDisplay || !Number.isFinite(Date.parse(expiresAt)) ||
-    data.network !== option.network || data.tokenSymbol !== option.token ||
-    (option.network === 'ton' ? !(ref && /^\d{6}$/.test(ref)) : ref !== null)
-  ) {
+  const shown = native ? nativeShown(data) : listedShown(option, data)
+  if (!shown) {
     console.warn('[tron-ton-alpha] option response failed validation')
     return fail(UPSTREAM_FALLBACK.status, UPSTREAM_FALLBACK.code, UPSTREAM_FALLBACK.message)
   }
+  const { expected, expectedAtomic, tokenIdentity, tokenIdentityDisplay, address, addressDisplay, ref, expiresAt } = shown
 
   // The order deadline is shared by every option and never renewed. A link
   // that dies before it would let us take money we can no longer deliver, so
@@ -533,6 +659,7 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     expectedAmount: expected,
     expectedAmountAtomic: expectedAtomic,
     paymentReference: ref,
+    ...shown.extra,
     expiresAt,
     serverTime: typeof data.serverTime === 'string' ? data.serverTime : new Date().toISOString(),
     linkExpiresAt: linkExpiresAt ?? null,
