@@ -35,6 +35,7 @@ import { buildCheckoutTitle, type CheckoutPricing } from './checkout-web-pricing
 import { withForwardedClientHint } from './client-hint-forward'
 import { coinbaseLinkFromId, saveOriginalPaymentLink } from './payment-link-store'
 import { deviceIdField } from './device-id-forward'
+import type { OrderAttribution } from './order-attribution'
 
 const ORDER_TIMEOUT_MS = 8_000
 // Set once the order is known to exist; later polls of the same invoice skip
@@ -77,6 +78,15 @@ export interface AlphaOrderArgs {
   test: boolean
   /** Browser device id, validated by readDeviceId (device-id-forward.ts). Never logged. */
   deviceId?: string | null
+  /**
+   * Channel attribution, built exactly as create-invoice builds it
+   * (order-attribution.ts): `orderAttribution` is the sanitized record written
+   * to metadata.attribution, `attributionField` the raw top-level passthrough
+   * payment-api files under metadata.internal.attribution. Both are written on
+   * create only; an existing order keeps what it was created with.
+   */
+  orderAttribution?: { attribution?: OrderAttribution }
+  attributionField?: { attribution?: Record<string, unknown> }
 }
 
 /** The payment-api create body. Pure; mirrors create-invoice's default (Base USDC, exactIn) order. */
@@ -104,10 +114,12 @@ export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs): Record<string, u
       tokenSymbol: 'USDC',
       tokenAddress: BASE_USDC_ADDRESS,
     },
+    ...(a.attributionField ?? {}),
     ...deviceIdField(a.deviceId),
     metadata: {
       source: 'mpprouter-tron-ton-alpha',
       coinbasePaymentLinkId: a.invoiceKey,
+      ...(a.orderAttribution ?? {}),
       ...priced,
       ...(a.test ? { testMode: true } : {}),
     },

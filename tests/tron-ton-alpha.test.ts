@@ -356,6 +356,60 @@ describe('tron-ton-alpha option: one order per Coinbase invoice', () => {
     expect(JSON.stringify(await r.json())).not.toContain(DEVICE_ID)
   })
 
+  it('writes channel attribution on the business order create, like create-invoice', async () => {
+    const req = new Request('https://apiserver.mpprouter.dev/v1/services/rozo-agent-api/tron-ton-alpha/option', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'cf-ipcountry': 'US', 'user-agent': 'Mozilla/5.0 test' },
+      body: JSON.stringify({
+        payment_id: PL, network: 'tron', token: 'USDT',
+        attribution: {
+          client: 'checkout.rozo.ai', utm_source: 'chatgpt.com', landing_path: '/tron?x=1',
+          referrer: 'https://chatgpt.com/c/abc?q=1', referrer_host: 'chatgpt.com',
+          install_id: 'not-a-uuid', account_hash: 'raw-key', bogus: 1,
+        },
+      }),
+    })
+    const r = await handleTronTonAlphaOption(req, makeEnv())
+    expect(r.status).toBe(200)
+    expect(intents.creates.length).toBe(1)
+    const created = intents.creates[0]
+    // metadata.attribution: sanitized record plus the server-owned country
+    expect(created.metadata.attribution).toEqual({
+      client: 'checkout.rozo.ai', utm_source: 'chatgpt.com', landing_path: '/tron',
+      referrer: 'https://chatgpt.com', country: 'US',
+    })
+    // top-level passthrough for payment-api's own whitelist, identity fields stripped
+    expect(created.attribution.utm_source).toBe('chatgpt.com')
+    expect('install_id' in created.attribution).toBe(false)
+    expect('account_hash' in created.attribution).toBe(false)
+    // pricing metadata is untouched and the allocator never sees attribution
+    expect(created.metadata.source).toBe('mpprouter-tron-ton-alpha')
+    for (const c of up.calls) expect(JSON.stringify(c.body)).not.toContain('chatgpt.com')
+    expect(JSON.stringify(await r.json())).not.toContain('chatgpt.com')
+  })
+
+  it('without a body attribution still records the surface from the User-Agent', async () => {
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'ton', token: 'USDT' }), makeEnv())
+    expect(r.status).toBe(200)
+    const created = intents.creates[0]
+    expect(created.metadata.attribution).toEqual({ client: 'unknown' })
+    expect('attribution' in created).toBe(false)
+  })
+
+  it('never writes attribution onto an existing order', async () => {
+    intents.lookup = () => new Response(JSON.stringify({ id: 'x', status: 'payment_unpaid' }), { status: 200 })
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT', attribution: { utm_source: 'x' } }), makeEnv())
+    expect(r.status).toBe(200)
+    expect(intents.creates).toHaveLength(0)
+  })
+
+  it('a malformed attribution never fails the option', async () => {
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT', attribution: ['x'] }), makeEnv())
+    expect(r.status).toBe(200)
+    expect(intents.creates[0].metadata.attribution).toEqual({ client: 'unknown' })
+    expect('attribution' in intents.creates[0]).toBe(false)
+  })
+
   it('drops a malformed deviceId and still creates the business order', async () => {
     const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT', deviceId: 'ab'.repeat(32) }), makeEnv())
     expect(r.status).toBe(200)

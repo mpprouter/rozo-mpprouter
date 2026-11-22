@@ -81,6 +81,7 @@ import { normalizeContactEmail } from './contact-email'
 import {
   attributionMetadata,
   buildOrderAttribution,
+  forwardedAttributionField,
   type OrderAttribution,
 } from './order-attribution'
 import {
@@ -1745,12 +1746,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // upstream, so an unvalidated value never travels. Clients must send ONLY
   // the sha256 hash as account_hash, never a raw OpenRouter account id or API
   // key; a non-hash value is dropped here, never stored.
-  let attributionField: { attribution?: Record<string, unknown> } = {}
-  if (attributionRaw && typeof attributionRaw === 'object' && !Array.isArray(attributionRaw)) {
-    const { install_id: _installId, account_hash: _accountHash, ...forwarded } =
-      attributionRaw as Record<string, unknown>
-    if (Object.keys(forwarded).length) attributionField = { attribution: forwarded }
-  }
+  const attributionField = forwardedAttributionField(attributionRaw)
   // Order-level attribution (surface + campaign), written to
   // metadata.attribution on creation only. Separate from the passthrough above
   // and from pricing: it is computed here and only ever spread into metadata.
