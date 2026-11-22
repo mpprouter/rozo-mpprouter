@@ -527,6 +527,46 @@ describe('Celo gate: manual /admin/pay-invoice', () => {
     expect(calls.pay).toBe(0)
   })
 
+  it('an unpaid / started Celo order is not exempt: pause on blocks the manual pay', async () => {
+    for (const status of ['payment_unpaid', 'payment_started', undefined]) {
+      const { calls } = stub({ order: celoOrder({ status }, { txHash: null }) })
+      const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+      const res = await handleAdminPayInvoice(adminPay(), env)
+      expect(res.status).toBe(409)
+      expect(calls.pay).toBe(0)
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it('an expired Celo order with no payin does not block the manual pay', async () => {
+    const { calls } = stub({ order: celoOrder({ status: 'payment_expired' }, { txHash: null }) })
+    const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+    const res = await handleAdminPayInvoice(adminPay(), env)
+    expect(res.status).toBe(200)
+    expect(calls.pay).toBe(1)
+  })
+
+  it('record names a Base order, but a Celo sibling slot exists: the sibling is gated', async () => {
+    const baseOrder = boundRozoOrder(ROZO_ID, PL, { status: 'payment_expired' })
+    const celoSibling = celoOrder({ id: 'celo-sibling' })
+    const { calls } = stub({ order: baseOrder, rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    // By-id reads answer the Base order; slot scans answer the Celo sibling.
+    const inner = (globalThis.fetch as any).getMockImplementation()
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input)
+        if (url.includes('intentapiv4.rozo.ai') && url.includes('/payments/order/')) return Response.json(celoSibling)
+        return inner(input, init)
+      }),
+    )
+    const { env, kv } = makeEnv()
+    seedRecord(kv, { sourceChainId: '8453' })
+    const res = await handleAdminPayInvoice(adminPay(), env)
+    expect(res.status).toBe(409)
+    expect(calls.pay).toBe(0)
+  })
+
   it('a stale Base chain on the record does not bypass a Celo order', async () => {
     const { calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
     const { env, kv } = makeEnv()

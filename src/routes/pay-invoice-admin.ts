@@ -31,7 +31,11 @@ import { timingSafeEqualStr } from '../utils/timing-safe'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead, casUpdate } from './stripe-atomic'
-import { ROZO_ORDER_PAID_STATUSES, fetchRozoPaymentById, loadRecord } from './webhook'
+import { fetchRozoPaymentById, loadRecord } from './webhook'
+
+// Rozo statuses that end an order with no money kept; a Celo order in one of
+// these with no payin tx does not block a manual pay of a sibling order.
+const CELO_EXEMPT_ENDED_STATUSES: ReadonlySet<string> = new Set(['payment_expired', 'payment_refunded', 'payment_bounced', 'payment_failed'])
 import { listLinkOrderRows, readPaymentStatus } from './existing-order'
 import { celoSettlementGate, isCeloChain } from './celo-finality'
 
@@ -42,9 +46,9 @@ import { celoSettlementGate, isCeloChain } from './celo-finality'
  *
  * The source chain is always re-read from Rozo, never taken from the cached
  * record alone: the Rozo orders named on the fulfillment record (settling,
- * first and duplicate orders), or, when the record names none (no webhook
- * reached us yet), every order slot of the link. Each paid Celo-sourced order
- * among them must pass the gate (pause switch "off", payin finalized with the
+ * first and duplicate orders) plus every order slot of the link (a Celo
+ * sibling whose webhook has not arrived yet). Each Celo-sourced order that is
+ * not definitely ended without a payin must pass the gate (pause switch "off", payin finalized with the
  * same hash on two RPCs, Transfer matching the order). If any of those reads
  * fails the source chain is unknown and the manual pay is refused.
  */
@@ -58,21 +62,26 @@ export async function celoManualPayRefusal(env: Env, coinbaseId: string): Promis
     ),
   ]
   const orders: any[] = []
-  if (ids.length > 0) {
-    for (const id of ids) {
-      const o = await fetchRozoPaymentById(env, id)
-      if (!o || typeof o !== 'object') return 'source chain unknown: Rozo order unreadable'
-      orders.push(o)
-    }
-  } else {
-    const rows = await listLinkOrderRows(env, coinbaseId)
-    if (rows === null) return 'source chain unknown: Rozo orders for this invoice unreadable'
-    orders.push(...rows)
+  for (const id of ids) {
+    const o = await fetchRozoPaymentById(env, id)
+    if (!o || typeof o !== 'object') return 'source chain unknown: Rozo order unreadable'
+    orders.push(o)
   }
-  const celoPaid = orders.filter(
-    (o) => o && isCeloChain(o.source?.chainId) && ROZO_ORDER_PAID_STATUSES.has(readPaymentStatus(o) ?? ''),
-  )
-  for (const order of celoPaid) {
+  // Always also scan every order slot of the link: a Celo sibling whose
+  // webhook has not reached us is not named on the record.
+  const rows = await listLinkOrderRows(env, coinbaseId)
+  if (rows === null) return 'source chain unknown: Rozo orders for this invoice unreadable'
+  orders.push(...rows)
+  // Every Celo order must pass the gate unless Rozo says it definitely ended
+  // with no money kept and it carries no payin tx. Unpaid / started / unknown
+  // statuses are NOT exempt (a payin may be on its way or not yet credited).
+  const celoLive = orders.filter((o) => {
+    if (!o || !isCeloChain(o.source?.chainId)) return false
+    const status = readPaymentStatus(o) ?? ''
+    const hasPayinTx = typeof o.source?.txHash === 'string' && o.source.txHash.length > 0
+    return hasPayinTx || !CELO_EXEMPT_ENDED_STATUSES.has(status)
+  })
+  for (const order of celoLive) {
     const gate = await celoSettlementGate(env, { chainHints: [], order })
     if (gate.applies && !gate.ok) return gate.reason
   }
