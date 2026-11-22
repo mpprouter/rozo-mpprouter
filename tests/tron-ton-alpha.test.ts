@@ -863,6 +863,17 @@ describe('tron-ton-alpha option: native TON (Gram) beta', () => {
     expect(intents.creates).toHaveLength(0)
   })
 
+  it.each([
+    ['tron', 'USDT'], ['tron', 'TRX'], ['ton', 'USDT'],
+  ])('the native-only refusals keep main\'s fallback on %s %s', async (network, token) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    for (const error of ['ton_native_disabled', 'order_already_fulfilled', 'exposure_full']) {
+      up.reply = (body) => body.network ? new Response(JSON.stringify({ error }), { status: 409 }) : null
+      const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network, token, beta: 'gram' }), makeEnv())
+      expect([r.status, ((await r.json()) as any).code]).toEqual([502, 'ALPHA_UPSTREAM_FAILED'])
+    }
+  })
+
   it('a price outage names TON, and TRX keeps its message', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     up.reply = (body) => body.network ? new Response(JSON.stringify({ error: 'price_unavailable' }), { status: 503 }) : null
@@ -894,6 +905,7 @@ describe('tron-ton-alpha option: native TON (Gram) beta', () => {
     ['a jetton token identity', { tokenIdentity: '0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe' }],
     ['6 token decimals', { tokenDecimals: 6 }],
     ['2 display decimals', { displayDecimals: 2 }],
+    ['no display decimals', { displayDecimals: undefined }],
     ['a six-digit code', { paymentReference: '123456' }],
     ['no per-order flag', { addressPerOrder: undefined }],
     ['USDT symbol', { tokenSymbol: 'USDT' }],

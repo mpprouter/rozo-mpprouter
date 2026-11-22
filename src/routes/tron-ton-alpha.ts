@@ -130,7 +130,7 @@ export interface TonNativeChecked {
 export function checkTonNativeAnswer(data: Record<string, any>): TonNativeChecked | null {
   if (data.network !== 'ton' || data.tokenSymbol !== 'TON' || data.tokenIdentity !== 'native') return null
   if (Number(data.tokenDecimals) !== TON_NATIVE_DECIMALS) return null
-  if (data.displayDecimals != null && Number(data.displayDecimals) !== TON_NATIVE_BETA_OPTION.displayDecimals) return null
+  if (Number(data.displayDecimals) !== TON_NATIVE_BETA_OPTION.displayDecimals) return null
   if (data.addressPerOrder !== true || data.paymentReference != null) return null
   const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
   if (!/^\d+\.\d{4}$/.test(expected)) return null
@@ -326,7 +326,10 @@ const UPSTREAM_ERRORS: Record<string, { status: number; code: string; message: s
   payment_reference_exhausted: { status: 503, code: 'ALPHA_CAPACITY', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' },
   increment_budget_unset: { status: 503, code: 'ALPHA_CAPACITY', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' },
   price_unavailable: { status: 503, code: 'ALPHA_PRICE_UNAVAILABLE', message: 'The TRX price is unavailable right now. Try again later or pay with USDT.' },
-  // Native TON (Gram) beta refusals (rozo-intents-api ton-native-create.ts).
+}
+// Native TON (Gram) beta refusals (rozo-intents-api ton-native-create.ts).
+// Read for the native option only, so the listed coins keep main's mapping.
+const NATIVE_UPSTREAM_ERRORS: Record<string, { status: number; code: string; message: string }> = {
   ton_native_disabled: { status: 404, code: 'ALPHA_UNAVAILABLE', message: 'TRON and TON payments are not available.' },
   order_already_fulfilled: { status: 409, code: 'ALPHA_ORDER_CLOSED', message: 'This TRON / TON order is closed.' },
   exposure_full: { status: 503, code: 'ALPHA_CAPACITY', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' },
@@ -583,7 +586,7 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   const data = (await upstream.json().catch(() => null)) as Record<string, any> | null
   if (!upstream.ok || !data || data.alpha !== true) {
     const reason = typeof data?.error === 'string' ? data.error : ''
-    const mapped = UPSTREAM_ERRORS[reason] ?? UPSTREAM_FALLBACK
+    const mapped = (native ? NATIVE_UPSTREAM_ERRORS[reason] : undefined) ?? UPSTREAM_ERRORS[reason] ?? UPSTREAM_FALLBACK
     // Reason code only: never the upstream body, the link or the key.
     console.warn('[tron-ton-alpha] option refused', upstream.status, reason || 'unknown')
     const message = native && reason === 'price_unavailable' ? TON_PRICE_UNAVAILABLE_MESSAGE : mapped.message
