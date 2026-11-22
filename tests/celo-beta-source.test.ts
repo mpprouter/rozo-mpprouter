@@ -149,6 +149,22 @@ describe('Celo USDT beta source: opening rules', () => {
     expect(celoOnly.has('BTC@9000')).toBe(false)
   })
 
+  it('?beta=btc,celo (what the /celo page sends) opens BTC and Celo USDT, each independently', () => {
+    const both = withBetaSources(base, 'ZEC@9133,BTC@9000,USDT@42220', 'https://x/q?beta=btc,celo')
+    expect(both.has('BTC@9000')).toBe(true)
+    expect(both.has('USDT@42220')).toBe(true)
+    expect(both.has('ZEC@9133')).toBe(false)
+    const sup = supportedSources(STABLE_SOURCES, both)
+    expect(sup['42220']).toEqual(['USDT'])
+    expect(sup['9000']).toEqual(['BTC'])
+    // Without the Celo env key, btc still opens and Celo stays closed.
+    const btcOnly = withBetaSources(base, 'ZEC@9133,BTC@9000', 'https://x/q?beta=btc,celo')
+    expect(btcOnly.has('BTC@9000')).toBe(true)
+    expect(btcOnly.has('USDT@42220')).toBe(false)
+    // Repeated params work the same as a comma list.
+    expect(withBetaSources(base, 'BTC@9000,USDT@42220', 'https://x/q?beta=btc&beta=celo').has('USDT@42220')).toBe(true)
+  })
+
   it('resolveSource: Celo USDT resolves to the Celo USDT contract only when open', () => {
     const closed = resolveSource(CELO, base) as any
     expect(closed.error.code).toBe('UNSUPPORTED_SOURCE')
@@ -202,6 +218,16 @@ describe('create-invoice with Celo USDT', () => {
     expect(unknown.status).toBe(400)
     expect(unknown.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
     expect(createCalls).toBe(0)
+  })
+
+  it('?beta=btc,celo create: Celo USDT order is created', async () => {
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO }, { query: '?beta=btc,celo' })
+    expect(createCalls).toBe(1)
+    expect(createdIntent.source).toMatchObject({ chainId: '42220', tokenSymbol: 'USDT', tokenAddress: CELO_USDT })
+    expect(r.status).toBeLessThan(300)
+    const q = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: '?beta=btc,celo' })
+    expect(q.json.supportedSources['42220']).toEqual(['USDT'])
+    expect(q.json.supportedSources['9000']).toEqual(['BTC'])
   })
 
   it('open and the link lives long enough: creates upstream with the Celo USDT contract', async () => {
