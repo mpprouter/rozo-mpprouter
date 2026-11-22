@@ -38,6 +38,7 @@ import { isTestPaymentId, TEST_MERCHANT_NAME, verifyTestPaymentId } from './nati
 import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
 import { forwardedClientHintHeader } from './client-hint-forward'
 import { readDeviceId } from './device-id-forward'
+import { attributionMetadata, buildOrderAttribution, forwardedAttributionField } from './order-attribution'
 
 export const TRON_TON_ALPHA_CAPABILITY_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/capability'
 export const TRON_TON_ALPHA_OPTION_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/option'
@@ -342,8 +343,9 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
 
   // Only the invoice reference is read from the body. Any orderId-like field
   // the caller sends is ignored: the order key is the invoice id below. (The
-  // optional browser `deviceId` is read further down, only for the business
-  // order create; see device-id-forward.ts.)
+  // optional browser `deviceId` and channel `attribution` are read further
+  // down, only for the business order create; see device-id-forward.ts and
+  // order-attribution.ts.)
   const { normalized, error, provider_detected } = normalizePayInvoiceBody({
     url: parsed.url,
     payment_id: parsed.payment_id,
@@ -478,9 +480,21 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   // before any instructions are shown (tron-ton-alpha-order.ts). Ensured only
   // once the allocation succeeded; a failure hides the instructions and the
   // next read retries it (later reads hit the KV marker, no extra calls).
+  // Channel attribution (optional top-level `attribution`, same body shape as
+  // create-invoice) is built the way create-invoice builds it, so a TRON / TON
+  // order carries metadata.attribution like any other checkout order. It is
+  // telemetry only: it never changes pricing, the allocation or an error code.
   const order = await ensureAlphaBusinessOrder(
     env,
-    { invoiceKey, merchant, pricing, test: testId !== null, deviceId: readDeviceId(parsed) },
+    {
+      invoiceKey,
+      merchant,
+      pricing,
+      test: testId !== null,
+      deviceId: readDeviceId(parsed),
+      orderAttribution: attributionMetadata(buildOrderAttribution(parsed.attribution, request)),
+      attributionField: forwardedAttributionField(parsed.attribution),
+    },
     forwardedClientHintHeader(request, null),
   ).catch(() => ({ ok: false as const, reason: 'create_failed' as const }))
   if (!order.ok) {

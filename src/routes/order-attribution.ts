@@ -216,3 +216,21 @@ export function buildOrderAttribution(raw: unknown, request: Request): OrderAttr
 export function attributionMetadata(attr: OrderAttribution | null): { attribution?: OrderAttribution } {
   return attr && Object.keys(attr).length ? { attribution: attr } : {}
 }
+
+/**
+ * The raw top-level `attribution` field forwarded to payment-api, whose own
+ * whitelist (utm-attribution.ts) files it under metadata.internal.attribution.
+ * Identity fields (install_id, account_hash) are stripped from the forwarded
+ * copy: only the regex-validated values in buildOrderAttribution may reach
+ * upstream, so an unvalidated value never travels. Returns `{ attribution }`
+ * or `{}` (absent, not an object, or nothing left). Never throws.
+ */
+export function forwardedAttributionField(raw: unknown): { attribution?: Record<string, unknown> } {
+  try {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {}
+    const { install_id: _installId, account_hash: _accountHash, ...forwarded } = raw as Record<string, unknown>
+    return Object.keys(forwarded).length ? { attribution: forwarded } : {}
+  } catch {
+    return {}
+  }
+}
