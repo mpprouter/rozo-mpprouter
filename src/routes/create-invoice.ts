@@ -69,6 +69,7 @@ import {
   supportedSources,
   verifyTestPaymentId,
   withBetaSources,
+  stableTokensFor,
   zecShieldedAvailable,
   zecShieldedMaxUsd,
   ZEC_BLOCK_TARGET_SECONDS,
@@ -156,6 +157,9 @@ const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
     USDT: '0x55d398326f99059fF775485246999027B3197955',
   },
   '8453': { USDC: BASE_USDC_ADDRESS },
+  // Celo USDT (Tether native on Celo, 6 decimals). Beta only: reachable just
+  // through BETA_STABLE_SOURCES "USDT@42220" + `?beta=celo`.
+  '42220': { USDT: '0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e' },
   // Solana USDT mint. USDT payin is supported (sol-pool-monitor); Solana USDT *payout*
   // is not (rejected downstream) — irrelevant here since settlement is Base USDC.
   '900':  {
@@ -416,7 +420,9 @@ export function resolveSource(
     return { resolved: { chainId, tokenSymbol: def.symbol, tokenAddress: def.tokenAddress, warnings } }
   }
 
-  const allowedTokens = SUPPORTED_SOURCE[chainId]
+  // STABLE_SOURCES plus any beta stable source opened for this request
+  // (BETA_STABLE_SOURCES via NATIVE_SOURCES_BETA + `?beta=`).
+  const allowedTokens = stableTokensFor(chainId, nativeAllowed)
   if (!allowedTokens) {
     return {
       error: {
@@ -695,6 +701,16 @@ export const ZEC_CODE_MESSAGES: Readonly<Record<string, string>> = {
  * refuses with BTC_LINK_TOO_SOON. Same floor here; unknown expiry fails closed.
  */
 export const BTC_ONCHAIN_MIN_LINK_LIFE_MS = (30 + 10 + 10) * 60_000
+
+/**
+ * Celo (beta) source: a Celo payin is paid out only after its block is
+ * finalized (~25 to 30 minutes, routes/celo-finality.ts), plus the payer's own
+ * time to send. A new Celo order needs the merchant link to live at least this
+ * long; unknown expiry fails closed (same rule as ZEC / on-chain BTC).
+ * 100 minutes is a PLACEHOLDER pending registration in ainative
+ * docs/policy/magic-numbers.md.
+ */
+export const CELO_MIN_LINK_LIFE_MS = 100 * 60_000
 
 /** rozo-intents-api codes an on-chain BTC create may answer with; passed through unchanged. */
 // rozo-intents-api #1110 (shared/btc-custody-quote.ts BTC_CUSTODY_ERROR and
@@ -2796,6 +2812,23 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       })
     }
     merchantLinkExpiresAt = check.iso
+  }
+  // Celo (beta): the payout waits for finality, so the link must outlive it.
+  // Checked only, not handed to rozo-intents-api (no Celo-side re-check there).
+  if (source.chainId === '42220') {
+    const linkExpiry =
+      testInvoiceCents !== null
+        ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
+        : await linkExpiresAtPromise
+    const check = checkZecLinkExpiry(linkExpiry, Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
+    if (!check.ok) {
+      return errorResponse(400, {
+        code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
+        message: check.message,
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
   }
 
   // A fresh shielded order: the shielded per-invoice cap applies here (after
