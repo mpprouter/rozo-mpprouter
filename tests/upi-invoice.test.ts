@@ -740,6 +740,7 @@ describe('invoice claim (cross-channel)', () => {
         orderId: 'stripe_crypto_cpis_stripe1',
         rozoPaymentId: 'rozo-1',
         invoiceAmountStr: '18.19',
+        sourceChainId: '8453',
       },
       new Date(),
     )

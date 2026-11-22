@@ -344,6 +344,8 @@ describe('handleStripeWebhookEvent', () => {
   const evt = (over: Partial<any> = {}) => ({
     eventId: 'ev', eventType: 'payment_payout_completed',
     orderId: 'stripe_crypto_cpis_wh', rozoPaymentId: 'rp-wh', invoiceAmountStr: '10.00',
+    // The webhook always passes the order's source chain (Celo gate input).
+    sourceChainId: '8453',
     ...over,
   })
 
