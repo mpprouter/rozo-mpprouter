@@ -20,6 +20,7 @@ import { handleCreateInvoice } from '../src/routes/create-invoice'
 import { baseLinkIdOf, retryOrderIds } from '../src/mpp/contract-variant'
 import { rowFundingEvidence } from '../src/routes/relink-guard'
 import type { Env } from '../src/index'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 const LINK = 'paymentSession_11111111-2222-3333-4444-555555555555'
 const PAST = '2020-01-01T00:00:00.000Z'
@@ -30,6 +31,7 @@ function makeEnv(): Env {
   return {
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     ROZO_INTENTS_API_KEY: 'test-key',
+    ATOMIC_STORE: makeAtomicStoreMock(),
     MPP_STORE: {
       get: async (k: string) => store.get(k) ?? null,
       put: async (k: string, v: string) => void store.set(k, v),

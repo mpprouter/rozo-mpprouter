@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { handleCreateInvoice } from '../src/routes/create-invoice'
 import type { Env } from '../src/index'
 import { normalizeContactEmail } from '../src/routes/contact-email'
+import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 function makeKvStub() {
   const store = new Map<string, string>()
@@ -24,6 +25,7 @@ function makeEnv(): Env {
   return {
     PAYINVOICE_ADMIN_SECRET: 'test-admin-secret',
     ROZO_INTENTS_API_KEY: 'test-key',
+    ATOMIC_STORE: makeAtomicStoreMock(),
     MPP_STORE: makeKvStub(),
   } as unknown as Env
 }

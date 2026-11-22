@@ -10,7 +10,14 @@ import {
   stripeTerminal,
 } from '../src/routes/upi-invoice'
 import { claimInvoiceKey, readInvoiceClaim } from '../src/routes/invoice-claim'
-import { readCheckoutControl, resumeCheckout, stopCheckout } from '../src/routes/checkout-control'
+import {
+  readCheckoutControl,
+  readCheckoutIntake,
+  resumeCheckout,
+  resumeCheckoutIntake,
+  stopCheckout,
+  stopCheckoutIntake,
+} from '../src/routes/checkout-control'
 import { handleStripeWebhookEvent, seedStripeRecord } from '../src/routes/stripe-fulfillment'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import type { Env } from '../src/index'
@@ -459,6 +466,34 @@ describe('POST /api/invoice/verified-pay-in — auth and idempotency', () => {
 })
 
 // ── verified-pay-in: execution and terminal mapping ─────────────────────────
+
+describe('UPI and the checkout intake stop', () => {
+  it('resolve answers 422 not_payable / intake_paused and stores no quote; resolves again after resume', async () => {
+    const env = makeEnv()
+    await stopCheckoutIntake(env, { reason: 'drill', actor: 'test', requestId: 'i1' })
+    const paused = await resolve(env, PS_URL)
+    expect(paused.status).toBe(422)
+    expect(paused.body.error).toBe('not_payable')
+    expect(paused.body.reason).toBe('intake_paused')
+    expect(paused.body.message).toMatch(/temporarily paused/)
+    expect([...(env.MPP_STORE as any).store.keys()].filter((k: string) => k.startsWith('upi'))).toEqual([])
+
+    const seen = await readCheckoutIntake(env)
+    await resumeCheckoutIntake(env, { reason: 'drill over', actor: 'test', requestId: 'i2' }, seen.version)
+    const ok = await resolve(env, PS_URL)
+    expect(ok.status).toBe(200)
+    expect(ok.body.payable).toBe(true)
+  })
+
+  it('a UPI payment already captured is still delivered while intake is paused', async () => {
+    const env = makeEnv()
+    const { body: q } = await resolve(env, PS_URL)
+    await stopCheckoutIntake(env, { reason: 'drill', actor: 'test', requestId: 'i3' })
+    const r = await payIn(env, payInBody(q))
+    expect(r.status).toBe(202)
+    expect(world.payCalls.length).toBe(1)
+  })
+})
 
 describe('POST /api/invoice/verified-pay-in — checkout emergency stop', () => {
   it('answers 503 before any record exists, then the same order goes through after resume', async () => {

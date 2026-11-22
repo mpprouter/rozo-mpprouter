@@ -65,10 +65,10 @@ function parseState(raw: string | null): CheckoutControlState | 'absent' | 'corr
   }
 }
 
-/** Read the switch. Never throws: any failure reads as paused. */
-export async function readCheckoutControl(env: Env): Promise<CheckoutControlRead> {
+/** Read a switch key. Never throws: any failure reads as paused. */
+async function readSwitch(env: Env, key: string): Promise<CheckoutControlRead> {
   try {
-    const { value, version } = await casRead(env, CHECKOUT_CONTROL_KEY)
+    const { value, version } = await casRead(env, key)
     const state = parseState(value)
     if (state === 'absent') return { paused: false, version, state: null, error: null }
     if (state === 'corrupt') return { paused: true, version, state: null, error: 'switch value unparseable' }
@@ -83,9 +83,57 @@ export async function readCheckoutControl(env: Env): Promise<CheckoutControlRead
   }
 }
 
+/** Read the delivery switch. Never throws: any failure reads as paused. */
+export async function readCheckoutControl(env: Env): Promise<CheckoutControlRead> {
+  return readSwitch(env, CHECKOUT_CONTROL_KEY)
+}
+
 /** True when checkout delivery must not start (paused, or switch unreadable). */
 export async function checkoutDeliveryPaused(env: Env): Promise<boolean> {
   return (await readCheckoutControl(env)).paused
+}
+
+// ── Intake switch: stop NEW merchant-invoice orders (G1) ───────────────────
+//
+// `admin stop checkout-intake` / `admin resume checkout-intake`. Independent
+// of the delivery switch above: stopping intake never touches delivery or the
+// backlog replay of orders already paid, and stopping delivery never touches
+// intake. Read by every order-creating entry point for a funder-paid merchant
+// invoice (create-invoice Coinbase / Stripe / rozotest, the TRON / TON alpha
+// option, the UPI resolve) before anything is created upstream. Same value
+// format and the same fail-closed reading as the delivery switch: absent =
+// accepting orders (production default), corrupt or unreadable = paused.
+// Design: ainative docs/design/20261122-stop-new-openrouter-orders-switch.zh.md
+
+export const CHECKOUT_INTAKE_KEY = 'checkout-intake:v1'
+
+export async function readCheckoutIntake(env: Env): Promise<CheckoutControlRead> {
+  return readSwitch(env, CHECKOUT_INTAKE_KEY)
+}
+
+/** True when no new merchant-invoice order may be created. */
+export async function checkoutIntakePaused(env: Env): Promise<boolean> {
+  return (await readCheckoutIntake(env)).paused
+}
+
+export const CHECKOUT_INTAKE_PAUSED_CODE = 'CHECKOUT_INTAKE_PAUSED'
+const CHECKOUT_INTAKE_PAUSED_MESSAGE =
+  'New checkout orders are temporarily paused. Nothing was created or charged. ' +
+  'Orders you already paid are not affected. Please try again later.'
+
+/** Body a refused create answers with (HTTP 503). `error` is the message, like the other create errors. */
+export const CHECKOUT_INTAKE_PAUSED_BODY = {
+  error: CHECKOUT_INTAKE_PAUSED_MESSAGE,
+  code: CHECKOUT_INTAKE_PAUSED_CODE,
+  message: CHECKOUT_INTAKE_PAUSED_MESSAGE,
+  retryable: true,
+} as const
+
+export function checkoutIntakePausedResponse(): Response {
+  return new Response(JSON.stringify(CHECKOUT_INTAKE_PAUSED_BODY), {
+    status: 503,
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Retry-After': '300' },
+  })
 }
 
 /** Body every refused synchronous entry point answers with (HTTP 503). */
@@ -215,7 +263,22 @@ export type StopResult = { changed: boolean; previous: CheckoutControlRead; stat
 
 /** Pause delivery. Idempotent: an already-paused switch is left untouched. */
 export async function stopCheckout(env: Env, req: ControlRequest, now: Date = new Date()): Promise<StopResult> {
-  const previous = await readCheckoutControl(env)
+  return stopSwitch(env, CHECKOUT_CONTROL_KEY, 'stop', req, now)
+}
+
+/** Stop new orders. Idempotent like stopCheckout; delivery is not touched. */
+export async function stopCheckoutIntake(env: Env, req: ControlRequest, now: Date = new Date()): Promise<StopResult> {
+  return stopSwitch(env, CHECKOUT_INTAKE_KEY, 'stop_intake', req, now)
+}
+
+async function stopSwitch(
+  env: Env,
+  key: string,
+  action: AuditAction,
+  req: ControlRequest,
+  now: Date,
+): Promise<StopResult> {
+  const previous = await readSwitch(env, key)
   const state: CheckoutControlState = {
     paused: true,
     reason: req.reason,
@@ -223,15 +286,19 @@ export async function stopCheckout(env: Env, req: ControlRequest, now: Date = ne
     requestId: req.requestId,
     at: now.toISOString(),
   }
-  const result = await casUpdate<StopResult>(env, CHECKOUT_CONTROL_KEY, (raw) => {
+  const result = await casUpdate<StopResult>(env, key, (raw) => {
     const cur = parseState(raw)
-    // Already paused by an earlier stop: keep its who/why, write nothing.
+    // Already paused by an earlier stop: keep its who/why, but write it back
+    // with the latest stop request so the version moves on. A resume prepared
+    // from a version read before this stop then fails (409) instead of
+    // overriding the newer stop intent.
     if (cur !== 'absent' && cur !== 'corrupt' && cur.paused) {
-      return { op: 'noop', result: { changed: false, previous, state: cur } }
+      const rewritten = { ...cur, lastStopAt: now.toISOString(), lastStopRequestId: req.requestId }
+      return { op: 'set', value: JSON.stringify(rewritten), result: { changed: false, previous, state: cur } }
     }
     return { op: 'set', value: JSON.stringify(state), result: { changed: true, previous, state } }
   })
-  await appendAudit(env, 'stop', req, previous, result.changed, now)
+  await appendAudit(env, action, req, previous, result.changed, now)
   return result
 }
 
@@ -250,10 +317,31 @@ export async function resumeCheckout(
   expectedVersion: number,
   now: Date = new Date(),
 ): Promise<ResumeResult> {
-  const current = await readCheckoutControl(env)
+  return resumeSwitch(env, CHECKOUT_CONTROL_KEY, 'resume', req, expectedVersion, now)
+}
+
+/** Accept new orders again, only at `expectedVersion`. Nothing to replay. */
+export async function resumeCheckoutIntake(
+  env: Env,
+  req: ControlRequest,
+  expectedVersion: number,
+  now: Date = new Date(),
+): Promise<ResumeResult> {
+  return resumeSwitch(env, CHECKOUT_INTAKE_KEY, 'resume_intake', req, expectedVersion, now)
+}
+
+async function resumeSwitch(
+  env: Env,
+  key: string,
+  action: AuditAction,
+  req: ControlRequest,
+  expectedVersion: number,
+  now: Date,
+): Promise<ResumeResult> {
+  const current = await readSwitch(env, key)
   if (current.error) return { ok: false, conflict: true, current }
   if (!current.paused) {
-    await appendAudit(env, 'resume', req, current, false, now)
+    await appendAudit(env, action, req, current, false, now)
     return { ok: true, changed: false, state: current.state }
   }
   if (current.version !== expectedVersion) return { ok: false, conflict: true, current }
@@ -264,15 +352,17 @@ export async function resumeCheckout(
     requestId: req.requestId,
     at: now.toISOString(),
   }
-  const committed = await casCommit(env, CHECKOUT_CONTROL_KEY, expectedVersion, JSON.stringify(state))
-  if (!committed) return { ok: false, conflict: true, current: await readCheckoutControl(env) }
-  await appendAudit(env, 'resume', req, current, true, now)
+  const committed = await casCommit(env, key, expectedVersion, JSON.stringify(state))
+  if (!committed) return { ok: false, conflict: true, current: await readSwitch(env, key) }
+  await appendAudit(env, action, req, current, true, now)
   return { ok: true, changed: true, state }
 }
 
+type AuditAction = 'stop' | 'resume' | 'replay' | 'stop_intake' | 'resume_intake'
+
 async function appendAudit(
   env: Env,
-  action: 'stop' | 'resume' | 'replay',
+  action: AuditAction,
   req: ControlRequest,
   before: CheckoutControlRead,
   changed: boolean,

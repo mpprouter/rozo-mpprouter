@@ -33,6 +33,7 @@ import type { Env } from '../index'
 import { normalizePayInvoiceBody } from './pay-invoice-admin'
 import { resolveCheckoutPricing, formatUsdcAtomic, parseUsdcAtomic } from './checkout-web-pricing'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
+import { checkoutIntakePaused, checkoutIntakePausedResponse } from './checkout-control'
 import { resolveCoinbaseLinkExpiry } from './create-invoice'
 import { isTestPaymentId, TEST_MERCHANT_NAME, verifyTestPaymentId } from './native-sources'
 import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
@@ -324,6 +325,10 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     res.headers.set('Retry-After', String(gate.retryAfterSeconds))
     return res
   }
+
+  // `admin stop checkout-intake`: no new TRON / TON option (it allocates an
+  // address and opens the business order upstream). Before anything upstream.
+  if (await checkoutIntakePaused(env)) return checkoutIntakePausedResponse()
 
   let parsed: Record<string, unknown>
   try {

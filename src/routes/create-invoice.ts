@@ -18,6 +18,7 @@ import { stripeOrderId, seedStripeRecord } from './stripe-fulfillment'
 import { saveOriginalPaymentLink, coinbaseLinkFromId } from './payment-link-store'
 import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
+import { checkoutIntakePaused, checkoutIntakePausedResponse } from './checkout-control'
 import { StageTimer } from '../utils/stage-timer'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase } from './intents-base'
@@ -1674,6 +1675,17 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       emailResult.email,
       deviceId,
     )
+  }
+
+  // `admin stop checkout-intake` (checkout-control.ts): no new funder-paid
+  // merchant-invoice order (Coinbase, Stripe Crypto, rozotest) while paused,
+  // and no reuse or coin switch of an existing one either, so nothing hands
+  // out a deposit address. Checked before any upstream read or write.
+  // Bitrefill (above) is paid by Intents directly and is not affected.
+  // Delivery of orders already paid is the separate delivery switch.
+  if (await checkoutIntakePaused(env)) {
+    timer.mark('intake_paused')
+    return checkoutIntakePausedResponse()
   }
 
   const { normalized, error, link_id_detected, provider_detected, raw_url } =

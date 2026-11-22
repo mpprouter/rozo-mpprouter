@@ -11,6 +11,9 @@
 //                           expected_version; does NOT re-drive anything
 //        action = replay  → re-drive up to REPLAY_MAX backlog entries through
 //                           the unchanged settlement path (switch must be open)
+//        action = stop_intake   → stop NEW orders (idempotent); delivery untouched
+//        action = resume_intake → accept new orders again, only at
+//                                 expected_version (from GET `intake.version`)
 //
 // Auth: x-admin-secret = CHECKOUT_CONTROL_SECRET. Its own secret on purpose:
 // it can stop and restart delivery but can never pay an invoice by itself.
@@ -24,8 +27,11 @@ import {
   clearPausedDelivery,
   listPausedDeliveries,
   readCheckoutControl,
+  readCheckoutIntake,
   resumeCheckout,
+  resumeCheckoutIntake,
   stopCheckout,
+  stopCheckoutIntake,
 } from './checkout-control'
 import {
   type FulfillmentRecord,
@@ -130,7 +136,32 @@ export async function handleCheckoutControl(request: Request, env: Env): Promise
     return json(200, { action, results, remaining })
   }
 
-  return json(400, { error: 'action must be stop, resume or replay' })
+  if (action === 'stop_intake') {
+    const r = await stopCheckoutIntake(env, req)
+    const after = await readCheckoutIntake(env)
+    return json(200, {
+      action,
+      changed: r.changed,
+      before: { paused: r.previous.paused, version: r.previous.version, error: r.previous.error },
+      after,
+      // Read on every create with no cache: a re-read showing paused means
+      // every later create sees it.
+      verified: after.paused && after.error === null,
+    })
+  }
+
+  if (action === 'resume_intake') {
+    const expected = body?.expected_version
+    if (typeof expected !== 'number' || !Number.isInteger(expected) || expected < 0) {
+      return json(400, { error: 'expected_version (integer from GET intake.version) is required for resume_intake' })
+    }
+    const r = await resumeCheckoutIntake(env, req, expected)
+    if (!r.ok) return json(409, { action, error: 'intake switch changed since expected_version; re-read and decide again', current: r.current })
+    const after = await readCheckoutIntake(env)
+    return json(200, { action, changed: r.changed, after, verified: !after.paused })
+  }
+
+  return json(400, { error: 'action must be stop, resume, replay, stop_intake or resume_intake' })
 }
 
 // ── Replay ──────────────────────────────────────────────────────────────────
@@ -266,6 +297,7 @@ interface InFlightRow {
 
 export async function checkoutStatus(env: Env): Promise<Record<string, unknown>> {
   const control = await readCheckoutControl(env)
+  const intake = await readCheckoutIntake(env)
   let backlog: BacklogEntry[] | null = null
   let backlogError: string | null = null
   try {
@@ -325,6 +357,12 @@ export async function checkoutStatus(env: Env): Promise<Record<string, unknown>>
       version: control.version,
       state: control.state,
       error: control.error,
+    },
+    intake: {
+      paused: intake.paused,
+      version: intake.version,
+      state: intake.state,
+      error: intake.error,
     },
     backlog: backlog === null ? null : { count: backlog.length, entries: backlog },
     backlogError,
