@@ -819,6 +819,20 @@ describe('Celo retry queue (cron re-drive)', () => {
     expect(await listCeloRetries(env)).toHaveLength(0)
   })
 
+  it('Rozo order moved to payment_completed while deferred: the retry still pays once after finality', async () => {
+    const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env, kv } = makeEnv()
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    up.order = celoOrder({ status: 'payment_completed' })
+    up.rpc1 = FINAL_OK
+    up.rpc2 = FINAL_OK
+    const out = await sweepCeloRetries(env, new Date(t0 + 3 * MIN))
+    expect(out[0].outcome).toBe('handed_back')
+    expect(calls.pay).toBe(1)
+    expect(rec(kv).status).toBe('paid')
+  })
+
   it('paused for more than 3 hours, then resumed with the payin finalized: paid once, not dropped', async () => {
     const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
     const { env, kv } = makeEnv()

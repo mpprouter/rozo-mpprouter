@@ -58,8 +58,12 @@ async function redriveOnce(
   const matches = entry.provider === 'stripe' ? orderId === entry.ref : baseLinkIdOf(orderId) === entry.ref
   if (!matches) return { deferred: 'rozo_unreadable', reason: 'Rozo payment orderId does not match the entry' }
   const status = typeof rozo.status === 'string' ? rozo.status : ''
+  // payment_completed is a terminal "paid out" status too (same as
+  // ROZO_ORDER_PAID_STATUSES / Bitrefill ORDER_PAID_OUT): drive it as the
+  // confirmed payout event, so a deferred order whose Rozo row moved on is
+  // still settled once finalized instead of retrying until the give-up alert.
   const eventType =
-    status === 'payment_payout_completed'
+    status === 'payment_payout_completed' || status === 'payment_completed'
       ? 'payment_payout_completed'
       : PAYIN_LIKE.has(status)
         ? 'payment_payin_completed'
