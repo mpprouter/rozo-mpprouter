@@ -2146,6 +2146,40 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       CELO_MIN_LINK_LIFE_MS,
       'Celo',
     )
+  // The check above only sees the REQUESTED source. An existing Celo order
+  // handed back for a request of another coin (reuse with rotation refused,
+  // failed or not attempted; or the winner of a create conflict) must pass
+  // the same two gates before its pay instructions leave: USDT@42220 opened
+  // for this request (NATIVE_SOURCES_BETA plus ?beta=celo) and a merchant
+  // link that outlives CELO_MIN_LINK_LIFE_MS (unknown expiry fails closed).
+  // Otherwise only the order id and status are returned, never its address,
+  // link or raw row. Non-Celo rows: null (no change).
+  const celoReuseBlock = async (
+    row: any,
+    rowSource: { chainId: string | null },
+  ): Promise<Response | null> => {
+    if (String(rowSource.chainId ?? '') !== '42220') return null
+    const refuse = (status: number, code: string, message: string) =>
+      json(status, {
+        ok: false,
+        code,
+        message,
+        error: { code, message },
+        linkId,
+        rozoPaymentId: row?.id ?? null,
+        status: readPaymentStatus(row),
+      })
+    if (!nativeAllowed.has(CELO_USDT_BETA_KEY)) {
+      return refuse(
+        409,
+        'CELO_NOT_ENABLED',
+        'The unpaid order for this payment link pays from Celo, which is not available here. ' +
+          'Do not pay it; request another coin to switch the order.',
+      )
+    }
+    const check = await celoLinkLifeCheck()
+    return check.ok ? null : refuse(400, 'MERCHANT_LINK_EXPIRES_TOO_SOON', check.message)
+  }
   if (source.chainId === '42220') {
     const check = await celoLinkLifeCheck()
     if (!check.ok) {
@@ -2701,41 +2735,10 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         })
       }
 
-      // Celo (beta) gates on the row we are about to hand back. The check at
-      // the top only sees the REQUESTED source; a live Celo order reused for
-      // a request of another coin (rotation refused, failed or not
-      // attempted) must pass the same two gates before its pay instructions
-      // leave: USDT@42220 opened for this request (NATIVE_SOURCES_BETA plus
-      // ?beta=celo) and a merchant link that outlives CELO_MIN_LINK_LIFE_MS
-      // (unknown expiry fails closed). Otherwise only the order id and
-      // status are returned, never its address, link or raw row.
-      if (String(rowSource.chainId ?? '') === '42220') {
-        if (!nativeAllowed.has(CELO_USDT_BETA_KEY)) {
-          const message =
-            'The unpaid order for this payment link pays from Celo, which is not available here. ' +
-            'Do not pay it; request another coin to switch the order.'
-          return json(409, {
-            ok: false,
-            code: 'CELO_NOT_ENABLED',
-            message,
-            error: { code: 'CELO_NOT_ENABLED', message },
-            linkId,
-            rozoPaymentId: row?.id ?? existing?.id ?? null,
-            status: readPaymentStatus(row),
-          })
-        }
-        const check = await celoLinkLifeCheck()
-        if (!check.ok) {
-          return json(400, {
-            ok: false,
-            code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
-            message: check.message,
-            error: { code: 'MERCHANT_LINK_EXPIRES_TOO_SOON', message: check.message },
-            linkId,
-            rozoPaymentId: row?.id ?? existing?.id ?? null,
-            status: readPaymentStatus(row),
-          })
-        }
+      // Celo (beta) gates on the row we are about to hand back (see celoReuseBlock).
+      {
+        const celoBlock = await celoReuseBlock(row, rowSource)
+        if (celoBlock) return celoBlock
       }
 
       // BTC rail invariant on the row we are about to hand back.
@@ -3136,6 +3139,12 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           // shielded create racing for the slot): report it, never hand it
           // over silently or switch it (same rule as the reuse path).
           const winnerModeMismatch = zecReceiveDiffers(winnerSource, source)
+          // Celo (beta) gates on the winner too: a plain request can lose the
+          // slot race to a ?beta=celo create (celoReuseBlock).
+          {
+            const celoBlock = await celoReuseBlock(winner, winnerSource)
+            if (celoBlock) return celoBlock
+          }
           // Reused order: make the stored link idempotent (founder 2026-10-26).
           if (linkId && winner?.id) {
             const reusedUrl = raw_url || coinbaseLinkFromId(linkId)

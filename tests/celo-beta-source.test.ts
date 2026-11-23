@@ -51,6 +51,7 @@ let createCalls = 0
 let linkExpiresAt: string | null = null
 let checkoutCalls = 0
 let existingOrder: any = null
+let conflictWinner: any = null
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString()
 
 beforeEach(() => {
@@ -58,6 +59,7 @@ beforeEach(() => {
   createCalls = 0
   checkoutCalls = 0
   existingOrder = null
+  conflictWinner = null
   linkExpiresAt = inMinutes(24 * 60)
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -92,6 +94,11 @@ beforeEach(() => {
     if (u.includes('/payment-api') && init?.method === 'POST') {
       createCalls++
       createdIntent = JSON.parse(String(init?.body ?? '{}'))
+      // Slot race: a concurrent create won this orderId first.
+      if (conflictWinner) {
+        existingOrder = conflictWinner
+        return new Response('{"error":{"code":"orderIdConflict","message":"orderIdConflict"}}', { status: 409 })
+      }
       return new Response(JSON.stringify({
         id: 'rozo-pay-celo',
         status: 'payment_unpaid',
@@ -335,6 +342,48 @@ describe('create-invoice with Celo USDT', () => {
       expect(unknown.status).toBe(400)
       expect(unknown.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
       expectNoPayInstructions(unknown.json)
+    })
+
+    it('create conflict: a plain request that loses the slot to a Celo order does not get it without ?beta=celo', async () => {
+      conflictWinner = await liveCelo()
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC })
+      expect(createCalls).toBe(1)
+      expect(r.status).toBe(409)
+      expect(r.json.code).toBe('CELO_NOT_ENABLED')
+      expect(r.json.rozoPaymentId).toBe('rozo-pay-celo-live')
+      expectNoPayInstructions(r.json)
+    })
+
+    it('create conflict: Celo winner with beta open but a short link: refused', async () => {
+      conflictWinner = await liveCelo()
+      linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC }, { query: '?beta=celo' })
+      expect(r.status).toBe(400)
+      expect(r.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+      expectNoPayInstructions(r.json)
+    })
+
+    it('create conflict control: Celo winner with beta open and a long link is handed back', async () => {
+      conflictWinner = await liveCelo()
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC }, { query: '?beta=celo' })
+      expect(r.status).toBe(200)
+      expect(r.json.paymentLink).toBe('https://pay.rozo.ai/celo-live')
+    })
+
+    it('non-Celo control: a live Base order reused for a plain request is unchanged (no Celo gate)', async () => {
+      const celo = await liveCelo()
+      existingOrder = {
+        ...celo,
+        id: 'rozo-pay-base-live',
+        paymentLink: 'https://pay.rozo.ai/base-live',
+        source: { chainId: '8453', tokenSymbol: 'USDC', amount: celo.source.amount, receiverAddress: '0x2222222222222222222222222222222222222222' },
+      }
+      linkExpiresAt = null // a Celo gate would refuse on unknown expiry; a Base row must not care
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC })
+      expect(r.status).toBe(200)
+      expect(r.json.reused).toBe(true)
+      expect(r.json.paymentLink).toBe('https://pay.rozo.ai/base-live')
+      expect(checkoutCalls).toBe(0)
     })
 
     it('control: beta open and the link lives long enough: the Celo order is reused with sourceMismatch', async () => {
