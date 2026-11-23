@@ -29,6 +29,7 @@ import {
   CELO_TOKENS,
   celoFulfillmentPaused,
   celoPayinTerms,
+  hasChain,
   isCeloChain,
   parseTokenAtomic,
 } from '../src/routes/celo-finality'
@@ -921,6 +922,20 @@ describe('Celo retry queue (cron re-drive)', () => {
     expect(calls.alerts.filter((a) => a.includes('after 3 hours'))).toHaveLength(0)
   })
 
+  it('Celo event whose order cannot be read yet (binding unverified): queued, then paid once after the read and finality', async () => {
+    const { up, calls } = stub({ order: null })
+    const { env, kv } = makeEnv()
+    const t0 = Date.now()
+    const res = (await (await handleRozoWebhook(await signed(event('payment_payout_completed')), env)).json()) as any
+    expect(res.deferred).toBe('order_binding_unverified')
+    expect((await listCeloRetries(env)).map((e) => e.ref)).toEqual([PL])
+    up.order = celoOrder()
+    const out = await sweepCeloRetries(env, new Date(t0 + 3 * MIN))
+    expect(out[0].outcome).toBe('handed_back')
+    expect(calls.pay).toBe(1)
+    expect(rec(kv).status).toBe('paid')
+  }, 30_000) // the binding read retries with real 2 s + 5 s delays
+
   it('Rozo order unreadable during a retry: kept and rescheduled', async () => {
     const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
     const { env } = makeEnv()
@@ -988,7 +1003,7 @@ describe('Celo retry queue (cron re-drive)', () => {
       // Own deferral (+1) AND a concurrent webhook deferral (+1).
       await enqueueCeloRetry(env, { ...e, reason: 'own' }, new Date())
       await enqueueCeloRetry(env, { ...e, reason: 'concurrent' }, new Date())
-      return { ok: true, deferred: 'celo_finality', reason: 'not finalized' }
+      return { ok: true, deferred: 'celo_finality', reason: 'not finalized', celoQueued: true }
     })
     expect(out[0].outcome).toBe('still_deferred')
     expect(await listCeloRetries(env)).toHaveLength(1)
@@ -1001,7 +1016,7 @@ describe('Celo retry queue (cron re-drive)', () => {
     await enqueueCeloRetry(env, { provider: 'stripe', ref: 'stripe_crypto_cpis_old2', rozoPaymentId: ROZO_ID, eventType: 'payment_payout_completed', reason: 'x' }, old)
     const out = await runCeloRetries(env, async (_env, e) => {
       await enqueueCeloRetry(env, { ...e, reason: 'own' }, new Date())
-      return { ok: true, deferred: 'celo_finality', reason: 'not finalized' }
+      return { ok: true, deferred: 'celo_finality', reason: 'not finalized', celoQueued: true }
     })
     expect(out[0].outcome).toBe('gave_up')
     expect(await listCeloRetries(env)).toHaveLength(0)
@@ -1197,6 +1212,14 @@ describe('Celo gate helpers', () => {
     for (const v of [undefined, 'on', 'OFF', ' off', 'no', '0']) {
       expect(celoFulfillmentPaused({ CELO_FULFILLMENT_PAUSED: v })).toBe(true)
     }
+  })
+
+  it('every spelling of 42220 a chain check accepts is Celo; junk is chain unknown', () => {
+    for (const v of ['042220', 'eip155:042220', '0x0a4ec', '0xA4EC', ' 42220 ']) {
+      expect(hasChain(v)).toBe(true)
+      expect(isCeloChain(v)).toBe(true)
+    }
+    for (const v of ['unknown', false, {}, '', null, undefined, 'eip155:', '0x']) expect(hasChain(v)).toBe(false)
   })
 
   it('recognises Celo chain spellings only', () => {

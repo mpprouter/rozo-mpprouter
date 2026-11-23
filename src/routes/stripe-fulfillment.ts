@@ -701,7 +701,7 @@ export async function handleStripeWebhookEvent(
       // Queue write failed (human paged by enqueueCeloRetry): the webhook
       // answers 503 so a retrying sender re-delivers (webhookStatusFor).
       if (!queued) return { ok: false, deferred: 'celo_finality', reason: celo.reason, orderId, retryQueueFailed: true }
-      return { ok: true, deferred: 'celo_finality', reason: celo.reason, orderId }
+      return { ok: true, deferred: 'celo_finality', reason: celo.reason, orderId, celoQueued: true }
     }
   }
 

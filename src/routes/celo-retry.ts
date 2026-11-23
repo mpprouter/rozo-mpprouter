@@ -207,14 +207,11 @@ export async function runCeloRetries(
         // Past the limit and still not paid: drop the entry only once the
         // alert is out. A failed alert keeps it and tries again next run.
         if (await alertGaveUp(env, { ...entry, lastReason: String(summary?.reason ?? entry.lastReason ?? '') || null })) {
-          // The re-drive above may have rescheduled the entry itself; clear
-          // the version read now, so a reschedule by anyone after this read
-          // is kept rather than deleted.
           // This run owns exactly: the version it re-drove, plus one bump when
-          // its own re-drive deferred again (the settle path re-enqueues on a
-          // Celo deferral, nowhere else). Any other attempt count means
-          // someone rescheduled the entry meanwhile: keep it.
-          const ownAttempts = entry.attempts + (stillDeferred ? 1 : 0)
+          // its own re-drive reported a successful queue write (celoQueued; a
+          // failed write reports none). Any other attempt count means someone
+          // rescheduled the entry meanwhile: keep it.
+          const ownAttempts = entry.attempts + (summary?.celoQueued === true ? 1 : 0)
           const cleared = await clearCeloRetryIfAttempts(env, entry.ref, entry.firstAt, ownAttempts)
           out.push({ ref: entry.ref, outcome: cleared ? 'gave_up' : 'still_deferred', detail: cleared ? undefined : 'rescheduled meanwhile; kept' })
         } else {

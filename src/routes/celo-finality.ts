@@ -57,9 +57,20 @@ export function celoFulfillmentPaused(env: CeloGateEnv): boolean {
 
 /** True for any spelling of Celo mainnet a payload may carry. */
 export function isCeloChain(v: unknown): boolean {
-  if (v === undefined || v === null) return false
+  if (typeof v !== 'string' && typeof v !== 'number') return false
   const s = String(v).trim().toLowerCase()
-  return s === CELO_CHAIN_ID || s === `eip155:${CELO_CHAIN_ID}` || s === '0xa4ec' || s === 'celo'
+  if (s === 'celo') return true
+  // Compare numerically so every spelling hasChain accepts ("042220",
+  // "eip155:042220", "0x0a4ec") is recognised: no spelling of 42220 can read
+  // as a confirmed non-Celo chain.
+  try {
+    const dec = /^(?:eip155:)?([0-9]+)$/.exec(s)
+    if (dec) return BigInt(dec[1]) === BigInt(CELO_CHAIN_ID)
+    if (/^0x[0-9a-f]+$/.test(s)) return BigInt(s) === BigInt(CELO_CHAIN_ID)
+  } catch {
+    return false
+  }
+  return false
 }
 
 /**

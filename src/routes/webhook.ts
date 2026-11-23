@@ -28,7 +28,7 @@ import {
   normalizeCoinbasePayment,
 } from './invoice-provider'
 import { coinbaseDailyCapAtomic, releaseDailySpend, reserveDailySpend } from './stripe-fulfillment'
-import { celoGateAlertText, celoSettlementGate, type CeloGateResult } from './celo-finality'
+import { celoGateAlertText, celoSettlementGate, isCeloChain, type CeloGateResult } from './celo-finality'
 import { enqueueCeloRetry, type CeloRetryProvider } from './celo-retry'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
@@ -861,7 +861,9 @@ export async function deferForCeloGate(
   // sender that retries non-2xx re-delivers the event; its dedup marker was
   // forgotten above. Nothing was paid either way.
   if (!queued) return { ok: false, deferred: 'celo_finality', reason: gate.reason, plId, retryQueueFailed: true }
-  return { ok: true, deferred: 'celo_finality', reason: gate.reason, plId }
+  // celoQueued: this call itself wrote one retry-queue bump (celo-retry.ts
+  // uses it to know which attempt count it owns at give-up time).
+  return { ok: true, deferred: 'celo_finality', reason: gate.reason, plId, celoQueued: true }
 }
 
 /** HTTP status for a webhook whose Celo deferral could not be queued. */
@@ -1104,6 +1106,20 @@ export async function settleCoinbaseEvent(
     // webhook (the sweep's stuck alert asks for exactly that) or a replay is
     // processed again instead of being dropped as already seen.
     await env.MPP_STORE.delete(eventKvKey(eventId)).catch(() => undefined)
+    // A Celo event (by its own hint) whose order could not be read yet has no
+    // other automatic trigger once both webhooks are consumed: queue the same
+    // re-drive the Celo gate uses (it re-runs this path, binding included).
+    if (isCeloChain(evt.data?.source?.chainId)) {
+      const queued = await enqueueCeloRetry(env, {
+        provider: 'coinbase',
+        ref: plId,
+        rozoPaymentId: rozoPaymentId ?? rec.settlingRozoPaymentId ?? rec.rozoPaymentId ?? null,
+        eventType,
+        reason: `order binding unverified: ${binding.reason}`,
+      })
+      if (!queued) return { ok: false, deferred: 'order_binding_unverified', reason: binding.reason, plId, retryQueueFailed: true }
+      return { ok: true, deferred: 'order_binding_unverified', reason: binding.reason, plId, celoQueued: true }
+    }
     return { ok: true, deferred: 'order_binding_unverified', reason: binding.reason, plId }
   }
 
