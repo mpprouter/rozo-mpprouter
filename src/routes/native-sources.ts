@@ -34,10 +34,50 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
   // Arc (founder 2026-10-28, /arc Beta page). Upstream intake is gated by
   // app_config arc_intake_enabled; when off, rozo-intents refuses the order.
   // Arc's native USDC is the same balance as its ERC-20 view, so only the
-  // ERC-20 view is a source. Celo (42220) is NOT a source yet: no
-  // merchant_openrouter order has run there; it ships later with its own
-  // founder approval.
+  // ERC-20 view is a source.
   '5042': ['USDC'],           // Arc
+}
+
+/**
+ * Beta stablecoin sources, keyed "TOKEN@chainId". Closed by default: a key
+ * opens only when it is listed in NATIVE_SOURCES_BETA AND the request carries
+ * `?beta=<param>` (the same two-step opt-in as the beta native coins, see
+ * withBetaSources). Opening one adds it to the request's allowed set, which
+ * supportedSources / stableTokensFor read.
+ *
+ * Celo USDT and Celo USDC (founder 2026-11-23 "开", both 6 decimals; design
+ * ainative docs/design/20261122-celo-stablecoins-payin-implementation.zh.md
+ * A2): only behind `?beta=celo`, each key listed separately in
+ * NATIVE_SOURCES_BETA. Every Celo-sourced settlement is gated by finality
+ * (routes/celo-finality.ts), so a Celo payin is paid out ~25 to 30 minutes
+ * after it lands; create-invoice refuses a link that expires sooner than
+ * CELO_MIN_LINK_LIFE_MS. Per-order, daily and outstanding Celo limits live in
+ * rozo-intents-api (500 / 2,000 / 2,000 USD, both coins combined); this
+ * router holds no Celo amount limit of its own.
+ */
+export const CELO_USDT_BETA_KEY = 'USDT@42220'
+export const CELO_USDC_BETA_KEY = 'USDC@42220'
+export const BETA_STABLE_SOURCES: Readonly<Record<string, { chainId: string; token: 'USDC' | 'USDT'; param: string }>> = {
+  [CELO_USDT_BETA_KEY]: { chainId: '42220', token: 'USDT', param: 'celo' },
+  [CELO_USDC_BETA_KEY]: { chainId: '42220', token: 'USDC', param: 'celo' },
+}
+
+/** The beta key a Celo order paying `tokenSymbol` needs opened; null for any other token (fail closed). */
+export function celoBetaKeyFor(tokenSymbol: string | null | undefined): string | null {
+  const s = typeof tokenSymbol === 'string' ? tokenSymbol.trim().toUpperCase() : ''
+  if (s === 'USDT') return CELO_USDT_BETA_KEY
+  if (s === 'USDC') return CELO_USDC_BETA_KEY
+  return null
+}
+
+/** Stable tokens accepted on `chainId` for a request: STABLE_SOURCES plus any opened beta stable key. */
+export function stableTokensFor(chainId: string, allowed: ReadonlySet<string> = new Set()): readonly ('USDC' | 'USDT')[] | undefined {
+  const base = STABLE_SOURCES[chainId]
+  const extra = Object.entries(BETA_STABLE_SOURCES)
+    .filter(([key, d]) => d.chainId === chainId && allowed.has(key))
+    .map(([, d]) => d.token)
+  if (extra.length === 0) return base
+  return [...new Set([...(base ?? []), ...extra])]
 }
 
 
@@ -306,12 +346,12 @@ export function parseNativeSources(raw: string | undefined): Set<string> {
   return out
 }
 
-/** Parse NATIVE_SOURCES_BETA ("ZEC@9133") into known beta keys. */
+/** Parse NATIVE_SOURCES_BETA ("ZEC@9133") into known beta keys (beta native coins and BETA_STABLE_SOURCES). */
 export function parseBetaNativeSources(raw: string | undefined): Set<string> {
   const out = new Set<string>()
   for (const part of (raw ?? '').split(',')) {
     const key = part.trim().toUpperCase()
-    if (BETA_NATIVE_SOURCES.has(key)) out.add(key)
+    if (BETA_NATIVE_SOURCES.has(key) || key in BETA_STABLE_SOURCES) out.add(key)
   }
   return out
 }
@@ -376,7 +416,10 @@ export function withBetaSources(
   if (asked.size === 0) return base
   const out = new Set(base)
   for (const key of parseBetaNativeSources(betaRaw)) {
-    if (asked.has(key.split('@')[0].toLowerCase())) out.add(key)
+    // A beta stable source opens under its own param name (`?beta=celo`),
+    // never under its token symbol (`?beta=usdt` would be ambiguous).
+    const param = BETA_STABLE_SOURCES[key]?.param ?? key.split('@')[0].toLowerCase()
+    if (asked.has(param)) out.add(key)
   }
   return out
 }
@@ -509,6 +552,11 @@ export function supportedSources(
 ): Record<string, string[]> {
   const out: Record<string, string[]> = {}
   for (const [chainId, tokens] of Object.entries(stable)) out[chainId] = [...tokens]
+  for (const [key, d] of Object.entries(BETA_STABLE_SOURCES)) {
+    if (!nativeAllowed.has(key)) continue
+    const cur = out[d.chainId] ?? []
+    if (!cur.includes(d.token)) out[d.chainId] = [...cur, d.token]
+  }
   for (const [chainId, def] of Object.entries(NATIVE_SOURCE_DEFS)) {
     if (!nativeAllowed.has(`${def.symbol}@${chainId}`)) continue
     out[chainId] = [...(out[chainId] ?? []), def.symbol]
