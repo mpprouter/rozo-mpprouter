@@ -691,7 +691,7 @@ export async function handleRozoWebhook(
     // real summary.
     ctx?.waitUntil(settlement.catch(() => undefined))
     const summary = await settlement
-    return json(200, summary)
+    return json(webhookStatusFor(summary), summary)
   }
 
   // 6. Coinbase settlement. Same reasoning as the Stripe branch above: Rozo's
@@ -711,7 +711,7 @@ export async function handleRozoWebhook(
   })
   ctx?.waitUntil(settlement.catch(() => undefined))
   const summary = await settlement
-  return json(200, summary)
+  return json(webhookStatusFor(summary), summary)
 }
 
 // True only when the pay-invoice response proves Coinbase CAPTURED the
@@ -841,7 +841,7 @@ export async function deferForCeloGate(
   await forgetWebhookEvent(env, eventId)
   // Queue the automatic re-drive (celo-retry.ts): the cron re-runs this same
   // settle path, and so this gate, every few minutes for up to 3 hours.
-  await enqueueCeloRetry(env, {
+  const queued = await enqueueCeloRetry(env, {
     provider: retry.provider,
     ref: plId,
     rozoPaymentId: retry.rozoPaymentId ?? rec.settlingRozoPaymentId ?? rec.rozoPaymentId ?? null,
@@ -856,7 +856,20 @@ export async function deferForCeloGate(
       console.warn(`[webhook] celo gate alert error (non-fatal): ${err instanceof Error ? err.message : String(err)}`)
     }
   }
+  // Queue write failed (a human was already paged by enqueueCeloRetry): the
+  // webhook answers 503 (CELO_RETRY_QUEUE_FAILED_STATUS) instead of 200, so a
+  // sender that retries non-2xx re-delivers the event; its dedup marker was
+  // forgotten above. Nothing was paid either way.
+  if (!queued) return { ok: false, deferred: 'celo_finality', reason: gate.reason, plId, retryQueueFailed: true }
   return { ok: true, deferred: 'celo_finality', reason: gate.reason, plId }
+}
+
+/** HTTP status for a webhook whose Celo deferral could not be queued. */
+export const CELO_RETRY_QUEUE_FAILED_STATUS = 503
+
+/** 200 normally; 503 when a Celo deferral was not persisted to the retry queue. */
+export function webhookStatusFor(summary: Record<string, unknown> | null | undefined): number {
+  return summary && summary.retryQueueFailed === true ? CELO_RETRY_QUEUE_FAILED_STATUS : 200
 }
 
 export interface CoinbaseEventInput {

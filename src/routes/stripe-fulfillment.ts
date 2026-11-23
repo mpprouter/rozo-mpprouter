@@ -688,7 +688,7 @@ export async function handleStripeWebhookEvent(
     if (celo.applies && !celo.ok) {
       await forgetWebhookEvent(env, input.eventId)
       // Automatic re-drive by the cron (celo-retry.ts) through this same path.
-      await enqueueCeloRetry(env, {
+      const queued = await enqueueCeloRetry(env, {
         provider: 'stripe',
         ref: orderId,
         rozoPaymentId: input.rozoPaymentId,
@@ -698,6 +698,9 @@ export async function handleStripeWebhookEvent(
       if (celo.alert && alertSinkConfigured(env)) {
         await sendAlert(env, redactForAlert(celoGateAlertText(orderId, celo.reason))).catch(() => false)
       }
+      // Queue write failed (human paged by enqueueCeloRetry): the webhook
+      // answers 503 so a retrying sender re-delivers (webhookStatusFor).
+      if (!queued) return { ok: false, deferred: 'celo_finality', reason: celo.reason, orderId, retryQueueFailed: true }
       return { ok: true, deferred: 'celo_finality', reason: celo.reason, orderId }
     }
   }

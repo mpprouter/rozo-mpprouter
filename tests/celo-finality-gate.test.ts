@@ -12,7 +12,7 @@
  */
 
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest'
-import { handleRozoWebhook, type FulfillmentRecord } from '../src/routes/webhook'
+import { handleRozoWebhook, webhookStatusFor, type FulfillmentRecord } from '../src/routes/webhook'
 import { listPausedDeliveries, recordPausedDelivery } from '../src/routes/checkout-control'
 import { replayPausedDeliveries } from '../src/routes/checkout-control-admin'
 import { handleAdminPayInvoice } from '../src/routes/pay-invoice-admin'
@@ -694,6 +694,27 @@ describe('Celo gate: Stripe settle entry', () => {
     expect((await listCeloRetries(env))[0]).toMatchObject({ provider: 'stripe', ref: 'stripe_crypto_cpis_celoTest' })
   })
 
+  it('event names Base but the Rozo order is Celo: the order wins, gated, nothing paid', async () => {
+    const { calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv()
+    const summary = await handleStripeWebhookEvent(
+      env,
+      {
+        eventId: 'evt-stripe-basehint',
+        eventType: 'payment_payout_completed',
+        orderId: 'stripe_crypto_cpis_celoTest',
+        rozoPaymentId: ROZO_ID,
+        invoiceAmountStr: '1.00',
+        sourceChainId: '8453',
+        sourceTxHash: TX,
+      },
+      new Date(),
+    )
+    expect(summary.deferred).toBe('celo_finality')
+    expect(calls.orderGet).toBeGreaterThan(0)
+    expect(calls.pay).toBe(0)
+  })
+
   it('no source chain on the event (e.g. ambiguous retry): reads the order, Celo is gated', async () => {
     const { calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
     const { env } = makeEnv()
@@ -796,6 +817,24 @@ describe('Celo retry queue (cron re-drive)', () => {
     expect(calls.pay).toBe(0)
     expect(calls.alerts.filter((a) => a.includes('after 3 hours'))).toHaveLength(1)
     expect(await listCeloRetries(env)).toHaveLength(0)
+  })
+
+  it('paused for more than 3 hours, then resumed with the payin finalized: paid once, not dropped', async () => {
+    const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env, kv } = makeEnv()
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    ;(env as any).CELO_FULFILLMENT_PAUSED = 'on'
+    let out = await sweepCeloRetries(env, new Date(t0 + 2 * 60 * MIN))
+    expect(out[0].outcome).toBe('paused_kept')
+    ;(env as any).CELO_FULFILLMENT_PAUSED = 'off'
+    up.rpc1 = FINAL_OK
+    up.rpc2 = FINAL_OK
+    out = await sweepCeloRetries(env, new Date(t0 + 5 * 60 * MIN))
+    expect(out[0].outcome).toBe('handed_back')
+    expect(calls.pay).toBe(1)
+    expect(rec(kv).status).toBe('paid')
+    expect(calls.alerts.filter((a) => a.includes('after 3 hours'))).toHaveLength(0)
   })
 
   it('Rozo order unreadable during a retry: kept and rescheduled', async () => {
@@ -985,6 +1024,15 @@ describe('Celo gate: internal rozotest_ orders', () => {
     expect(trec(kv).status).toBe('test_settled')
   })
 
+  it('test event names Base but the Rozo order is Celo and not finalized: stays open', async () => {
+    const { calls } = stub({ order: testOrder(), rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env, kv } = makeEnv()
+    const res = (await (await handleRozoWebhook(await signed(testEvent('payment_payout_completed', { chainId: '8453' })), env)).json()) as any
+    expect(res.deferred).toBe('celo_finality')
+    expect(trec(kv).status).not.toBe('test_settled')
+    expect(calls.pay).toBe(0)
+  })
+
   it('a Base test order closes as before, with no Celo reads', async () => {
     const { calls } = stub({ order: boundRozoOrder(ROZO_ID, TID) })
     const { env, kv } = makeEnv({ CELO_FULFILLMENT_PAUSED: undefined })
@@ -1016,6 +1064,12 @@ describe('Celo gate helpers', () => {
     expect(parseTokenAtomic('1.0000001', 6)).toBeNull()
     expect(parseTokenAtomic('-1', 6)).toBeNull()
     expect(parseTokenAtomic('abc', 6)).toBeNull()
+  })
+
+  it('webhook answers 503 only when a Celo deferral could not be queued', () => {
+    expect(webhookStatusFor({ ok: true, deferred: 'celo_finality' })).toBe(200)
+    expect(webhookStatusFor({ ok: false, deferred: 'celo_finality', retryQueueFailed: true })).toBe(503)
+    expect(webhookStatusFor(null)).toBe(200)
   })
 
   it('maps token symbol when the address is absent', () => {

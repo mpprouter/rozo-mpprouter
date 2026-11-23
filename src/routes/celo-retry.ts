@@ -180,12 +180,21 @@ export async function runCeloRetries(
   for (const entry of due.slice(0, CELO_RETRY_MAX_PER_RUN)) {
     try {
       const first = Date.parse(entry.firstAt)
-      if (Number.isFinite(first) && nowMs - first > CELO_RETRY_MAX_AGE_MS) {
-        // Stop paying attempts; drop the entry only once the alert is out. A
-        // failed alert keeps the entry (no further re-drive past the limit)
-        // and tries the alert again next run.
-        if (await alertGaveUp(env, entry)) {
-          await clearCeloRetry(env, entry.ref, entry)
+      const expired = Number.isFinite(first) && nowMs - first > CELO_RETRY_MAX_AGE_MS
+      // Always re-drive first, even past the 3 h limit: the settle path re-runs
+      // the gate and pays only through the idempotent machinery, so a payin
+      // that finalized while Celo was paused (the queue does not age while
+      // paused, but firstAt keeps counting) is still paid on the first run
+      // after resume instead of being dropped unchecked.
+      const eventId = `celo-retry:${entry.ref}:${entry.attempts + 1}:${crypto.randomUUID()}`
+      const summary = await redrive(env, entry, eventId)
+      const stillDeferred = summary?.deferred === 'celo_finality'
+      const keep = summary?.deferred === 'rozo_unreadable' || summary?.celoRetryKeep === true
+      if ((stillDeferred || keep) && expired) {
+        // Past the limit and still not paid: drop the entry only once the
+        // alert is out. A failed alert keeps it and tries again next run.
+        if (await alertGaveUp(env, { ...entry, lastReason: String(summary?.reason ?? entry.lastReason ?? '') || null })) {
+          await clearCeloRetry(env, entry.ref)
           out.push({ ref: entry.ref, outcome: 'gave_up' })
         } else {
           await enqueueCeloRetry(env, { ...entry, reason: entry.lastReason ?? 'give-up alert not delivered' }, now)
@@ -193,16 +202,14 @@ export async function runCeloRetries(
         }
         continue
       }
-      const eventId = `celo-retry:${entry.ref}:${entry.attempts + 1}:${crypto.randomUUID()}`
-      const summary = await redrive(env, entry, eventId)
-      if (summary?.deferred === 'celo_finality') {
+      if (stillDeferred) {
         out.push({ ref: entry.ref, outcome: 'still_deferred', detail: String(summary.reason ?? '') })
         continue
       }
       // Not paid and nothing else owns it yet (order unreadable, binding not
       // verifiable right now, funder short on a payin event, daily cap...):
       // keep it, with backoff, until it is paid or the 3 h limit alerts.
-      if (summary?.deferred === 'rozo_unreadable' || summary?.celoRetryKeep === true) {
+      if (keep) {
         const why = String(summary.reason ?? summary.deferred ?? summary.celoRetryRecordStatus ?? 'not paid yet')
         await enqueueCeloRetry(env, { ...entry, reason: why }, now)
         out.push({ ref: entry.ref, outcome: 'still_deferred', detail: why })

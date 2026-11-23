@@ -100,21 +100,28 @@ export async function celoSettlementGate(
   deps: CeloGateDeps = {},
 ): Promise<CeloGateResult> {
   let order = input.order ?? null
-  const hints = [...input.chainHints, orderSourceChain(order)]
-  // No source chain known at all (a caller that carries none, e.g. the Stripe
-  // ambiguous retry): the Rozo order is the authority. Read it before deciding
-  // whether the gate applies; unreadable = refuse (the chain is unknown).
-  const known = hints.some((h) => h !== undefined && h !== null && String(h).trim() !== '')
-  if (!known && !order && input.loadOrder) {
+  // The Rozo order is the authority on the source chain. Whenever the caller
+  // can read it (Stripe settle, rozotest_ close, Bitrefill fallback), read it
+  // BEFORE deciding whether the gate applies, so an event that names another
+  // chain cannot skip the gate for an order that is really Celo. A failed read
+  // is not fatal for an event that names a non-Celo chain (signed by Rozo;
+  // other chains stay unchanged), but with no chain known at all it refuses.
+  let loadFailed = false
+  if (!order && input.loadOrder) {
     try {
       order = await input.loadOrder()
     } catch {
       order = null
     }
     if (!order || typeof order !== 'object') {
-      return { applies: true, ok: false, reason: 'source chain unknown: Rozo order unreadable', alert: false }
+      order = null
+      loadFailed = true
     }
-    hints.push(orderSourceChain(order))
+  }
+  const hints = [...input.chainHints, orderSourceChain(order)]
+  const known = hints.some((h) => h !== undefined && h !== null && String(h).trim() !== '')
+  if (!known && loadFailed) {
+    return { applies: true, ok: false, reason: 'source chain unknown: Rozo order unreadable', alert: false }
   }
   if (!hints.some(isCeloChain)) return { applies: false }
 
@@ -122,13 +129,6 @@ export async function celoSettlementGate(
     return { applies: true, ok: false, reason: 'celo_fulfillment_paused', alert: false }
   }
 
-  if (!order && input.loadOrder) {
-    try {
-      order = await input.loadOrder()
-    } catch {
-      order = null
-    }
-  }
   if (!order || typeof order !== 'object') {
     return { applies: true, ok: false, reason: 'Rozo order unreadable', alert: false }
   }

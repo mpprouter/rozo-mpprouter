@@ -26,6 +26,13 @@ import type { Env } from '../src/index'
 // Implements the DO's /read + /commit versioned-CAS contract so the code under
 // test exercises the SAME linearizable path it uses in production. Storage is a
 // single Map keyed by `v:<k>` / `n:<k>`, mirroring the real DO's key layout.
+// Calls other than the Celo gate's read of the Rozo order (GET /payments/:id),
+// which runs on every Stripe settle event since the order is the authority on
+// the source chain (celo-finality.ts).
+function nonOrderReads(spy: { mock: { calls: unknown[][] } }): unknown[][] {
+  return spy.mock.calls.filter((c) => !/\/payment-api\/payments\/[^/]+$/.test(String(c[0])))
+}
+
 function makeDoNamespace() {
   const store = new Map<string, string>() // v:<k>
   const versions = new Map<string, number>() // n:<k>
@@ -372,7 +379,7 @@ describe('handleStripeWebhookEvent', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'evPaused' }), new Date(Date.UTC(2026, 6, 12)))
     expect(summary.deferred).toBe('checkout_paused')
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(nonOrderReads(fetchSpy)).toHaveLength(0)
     expect((await loadRec(env, 'cpis_wh')).status).toBe('payout_seen')
     // This file's DO stub has no /scan; read the index key directly.
     const entry = JSON.parse((await casRead(env, checkoutBacklogKey('stripe_crypto_cpis_wh'))).value!)
@@ -392,7 +399,7 @@ describe('handleStripeWebhookEvent', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev2' }), new Date(Date.UTC(2026, 6, 12)))
     expect(summary.already_in_flight).toBe(true)
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(nonOrderReads(fetchSpy)).toHaveLength(0)
   })
 
   it('two concurrent events → only ONE reaches pay-invoice (double-sign serializer)', async () => {
@@ -474,7 +481,7 @@ describe('handleStripeWebhookEvent', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'evmr2', orderId: 'stripe_crypto_cpis_mr', eventType: 'payment_payout_completed' }), new Date(Date.UTC(2026, 6, 12)))
     // Stays terminal manual_review; pay-invoice is never called.
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(nonOrderReads(fetchSpy)).toHaveLength(0)
     const rec = await loadRec(env, 'cpis_mr')
     expect(rec.status).toBe('manual_review')
   })

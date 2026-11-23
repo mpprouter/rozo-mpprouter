@@ -105,10 +105,32 @@ describe('fund guard', () => {
   })
 })
 
+// The Celo gate (celo-finality.ts) reads the Rozo order (GET
+// /payment-api/payments/:id) before a test order closes, since the order is
+// the authority on the source chain. This stub answers that read with a Base
+// order and records every OTHER call; `queue` answers those in order (the last
+// one repeats). No real network is touched.
+function spyFetch(...queue: Array<() => Response>) {
+  const calls: Array<[string, RequestInit | undefined]> = []
+  const orderReads: string[] = []
+  vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: RequestInit) => {
+    const u = String(input instanceof Request ? input.url : input)
+    if (/\/payment-api\/payments\/[^/]+$/.test(u) && (!init?.method || init.method === 'GET')) {
+      orderReads.push(u)
+      return new Response(JSON.stringify({ id: RPID, source: { chainId: '8453' } }), { status: 200 })
+    }
+    calls.push([u, init])
+    const make = queue.length > 1 ? queue.shift()! : queue[0]
+    if (!make) throw new Error(`unexpected fetch ${u}`)
+    return make()
+  }) as typeof fetch)
+  return { calls, orderReads }
+}
+
 describe('webhook: test order', () => {
   it('payin then payout marks test_settled with no funder, Coinbase or alert traffic', async () => {
     const env = webhookEnv()
-    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const { calls: fetchCalls } = spyFetch()
     const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 10, 'abcdef12')
     const base = { data: { id: RPID, orderId: id, source: { amount: '0.10', chainId: '8453' }, destination: { amount: '0.10' } } }
@@ -118,7 +140,7 @@ describe('webhook: test order', () => {
     const r2 = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'e2', type: 'payment_payout_completed' }), env)
     expect(await r2.json()).toMatchObject({ ok: true, test_invoice: true, status: 'test_settled' })
 
-    expect(fetchSpy).not.toHaveBeenCalled() // no balance RPC, no agentapi, no DingTalk/Feishu
+    expect(fetchCalls).toHaveLength(0) // no balance RPC, no agentapi, no DingTalk/Feishu
     const rec = JSON.parse(env.MPP_STORE._store.get(`invoice-fulfillment:${id}`))
     expect(rec.status).toBe('test_settled')
     expect(log.mock.calls.map((c) => String(c[0])).join('\n')).toContain(`[test-order] order_id=${id} rozo_payment_id=${RPID} event=payment_payout_completed status=test_settled`)
@@ -126,12 +148,12 @@ describe('webhook: test order', () => {
 
   it('a contract-variant test order is handled the same way', async () => {
     const env = webhookEnv()
-    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const { calls: fetchCalls } = spyFetch()
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 10, 'abcdef13')
     const r = await handleRozoWebhook(await signedWebhook({ event_id: 'e3', type: 'payment_payout_completed', data: { id: RPID, orderId: `${id}__contract`, source: { chainId: '8453' } } }), env)
     expect(await r.json()).toMatchObject({ test_invoice: true, status: 'test_settled' })
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(fetchCalls).toHaveLength(0)
   })
 })
 
@@ -140,22 +162,23 @@ describe('webhook: test order delivery ack to Rozo', () => {
 
   it('payout reports delivered once (so the Rozo reconciliation alert stays quiet); a non-alpha payin is refused by Rozo and does not close', async () => {
     const env = enabledEnv()
-    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const { calls: fetchCalls } = spyFetch(
       // payin: Rozo refuses the ack (not an alpha-settled order, payout pending)
-      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'invalidStatus' } }), { status: 409 }))
-      .mockResolvedValue(new Response('{}', { status: 200 }))
+      () => new Response(JSON.stringify({ error: { code: 'invalidStatus' } }), { status: 409 }),
+      () => new Response('{}', { status: 200 }),
+    )
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 10, 'abcdef14')
     const base = { data: { id: RPID, orderId: id, source: { amount: '0.10', chainId: '8453' }, destination: { amount: '0.10' } } }
 
     const r1 = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'd1', type: 'payment_payin_completed' }), env)
     expect(await r1.json()).toMatchObject({ test_invoice: true, status: 'payin_seen' })
-    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(fetchCalls).toHaveLength(1)
 
     const r = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'd2', type: 'payment_payout_completed' }), env)
     expect(await r.json()).toMatchObject({ test_invoice: true, status: 'test_settled' })
-    expect(fetchSpy).toHaveBeenCalledTimes(2)
-    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit]
+    expect(fetchCalls).toHaveLength(2)
+    const [url, init] = fetchCalls[1] as [string, RequestInit]
     expect(String(url)).toMatch(new RegExp(`/payments/${RPID}/delivered$`))
     expect(init.method).toBe('POST')
     expect((init.headers as Record<string, string>)['X-API-Key']).toBe('k')
@@ -165,16 +188,16 @@ describe('webhook: test order delivery ack to Rozo', () => {
 
     // A replayed payout is terminal: no second report.
     await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'd3', type: 'payment_payout_completed' }), env)
-    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(fetchCalls).toHaveLength(2)
   })
 
   it('a failed report never alerts; it only records the attempt', async () => {
     const env = enabledEnv()
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('no', { status: 500 }))
+    const { calls: fetchCalls } = spyFetch(() => new Response('no', { status: 500 }))
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 10, 'abcdef15')
     await handleRozoWebhook(await signedWebhook({ event_id: 'd4', type: 'payment_payout_completed', data: { id: RPID, orderId: id, source: { chainId: '8453' } } }), env)
-    expect(fetchSpy).toHaveBeenCalledTimes(1) // the delivered POST only; no DingTalk/Feishu
+    expect(fetchCalls).toHaveLength(1) // the delivered POST only; no DingTalk/Feishu
     const rec = JSON.parse(env.MPP_STORE._store.get(`invoice-fulfillment:${id}`))
     expect(rec.status).toBe('test_settled')
     expect(rec.deliveredReported).toBeFalsy()
@@ -187,7 +210,7 @@ describe('webhook: TRON / TON alpha test order (closes on payin, no payout exist
 
   it('payin_completed closes the test invoice when Rozo accepts the delivered ack (alpha-settled order)', async () => {
     const env = enabledEnv()
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }))
+    const { calls: fetchCalls } = spyFetch(() => new Response('{}', { status: 200 }))
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef21')
     const base = { data: { id: RPID, orderId: id, source: { amount: '1.01', chainId: '728126428' } } }
@@ -195,22 +218,23 @@ describe('webhook: TRON / TON alpha test order (closes on payin, no payout exist
     const r = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'a1', type: 'payment_payin_completed' }), env)
     expect(await r.json()).toMatchObject({ ok: true, test_invoice: true, status: 'test_settled' })
     // Only the delivered ack: no funder balance RPC, no agentapi, no alert sink.
-    expect(fetchSpy).toHaveBeenCalledTimes(1)
-    expect(String(fetchSpy.mock.calls[0][0])).toMatch(new RegExp(`/payments/${RPID}/delivered$`))
+    expect(fetchCalls).toHaveLength(1)
+    expect(String(fetchCalls[0][0])).toMatch(new RegExp(`/payments/${RPID}/delivered$`))
     const rec = JSON.parse(env.MPP_STORE._store.get(`invoice-fulfillment:${id}`))
     expect(rec.status).toBe('test_settled')
     expect(rec.deliveredReported).toBe(true)
 
     // The outbox re-sends the payin webhook: terminal, nothing more.
     await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'a2', type: 'payment_payin_completed' }), env)
-    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    expect(fetchCalls).toHaveLength(1)
   })
 
   it('any other rail (Rozo answers 409 on payin) keeps waiting for the payout, which then acks', async () => {
     const env = enabledEnv()
-    const fetchSpy = vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: 'invalidStatus' } }), { status: 409 }))
-      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+    const { calls: fetchCalls } = spyFetch(
+      () => new Response(JSON.stringify({ error: { code: 'invalidStatus' } }), { status: 409 }),
+      () => new Response('{}', { status: 200 }),
+    )
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef22')
     const base = { data: { id: RPID, orderId: id, source: { chainId: '728126428' } } }
@@ -218,7 +242,7 @@ describe('webhook: TRON / TON alpha test order (closes on payin, no payout exist
     expect(await r.json()).toMatchObject({ test_invoice: true, status: 'payin_seen' })
     const r2 = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'a4', type: 'payment_payout_completed' }), env)
     expect(await r2.json()).toMatchObject({ test_invoice: true, status: 'test_settled' })
-    expect(fetchSpy).toHaveBeenCalledTimes(2)
+    expect(fetchCalls).toHaveLength(2)
     const rec = JSON.parse(env.MPP_STORE._store.get(`invoice-fulfillment:${id}`))
     expect(rec.deliveredReported).toBe(true)
   })
