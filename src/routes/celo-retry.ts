@@ -27,7 +27,7 @@
 import type { Env } from '../index'
 import { alertSinkConfigured, sendAlert } from '../utils/alert'
 import { redactForAlert } from '../utils/alert-redaction'
-import { casRead, casScan, casUpdate } from './stripe-atomic'
+import { casScan, casUpdate } from './stripe-atomic'
 import { celoFulfillmentPaused } from './celo-finality'
 
 export const CELO_RETRY_PREFIX = 'celo-retry:v1:'
@@ -129,10 +129,17 @@ export async function clearCeloRetry(env: Env, ref: string, seen?: CeloRetryEntr
   })
 }
 
-/** The current entry for `ref`, or null (absent or cleared). */
-export async function readCeloRetry(env: Env, ref: string): Promise<CeloRetryEntry | null> {
-  const r = await casRead(env, celoRetryKey(ref))
-  return parseEntry(r.value)
+/**
+ * Remove the entry only if it is still the same generation (`firstAt`) at
+ * exactly `attempts`. Returns false (and keeps it) on any other state.
+ */
+export async function clearCeloRetryIfAttempts(env: Env, ref: string, firstAt: string, attempts: number): Promise<boolean> {
+  return casUpdate<boolean>(env, celoRetryKey(ref), (raw) => {
+    if (!raw) return { op: 'noop', result: true }
+    const cur = parseEntry(raw)
+    if (!cur || cur.firstAt !== firstAt || cur.attempts !== attempts) return { op: 'noop', result: false }
+    return { op: 'set', value: '', result: true }
+  })
 }
 
 export async function listCeloRetries(env: Env): Promise<CeloRetryEntry[]> {
@@ -203,9 +210,13 @@ export async function runCeloRetries(
           // The re-drive above may have rescheduled the entry itself; clear
           // the version read now, so a reschedule by anyone after this read
           // is kept rather than deleted.
-          const cur = await readCeloRetry(env, entry.ref)
-          if (cur) await clearCeloRetry(env, entry.ref, cur)
-          out.push({ ref: entry.ref, outcome: 'gave_up' })
+          // This run owns exactly: the version it re-drove, plus one bump when
+          // its own re-drive deferred again (the settle path re-enqueues on a
+          // Celo deferral, nowhere else). Any other attempt count means
+          // someone rescheduled the entry meanwhile: keep it.
+          const ownAttempts = entry.attempts + (stillDeferred ? 1 : 0)
+          const cleared = await clearCeloRetryIfAttempts(env, entry.ref, entry.firstAt, ownAttempts)
+          out.push({ ref: entry.ref, outcome: cleared ? 'gave_up' : 'still_deferred', detail: cleared ? undefined : 'rescheduled meanwhile; kept' })
         } else {
           await enqueueCeloRetry(env, { ...entry, reason: entry.lastReason ?? 'give-up alert not delivered' }, now)
           out.push({ ref: entry.ref, outcome: 'error', detail: 'give-up alert not delivered; kept' })

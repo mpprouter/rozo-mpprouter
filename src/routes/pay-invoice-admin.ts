@@ -114,6 +114,9 @@ async function celoRefusalForOrders(
   // A live order whose source chain cannot be read (no source.chainId nor
   // source_chain_id, or not an object) is "chain unknown": refuse, never treat
   // it as non-Celo.
+  // No Rozo order at all (no record ids and every slot answered "not found"):
+  // nothing proves the invoice is not Celo-sourced, so refuse as well.
+  if (orders.length === 0) return 'source chain unknown: no Rozo order found for this invoice'
   if (orders.some((o) => !o || typeof o !== 'object' || (!hasChain(orderSourceChain(o)) && isLive(o)))) {
     return 'source chain unknown: a Rozo order for this invoice carries no source chain'
   }

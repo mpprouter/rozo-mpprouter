@@ -62,9 +62,16 @@ export function isCeloChain(v: unknown): boolean {
   return s === CELO_CHAIN_ID || s === `eip155:${CELO_CHAIN_ID}` || s === '0xa4ec' || s === 'celo'
 }
 
-/** True when a chain value is present (non-empty), whatever chain it names. */
+/**
+ * True only for a recognisable source-chain id: a decimal chain id (optionally
+ * "eip155:"-prefixed), a 0x hex chain id, or a named chain this router knows
+ * ("lightning", "celo"). Anything else ("unknown", false, {}, "") is chain
+ * unknown, so it can never count as a confirmed non-Celo chain.
+ */
 export function hasChain(v: unknown): boolean {
-  return v !== undefined && v !== null && String(v).trim() !== ''
+  if (typeof v !== 'string' && typeof v !== 'number') return false
+  const s = String(v).trim().toLowerCase()
+  return /^(eip155:)?[0-9]+$/.test(s) || /^0x[0-9a-f]+$/.test(s) || s === 'lightning' || s === 'celo'
 }
 
 /** Source chain of a Rozo order row, in either spelling the API returns. */

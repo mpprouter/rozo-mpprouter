@@ -649,6 +649,24 @@ describe('Celo gate: manual /admin/pay-invoice', () => {
     expect(calls.pay).toBe(0)
   })
 
+  it('no record and every order slot "not found": 409 chain unknown, nothing sent', async () => {
+    const { calls } = stub({ order: null })
+    const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+    const fetchMock = globalThis.fetch as any
+    const inner = fetchMock.getMockImplementation()
+    fetchMock.mockImplementation(async (input: any, init?: any) => {
+      const u = String(input instanceof Request ? input.url : input)
+      if (u.includes('intentapiv4.rozo.ai')) {
+        return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
+      }
+      return inner(input, init)
+    })
+    const res = await handleAdminPayInvoice(adminPay(), env)
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as any).message).toContain('source chain unknown')
+    expect(calls.pay).toBe(0)
+  })
+
   it('a live order row with no source chain field: 409 chain unknown, nothing sent', async () => {
     const { calls } = stub({ order: { id: ROZO_ID, orderId: PL, status: 'payment_payin_completed', source: { amount: '1.00' } } })
     const { env, kv } = makeEnv()
@@ -728,6 +746,9 @@ describe('Celo gate: Stripe settle entry', () => {
   for (const [name, order] of [
     ['order read returns an object with no source chain', {}],
     ['order unreadable', null],
+    ['order chain is "unknown"', { id: ROZO_ID, source: { chainId: 'unknown' } }],
+    ['order chain is an object', { id: ROZO_ID, source: { chainId: {} } }],
+    ['order chain is false', { id: ROZO_ID, source: { chainId: false } }],
   ] as Array<[string, any]>) {
     it(`event names Base but ${name}: chain unknown, deferred and queued, nothing paid`, async () => {
       const { calls } = stub({ order })
@@ -735,7 +756,7 @@ describe('Celo gate: Stripe settle entry', () => {
       const summary = await handleStripeWebhookEvent(
         env,
         {
-          eventId: `evt-stripe-unknown-${order === null ? 'null' : 'empty'}`,
+          eventId: `evt-stripe-unknown-${name.replace(/\W+/g, '-')}`,
           eventType: 'payment_payout_completed',
           orderId: 'stripe_crypto_cpis_celoTest',
           rozoPaymentId: ROZO_ID,
@@ -956,6 +977,34 @@ describe('Celo retry queue (cron re-drive)', () => {
     expect(out[0].outcome).toBe('error')
     expect(await listCeloRetries(env)).toHaveLength(1)
     expect(calls.pay).toBe(0)
+  })
+
+  it('past 3 hours: an entry rescheduled by someone else during the re-drive is kept, not given up', async () => {
+    stub()
+    const { env } = makeEnv()
+    const old = new Date(Date.now() - 4 * 60 * MIN)
+    await enqueueCeloRetry(env, { provider: 'stripe', ref: 'stripe_crypto_cpis_old', rozoPaymentId: ROZO_ID, eventType: 'payment_payout_completed', reason: 'x' }, old)
+    const out = await runCeloRetries(env, async (_env, e) => {
+      // Own deferral (+1) AND a concurrent webhook deferral (+1).
+      await enqueueCeloRetry(env, { ...e, reason: 'own' }, new Date())
+      await enqueueCeloRetry(env, { ...e, reason: 'concurrent' }, new Date())
+      return { ok: true, deferred: 'celo_finality', reason: 'not finalized' }
+    })
+    expect(out[0].outcome).toBe('still_deferred')
+    expect(await listCeloRetries(env)).toHaveLength(1)
+  })
+
+  it('past 3 hours with only its own deferral: given up and removed after the alert', async () => {
+    stub()
+    const { env } = makeEnv()
+    const old = new Date(Date.now() - 4 * 60 * MIN)
+    await enqueueCeloRetry(env, { provider: 'stripe', ref: 'stripe_crypto_cpis_old2', rozoPaymentId: ROZO_ID, eventType: 'payment_payout_completed', reason: 'x' }, old)
+    const out = await runCeloRetries(env, async (_env, e) => {
+      await enqueueCeloRetry(env, { ...e, reason: 'own' }, new Date())
+      return { ok: true, deferred: 'celo_finality', reason: 'not finalized' }
+    })
+    expect(out[0].outcome).toBe('gave_up')
+    expect(await listCeloRetries(env)).toHaveLength(0)
   })
 
   it('an entry rescheduled while its re-drive ran is kept, not deleted (version-checked clear)', async () => {
