@@ -46,7 +46,7 @@ const KEY = `invoice-fulfillment:${PL}`
 const FORNO = 'https://forno.celo.org'
 const CELO2 = 'https://celo-mainnet.g.alchemy.test/v2/test'
 // Code default for the second RPC when CELO_RPC_URL is unset (celo-finality.ts).
-const CELO_DEFAULT2 = 'https://1rpc.io/celo'
+const CELO_DEFAULT2 = 'https://celo.drpc.org'
 const CELO_USDT = '0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e'
 const CELO_USDC = '0xcebA9300f2b948710d2653dD7B07f33A8B32118C'
 const RECEIVER = '0x1111111111111111111111111111111111111111'
@@ -304,7 +304,7 @@ describe('Celo gate: webhook payin_completed', () => {
     expect(calls.celoRpc).toBe(0)
   })
 
-  it('CELO_RPC_URL unset: the code default 1rpc.io/celo is the second RPC, no secret needed; pays once', async () => {
+  it('CELO_RPC_URL unset: the code default celo.drpc.org is the second RPC, no secret needed; pays once', async () => {
     const seen: string[] = []
     const { calls } = stub()
     const inner = globalThis.fetch
@@ -348,7 +348,7 @@ describe('Celo gate: webhook payin_completed', () => {
     ['payin tx reverted', { rpc1: { ...FINAL_OK, receipt: celoReceipt({ status: '0x0' }) } }, {}],
     ['second RPC is forno again', {}, { CELO_RPC_URL: 'https://forno.celo.org/other' }],
     ['second RPC is not https', {}, { CELO_RPC_URL: 'http://celo.example/rpc' }],
-    ['second RPC unset, default 1rpc finalized tag missing', { rpc2: { ...FINAL_OK, finalized: null } }, { CELO_RPC_URL: undefined }],
+    ['second RPC unset, default drpc finalized tag missing', { rpc2: { ...FINAL_OK, finalized: null } }, { CELO_RPC_URL: undefined }],
     ['Rozo order has no payin tx hash', { order: celoOrder({}, { txHash: null }) }, {}],
   ]
   for (const [name, up, envOver] of unreadable) {

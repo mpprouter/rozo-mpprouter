@@ -513,7 +513,7 @@ export interface Env {
   CELO_FULFILLMENT_PAUSED?: string
   // Second, independent Celo mainnet RPC for the finality check; the first is
   // the public forno.celo.org (cLabs). Plain [vars] entry in wrangler.toml
-  // (public 1rpc.io/celo endpoint, no key, not a secret). Unset or blank falls back to
+  // (public celo.drpc.org endpoint, no key, not a secret; never 1rpc.io or publicnode). Unset or blank falls back to
   // CELO_SECOND_RPC_DEFAULT (same URL); a value on forno's host or not https
   // is refused, so every Celo-sourced order is then deferred (never paid).
   CELO_RPC_URL?: string
