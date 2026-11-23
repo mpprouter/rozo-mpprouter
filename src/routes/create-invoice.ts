@@ -2735,12 +2735,6 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         })
       }
 
-      // Celo (beta) gates on the row we are about to hand back (see celoReuseBlock).
-      {
-        const celoBlock = await celoReuseBlock(row, rowSource)
-        if (celoBlock) return celoBlock
-      }
-
       // BTC rail invariant on the row we are about to hand back.
       {
         const violation = btcRailViolation(rowSource.chainId === source.chainId ? source : { chainId: String(rowSource.chainId ?? '') }, row)
@@ -2783,6 +2777,13 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
       if (linkId && row?.id) {
         const reusedUrl = raw_url || coinbaseLinkFromId(linkId)
         if (reusedUrl) await deferBestEffort(ctx, saveOriginalPaymentLink(env, { rozoPaymentId: String(row.id), provider: 'coinbase', orderRef: linkId, url: reusedUrl }))
+      }
+      // Celo (beta) gates on the row we are about to hand back (see
+      // celoReuseBlock), after the last await so the link life is checked at
+      // hand-out time.
+      {
+        const celoBlock = await celoReuseBlock(row, rowSource)
+        if (celoBlock) return celoBlock
       }
       return json(200, {
         ok: true,
@@ -3139,16 +3140,17 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           // shielded create racing for the slot): report it, never hand it
           // over silently or switch it (same rule as the reuse path).
           const winnerModeMismatch = zecReceiveDiffers(winnerSource, source)
-          // Celo (beta) gates on the winner too: a plain request can lose the
-          // slot race to a ?beta=celo create (celoReuseBlock).
-          {
-            const celoBlock = await celoReuseBlock(winner, winnerSource)
-            if (celoBlock) return celoBlock
-          }
           // Reused order: make the stored link idempotent (founder 2026-10-26).
           if (linkId && winner?.id) {
             const reusedUrl = raw_url || coinbaseLinkFromId(linkId)
             if (reusedUrl) await deferBestEffort(ctx, saveOriginalPaymentLink(env, { rozoPaymentId: String(winner.id), provider: 'coinbase', orderRef: linkId, url: reusedUrl }))
+          }
+          // Celo (beta) gates on the winner too: a plain request can lose the
+          // slot race to a ?beta=celo create (celoReuseBlock). After the last
+          // await, so the link life is checked at hand-out time.
+          {
+            const celoBlock = await celoReuseBlock(winner, winnerSource)
+            if (celoBlock) return celoBlock
           }
           return json(200, {
             ok: true,
