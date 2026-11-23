@@ -213,6 +213,19 @@ describe('quote-invoice with Celo USDT', () => {
     expect(strip(beta.json)).toEqual(strip(plain.json))
   })
 
+  it('?beta=celo on a link shorter than CELO_MIN_LINK_LIFE_MS, or unknown expiry: Celo not offered, the rest unchanged', async () => {
+    const plain = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
+    linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
+    const short = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: '?beta=celo' })
+    expect(short.status).toBe(200)
+    expect(short.json.supportedSources['42220']).toBeUndefined()
+    expect(short.json.supportedSources).toEqual(plain.json.supportedSources)
+    linkExpiresAt = null
+    const unknown = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: '?beta=celo' })
+    expect(unknown.status).toBe(200)
+    expect(unknown.json.supportedSources['42220']).toBeUndefined()
+  })
+
   it('only USDT@42220 in NATIVE_SOURCES_BETA: Celo USDT listed, Celo USDC not', async () => {
     const r = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: makeEnv({ NATIVE_SOURCES_BETA: 'USDT@42220' }), query: '?beta=celo' })
     expect(r.json.supportedSources['42220']).toEqual(['USDT'])

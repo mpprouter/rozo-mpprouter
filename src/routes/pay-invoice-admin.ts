@@ -15,7 +15,14 @@ import {
   supportedSources,
   verifyTestPaymentId,
   withBetaSources,
+  CELO_USDC_BETA_KEY,
+  CELO_USDT_BETA_KEY,
 } from './native-sources'
+// Called at request time only, so the existing create-invoice <-> this module
+// import cycle is harmless (ESM live bindings).
+import { CELO_MIN_LINK_LIFE_MS, checkZecLinkExpiry, resolveCoinbaseLinkExpiry } from './create-invoice'
+
+const CELO_BETA_KEYS: readonly string[] = [CELO_USDT_BETA_KEY, CELO_USDC_BETA_KEY]
 import { createQuoteReceipt, quoteIdentity } from './quote-receipt'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { invoiceResolveRateLimit } from './invoice-details'
@@ -951,11 +958,20 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
 
   // Open native coins for this request: NATIVE_SOURCES plus any
   // NATIVE_SOURCES_BETA coin named by ?beta= (create-invoice reads the same).
-  const nativeAllowed = withBetaSources(
+  const nativeOpen = withBetaSources(
     parseNativeSources(env.NATIVE_SOURCES),
     env.NATIVE_SOURCES_BETA,
     request.url,
   )
+  // Celo (beta) is offered only on a link that outlives CELO_MIN_LINK_LIFE_MS,
+  // the same rule create-invoice enforces; unknown expiry hides it (fail
+  // closed). The extra Coinbase read runs only when a Celo key is open for
+  // this request (?beta=celo), so the plain quote keeps its fast path.
+  let nativeAllowed: ReadonlySet<string> = nativeOpen
+  if (CELO_BETA_KEYS.some((k) => nativeOpen.has(k))) {
+    const life = checkZecLinkExpiry(await resolveCoinbaseLinkExpiry(paymentId), Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
+    if (!life.ok) nativeAllowed = new Set([...nativeOpen].filter((k) => !CELO_BETA_KEYS.includes(k)))
+  }
   const quoteReceipt = await createQuoteReceipt(
     paymentId,
     amount,
