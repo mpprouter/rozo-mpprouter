@@ -226,7 +226,11 @@ export async function runCeloRetries(
   return out
 }
 
-/** True once the alert is delivered (or no alert channel exists at all). */
+/**
+ * True once the alert is delivered. With no alert channel at all it is never
+ * true: a console line is not a hand-off, so the entry stays queued (and keeps
+ * being re-driven, still through the gate) until an alert can go out.
+ */
 async function alertGaveUp(env: Env, e: CeloRetryEntry): Promise<boolean> {
   const text = [
     '[MPP Router] 🚨 Celo payin NOT paid after 3 hours of retries: needs a human',
@@ -237,8 +241,8 @@ async function alertGaveUp(env: Env, e: CeloRetryEntry): Promise<boolean> {
   ].join('\n')
   try {
     if (!alertSinkConfigured(env)) {
-      console.error(`[celo-retry] give-up alert SKIPPED (no alert channel) for ${e.ref}: ${text}`)
-      return true
+      console.error(`[celo-retry] give-up alert NOT SENT (no alert channel), entry kept for ${e.ref}: ${text}`)
+      return false
     }
     return await sendAlert(env, redactForAlert(text))
   } catch (err) {

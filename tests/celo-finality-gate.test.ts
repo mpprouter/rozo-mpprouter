@@ -884,6 +884,17 @@ describe('Celo retry queue (cron re-drive)', () => {
     expect(calls.pay).toBe(0)
   })
 
+  it('no alert channel at all: past 3 hours the entry is kept, never dropped silently', async () => {
+    const { calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env } = makeEnv({ DINGTALK_ACCESS_TOKEN: undefined })
+    const t0 = Date.now()
+    await handleRozoWebhook(await signed(event()), env)
+    const out = await sweepCeloRetries(env, new Date(t0 + 3 * 60 * MIN + MIN))
+    expect(out[0].outcome).toBe('error')
+    expect(await listCeloRetries(env)).toHaveLength(1)
+    expect(calls.pay).toBe(0)
+  })
+
   it('backoff: 2, 3, 4, then 5 minutes', () => {
     expect([0, 1, 2, 3, 4, 10].map((n) => CELO_RETRY_DELAY_MS(n) / MIN)).toEqual([2, 3, 4, 5, 5, 5])
   })
