@@ -28,7 +28,7 @@ import {
   normalizeCoinbasePayment,
 } from './invoice-provider'
 import { coinbaseDailyCapAtomic, releaseDailySpend, reserveDailySpend } from './stripe-fulfillment'
-import { celoGateAlertText, celoSettlementGate, isCeloChain, type CeloGateResult } from './celo-finality'
+import { celoGateAlertText, celoSettlementGate, type CeloGateResult } from './celo-finality'
 import { enqueueCeloRetry, type CeloRetryProvider } from './celo-retry'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
@@ -1106,10 +1106,12 @@ export async function settleCoinbaseEvent(
     // webhook (the sweep's stuck alert asks for exactly that) or a replay is
     // processed again instead of being dropped as already seen.
     await env.MPP_STORE.delete(eventKvKey(eventId)).catch(() => undefined)
-    // A Celo event (by its own hint) whose order could not be read yet has no
-    // other automatic trigger once both webhooks are consumed: queue the same
-    // re-drive the Celo gate uses (it re-runs this path, binding included).
-    if (isCeloChain(evt.data?.source?.chainId)) {
+    // An event whose order could not be read yet has no other automatic
+    // trigger once both webhooks are consumed, and its source chain is not
+    // confirmed by the order (the event's own hint does not count): queue the
+    // same re-drive the Celo gate uses (it re-runs this path, binding and
+    // gate included; bounded at 3 h, then a human alert).
+    {
       const queued = await enqueueCeloRetry(env, {
         provider: 'coinbase',
         ref: plId,
@@ -1120,7 +1122,6 @@ export async function settleCoinbaseEvent(
       if (!queued) return { ok: false, deferred: 'order_binding_unverified', reason: binding.reason, plId, retryQueueFailed: true }
       return { ok: true, deferred: 'order_binding_unverified', reason: binding.reason, plId, celoQueued: true }
     }
-    return { ok: true, deferred: 'order_binding_unverified', reason: binding.reason, plId }
   }
 
   // 7d. Celo settlement gate (celo-finality.ts). For an order whose source

@@ -612,12 +612,13 @@ describe('Celo gate: manual /admin/pay-invoice', () => {
     }
   })
 
-  it('an expired Celo order with no payin does not block the manual pay', async () => {
+  it('only an expired Celo order with no payin: no live order backs the pay, 409 chain unknown', async () => {
     const { calls } = stub({ order: celoOrder({ status: 'payment_expired' }, { txHash: null }) })
     const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
     const res = await handleAdminPayInvoice(adminPay(), env)
-    expect(res.status).toBe(200)
-    expect(calls.pay).toBe(1)
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as any).message).toContain('no live Rozo order')
+    expect(calls.pay).toBe(0)
   })
 
   it('record names a Base order, but a Celo sibling slot exists: the sibling is gated', async () => {
@@ -922,11 +923,11 @@ describe('Celo retry queue (cron re-drive)', () => {
     expect(calls.alerts.filter((a) => a.includes('after 3 hours'))).toHaveLength(0)
   })
 
-  it('Celo event whose order cannot be read yet (binding unverified): queued, then paid once after the read and finality', async () => {
+  it('event naming Base whose order cannot be read yet (binding unverified): still queued, then the Celo order is gated and paid once', async () => {
     const { up, calls } = stub({ order: null })
     const { env, kv } = makeEnv()
     const t0 = Date.now()
-    const res = (await (await handleRozoWebhook(await signed(event('payment_payout_completed')), env)).json()) as any
+    const res = (await (await handleRozoWebhook(await signed(event('payment_payout_completed', { chainId: '8453' })), env)).json()) as any
     expect(res.deferred).toBe('order_binding_unverified')
     expect((await listCeloRetries(env)).map((e) => e.ref)).toEqual([PL])
     up.order = celoOrder()
