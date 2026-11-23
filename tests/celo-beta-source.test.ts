@@ -190,40 +190,32 @@ describe('quote-invoice with Celo USDT', () => {
     expect(strip(beta.json)).toEqual(strip(plain.json))
   })
 
-  it('link shorter than CELO_MIN_LINK_LIFE_MS, or unknown expiry: Celo not offered (with or without ?beta=celo), the rest unchanged', async () => {
-    const long = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
-    linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
-    for (const query of ['', '?beta=celo']) {
-      const short = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query })
-      expect(short.status).toBe(200)
-      expect(short.json.supportedSources['42220']).toBeUndefined()
-      const rest = { ...long.json.supportedSources }
-      delete rest['42220']
-      expect(short.json.supportedSources).toEqual(rest)
+  it('the quote makes no Coinbase expiry request and lists Celo even on a short or unknown link', async () => {
+    const fetchMock = globalThis.fetch as any
+    for (const exp of [new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString(), null]) {
+      linkExpiresAt = exp
+      fetchMock.mockClear()
+      const q = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
+      expect(q.status).toBe(200)
+      expect(q.json.supportedSources['42220']).toEqual(['USDT', 'USDC'])
+      const coinbaseReads = fetchMock.mock.calls.filter((c: any[]) => String(c[0]?.url ?? c[0]).includes('payments.coinbase.com/next-api/'))
+      expect(coinbaseReads).toHaveLength(0)
     }
-    linkExpiresAt = null
-    const unknown = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
-    expect(unknown.status).toBe(200)
-    expect(unknown.json.supportedSources['42220']).toBeUndefined()
   })
 
-  it('slow Coinbase expiry read: the quote does not wait for it; Celo hidden, other coins returned', async () => {
-    const plain = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
-    const fetchMock = globalThis.fetch as any
-    const inner = fetchMock.getMockImplementation()
-    fetchMock.mockImplementation(async (input: any, init?: any) => {
-      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
-      if (u.includes('payments.coinbase.com/next-api/')) await new Promise((r) => setTimeout(r, 2_000))
-      return inner(input, init)
-    })
-    const t0 = Date.now()
-    const slow = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
-    expect(Date.now() - t0).toBeLessThan(1_500)
-    expect(slow.status).toBe(200)
-    expect(slow.json.supportedSources['42220']).toBeUndefined()
-    const rest = { ...plain.json.supportedSources }
-    delete rest['42220']
-    expect(slow.json.supportedSources).toEqual(rest)
+  it('a short link is refused only when the Celo order is created: MERCHANT_LINK_EXPIRES_TOO_SOON with a "use another coin or a new link" message', async () => {
+    linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
+    for (const tokenSymbol of ['USDT', 'USDC']) {
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: { chainId: '42220', tokenSymbol } })
+      expect(r.status).toBe(400)
+      expect(r.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+      expect(r.json.message).toContain('expires too soon for Celo')
+      expect(r.json.message).toContain('Pay with another coin, or create a new payment link')
+    }
+    expect(createCalls).toBe(0)
+    // Other coins on the same short link are not affected.
+    const base = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: { chainId: '8453', tokenSymbol: 'USDC' } })
+    expect(base.status).toBeLessThan(300)
   })
 
   it('NATIVE_SOURCES_BETA without the old Celo keys: still listed', async () => {

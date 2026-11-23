@@ -40,9 +40,10 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
   // Official since the 2026-11-23 small tests (were behind ?beta=celo, #338).
   // Every Celo-sourced settlement is gated by finality (celo-finality.ts,
   // paid ~25 to 30 minutes after the payin, CELO_FULFILLMENT_PAUSED stops it);
-  // create-invoice refuses a link that expires within CELO_MIN_LINK_LIFE_MS
-  // and the quote hides Celo on such a link; Stripe and Bitrefill invoices
-  // never take Celo. Per-order, daily and outstanding Celo limits live in
+  // create-invoice (fresh create, reuse, conflict winner, hand-out) refuses a
+  // link that expires within CELO_MIN_LINK_LIFE_MS with
+  // MERCHANT_LINK_EXPIRES_TOO_SOON; the quote lists Celo without reading the
+  // link expiry; Stripe and Bitrefill invoices never take Celo. Per-order, daily and outstanding Celo limits live in
   // rozo-intents-api (500 / 2,000 / 2,000 USD, both coins combined).
   '42220': ['USDT', 'USDC'],  // Celo
 }

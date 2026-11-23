@@ -15,21 +15,7 @@ import {
   supportedSources,
   verifyTestPaymentId,
   withBetaSources,
-  CELO_CHAIN,
 } from './native-sources'
-// Called at request time only, so the existing create-invoice <-> this module
-// import cycle is harmless (ESM live bindings).
-import { CELO_MIN_LINK_LIFE_MS, checkZecLinkExpiry, resolveCoinbaseLinkExpiry } from './create-invoice'
-
-/** How long the quote waits, after the upstream quote, for the Celo link-expiry read (else Celo is hidden). */
-export const CELO_QUOTE_EXPIRY_GRACE_MS = 300
-
-/** The stable-source table without Celo (quote on a link too short for Celo). */
-function withoutCelo(table: Record<string, readonly ('USDC' | 'USDT')[]>): Record<string, readonly ('USDC' | 'USDT')[]> {
-  const out = { ...table }
-  delete out[CELO_CHAIN]
-  return out
-}
 import { createQuoteReceipt, quoteIdentity } from './quote-receipt'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { invoiceResolveRateLimit } from './invoice-details'
@@ -885,11 +871,10 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
   // seconds in production and the quote must stay on its fast path. Clients
   // ask GET /v1/services/rozo-agent-api/existing-order separately.
   //
-  // Celo is offered only on a link that outlives CELO_MIN_LINK_LIFE_MS (the
-  // rule create-invoice enforces). Its Coinbase expiry read starts now, in
-  // parallel with the upstream quote, so the quote's latency does not grow.
-  const expiryIdGuess = link_id_detected ?? ('payment_id' in normalized ? normalized.payment_id : null)
-  const celoExpiryPromise = resolveCoinbaseLinkExpiry(expiryIdGuess)
+  // Celo is listed like any stable source, with no expiry read here (no extra
+  // Coinbase request on the quote path). create-invoice refuses a Celo order
+  // on a link with less than CELO_MIN_LINK_LIFE_MS left
+  // (MERCHANT_LINK_EXPIRES_TOO_SOON), so the page offers another coin.
   let upstream: Response
   try {
     upstream = await fetch('https://agentapi.rozo.ai/quote-invoice', {
@@ -976,19 +961,6 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     env.NATIVE_SOURCES_BETA,
     request.url,
   )
-  // Celo: hidden when the link expires within CELO_MIN_LINK_LIFE_MS or its
-  // expiry is unreadable (fail closed). The quote never waits long for it:
-  // if the parallel read has not finished within CELO_QUOTE_EXPIRY_GRACE_MS
-  // after the upstream quote, or the confirmed id differs from the early
-  // guess, Celo is simply not offered and every other coin returns at once.
-  const celoExpiry = paymentId === expiryIdGuess
-    ? await Promise.race([
-        celoExpiryPromise,
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), CELO_QUOTE_EXPIRY_GRACE_MS)),
-      ])
-    : null
-  const celoLife = checkZecLinkExpiry(celoExpiry, Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
-  const stableForQuote = celoLife.ok ? STABLE_SOURCES : withoutCelo(STABLE_SOURCES)
   const quoteReceipt = await createQuoteReceipt(
     paymentId,
     amount,
@@ -1018,7 +990,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     title: buildCheckoutTitle(merchant, pricing),
     currency: 'USD',
     // Coins this checkout may be paid with (stablecoins + open native coins).
-    supportedSources: supportedSources(stableForQuote, nativeAllowed),
+    supportedSources: supportedSources(STABLE_SOURCES, nativeAllowed),
     // Per-coin checkout metadata for open coins that carry it (beta ZEC:
     // eta, refund address required, single-use deposit address).
     sourceMeta: sourceMeta(nativeAllowed, parseZecRail(env.ZEC_RAIL), zecShieldedRequested(request.url), env.BTC_ONCHAIN_MAX_USD, parseBtcOnchainLimits(env.BTC_ONCHAIN_LIMITS)),
