@@ -162,6 +162,10 @@ function setup(cfg: Partial<Up> = {}, envOverrides: Record<string, unknown> = {}
         boundRozoOrder(ROZO_ID, PL, { source: { amount: '20', chainId: '8453' }, destination: { amount: '20', chainId: '8453' } }),
       )
     }
+    // Order slot scan of the link (manual pay's Celo check): no other order.
+    if (url.includes('intentapiv4.rozo.ai') && url.includes('/payments/order/')) {
+      return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
+    }
     if (url.includes('dingtalk') || url.includes('feishu') || url.includes('larksuite')) {
       return Response.json({ errcode: 0, code: 0 })
     }

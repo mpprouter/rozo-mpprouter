@@ -649,6 +649,16 @@ describe('Celo gate: manual /admin/pay-invoice', () => {
     expect(calls.pay).toBe(0)
   })
 
+  it('a live order row with no source chain field: 409 chain unknown, nothing sent', async () => {
+    const { calls } = stub({ order: { id: ROZO_ID, orderId: PL, status: 'payment_payin_completed', source: { amount: '1.00' } } })
+    const { env, kv } = makeEnv()
+    seedRecord(kv, { sourceChainId: '8453' })
+    const res = await handleAdminPayInvoice(adminPay(), env)
+    expect(res.status).toBe(409)
+    expect(((await res.json()) as any).message).toContain('source chain unknown')
+    expect(calls.pay).toBe(0)
+  })
+
   it('a stale Celo chain on the record does not block a Base order', async () => {
     const { calls } = stub({ order: boundRozoOrder(ROZO_ID, PL) })
     const { env, kv } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
@@ -712,6 +722,45 @@ describe('Celo gate: Stripe settle entry', () => {
     )
     expect(summary.deferred).toBe('celo_finality')
     expect(calls.orderGet).toBeGreaterThan(0)
+    expect(calls.pay).toBe(0)
+  })
+
+  for (const [name, order] of [
+    ['order read returns an object with no source chain', {}],
+    ['order unreadable', null],
+  ] as Array<[string, any]>) {
+    it(`event names Base but ${name}: chain unknown, deferred and queued, nothing paid`, async () => {
+      const { calls } = stub({ order })
+      const { env } = makeEnv()
+      const summary = await handleStripeWebhookEvent(
+        env,
+        {
+          eventId: `evt-stripe-unknown-${order === null ? 'null' : 'empty'}`,
+          eventType: 'payment_payout_completed',
+          orderId: 'stripe_crypto_cpis_celoTest',
+          rozoPaymentId: ROZO_ID,
+          invoiceAmountStr: '1.00',
+          sourceChainId: '8453',
+          sourceTxHash: TX,
+        },
+        new Date(),
+      )
+      expect(summary.deferred).toBe('celo_finality')
+      expect(String(summary.reason)).toContain('source chain unknown')
+      expect(calls.pay).toBe(0)
+      expect(await listCeloRetries(env)).toHaveLength(1)
+    })
+  }
+
+  it('no Rozo payment id at all (nothing to read): chain unknown, deferred', async () => {
+    const { calls } = stub()
+    const { env } = makeEnv()
+    const summary = await handleStripeWebhookEvent(
+      env,
+      { eventId: 'evt-stripe-noid', eventType: 'payment_payout_completed', orderId: 'stripe_crypto_cpis_celoTest', rozoPaymentId: null, invoiceAmountStr: '1.00', sourceChainId: '8453' },
+      new Date(),
+    )
+    expect(summary.deferred).toBe('celo_finality')
     expect(calls.pay).toBe(0)
   })
 
@@ -909,6 +958,21 @@ describe('Celo retry queue (cron re-drive)', () => {
     expect(calls.pay).toBe(0)
   })
 
+  it('an entry rescheduled while its re-drive ran is kept, not deleted (version-checked clear)', async () => {
+    stub()
+    const { env } = makeEnv()
+    const t0 = new Date(Date.now() - 10 * MIN)
+    await enqueueCeloRetry(env, { provider: 'stripe', ref: 'stripe_crypto_cpis_race', rozoPaymentId: ROZO_ID, eventType: 'payment_payout_completed', reason: 'x' }, t0)
+    // The re-drive saw another run's provider_paying (handed back), but that
+    // other run then hit the daily cap and re-queued the same invoice.
+    const out = await runCeloRetries(env, async (_env, e) => {
+      await enqueueCeloRetry(env, { ...e, reason: 'daily cap' }, new Date())
+      return { ok: true, already_in_flight: true }
+    })
+    expect(out[0].outcome).toBe('still_deferred')
+    expect((await listCeloRetries(env)).map((e) => e.ref)).toEqual(['stripe_crypto_cpis_race'])
+  })
+
   it('backoff: 2, 3, 4, then 5 minutes', () => {
     expect([0, 1, 2, 3, 4, 10].map((n) => CELO_RETRY_DELAY_MS(n) / MIN)).toEqual([2, 3, 4, 5, 5, 5])
   })
@@ -1051,6 +1115,15 @@ describe('Celo gate: internal rozotest_ orders', () => {
 
   it('test event names Base but the Rozo order is Celo and not finalized: stays open', async () => {
     const { calls } = stub({ order: testOrder(), rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env, kv } = makeEnv()
+    const res = (await (await handleRozoWebhook(await signed(testEvent('payment_payout_completed', { chainId: '8453' })), env)).json()) as any
+    expect(res.deferred).toBe('celo_finality')
+    expect(trec(kv).status).not.toBe('test_settled')
+    expect(calls.pay).toBe(0)
+  })
+
+  it('test event names Base but the Rozo order has no source chain: stays open', async () => {
+    const { calls } = stub({ order: { id: ROZO_ID, orderId: TID } })
     const { env, kv } = makeEnv()
     const res = (await (await handleRozoWebhook(await signed(testEvent('payment_payout_completed', { chainId: '8453' })), env)).json()) as any
     expect(res.deferred).toBe('celo_finality')

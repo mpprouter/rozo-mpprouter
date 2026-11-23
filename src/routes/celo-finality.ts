@@ -62,6 +62,11 @@ export function isCeloChain(v: unknown): boolean {
   return s === CELO_CHAIN_ID || s === `eip155:${CELO_CHAIN_ID}` || s === '0xa4ec' || s === 'celo'
 }
 
+/** True when a chain value is present (non-empty), whatever chain it names. */
+export function hasChain(v: unknown): boolean {
+  return v !== undefined && v !== null && String(v).trim() !== ''
+}
+
 /** Source chain of a Rozo order row, in either spelling the API returns. */
 export function orderSourceChain(order: any): unknown {
   return order?.source?.chainId ?? order?.source_chain_id ?? null
@@ -100,40 +105,36 @@ export async function celoSettlementGate(
   deps: CeloGateDeps = {},
 ): Promise<CeloGateResult> {
   let order = input.order ?? null
-  // The Rozo order is the authority on the source chain. Whenever the caller
-  // can read it (Stripe settle, rozotest_ close, Bitrefill fallback), read it
-  // BEFORE deciding whether the gate applies, so an event that names another
-  // chain cannot skip the gate for an order that is really Celo. A failed read
-  // is not fatal for an event that names a non-Celo chain (signed by Rozo;
-  // other chains stay unchanged), but with no chain known at all it refuses.
-  let loadFailed = false
+  // The Rozo order is the ONLY authority that lets a payment skip this gate.
+  // Read it whenever the caller has not (Stripe settle, rozotest_ close,
+  // Bitrefill fallback). The gate does not apply only when that order was
+  // read and names a source chain that is not Celo. An unreadable order, a
+  // missing loader, or an order without a source chain field is "chain
+  // unknown": refused and deferred (retried), whatever the event claims.
   if (!order && input.loadOrder) {
     try {
       order = await input.loadOrder()
     } catch {
       order = null
     }
-    if (!order || typeof order !== 'object') {
-      order = null
-      loadFailed = true
-    }
   }
-  const hints = [...input.chainHints, orderSourceChain(order)]
-  const known = hints.some((h) => h !== undefined && h !== null && String(h).trim() !== '')
-  if (!known && loadFailed) {
+  if (!order || typeof order !== 'object') {
     return { applies: true, ok: false, reason: 'source chain unknown: Rozo order unreadable', alert: false }
   }
-  if (!hints.some(isCeloChain)) return { applies: false }
+  if (!hasChain(orderSourceChain(order))) {
+    return { applies: true, ok: false, reason: 'source chain unknown: Rozo order carries no source chain', alert: false }
+  }
+  if (!isCeloChain(orderSourceChain(order))) {
+    // Authoritative non-Celo order. An event that says Celo for it is a
+    // disagreement worth a look; otherwise other chains pass unchanged.
+    if (input.chainHints.some(isCeloChain)) {
+      return { applies: true, ok: false, reason: 'Rozo order source chain is not Celo but the event says Celo', alert: true }
+    }
+    return { applies: false }
+  }
 
   if (celoFulfillmentPaused(env)) {
     return { applies: true, ok: false, reason: 'celo_fulfillment_paused', alert: false }
-  }
-
-  if (!order || typeof order !== 'object') {
-    return { applies: true, ok: false, reason: 'Rozo order unreadable', alert: false }
-  }
-  if (!isCeloChain(orderSourceChain(order))) {
-    return { applies: true, ok: false, reason: 'Rozo order source chain is not Celo but the event says Celo', alert: true }
   }
 
   const terms = celoPayinTerms(order, input.eventTxHash ?? null)

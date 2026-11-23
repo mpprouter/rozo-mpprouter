@@ -3,6 +3,14 @@
 // aborted at 10s while the router was inline in pay-invoice, and nothing ever
 // reconciled the record against Stripe afterwards.
 import { describe, it, expect, vi, afterEach } from 'vitest'
+
+// The Celo gate reads the Rozo order on every Stripe settle and refuses when
+// the chain is unknown (celo-finality.ts). These tests cover other chains, so
+// that read answers a Base order; no real network is touched.
+vi.mock('../src/routes/webhook', async (importOriginal) => {
+  const mod: any = await importOriginal()
+  return { ...mod, fetchRozoPaymentById: async (_env: unknown, id: string) => ({ id, source: { chainId: '8453' } }) }
+})
 import {
   seedStripeRecord,
   stripeKvKey,

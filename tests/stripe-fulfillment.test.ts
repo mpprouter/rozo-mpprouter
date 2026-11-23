@@ -1,4 +1,12 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
+
+// The Celo gate reads the Rozo order on every Stripe settle and refuses when
+// the chain is unknown (celo-finality.ts). These tests cover other chains, so
+// that read answers a Base order; no real network is touched.
+vi.mock('../src/routes/webhook', async (importOriginal) => {
+  const mod: any = await importOriginal()
+  return { ...mod, fetchRozoPaymentById: async (_env: unknown, id: string) => ({ id, source: { chainId: '8453' } }) }
+})
 import {
   isStripeOrderId,
   stripeOrderId,
@@ -458,7 +466,7 @@ describe('handleStripeWebhookEvent', () => {
   it('falls into manual_review when the locked binding is missing', async () => {
     const env = makeEnv()
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
-    const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev3', orderId: 'stripe_crypto_cpis_missing', rozoPaymentId: null }), new Date(Date.UTC(2026, 6, 12)))
+    const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev3', orderId: 'stripe_crypto_cpis_missing', rozoPaymentId: 'rp-missing' }), new Date(Date.UTC(2026, 6, 12)))
     expect(summary.deferred).toBe('missing_lock_binding')
     expect(fetchSpy).not.toHaveBeenCalled()
   })
@@ -466,7 +474,7 @@ describe('handleStripeWebhookEvent', () => {
   it('manual_review is terminal: a later event never reclaims + auto-submits (P1)', async () => {
     const env = makeEnv()
     // First event with no seeded lock binding → manual_review, no fetch.
-    const first = await handleStripeWebhookEvent(env, evt({ eventId: 'evmr1', orderId: 'stripe_crypto_cpis_mr', rozoPaymentId: null }), new Date(Date.UTC(2026, 6, 12)))
+    const first = await handleStripeWebhookEvent(env, evt({ eventId: 'evmr1', orderId: 'stripe_crypto_cpis_mr', rozoPaymentId: 'rp-mr' }), new Date(Date.UTC(2026, 6, 12)))
     expect(first.deferred).toBe('missing_lock_binding')
     // Now a fully-valid seed appears late AND a payout event arrives. The
     // record is already manual_review — it must NOT be reclaimed for settlement.

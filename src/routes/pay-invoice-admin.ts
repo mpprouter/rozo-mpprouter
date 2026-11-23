@@ -33,7 +33,7 @@ import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exe
 import { casRead, casUpdate } from './stripe-atomic'
 import { fetchRozoPaymentById, loadRecord } from './webhook'
 import { listLinkOrderRows, listOrderRows, readPaymentStatus } from './existing-order'
-import { celoSettlementGate, isCeloChain, orderSourceChain } from './celo-finality'
+import { celoSettlementGate, hasChain, isCeloChain, orderSourceChain } from './celo-finality'
 import { lookupStripeSession } from './stripe-session-index'
 import { loadStripeRecordForStatus } from './stripe-fulfillment'
 
@@ -111,7 +111,13 @@ async function celoRefusalForOrders(
     const hasPayinTx = typeof o?.source?.txHash === 'string' && o.source.txHash.length > 0
     return hasPayinTx || !CELO_EXEMPT_ENDED_STATUSES.has(status)
   }
-  const celoLive = orders.filter((o) => o && isCeloChain(orderSourceChain(o)) && isLive(o))
+  // A live order whose source chain cannot be read (no source.chainId nor
+  // source_chain_id, or not an object) is "chain unknown": refuse, never treat
+  // it as non-Celo.
+  if (orders.some((o) => !o || typeof o !== 'object' || (!hasChain(orderSourceChain(o)) && isLive(o)))) {
+    return 'source chain unknown: a Rozo order for this invoice carries no source chain'
+  }
+  const celoLive = orders.filter((o) => isCeloChain(orderSourceChain(o)) && isLive(o))
   for (const order of celoLive) {
     const gate = await celoSettlementGate(env, { chainHints: [], order })
     if (gate.applies && !gate.ok) return gate.reason
