@@ -350,13 +350,15 @@ ROZO_DELIVERED_REPORT_ENABLED = "true"
 # Stripe). No effect on any other source chain. Initial value "off".
 CELO_FULFILLMENT_PAUSED = "off"
 # Second, independent Celo mainnet RPC for that finality check (the first is
-# forno.celo.org, run by cLabs). Public 1RPC endpoint (Automata), different
-# operator, no API key, so a plain var and not a secret. Never use
-# celo-rpc.publicnode.com (seen ~1.7M blocks behind on 2026-11-23). Do NOT also create a secret with
+# forno.celo.org, run by cLabs). Public dRPC endpoint, different operator
+# from forno (required), no API key, so a plain var and not a secret. Never use
+# celo-rpc.publicnode.com (seen ~1.7M blocks behind on 2026-11-23) or
+# 1rpc.io/celo (its finalized tag stalled at block 83516125 from 2026-11-23
+# ~06:55 UTC for about an hour, deferring every Celo order). Do NOT also create a secret with
 # this name (wrangler refuses a var and a secret with the same binding name).
 # Must be https and on another host than forno.celo.org, or every Celo order
 # is deferred. Code default when unset: the same URL.
-CELO_RPC_URL = "https://1rpc.io/celo"
+CELO_RPC_URL = "https://celo.drpc.org"
 # Read-path switch for the Rozo Intents API (src/routes/intents-base.ts).
 # Unset = read-only GET /payments/:id and /payments/order/... stay on the big
 # payment-api function (current production). Deliberately NOT set here: it is
