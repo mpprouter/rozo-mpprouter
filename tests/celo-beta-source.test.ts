@@ -397,6 +397,26 @@ describe('create-invoice with Celo USDT', () => {
     })
   })
 
+  it('fresh create: a link that crosses CELO_MIN_LINK_LIFE_MS during the upstream create is refused at hand-out', async () => {
+    const realNow = Date.now.bind(Date)
+    let offset = 0
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow() + offset)
+    linkExpiresAt = new Date(realNow() + CELO_MIN_LINK_LIFE_MS + 30_000).toISOString()
+    const fetchMock = globalThis.fetch as any
+    const inner = fetchMock.getMockImplementation()
+    fetchMock.mockImplementation(async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('/payment-api') && init?.method === 'POST') offset += 60_000 // the create takes a minute
+      return inner(input, init)
+    })
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO }, { query: '?beta=celo' })
+    expect(createCalls).toBe(1)
+    expect(r.status).toBe(400)
+    expect(r.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+    expect(r.json.raw).toBeUndefined()
+    expect(r.json.paymentLink).toBeUndefined()
+  })
+
   it('open and the link lives long enough: creates upstream with the Celo USDT contract', async () => {
     linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS + 10 * 60_000).toISOString()
     const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO }, { query: '?beta=celo' })

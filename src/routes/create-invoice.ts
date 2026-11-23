@@ -3298,6 +3298,15 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     )
   }
 
+  // Celo (beta): the link-life check at the top ran before the upstream
+  // create; re-check at hand-out time so a link that crossed
+  // CELO_MIN_LINK_LIFE_MS meanwhile never gets Celo pay instructions. The
+  // unpaid order stays upstream and is gated again on any later reuse.
+  {
+    const celoBlock = await celoReuseBlock(intentsJson, { chainId: source.chainId })
+    if (celoBlock) return celoBlock
+  }
+
   return json(200, {
     ok: true,
     reused: false,
