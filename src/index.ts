@@ -511,10 +511,11 @@ export interface Env {
   // Coinbase / Stripe / Bitrefill invoice; missing or any other value pauses.
   // Has no effect on orders from any other source chain.
   CELO_FULFILLMENT_PAUSED?: string
-  // Second, independent Celo mainnet RPC (Alchemy celo-mainnet) for the
-  // finality check; the first is the public forno.celo.org. Unset = every
-  // Celo-sourced order is deferred (never paid).
-  // Set via: wrangler secret put CELO_RPC_URL
+  // Second, independent Celo mainnet RPC for the finality check; the first is
+  // the public forno.celo.org (cLabs). Plain [vars] entry in wrangler.toml
+  // (public 1rpc.io/celo endpoint, no key, not a secret). Unset or blank falls back to
+  // CELO_SECOND_RPC_DEFAULT (same URL); a value on forno's host or not https
+  // is refused, so every Celo-sourced order is then deferred (never paid).
   CELO_RPC_URL?: string
 
   // DingTalk webhook token for operational alerts (low balance, etc.)

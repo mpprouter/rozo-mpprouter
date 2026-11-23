@@ -15,7 +15,7 @@
 //   1. CELO_FULFILLMENT_PAUSED must be exactly "off" (missing / anything else
 //      pauses: fail closed);
 //   2. the payin tx receipt, read from two independent RPCs (forno.celo.org
-//      and CELO_RPC_URL), succeeded, is in the same block on both, and carries
+//      and CELO_RPC_URL, default 1rpc.io/celo), succeeded, is in the same block on both, and carries
 //      a Transfer of the order's source token to the order's receive address
 //      for at least the order's source amount (no tolerance);
 //   3. both RPCs report a finalized block at or above the payin block, and the
@@ -28,6 +28,13 @@
 
 export const CELO_CHAIN_ID = '42220'
 export const CELO_FORNO_RPC = 'https://forno.celo.org'
+// Second, independent Celo mainnet RPC used when CELO_RPC_URL is unset or
+// blank: 1RPC's public endpoint (Automata, a different operator from forno /
+// cLabs, no API key). wrangler.toml sets CELO_RPC_URL to the same value as a
+// plain [vars] entry; this default only exists so that no deploy can depend
+// on a secret being set by hand. It still has to agree with forno on every
+// check. Do not use celo-rpc.publicnode.com (seen ~1.7M blocks behind).
+export const CELO_SECOND_RPC_DEFAULT = 'https://1rpc.io/celo'
 
 /** Celo ERC-20 sources this gate accepts (both 6 decimals). Lowercase. */
 export const CELO_TOKENS: Readonly<Record<'USDT' | 'USDC', string>> = {
@@ -266,11 +273,15 @@ export async function verifyCeloPayinFinalized(
   deps: CeloGateDeps = {},
 ): Promise<{ ok: true; blockNumber: string; blockHash: string } | { ok: false; reason: string; alert: boolean }> {
   const f = deps.fetch ?? fetch
-  const second = typeof env.CELO_RPC_URL === 'string' ? env.CELO_RPC_URL.trim() : ''
-  if (!second) return { ok: false, reason: 'second Celo RPC (CELO_RPC_URL) not configured', alert: false }
+  const configured = typeof env.CELO_RPC_URL === 'string' ? env.CELO_RPC_URL.trim() : ''
+  const second = configured || CELO_SECOND_RPC_DEFAULT
   const h1 = hostOf(CELO_FORNO_RPC)
   const h2 = hostOf(second)
-  if (!h2 || h2 === h1) return { ok: false, reason: 'CELO_RPC_URL is not an independent RPC', alert: false }
+  // A configured value that is not an https URL on another host than forno is
+  // refused outright (fail closed), never silently replaced by the default.
+  if (!h2 || h2 === h1 || !second.toLowerCase().startsWith('https://')) {
+    return { ok: false, reason: 'CELO_RPC_URL is not an independent https RPC', alert: false }
+  }
   const urls = [CELO_FORNO_RPC, second]
 
   // 1. Receipt on both RPCs: success, same block, qualifying Transfer.

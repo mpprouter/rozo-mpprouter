@@ -44,6 +44,8 @@ const KEY = `invoice-fulfillment:${PL}`
 
 const FORNO = 'https://forno.celo.org'
 const CELO2 = 'https://celo-mainnet.g.alchemy.test/v2/test'
+// Code default for the second RPC when CELO_RPC_URL is unset (celo-finality.ts).
+const CELO_DEFAULT2 = 'https://1rpc.io/celo'
 const CELO_USDT = '0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e'
 const CELO_USDC = '0xcebA9300f2b948710d2653dD7B07f33A8B32118C'
 const RECEIVER = '0x1111111111111111111111111111111111111111'
@@ -184,7 +186,7 @@ function stub(cfg: Partial<Up> = {}) {
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input instanceof Request ? input.url : input)
       if (url.startsWith(FORNO)) return chainAnswer(up.rpc1, JSON.parse(String(init?.body)))
-      if (url.startsWith(CELO2)) return chainAnswer(up.rpc2, JSON.parse(String(init?.body)))
+      if (url.startsWith(CELO2) || url.startsWith(CELO_DEFAULT2)) return chainAnswer(up.rpc2, JSON.parse(String(init?.body)))
       if (url.includes('oapi.dingtalk.com')) {
         if ((up as any).alertDown) return new Response('down', { status: 500 })
         calls.alerts.push(JSON.parse(String(init?.body)).text.content)
@@ -270,6 +272,53 @@ describe('Celo gate: webhook payin_completed', () => {
     expect(r.events.some((e) => e.kind === 'celo_finality_verified')).toBe(true)
   })
 
+  // Celo USDC (0xcebA...118C) is gated by source chain exactly like USDT.
+  const USDC_ORDER = () => celoOrder({}, { tokenSymbol: 'USDC', tokenAddress: CELO_USDC })
+  const USDC_FINAL: ChainView = { ...FINAL_OK, receipt: celoReceipt({}, transferLog({ token: CELO_USDC })) }
+  const USDC_NOT_FINAL: ChainView = { ...NOT_FINAL, receipt: celoReceipt({}, transferLog({ token: CELO_USDC })) }
+
+  it('Celo USDC order, finalized on both RPCs: pays once', async () => {
+    const { calls } = stub({ order: USDC_ORDER(), rpc1: USDC_FINAL, rpc2: USDC_FINAL })
+    const { env, kv } = makeEnv()
+    await handleRozoWebhook(await signed(event()), env)
+    expect(calls.pay).toBe(1)
+    expect(rec(kv).status).toBe('paid')
+  })
+
+  it('Celo USDC order, not finalized: nothing paid, deferred', async () => {
+    const { calls } = stub({ order: USDC_ORDER(), rpc1: USDC_NOT_FINAL, rpc2: USDC_NOT_FINAL })
+    const { env, kv } = makeEnv()
+    const res = (await (await handleRozoWebhook(await signed(event()), env)).json()) as any
+    expect(calls.pay).toBe(0)
+    expect(res.deferred).toBe('celo_finality')
+    expect(rec(kv).status).toBe('payin_seen')
+  })
+
+  it('Celo USDC order, pause switch on: nothing paid, no Celo reads', async () => {
+    const { calls } = stub({ order: USDC_ORDER(), rpc1: USDC_FINAL, rpc2: USDC_FINAL })
+    const { env } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+    const res = (await (await handleRozoWebhook(await signed(event()), env)).json()) as any
+    expect(calls.pay).toBe(0)
+    expect(res.deferred).toBe('celo_finality')
+    expect(calls.celoRpc).toBe(0)
+  })
+
+  it('CELO_RPC_URL unset: the code default 1rpc.io/celo is the second RPC, no secret needed; pays once', async () => {
+    const seen: string[] = []
+    const { calls } = stub()
+    const inner = globalThis.fetch
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(String(input instanceof Request ? input.url : input))
+      return inner(input, init)
+    }))
+    const { env, kv } = makeEnv({ CELO_RPC_URL: undefined })
+    await handleRozoWebhook(await signed(event()), env)
+    expect(calls.pay).toBe(1)
+    expect(rec(kv).status).toBe('paid')
+    expect(seen.some((u) => u.startsWith(CELO_DEFAULT2))).toBe(true)
+    expect(seen.some((u) => u.startsWith(FORNO))).toBe(true)
+  })
+
   it('not finalized, then the later payout webhook after finality pays exactly once', async () => {
     const { up, calls } = stub({ rpc1: NOT_FINAL, rpc2: NOT_FINAL })
     const { env, kv } = makeEnv()
@@ -296,8 +345,9 @@ describe('Celo gate: webhook payin_completed', () => {
     ['receipt read error', { rpc2: { ...FINAL_OK, receiptError: true } }, {}],
     ['receipt not found', { rpc1: { ...FINAL_OK, receipt: null } }, {}],
     ['payin tx reverted', { rpc1: { ...FINAL_OK, receipt: celoReceipt({ status: '0x0' }) } }, {}],
-    ['second RPC not configured', {}, { CELO_RPC_URL: undefined }],
     ['second RPC is forno again', {}, { CELO_RPC_URL: 'https://forno.celo.org/other' }],
+    ['second RPC is not https', {}, { CELO_RPC_URL: 'http://celo.example/rpc' }],
+    ['second RPC unset, default 1rpc finalized tag missing', { rpc2: { ...FINAL_OK, finalized: null } }, { CELO_RPC_URL: undefined }],
     ['Rozo order has no payin tx hash', { order: celoOrder({}, { txHash: null }) }, {}],
   ]
   for (const [name, up, envOver] of unreadable) {
@@ -876,6 +926,71 @@ describe('Celo gate: manual /admin/pay-invoice for Stripe', () => {
     const res = await handleAdminPayInvoice(adminPay({ url: 'https://crypto.stripe.com/pay/unknownblob' }), env)
     expect(res.status).toBe(409)
     expect(calls.pay).toBe(0)
+  })
+})
+
+// ── Internal test invoices (rozotest_) ──────────────────────────────────────
+
+describe('Celo gate: internal rozotest_ orders', () => {
+  const TID = 'rozotest_100_abcdef_0123456789abcdef'
+  const TKEY = `invoice-fulfillment:${TID}`
+  const testOrder = (sourceOver: Record<string, unknown> = {}) => celoOrder({ orderId: TID }, sourceOver)
+  const testEvent = (type: string, source: Record<string, unknown> = {}) => {
+    const e = event(type, source)
+    return { ...e, data: { ...e.data, orderId: TID } }
+  }
+  const trec = (kv: ReturnType<typeof makeKv>): FulfillmentRecord => JSON.parse(kv._store.get(TKEY)!)
+
+  it('payout landed, payin NOT finalized: test order stays open, queued, nothing paid', async () => {
+    const { calls } = stub({ order: testOrder(), rpc1: NOT_FINAL, rpc2: NOT_FINAL })
+    const { env, kv } = makeEnv()
+    const res = (await (await handleRozoWebhook(await signed(testEvent('payment_payout_completed')), env)).json()) as any
+    expect(calls.pay).toBe(0)
+    expect(res.deferred).toBe('celo_finality')
+    expect(trec(kv).status).not.toBe('test_settled')
+    expect((await listCeloRetries(env)).map((e) => e.ref)).toEqual([TID])
+  })
+
+  it('pause switch on: test order stays open, no Celo reads, nothing paid', async () => {
+    const { calls } = stub({ order: testOrder() })
+    const { env, kv } = makeEnv({ CELO_FULFILLMENT_PAUSED: 'on' })
+    const res = (await (await handleRozoWebhook(await signed(testEvent('payment_payout_completed')), env)).json()) as any
+    expect(calls.pay).toBe(0)
+    expect(calls.celoRpc).toBe(0)
+    expect(res.deferred).toBe('celo_finality')
+    expect(trec(kv).status).not.toBe('test_settled')
+  })
+
+  it('finalized on both RPCs: test order closes as test_settled, still no Coinbase pay', async () => {
+    const { calls } = stub({ order: testOrder() })
+    const { env, kv } = makeEnv()
+    await handleRozoWebhook(await signed(testEvent('payment_payout_completed')), env)
+    expect(calls.pay).toBe(0)
+    const r = trec(kv)
+    expect(r.status).toBe('test_settled')
+    expect(r.events.some((e) => e.kind === 'celo_finality_verified')).toBe(true)
+  })
+
+  it('Celo USDC test order not finalized, then the cron re-drive after finality closes it', async () => {
+    const usdcView = (v: ChainView): ChainView => ({ ...v, receipt: celoReceipt({}, transferLog({ token: CELO_USDC })) })
+    const order = testOrder({ tokenSymbol: 'USDC', tokenAddress: CELO_USDC })
+    const first = stub({ order, rpc1: usdcView(NOT_FINAL), rpc2: usdcView(NOT_FINAL) })
+    const { env, kv } = makeEnv()
+    await handleRozoWebhook(await signed(testEvent('payment_payout_completed')), env)
+    expect(trec(kv).status).not.toBe('test_settled')
+    expect(first.calls.pay).toBe(0)
+    const second = stub({ order: { ...order, status: 'payment_payout_completed' }, rpc1: usdcView(FINAL_OK), rpc2: usdcView(FINAL_OK) })
+    await sweepCeloRetries(env, new Date(Date.now() + 10 * 60_000))
+    expect(second.calls.pay).toBe(0)
+    expect(trec(kv).status).toBe('test_settled')
+  })
+
+  it('a Base test order closes as before, with no Celo reads', async () => {
+    const { calls } = stub({ order: boundRozoOrder(ROZO_ID, TID) })
+    const { env, kv } = makeEnv({ CELO_FULFILLMENT_PAUSED: undefined })
+    await handleRozoWebhook(await signed(testEvent('payment_payout_completed', { chainId: '8453', txHash: null })), env)
+    expect(calls.celoRpc).toBe(0)
+    expect(trec(kv).status).toBe('test_settled')
   })
 })
 

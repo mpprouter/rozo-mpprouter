@@ -970,6 +970,30 @@ export async function settleCoinbaseEvent(
         rec.events.push({ kind: 'delivered_reported', at: new Date().toISOString(), detail: { status: rep.status, test: true, alpha: true } })
       }
     }
+    // Celo settlement gate (celo-finality.ts) on test orders too, so a small
+    // internal test proves the live behaviour: a Celo-sourced test order is
+    // only closed once the pause switch is "off" and its payin block is
+    // finalized with the same hash on two RPCs. Nothing is ever paid for a
+    // test order; a refusal keeps the record open and queues the same
+    // automatic re-drive as a real invoice. Other source chains: no change.
+    if (closesTest) {
+      const celo = await celoSettlementGate(env, {
+        chainHints: [evt.data?.source?.chainId],
+        loadOrder: rozoPaymentId ? () => fetchRozoPaymentById(env, rozoPaymentId) : undefined,
+        eventTxHash: evt.data?.source?.txHash ?? null,
+      })
+      if (celo.applies && !celo.ok) {
+        return deferForCeloGate(env, plId, rec, eventId, celo, { provider: 'coinbase', eventType, rozoPaymentId })
+      }
+      if (celo.applies && celo.ok) {
+        rec.events.push({
+          kind: 'celo_finality_verified',
+          at: new Date().toISOString(),
+          event_id: eventId,
+          detail: { tx: celo.txHash, block: celo.blockNumber, hash: celo.blockHash, test: true },
+        })
+      }
+    }
     if (closesTest) {
       rec.status = 'test_settled'
       rec.events.push({ kind: 'test_settled', at: new Date().toISOString() })

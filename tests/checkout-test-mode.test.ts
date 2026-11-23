@@ -111,7 +111,7 @@ describe('webhook: test order', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     const log = vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 10, 'abcdef12')
-    const base = { data: { id: RPID, orderId: id, source: { amount: '0.10' }, destination: { amount: '0.10' } } }
+    const base = { data: { id: RPID, orderId: id, source: { amount: '0.10', chainId: '8453' }, destination: { amount: '0.10' } } }
 
     const r1 = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'e1', type: 'payment_payin_completed' }), env)
     expect(await r1.json()).toMatchObject({ ok: true, test_invoice: true, status: 'payin_seen' })
@@ -129,7 +129,7 @@ describe('webhook: test order', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 10, 'abcdef13')
-    const r = await handleRozoWebhook(await signedWebhook({ event_id: 'e3', type: 'payment_payout_completed', data: { id: RPID, orderId: `${id}__contract` } }), env)
+    const r = await handleRozoWebhook(await signedWebhook({ event_id: 'e3', type: 'payment_payout_completed', data: { id: RPID, orderId: `${id}__contract`, source: { chainId: '8453' } } }), env)
     expect(await r.json()).toMatchObject({ test_invoice: true, status: 'test_settled' })
     expect(fetchSpy).not.toHaveBeenCalled()
   })
@@ -146,7 +146,7 @@ describe('webhook: test order delivery ack to Rozo', () => {
       .mockResolvedValue(new Response('{}', { status: 200 }))
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 10, 'abcdef14')
-    const base = { data: { id: RPID, orderId: id, source: { amount: '0.10' }, destination: { amount: '0.10' } } }
+    const base = { data: { id: RPID, orderId: id, source: { amount: '0.10', chainId: '8453' }, destination: { amount: '0.10' } } }
 
     const r1 = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'd1', type: 'payment_payin_completed' }), env)
     expect(await r1.json()).toMatchObject({ test_invoice: true, status: 'payin_seen' })
@@ -173,7 +173,7 @@ describe('webhook: test order delivery ack to Rozo', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('no', { status: 500 }))
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 10, 'abcdef15')
-    await handleRozoWebhook(await signedWebhook({ event_id: 'd4', type: 'payment_payout_completed', data: { id: RPID, orderId: id } }), env)
+    await handleRozoWebhook(await signedWebhook({ event_id: 'd4', type: 'payment_payout_completed', data: { id: RPID, orderId: id, source: { chainId: '8453' } } }), env)
     expect(fetchSpy).toHaveBeenCalledTimes(1) // the delivered POST only; no DingTalk/Feishu
     const rec = JSON.parse(env.MPP_STORE._store.get(`invoice-fulfillment:${id}`))
     expect(rec.status).toBe('test_settled')
@@ -190,7 +190,7 @@ describe('webhook: TRON / TON alpha test order (closes on payin, no payout exist
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }))
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef21')
-    const base = { data: { id: RPID, orderId: id, source: { amount: '1.01' } } }
+    const base = { data: { id: RPID, orderId: id, source: { amount: '1.01', chainId: '728126428' } } }
 
     const r = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'a1', type: 'payment_payin_completed' }), env)
     expect(await r.json()).toMatchObject({ ok: true, test_invoice: true, status: 'test_settled' })
@@ -213,7 +213,7 @@ describe('webhook: TRON / TON alpha test order (closes on payin, no payout exist
       .mockResolvedValueOnce(new Response('{}', { status: 200 }))
     vi.spyOn(console, 'log').mockImplementation(() => {})
     const id = await signTestPaymentId(TEST_SECRET, 100, 'abcdef22')
-    const base = { data: { id: RPID, orderId: id } }
+    const base = { data: { id: RPID, orderId: id, source: { chainId: '728126428' } } }
     const r = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'a3', type: 'payment_payin_completed' }), env)
     expect(await r.json()).toMatchObject({ test_invoice: true, status: 'payin_seen' })
     const r2 = await handleRozoWebhook(await signedWebhook({ ...base, event_id: 'a4', type: 'payment_payout_completed' }), env)
