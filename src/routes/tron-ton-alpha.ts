@@ -12,6 +12,8 @@
  *   POST /v1/services/rozo-agent-api/tron-ton-alpha/option
  *        { payment_id | url, network: 'tron'|'ton', token: 'USDT'|'TRX' }
  *        -> one payment option (exact amount, address, TON code, deadline)
+ *        { network: 'ton', token: 'TON' } = native TON (Gram), public Beta,
+ *        listed by the capability only while the upstream admits it.
  *
  * The business order key is derived HERE, never from the request body: the
  * Coinbase invoice id the quote resolves (`pl_*` or `paymentSession_*`) is
@@ -67,9 +69,9 @@ export const ALPHA_DESTINATION = Object.freeze({
 
 export interface AlphaOptionDef {
   network: 'tron' | 'ton'
-  token: 'USDT' | 'TRX'
+  token: 'USDT' | 'TRX' | 'TON'
   chainId: string
-  displayDecimals: 1 | 2
+  displayDecimals: 1 | 2 | 4
 }
 
 // Mirrors ALPHA_ASSETS in rozo-intents-api shared/tron-ton-alpha/chains.ts.
@@ -79,10 +81,70 @@ export const ALPHA_OPTIONS: readonly AlphaOptionDef[] = [
   { network: 'ton', token: 'USDT', chainId: '1600', displayDecimals: 2 },
 ]
 
+// Native TON (Gram), public Beta (ainative docs/design/20261122-ton-native-
+// payin-implementation.zh.md; founder 2026-11-23 "yes for everyone, with a
+// limit"). Accepted on /option without any beta parameter. The capability
+// route lists it (with `beta: true`) only while the upstream admits this
+// router's app for native TON (TON_NATIVE_PAYIN_ENABLED and
+// TON_NATIVE_PAYIN_APPS, probed read-only below), so the page never offers a
+// coin the backend would refuse. Upstream off = 400 unsupported_asset here.
+export const TON_NATIVE_OPTION: AlphaOptionDef = Object.freeze({
+  network: 'ton', token: 'TON', chainId: '1600', displayDecimals: 4,
+})
+const TON_NATIVE_DECIMALS = 9
+
 export function findAlphaOption(network: unknown, token: unknown): AlphaOptionDef | null {
   const n = String(network ?? '').trim().toLowerCase()
   const t = String(token ?? '').trim().toUpperCase()
-  return ALPHA_OPTIONS.find((o) => o.network === n && o.token === t) ?? null
+  const listed = ALPHA_OPTIONS.find((o) => o.network === n && o.token === t)
+  if (listed) return listed
+  if (n === TON_NATIVE_OPTION.network && t === TON_NATIVE_OPTION.token) return TON_NATIVE_OPTION
+  return null
+}
+
+/** Decimal string to integer units at `decimals`; null when it does not fit exactly. */
+function decimalToAtomic(s: string, decimals: number): bigint | null {
+  const m = /^(\d+)(?:\.(\d+))?$/.exec(s)
+  if (!m) return null
+  const frac = m[2] ?? ''
+  if (frac.length > decimals) return null
+  return BigInt(m[1] + frac.padEnd(decimals, '0'))
+}
+
+export interface TonNativeChecked {
+  expected: string
+  expectedAtomic: string
+  rawAddress: string
+  addressDisplay: string
+  transferUri: string
+}
+
+/**
+ * Native TON answer from upstream, or null when any part of it cannot be
+ * shown to a payer: 4-decimal amount, nanoton atomic amount equal to it, no
+ * jetton, the per-order non-bounceable UQ address that is exactly the wallet
+ * form of the raw address (an EQ address to a fresh wallet bounces the
+ * coins), no code, and the transfer link rebuilt from those two values.
+ */
+export function checkTonNativeAnswer(data: Record<string, any>): TonNativeChecked | null {
+  if (data.network !== 'ton' || data.tokenSymbol !== 'TON' || data.tokenIdentity !== 'native') return null
+  if (Number(data.tokenDecimals) !== TON_NATIVE_DECIMALS) return null
+  if (Number(data.displayDecimals) !== TON_NATIVE_OPTION.displayDecimals) return null
+  if (data.addressPerOrder !== true || data.paymentReference != null) return null
+  const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
+  if (!/^\d+\.\d{4}$/.test(expected)) return null
+  const atomic = decimalToAtomic(expected, TON_NATIVE_DECIMALS)
+  const expectedAtomic = typeof data.expectedAmountAtomic === 'string' ? data.expectedAmountAtomic : ''
+  if (atomic === null || atomic <= 0n || !/^[1-9]\d*$/.test(expectedAtomic) || BigInt(expectedAtomic) !== atomic) return null
+  const rawAddress = typeof data.receivingAddressRaw === 'string' ? data.receivingAddressRaw : ''
+  if (!/^0:[0-9a-f]{64}$/.test(rawAddress)) return null
+  const addressDisplay = tonRawToFriendly(rawAddress)
+  if (!addressDisplay || !/^UQ[A-Za-z0-9_-]{46}$/.test(addressDisplay)) return null
+  if (data.receivingAddressDisplay !== addressDisplay || data.receivingAddress !== addressDisplay) return null
+  const transferUri = `ton://transfer/${addressDisplay}?amount=${expectedAtomic}`
+  if (data.tonTransferUri !== transferUri) return null
+  if (!Number.isFinite(Date.parse(typeof data.expiresAt === 'string' ? data.expiresAt : ''))) return null
+  return { expected, expectedAtomic, rawAddress, addressDisplay, transferUri }
 }
 
 function json(status: number, payload: unknown): Response {
@@ -130,19 +192,56 @@ export function tonRawToFriendly(raw: string, bounceable = false): string | null
 
 // ── Capability ───────────────────────────────────────────────────────────────
 
-// Per isolate. `at` is when the cached answer should next be re-probed from;
-// `knownAt` is when the upstream last gave a definitive answer.
-let capabilityCache: { at: number; enabled: boolean; knownAt: number } | null = null
+type CapabilityCache = { at: number; enabled: boolean; knownAt: number }
+
+/**
+ * One read-only upstream probe. `body` is sent as is; a 400 whose `error` is
+ * `on400` means on, any other definitive client-error answer means off.
+ */
+interface ProbeSpec {
+  name: 'alpha' | 'ton_native'
+  body: string
+  on400: string
+  kvKey: string
+}
+
+// Per isolate, per probe. `at` is when the cached answer should next be
+// re-probed from; `knownAt` is when the upstream last gave a definitive answer.
+const capabilityCaches: Record<ProbeSpec['name'], CapabilityCache | null> = { alpha: null, ton_native: null }
 
 /** Test hook. */
 export function resetTronTonAlphaCapabilityCache(): void {
-  capabilityCache = null
+  capabilityCaches.alpha = null
+  capabilityCaches.ton_native = null
 }
 
 // Shared last definitive answer, so a fresh isolate whose first probe times
 // out does not report the route as off (2026-11-17 flapping: capability read
 // true / false on alternate requests while the backend switch was on).
 export const CAPABILITY_LAST_KNOWN_KEY = 'tta:capability:last-known'
+export const TON_NATIVE_CAPABILITY_LAST_KNOWN_KEY = 'tta:capability:ton-native:last-known'
+
+/**
+ * The function checks its switch and app allowlist before it reads the body,
+ * so an empty body is read-only: 400 unsupported_asset = on (nothing is
+ * allocated).
+ */
+const ALPHA_PROBE: ProbeSpec = { name: 'alpha', body: '{}', on400: 'unsupported_asset', kvKey: CAPABILITY_LAST_KNOWN_KEY }
+
+/**
+ * Native TON (rozo-intents-api handler.ts): `{ network: 'ton', token: 'TON' }`
+ * reaches ton-native-create.ts only when TON_NATIVE_PAYIN_ENABLED is 'true'
+ * and this app is in TON_NATIVE_PAYIN_APPS, and that code answers 400
+ * bad_request for a body without merchantOrderId before it reads a price,
+ * an index or the database. Not admitted = 400 unsupported_asset (off).
+ * Nothing is allocated either way.
+ */
+const TON_NATIVE_PROBE: ProbeSpec = {
+  name: 'ton_native',
+  body: JSON.stringify({ network: 'ton', token: 'TON' }),
+  on400: 'bad_request',
+  kvKey: TON_NATIVE_CAPABILITY_LAST_KNOWN_KEY,
+}
 // How long a definitive answer may stand in for probes that fail transiently.
 export const CAPABILITY_STALE_MAX_MS = 30 * 60_000
 // After a failed probe, try again this soon instead of waiting the full TTL.
@@ -153,41 +252,40 @@ const CAPABILITY_KV_REFRESH_MS = 5 * 60_000
 type ProbeOutcome = 'on' | 'off' | 'unknown'
 
 /**
- * One upstream probe. The function checks its switch and app allowlist before
- * it reads the body, so an empty body is read-only: 400 unsupported_asset = on
- * (nothing is allocated); any other definitive client-error answer (403
+ * One upstream probe (see ProbeSpec). 400 with the spec's `on400` error = on;
+ * any other definitive client-error answer (another 400 error, 403
  * alpha_disabled / app_not_allowed, 404 not deployed, ...) = off. Timeouts,
  * network errors, 408 / 429 and 5xx say nothing about the switch = unknown.
  */
-async function probeOnce(env: Env, fetchImpl: typeof fetch): Promise<ProbeOutcome> {
+async function probeOnce(spec: ProbeSpec, env: Env, fetchImpl: typeof fetch): Promise<ProbeOutcome> {
   try {
     const r = await fetchImpl(TRON_TON_ALPHA_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': env.ROZO_INTENTS_API_KEY },
-      body: '{}',
+      body: spec.body,
       signal: AbortSignal.timeout(CAPABILITY_TIMEOUT_MS),
     })
     if (r.status === 400) {
       // A body that cannot be read (timeout, reset, not JSON) says nothing.
       const body = (await r.json().catch(() => undefined)) as { error?: unknown } | null | undefined
       if (body === undefined) {
-        console.warn('[tron-ton-alpha] capability probe body unreadable', r.status)
+        console.warn('[tron-ton-alpha] capability probe body unreadable', spec.name, r.status)
         return 'unknown'
       }
-      return body?.error === 'unsupported_asset' ? 'on' : 'off'
+      return body?.error === spec.on400 ? 'on' : 'off'
     }
     if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) return 'off'
-    console.warn('[tron-ton-alpha] capability probe inconclusive', r.status)
+    console.warn('[tron-ton-alpha] capability probe inconclusive', spec.name, r.status)
     return 'unknown'
   } catch (e) {
-    console.warn('[tron-ton-alpha] capability probe failed', e instanceof Error ? e.name : 'error')
+    console.warn('[tron-ton-alpha] capability probe failed', spec.name, e instanceof Error ? e.name : 'error')
     return 'unknown'
   }
 }
 
-async function readLastKnown(env: Env): Promise<{ enabled: boolean; at: number } | null> {
+async function readLastKnown(spec: ProbeSpec, env: Env): Promise<{ enabled: boolean; at: number } | null> {
   try {
-    const raw = await env.MPP_STORE?.get(CAPABILITY_LAST_KNOWN_KEY)
+    const raw = await env.MPP_STORE?.get(spec.kvKey)
     if (!raw) return null
     const v = JSON.parse(raw) as { enabled?: unknown; at?: unknown }
     if (typeof v.enabled !== 'boolean' || typeof v.at !== 'number' || !Number.isFinite(v.at)) return null
@@ -197,13 +295,13 @@ async function readLastKnown(env: Env): Promise<{ enabled: boolean; at: number }
   }
 }
 
-async function writeLastKnown(env: Env, enabled: boolean, at: number): Promise<void> {
+async function writeLastKnown(spec: ProbeSpec, env: Env, enabled: boolean, at: number): Promise<void> {
   try {
-    const prev = await readLastKnown(env)
+    const prev = await readLastKnown(spec, env)
     if (prev && prev.enabled === enabled && at - prev.at < CAPABILITY_KV_REFRESH_MS) return
     // A late probe must not overwrite a newer answer another request stored.
     if (prev && prev.at > at) return
-    await env.MPP_STORE?.put(CAPABILITY_LAST_KNOWN_KEY, JSON.stringify({ enabled, at }))
+    await env.MPP_STORE?.put(spec.kvKey, JSON.stringify({ enabled, at }))
   } catch {
     // best effort: the in-isolate cache still holds the answer
   }
@@ -217,34 +315,49 @@ async function writeLastKnown(env: Env, enabled: boolean, at: number): Promise<v
  * the probe is retried after CAPABILITY_RETRY_MS. With no definitive answer in
  * that window the route is reported off, as before.
  */
-export async function probeTronTonAlpha(env: Env, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+async function probeCapability(spec: ProbeSpec, env: Env, fetchImpl: typeof fetch): Promise<boolean> {
   const now = Date.now()
-  if (capabilityCache && now < capabilityCache.at) return capabilityCache.enabled
-  const outcome = await probeOnce(env, fetchImpl)
+  const cached = capabilityCaches[spec.name]
+  if (cached && now < cached.at) return cached.enabled
+  const outcome = await probeOnce(spec, env, fetchImpl)
   if (outcome !== 'unknown') {
     const enabled = outcome === 'on'
-    capabilityCache = { at: now + CAPABILITY_TTL_MS, enabled, knownAt: now }
-    await writeLastKnown(env, enabled, now)
+    capabilityCaches[spec.name] = { at: now + CAPABILITY_TTL_MS, enabled, knownAt: now }
+    await writeLastKnown(spec, env, enabled, now)
     return enabled
   }
   let fallback: { enabled: boolean; at: number } | null =
-    capabilityCache ? { enabled: capabilityCache.enabled, at: capabilityCache.knownAt } : null
-  const shared = await readLastKnown(env)
+    cached ? { enabled: cached.enabled, at: cached.knownAt } : null
+  const shared = await readLastKnown(spec, env)
   if (shared && (!fallback || shared.at > fallback.at)) fallback = shared
   const usable = fallback && now - fallback.at <= CAPABILITY_STALE_MAX_MS ? fallback : null
   const enabled = usable ? usable.enabled : false
-  capabilityCache = { at: now + CAPABILITY_RETRY_MS, enabled, knownAt: usable ? usable.at : 0 }
+  capabilityCaches[spec.name] = { at: now + CAPABILITY_RETRY_MS, enabled, knownAt: usable ? usable.at : 0 }
   return enabled
+}
+
+export function probeTronTonAlpha(env: Env, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  return probeCapability(ALPHA_PROBE, env, fetchImpl)
+}
+
+/**
+ * Whether the upstream offers native TON (Gram) to this router's app. Same
+ * caching and transient-failure rules as probeTronTonAlpha, separate state.
+ * Only a listing decision: /option still forwards the request and shows
+ * nothing unless the upstream answer passes checkTonNativeAnswer.
+ */
+export function probeTonNative(env: Env, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  return probeCapability(TON_NATIVE_PROBE, env, fetchImpl)
 }
 
 export async function handleTronTonAlphaCapability(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'GET') return json(405, { error: 'Method not allowed' })
-  const enabled = env.ROZO_INTENTS_API_KEY ? await probeTronTonAlpha(env) : false
-  return json(200, {
-    ok: true,
-    enabled,
-    options: enabled ? ALPHA_OPTIONS.map((o) => ({ ...o })) : [],
-  })
+  if (!env.ROZO_INTENTS_API_KEY) return json(200, { ok: true, enabled: false, options: [] })
+  const [enabled, tonNative] = await Promise.all([probeTronTonAlpha(env), probeTonNative(env)])
+  const options: Array<AlphaOptionDef & { beta?: true }> = enabled ? ALPHA_OPTIONS.map((o) => ({ ...o })) : []
+  // Native TON is listed last, marked Beta, and only inside an open alpha.
+  if (enabled && tonNative) options.push({ ...TON_NATIVE_OPTION, beta: true })
+  return json(200, { ok: true, enabled, options })
 }
 
 // ── Option ───────────────────────────────────────────────────────────────────
@@ -264,6 +377,14 @@ const UPSTREAM_ERRORS: Record<string, { status: number; code: string; message: s
   increment_budget_unset: { status: 503, code: 'ALPHA_CAPACITY', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' },
   price_unavailable: { status: 503, code: 'ALPHA_PRICE_UNAVAILABLE', message: 'The TRX price is unavailable right now. Try again later or pay with USDT.' },
 }
+// Native TON (Gram) beta refusals (rozo-intents-api ton-native-create.ts).
+// Read for the native option only, so the listed coins keep main's mapping.
+const NATIVE_UPSTREAM_ERRORS: Record<string, { status: number; code: string; message: string }> = {
+  ton_native_disabled: { status: 404, code: 'ALPHA_UNAVAILABLE', message: 'TRON and TON payments are not available.' },
+  order_already_fulfilled: { status: 409, code: 'ALPHA_ORDER_CLOSED', message: 'This TRON / TON order is closed.' },
+  exposure_full: { status: 503, code: 'ALPHA_CAPACITY', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' },
+}
+const TON_PRICE_UNAVAILABLE_MESSAGE = 'The TON price is unavailable right now. Try again later or pay with USDT.'
 const UPSTREAM_FALLBACK = { status: 502, code: 'ALPHA_UPSTREAM_FAILED', message: 'TRON / TON payments are temporarily unavailable. Pay with another coin.' }
 
 /** Upstream gross_usd (numeric from SQL, string or number) to a cent string. */
@@ -307,6 +428,84 @@ export function buildAlphaUpstreamBody(
 
 const COINBASE_INVOICE_KEY = /^(pl_[A-Za-z0-9_-]+|paymentSession_[0-9a-fA-F-]{36})$/
 
+/** What the page is shown, after validation. */
+interface ShownOption {
+  expected: string
+  expectedAtomic: string
+  tokenIdentity: string
+  tokenIdentityDisplay: string | null
+  address: string
+  addressDisplay: string
+  ref: string | null
+  expiresAt: string
+  /** Extra response fields: native TON beta, TON USDT per-order address. */
+  extra: Record<string, unknown>
+}
+
+function nativeShown(data: Record<string, any>): ShownOption | null {
+  const c = checkTonNativeAnswer(data)
+  if (!c) return null
+  return {
+    expected: c.expected,
+    expectedAtomic: c.expectedAtomic,
+    tokenIdentity: 'native',
+    tokenIdentityDisplay: null,
+    address: c.rawAddress,
+    addressDisplay: c.addressDisplay,
+    ref: null,
+    expiresAt: data.expiresAt,
+    extra: {
+      tokenName: 'TON (Gram)',
+      tokenDecimals: TON_NATIVE_DECIMALS,
+      addressPerOrder: true,
+      tonTransferUri: c.transferUri,
+      beta: true,
+    },
+  }
+}
+
+/** TRON USDT, TRON TRX and TON USDT: the checks the route has always made. */
+function listedShown(option: AlphaOptionDef, data: Record<string, any>): ShownOption | null {
+  const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
+  const decimalsOk = new RegExp(`^\\d+\\.\\d{${option.displayDecimals}}$`).test(expected)
+  // Atomic amount (6 decimals) for wallet links (TON QR). Must be the same
+  // number as the displayed amount, or neither is shown.
+  const expectedAtomic = typeof data.expectedAmountAtomic === 'string' ? data.expectedAmountAtomic : ''
+  const atomicOk = decimalsOk && /^\d+$/.test(expectedAtomic) && parseUsdcAtomic(expected) === BigInt(expectedAtomic)
+  // TON: the USDT jetton master in wallet form for the transfer link.
+  const tokenIdentity = typeof data.tokenIdentity === 'string' ? data.tokenIdentity : ''
+  const tokenIdentityDisplay = option.network === 'ton' ? tonRawToFriendly(tokenIdentity, true) : tokenIdentity || null
+  // TON: upstream sends the wallet form in receivingAddress and the canonical
+  // raw form in receivingAddressRaw (rozo-intents-api #854). This route
+  // returns the raw form and derives the wallet form itself, so read the raw
+  // one; an older upstream that sent raw in receivingAddress still works.
+  const rawAddress = option.network === 'ton' && typeof data.receivingAddressRaw === 'string'
+    ? data.receivingAddressRaw
+    : data.receivingAddress
+  const address = typeof rawAddress === 'string' ? rawAddress : ''
+  const ref = data.paymentReference == null ? null : String(data.paymentReference)
+  const expiresAt = typeof data.expiresAt === 'string' ? data.expiresAt : ''
+  const addressDisplay = option.network === 'ton' ? tonRawToFriendly(address) : address
+  if (
+    !atomicOk || (option.network === 'ton' && !tokenIdentityDisplay) || !address || !addressDisplay || !Number.isFinite(Date.parse(expiresAt)) ||
+    data.network !== option.network || data.tokenSymbol !== option.token ||
+    (option.network === 'ton' ? !(ref && /^\d{6}$/.test(ref)) : ref !== null)
+  ) {
+    return null
+  }
+  // TON USDT per-order address (rozo-intents-api handler.ts optionResponse,
+  // ainative design 20261031-ton-usdt-per-order-address section 10): the
+  // address alone identifies the order, so the page hides the code box. The
+  // flag is passed on only when upstream's wallet form is exactly the one
+  // derived here; otherwise the answer is shown the way it always was.
+  const perOrder = option.network === 'ton' && data.addressPerOrder === true &&
+    typeof data.receivingAddressDisplay === 'string' && data.receivingAddressDisplay === addressDisplay
+  return {
+    expected, expectedAtomic, tokenIdentity, tokenIdentityDisplay, address, addressDisplay, ref, expiresAt,
+    extra: perOrder ? { addressPerOrder: true } : {},
+  }
+}
+
 export async function handleTronTonAlphaOption(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.ROZO_INTENTS_API_KEY || !env.PAYINVOICE_ADMIN_SECRET) {
@@ -340,6 +539,7 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   }
 
   const option = findAlphaOption(parsed.network, parsed.token)
+  const native = option === TON_NATIVE_OPTION
   if (!option) {
     return fail(400, 'UNSUPPORTED_SOURCE', 'Unsupported network or token.', {
       supported: ALPHA_OPTIONS.map((o) => ({ network: o.network, token: o.token })),
@@ -436,40 +636,19 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   const data = (await upstream.json().catch(() => null)) as Record<string, any> | null
   if (!upstream.ok || !data || data.alpha !== true) {
     const reason = typeof data?.error === 'string' ? data.error : ''
-    const mapped = UPSTREAM_ERRORS[reason] ?? UPSTREAM_FALLBACK
+    const mapped = (native ? NATIVE_UPSTREAM_ERRORS[reason] : undefined) ?? UPSTREAM_ERRORS[reason] ?? UPSTREAM_FALLBACK
     // Reason code only: never the upstream body, the link or the key.
     console.warn('[tron-ton-alpha] option refused', upstream.status, reason || 'unknown')
-    return fail(mapped.status, mapped.code, mapped.message)
+    const message = native && reason === 'price_unavailable' ? TON_PRICE_UNAVAILABLE_MESSAGE : mapped.message
+    return fail(mapped.status, mapped.code, message)
   }
 
-  const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
-  const decimalsOk = new RegExp(`^\\d+\\.\\d{${option.displayDecimals}}$`).test(expected)
-  // Atomic amount (6 decimals) for wallet links (TON QR). Must be the same
-  // number as the displayed amount, or neither is shown.
-  const expectedAtomic = typeof data.expectedAmountAtomic === 'string' ? data.expectedAmountAtomic : ''
-  const atomicOk = decimalsOk && /^\d+$/.test(expectedAtomic) && parseUsdcAtomic(expected) === BigInt(expectedAtomic)
-  // TON: the USDT jetton master in wallet form for the transfer link.
-  const tokenIdentity = typeof data.tokenIdentity === 'string' ? data.tokenIdentity : ''
-  const tokenIdentityDisplay = option.network === 'ton' ? tonRawToFriendly(tokenIdentity, true) : tokenIdentity || null
-  // TON: upstream sends the wallet form in receivingAddress and the canonical
-  // raw form in receivingAddressRaw (rozo-intents-api #854). This route
-  // returns the raw form and derives the wallet form itself, so read the raw
-  // one; an older upstream that sent raw in receivingAddress still works.
-  const rawAddress = option.network === 'ton' && typeof data.receivingAddressRaw === 'string'
-    ? data.receivingAddressRaw
-    : data.receivingAddress
-  const address = typeof rawAddress === 'string' ? rawAddress : ''
-  const ref = data.paymentReference == null ? null : String(data.paymentReference)
-  const expiresAt = typeof data.expiresAt === 'string' ? data.expiresAt : ''
-  const addressDisplay = option.network === 'ton' ? tonRawToFriendly(address) : address
-  if (
-    !atomicOk || (option.network === 'ton' && !tokenIdentityDisplay) || !address || !addressDisplay || !Number.isFinite(Date.parse(expiresAt)) ||
-    data.network !== option.network || data.tokenSymbol !== option.token ||
-    (option.network === 'ton' ? !(ref && /^\d{6}$/.test(ref)) : ref !== null)
-  ) {
+  const shown = native ? nativeShown(data) : listedShown(option, data)
+  if (!shown) {
     console.warn('[tron-ton-alpha] option response failed validation')
     return fail(UPSTREAM_FALLBACK.status, UPSTREAM_FALLBACK.code, UPSTREAM_FALLBACK.message)
   }
+  const { expected, expectedAtomic, tokenIdentity, tokenIdentityDisplay, address, addressDisplay, ref, expiresAt } = shown
 
   // The order deadline is shared by every option and never renewed. A link
   // that dies before it would let us take money we can no longer deliver, so
@@ -533,6 +712,7 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     expectedAmount: expected,
     expectedAmountAtomic: expectedAtomic,
     paymentReference: ref,
+    ...shown.extra,
     expiresAt,
     serverTime: typeof data.serverTime === 'string' ? data.serverTime : new Date().toISOString(),
     linkExpiresAt: linkExpiresAt ?? null,
