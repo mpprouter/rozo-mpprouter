@@ -15,14 +15,18 @@ import {
   supportedSources,
   verifyTestPaymentId,
   withBetaSources,
-  CELO_USDC_BETA_KEY,
-  CELO_USDT_BETA_KEY,
+  CELO_CHAIN,
 } from './native-sources'
 // Called at request time only, so the existing create-invoice <-> this module
 // import cycle is harmless (ESM live bindings).
 import { CELO_MIN_LINK_LIFE_MS, checkZecLinkExpiry, resolveCoinbaseLinkExpiry } from './create-invoice'
 
-const CELO_BETA_KEYS: readonly string[] = [CELO_USDT_BETA_KEY, CELO_USDC_BETA_KEY]
+/** The stable-source table without Celo (quote on a link too short for Celo). */
+function withoutCelo(table: Record<string, readonly ('USDC' | 'USDT')[]>): Record<string, readonly ('USDC' | 'USDT')[]> {
+  const out = { ...table }
+  delete out[CELO_CHAIN]
+  return out
+}
 import { createQuoteReceipt, quoteIdentity } from './quote-receipt'
 import { resolveStripeInvoice, StripeResolveError } from './invoice-provider'
 import { invoiceResolveRateLimit } from './invoice-details'
@@ -877,6 +881,12 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
   // The link's existing order is NOT looked up here: the intents lookup takes
   // seconds in production and the quote must stay on its fast path. Clients
   // ask GET /v1/services/rozo-agent-api/existing-order separately.
+  //
+  // Celo is offered only on a link that outlives CELO_MIN_LINK_LIFE_MS (the
+  // rule create-invoice enforces). Its Coinbase expiry read starts now, in
+  // parallel with the upstream quote, so the quote's latency does not grow.
+  const expiryIdGuess = link_id_detected ?? ('payment_id' in normalized ? normalized.payment_id : null)
+  const celoExpiryPromise = resolveCoinbaseLinkExpiry(expiryIdGuess)
   let upstream: Response
   try {
     upstream = await fetch('https://agentapi.rozo.ai/quote-invoice', {
@@ -958,20 +968,17 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
 
   // Open native coins for this request: NATIVE_SOURCES plus any
   // NATIVE_SOURCES_BETA coin named by ?beta= (create-invoice reads the same).
-  const nativeOpen = withBetaSources(
+  const nativeAllowed = withBetaSources(
     parseNativeSources(env.NATIVE_SOURCES),
     env.NATIVE_SOURCES_BETA,
     request.url,
   )
-  // Celo (beta) is offered only on a link that outlives CELO_MIN_LINK_LIFE_MS,
-  // the same rule create-invoice enforces; unknown expiry hides it (fail
-  // closed). The extra Coinbase read runs only when a Celo key is open for
-  // this request (?beta=celo), so the plain quote keeps its fast path.
-  let nativeAllowed: ReadonlySet<string> = nativeOpen
-  if (CELO_BETA_KEYS.some((k) => nativeOpen.has(k))) {
-    const life = checkZecLinkExpiry(await resolveCoinbaseLinkExpiry(paymentId), Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
-    if (!life.ok) nativeAllowed = new Set([...nativeOpen].filter((k) => !CELO_BETA_KEYS.includes(k)))
-  }
+  // Celo: hidden when the link expires within CELO_MIN_LINK_LIFE_MS or its
+  // expiry is unreadable (fail closed). Read for the id the upstream quote
+  // confirmed when it differs from the early guess.
+  const celoExpiry = paymentId === expiryIdGuess ? await celoExpiryPromise : await resolveCoinbaseLinkExpiry(paymentId)
+  const celoLife = checkZecLinkExpiry(celoExpiry, Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
+  const stableForQuote = celoLife.ok ? STABLE_SOURCES : withoutCelo(STABLE_SOURCES)
   const quoteReceipt = await createQuoteReceipt(
     paymentId,
     amount,
@@ -1001,7 +1008,7 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     title: buildCheckoutTitle(merchant, pricing),
     currency: 'USD',
     // Coins this checkout may be paid with (stablecoins + open native coins).
-    supportedSources: supportedSources(STABLE_SOURCES, nativeAllowed),
+    supportedSources: supportedSources(stableForQuote, nativeAllowed),
     // Per-coin checkout metadata for open coins that carry it (beta ZEC:
     // eta, refund address required, single-use deposit address).
     sourceMeta: sourceMeta(nativeAllowed, parseZecRail(env.ZEC_RAIL), zecShieldedRequested(request.url), env.BTC_ONCHAIN_MAX_USD, parseBtcOnchainLimits(env.BTC_ONCHAIN_LIMITS)),

@@ -70,7 +70,7 @@ import {
   verifyTestPaymentId,
   withBetaSources,
   stableTokensFor,
-  celoBetaKeyFor,
+  celoTokenAccepted,
   zecShieldedAvailable,
   zecShieldedMaxUsd,
   ZEC_BLOCK_TARGET_SECONDS,
@@ -160,8 +160,7 @@ const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
   },
   '8453': { USDC: BASE_USDC_ADDRESS },
   // Celo USDT (Tether native on Celo) and Celo USDC (Circle native), both 6
-  // decimals. Beta only: reachable just through BETA_STABLE_SOURCES
-  // "USDT@42220" / "USDC@42220" + `?beta=celo`.
+  // decimals. Official stable source (STABLE_SOURCES['42220']).
   '42220': {
     USDT: '0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e',
     USDC: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C',
@@ -2154,11 +2153,10 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // The check above only sees the REQUESTED source. An existing Celo order
   // handed back for a request of another coin (reuse with rotation refused,
   // failed or not attempted; or the winner of a create conflict) must pass
-  // the same two gates before its pay instructions leave: the beta key of the
-  // row's own coin (USDT@42220 or USDC@42220; any other or unknown coin is
-  // refused) opened for this request (NATIVE_SOURCES_BETA plus ?beta=celo)
-  // and a merchant
-  // link that outlives CELO_MIN_LINK_LIFE_MS (unknown expiry fails closed).
+  // the same two gates before its pay instructions leave: the row's own coin
+  // must be Celo USDT or USDC (any other or unknown coin is refused) and the
+  // merchant link must outlive CELO_MIN_LINK_LIFE_MS (unknown expiry fails
+  // closed).
   // Otherwise only the order id and status are returned, never its address,
   // link or raw row. Non-Celo rows: null (no change).
   const celoReuseBlock = async (
@@ -2176,8 +2174,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         rozoPaymentId: row?.id ?? null,
         status: readPaymentStatus(row),
       })
-    const celoKey = celoBetaKeyFor(rowSource.tokenSymbol)
-    if (!celoKey || !nativeAllowed.has(celoKey)) {
+    if (!celoTokenAccepted(rowSource.tokenSymbol)) {
       return refuse(
         409,
         'CELO_NOT_ENABLED',
