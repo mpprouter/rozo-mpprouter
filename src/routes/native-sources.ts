@@ -45,16 +45,29 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
  * withBetaSources). Opening one adds it to the request's allowed set, which
  * supportedSources / stableTokensFor read.
  *
- * Celo USDT (founder 2026-11-23 "开", design ainative
- * docs/design/20261122-celo-stablecoins-payin-implementation.zh.md A2): only
- * behind `?beta=celo`. Every Celo-sourced settlement is gated by finality
+ * Celo USDT and Celo USDC (founder 2026-11-23 "开", both 6 decimals; design
+ * ainative docs/design/20261122-celo-stablecoins-payin-implementation.zh.md
+ * A2): only behind `?beta=celo`, each key listed separately in
+ * NATIVE_SOURCES_BETA. Every Celo-sourced settlement is gated by finality
  * (routes/celo-finality.ts), so a Celo payin is paid out ~25 to 30 minutes
  * after it lands; create-invoice refuses a link that expires sooner than
- * CELO_MIN_LINK_LIFE_MS.
+ * CELO_MIN_LINK_LIFE_MS. Per-order, daily and outstanding Celo limits live in
+ * rozo-intents-api (500 / 2,000 / 2,000 USD, both coins combined); this
+ * router holds no Celo amount limit of its own.
  */
 export const CELO_USDT_BETA_KEY = 'USDT@42220'
+export const CELO_USDC_BETA_KEY = 'USDC@42220'
 export const BETA_STABLE_SOURCES: Readonly<Record<string, { chainId: string; token: 'USDC' | 'USDT'; param: string }>> = {
   [CELO_USDT_BETA_KEY]: { chainId: '42220', token: 'USDT', param: 'celo' },
+  [CELO_USDC_BETA_KEY]: { chainId: '42220', token: 'USDC', param: 'celo' },
+}
+
+/** The beta key a Celo order paying `tokenSymbol` needs opened; null for any other token (fail closed). */
+export function celoBetaKeyFor(tokenSymbol: string | null | undefined): string | null {
+  const s = typeof tokenSymbol === 'string' ? tokenSymbol.trim().toUpperCase() : ''
+  if (s === 'USDT') return CELO_USDT_BETA_KEY
+  if (s === 'USDC') return CELO_USDC_BETA_KEY
+  return null
 }
 
 /** Stable tokens accepted on `chainId` for a request: STABLE_SOURCES plus any opened beta stable key. */

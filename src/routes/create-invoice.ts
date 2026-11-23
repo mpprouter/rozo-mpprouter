@@ -70,7 +70,7 @@ import {
   verifyTestPaymentId,
   withBetaSources,
   stableTokensFor,
-  CELO_USDT_BETA_KEY,
+  celoBetaKeyFor,
   zecShieldedAvailable,
   zecShieldedMaxUsd,
   ZEC_BLOCK_TARGET_SECONDS,
@@ -81,6 +81,7 @@ import {
   type ZecRailMode,
 } from './native-sources'
 import { normalizeContactEmail } from './contact-email'
+import { isCeloChain } from './celo-finality'
 import {
   attributionMetadata,
   buildOrderAttribution,
@@ -158,9 +159,13 @@ const TOKEN_ADDRS: Record<string, Partial<Record<SourceToken, string>>> = {
     USDT: '0x55d398326f99059fF775485246999027B3197955',
   },
   '8453': { USDC: BASE_USDC_ADDRESS },
-  // Celo USDT (Tether native on Celo, 6 decimals). Beta only: reachable just
-  // through BETA_STABLE_SOURCES "USDT@42220" + `?beta=celo`.
-  '42220': { USDT: '0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e' },
+  // Celo USDT (Tether native on Celo) and Celo USDC (Circle native), both 6
+  // decimals. Beta only: reachable just through BETA_STABLE_SOURCES
+  // "USDT@42220" / "USDC@42220" + `?beta=celo`.
+  '42220': {
+    USDT: '0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e',
+    USDC: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C',
+  },
   // Solana USDT mint. USDT payin is supported (sol-pool-monitor); Solana USDT *payout*
   // is not (rejected downstream) — irrelevant here since settlement is Base USDC.
   '900':  {
@@ -708,8 +713,8 @@ export const BTC_ONCHAIN_MIN_LINK_LIFE_MS = (30 + 10 + 10) * 60_000
  * finalized (~25 to 30 minutes, routes/celo-finality.ts), plus the payer's own
  * time to send. A new Celo order needs the merchant link to live at least this
  * long; unknown expiry fails closed (same rule as ZEC / on-chain BTC).
- * 100 minutes is a PLACEHOLDER pending registration in ainative
- * docs/policy/magic-numbers.md.
+ * 100 minutes: founder 2026-11-23, ainative docs/policy/magic-numbers.md
+ * NPT-CELO-4 (applies to Celo USDT and Celo USDC alike).
  */
 export const CELO_MIN_LINK_LIFE_MS = 100 * 60_000
 
@@ -2149,16 +2154,18 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // The check above only sees the REQUESTED source. An existing Celo order
   // handed back for a request of another coin (reuse with rotation refused,
   // failed or not attempted; or the winner of a create conflict) must pass
-  // the same two gates before its pay instructions leave: USDT@42220 opened
-  // for this request (NATIVE_SOURCES_BETA plus ?beta=celo) and a merchant
+  // the same two gates before its pay instructions leave: the beta key of the
+  // row's own coin (USDT@42220 or USDC@42220; any other or unknown coin is
+  // refused) opened for this request (NATIVE_SOURCES_BETA plus ?beta=celo)
+  // and a merchant
   // link that outlives CELO_MIN_LINK_LIFE_MS (unknown expiry fails closed).
   // Otherwise only the order id and status are returned, never its address,
   // link or raw row. Non-Celo rows: null (no change).
   const celoReuseBlock = async (
     row: any,
-    rowSource: { chainId: string | null },
+    rowSource: { chainId: string | null; tokenSymbol: string | null },
   ): Promise<Response | null> => {
-    if (String(rowSource.chainId ?? '') !== '42220') return null
+    if (!isCeloChain(rowSource.chainId)) return null
     const refuse = (status: number, code: string, message: string) =>
       json(status, {
         ok: false,
@@ -2169,7 +2176,8 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         rozoPaymentId: row?.id ?? null,
         status: readPaymentStatus(row),
       })
-    if (!nativeAllowed.has(CELO_USDT_BETA_KEY)) {
+    const celoKey = celoBetaKeyFor(rowSource.tokenSymbol)
+    if (!celoKey || !nativeAllowed.has(celoKey)) {
       return refuse(
         409,
         'CELO_NOT_ENABLED',
@@ -2180,7 +2188,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     const check = await celoLinkLifeCheck()
     return check.ok ? null : refuse(400, 'MERCHANT_LINK_EXPIRES_TOO_SOON', check.message)
   }
-  if (source.chainId === '42220') {
+  if (isCeloChain(source.chainId)) {
     const check = await celoLinkLifeCheck()
     if (!check.ok) {
       return errorResponse(400, {
@@ -3305,7 +3313,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // CELO_MIN_LINK_LIFE_MS meanwhile never gets Celo pay instructions. The
   // unpaid order stays upstream and is gated again on any later reuse.
   {
-    const celoBlock = await celoReuseBlock(intentsJson, { chainId: source.chainId })
+    const celoBlock = await celoReuseBlock(intentsJson, { chainId: source.chainId, tokenSymbol: source.tokenSymbol })
     if (celoBlock) return celoBlock
   }
 
@@ -3408,7 +3416,7 @@ export async function handleStripeCreateInvoice(
 ): Promise<Response> {
   // Celo (beta) is a Coinbase-checkout source only: the Stripe path has no
   // Celo link-life check, so it never creates a Celo order.
-  if (source.chainId === '42220') {
+  if (isCeloChain(source.chainId)) {
     return errorResponse(400, {
       code: 'UNSUPPORTED_SOURCE',
       message: 'Celo is not available for Stripe invoices. Pay with USDC/USDT on another chain.',
