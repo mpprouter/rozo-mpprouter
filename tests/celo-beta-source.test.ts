@@ -144,105 +144,92 @@ async function post(
   return { status: res.status, json: (await res.json()) as any }
 }
 
-describe('Celo USDT beta source: opening rules', () => {
+describe('Celo USDT / USDC: official stable sources', () => {
   const base = parseNativeSources(PROD_NATIVE)
 
-  it('is not a default stable source', () => {
-    expect(STABLE_SOURCES['42220']).toBeUndefined()
-    expect(supportedSources(STABLE_SOURCES, base)['42220']).toBeUndefined()
-    expect(stableTokensFor('42220', base)).toBeUndefined()
+  it('is a default stable source (USDT and USDC), no beta param or env key needed', () => {
+    expect(STABLE_SOURCES['42220']).toEqual(['USDT', 'USDC'])
+    expect(supportedSources(STABLE_SOURCES, base)['42220']).toEqual(['USDT', 'USDC'])
+    expect(stableTokensFor('42220', base)).toEqual(['USDT', 'USDC'])
   })
 
-  it('opens only with USDT@42220 in NATIVE_SOURCES_BETA AND ?beta=celo', () => {
-    const on = withBetaSources(base, 'ZEC@9133,USDT@42220', 'https://x/q?beta=celo')
-    expect(on.has('USDT@42220')).toBe(true)
-    expect(supportedSources(STABLE_SOURCES, on)['42220']).toEqual(['USDT'])
-    expect(stableTokensFor('42220', on)).toEqual(['USDT'])
-
-    expect(withBetaSources(base, 'ZEC@9133,USDT@42220', 'https://x/q').has('USDT@42220')).toBe(false)
-    expect(withBetaSources(base, 'ZEC@9133,BTC@9000', 'https://x/q?beta=celo').has('USDT@42220')).toBe(false)
-    expect(withBetaSources(base, '', 'https://x/q?beta=celo').has('USDT@42220')).toBe(false)
-    // Its token symbol is not its param: ?beta=usdt never opens it.
-    expect(withBetaSources(base, 'USDT@42220', 'https://x/q?beta=usdt').has('USDT@42220')).toBe(false)
+  it('?beta=celo (still sent by the page) and stale USDT@42220 / USDC@42220 env keys are harmless no-ops', () => {
+    const stale = withBetaSources(base, 'ZEC@9133,BTC@9000,USDT@42220,USDC@42220', 'https://x/q?beta=btc,celo')
+    expect(stale.has('USDT@42220')).toBe(false)
+    expect(stale.has('USDC@42220')).toBe(false)
+    expect(stale.has('BTC@9000')).toBe(true)
+    expect(stale.has('ZEC@9133')).toBe(false)
+    const sup = supportedSources(STABLE_SOURCES, stale)
+    expect(sup['42220']).toEqual(['USDT', 'USDC'])
+    expect(sup['9000']).toEqual(['BTC'])
     // ?beta=celo opens nothing else.
-    const celoOnly = withBetaSources(base, 'ZEC@9133,BTC@9000,USDT@42220', 'https://x/q?beta=celo')
+    const celoOnly = withBetaSources(base, 'ZEC@9133,BTC@9000', 'https://x/q?beta=celo')
     expect(celoOnly.has('ZEC@9133')).toBe(false)
     expect(celoOnly.has('BTC@9000')).toBe(false)
   })
 
-  it('?beta=btc,celo (what the /celo page sends) opens BTC and Celo USDT, each independently', () => {
-    const both = withBetaSources(base, 'ZEC@9133,BTC@9000,USDT@42220', 'https://x/q?beta=btc,celo')
-    expect(both.has('BTC@9000')).toBe(true)
-    expect(both.has('USDT@42220')).toBe(true)
-    expect(both.has('ZEC@9133')).toBe(false)
-    const sup = supportedSources(STABLE_SOURCES, both)
-    expect(sup['42220']).toEqual(['USDT'])
-    expect(sup['9000']).toEqual(['BTC'])
-    // Without the Celo env key, btc still opens and Celo stays closed.
-    const btcOnly = withBetaSources(base, 'ZEC@9133,BTC@9000', 'https://x/q?beta=btc,celo')
-    expect(btcOnly.has('BTC@9000')).toBe(true)
-    expect(btcOnly.has('USDT@42220')).toBe(false)
-    // Repeated params work the same as a comma list.
-    expect(withBetaSources(base, 'BTC@9000,USDT@42220', 'https://x/q?beta=btc&beta=celo').has('USDT@42220')).toBe(true)
-  })
-
-  it('resolveSource: Celo USDT resolves to the Celo USDT contract only when open', () => {
-    const closed = resolveSource(CELO, base) as any
-    expect(closed.error.code).toBe('UNSUPPORTED_SOURCE')
-    const open = resolveSource(CELO, withBetaSources(base, 'USDT@42220', 'https://x/q?beta=celo')) as any
-    expect(open.resolved).toMatchObject({ chainId: '42220', tokenSymbol: 'USDT', tokenAddress: CELO_USDT })
-    // Celo USDC is not opened by the USDT key.
-    const usdc = resolveSource({ chainId: '42220', tokenSymbol: 'USDC' }, withBetaSources(base, 'USDT@42220', 'https://x/q?beta=celo')) as any
-    expect(usdc.error.code).toBe('UNSUPPORTED_SOURCE')
+  it('resolveSource: Celo USDT and USDC resolve to their contracts with or without ?beta=celo', () => {
+    const usdt = resolveSource(CELO, base) as any
+    expect(usdt.resolved).toMatchObject({ chainId: '42220', tokenSymbol: 'USDT', tokenAddress: CELO_USDT })
+    const usdc = resolveSource({ chainId: '42220', tokenSymbol: 'USDC' }, withBetaSources(base, 'ZEC@9133', 'https://x/q?beta=celo')) as any
+    expect(usdc.resolved).toMatchObject({ chainId: '42220', tokenSymbol: 'USDC', tokenAddress: '0xcebA9300f2b948710d2653dD7B07f33A8B32118C' })
+    // Other Celo coins are still refused.
+    const cusd = resolveSource({ chainId: '42220', tokenSymbol: 'CUSD' }, base) as any
+    expect(cusd.error).toBeTruthy()
   })
 })
 
 describe('quote-invoice with Celo USDT', () => {
-  it('default: no 42220; with ?beta=celo: Celo USDT listed and nothing else changes', async () => {
+  it('Celo USDT and USDC listed with or without ?beta=celo; the two quotes are identical', async () => {
     const plain = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
     const beta = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: '?beta=celo' })
     expect(plain.status).toBe(200)
-    expect(plain.json.supportedSources['42220']).toBeUndefined()
+    expect(plain.json.supportedSources['42220']).toEqual(['USDT', 'USDC'])
     expect(beta.status).toBe(200)
-    expect(beta.json.supportedSources['42220']).toEqual(['USDT', 'USDC'])
-    const strip = (j: any) => {
-      const sup = { ...j.supportedSources }
-      delete sup['42220']
-      return { sup, callerPays: j.callerPays, title: j.title, sourceMeta: j.sourceMeta }
-    }
+    const strip = (j: any) => ({ sup: j.supportedSources, callerPays: j.callerPays, title: j.title, sourceMeta: j.sourceMeta })
     expect(strip(beta.json)).toEqual(strip(plain.json))
   })
 
-  it('?beta=celo on a link shorter than CELO_MIN_LINK_LIFE_MS, or unknown expiry: Celo not offered, the rest unchanged', async () => {
-    const plain = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
+  it('the quote makes no Coinbase expiry request and lists Celo even on a short or unknown link', async () => {
+    const fetchMock = globalThis.fetch as any
+    for (const exp of [new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString(), null]) {
+      linkExpiresAt = exp
+      fetchMock.mockClear()
+      const q = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
+      expect(q.status).toBe(200)
+      expect(q.json.supportedSources['42220']).toEqual(['USDT', 'USDC'])
+      const coinbaseReads = fetchMock.mock.calls.filter((c: any[]) => String(c[0]?.url ?? c[0]).includes('payments.coinbase.com/next-api/'))
+      expect(coinbaseReads).toHaveLength(0)
+    }
+  })
+
+  it('a short link is refused only when the Celo order is created: MERCHANT_LINK_EXPIRES_TOO_SOON with a "use another coin or a new link" message', async () => {
     linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
-    const short = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: '?beta=celo' })
-    expect(short.status).toBe(200)
-    expect(short.json.supportedSources['42220']).toBeUndefined()
-    expect(short.json.supportedSources).toEqual(plain.json.supportedSources)
-    linkExpiresAt = null
-    const unknown = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: '?beta=celo' })
-    expect(unknown.status).toBe(200)
-    expect(unknown.json.supportedSources['42220']).toBeUndefined()
+    for (const tokenSymbol of ['USDT', 'USDC']) {
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: { chainId: '42220', tokenSymbol } })
+      expect(r.status).toBe(400)
+      expect(r.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+      expect(r.json.message).toContain('expires too soon for Celo')
+      expect(r.json.message).toContain('Pay with another coin, or create a new payment link')
+    }
+    expect(createCalls).toBe(0)
+    // Other coins on the same short link are not affected.
+    const base = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: { chainId: '8453', tokenSymbol: 'USDC' } })
+    expect(base.status).toBeLessThan(300)
   })
 
-  it('only USDT@42220 in NATIVE_SOURCES_BETA: Celo USDT listed, Celo USDC not', async () => {
-    const r = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: makeEnv({ NATIVE_SOURCES_BETA: 'USDT@42220' }), query: '?beta=celo' })
-    expect(r.json.supportedSources['42220']).toEqual(['USDT'])
-  })
-
-  it('NATIVE_SOURCES_BETA without USDT@42220: hidden even with ?beta=celo', async () => {
-    const r = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: makeEnv({ NATIVE_SOURCES_BETA: 'ZEC@9133,BTC@9000' }), query: '?beta=celo' })
-    expect(r.json.supportedSources['42220']).toBeUndefined()
+  it('NATIVE_SOURCES_BETA without the old Celo keys: still listed', async () => {
+    const r = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: makeEnv({ NATIVE_SOURCES_BETA: 'ZEC@9133,BTC@9000' }) })
+    expect(r.json.supportedSources['42220']).toEqual(['USDT', 'USDC'])
   })
 })
 
 describe('create-invoice with Celo USDT', () => {
-  it('closed (no ?beta=celo): 400 UNSUPPORTED_SOURCE, no upstream create', async () => {
-    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO })
-    expect(r.status).toBe(400)
-    expect(r.json.code).toBe('UNSUPPORTED_SOURCE')
-    expect(createCalls).toBe(0)
+  it('no ?beta=celo and no Celo env key: Celo USDT order is created (official source)', async () => {
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO }, { env: makeEnv({ NATIVE_SOURCES_BETA: 'ZEC@9133,BTC@9000' }) })
+    expect(r.status).toBeLessThan(300)
+    expect(createCalls).toBe(1)
+    expect(createdIntent.source).toMatchObject({ chainId: '42220', tokenSymbol: 'USDT', tokenAddress: CELO_USDT })
   })
 
   it('link that expires within CELO_MIN_LINK_LIFE_MS, or unknown expiry: refused before any create', async () => {
@@ -328,23 +315,22 @@ describe('create-invoice with Celo USDT', () => {
       expect(JSON.stringify(j)).not.toContain('pay.rozo.ai/celo-live')
     }
 
-    it('without ?beta=celo: rotation fails, the Celo order is not handed out (409 CELO_NOT_ENABLED)', async () => {
+    it('without ?beta=celo and no Celo env key: the live Celo order is handed back (link long enough)', async () => {
       existingOrder = await liveCelo()
-      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC })
-      expect(checkoutCalls).toBe(1)
-      expect(r.status).toBe(409)
-      expect(r.json.code).toBe('CELO_NOT_ENABLED')
-      expect(r.json.rozoPaymentId).toBe('rozo-pay-celo-live')
-      expectNoPayInstructions(r.json)
+      const env = makeEnv({ NATIVE_SOURCES_BETA: 'ZEC@9133,BTC@9000' })
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC }, { env })
+      expect(r.status).toBe(200)
+      expect(r.json.reused).toBe(true)
+      expect(r.json.paymentLink).toBe('https://pay.rozo.ai/celo-live')
       expect(createCalls).toBe(0)
     })
 
-    it('USDT@42220 removed from NATIVE_SOURCES_BETA: refused even with ?beta=celo', async () => {
+    it('without ?beta=celo: a live Celo order on a short link is still refused', async () => {
       existingOrder = await liveCelo()
-      const env = makeEnv({ NATIVE_SOURCES_BETA: 'ZEC@9133,BTC@9000' })
-      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC }, { env, query: '?beta=celo' })
-      expect(r.status).toBe(409)
-      expect(r.json.code).toBe('CELO_NOT_ENABLED')
+      linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC })
+      expect(r.status).toBe(400)
+      expect(r.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
       expectNoPayInstructions(r.json)
     })
 
@@ -363,13 +349,13 @@ describe('create-invoice with Celo USDT', () => {
       expectNoPayInstructions(unknown.json)
     })
 
-    it('create conflict: a plain request that loses the slot to a Celo order does not get it without ?beta=celo', async () => {
+    it('create conflict: a plain request (no ?beta=celo) that loses the slot to a Celo order on a short link is refused', async () => {
       conflictWinner = await liveCelo()
+      linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
       const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC })
       expect(createCalls).toBe(1)
-      expect(r.status).toBe(409)
-      expect(r.json.code).toBe('CELO_NOT_ENABLED')
-      expect(r.json.rozoPaymentId).toBe('rozo-pay-celo-live')
+      expect(r.status).toBe(400)
+      expect(r.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
       expectNoPayInstructions(r.json)
     })
 
@@ -440,14 +426,11 @@ describe('create-invoice with Celo USDT', () => {
     const CELO_USDC_SRC = { chainId: '42220', tokenSymbol: 'USDC' }
     const CELO_USDC = '0xcebA9300f2b948710d2653dD7B07f33A8B32118C'
 
-    it('closed without ?beta=celo, and closed when only USDT@42220 is listed', async () => {
-      const plain = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO_USDC_SRC })
-      expect(plain.status).toBe(400)
-      expect(plain.json.code).toBe('UNSUPPORTED_SOURCE')
-      const usdtOnly = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO_USDC_SRC }, { env: makeEnv({ NATIVE_SOURCES_BETA: 'USDT@42220' }), query: '?beta=celo' })
-      expect(usdtOnly.status).toBe(400)
-      expect(usdtOnly.json.code).toBe('UNSUPPORTED_SOURCE')
-      expect(createCalls).toBe(0)
+    it('created without ?beta=celo and without any Celo env key', async () => {
+      const plain = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO_USDC_SRC }, { env: makeEnv({ NATIVE_SOURCES_BETA: '' }) })
+      expect(plain.status).toBeLessThan(300)
+      expect(createCalls).toBe(1)
+      expect(createdIntent.source).toMatchObject({ chainId: '42220', tokenSymbol: 'USDC', tokenAddress: CELO_USDC })
     })
 
     it('link shorter than CELO_MIN_LINK_LIFE_MS or unknown: refused before any create', async () => {
@@ -469,7 +452,7 @@ describe('create-invoice with Celo USDT', () => {
       expect(r.status).toBeLessThan(300)
     })
 
-    it('a live Celo USDC order reused for a Base request: refused when USDC@42220 is not open, even with USDT@42220 open', async () => {
+    it('a live Celo USDC order reused for a Base request: handed back on a long link, refused on a short one (no beta param)', async () => {
       // Same pricing metadata a real ?beta=celo USDC create writes.
       const made = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO_USDC_SRC }, { query: '?beta=celo' })
       expect(made.status).toBeLessThan(300)
@@ -486,14 +469,14 @@ describe('create-invoice with Celo USDT', () => {
         source: { chainId: '42220', tokenSymbol: 'USDC', tokenAddress: CELO_USDC, amount: intent.source.amount, receiverAddress: '0x4444444444444444444444444444444444444444' },
         destination: { chainId: '8453', tokenSymbol: 'USDC', amount: '5.00' },
       }
-      // Control: with USDC@42220 open the same order is handed back.
-      const open = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: { chainId: '8453', tokenSymbol: 'USDC' } }, { query: '?beta=celo' })
+      const env = makeEnv({ NATIVE_SOURCES_BETA: '' })
+      const open = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: { chainId: '8453', tokenSymbol: 'USDC' } }, { env })
       expect(open.status).toBe(200)
       expect(open.json.paymentLink).toBe('https://pay.rozo.ai/celo-usdc')
-      const env = makeEnv({ NATIVE_SOURCES_BETA: 'USDT@42220' })
-      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: { chainId: '8453', tokenSymbol: 'USDC' } }, { env, query: '?beta=celo' })
-      expect(r.status).toBe(409)
-      expect(r.json.code).toBe('CELO_NOT_ENABLED')
+      linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: { chainId: '8453', tokenSymbol: 'USDC' } }, { env })
+      expect(r.status).toBe(400)
+      expect(r.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
       expect(JSON.stringify(r.json)).not.toContain('0x4444444444444444444444444444444444444444')
       expect(r.json.paymentLink).toBeUndefined()
     })
@@ -529,19 +512,18 @@ describe('create-invoice with Celo USDT', () => {
       }
     })
 
-    it('without ?beta=celo a test invoice cannot use Celo either', async () => {
+    it('without ?beta=celo a test invoice uses Celo too', async () => {
       const id = await signTestPaymentId('test-link-secret', 10, 'celotest2')
       const r = await post(handleCreateInvoice, { payment_id: id, source: { chainId: '42220', tokenSymbol: 'USDC' } })
-      expect(r.status).toBe(400)
-      expect(r.json.code).toBe('UNSUPPORTED_SOURCE')
-      expect(createCalls).toBe(0)
+      expect(r.status).toBeLessThan(300)
+      expect(createCalls).toBe(1)
     })
 
-    it('quote for a test invoice lists Celo USDT and USDC only with ?beta=celo', async () => {
+    it('quote for a test invoice lists Celo USDT and USDC with or without ?beta=celo', async () => {
       const id = await signTestPaymentId('test-link-secret', 10, 'celotest3')
       const plain = await post(handleQuoteInvoice as any, { payment_id: id })
       const beta = await post(handleQuoteInvoice as any, { payment_id: id }, { query: '?beta=celo' })
-      expect(plain.json.supportedSources['42220']).toBeUndefined()
+      expect(plain.json.supportedSources['42220']).toEqual(['USDT', 'USDC'])
       expect(beta.json.supportedSources['42220']).toEqual(['USDT', 'USDC'])
     })
   })

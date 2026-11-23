@@ -515,10 +515,10 @@ describe('resolveSource', () => {
     expect(resolveSource({ chainId: 5042, tokenSymbol: 'USDC' }).resolved?.tokenAddress).toBe('0x3600000000000000000000000000000000000000')
   })
 
-  it('refuses Celo (not shipped yet), Arc USDT and native Arc coins', () => {
+  it('accepts Celo USDT / USDC (official); refuses native CELO, Arc USDT and native Arc coins', () => {
     expect(resolveSource({ chainId: 5042, tokenSymbol: 'USDT' }).error?.code).toBe('UNSUPPORTED_SOURCE')
-    expect(resolveSource({ chainId: 42220, tokenSymbol: 'USDC' }).error?.code).toBe('UNSUPPORTED_SOURCE')
-    expect(resolveSource({ chainId: 42220, tokenSymbol: 'USDT' }).error?.code).toBe('UNSUPPORTED_SOURCE')
+    expect(resolveSource({ chainId: 42220, tokenSymbol: 'USDC' }).resolved?.tokenAddress).toBe('0xcebA9300f2b948710d2653dD7B07f33A8B32118C')
+    expect(resolveSource({ chainId: 42220, tokenSymbol: 'USDT' }).resolved?.tokenAddress).toBe('0x48065fbBE25f71C9282ddf5e1cD6D6A887483D5e')
     expect(resolveSource({ chainId: 42220, tokenSymbol: 'CELO' }).error).toBeDefined()
     expect(resolveSource({ chainId: 5042, tokenSymbol: 'ETH' }).error).toBeDefined()
   })

@@ -265,6 +265,15 @@ describe('create (funder model)', () => {
     expect(r.status).toBe(400)
   })
 
+  it('refuses Celo USDT / USDC (a Coinbase-checkout source only; finality outlasts a Bitrefill invoice)', async () => {
+    for (const tokenSymbol of ['USDT', 'USDC']) {
+      const r = await post(body({}, { source: { chainId: '42220', tokenSymbol } }))
+      expect(r.status).toBe(400)
+      expect(r.json.error).toBe('UNSUPPORTED_SOURCE')
+      expect(r.json.message).toContain('Celo')
+    }
+  })
+
   it('rejects non-UUID ids, blocked or funder receivers, over-cap amounts, bad expiry', async () => {
     for (const [br, code] of [
       [{ invoiceId: 'inv-abc123' }, 'INVALID_INPUT'],

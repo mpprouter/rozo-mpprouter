@@ -31,6 +31,7 @@ import {
 import { OPENROUTER_APP_ID } from './existing-order'
 import { casUpdate } from './stripe-atomic'
 import { claimInvoiceKey } from './invoice-claim'
+import { isCeloChain } from './celo-finality'
 import {
   BITREFILL_FEE_BPS,
   BITREFILL_FUNDER,
@@ -211,6 +212,11 @@ export async function handleBitrefillCreateInvoice(
     })
   }
   const source = src.resolved
+  // Celo is a Coinbase-checkout source only: its payout waits ~25 to 30 min
+  // for finality, longer than a 60-minute Bitrefill invoice can safely spare.
+  if (isCeloChain(source.chainId)) {
+    return fail(400, 'UNSUPPORTED_SOURCE', 'Celo is not available for Bitrefill invoices.')
+  }
   if (isNativeSymbol(source.chainId, source.tokenSymbol) && Number(amount) > nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD)) {
     return fail(400, 'AMOUNT_OUT_OF_RANGE', `Native coin payment is limited to $${nativeMaxUsdFor(source.chainId, env.NATIVE_MAX_USD)} per invoice. Pay with USDC/USDT instead.`)
   }
@@ -592,6 +598,9 @@ export async function handleBitrefillFunderCreate(
     return fail(400, 'UNSUPPORTED_SOURCE', src.error?.message ?? 'Unsupported source.', { supported: src.error?.supported })
   }
   const source = src.resolved
+  if (isCeloChain(source.chainId)) {
+    return fail(400, 'UNSUPPORTED_SOURCE', 'Celo is not available for Bitrefill invoices.')
+  }
   if (source.tokenSymbol === 'ZEC') {
     return fail(400, 'UNSUPPORTED_SOURCE', 'ZEC is not available for Bitrefill invoices.')
   }

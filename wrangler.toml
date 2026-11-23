@@ -203,15 +203,13 @@ INTENTS_WARMUP = "on"
 # BTC_ONCHAIN_MAX_USD may only lower the cap). Unset = test_only band $0.50 to
 # $1.00. Rollback: remove BTC_ONCHAIN_LIMITS and redeploy.
 # Lightning BTC (chainId "lightning") is not affected by this entry.
-# USDT@42220 / USDC@42220 = Celo USDT and Celo USDC (Beta, founder
-# 2026-11-23), each opened only with ?beta=celo; every Celo payment waits for
-# the finality gate (CELO_FULFILLMENT_PAUSED / CELO_RPC_URL below) and a new
-# Celo order needs >= 100 min of link life. Amount limits live in intents.
-# Rollback (Celo only): remove USDT@42220,USDC@42220 and redeploy (the
-# finality gate and pause switch stay in place).
+# Celo USDT / USDC are no longer beta keys: they are official stable sources
+# (STABLE_SOURCES['42220'] in src/routes/native-sources.ts), still behind the
+# finality gate, CELO_FULFILLMENT_PAUSED and the 100 min link-life check.
+# To stop new Celo payments without a code change: CELO_FULFILLMENT_PAUSED = "on".
 # Rollback (BTC only): remove BTC@9000 and redeploy.
 # Rollback: set NATIVE_SOURCES_BETA = "" and redeploy.
-NATIVE_SOURCES_BETA = "ZEC@9133,BTC@9000,USDT@42220,USDC@42220"
+NATIVE_SOURCES_BETA = "ZEC@9133,BTC@9000"
 BTC_ONCHAIN_LIMITS = "beta"
 # Which rail rozo-intents-api is expected to use for NEW ZEC orders
 # (src/routes/native-sources.ts parseZecRail). "near" (default) = NEAR 1Click,
