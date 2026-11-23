@@ -12,8 +12,8 @@
  *   POST /v1/services/rozo-agent-api/tron-ton-alpha/option
  *        { payment_id | url, network: 'tron'|'ton', token: 'USDT'|'TRX' }
  *        -> one payment option (exact amount, address, TON code, deadline)
- *        Hidden beta: { network: 'ton', token: 'TON', beta: 'gram' } = native
- *        TON (Gram); without `beta: 'gram'` it is refused as before.
+ *        { network: 'ton', token: 'TON' } = native TON (Gram), public Beta,
+ *        listed by the capability only while the upstream admits it.
  *
  * The business order key is derived HERE, never from the request body: the
  * Coinbase invoice id the quote resolves (`pl_*` or `paymentSession_*`) is
@@ -81,25 +81,24 @@ export const ALPHA_OPTIONS: readonly AlphaOptionDef[] = [
   { network: 'ton', token: 'USDT', chainId: '1600', displayDecimals: 2 },
 ]
 
-// Native TON (Gram), hidden Beta (ainative docs/design/20261122-ton-native-
-// payin-implementation.zh.md). Never listed by the capability route and only
-// accepted on /option when the body carries `beta: "gram"` (the /ton?beta=gram
-// page); without it the request gets the same UNSUPPORTED_SOURCE as before.
-// The upstream function has its own switch (off = 400 unsupported_asset).
-export const TON_NATIVE_BETA_PARAM = 'gram'
-export const TON_NATIVE_BETA_OPTION: AlphaOptionDef = Object.freeze({
+// Native TON (Gram), public Beta (ainative docs/design/20261122-ton-native-
+// payin-implementation.zh.md; founder 2026-11-23 "yes for everyone, with a
+// limit"). Accepted on /option without any beta parameter. The capability
+// route lists it (with `beta: true`) only while the upstream admits this
+// router's app for native TON (TON_NATIVE_PAYIN_ENABLED and
+// TON_NATIVE_PAYIN_APPS, probed read-only below), so the page never offers a
+// coin the backend would refuse. Upstream off = 400 unsupported_asset here.
+export const TON_NATIVE_OPTION: AlphaOptionDef = Object.freeze({
   network: 'ton', token: 'TON', chainId: '1600', displayDecimals: 4,
 })
 const TON_NATIVE_DECIMALS = 9
 
-export function findAlphaOption(network: unknown, token: unknown, beta?: unknown): AlphaOptionDef | null {
+export function findAlphaOption(network: unknown, token: unknown): AlphaOptionDef | null {
   const n = String(network ?? '').trim().toLowerCase()
   const t = String(token ?? '').trim().toUpperCase()
   const listed = ALPHA_OPTIONS.find((o) => o.network === n && o.token === t)
   if (listed) return listed
-  if (beta === TON_NATIVE_BETA_PARAM && n === TON_NATIVE_BETA_OPTION.network && t === TON_NATIVE_BETA_OPTION.token) {
-    return TON_NATIVE_BETA_OPTION
-  }
+  if (n === TON_NATIVE_OPTION.network && t === TON_NATIVE_OPTION.token) return TON_NATIVE_OPTION
   return null
 }
 
@@ -130,7 +129,7 @@ export interface TonNativeChecked {
 export function checkTonNativeAnswer(data: Record<string, any>): TonNativeChecked | null {
   if (data.network !== 'ton' || data.tokenSymbol !== 'TON' || data.tokenIdentity !== 'native') return null
   if (Number(data.tokenDecimals) !== TON_NATIVE_DECIMALS) return null
-  if (Number(data.displayDecimals) !== TON_NATIVE_BETA_OPTION.displayDecimals) return null
+  if (Number(data.displayDecimals) !== TON_NATIVE_OPTION.displayDecimals) return null
   if (data.addressPerOrder !== true || data.paymentReference != null) return null
   const expected = typeof data.expectedAmount === 'string' ? data.expectedAmount : ''
   if (!/^\d+\.\d{4}$/.test(expected)) return null
@@ -193,19 +192,56 @@ export function tonRawToFriendly(raw: string, bounceable = false): string | null
 
 // ── Capability ───────────────────────────────────────────────────────────────
 
-// Per isolate. `at` is when the cached answer should next be re-probed from;
-// `knownAt` is when the upstream last gave a definitive answer.
-let capabilityCache: { at: number; enabled: boolean; knownAt: number } | null = null
+type CapabilityCache = { at: number; enabled: boolean; knownAt: number }
+
+/**
+ * One read-only upstream probe. `body` is sent as is; a 400 whose `error` is
+ * `on400` means on, any other definitive client-error answer means off.
+ */
+interface ProbeSpec {
+  name: 'alpha' | 'ton_native'
+  body: string
+  on400: string
+  kvKey: string
+}
+
+// Per isolate, per probe. `at` is when the cached answer should next be
+// re-probed from; `knownAt` is when the upstream last gave a definitive answer.
+const capabilityCaches: Record<ProbeSpec['name'], CapabilityCache | null> = { alpha: null, ton_native: null }
 
 /** Test hook. */
 export function resetTronTonAlphaCapabilityCache(): void {
-  capabilityCache = null
+  capabilityCaches.alpha = null
+  capabilityCaches.ton_native = null
 }
 
 // Shared last definitive answer, so a fresh isolate whose first probe times
 // out does not report the route as off (2026-11-17 flapping: capability read
 // true / false on alternate requests while the backend switch was on).
 export const CAPABILITY_LAST_KNOWN_KEY = 'tta:capability:last-known'
+export const TON_NATIVE_CAPABILITY_LAST_KNOWN_KEY = 'tta:capability:ton-native:last-known'
+
+/**
+ * The function checks its switch and app allowlist before it reads the body,
+ * so an empty body is read-only: 400 unsupported_asset = on (nothing is
+ * allocated).
+ */
+const ALPHA_PROBE: ProbeSpec = { name: 'alpha', body: '{}', on400: 'unsupported_asset', kvKey: CAPABILITY_LAST_KNOWN_KEY }
+
+/**
+ * Native TON (rozo-intents-api handler.ts): `{ network: 'ton', token: 'TON' }`
+ * reaches ton-native-create.ts only when TON_NATIVE_PAYIN_ENABLED is 'true'
+ * and this app is in TON_NATIVE_PAYIN_APPS, and that code answers 400
+ * bad_request for a body without merchantOrderId before it reads a price,
+ * an index or the database. Not admitted = 400 unsupported_asset (off).
+ * Nothing is allocated either way.
+ */
+const TON_NATIVE_PROBE: ProbeSpec = {
+  name: 'ton_native',
+  body: JSON.stringify({ network: 'ton', token: 'TON' }),
+  on400: 'bad_request',
+  kvKey: TON_NATIVE_CAPABILITY_LAST_KNOWN_KEY,
+}
 // How long a definitive answer may stand in for probes that fail transiently.
 export const CAPABILITY_STALE_MAX_MS = 30 * 60_000
 // After a failed probe, try again this soon instead of waiting the full TTL.
@@ -216,41 +252,40 @@ const CAPABILITY_KV_REFRESH_MS = 5 * 60_000
 type ProbeOutcome = 'on' | 'off' | 'unknown'
 
 /**
- * One upstream probe. The function checks its switch and app allowlist before
- * it reads the body, so an empty body is read-only: 400 unsupported_asset = on
- * (nothing is allocated); any other definitive client-error answer (403
+ * One upstream probe (see ProbeSpec). 400 with the spec's `on400` error = on;
+ * any other definitive client-error answer (another 400 error, 403
  * alpha_disabled / app_not_allowed, 404 not deployed, ...) = off. Timeouts,
  * network errors, 408 / 429 and 5xx say nothing about the switch = unknown.
  */
-async function probeOnce(env: Env, fetchImpl: typeof fetch): Promise<ProbeOutcome> {
+async function probeOnce(spec: ProbeSpec, env: Env, fetchImpl: typeof fetch): Promise<ProbeOutcome> {
   try {
     const r = await fetchImpl(TRON_TON_ALPHA_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-api-key': env.ROZO_INTENTS_API_KEY },
-      body: '{}',
+      body: spec.body,
       signal: AbortSignal.timeout(CAPABILITY_TIMEOUT_MS),
     })
     if (r.status === 400) {
       // A body that cannot be read (timeout, reset, not JSON) says nothing.
       const body = (await r.json().catch(() => undefined)) as { error?: unknown } | null | undefined
       if (body === undefined) {
-        console.warn('[tron-ton-alpha] capability probe body unreadable', r.status)
+        console.warn('[tron-ton-alpha] capability probe body unreadable', spec.name, r.status)
         return 'unknown'
       }
-      return body?.error === 'unsupported_asset' ? 'on' : 'off'
+      return body?.error === spec.on400 ? 'on' : 'off'
     }
     if (r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) return 'off'
-    console.warn('[tron-ton-alpha] capability probe inconclusive', r.status)
+    console.warn('[tron-ton-alpha] capability probe inconclusive', spec.name, r.status)
     return 'unknown'
   } catch (e) {
-    console.warn('[tron-ton-alpha] capability probe failed', e instanceof Error ? e.name : 'error')
+    console.warn('[tron-ton-alpha] capability probe failed', spec.name, e instanceof Error ? e.name : 'error')
     return 'unknown'
   }
 }
 
-async function readLastKnown(env: Env): Promise<{ enabled: boolean; at: number } | null> {
+async function readLastKnown(spec: ProbeSpec, env: Env): Promise<{ enabled: boolean; at: number } | null> {
   try {
-    const raw = await env.MPP_STORE?.get(CAPABILITY_LAST_KNOWN_KEY)
+    const raw = await env.MPP_STORE?.get(spec.kvKey)
     if (!raw) return null
     const v = JSON.parse(raw) as { enabled?: unknown; at?: unknown }
     if (typeof v.enabled !== 'boolean' || typeof v.at !== 'number' || !Number.isFinite(v.at)) return null
@@ -260,13 +295,13 @@ async function readLastKnown(env: Env): Promise<{ enabled: boolean; at: number }
   }
 }
 
-async function writeLastKnown(env: Env, enabled: boolean, at: number): Promise<void> {
+async function writeLastKnown(spec: ProbeSpec, env: Env, enabled: boolean, at: number): Promise<void> {
   try {
-    const prev = await readLastKnown(env)
+    const prev = await readLastKnown(spec, env)
     if (prev && prev.enabled === enabled && at - prev.at < CAPABILITY_KV_REFRESH_MS) return
     // A late probe must not overwrite a newer answer another request stored.
     if (prev && prev.at > at) return
-    await env.MPP_STORE?.put(CAPABILITY_LAST_KNOWN_KEY, JSON.stringify({ enabled, at }))
+    await env.MPP_STORE?.put(spec.kvKey, JSON.stringify({ enabled, at }))
   } catch {
     // best effort: the in-isolate cache still holds the answer
   }
@@ -280,34 +315,49 @@ async function writeLastKnown(env: Env, enabled: boolean, at: number): Promise<v
  * the probe is retried after CAPABILITY_RETRY_MS. With no definitive answer in
  * that window the route is reported off, as before.
  */
-export async function probeTronTonAlpha(env: Env, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+async function probeCapability(spec: ProbeSpec, env: Env, fetchImpl: typeof fetch): Promise<boolean> {
   const now = Date.now()
-  if (capabilityCache && now < capabilityCache.at) return capabilityCache.enabled
-  const outcome = await probeOnce(env, fetchImpl)
+  const cached = capabilityCaches[spec.name]
+  if (cached && now < cached.at) return cached.enabled
+  const outcome = await probeOnce(spec, env, fetchImpl)
   if (outcome !== 'unknown') {
     const enabled = outcome === 'on'
-    capabilityCache = { at: now + CAPABILITY_TTL_MS, enabled, knownAt: now }
-    await writeLastKnown(env, enabled, now)
+    capabilityCaches[spec.name] = { at: now + CAPABILITY_TTL_MS, enabled, knownAt: now }
+    await writeLastKnown(spec, env, enabled, now)
     return enabled
   }
   let fallback: { enabled: boolean; at: number } | null =
-    capabilityCache ? { enabled: capabilityCache.enabled, at: capabilityCache.knownAt } : null
-  const shared = await readLastKnown(env)
+    cached ? { enabled: cached.enabled, at: cached.knownAt } : null
+  const shared = await readLastKnown(spec, env)
   if (shared && (!fallback || shared.at > fallback.at)) fallback = shared
   const usable = fallback && now - fallback.at <= CAPABILITY_STALE_MAX_MS ? fallback : null
   const enabled = usable ? usable.enabled : false
-  capabilityCache = { at: now + CAPABILITY_RETRY_MS, enabled, knownAt: usable ? usable.at : 0 }
+  capabilityCaches[spec.name] = { at: now + CAPABILITY_RETRY_MS, enabled, knownAt: usable ? usable.at : 0 }
   return enabled
+}
+
+export function probeTronTonAlpha(env: Env, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  return probeCapability(ALPHA_PROBE, env, fetchImpl)
+}
+
+/**
+ * Whether the upstream offers native TON (Gram) to this router's app. Same
+ * caching and transient-failure rules as probeTronTonAlpha, separate state.
+ * Only a listing decision: /option still forwards the request and shows
+ * nothing unless the upstream answer passes checkTonNativeAnswer.
+ */
+export function probeTonNative(env: Env, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  return probeCapability(TON_NATIVE_PROBE, env, fetchImpl)
 }
 
 export async function handleTronTonAlphaCapability(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'GET') return json(405, { error: 'Method not allowed' })
-  const enabled = env.ROZO_INTENTS_API_KEY ? await probeTronTonAlpha(env) : false
-  return json(200, {
-    ok: true,
-    enabled,
-    options: enabled ? ALPHA_OPTIONS.map((o) => ({ ...o })) : [],
-  })
+  if (!env.ROZO_INTENTS_API_KEY) return json(200, { ok: true, enabled: false, options: [] })
+  const [enabled, tonNative] = await Promise.all([probeTronTonAlpha(env), probeTonNative(env)])
+  const options: Array<AlphaOptionDef & { beta?: true }> = enabled ? ALPHA_OPTIONS.map((o) => ({ ...o })) : []
+  // Native TON is listed last, marked Beta, and only inside an open alpha.
+  if (enabled && tonNative) options.push({ ...TON_NATIVE_OPTION, beta: true })
+  return json(200, { ok: true, enabled, options })
 }
 
 // ── Option ───────────────────────────────────────────────────────────────────
@@ -488,8 +538,8 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     return fail(400, 'INVALID_INPUT', 'Invalid JSON body')
   }
 
-  const option = findAlphaOption(parsed.network, parsed.token, parsed.beta)
-  const native = option === TON_NATIVE_BETA_OPTION
+  const option = findAlphaOption(parsed.network, parsed.token)
+  const native = option === TON_NATIVE_OPTION
   if (!option) {
     return fail(400, 'UNSUPPORTED_SOURCE', 'Unsupported network or token.', {
       supported: ALPHA_OPTIONS.map((o) => ({ network: o.network, token: o.token })),

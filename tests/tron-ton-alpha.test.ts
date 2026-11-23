@@ -17,7 +17,9 @@ import {
   handleTronTonAlphaCapability,
   handleTronTonAlphaOption,
   probeTronTonAlpha,
+  probeTonNative,
   resetTronTonAlphaCapabilityCache,
+  TON_NATIVE_CAPABILITY_LAST_KNOWN_KEY,
   tonRawToFriendly,
   CAPABILITY_LAST_KNOWN_KEY,
   CAPABILITY_STALE_MAX_MS,
@@ -79,6 +81,8 @@ interface FakeUpstream {
 
 let up: FakeUpstream
 let legacyTonShape = false
+/** Whether the fake upstream admits this app for native TON (TON_NATIVE_PAYIN_APPS). */
+let tonNativeOn = false
 let quoteLinkId = PL
 let quoteStatus = 200
 let linkExpiresAt: string | null = null
@@ -127,6 +131,7 @@ beforeEach(() => {
   ;(fakeAllocate as any).seq = 0
   up = { calls: [] }
   legacyTonShape = false
+  tonNativeOn = false
   intents = { lookups: [], creates: [] }
   quoteLinkId = PL
   quoteStatus = 200
@@ -141,6 +146,15 @@ beforeEach(() => {
       const custom = up.reply?.(body)
       if (custom) return custom
       if (!body.network) return new Response(JSON.stringify({ error: 'unsupported_asset' }), { status: 400 })
+      // rozo-intents-api handler.ts: ton/TON reaches ton-native-create.ts only
+      // when the app is admitted; there a body without merchantOrderId is 400
+      // bad_request. Not admitted: today's 400 unsupported_asset.
+      if (body.network === 'ton' && body.token === 'TON' && !tonNativeOn) {
+        return new Response(JSON.stringify({ error: 'unsupported_asset' }), { status: 400 })
+      }
+      if (body.network === 'ton' && body.token === 'TON' && !body.merchantOrderId) {
+        return new Response(JSON.stringify({ error: 'bad_request' }), { status: 400 })
+      }
       return fakeAllocate(body)
     }
     if (u.includes('/functions/v1/payment-api/payments/order/')) {
@@ -186,9 +200,9 @@ describe('tron-ton-alpha capability', () => {
     const j: any = await r.json()
     expect(j.enabled).toBe(true)
     expect(j.options.map((o: any) => `${o.network}:${o.token}:${o.displayDecimals}`)).toEqual(['tron:USDT:2', 'tron:TRX:1', 'ton:USDT:2'])
-    expect(up.calls).toHaveLength(1)
-    expect(up.calls[0].body).toEqual({})
-    expect(up.calls[0].headers['x-api-key']).toBe(KEY)
+    // Two read-only probes: the alpha switch and the native TON admission.
+    expect(up.calls.map((c) => c.body)).toEqual([{}, { network: 'ton', token: 'TON' }])
+    expect(up.calls.every((c) => c.headers['x-api-key'] === KEY)).toBe(true)
   })
 
   it.each([
@@ -788,37 +802,102 @@ function replyNative(over: Record<string, unknown> = {}) {
   up.reply = (body) => body.token === 'TON' ? new Response(JSON.stringify(nativeBody(over)), { status: 200 }) : null
 }
 const gramReq = (extra: Record<string, unknown> = {}) =>
-  optionReq({ payment_id: PL, network: 'ton', token: 'TON', beta: 'gram', ...extra })
+  optionReq({ payment_id: PL, network: 'ton', token: 'TON', ...extra })
 
-describe('tron-ton-alpha option: native TON (Gram) beta', () => {
-  it.each([
-    ['no beta field', {}],
-    ['another beta value', { beta: 'GRAM' }],
-    ['a non-string beta', { beta: true }],
-  ])('without beta=gram it answers exactly like main (%s): UNSUPPORTED_SOURCE, nothing upstream', async (_label, extra) => {
-    replyNative()
-    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'ton', token: 'TON', ...extra }), makeEnv())
-    expect(r.status).toBe(400)
-    expect(await r.json()).toEqual({
-      ok: false, code: 'UNSUPPORTED_SOURCE', message: 'Unsupported network or token.',
-      supported: [{ network: 'tron', token: 'USDT' }, { network: 'tron', token: 'TRX' }, { network: 'ton', token: 'USDT' }],
-    })
-    expect(up.calls).toHaveLength(0)
+describe('tron-ton-alpha capability: native TON (Gram) public Beta', () => {
+  it('lists Gram last, marked Beta, only while the upstream admits this app', async () => {
+    tonNativeOn = true
+    const j: any = await (await handleTronTonAlphaCapability(new Request('https://x/cap'), makeEnv())).json()
+    expect(j.enabled).toBe(true)
+    expect(j.options.map((o: any) => `${o.network}:${o.token}:${o.displayDecimals}`)).toEqual(['tron:USDT:2', 'tron:TRX:1', 'ton:USDT:2', 'ton:TON:4'])
+    expect(j.options[3]).toEqual({ network: 'ton', token: 'TON', chainId: '1600', displayDecimals: 4, beta: true })
+    expect(j.options.slice(0, 3).some((o: any) => 'beta' in o)).toBe(false)
+    // The probe never allocates: no merchantOrderId, no business order.
+    expect(up.calls[1].body).toEqual({ network: 'ton', token: 'TON' })
     expect(intents.creates).toHaveLength(0)
   })
 
-  it('beta=gram does not open TRON TON or any other coin', async () => {
+  it('is not listed when the upstream does not admit this app (unsupported_asset)', async () => {
+    const j: any = await (await handleTronTonAlphaCapability(new Request('https://x/cap'), makeEnv())).json()
+    expect(j.enabled).toBe(true)
+    expect(j.options.some((o: any) => o.token === 'TON')).toBe(false)
+  })
+
+  it('is never listed while the alpha itself is off, even if admitted', async () => {
+    tonNativeOn = true
+    up.reply = (body) => body.network ? null : new Response(JSON.stringify({ error: 'alpha_disabled' }), { status: 403 })
+    const j: any = await (await handleTronTonAlphaCapability(new Request('https://x/cap'), makeEnv())).json()
+    expect(j).toEqual({ ok: true, enabled: false, options: [] })
+  })
+
+  it.each([
+    ['403 alpha_disabled', () => new Response(JSON.stringify({ error: 'alpha_disabled' }), { status: 403 })],
+    ['400 bad_json', () => new Response(JSON.stringify({ error: 'bad_json' }), { status: 400 })],
+    ['401 unauthorized', () => new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 })],
+  ])('the native probe reads %s as off', async (_label, reply) => {
+    up.reply = (body) => body.token === 'TON' ? reply() : null
+    expect(await probeTonNative(makeEnv())).toBe(false)
+  })
+
+  it('with nothing known, an unreachable native probe is off; a known on survives a blip like the alpha', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    up.reply = (body) => { if (body.token === 'TON') throw new Error('down'); return null }
+    expect(await probeTonNative(makeEnv())).toBe(false)
+    resetTronTonAlphaCapabilityCache()
+    tonNativeOn = true
+    up.reply = undefined
+    const env = makeEnv()
+    expect(await probeTonNative(env)).toBe(true)
+    expect(JSON.parse((env.MPP_STORE as any).map.get(TON_NATIVE_CAPABILITY_LAST_KNOWN_KEY))).toEqual({ enabled: true, at: t0 })
+    // The alpha's shared answer is a separate key.
+    expect((env.MPP_STORE as any).map.has(CAPABILITY_LAST_KNOWN_KEY)).toBe(false)
+    now.mockReturnValue(t0 + 61_000)
+    up.reply = (body) => { if (body.token === 'TON') throw new Error('down'); return null }
+    expect(await probeTonNative(env)).toBe(true)
+  })
+
+  it('turning admission off hides Gram on the next probe after the cache window', async () => {
+    const t0 = 1_800_000_000_000
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0)
+    tonNativeOn = true
+    const env = makeEnv()
+    expect(await probeTonNative(env)).toBe(true)
+    tonNativeOn = false
+    now.mockReturnValue(t0 + 61_000)
+    expect(await probeTonNative(env)).toBe(false)
+    expect(JSON.parse((env.MPP_STORE as any).map.get(TON_NATIVE_CAPABILITY_LAST_KNOWN_KEY)).enabled).toBe(false)
+  })
+})
+
+describe('tron-ton-alpha option: native TON (Gram) public Beta', () => {
+  it.each([
+    ['no beta field', {}],
+    ['an old page that still sends beta=gram', { beta: 'gram' }],
+    ['another beta value', { beta: 'GRAM' }],
+  ])('is accepted without any beta parameter (%s)', async (_label, extra) => {
+    replyNative()
+    const r = await handleTronTonAlphaOption(gramReq(extra), makeEnv())
+    expect(r.status).toBe(200)
+    expect(((await r.json()) as any).tokenSymbol).toBe('TON')
+  })
+
+  it('while the upstream does not admit it, the answer is UNSUPPORTED_SOURCE and no order is created', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const r = await handleTronTonAlphaOption(gramReq(), makeEnv())
+    const j: any = await r.json()
+    expect([r.status, j.code]).toEqual([400, 'UNSUPPORTED_SOURCE'])
+    expect(j.receivingAddress).toBeUndefined()
+    expect(intents.creates).toHaveLength(0)
+  })
+
+  it('does not open TRON TON or any other coin', async () => {
     for (const [network, token] of [['tron', 'TON'], ['ton', 'TRX'], ['ton', 'USDC']]) {
       const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network, token, beta: 'gram' }), makeEnv())
       expect(r.status).toBe(400)
       expect(((await r.json()) as any).code).toBe('UNSUPPORTED_SOURCE')
     }
     expect(up.calls).toHaveLength(0)
-  })
-
-  it('the capability never lists it', async () => {
-    const j: any = await (await handleTronTonAlphaCapability(new Request('https://x/cap?beta=gram'), makeEnv())).json()
-    expect(j.options.some((o: any) => o.token === 'TON')).toBe(false)
   })
 
   it('forwards ton/TON with the same order facts as the other coins and returns the checked option', async () => {
