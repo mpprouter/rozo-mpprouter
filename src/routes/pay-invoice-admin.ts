@@ -21,6 +21,9 @@ import {
 // import cycle is harmless (ESM live bindings).
 import { CELO_MIN_LINK_LIFE_MS, checkZecLinkExpiry, resolveCoinbaseLinkExpiry } from './create-invoice'
 
+/** How long the quote waits, after the upstream quote, for the Celo link-expiry read (else Celo is hidden). */
+export const CELO_QUOTE_EXPIRY_GRACE_MS = 300
+
 /** The stable-source table without Celo (quote on a link too short for Celo). */
 function withoutCelo(table: Record<string, readonly ('USDC' | 'USDT')[]>): Record<string, readonly ('USDC' | 'USDT')[]> {
   const out = { ...table }
@@ -974,9 +977,16 @@ export async function handleQuoteInvoice(request: Request, env: Env): Promise<Re
     request.url,
   )
   // Celo: hidden when the link expires within CELO_MIN_LINK_LIFE_MS or its
-  // expiry is unreadable (fail closed). Read for the id the upstream quote
-  // confirmed when it differs from the early guess.
-  const celoExpiry = paymentId === expiryIdGuess ? await celoExpiryPromise : await resolveCoinbaseLinkExpiry(paymentId)
+  // expiry is unreadable (fail closed). The quote never waits long for it:
+  // if the parallel read has not finished within CELO_QUOTE_EXPIRY_GRACE_MS
+  // after the upstream quote, or the confirmed id differs from the early
+  // guess, Celo is simply not offered and every other coin returns at once.
+  const celoExpiry = paymentId === expiryIdGuess
+    ? await Promise.race([
+        celoExpiryPromise,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), CELO_QUOTE_EXPIRY_GRACE_MS)),
+      ])
+    : null
   const celoLife = checkZecLinkExpiry(celoExpiry, Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
   const stableForQuote = celoLife.ok ? STABLE_SOURCES : withoutCelo(STABLE_SOURCES)
   const quoteReceipt = await createQuoteReceipt(

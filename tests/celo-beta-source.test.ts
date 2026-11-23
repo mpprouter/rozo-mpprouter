@@ -207,6 +207,25 @@ describe('quote-invoice with Celo USDT', () => {
     expect(unknown.json.supportedSources['42220']).toBeUndefined()
   })
 
+  it('slow Coinbase expiry read: the quote does not wait for it; Celo hidden, other coins returned', async () => {
+    const plain = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
+    const fetchMock = globalThis.fetch as any
+    const inner = fetchMock.getMockImplementation()
+    fetchMock.mockImplementation(async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('payments.coinbase.com/next-api/')) await new Promise((r) => setTimeout(r, 2_000))
+      return inner(input, init)
+    })
+    const t0 = Date.now()
+    const slow = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID })
+    expect(Date.now() - t0).toBeLessThan(1_500)
+    expect(slow.status).toBe(200)
+    expect(slow.json.supportedSources['42220']).toBeUndefined()
+    const rest = { ...plain.json.supportedSources }
+    delete rest['42220']
+    expect(slow.json.supportedSources).toEqual(rest)
+  })
+
   it('NATIVE_SOURCES_BETA without the old Celo keys: still listed', async () => {
     const r = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { env: makeEnv({ NATIVE_SOURCES_BETA: 'ZEC@9133,BTC@9000' }) })
     expect(r.json.supportedSources['42220']).toEqual(['USDT', 'USDC'])
