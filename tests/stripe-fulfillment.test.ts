@@ -1,4 +1,12 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
+
+// The Celo gate reads the Rozo order on every Stripe settle and refuses when
+// the chain is unknown (celo-finality.ts). These tests cover other chains, so
+// that read answers a Base order; no real network is touched.
+vi.mock('../src/routes/webhook', async (importOriginal) => {
+  const mod: any = await importOriginal()
+  return { ...mod, fetchRozoPaymentById: async (_env: unknown, id: string) => ({ id, source: { chainId: '8453' } }) }
+})
 import {
   isStripeOrderId,
   stripeOrderId,
@@ -26,6 +34,13 @@ import type { Env } from '../src/index'
 // Implements the DO's /read + /commit versioned-CAS contract so the code under
 // test exercises the SAME linearizable path it uses in production. Storage is a
 // single Map keyed by `v:<k>` / `n:<k>`, mirroring the real DO's key layout.
+// Calls other than the Celo gate's read of the Rozo order (GET /payments/:id),
+// which runs on every Stripe settle event since the order is the authority on
+// the source chain (celo-finality.ts).
+function nonOrderReads(spy: { mock: { calls: unknown[][] } }): unknown[][] {
+  return spy.mock.calls.filter((c) => !/\/payment-api\/payments\/[^/]+$/.test(String(c[0])))
+}
+
 function makeDoNamespace() {
   const store = new Map<string, string>() // v:<k>
   const versions = new Map<string, number>() // n:<k>
@@ -344,6 +359,8 @@ describe('handleStripeWebhookEvent', () => {
   const evt = (over: Partial<any> = {}) => ({
     eventId: 'ev', eventType: 'payment_payout_completed',
     orderId: 'stripe_crypto_cpis_wh', rozoPaymentId: 'rp-wh', invoiceAmountStr: '10.00',
+    // The webhook always passes the order's source chain (Celo gate input).
+    sourceChainId: '8453',
     ...over,
   })
 
@@ -370,7 +387,7 @@ describe('handleStripeWebhookEvent', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'evPaused' }), new Date(Date.UTC(2026, 6, 12)))
     expect(summary.deferred).toBe('checkout_paused')
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(nonOrderReads(fetchSpy)).toHaveLength(0)
     expect((await loadRec(env, 'cpis_wh')).status).toBe('payout_seen')
     // This file's DO stub has no /scan; read the index key directly.
     const entry = JSON.parse((await casRead(env, checkoutBacklogKey('stripe_crypto_cpis_wh'))).value!)
@@ -390,7 +407,7 @@ describe('handleStripeWebhookEvent', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev2' }), new Date(Date.UTC(2026, 6, 12)))
     expect(summary.already_in_flight).toBe(true)
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(nonOrderReads(fetchSpy)).toHaveLength(0)
   })
 
   it('two concurrent events → only ONE reaches pay-invoice (double-sign serializer)', async () => {
@@ -449,7 +466,7 @@ describe('handleStripeWebhookEvent', () => {
   it('falls into manual_review when the locked binding is missing', async () => {
     const env = makeEnv()
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
-    const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev3', orderId: 'stripe_crypto_cpis_missing', rozoPaymentId: null }), new Date(Date.UTC(2026, 6, 12)))
+    const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'ev3', orderId: 'stripe_crypto_cpis_missing', rozoPaymentId: 'rp-missing' }), new Date(Date.UTC(2026, 6, 12)))
     expect(summary.deferred).toBe('missing_lock_binding')
     expect(fetchSpy).not.toHaveBeenCalled()
   })
@@ -457,7 +474,7 @@ describe('handleStripeWebhookEvent', () => {
   it('manual_review is terminal: a later event never reclaims + auto-submits (P1)', async () => {
     const env = makeEnv()
     // First event with no seeded lock binding → manual_review, no fetch.
-    const first = await handleStripeWebhookEvent(env, evt({ eventId: 'evmr1', orderId: 'stripe_crypto_cpis_mr', rozoPaymentId: null }), new Date(Date.UTC(2026, 6, 12)))
+    const first = await handleStripeWebhookEvent(env, evt({ eventId: 'evmr1', orderId: 'stripe_crypto_cpis_mr', rozoPaymentId: 'rp-mr' }), new Date(Date.UTC(2026, 6, 12)))
     expect(first.deferred).toBe('missing_lock_binding')
     // Now a fully-valid seed appears late AND a payout event arrives. The
     // record is already manual_review — it must NOT be reclaimed for settlement.
@@ -472,7 +489,7 @@ describe('handleStripeWebhookEvent', () => {
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
     const summary = await handleStripeWebhookEvent(env, evt({ eventId: 'evmr2', orderId: 'stripe_crypto_cpis_mr', eventType: 'payment_payout_completed' }), new Date(Date.UTC(2026, 6, 12)))
     // Stays terminal manual_review; pay-invoice is never called.
-    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(nonOrderReads(fetchSpy)).toHaveLength(0)
     const rec = await loadRec(env, 'cpis_mr')
     expect(rec.status).toBe('manual_review')
   })

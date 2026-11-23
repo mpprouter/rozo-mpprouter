@@ -28,6 +28,8 @@ import {
   normalizeCoinbasePayment,
 } from './invoice-provider'
 import { coinbaseDailyCapAtomic, releaseDailySpend, reserveDailySpend } from './stripe-fulfillment'
+import { celoGateAlertText, celoSettlementGate, type CeloGateResult } from './celo-finality'
+import { enqueueCeloRetry, type CeloRetryProvider } from './celo-retry'
 
 // Funder wallet — same wallet that receives caller USDC AND pays
 // Coinbase invoices via agentapi's admin-bypass. Configured in
@@ -161,6 +163,9 @@ export interface FulfillmentRecord {
   // settling-order.ts.
   settlingRozoPaymentId?: string | null
   duplicateRozoPaymentIds?: string[]
+  // Source chain of the payin as last seen on a webhook / order read.
+  // Informational (audit); the Celo gate (celo-finality.ts) never decides on it.
+  sourceChainId?: string | null
   deliveredReported?: boolean
   deliveredReportAttempts?: number
   // Last time Rozo answered the delivered report with the "payout not done
@@ -671,6 +676,8 @@ export async function handleRozoWebhook(
         rozoPaymentId,
         invoiceAmountStr:
           evt.data?.destination?.amount ?? evt.data?.source?.amount ?? null,
+        sourceChainId: evt.data?.source?.chainId,
+        sourceTxHash: evt.data?.source?.txHash ?? null,
       },
       new Date(now),
     )
@@ -684,7 +691,7 @@ export async function handleRozoWebhook(
     // real summary.
     ctx?.waitUntil(settlement.catch(() => undefined))
     const summary = await settlement
-    return json(200, summary)
+    return json(webhookStatusFor(summary), summary)
   }
 
   // 6. Coinbase settlement. Same reasoning as the Stripe branch above: Rozo's
@@ -704,7 +711,7 @@ export async function handleRozoWebhook(
   })
   ctx?.waitUntil(settlement.catch(() => undefined))
   const summary = await settlement
-  return json(200, summary)
+  return json(webhookStatusFor(summary), summary)
 }
 
 // True only when the pay-invoice response proves Coinbase CAPTURED the
@@ -802,6 +809,71 @@ export async function deferForCheckoutPause(
   return { ok: true, deferred: 'checkout_paused', plId }
 }
 
+/**
+ * Records the source chain of the order currently being settled (latest
+ * event / order read wins). Informational only: no gate decision reads it
+ * back; every gate re-derives the chain from the event and the Rozo order.
+ */
+export function noteSourceChain(rec: FulfillmentRecord, chainId: unknown): void {
+  if (chainId === undefined || chainId === null || chainId === '') return
+  rec.sourceChainId = String(chainId)
+}
+
+// The Celo settlement gate (celo-finality.ts) refused this payment: keep the
+// record in its pre-pay status, note why, forget the event's dedup marker so
+// the payout webhook / a resend / a replay is processed again, and alert on a
+// block-hash or chain disagreement. Nothing was sent.
+export async function deferForCeloGate(
+  env: Env,
+  plId: string,
+  rec: FulfillmentRecord,
+  eventId: string,
+  gate: Extract<CeloGateResult, { ok: false }>,
+  retry: { provider: CeloRetryProvider; eventType: string; rozoPaymentId: string | null },
+): Promise<Record<string, unknown>> {
+  rec.events.push({
+    kind: 'celo_finality_deferred',
+    at: new Date().toISOString(),
+    event_id: eventId,
+    detail: { reason: gate.reason },
+  })
+  await saveRecordGuarded(env, plId, rec)
+  await forgetWebhookEvent(env, eventId)
+  // Queue the automatic re-drive (celo-retry.ts): the cron re-runs this same
+  // settle path, and so this gate, every few minutes for up to 3 hours.
+  const queued = await enqueueCeloRetry(env, {
+    provider: retry.provider,
+    ref: plId,
+    rozoPaymentId: retry.rozoPaymentId ?? rec.settlingRozoPaymentId ?? rec.rozoPaymentId ?? null,
+    eventType: retry.eventType,
+    reason: gate.reason,
+  })
+  if (gate.alert) {
+    try {
+      if (alertSinkConfigured(env)) await sendAlert(env, redactForAlert(celoGateAlertText(plId, gate.reason)))
+      else console.warn(`[webhook] celo gate alert SKIPPED (no alert channel configured) for ${plId}: ${gate.reason}`)
+    } catch (err) {
+      console.warn(`[webhook] celo gate alert error (non-fatal): ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+  // Queue write failed (a human was already paged by enqueueCeloRetry): the
+  // webhook answers 503 (CELO_RETRY_QUEUE_FAILED_STATUS) instead of 200, so a
+  // sender that retries non-2xx re-delivers the event; its dedup marker was
+  // forgotten above. Nothing was paid either way.
+  if (!queued) return { ok: false, deferred: 'celo_finality', reason: gate.reason, plId, retryQueueFailed: true }
+  // celoQueued: this call itself wrote one retry-queue bump (celo-retry.ts
+  // uses it to know which attempt count it owns at give-up time).
+  return { ok: true, deferred: 'celo_finality', reason: gate.reason, plId, celoQueued: true }
+}
+
+/** HTTP status for a webhook whose Celo deferral could not be queued. */
+export const CELO_RETRY_QUEUE_FAILED_STATUS = 503
+
+/** 200 normally; 503 when a Celo deferral was not persisted to the retry queue. */
+export function webhookStatusFor(summary: Record<string, unknown> | null | undefined): number {
+  return summary && summary.retryQueueFailed === true ? CELO_RETRY_QUEUE_FAILED_STATUS : 200
+}
+
 export interface CoinbaseEventInput {
   eventId: string
   eventType: string
@@ -872,6 +944,7 @@ export async function settleCoinbaseEvent(
       dest_tx: evt.data?.destination?.txHash,
     },
   })
+  noteSourceChain(rec, evt.data?.source?.chainId)
 
   // If already paid, submitted (capture_pending), parked or terminally
   // failed, just persist the event and 200. None of these may pay again.
@@ -910,6 +983,30 @@ export async function settleCoinbaseEvent(
         closesTest = true
         rec.deliveredReported = true
         rec.events.push({ kind: 'delivered_reported', at: new Date().toISOString(), detail: { status: rep.status, test: true, alpha: true } })
+      }
+    }
+    // Celo settlement gate (celo-finality.ts) on test orders too, so a small
+    // internal test proves the live behaviour: a Celo-sourced test order is
+    // only closed once the pause switch is "off" and its payin block is
+    // finalized with the same hash on two RPCs. Nothing is ever paid for a
+    // test order; a refusal keeps the record open and queues the same
+    // automatic re-drive as a real invoice. Other source chains: no change.
+    if (closesTest) {
+      const celo = await celoSettlementGate(env, {
+        chainHints: [evt.data?.source?.chainId],
+        loadOrder: rozoPaymentId ? () => fetchRozoPaymentById(env, rozoPaymentId) : undefined,
+        eventTxHash: evt.data?.source?.txHash ?? null,
+      })
+      if (celo.applies && !celo.ok) {
+        return deferForCeloGate(env, plId, rec, eventId, celo, { provider: 'coinbase', eventType, rozoPaymentId })
+      }
+      if (celo.applies && celo.ok) {
+        rec.events.push({
+          kind: 'celo_finality_verified',
+          at: new Date().toISOString(),
+          event_id: eventId,
+          detail: { tx: celo.txHash, block: celo.blockNumber, hash: celo.blockHash, test: true },
+        })
       }
     }
     if (closesTest) {
@@ -1009,8 +1106,48 @@ export async function settleCoinbaseEvent(
     // webhook (the sweep's stuck alert asks for exactly that) or a replay is
     // processed again instead of being dropped as already seen.
     await env.MPP_STORE.delete(eventKvKey(eventId)).catch(() => undefined)
-    return { ok: true, deferred: 'order_binding_unverified', reason: binding.reason, plId }
+    // An event whose order could not be read yet has no other automatic
+    // trigger once both webhooks are consumed, and its source chain is not
+    // confirmed by the order (the event's own hint does not count): queue the
+    // same re-drive the Celo gate uses (it re-runs this path, binding and
+    // gate included; bounded at 3 h, then a human alert).
+    {
+      const queued = await enqueueCeloRetry(env, {
+        provider: 'coinbase',
+        ref: plId,
+        rozoPaymentId: rozoPaymentId ?? rec.settlingRozoPaymentId ?? rec.rozoPaymentId ?? null,
+        eventType,
+        reason: `order binding unverified: ${binding.reason}`,
+      })
+      if (!queued) return { ok: false, deferred: 'order_binding_unverified', reason: binding.reason, plId, retryQueueFailed: true }
+      return { ok: true, deferred: 'order_binding_unverified', reason: binding.reason, plId, celoQueued: true }
+    }
   }
+
+  // 7d. Celo settlement gate (celo-finality.ts). For an order whose source
+  // chain is Celo (42220), on payin AND payout events alike: the Celo pause
+  // switch must be "off" and the payin block must be finalized with the same
+  // hash on two RPCs, with a Transfer matching the order. Otherwise nothing is
+  // paid and the event is kept (the payout webhook, a resend or a replay
+  // re-runs this). Any other source chain: no read, no change.
+  noteSourceChain(rec, binding.order?.source?.chainId)
+  const celo = await celoSettlementGate(env, {
+    chainHints: [evt.data?.source?.chainId],
+    order: binding.order,
+    eventTxHash: evt.data?.source?.txHash ?? null,
+  })
+  if (celo.applies && !celo.ok) {
+    return deferForCeloGate(env, plId, rec, eventId, celo, { provider: 'coinbase', eventType, rozoPaymentId })
+  }
+  if (celo.applies && celo.ok) {
+    rec.events.push({
+      kind: 'celo_finality_verified',
+      at: new Date().toISOString(),
+      event_id: eventId,
+      detail: { tx: celo.txHash, block: celo.blockNumber, hash: celo.blockHash },
+    })
+  }
+
   const invoiceAtomic: bigint = binding.invoiceAtomic
   rec.invoiceAmountAtomic = invoiceAtomic.toString()
 
@@ -1337,7 +1474,7 @@ const ROZO_ORDER_NOT_YET_PAID_STATUSES: ReadonlySet<string> = new Set(['payment_
 const BINDING_READ_TIMEOUT_MS = 5000
 
 export type OrderBindingResult =
-  | { ok: true; invoiceAtomic: bigint; orderDestinationAtomic: bigint }
+  | { ok: true; invoiceAtomic: bigint; orderDestinationAtomic: bigint; order: any }
   // terminal: a definite mismatch, never pay. Not terminal: could not verify
   // right now (read failed, order still catching up); a later event retries.
   | { ok: false; terminal: boolean; reason: string; invoiceAtomic?: bigint | null }
@@ -1428,7 +1565,7 @@ async function verifyCoinbaseOrderBindingOnce(
       invoiceAtomic,
     }
   }
-  return { ok: true, invoiceAtomic, orderDestinationAtomic }
+  return { ok: true, invoiceAtomic, orderDestinationAtomic, order }
 }
 
 // ── Fast capture confirmation after pay-invoice ────────────────────────────

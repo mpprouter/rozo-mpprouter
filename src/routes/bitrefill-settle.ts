@@ -44,8 +44,10 @@ import {
   type FulfillmentRecord,
   FUNDER_WALLET,
   TERMINAL_STATUSES,
+  deferForCeloGate,
   deferForCheckoutPause,
   deliveredReportEnabled,
+  noteSourceChain,
   deliveredReportStillPending,
   emptyRecord,
   forgetWebhookEvent,
@@ -56,7 +58,9 @@ import {
   saveRecordGuarded,
 } from './webhook'
 
-export const BITREFILL_PAY_INVOICE_URL = 'https://agentapi.rozo.ai/pay-invoice'
+import { celoSettlementGate } from './celo-finality'
+
+export const BITREFILL_PAY_INVOICE_URL ='https://agentapi.rozo.ai/pay-invoice'
 export const BITREFILL_PAY_TIMEOUT_MS = 60_000
 export const BITREFILL_PRESIGN_RETRY_DELAY_MS = 2_000
 /** Do not start a payment with less than this left on the invoice (pay-invoice uses the same). */
@@ -121,7 +125,7 @@ function fmt(atomic: bigint | string | null | undefined): string {
 // ── Order verification (router side) ────────────────────────────────────────
 
 export type BitrefillOrderCheck =
-  | { ok: true; facts: BitrefillFrozenFacts }
+  | { ok: true; facts: BitrefillFrozenFacts; order?: any }
   | { ok: false; terminal: boolean; reason: string }
 
 /**
@@ -181,7 +185,7 @@ export async function verifyBitrefillOrder(
   if (delivered < facts.callerPaysAtomic) {
     return { ok: false, terminal: true, reason: `payout ${delivered} below invoice + fee ${facts.callerPaysAtomic}` }
   }
-  return { ok: true, facts }
+  return { ok: true, facts, order }
 }
 
 // ── pay-invoice call ────────────────────────────────────────────────────────
@@ -387,6 +391,20 @@ export async function settleBitrefillFunderEvent(
     await forgetWebhookEvent(env, eventId)
     return { ok: true, deferred: 'order_binding_unverified', reason: check.reason, plId }
   }
+  // Celo settlement gate (celo-finality.ts): a Celo-sourced order pays only
+  // once its payin block is finalized with the same hash on two RPCs and the
+  // pause switch is "off". Other source chains: no read, no change.
+  noteSourceChain(rec, check.order?.source?.chainId)
+  const celo = await celoSettlementGate(env, {
+    chainHints: [evt.data?.source?.chainId],
+    order: check.order ?? null,
+    loadOrder: rozoPaymentId ? () => fetchRozoPaymentById(env, rozoPaymentId) : undefined,
+    eventTxHash: evt.data?.source?.txHash ?? null,
+  })
+  if (celo.applies && !celo.ok) {
+    return deferForCeloGate(env, plId, rec, eventId, celo, { provider: 'bitrefill', eventType, rozoPaymentId })
+  }
+
   const facts = check.facts
   rec.invoiceAmountAtomic = facts.amountAtomic.toString()
   rec.bitrefill = {

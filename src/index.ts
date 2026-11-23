@@ -27,6 +27,7 @@ import { handleJobStatus, handleJobChallenge, reconcileAsyncRefunds } from './ro
 import { sweepInFlightStripeRecords, sweepStripeSessionIndex, sweepManualReviewOnchain } from './routes/stripe-fulfillment'
 import { sweepCoinbaseFulfillments } from './routes/coinbase-sweep'
 import { sweepBitrefillFulfillments } from './routes/bitrefill-settle'
+import { sweepCeloRetries } from './routes/celo-retry-run'
 import { INTENTS_WARMUP_CRON, warmIntentsPaymentApi } from './utils/intents-warmup'
 import { handleHealth } from './routes/health'
 import { handleServices } from './routes/services'
@@ -505,6 +506,18 @@ export interface Env {
   // Set via: wrangler secret put BASE_RPC_URL
   BASE_RPC_URL?: string
 
+  // Celo (source chain 42220) fulfillment pause (routes/celo-finality.ts).
+  // Fail-closed: only the exact value "off" lets a Celo-sourced order pay a
+  // Coinbase / Stripe / Bitrefill invoice; missing or any other value pauses.
+  // Has no effect on orders from any other source chain.
+  CELO_FULFILLMENT_PAUSED?: string
+  // Second, independent Celo mainnet RPC for the finality check; the first is
+  // the public forno.celo.org (cLabs). Plain [vars] entry in wrangler.toml
+  // (public 1rpc.io/celo endpoint, no key, not a secret). Unset or blank falls back to
+  // CELO_SECOND_RPC_DEFAULT (same URL); a value on forno's host or not https
+  // is refused, so every Celo-sourced order is then deferred (never paid).
+  CELO_RPC_URL?: string
+
   // DingTalk webhook token for operational alerts (low balance, etc.)
   // Set via: wrangler secret put DINGTALK_ACCESS_TOKEN
   DINGTALK_ACCESS_TOKEN?: string
@@ -814,6 +827,11 @@ export default {
     // directly; a bounded re-drive of a deferred payout runs the full settle
     // path (allowlist, exec gate, paying-before-call).
     ctx.waitUntil(sweepBitrefillFulfillments(env))
+    // Celo-sourced settlements the Celo finality gate deferred (celo-retry.ts):
+    // re-run the normal settle path (gate, claim, exec gate) every few minutes
+    // for up to 3 hours, then alert. Own queue and own per-run limit; no-op
+    // (one DO scan) when the queue is empty. Never calls pay-invoice itself.
+    ctx.waitUntil(sweepCeloRetries(env))
     // One-time backfill of the pay-URL → session index for records created
     // before the index existed (bounded per run; no-op once caught up).
     ctx.waitUntil(sweepStripeSessionIndex(env))

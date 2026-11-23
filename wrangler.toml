@@ -338,6 +338,21 @@ COUPON_ENDPOINT_ENABLED = "true"
 # /delivered endpoint live: before that every paid record would 404 five times
 # and raise a give-up alert. Flip to "true" + redeploy afterwards.
 ROZO_DELIVERED_REPORT_ENABLED = "true"
+# Celo (source chain 42220) fulfillment pause (src/routes/celo-finality.ts).
+# Fail-closed: only the exact value "off" lets a Celo-sourced order pay an
+# invoice, and then only after its payin block is finalized with the same
+# hash on forno.celo.org and CELO_RPC_URL. Missing or any other value (e.g.
+# "on") pauses every Celo payment path (webhook, replay, manual, Bitrefill,
+# Stripe). No effect on any other source chain. Initial value "off".
+CELO_FULFILLMENT_PAUSED = "off"
+# Second, independent Celo mainnet RPC for that finality check (the first is
+# forno.celo.org, run by cLabs). Public 1RPC endpoint (Automata), different
+# operator, no API key, so a plain var and not a secret. Never use
+# celo-rpc.publicnode.com (seen ~1.7M blocks behind on 2026-11-23). Do NOT also create a secret with
+# this name (wrangler refuses a var and a secret with the same binding name).
+# Must be https and on another host than forno.celo.org, or every Celo order
+# is deferred. Code default when unset: the same URL.
+CELO_RPC_URL = "https://1rpc.io/celo"
 # Read-path switch for the Rozo Intents API (src/routes/intents-base.ts).
 # Unset = read-only GET /payments/:id and /payments/order/... stay on the big
 # payment-api function (current production). Deliberately NOT set here: it is

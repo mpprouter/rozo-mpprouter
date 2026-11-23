@@ -93,6 +93,9 @@ async function frozenOrder(over: Record<string, unknown> = {}, factOver: Record<
     appId: 'merchant_openrouter',
     orderId: PL,
     status: 'payment_payout_completed',
+    // Real intents rows always carry the source chain; the Celo gate refuses
+    // an order without one (chain unknown).
+    source: { chainId: '8453', tokenSymbol: 'USDC', amount: '206.04' },
     destination: { chainId: '8453', receiverAddress: FUNDER_WALLET, tokenSymbol: 'USDC', amount: '206.04', txHash: TX },
     metadata: {
       provider: 'bitrefill',

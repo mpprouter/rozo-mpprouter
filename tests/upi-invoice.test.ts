@@ -1,4 +1,12 @@
-import { describe, it, expect, afterEach, beforeEach } from 'vitest'
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest'
+
+// The Celo gate reads the Rozo order on every Stripe settle and refuses when
+// the chain is unknown (celo-finality.ts). These tests cover other chains, so
+// that read answers a Base order; no real network is touched.
+vi.mock('../src/routes/webhook', async (importOriginal) => {
+  const mod: any = await importOriginal()
+  return { ...mod, fetchRozoPaymentById: async (_env: unknown, id: string) => ({ id, source: { chainId: '8453' } }) }
+})
 import {
   handleUpiResolve,
   handleUpiVerifiedPayIn,
@@ -740,6 +748,7 @@ describe('invoice claim (cross-channel)', () => {
         orderId: 'stripe_crypto_cpis_stripe1',
         rozoPaymentId: 'rozo-1',
         invoiceAmountStr: '18.19',
+        sourceChainId: '8453',
       },
       new Date(),
     )
