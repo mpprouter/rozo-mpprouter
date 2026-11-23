@@ -52,8 +52,9 @@ export const STABLE_SOURCES: Record<string, readonly ('USDC' | 'USDT')[]> = {
  * after it lands; create-invoice refuses a link that expires sooner than
  * CELO_MIN_LINK_LIFE_MS.
  */
+export const CELO_USDT_BETA_KEY = 'USDT@42220'
 export const BETA_STABLE_SOURCES: Readonly<Record<string, { chainId: string; token: 'USDC' | 'USDT'; param: string }>> = {
-  'USDT@42220': { chainId: '42220', token: 'USDT', param: 'celo' },
+  [CELO_USDT_BETA_KEY]: { chainId: '42220', token: 'USDT', param: 'celo' },
 }
 
 /** Stable tokens accepted on `chainId` for a request: STABLE_SOURCES plus any opened beta stable key. */

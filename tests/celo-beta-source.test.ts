@@ -107,6 +107,10 @@ beforeEach(() => {
         destination: { chainId: '8453', tokenSymbol: 'USDC', amount: '5.00' },
       }), { status: 200 })
     }
+    // Re-read of a live order by id (after a failed /checkout rotation).
+    if (existingOrder && u.endsWith(`/payments/${existingOrder.id}`)) {
+      return new Response(JSON.stringify(existingOrder), { status: 200 })
+    }
     if (u.includes('/payment-api/payments/')) {
       return new Response('{"error":{"code":"paymentNotFound","message":"Payment not found"}}', { status: 404 })
     }
@@ -262,6 +266,86 @@ describe('create-invoice with Celo USDT', () => {
     const q = await post(handleQuoteInvoice as any, { payment_id: SESSION_ID }, { query: '?beta=btc,celo' })
     expect(q.json.supportedSources['42220']).toEqual(['USDT'])
     expect(q.json.supportedSources['9000']).toEqual(['BTC'])
+  })
+
+  describe('a live Celo order reused for a request of another coin', () => {
+    const BASE_USDC = { chainId: '8453', tokenSymbol: 'USDC' }
+    // The live order is the one a real ?beta=celo create would have made
+    // (same pricing metadata and amount), so only the Celo gates differ.
+    const liveCelo = async () => {
+      const made = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: CELO }, { query: '?beta=celo' })
+      expect(made.status).toBeLessThan(300)
+      const intent = createdIntent
+      createCalls = 0
+      return {
+        id: 'rozo-pay-celo-live',
+        appId: 'merchant_openrouter',
+        orderId: SESSION_ID,
+        status: 'payment_unpaid',
+        paymentLink: 'https://pay.rozo.ai/celo-live',
+        expiresAt: '2999-01-01T01:00:00.000Z',
+        metadata: intent.metadata,
+        source: {
+          chainId: '42220',
+          tokenSymbol: 'USDT',
+          tokenAddress: CELO_USDT,
+          amount: intent.source.amount,
+          receiverAddress: '0x3333333333333333333333333333333333333333',
+        },
+        destination: { chainId: '8453', tokenSymbol: 'USDC', amount: '5.00' },
+      }
+    }
+    const expectNoPayInstructions = (j: any) => {
+      expect(j.raw).toBeUndefined()
+      expect(j.paymentLink).toBeUndefined()
+      expect(JSON.stringify(j)).not.toContain('0x3333333333333333333333333333333333333333')
+      expect(JSON.stringify(j)).not.toContain('pay.rozo.ai/celo-live')
+    }
+
+    it('without ?beta=celo: rotation fails, the Celo order is not handed out (409 CELO_NOT_ENABLED)', async () => {
+      existingOrder = await liveCelo()
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC })
+      expect(checkoutCalls).toBe(1)
+      expect(r.status).toBe(409)
+      expect(r.json.code).toBe('CELO_NOT_ENABLED')
+      expect(r.json.rozoPaymentId).toBe('rozo-pay-celo-live')
+      expectNoPayInstructions(r.json)
+      expect(createCalls).toBe(0)
+    })
+
+    it('USDT@42220 removed from NATIVE_SOURCES_BETA: refused even with ?beta=celo', async () => {
+      existingOrder = await liveCelo()
+      const env = makeEnv({ NATIVE_SOURCES_BETA: 'ZEC@9133,BTC@9000' })
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC }, { env, query: '?beta=celo' })
+      expect(r.status).toBe(409)
+      expect(r.json.code).toBe('CELO_NOT_ENABLED')
+      expectNoPayInstructions(r.json)
+    })
+
+    it('beta open but the link expires within CELO_MIN_LINK_LIFE_MS, or unknown expiry: refused', async () => {
+      existingOrder = await liveCelo()
+      linkExpiresAt = new Date(Date.now() + CELO_MIN_LINK_LIFE_MS - 60_000).toISOString()
+      const short = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC }, { query: '?beta=celo' })
+      expect(short.status).toBe(400)
+      expect(short.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+      expect(short.json.message).toContain('Celo')
+      expectNoPayInstructions(short.json)
+      linkExpiresAt = null
+      const unknown = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC }, { query: '?beta=celo' })
+      expect(unknown.status).toBe(400)
+      expect(unknown.json.code).toBe('MERCHANT_LINK_EXPIRES_TOO_SOON')
+      expectNoPayInstructions(unknown.json)
+    })
+
+    it('control: beta open and the link lives long enough: the Celo order is reused with sourceMismatch', async () => {
+      existingOrder = await liveCelo()
+      const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: BASE_USDC }, { query: '?beta=celo' })
+      expect(r.status).toBe(200)
+      expect(r.json.reused).toBe(true)
+      expect(r.json.sourceMismatch).toBe(true)
+      expect(r.json.source).toMatchObject({ chainId: '42220', tokenSymbol: 'USDT' })
+      expect(r.json.paymentLink).toBe('https://pay.rozo.ai/celo-live')
+    })
   })
 
   it('open and the link lives long enough: creates upstream with the Celo USDT contract', async () => {

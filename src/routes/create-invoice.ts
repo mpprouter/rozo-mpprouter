@@ -70,6 +70,7 @@ import {
   verifyTestPaymentId,
   withBetaSources,
   stableTokensFor,
+  CELO_USDT_BETA_KEY,
   zecShieldedAvailable,
   zecShieldedMaxUsd,
   ZEC_BLOCK_TARGET_SECONDS,
@@ -2135,12 +2136,18 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   // outlive it. Checked here, before ANY upstream operation (fresh create,
   // reuse, or rotating a live order onto Celo). Unknown expiry fails closed.
   // Checked only, not handed to rozo-intents-api (no Celo-side re-check there).
-  if (source.chainId === '42220') {
-    const linkExpiry =
+  // The same check runs again on a reused order that pays from Celo (below).
+  const celoLinkLifeCheck = async () =>
+    checkZecLinkExpiry(
       testInvoiceCents !== null
         ? new Date(Date.now() + TEST_INVOICE_LINK_LIFE_MS).toISOString()
-        : await linkExpiresAtPromise
-    const check = checkZecLinkExpiry(linkExpiry, Date.now(), CELO_MIN_LINK_LIFE_MS, 'Celo')
+        : await linkExpiresAtPromise,
+      Date.now(),
+      CELO_MIN_LINK_LIFE_MS,
+      'Celo',
+    )
+  if (source.chainId === '42220') {
+    const check = await celoLinkLifeCheck()
     if (!check.ok) {
       return errorResponse(400, {
         code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
@@ -2692,6 +2699,43 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           status: postRotationStatus,
           expiresAt: row?.expiresAt ?? existingExpiresAt,
         })
+      }
+
+      // Celo (beta) gates on the row we are about to hand back. The check at
+      // the top only sees the REQUESTED source; a live Celo order reused for
+      // a request of another coin (rotation refused, failed or not
+      // attempted) must pass the same two gates before its pay instructions
+      // leave: USDT@42220 opened for this request (NATIVE_SOURCES_BETA plus
+      // ?beta=celo) and a merchant link that outlives CELO_MIN_LINK_LIFE_MS
+      // (unknown expiry fails closed). Otherwise only the order id and
+      // status are returned, never its address, link or raw row.
+      if (String(rowSource.chainId ?? '') === '42220') {
+        if (!nativeAllowed.has(CELO_USDT_BETA_KEY)) {
+          const message =
+            'The unpaid order for this payment link pays from Celo, which is not available here. ' +
+            'Do not pay it; request another coin to switch the order.'
+          return json(409, {
+            ok: false,
+            code: 'CELO_NOT_ENABLED',
+            message,
+            error: { code: 'CELO_NOT_ENABLED', message },
+            linkId,
+            rozoPaymentId: row?.id ?? existing?.id ?? null,
+            status: readPaymentStatus(row),
+          })
+        }
+        const check = await celoLinkLifeCheck()
+        if (!check.ok) {
+          return json(400, {
+            ok: false,
+            code: 'MERCHANT_LINK_EXPIRES_TOO_SOON',
+            message: check.message,
+            error: { code: 'MERCHANT_LINK_EXPIRES_TOO_SOON', message: check.message },
+            linkId,
+            rozoPaymentId: row?.id ?? existing?.id ?? null,
+            status: readPaymentStatus(row),
+          })
+        }
       }
 
       // BTC rail invariant on the row we are about to hand back.
