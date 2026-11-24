@@ -1077,3 +1077,60 @@ describe('hourly reconciliation', () => {
     expect(sent).toHaveLength(0)
   })
 })
+
+describe('tiered funders (x402 = T1)', () => {
+  const T1 = '0x1000000000000000000000000000000000000001'
+  const TIERS = {
+    FUNDER_TIERS_ENABLED: 'true',
+    FUNDER_T1_ADDRESS: T1,
+    FUNDER_T2_ADDRESS: '0x2000000000000000000000000000000000000002',
+    FUNDER_T3A_ADDRESS: '0x3000000000000000000000000000000000000003',
+    FUNDER_T3B_ADDRESS: '0x4000000000000000000000000000000000000004',
+  }
+  const LEGACY = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
+
+  it('expected signer: legacy funder when off, T1 when on, none when T1 is missing', async () => {
+    const { depsFromEnv, x402BaseFunder } = await import('../src/x402payer/routes')
+    const base = { MPP_STORE: kv(), X402_SIGN_SHARED_SECRET: 'test-shared-secret' } as any
+    expect(depsFromEnv(base).evmRemote?.expectedFunder).toBe(LEGACY)
+    expect(depsFromEnv({ ...base, ...TIERS }).evmRemote?.expectedFunder).toBe(T1)
+    expect(depsFromEnv({ ...base, ...TIERS, FUNDER_T1_ADDRESS: undefined }).evmRemote).toBeNull()
+    expect(x402BaseFunder({ ...TIERS, FUNDER_T1_ADDRESS: '0x2000000000000000000000000000000000000002' })).toBeNull()
+  })
+
+  it('topup receiver default: legacy when off, T1 when on, X402_TOPUP_RECEIVER still wins', async () => {
+    const key = await newKey(0)
+    const sentReceivers: string[] = []
+    deps.fetchImpl = (async (_u: any, init: any) => {
+      const r = JSON.parse(init.body).destination.receiverAddress
+      sentReceivers.push(r)
+      return new Response(JSON.stringify({
+        id: '6f1c6c7e-1111-4222-8333-944455556666',
+        source: { chainId: '8453', tokenSymbol: 'USDC', receiverAddress: 'DepositAddr111', amount: '20' },
+        destination: { receiverAddress: r, amount: '19.80' },
+      }), { status: 200 })
+    }) as any
+    const topup = () => call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', chain: 'base', token: 'USDC' }) })
+    expect((await topup()).status).toBe(200)
+    Object.assign(env, TIERS)
+    expect((await topup()).status).toBe(200)
+    env.X402_TOPUP_RECEIVER = '0x5555555555555555555555555555555555555555'
+    expect((await topup()).status).toBe(200)
+    expect(sentReceivers).toEqual([LEGACY, T1, '0x5555555555555555555555555555555555555555'])
+    delete env.X402_TOPUP_RECEIVER
+    env.FUNDER_T1_ADDRESS = undefined
+    const r = await topup()
+    expect(r.status).toBe(503)
+    expect(r.body.code).toBe('X402_TOPUP_NOT_CONFIGURED')
+  })
+
+  it('sign, flag on with T1 missing: refused before the signer, nothing debited', async () => {
+    const key = await newKey(10)
+    Object.assign(env, { ...TIERS, FUNDER_T1_ADDRESS: undefined })
+    const r = await call('/v1/x402/sign', { method: 'POST', key, body: JSON.stringify({ idempotencyKey: 'idem-tier-01', accepts: baseReq() }) })
+    expect(r.status).toBe(503)
+    expect(r.body.code).toBe('FUNDER_TIER_REFUSED')
+    expect(signerCalls).toHaveLength(0)
+    expect(ledger.commits).toBe(0)
+  })
+})

@@ -67,7 +67,13 @@ import {
 } from './stripe-fulfillment'
 import { encryptCapability } from './invoice-capability-crypto'
 import { parseUsdc, formatUsdc } from './create-invoice'
-import { callAgentApiPayInvoice, fetchCoinbasePayment, FUNDER_WALLET } from './webhook'
+import { callAgentApiPayInvoice, fetchCoinbasePayment } from './webhook'
+import {
+  FUNDER_TIER_REFUSED_CODE,
+  funderRefusalMessage,
+  funderRefusalStatus,
+  resolveFunder,
+} from '../funder-address'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import {
   acquireCoinbaseExecGate,
@@ -1642,7 +1648,23 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // unreadable, attempt anyway without a reservation — same philosophy as the
   // webhook path; agentapi re-checks the funder balance as the final gate.
   // The reservation is for the INVOICE amount (what is actually paid).
-  const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
+  // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder). No
+  // order is involved here: the selected tier wallet just pays. A refusal
+  // gives the coupon back before anything is reserved, claimed or sent.
+  const funder = resolveFunder(env, isStripe ? 'stripe' : 'coinbase', invoiceAtomic)
+  if (!funder.ok) {
+    await rollbackToIssued(`funder tier refused: ${funder.reason}`)
+    return done(
+      json(funderRefusalStatus(funder.reason), {
+        error: FUNDER_TIER_REFUSED_CODE,
+        reason: funder.reason,
+        message: `${funderRefusalMessage(funder.reason)} Your coupon is still valid.`,
+      }),
+      'rejected',
+      'funder_tier_refused',
+    )
+  }
+  const balanceResult = await getBaseUsdcBalance(funder.address, env.BASE_RPC_URL)
   const balance = balanceResult.balance
   let reservedFunds = false
   if (balance !== null) {
@@ -1809,6 +1831,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
         expectedMerchantAccount: stripeInv!.merchantAccount!,
         expectedAmountAtomic: stripeInv!.stablecoinAmountAtomic,
         spentTodayAtomic: spentBefore!.toString(),
+        expectedFunder: funder.expectedFunder,
       })
     } catch {
       // callStripePayInvoice maps transport errors itself; a throw here is
@@ -1839,7 +1862,7 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   } else {
     let payResult: { ok: boolean; status: number; body: any }
     try {
-      payResult = await callAgentApiPayInvoice(env, plId, undefined, { line: 'coupon' })
+      payResult = await callAgentApiPayInvoice(env, plId, undefined, { line: 'coupon' }, funder.expectedFunder)
     } catch (err: any) {
       payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }
     }

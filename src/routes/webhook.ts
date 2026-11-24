@@ -1,5 +1,14 @@
 import type { Env } from '../index'
-import { BASE_FUNDER_ADDRESS } from '../funder-address'
+import {
+  BASE_FUNDER_ADDRESS,
+  FUNDER_TIER_RECEIVER_MISMATCH_CODE,
+  FUNDER_ALPHA_KIND,
+  FUNDER_TIER_REFUSED_CODE,
+  coinbaseOrderKind,
+  funderTiersEnabled,
+  resolveFunder,
+  sameEvmAddress,
+} from '../funder-address'
 import { watchSignedCollector, type PayLine } from './coinbase-collector-watch'
 import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, isTestPaymentId } from './native-sources'
 import { isBitrefillOrderId } from './bitrefill-invoice'
@@ -144,6 +153,10 @@ export interface FulfillmentRecord {
   rozoPaymentId: string | null
   invoiceAmountAtomic: string | null
   funderBalanceAtomic: string | null
+  // Tiered funders only (FUNDER_TIERS_ENABLED="true"): the tier wallet that
+  // was asked to pay. Never written while the flag is off; readers fall back
+  // to FUNDER_WALLET when absent.
+  funderAddress?: string | null
   paidAt: string | null
   // Set when the record enters `paying`; the sweep's 10/30-minute windows are
   // measured from here (never from the events array).
@@ -198,6 +211,8 @@ export interface FulfillmentRecord {
     expiresAt: string
     validBefore?: number | null
     transaction?: string | null
+    // Tier wallet that signs (FUNDER_TIERS_ENABLED only). Absent = FUNDER_WALLET.
+    funder?: string
   }
 }
 
@@ -410,6 +425,8 @@ export interface InvoiceFailureAlertParams {
   availableAtomic?: bigint | null
   failureReason: string
   detail?: string
+  /** Wallet the balance refers to. Default FUNDER_WALLET (legacy text). */
+  funderAddress?: string
 }
 
 function fmtUsdcAtomic(atomic: bigint | null | undefined): string {
@@ -418,7 +435,7 @@ function fmtUsdcAtomic(atomic: bigint | null | undefined): string {
 }
 
 export function buildInvoiceFailureAlert(params: InvoiceFailureAlertParams): string {
-  const funderMasked = maskAddresses(FUNDER_WALLET)
+  const funderMasked = maskAddresses(params.funderAddress ?? FUNDER_WALLET)
   const headline =
     params.kind === 'upi_refused_before_signing'
       ? '🚨 UPI reward order REFUSED before signing: pay-invoice binding mismatch'
@@ -520,11 +537,57 @@ export function payInvoiceRefusedBeforeSend(status: number): boolean {
   return status >= 400 && status < 500 && status !== 408 && status !== 499
 }
 
+/**
+ * The signer's tier cross-check refusal: its own funder selection differs from
+ * the `expected_funder` we sent (HTTP 409, signed:false). Nothing was signed;
+ * a 4xx, so payInvoiceRefusedBeforeSend already treats it as a definite
+ * refusal. Named so callers can label it.
+ */
+export function isFunderTierMismatch(status: number, body: any): boolean {
+  return (
+    status === 409 &&
+    body !== null &&
+    typeof body === 'object' &&
+    body.signed === false &&
+    (body.code === 'funder_tier_mismatch' || body.error === 'funder_tier_mismatch')
+  )
+}
+
+/**
+ * Adds `expected_funder` (and `rozo_payment_id` when given) only when a tier
+ * wallet was selected (flag on). Flag off: the body is returned unchanged.
+ */
+export function withExpectedFunder<T extends Record<string, unknown>>(
+  body: T,
+  expectedFunder: string | undefined,
+  rozoPaymentId?: string,
+  paymentKind?: string,
+): T | (T & { expected_funder: string; rozo_payment_id?: string; payment_kind?: string }) {
+  if (!expectedFunder) return body
+  return {
+    ...body,
+    expected_funder: expectedFunder,
+    ...(rozoPaymentId ? { rozo_payment_id: rozoPaymentId } : {}),
+    ...(paymentKind ? { payment_kind: paymentKind } : {}),
+  }
+}
+
 export async function callAgentApiPayInvoice(
   env: Env,
   plId: string,
   expectedBinding?: PayInvoiceExpectedBinding,
   watch?: { line: PayLine; ref?: string; waitUntil?: (p: Promise<unknown>) => void },
+  // FUNDER_TIERS_ENABLED only: the tier wallet the router selected. Sent as
+  // `expected_funder`; the signer refuses (409 funder_tier_mismatch) if its
+  // own selection differs. Undefined = field not sent (legacy body).
+  expectedFunder?: string,
+  // FUNDER_TIERS_ENABLED only (sent only together with expectedFunder): the
+  // intents order whose payout went to that wallet, so a T3 signer can verify
+  // it read-only. Absent for paths without an order (coupon, UPI, admin).
+  rozoPaymentId?: string,
+  // FUNDER_TIERS_ENABLED only, alpha business orders only: `payment_kind`
+  // ("tron_ton_alpha"), sent only together with expectedFunder.
+  paymentKind?: string,
 ): Promise<{ ok: boolean; status: number; body: any }> {
   // Hard fund-safety guard: a test order is paid by nobody. Thrown (not a
   // soft failure) so no caller can mistake it for a retryable error.
@@ -537,7 +600,12 @@ export async function callAgentApiPayInvoice(
     },
     // Legacy callers send exactly { payment_id } (byte-for-byte unchanged).
     body: JSON.stringify(
-      expectedBinding ? { payment_id: plId, expected_binding: expectedBinding } : { payment_id: plId },
+      withExpectedFunder(
+        expectedBinding ? { payment_id: plId, expected_binding: expectedBinding } : { payment_id: plId },
+        expectedFunder,
+        rozoPaymentId,
+        paymentKind,
+      ),
     ),
   })
   const text = await resp.text()
@@ -1152,11 +1220,49 @@ export async function settleCoinbaseEvent(
   const invoiceAtomic: bigint = binding.invoiceAtomic
   rec.invoiceAmountAtomic = invoiceAtomic.toString()
 
-  const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
+  // 7e. Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder, no
+  // extra check). The tier wallet pays this invoice, so the order must have
+  // paid out to exactly that wallet. Any refusal or mismatch: nothing is
+  // paid, terminal, a human checks (same handling as an order mismatch).
+  // An order the TRON / TON alpha route created routes as kind tron_ton_alpha
+  // (its destination is the digest-bound alpha wallet); every other order on
+  // this line is a plain Coinbase invoice.
+  const payKind = coinbaseOrderKind(binding.order)
+  const funder = resolveFunder(env, payKind, invoiceAtomic)
+  const tierRefusal = !funder.ok
+    ? `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason}`
+    : funderTiersEnabled(env) &&
+        !sameEvmAddress(binding.order?.destination?.receiverAddress ?? binding.order?.destination_receiver_address, funder.address)
+      ? `${FUNDER_TIER_RECEIVER_MISMATCH_CODE}: order destination is not the ${funder.tier} funder`
+      : null
+  if (tierRefusal || !funder.ok) {
+    rec.status = 'order_binding_failed'
+    rec.failureReason = `funder tier: ${tierRefusal}`
+    rec.events.push({
+      kind: 'funder_tier_refused',
+      at: new Date().toISOString(),
+      event_id: eventId,
+      detail: { reason: tierRefusal },
+    })
+    console.error(`[webhook] funder tier refused for ${plId}: ${tierRefusal}`)
+    await sendInvoiceFailureAlert(env, {
+      kind: 'order_binding_failed',
+      plId,
+      invoiceAtomic,
+      funderBalanceAtomic: null,
+      failureReason: rec.failureReason,
+    })
+    const saved = await saveRecordGuarded(env, plId, rec)
+    return { ok: true, status: saved.status, plId, reason: tierRefusal }
+  }
+  const funderAddress = funder.address
+  if (funder.expectedFunder) rec.funderAddress = funder.expectedFunder
+
+  const balanceResult = await getBaseUsdcBalance(funderAddress, env.BASE_RPC_URL)
   const balance = balanceResult.balance
   rec.funderBalanceAtomic = balance?.toString() ?? null
   console.log(
-    `[webhook] balance for ${FUNDER_WALLET}: ${balance?.toString() ?? 'null'} (rpcs: ${JSON.stringify(balanceResult.rpcsTried)})`,
+    `[webhook] balance for ${funderAddress}: ${balance?.toString() ?? 'null'} (rpcs: ${JSON.stringify(balanceResult.rpcsTried)})`,
   )
 
   // If balance read failed (all RPCs down), don't sit forever — agentapi
@@ -1196,7 +1302,7 @@ export async function settleCoinbaseEvent(
         kind: 'failed_insufficient_balance',
         plId,
         invoiceAtomic,
-        funderBalanceAtomic: balance,
+        funderBalanceAtomic: balance, funderAddress,
         failureReason: rec.failureReason,
       })
     }
@@ -1236,7 +1342,7 @@ export async function settleCoinbaseEvent(
           kind: 'daily_cap_reached',
           plId,
           invoiceAtomic,
-          funderBalanceAtomic: balance,
+          funderBalanceAtomic: balance, funderAddress,
           failureReason: rec.failureReason,
         })
       }
@@ -1279,7 +1385,7 @@ export async function settleCoinbaseEvent(
       kind: 'failed_pay_invoice',
       plId,
       invoiceAtomic,
-      funderBalanceAtomic: balance,
+      funderBalanceAtomic: balance, funderAddress,
       failureReason: rec.failureReason,
     })
     await saveRecordGuarded(env, plId, rec)
@@ -1338,7 +1444,17 @@ export async function settleCoinbaseEvent(
   // 10. Trigger pay-invoice. From here the gate is never released.
   let payResult: { ok: boolean; status: number; body: any }
   try {
-    payResult = await callAgentApiPayInvoice(env, plId, undefined, { line: 'checkout', waitUntil })
+    payResult = await callAgentApiPayInvoice(
+      env,
+      plId,
+      undefined,
+      { line: 'checkout', waitUntil },
+      funder.expectedFunder,
+      // The order the binding re-read (its destination is the tier wallet).
+      typeof binding.order?.id === 'string' ? binding.order.id : rozoPaymentId ?? undefined,
+      // Alpha orders only (flag on): the signer routes by this field.
+      payKind === FUNDER_ALPHA_KIND ? payKind : undefined,
+    )
   } catch (err: any) {
     payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }
   }
@@ -1373,7 +1489,9 @@ export async function settleCoinbaseEvent(
     // exec-gate admin route may clear it).
     await releaseReservation()
     rec.status = 'failed_pay_invoice'
-    rec.failureReason = `agentapi pay-invoice ${payResult.status}`
+    rec.failureReason = `agentapi pay-invoice ${payResult.status}${
+      isFunderTierMismatch(payResult.status, payResult.body) ? ' funder_tier_mismatch (nothing signed)' : ''
+    }`
     rec.events.push({
       kind: 'pay_invoice_failed',
       at: new Date().toISOString(),
@@ -1385,7 +1503,7 @@ export async function settleCoinbaseEvent(
       kind: 'failed_pay_invoice',
       plId,
       invoiceAtomic,
-      funderBalanceAtomic: balance,
+      funderBalanceAtomic: balance, funderAddress,
       failureReason: rec.failureReason,
       detail: JSON.stringify(payResult.body),
     })
@@ -1404,7 +1522,7 @@ export async function settleCoinbaseEvent(
       kind: 'pay_invoice_unknown',
       plId,
       invoiceAtomic,
-      funderBalanceAtomic: balance,
+      funderBalanceAtomic: balance, funderAddress,
       failureReason: rec.failureReason,
       detail: JSON.stringify(payResult.body),
     })

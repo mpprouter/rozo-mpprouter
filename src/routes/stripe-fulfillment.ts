@@ -18,7 +18,14 @@
 // separate provider-qualified namespace so the two never collide.
 
 import type { Env } from '../index'
-import { BASE_FUNDER_ADDRESS } from '../funder-address'
+import {
+  BASE_FUNDER_ADDRESS,
+  FUNDER_TIER_RECEIVER_MISMATCH_CODE,
+  FUNDER_TIER_REFUSED_CODE,
+  funderTiersEnabled,
+  resolveFunder,
+  sameEvmAddress,
+} from '../funder-address'
 import {
   deliveredReportEnabled,
   deliveredReportStillPending,
@@ -587,6 +594,12 @@ export async function callStripePayInvoice(
     expectedMerchantAccount: string
     expectedAmountAtomic: string
     spentTodayAtomic: string
+    // FUNDER_TIERS_ENABLED only: the selected tier wallet, sent as
+    // `expected_funder`. Undefined = field not sent (legacy body).
+    expectedFunder?: string
+    // FUNDER_TIERS_ENABLED only, sent only together with expectedFunder: the
+    // intents order whose payout went to that wallet.
+    rozoPaymentId?: string
   },
 ): Promise<StripePayInvoiceResult> {
   const url = env.STRIPE_PAY_INVOICE_URL ?? STRIPE_PAY_INVOICE_DEFAULT_URL
@@ -603,6 +616,8 @@ export async function callStripePayInvoice(
         expected_merchant_account: args.expectedMerchantAccount,
         expected_amount_atomic: args.expectedAmountAtomic,
         spent_today_atomic: args.spentTodayAtomic,
+        ...(args.expectedFunder ? { expected_funder: args.expectedFunder } : {}),
+        ...(args.expectedFunder && args.rozoPaymentId ? { rozo_payment_id: args.rozoPaymentId } : {}),
       }),
     })
   } catch (err: any) {
@@ -883,6 +898,41 @@ export async function handleStripeWebhookEvent(
   // the claim back to payout_seen and index it for `resume` to re-drive.
   if (await checkoutDeliveryPaused(env)) return deferForCheckoutPause()
 
+  // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder, no read).
+  // The selected tier wallet pays, so the order must have paid out to exactly
+  // that wallet. Nothing is claimed, reserved or signed on any refusal.
+  const funder = resolveFunder(env, 'stripe', invoiceAtomic)
+  if (!funder.ok) {
+    await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
+      failureReason: `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason} (nothing signed)`,
+      event: { kind: 'funder_tier_refused', detail: { reason: funder.reason } },
+    })
+    return { ok: true, provider: 'stripe_crypto', status: 'manual_review', reason: FUNDER_TIER_REFUSED_CODE }
+  }
+  if (funderTiersEnabled(env)) {
+    const order = input.rozoPaymentId ? await fetchRozoPaymentForSettle(env, input.rozoPaymentId) : null
+    const receiver = order?.destination?.receiverAddress ?? order?.destination_receiver_address ?? null
+    if (!order || typeof receiver !== 'string') {
+      // Could not read the order right now: not a decision. Step back so a
+      // later event (or the retry sweep) re-runs this path.
+      await releaseClaim(env, invoiceKey, orderId, nowIso, 'payout_seen', null, {
+        kind: 'funder_tier_order_unreadable',
+      })
+      return { ok: true, provider: 'stripe_crypto', deferred: 'funder_tier_order_unreadable', retryable: true }
+    }
+    if (!sameEvmAddress(receiver, funder.address)) {
+      console.error(`[stripe] order destination is not the ${funder.tier} funder for ${maskInvoiceKey(invoiceKey)}`)
+      await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
+        failureReason: `${FUNDER_TIER_RECEIVER_MISMATCH_CODE}: order destination is not the ${funder.tier} funder (nothing signed)`,
+        event: { kind: 'funder_tier_receiver_mismatch', detail: { tier: funder.tier } },
+      })
+      return { ok: true, provider: 'stripe_crypto', status: 'manual_review', reason: FUNDER_TIER_RECEIVER_MISMATCH_CODE }
+    }
+  }
+  const funderAddress = funder.address
+  // The order re-read above (flag on); undefined while the flag is off.
+  const tierOrderId = funderTiersEnabled(env) ? input.rozoPaymentId ?? undefined : undefined
+
   // Cross-channel claim (invoice-claim.ts): the UPI fiat channel may already be
   // settling this session. The per-record CAS above serializes Stripe-vs-Stripe;
   // this one serializes crypto-vs-UPI. Held elsewhere → terminal, never sign.
@@ -900,7 +950,7 @@ export async function handleStripeWebhookEvent(
   // reservation counter was removed 2026-09-26 (it leaked and blocked payable
   // invoices); pay-invoice re-checks the balance as the final gate. If the
   // funder can't cover the ORIGINAL invoice, release the claim and defer.
-  const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
+  const balanceResult = await getBaseUsdcBalance(funderAddress, env.BASE_RPC_URL)
   const balance = balanceResult.balance
   if (balance !== null) {
     if (balance < invoiceAtomic) {
@@ -991,6 +1041,8 @@ export async function handleStripeWebhookEvent(
       expectedMerchantAccount: claimed.merchantAccount,
       expectedAmountAtomic: claimed.invoiceAmountAtomic,
       spentTodayAtomic: spentBefore.toString(),
+      expectedFunder: funder.expectedFunder,
+      rozoPaymentId: tierOrderId,
     })
   } catch {
     // Defensive: callStripePayInvoice does not throw (it maps transport errors

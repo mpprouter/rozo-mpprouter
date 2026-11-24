@@ -31,6 +31,15 @@ import type { TransactionSigner } from '@solana/kit'
 import { encodePaymentSignatureHeader } from '@x402/core/http'
 import { resolveSource } from '../routes/create-invoice'
 import { FUNDER_WALLET } from '../routes/webhook'
+import {
+  FUNDER_TIER_REFUSED_CODE,
+  funderRefusalMessage,
+  funderRefusalStatus,
+  funderTierAddress,
+  funderTiersEnabled,
+  resolveFunder,
+  type FunderTierEnv,
+} from '../funder-address'
 import { clientIp } from '../routes/create-invoice-gate'
 import { SIGN_SERVICE_TIMEOUT_MS, randomEvmNonce, remoteSignEvmExact, remoteSignerFromEnv, type RemoteSignerConfig } from './evm'
 import { LedgerUnavailableError, supabaseLedger, type LedgerEnv, type LedgerPayment, type LedgerResult, type X402Ledger } from './ledger'
@@ -55,7 +64,7 @@ const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 const AGENT_KEY_RE = /^ak_[A-Za-z0-9_-]{43}$/
 
-export interface X402PayerEnv extends LedgerEnv {
+export interface X402PayerEnv extends LedgerEnv, FunderTierEnv {
   MPP_STORE: KVNamespace
   /** Remote Base signer (pay-invoice side). Default https://agentapi.rozo.ai/sign-x402. */
   X402_SIGN_SERVICE_URL?: string
@@ -85,10 +94,22 @@ export interface X402PayerDeps {
   kv?: KVNamespace
 }
 
+/**
+ * The Base wallet x402 signs from: the legacy FUNDER_WALLET while
+ * FUNDER_TIERS_ENABLED is off, else T1 (null when T1 is not validly
+ * configured: Base signing then answers X402_SIGNER_NOT_CONFIGURED).
+ */
+export function x402BaseFunder(env: FunderTierEnv): string | null {
+  if (!funderTiersEnabled(env)) return FUNDER_WALLET
+  const t1 = funderTierAddress(env, 'T1')
+  return t1.ok ? t1.address : null
+}
+
 export function depsFromEnv(env: X402PayerEnv): X402PayerDeps {
+  const baseFunder = x402BaseFunder(env)
   return {
     ledger: supabaseLedger(env),
-    evmRemote: remoteSignerFromEnv(env, FUNDER_WALLET, (...args) => fetch(...args)),
+    evmRemote: baseFunder ? remoteSignerFromEnv(env, baseFunder, (...args) => fetch(...args)) : null,
     svmSigner: () => svmSignerFromSecret(env.X402_SOLANA_FUNDER_SECRET_KEY, env.X402_SOLANA_FUNDER_ADDRESS),
     svmBuild: x402SvmPayloadBuilder(env.X402_SOLANA_RPC_URL),
     fetchImpl: (...args) => fetch(...args),
@@ -208,7 +229,7 @@ export async function handleX402Payer(request: Request, env: X402PayerEnv, deps:
       return await topup(request, env, deps)
     }
     if (request.method !== 'POST') return fail(405, 'METHOD_NOT_ALLOWED', 'Use POST.')
-    return await sign(request, deps)
+    return await sign(request, deps, env)
   } catch (err) {
     if (err instanceof LedgerUnavailableError) {
       console.warn(`[x402-payer] ${err.message}`)
@@ -294,7 +315,9 @@ async function topup(request: Request, env: X402PayerEnv, deps: X402PayerDeps): 
     return fail(400, 'X402_TOPUP_SOURCE_UNSUPPORTED', src.error.message, src.error.supported ? { supported: src.error.supported } : {})
   }
 
-  const receiver = (env.X402_TOPUP_RECEIVER || FUNDER_WALLET).trim()
+  // Default receiver: the legacy funder, or T1 while FUNDER_TIERS_ENABLED is
+  // on (unconfigured T1 = empty = refused as misconfigured below).
+  const receiver = (env.X402_TOPUP_RECEIVER || x402BaseFunder(env) || '').trim()
   if (!/^0x[0-9a-fA-F]{40}$/.test(receiver)) {
     return fail(503, 'X402_TOPUP_NOT_CONFIGURED', 'Top-up receiver is misconfigured.')
   }
@@ -506,7 +529,7 @@ function storedPaymentResponse(p: LedgerPayment, replay: boolean, balanceUsd?: s
   })
 }
 
-async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
+async function sign(request: Request, deps: X402PayerDeps, env: FunderTierEnv = {}): Promise<Response> {
   const token = readAgentKey(request)
   if (!token) return fail(401, 'X402_KEY_INVALID', 'Send the agent key as "Authorization: Bearer ak_...".')
   const body = await readJson(request)
@@ -569,6 +592,16 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
   let credential: Record<string, unknown> | null = null
   let validBeforeUnix: number | null = null
   const isEvm = req.network === BASE_MAINNET_CAIP2
+  // FUNDER_TIERS_ENABLED only: Base x402 is paid by T1, within T1's
+  // per-payment cap. Refused before any signer call or debit.
+  let baseFunder: string = FUNDER_WALLET
+  if (isEvm && funderTiersEnabled(env)) {
+    const funder = resolveFunder(env, 'x402', req.amountAtomic)
+    if (!funder.ok) {
+      return fail(funderRefusalStatus(funder.reason), FUNDER_TIER_REFUSED_CODE, funderRefusalMessage(funder.reason), { reason: funder.reason })
+    }
+    baseFunder = funder.address
+  }
   if (mode === 'on') {
     if (isEvm) {
       if (!deps.evmRemote) return fail(503, 'X402_SIGNER_NOT_CONFIGURED', 'Base signing is not configured on this deployment.')
@@ -613,7 +646,7 @@ async function sign(request: Request, deps: X402PayerDeps): Promise<Response> {
   } else {
     // Shadow: no signer is touched. The funder address is what would sign.
     if (isEvm) {
-      funder = FUNDER_WALLET
+      funder = baseFunder
       nonce = randomEvmNonce()
       validBeforeUnix = deps.nowSeconds() + req.maxTimeoutSeconds
     } else {

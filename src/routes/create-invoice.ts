@@ -1,5 +1,15 @@
 import type { Env } from '../index'
-import { BASE_FUNDER_ADDRESS, RETIRED_FUNDER_ADDRESS_20261124 } from '../funder-address'
+import {
+  BASE_FUNDER_ADDRESS,
+  RETIRED_FUNDER_ADDRESS_20261124,
+  FUNDER_ALPHA_KIND,
+  funderRefusalMessage,
+  funderRefusalStatus,
+  isTronTonAlphaOrder,
+  resolveFunder,
+  sameEvmAddress,
+  type FunderRefusalReason,
+} from '../funder-address'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
 import { handleBitrefillCreateInvoice } from './bitrefill-invoice'
 import {
@@ -123,10 +133,49 @@ const SETTLEMENT_CHAIN_ID = BASE_CHAIN_ID
 const SETTLEMENT_TOKEN_ADDRESS = BASE_USDC_ADDRESS
 export const SETTLEMENT_RECEIVER = BASE_FUNDER_ADDRESS
 
+function rowReceiver(row: any): unknown {
+  return row?.destination?.receiverAddress ?? row?.destination_receiver_address ?? row?.data?.destination?.receiverAddress
+}
+
 /** True when an intents order row's destination is the compromised pre-2026-11-24 funder. */
 export function paysRetiredFunder(row: any): boolean {
-  const r = row?.destination?.receiverAddress ?? row?.destination_receiver_address ?? row?.data?.destination?.receiverAddress
+  const r = rowReceiver(row)
   return typeof r === 'string' && r.toLowerCase() === RETIRED_FUNDER_ADDRESS_20261124.toLowerCase()
+}
+
+/**
+ * FUNDER_TIERS_ENABLED only (`expected` defined): true when the order row does
+ * NOT pay out to the selected tier wallet (missing receiver included). Such an
+ * order is never handed out. `expected` undefined (flag off): always false.
+ */
+export function paysOtherThanTier(row: any, expected: string | undefined): boolean {
+  if (expected === undefined) return false
+  return !sameEvmAddress(rowReceiver(row), expected)
+}
+
+/** The 400/503 a create path answers when the funder resolver refuses. */
+function funderRefusedResponse(
+  reason: FunderRefusalReason,
+  ctx: { normalized_input?: any; link_id_detected?: string | null },
+): Response {
+  return errorResponse(funderRefusalStatus(reason), {
+    code: 'FUNDER_TIER_REFUSED',
+    message: funderRefusalMessage(reason),
+    hint: reason,
+    normalized_input: ctx.normalized_input,
+    link_id_detected: ctx.link_id_detected ?? null,
+  })
+}
+
+/** The 503 when rozo-intents-api returned an order paying another wallet. */
+function funderReceiverMismatchResponse(ctx: { normalized_input?: any; link_id_detected?: string | null }): Response {
+  console.error('[create-invoice] intents order destination is not the selected funder tier wallet')
+  return errorResponse(503, {
+    code: 'FUNDER_TIER_RECEIVER_MISMATCH',
+    message: 'Payments are temporarily unavailable (order destination mismatch). Do not pay this order; try again later.',
+    normalized_input: ctx.normalized_input,
+    link_id_detected: ctx.link_id_detected ?? null,
+  })
 }
 
 // ── Source override support (caller picks which chain/token to pay with) ──────
@@ -526,6 +575,10 @@ export type CreateInvoiceErrorCode =
   | 'BTC_LINK_TOO_SOON'
   | 'BTC_REQUIRES_EXACT_OUT'
   | 'BTC_DESTINATION_UNSUPPORTED'
+  // Tiered funders (FUNDER_TIERS_ENABLED only): no tier wallet may take this
+  // order, or rozo-intents-api returned an order paying another wallet.
+  | 'FUNDER_TIER_REFUSED'
+  | 'FUNDER_TIER_RECEIVER_MISMATCH'
 
 // Resolver failure kind -> the error code a checkout UI keys its friendly copy
 // off. Without a code the UI renders the raw upstream string, so an expired
@@ -1473,10 +1526,13 @@ function readMetadataObject(row: any): Record<string, unknown> | null {
  * price. Legacy zero-fee rows are accepted when their amount matches; once a
  * fee is enabled, missing/partial pricing metadata fails closed.
  */
-export function pendingPricingMatches(row: any, pricing: CheckoutPricing): boolean {
+export function pendingPricingMatches(row: any, pricing: CheckoutPricing, expectedReceiver?: string): boolean {
   // An order created before the 2026-11-24 funder rotation pays out to the
   // compromised funder: never hand it out again (fail closed until it expires).
   if (paysRetiredFunder(row)) return false
+  // FUNDER_TIERS_ENABLED only: an order that does not pay out to the selected
+  // tier wallet is never handed out either (undefined = flag off, no check).
+  if (paysOtherThanTier(row, expectedReceiver)) return false
   const source = readRowSource(row)
   // exactOut rows (Lightning, native coins) carry the USD price on the
   // destination; their source amount is in BTC / coin units.
@@ -2244,6 +2300,24 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
+  // Funder tier (FUNDER_TIERS_ENABLED only). Off: the legacy funder, no
+  // check, byte-identical orders. On: the tier that will pay this Coinbase
+  // invoice is the order's receiver; a refusal creates nothing. Checked
+  // before any upstream operation (reuse, rotation or create).
+  const funder = resolveFunder(env, 'coinbase', invoiceAtomic)
+  if (!funder.ok) return funderRefusedResponse(funder.reason, { normalized_input: normalized, link_id_detected })
+  const settlementReceiver = funder.address
+  const tierReceiver = funder.expectedFunder
+  // A reusable order the TRON / TON alpha route created pays out to the alpha
+  // wallet (routeFunder kind tron_ton_alpha: the legacy funder in phase 2a,
+  // refused in 2b), not to this invoice's Coinbase tier. Flag off: undefined.
+  const alphaFunder = resolveFunder(env, FUNDER_ALPHA_KIND, invoiceAtomic)
+  const expectedReceiverFor = (row: any): string | undefined =>
+    tierReceiver === undefined
+      ? undefined
+      : isTronTonAlphaOrder(row)
+        ? alphaFunder.ok ? alphaFunder.expectedFunder : 'alpha-refused'
+        : tierReceiver
   // Shielded ZEC orders have their own cap (ZEC_SHIELDED_MAX_USD, default
   // $1,200 = intents ZEC_SHIELD_CAPS.max_order_usd), checked right before a
   // FRESH shielded create (shieldedCapBlock below) so that an existing order
@@ -2603,7 +2677,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           })
         }
       }
-      if (!pendingPricingMatches(existing, pricing)) {
+      if (!pendingPricingMatches(existing, pricing, expectedReceiverFor(existing))) {
         return pricingMismatchResponse({ linkId }, existing)
       }
       // A shielded ZEC row binds no refund address (none exists on that
@@ -2927,7 +3001,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
             },
         destination: {
           chainId: SETTLEMENT_CHAIN_ID,
-          receiverAddress: SETTLEMENT_RECEIVER,
+          receiverAddress: settlementReceiver,
           tokenSymbol: 'USDC',
           tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
           amount: callerPays,
@@ -2970,7 +3044,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
         },
         destination: {
           chainId: SETTLEMENT_CHAIN_ID,
-          receiverAddress: SETTLEMENT_RECEIVER,
+          receiverAddress: settlementReceiver,
           tokenSymbol: 'USDC',
           tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
         },
@@ -3120,7 +3194,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
               linkId,
             })
           }
-          if (!pendingPricingMatches(winner, pricing)) {
+          if (!pendingPricingMatches(winner, pricing, expectedReceiverFor(winner))) {
             return pricingMismatchResponse({ linkId }, winner)
           }
           const winnerSource = readRowSource(winner)
@@ -3246,6 +3320,13 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   {
     const violation = btcRailViolation(source, intentsJson)
     if (violation) return btcRailViolationResponse(violation, normalized, link_id_detected)
+  }
+
+  // FUNDER_TIERS_ENABLED only: rozo-intents-api can force a merchant's own
+  // destination. An order that does not pay out to the selected tier wallet
+  // is not handed out (it expires unpaid; reuse refuses it too).
+  if (paysOtherThanTier(intentsJson, tierReceiver)) {
+    return funderReceiverMismatchResponse({ normalized_input: normalized, link_id_detected })
   }
 
   // Close the re-order race: a late payment can land on one of the expired
@@ -3529,6 +3610,12 @@ export async function handleStripeCreateInvoice(
   const pricing = receiptPricing ?? currentPricing
   const priced = pricingFields(pricing)
   const callerPays = priced.callerPays
+  // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder, no
+  // check). The T3B wallet pays Stripe, so it is the order's receiver.
+  const stripeFunder = resolveFunder(env, 'stripe', invoiceAtomic)
+  if (!stripeFunder.ok) return funderRefusedResponse(stripeFunder.reason, {})
+  const stripeSettlementReceiver = stripeFunder.address
+  const stripeTierReceiver = stripeFunder.expectedFunder
   const originalStr = priced.original
   const discountStr = '0'
   const title = buildCheckoutTitle(invoice.merchantTitle, pricing)
@@ -3562,7 +3649,7 @@ export async function handleStripeCreateInvoice(
     else ended = { kind, row: found }
   }
 
-  if (existing && !pendingPricingMatches(existing, pricing)) {
+  if (existing && !pendingPricingMatches(existing, pricing, stripeTierReceiver)) {
     return pricingMismatchResponse(
       { provider: 'stripe_crypto', invoiceKey: invoice.invoiceKey },
       existing,
@@ -3763,7 +3850,7 @@ export async function handleStripeCreateInvoice(
           },
           destination: {
             chainId: SETTLEMENT_CHAIN_ID,
-            receiverAddress: SETTLEMENT_RECEIVER,
+            receiverAddress: stripeSettlementReceiver,
             tokenSymbol: 'USDC',
             tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
             amount: callerPays,
@@ -3785,7 +3872,7 @@ export async function handleStripeCreateInvoice(
           },
           destination: {
             chainId: SETTLEMENT_CHAIN_ID,
-            receiverAddress: SETTLEMENT_RECEIVER,
+            receiverAddress: stripeSettlementReceiver,
             tokenSymbol: 'USDC',
             tokenAddress: SETTLEMENT_TOKEN_ADDRESS,
           },
@@ -3849,6 +3936,11 @@ export async function handleStripeCreateInvoice(
       intentsJson = JSON.parse(intentsText)
     } catch {
       return json(502, { ok: false, provider: 'stripe_crypto', error: 'Rozo intents API returned non-JSON.' })
+    }
+    // FUNDER_TIERS_ENABLED only: never hand out an order that does not pay
+    // out to the selected tier wallet (nothing is seeded; it expires unpaid).
+    if (paysOtherThanTier(intentsJson, stripeTierReceiver)) {
+      return funderReceiverMismatchResponse({})
     }
     rozoPaymentId = intentsJson?.id ?? intentsJson?.paymentId ?? intentsJson?.data?.id ?? null
     paymentLink =

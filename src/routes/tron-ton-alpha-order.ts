@@ -29,9 +29,17 @@ import {
   BASE_USDC_ADDRESS,
   pricingFields,
   ROZO_INTENTS_URL,
+  paysOtherThanTier,
   paysRetiredFunder,
   SETTLEMENT_RECEIVER,
 } from './create-invoice'
+import {
+  ALPHA_ORDER_SOURCE,
+  FUNDER_ALPHA_KIND,
+  funderTiersEnabled,
+  isTronTonAlphaOrder,
+  resolveFunder,
+} from '../funder-address'
 import { buildCheckoutTitle, type CheckoutPricing } from './checkout-web-pricing'
 import { withForwardedClientHint } from './client-hint-forward'
 import { coinbaseLinkFromId, saveOriginalPaymentLink } from './payment-link-store'
@@ -120,7 +128,7 @@ export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs): Record<string, u
     ...(a.attributionField ?? {}),
     ...deviceIdField(a.deviceId),
     metadata: {
-      source: 'mpprouter-tron-ton-alpha',
+      source: ALPHA_ORDER_SOURCE,
       coinbasePaymentLinkId: a.invoiceKey,
       ...(a.orderAttribution ?? {}),
       ...priced,
@@ -131,7 +139,7 @@ export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs): Record<string, u
 
 export type EnsureAlphaOrderResult =
   | { ok: true; state: 'cached' | 'existing' | 'created' | 'raced' }
-  | { ok: false; reason: 'lookup_failed' | 'create_failed' | 'retired_funder' }
+  | { ok: false; reason: 'lookup_failed' | 'create_failed' | 'retired_funder' | 'funder_tier' }
 
 export async function ensureAlphaBusinessOrder(
   env: Env,
@@ -139,7 +147,29 @@ export async function ensureAlphaBusinessOrder(
   forwardedHint: string | null,
   fetchImpl: typeof fetch = fetch,
 ): Promise<EnsureAlphaOrderResult> {
-  const marker = alphaOrderMarkerKey(a.invoiceKey)
+  // Tiered funders (FUNDER_TIERS_ENABLED only; off = no check). An alpha
+  // order is received and paid by the wallet routeFunder picks for kind
+  // tron_ton_alpha (phase 2a: the legacy funder, the same address as the
+  // upstream digest's destination). A refusal opens nothing.
+  const tierOn = funderTiersEnabled(env)
+  const alphaFunder = resolveFunder(env, FUNDER_ALPHA_KIND, a.pricing.originalAtomic)
+  if (!alphaFunder.ok) return { ok: false, reason: 'funder_tier' }
+  // Flag on, an existing order must pay out to the wallet its settlement
+  // will select: an alpha-created order to the alpha wallet, a main-checkout
+  // order to the Coinbase tier for this invoice amount (an order created
+  // before the switch may pay another wallet; no instructions lead into it).
+  const coinbaseFunder = resolveFunder(env, 'coinbase', a.pricing.originalAtomic)
+  const wrongAlphaReceiver = (row: unknown) => {
+    if (!tierOn) return false
+    if (isTronTonAlphaOrder(row)) return paysOtherThanTier(row, alphaFunder.expectedFunder)
+    return !coinbaseFunder.ok || paysOtherThanTier(row, coinbaseFunder.expectedFunder)
+  }
+  // Flag on: a separate marker bound to the wallets the check used, so a
+  // marker cached while the flag was off, or before a tier address changed,
+  // cannot skip the check above.
+  const marker = alphaOrderMarkerKey(a.invoiceKey) + (tierOn
+    ? `:tiers:${String(alphaFunder.expectedFunder).toLowerCase()}:${String(coinbaseFunder.ok ? coinbaseFunder.expectedFunder : 'none').toLowerCase()}`
+    : '')
   const cached = await env.MPP_STORE.get(marker).catch(() => null)
   if (cached) return { ok: true, state: 'cached' }
   // The order exists: store its link, and cache that only once the link is in.
@@ -156,6 +186,7 @@ export async function ensureAlphaBusinessOrder(
     // Pre-rotation (2026-11-24) order: it pays out to the compromised funder,
     // so no TRON / TON instructions may lead into it.
     if (paysRetiredFunder(found.row)) return { ok: false, reason: 'retired_funder' }
+    if (wrongAlphaReceiver(found.row)) return { ok: false, reason: 'funder_tier' }
     await mark(found.row)
     return { ok: true, state: 'existing' }
   }
@@ -175,7 +206,14 @@ export async function ensureAlphaBusinessOrder(
     return { ok: false, reason: 'create_failed' }
   }
   if (res.ok) {
-    await mark(await res.json().catch(() => null))
+    const created = await res.json().catch(() => null)
+    // Flag on: the created order must pay out to the alpha wallet (a missing
+    // receiver fails closed). Flag off: unchanged.
+    if (tierOn && paysOtherThanTier(created, alphaFunder.expectedFunder)) {
+      console.error('[tron-ton-alpha] business order destination is not the alpha funder wallet')
+      return { ok: false, reason: 'funder_tier' }
+    }
+    await mark(created)
     return { ok: true, state: 'created' }
   }
   // A concurrent create (another tab, or the main checkout) took the orderId:
@@ -187,6 +225,7 @@ export async function ensureAlphaBusinessOrder(
     const again = await lookupIntentsOrder(env, OPENROUTER_APP_ID, a.invoiceKey, AbortSignal.timeout(ORDER_TIMEOUT_MS))
     if (again.state !== 'found') return { ok: false, reason: 'create_failed' }
     if (paysRetiredFunder(again.row)) return { ok: false, reason: 'retired_funder' }
+    if (wrongAlphaReceiver(again.row)) return { ok: false, reason: 'funder_tier' }
     await mark(again.row)
     return { ok: true, state: 'raced' }
   }

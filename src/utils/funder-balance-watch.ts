@@ -68,9 +68,44 @@ const EMPTY_STATE: FunderWatchState = {
   unreadableAlerted: false,
 }
 
-export function classifyBand(balance: bigint): Band {
-  if (balance < FUNDER_P0_THRESHOLD) return 'p0'
-  if (balance < FUNDER_P1_THRESHOLD) return 'p1'
+/**
+ * Thresholds and wording for one watched wallet. The default is the legacy
+ * single funder (texts unchanged). Tiered funders (FUNDER_TIERS_ENABLED) get
+ * their own profile and their own KV state (FUNDER_TIER_WATCH_PROFILES).
+ */
+export interface WatchProfile {
+  p0: bigint
+  p1: bigint
+  /** Message prefix, e.g. "Funder" or "Funder T1". */
+  label: string
+}
+
+export const DEFAULT_WATCH_PROFILE: WatchProfile = {
+  p0: FUNDER_P0_THRESHOLD,
+  p1: FUNDER_P1_THRESHOLD,
+  label: 'Funder',
+}
+
+/**
+ * Per-tier thresholds (proposed, agent-set, change freely). T1 holds at most
+ * 50 USDC and is topped up by hand when it drops below 10 (design 2026-11-24);
+ * T2 holds at most 200; T3A / T3B use the legacy bands.
+ */
+export const FUNDER_TIER_WATCH_PROFILES: Record<'T1' | 'T2' | 'T3A' | 'T3B', WatchProfile> = {
+  T1: { p0: 10n * USDC, p1: 20n * USDC, label: 'Funder T1 (x402)' },
+  T2: { p0: 50n * USDC, p1: 100n * USDC, label: 'Funder T2 (Coinbase < $200)' },
+  T3A: { p0: FUNDER_P0_THRESHOLD, p1: FUNDER_P1_THRESHOLD, label: 'Funder T3A (Coinbase >= $200)' },
+  T3B: { p0: FUNDER_P0_THRESHOLD, p1: FUNDER_P1_THRESHOLD, label: 'Funder T3B (Stripe / Bitrefill)' },
+}
+
+/** KV key of the watch state: legacy key for the legacy funder, one per tier otherwise. */
+export function watchStateKey(tier?: string): string {
+  return tier ? `${STATE_KEY}:${tier}` : STATE_KEY
+}
+
+export function classifyBand(balance: bigint, profile: WatchProfile = DEFAULT_WATCH_PROFILE): Band {
+  if (balance < profile.p0) return 'p0'
+  if (balance < profile.p1) return 'p1'
   return 'ok'
 }
 
@@ -88,10 +123,9 @@ export interface WatchDecision {
   nextState: FunderWatchState
 }
 
-const BAND_LABEL: Record<Band, string> = {
-  ok: 'OK',
-  p1: `P1 (< ${formatUsd(FUNDER_P1_THRESHOLD)})`,
-  p0: `P0 (< ${formatUsd(FUNDER_P0_THRESHOLD)})`,
+function bandLabel(band: Band, profile: WatchProfile): string {
+  if (band === 'ok') return 'OK'
+  return band === 'p1' ? `P1 (< ${formatUsd(profile.p1)})` : `P0 (< ${formatUsd(profile.p0)})`
 }
 
 /**
@@ -103,14 +137,16 @@ export function decide(
   address: string,
   now: number,
   rpcSummary = '',
+  profile: WatchProfile = DEFAULT_WATCH_PROFILE,
 ): WatchDecision {
+  const label = profile.label
   if (balance === null) {
     const streak = previous.unreadableStreak + 1
     const alert = streak >= UNREADABLE_ALERT_AFTER && !previous.unreadableAlerted
     return {
       messages: alert
         ? [
-            `[MPP Router] ❓ Funder balance unreadable for ${streak} consecutive checks\n` +
+            `[MPP Router] ❓ ${label} balance unreadable for ${streak} consecutive checks\n` +
               `Wallet: ${address} (Base USDC)\n` +
               `This is NOT a low-balance report; the balance is unknown. Low balance cannot be detected until reads recover.\n` +
               (rpcSummary ? `RPCs: ${rpcSummary}` : ''),
@@ -125,7 +161,7 @@ export function decide(
     }
   }
 
-  const band = classifyBand(balance)
+  const band = classifyBand(balance, profile)
   const messages: string[] = []
   const current = formatUsd(balance)
 
@@ -136,13 +172,13 @@ export function decide(
     const worse = previous.band === null || previous.band === 'ok' || band === 'p0'
     messages.push(
       worse
-        ? `[MPP Router] ${band === 'p0' ? '🚨' : '⚠️'} Funder balance ${BAND_LABEL[band]}: ${current}\n` +
+        ? `[MPP Router] ${band === 'p0' ? '🚨' : '⚠️'} ${label} balance ${bandLabel(band, profile)}: ${current}\n` +
             `Wallet: ${address} (Base USDC)\n` +
             (band === 'p0'
               ? `Impact: coupon / Coinbase / Stripe payments may already fail with insufficient funder balance.\n`
-              : `Impact: top up soon; below ${formatUsd(FUNDER_P0_THRESHOLD)} payments start failing.\n`) +
+              : `Impact: top up soon; below ${formatUsd(profile.p0)} payments start failing.\n`) +
             `Action needed: send Base USDC to the wallet above.`
-        : `[MPP Router] Funder balance improved to ${BAND_LABEL[band]}: ${current}\n` +
+        : `[MPP Router] ${label} balance improved to ${bandLabel(band, profile)}: ${current}\n` +
             `Wallet: ${address} (Base USDC)`,
     )
   }
@@ -157,9 +193,9 @@ export function decide(
     const drop = prev - balance
     // Quiet above the P1 line (founder rule): a big payment that still leaves
     // $200+ on hand is not worth a message.
-    if (balance < FUNDER_P1_THRESHOLD && prev > 0n && drop >= DROP_MIN_ABS && drop * 100n > prev * DROP_MIN_RATIO_PCT) {
+    if (balance < profile.p1 && prev > 0n && drop >= DROP_MIN_ABS && drop * 100n > prev * DROP_MIN_RATIO_PCT) {
       messages.push(
-        `[MPP Router] ⚠️ Funder balance dropped sharply: ${formatUsd(prev)} → ${current} ` +
+        `[MPP Router] ⚠️ ${label} balance dropped sharply: ${formatUsd(prev)} → ${current} ` +
           `(-${formatUsd(drop)}, -${(drop * 100n) / prev}%) in ${Math.round(elapsed / 60_000)} min\n` +
           `Wallet: ${address} (Base USDC)\n` +
           `Check whether this is a normal large payment or an unexpected withdrawal.`,
@@ -179,8 +215,8 @@ export function decide(
   }
 }
 
-export async function readWatchState(kv: KVNamespace): Promise<FunderWatchState> {
-  const raw = await kv.get(STATE_KEY)
+export async function readWatchState(kv: KVNamespace, stateKey: string = STATE_KEY): Promise<FunderWatchState> {
+  const raw = await kv.get(stateKey)
   if (!raw) return { ...EMPTY_STATE }
   try {
     const p = JSON.parse(raw) as Partial<FunderWatchState>
@@ -207,15 +243,19 @@ export async function checkFunderBalance(args: {
   rpcUrl?: string
   now?: number
   readBalance?: typeof getBaseUsdcBalance
+  /** Tiered funders only: own KV state + thresholds. Default = legacy funder. */
+  stateKey?: string
+  profile?: WatchProfile
 }): Promise<{ messages: string[]; commit: () => Promise<void> } | null> {
   const now = args.now ?? Date.now()
-  const previous = await readWatchState(args.kv)
+  const stateKey = args.stateKey ?? STATE_KEY
+  const previous = await readWatchState(args.kv, stateKey)
   if (now - previous.lastSampleAt < SAMPLE_INTERVAL_MS) return null
 
   const read = await (args.readBalance ?? getBaseUsdcBalance)(args.address, args.rpcUrl)
   const rpcSummary = read.rpcsTried.map((r) => `${r.url} ${r.ok ? 'ok' : r.reason ?? 'failed'}`).join('; ')
-  const decision = decide(previous, read.balance, args.address, now, rpcSummary)
-  const commit = () => args.kv.put(STATE_KEY, JSON.stringify(decision.nextState))
+  const decision = decide(previous, read.balance, args.address, now, rpcSummary, args.profile ?? DEFAULT_WATCH_PROFILE)
+  const commit = () => args.kv.put(stateKey, JSON.stringify(decision.nextState))
 
   if (decision.messages.length === 0) {
     await commit()

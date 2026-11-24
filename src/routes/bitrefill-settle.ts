@@ -52,11 +52,13 @@ import {
   emptyRecord,
   forgetWebhookEvent,
   fetchRozoPaymentById,
+  isFunderTierMismatch,
   loadRecord,
   maskAddresses,
   reportDeliveredToRozo,
   saveRecordGuarded,
 } from './webhook'
+import { FUNDER_TIER_REFUSED_CODE, resolveFunder } from '../funder-address'
 
 import { celoSettlementGate } from './celo-finality'
 
@@ -125,7 +127,15 @@ function fmt(atomic: bigint | string | null | undefined): string {
 // ── Order verification (router side) ────────────────────────────────────────
 
 export type BitrefillOrderCheck =
-  | { ok: true; facts: BitrefillFrozenFacts; order?: any }
+  | {
+      ok: true
+      facts: BitrefillFrozenFacts
+      order?: any
+      // Wallet that pays (legacy funder while FUNDER_TIERS_ENABLED is off).
+      funderAddress?: string
+      // `expected_funder` for pay-invoice; undefined while the flag is off.
+      expectedFunder?: string
+    }
   | { ok: false; terminal: boolean; reason: string }
 
 /**
@@ -165,7 +175,11 @@ export async function verifyBitrefillOrder(
   const status = readPaymentStatus(order) ?? ''
   if (!ORDER_PAID_OUT.has(status)) return { ok: false, terminal: false, reason: `order status ${status || 'missing'} is not paid out yet` }
   const dest = order.destination ?? {}
-  if (String(dest.receiverAddress ?? '').toLowerCase() !== FUNDER_WALLET.toLowerCase()) {
+  // The wallet that will pay: the legacy funder while FUNDER_TIERS_ENABLED is
+  // off, else the tier selected for this invoice amount (T3B).
+  const funder = resolveFunder(env, 'bitrefill', facts.amountAtomic)
+  if (!funder.ok) return { ok: false, terminal: true, reason: `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason}` }
+  if (String(dest.receiverAddress ?? '').toLowerCase() !== funder.address.toLowerCase()) {
     return { ok: false, terminal: true, reason: 'order destination is not the funder' }
   }
   if (String(dest.chainId ?? '') !== '8453' || String(dest.tokenSymbol ?? '').toUpperCase() !== 'USDC') {
@@ -185,7 +199,7 @@ export async function verifyBitrefillOrder(
   if (delivered < facts.callerPaysAtomic) {
     return { ok: false, terminal: true, reason: `payout ${delivered} below invoice + fee ${facts.callerPaysAtomic}` }
   }
-  return { ok: true, facts, order }
+  return { ok: true, facts, order, funderAddress: funder.address, expectedFunder: funder.expectedFunder }
 }
 
 // ── pay-invoice call ────────────────────────────────────────────────────────
@@ -249,6 +263,10 @@ export function classifyBitrefillPayResult(r: BitrefillPayResult): BitrefillPayV
   ) {
     return 'refused'
   }
+  // Tier cross-check (FUNDER_TIERS_ENABLED): the signer's own funder selection
+  // differs from our expected_funder. 409 + signed:false + this code, with or
+  // without the provider tag: nothing was signed.
+  if (isFunderTierMismatch(r.status, b)) return 'refused'
   if (fromUs && b.signed === false && b.ok === false) {
     if (r.status === 409 && b.code === 'INVOICE_EXPIRED') return 'expired'
     // An earlier signature for this invoice can still execute: NOT a refusal.
@@ -406,6 +424,7 @@ export async function settleBitrefillFunderEvent(
   }
 
   const facts = check.facts
+  const funderAddress = check.funderAddress ?? FUNDER_WALLET
   rec.invoiceAmountAtomic = facts.amountAtomic.toString()
   rec.bitrefill = {
     invoiceId: facts.invoiceId,
@@ -415,6 +434,9 @@ export async function settleBitrefillFunderEvent(
     expiresAt: facts.expiresAt,
     validBefore: rec.bitrefill?.validBefore ?? null,
     transaction: rec.bitrefill?.transaction ?? null,
+    // Tier wallet that signs the authorization (flag on only): the sweep
+    // reads its nonce under this authorizer. Absent = FUNDER_WALLET.
+    ...(check.expectedFunder ? { funder: check.expectedFunder } : {}),
   }
 
   // Late payin: the invoice can no longer be paid safely. Refunds are manual.
@@ -436,7 +458,7 @@ export async function settleBitrefillFunderEvent(
   }
 
   // Read-only pre-check; nothing is taken yet.
-  const balance = (await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)).balance
+  const balance = (await getBaseUsdcBalance(funderAddress, env.BASE_RPC_URL)).balance
   if (balance !== null && balance < facts.amountAtomic) {
     rec.status = 'failed_insufficient_balance'
     rec.failureReason = `funder balance ${balance} < invoice ${facts.amountAtomic}`
@@ -547,6 +569,8 @@ export async function settleBitrefillFunderEvent(
     bitrefill_invoice_id: facts.invoiceId,
     rozo_payment_id: rozoPaymentId,
     expected: { address: facts.address, amount_atomic: facts.amountAtomic.toString() },
+    // FUNDER_TIERS_ENABLED only (absent otherwise: legacy body).
+    ...(check.expectedFunder ? { expected_funder: check.expectedFunder } : {}),
   }
   let result = await callBitrefillPayInvoice(env, payload)
   let verdict = classifyBitrefillPayResult(result)
@@ -786,6 +810,15 @@ export async function readAuthorizationUsed(env: Env, funder: string, nonce: str
 
 const pad32 = (addr: string) => '0x' + addr.toLowerCase().replace(/^0x/, '').padStart(64, '0')
 
+/**
+ * The wallet that signed this record's authorization: the tier wallet stored
+ * at send time (FUNDER_TIERS_ENABLED only), else the legacy FUNDER_WALLET.
+ */
+export function bitrefillAuthorizer(rec: FulfillmentRecord): string {
+  const f = rec.bitrefill?.funder
+  return typeof f === 'string' && /^0x[0-9a-fA-F]{40}$/.test(f) ? f : FUNDER_WALLET
+}
+
 function isUsdcLog(log: any): boolean {
   return !!log && typeof log === 'object' && log.removed !== true && String(log.address ?? '').toLowerCase() === BASE_USDC.toLowerCase()
 }
@@ -915,6 +948,7 @@ export async function readBitrefillTransferProof(env: Env, rec: FulfillmentRecor
     return { result: 'unavailable', notes: ['no frozen address/amount on the record'] }
   }
   const recorded = typeof b.transaction === 'string' && /^0x[0-9a-fA-F]{64}$/.test(b.transaction) ? b.transaction.toLowerCase() : null
+  const authorizer = bitrefillAuthorizer(rec)
   const startMs = msOf(rec.payingAt ?? null)
   const deadlineMs = authorizationDeadlineMs(rec)
 
@@ -923,8 +957,8 @@ export async function readBitrefillTransferProof(env: Env, rec: FulfillmentRecor
     if (!r.ok || !r.result || typeof r.result !== 'object') return 'unavailable'
     const receipt = r.result as any
     if (receipt.status !== '0x1' || !Array.isArray(receipt.logs)) return 'no_auth'
-    if (!receipt.logs.some((l: any) => isAuthorizationUsedLog(l, FUNDER_WALLET, nonce))) return 'no_auth'
-    return receipt.logs.some((l: any) => isExactTransferLog(l, FUNDER_WALLET, b.address, amount)) ? 'proven' : 'disproven'
+    if (!receipt.logs.some((l: any) => isAuthorizationUsedLog(l, authorizer, nonce))) return 'no_auth'
+    return receipt.logs.some((l: any) => isExactTransferLog(l, authorizer, b.address, amount)) ? 'proven' : 'disproven'
   }
 
   const perHost = await Promise.all(
@@ -942,13 +976,13 @@ export async function readBitrefillTransferProof(env: Env, rec: FulfillmentRecor
       const logs = await rpcCall(url, 'eth_getLogs', [
         {
           address: BASE_USDC,
-          topics: [AUTHORIZATION_USED_TOPIC, pad32(FUNDER_WALLET), pad32(nonce)],
+          topics: [AUTHORIZATION_USED_TOPIC, pad32(authorizer), pad32(nonce)],
           fromBlock: '0x' + from.toString(16),
           toBlock: '0x' + to.toString(16),
         },
       ])
       if (!logs.ok || !Array.isArray(logs.result)) return { host, verdict: 'unavailable', note: 'eth_getLogs refused or unsupported' }
-      const hit = logs.result.find((l: any) => isAuthorizationUsedLog(l, FUNDER_WALLET, nonce) && typeof l.transactionHash === 'string' && /^0x[0-9a-fA-F]{64}$/.test(l.transactionHash))
+      const hit = logs.result.find((l: any) => isAuthorizationUsedLog(l, authorizer, nonce) && typeof l.transactionHash === 'string' && /^0x[0-9a-fA-F]{64}$/.test(l.transactionHash))
       // Empty logs are never "disproven".
       if (!hit) return { host, verdict: 'unavailable', note: 'no AuthorizationUsed log in the window' }
       const tx = String(hit.transactionHash).toLowerCase()
@@ -1055,7 +1089,7 @@ export function authorizationDeadlineMs(rec: FulfillmentRecord): number | null {
 
 export async function resolveBitrefillUnknown(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
   const nonce = rec.bitrefill?.nonce ?? bitrefillNonce(invoiceIdOf(plId))
-  const read = await readAuthorizationQuorum(env, FUNDER_WALLET, nonce)
+  const read = await readAuthorizationQuorum(env, bitrefillAuthorizer(rec), nonce)
   const used = read.used
   const nowIso = new Date(now).toISOString()
   if (used === null) return
@@ -1172,7 +1206,7 @@ async function applyChainUsed(
 export async function recheckBitrefillManualReview(env: Env, plId: string, rec: FulfillmentRecord, now: number): Promise<void> {
   if (rec.status !== 'manual_review' || !rec.bitrefillUnknownOrigin) return
   const nonce = rec.bitrefill?.nonce ?? bitrefillNonce(invoiceIdOf(plId))
-  const read = await readAuthorizationQuorum(env, FUNDER_WALLET, nonce)
+  const read = await readAuthorizationQuorum(env, bitrefillAuthorizer(rec), nonce)
   if (read.used !== true) return
   await applyChainUsed(env, plId, rec, now, read, nonce, true, true)
 }

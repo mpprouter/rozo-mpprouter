@@ -9,7 +9,8 @@ import { handleCreateInvoice, SETTLEMENT_RECEIVER } from '../src/routes/create-i
 import { FUNDER_WALLET, handleRozoWebhook, type FulfillmentRecord } from '../src/routes/webhook'
 import { FUNDER_WALLET as STRIPE_FUNDER } from '../src/routes/stripe-fulfillment'
 import { ALPHA_DESTINATION } from '../src/routes/tron-ton-alpha'
-import { RETIRED_FUNDER_ADDRESS_20261124 } from '../src/funder-address'
+import { BASE_FUNDER_ADDRESS, RETIRED_FUNDER_ADDRESS_20261124, resolveFunder } from '../src/funder-address'
+import { x402BaseFunder } from '../src/x402payer/routes'
 import {
   BITREFILL_FUNDER,
   bitrefillNonce,
@@ -131,6 +132,21 @@ describe('funder constants', () => {
     expect(BITREFILL_FUNDER).toBe(SETTLEMENT_RECEIVER)
     expect(BITREFILL_FUNDER).toBe(STRIPE_FUNDER)
     expect(ALPHA_DESTINATION.receiverAddress).toBe(FUNDER_WALLET)
+  })
+  it('with FUNDER_TIERS_ENABLED off, every funder constant and every resolved funder equals BASE_FUNDER_ADDRESS', () => {
+    for (const a of [FUNDER_WALLET, SETTLEMENT_RECEIVER, STRIPE_FUNDER, BITREFILL_FUNDER, ALPHA_DESTINATION.receiverAddress]) {
+      expect(a).toBe(BASE_FUNDER_ADDRESS)
+    }
+    for (const env of [{}, { FUNDER_TIERS_ENABLED: 'false', FUNDER_T2_ADDRESS: '0x2000000000000000000000000000000000000002' }]) {
+      for (const kind of ['x402', 'coinbase', 'stripe', 'bitrefill', 'other']) {
+        for (const amount of [1n, 199_999_999n, 200_000_000n, 1_200_000_000n, 5_000_000_000n]) {
+          const r = resolveFunder(env, kind, amount)
+          expect(r.ok && r.address).toBe(BASE_FUNDER_ADDRESS)
+          expect(r.ok && r.expectedFunder).toBeUndefined()
+        }
+      }
+    }
+    expect(x402BaseFunder({})).toBe(BASE_FUNDER_ADDRESS)
   })
   it('every funder constant is the rotated 2026-11-24 funder, never the compromised one', () => {
     expect(FUNDER_WALLET).toBe('0x282bE0C42E5c944b0285CEc363117AB077cC084A')
@@ -1557,5 +1573,172 @@ describe('sweep budget and ordering (R7)', () => {
     await sweepBitrefillFulfillments(env, Date.now(), clock)
     const done = [0, 1, 2].filter((i) => (load(kv, invN(i)).bitrefillRedrives ?? 0) === 1)
     expect(done).toHaveLength(1)
+  })
+})
+
+// ── Tiered funders (FUNDER_TIERS_ENABLED) ───────────────────────────────────
+
+describe('tiered funders (Bitrefill = T3B)', () => {
+  const T3B = '0x4000000000000000000000000000000000000004'
+  const TIERS = {
+    FUNDER_TIERS_ENABLED: 'true',
+    FUNDER_T1_ADDRESS: '0x1000000000000000000000000000000000000001',
+    FUNDER_T2_ADDRESS: '0x2000000000000000000000000000000000000002',
+    FUNDER_T3A_ADDRESS: '0x3000000000000000000000000000000000000003',
+    FUNDER_T3B_ADDRESS: T3B,
+  }
+
+  async function createWith(env: Env, br: Record<string, unknown> = {}, receiverInResponse?: string) {
+    let created: any = null
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('/payments/order/')) return new Response('{"error":{"code":"paymentNotFound"}}', { status: 404 })
+      if (u.includes('/payment-api') && init?.method === 'POST') {
+        created = JSON.parse(String(init?.body ?? '{}'))
+        return Response.json({
+          id: ROZO_ID,
+          expiresAt: inMinutes(60),
+          destination: { receiverAddress: receiverInResponse ?? created.destination.receiverAddress },
+        })
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch)
+    const res = await handleCreateInvoice(
+      new Request('https://mpp.test/v1/services/rozo-agent-api/create-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'bitrefill',
+          bitrefill: { invoiceId: INVOICE, address: RECEIVER, amount: '204', expiresAt: inMinutes(40), ...br },
+          source: { chainId: '8453', tokenSymbol: 'USDC' },
+        }),
+      }),
+      env,
+    )
+    return { status: res.status, json: (await res.json()) as any, created }
+  }
+
+  it('create: flag off -> legacy funder receiver; flag on -> T3B', async () => {
+    let r = await createWith(makeEnv().env)
+    expect(r.status).toBe(200)
+    expect(r.created.destination.receiverAddress).toBe(FUNDER_WALLET)
+    r = await createWith(makeEnv(TIERS).env)
+    expect(r.status).toBe(200)
+    expect(r.created.destination.receiverAddress).toBe(T3B)
+  })
+
+  it('create, flag on: a tier wallet as the Bitrefill address is blocked; a missing T3B refuses', async () => {
+    let r = await createWith(makeEnv(TIERS).env, { address: T3B.toLowerCase() })
+    expect(r.json.error).toBe('BLOCKED_ADDRESS')
+    r = await createWith(makeEnv({ ...TIERS, FUNDER_T3B_ADDRESS: '' }).env)
+    expect(r.json.error).toBe('FUNDER_TIER_REFUSED')
+    expect(r.created).toBeNull()
+  })
+
+  it('create, flag on: an upstream order paying another wallet is not handed out', async () => {
+    const r = await createWith(makeEnv(TIERS).env, {}, FUNDER_WALLET)
+    expect(r.status).toBe(503)
+    expect(r.json.error).toBe('FUNDER_TIER_RECEIVER_MISMATCH')
+  })
+
+  it('settle, flag on: order paid to T3B -> expected_funder T3B, funder stored on the record', async () => {
+    const { env, kv } = makeEnv(TIERS)
+    const order = await frozenOrder({ destination: { chainId: '8453', receiverAddress: T3B, tokenSymbol: 'USDC', amount: '206.04', txHash: TX } })
+    const { calls } = stub({ order })
+    await run(await signedEvent(), env)
+    expect(calls.pay).toBe(1)
+    expect(calls.payBodies[0]).toEqual({
+      provider: 'bitrefill',
+      bitrefill_invoice_id: INVOICE,
+      rozo_payment_id: ROZO_ID,
+      expected: { address: RECEIVER, amount_atomic: '204000000' },
+      expected_funder: T3B,
+    })
+    expect(rec(kv).bitrefill?.funder).toBe(T3B)
+  })
+
+  it('settle, flag on: an order paid to the legacy funder is refused before any send', async () => {
+    const { env, kv } = makeEnv(TIERS)
+    const { calls } = stub({ order: await frozenOrder() })
+    await run(await signedEvent(), env)
+    expect(calls.pay).toBe(0)
+    expect(rec(kv).status).toBe('order_binding_failed')
+  })
+
+  // Existing-order and concurrent-conflict return paths.
+  async function resumeWith(env: Env, row: any, mode: 'existing' | 'raced') {
+    let posts = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('/payments/order/')) {
+        // existing: visible from the first lookup; raced: only after the create conflicted.
+        const show = u.includes('/merchant_openrouter/') && (mode === 'existing' || posts > 0)
+        return show ? Response.json(row) : new Response('{"error":{"code":"paymentNotFound"}}', { status: 404 })
+      }
+      if (u.includes('/payment-api') && init?.method === 'POST') {
+        posts++
+        return new Response('{"error":{"code":"orderIdConflict"}}', { status: 409 })
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch)
+    const res = await handleCreateInvoice(
+      new Request('https://mpp.test/v1/services/rozo-agent-api/create-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'bitrefill',
+          bitrefill: { invoiceId: INVOICE, address: RECEIVER, amount: '204', expiresAt: inMinutes(40) },
+          source: { chainId: '8453', tokenSymbol: 'USDC' },
+        }),
+      }),
+      env,
+    )
+    // The path under test was really taken.
+    expect(posts).toBe(mode === 'raced' ? 1 : 0)
+    return { status: res.status, json: (await res.json()) as any }
+  }
+  const P2A ={ ...TIERS, FUNDER_T3B_ADDRESS: undefined, FUNDER_T3_BACKEND: 'legacy' }
+  for (const mode of ['existing', 'raced'] as const) {
+    it(`${mode} order: flag off unchanged (409 DUPLICATE_INVOICE with source)`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const r = await resumeWith(makeEnv().env, await frozenOrder({ status: 'payment_unpaid' }), mode)
+      expect(r.status).toBe(409)
+      expect(r.json.error).toBe('DUPLICATE_INVOICE')
+      expect(r.json.source).toBeDefined()
+    })
+    it(`${mode} order, phase 2a: legacy receiver resumes; T3B receiver refused without instructions`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      let r = await resumeWith(makeEnv(P2A).env, await frozenOrder({ status: 'payment_unpaid' }), mode)
+      expect(r.json.error).toBe('DUPLICATE_INVOICE')
+      const t3bOrder = await frozenOrder({ status: 'payment_unpaid', destination: { chainId: '8453', receiverAddress: T3B, tokenSymbol: 'USDC', amount: '206.04' } })
+      r = await resumeWith(makeEnv(P2A).env, t3bOrder, mode)
+      expect(r.status).toBe(503)
+      expect(r.json.error).toBe('FUNDER_TIER_RECEIVER_MISMATCH')
+      expect(r.json.source).toBeUndefined()
+      expect(r.json.rozoPaymentId).toBeUndefined()
+    })
+    it(`${mode} order, phase 2b: T3B receiver resumes; legacy receiver refused without instructions`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const t3bOrder = await frozenOrder({ status: 'payment_unpaid', destination: { chainId: '8453', receiverAddress: T3B, tokenSymbol: 'USDC', amount: '206.04' } })
+      let r = await resumeWith(makeEnv(TIERS).env, t3bOrder, mode)
+      expect(r.json.error).toBe('DUPLICATE_INVOICE')
+      r = await resumeWith(makeEnv(TIERS).env, await frozenOrder({ status: 'payment_unpaid' }), mode)
+      expect(r.status).toBe(503)
+      expect(r.json.error).toBe('FUNDER_TIER_RECEIVER_MISMATCH')
+      expect(r.json.source).toBeUndefined()
+    })
+  }
+
+  it('a 409 funder_tier_mismatch (signed:false) is a definite refusal', () => {
+    expect(classifyBitrefillPayResult({ status: 409, body: { signed: false, code: 'funder_tier_mismatch' } })).toBe('refused')
+    expect(classifyBitrefillPayResult({ status: 409, body: { provider: 'bitrefill', ok: false, signed: false, code: 'funder_tier_mismatch' } })).toBe('refused')
+  })
+
+  it('flag off: settle body and record are unchanged (no expected_funder, no funder field)', async () => {
+    const { env, kv } = makeEnv()
+    const { calls } = stub({ order: await frozenOrder() })
+    await run(await signedEvent(), env)
+    expect('expected_funder' in calls.payBodies[0]).toBe(false)
+    expect(rec(kv).bitrefill && 'funder' in rec(kv).bitrefill!).toBe(false)
   })
 })

@@ -50,11 +50,11 @@ import {
 import { casUpdate, casRead } from './stripe-atomic'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import {
-  FUNDER_WALLET,
   callAgentApiPayInvoice,
   sendInvoiceFailureAlert,
   type PayInvoiceExpectedBinding,
 } from './webhook'
+import { resolveFunder } from '../funder-address'
 import {
   callStripePayInvoice,
   reserveDailySpend,
@@ -900,7 +900,18 @@ async function executeFulfillment(
   // on-chain balance (the shared reservation counter was removed 2026-09-26).
   // An unreadable balance attempts anyway because the executor re-checks the
   // funder as the final gate.
-  const balanceResult = await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)
+  // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder). A
+  // refusal is definite: nothing was sent, the caller refunds the capture.
+  const funder = resolveFunder(env, provider === 'stripe_crypto' ? 'stripe' : 'coinbase', invoiceAtomic)
+  if (!funder.ok) {
+    await transition(env, orderId, 'failed', {
+      kind: 'funder_tier_refused',
+      failureReason: 'funder_tier_refused',
+      extra: { reason: funder.reason },
+    })
+    return
+  }
+  const balanceResult = await getBaseUsdcBalance(funder.address, env.BASE_RPC_URL)
   const balance = balanceResult.balance
   if (balance !== null) {
     if (balance < invoiceAtomic) {
@@ -914,6 +925,7 @@ async function executeFulfillment(
         plId: `${invoiceKey} (UPI order ${orderId})`,
         invoiceAtomic,
         funderBalanceAtomic: balance,
+        funderAddress: funder.address,
         failureReason: 'UPI captured but funder cannot cover the invoice',
       })
       return
@@ -921,9 +933,9 @@ async function executeFulfillment(
   }
 
   if (provider === 'stripe_crypto') {
-    await executeStripe(env, orderId, inv, payUrl, invoiceAtomic, now)
+    await executeStripe(env, orderId, inv, payUrl, invoiceAtomic, now, funder.expectedFunder)
   } else {
-    await executeCoinbase(env, orderId, invoiceKey, inv)
+    await executeCoinbase(env, orderId, invoiceKey, inv, funder.expectedFunder)
   }
 }
 
@@ -932,10 +944,11 @@ async function executeCoinbase(
   orderId: string,
   invoiceKey: string,
   inv: NormalizedInvoice,
+  expectedFunder?: string,
 ): Promise<void> {
   let result: { ok: boolean; status: number; body: unknown }
   try {
-    result = await callAgentApiPayInvoice(env, invoiceKey, undefined, { line: 'upi_v1', ref: orderId })
+    result = await callAgentApiPayInvoice(env, invoiceKey, undefined, { line: 'upi_v1', ref: orderId }, expectedFunder)
   } catch {
     // Transport failure: the executor MAY have paid. Ambiguous → unknown.
     await transition(env, orderId, 'unknown', {
@@ -983,6 +996,7 @@ async function executeStripe(
   payUrl: string | null,
   invoiceAtomic: bigint,
   now: Date,
+  expectedFunder?: string,
 ): Promise<void> {
   if (!payUrl || !inv.merchantAccount) {
     await transition(env, orderId, 'failed', {
@@ -1004,6 +1018,7 @@ async function executeStripe(
     expectedMerchantAccount: inv.merchantAccount,
     expectedAmountAtomic: inv.stablecoinAmountAtomic,
     spentTodayAtomic: spentBefore.toString(),
+    expectedFunder,
   })
   if (result.ambiguous) {
     // Keep the daily reservation (spend may have happened). Never re-pay.
@@ -1598,13 +1613,17 @@ async function runV2(
 
   // 5. Wallet inventory gate, as v1. Unreadable → attempt (executor re-checks).
   const invoiceAtomic = BigInt(g2.inv.stablecoinAmountAtomic)
-  const balance = (await getBaseUsdcBalance(FUNDER_WALLET, env.BASE_RPC_URL)).balance
+  // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder).
+  const funder = resolveFunder(env, 'coinbase', invoiceAtomic)
+  if (!funder.ok) return refuse('funder_tier_refused', { extra: { reason: funder.reason } })
+  const balance = (await getBaseUsdcBalance(funder.address, env.BASE_RPC_URL)).balance
   if (balance !== null && balance < invoiceAtomic) {
     await sendInvoiceFailureAlert(env, {
       kind: 'failed_insufficient_balance',
       plId: `${body.invoice_key} (UPI order ${orderId})`,
       invoiceAtomic,
       funderBalanceAtomic: balance,
+      funderAddress: funder.address,
       failureReason: 'UPI verified-funding refused: funder cannot cover the invoice',
     })
     return refuse('insufficient_funder_balance', {
@@ -1633,7 +1652,7 @@ async function runV2(
   })
   if (!acquired.applied) return v2Response(acquired.rec)
 
-  const run = executeCoinbaseV2(env, orderId, attemptId, body.invoice_key, expected, invoiceAtomic)
+  const run = executeCoinbaseV2(env, orderId, attemptId, body.invoice_key, expected, invoiceAtomic, funder.expectedFunder)
   if (opts.ctx) {
     opts.ctx.waitUntil(run.catch((e) => console.error('[upi-v2] execution error', e instanceof Error ? e.message : String(e))))
     return v2Response(acquired.rec)
@@ -1772,6 +1791,7 @@ async function executeCoinbaseV2(
   invoiceKey: string,
   expected: PayInvoiceExpectedBinding,
   invoiceAtomic: bigint,
+  expectedFunder?: string,
 ): Promise<void> {
   const mark = (kind: string, fn: (r: UpiFulfillmentRecord) => void, extra?: unknown) =>
     casV2(env, orderId, (r) => {
@@ -1783,7 +1803,7 @@ async function executeCoinbaseV2(
 
   let result: { ok: boolean; status: number; body: unknown }
   try {
-    result = await callAgentApiPayInvoice(env, invoiceKey, expected)
+    result = await callAgentApiPayInvoice(env, invoiceKey, expected, undefined, expectedFunder)
   } catch {
     // The signer MAY have run. Ambiguous → unknown; never re-called.
     await mark('executor_ambiguous', (r) => {

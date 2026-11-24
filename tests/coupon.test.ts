@@ -1391,3 +1391,60 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     expect(await couponState(env, code)).toBe('issued')
   })
 })
+
+describe('POST /coupon/redeem — tiered funders', () => {
+  const T2 = '0x2000000000000000000000000000000000000002'
+  const TIERS = {
+    FUNDER_TIERS_ENABLED: 'true',
+    FUNDER_T1_ADDRESS: '0x1000000000000000000000000000000000000001',
+    FUNDER_T2_ADDRESS: T2,
+    FUNDER_T3A_ADDRESS: '0x3000000000000000000000000000000000000003',
+    FUNDER_T3B_ADDRESS: '0x4000000000000000000000000000000000000004',
+  }
+  function capture(fetchMock: typeof globalThis.fetch) {
+    const seen = { payBodies: [] as any[], balanceOf: [] as string[] }
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('pay-invoice')) seen.payBodies.push(JSON.parse(String(init?.body)))
+      else if (!url.includes('quote-invoice') && !url.includes('dingtalk') && !url.includes('coinbase.com')) {
+        const data: string = JSON.parse(String(init?.body ?? '{}'))?.params?.[0]?.data ?? ''
+        if (data.startsWith('0x70a08231')) seen.balanceOf.push('0x' + data.slice(-40))
+      }
+      return fetchMock(input, init)
+    }) as typeof globalThis.fetch
+    return seen
+  }
+
+  it('flag off: legacy { payment_id } body and legacy balance address', async () => {
+    const { env, fetchMock } = makeEnv()
+    const seen = capture(fetchMock)
+    const code = await issueCoupon(env)
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp.status).toBe(200)
+    expect(seen.payBodies).toEqual([{ payment_id: 'pl_test123' }])
+    expect(seen.balanceOf).toEqual(['0x282be0c42e5c944b0285cec363117ab077cc084a'])
+  })
+
+  it('flag on: $20 Coinbase invoice -> T2 balance and expected_funder T2', async () => {
+    const { env, fetchMock } = makeEnv()
+    Object.assign(env, TIERS)
+    const seen = capture(fetchMock)
+    const code = await issueCoupon(env)
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp.status).toBe(200)
+    expect(seen.payBodies).toEqual([{ payment_id: 'pl_test123', expected_funder: T2 }])
+    expect(seen.balanceOf).toEqual([T2.toLowerCase()])
+  })
+
+  it('flag on: a missing tier refuses, the coupon stays issued, nothing paid', async () => {
+    const { env, fetchMock, calls } = makeEnv()
+    Object.assign(env, { ...TIERS, FUNDER_T2_ADDRESS: undefined })
+    capture(fetchMock)
+    const code = await issueCoupon(env)
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(resp.status).toBe(503)
+    expect(((await resp.json()) as any).error).toBe('FUNDER_TIER_REFUSED')
+    expect(calls.pay).toBe(0)
+    expect(await couponState(env, code)).toBe('issued')
+  })
+})
