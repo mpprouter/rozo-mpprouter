@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import vectors from '../src/funder-tier-vectors.json'
-import { parseUsdcAtomic, routeFunder, selectFunderTier, servedByLegacyFunder } from '../src/funder-tiers'
+import { parseUsdcAtomic, payFromReceivingWallet, routeFunder, selectFunderTier, servedByLegacyFunder } from '../src/funder-tiers'
 import {
   coinbaseOrderKind,
   BASE_FUNDER_ADDRESS,
@@ -15,6 +15,7 @@ import {
   funderTiersEnabled,
   isAnyConfiguredFunderTier,
   resolveFunder,
+  resolvePayingFunder,
 } from '../src/funder-address'
 import { EVM_BLOCKED_ADDRESSES } from '../src/evm-blocked-addresses'
 import { BITREFILL_BLOCKED_RECEIVERS } from '../src/routes/bitrefill-binding'
@@ -269,6 +270,58 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
       { tier: 'T2', address: T2 },
       { tier: 'legacy', address: BASE_FUNDER_ADDRESS },
     ])
+  })
+})
+
+describe('paying from the receiving wallet', () => {
+  it('payFromReceivingWallet matches every pay vector', () => {
+    const pay = (vectors as any).pay as Array<{ kind: string; amount: string; wallet: string; backend: string | null; expect: string; warn?: boolean }>
+    expect(pay.length).toBeGreaterThan(10)
+    for (const v of pay) {
+      const got = payFromReceivingWallet(v.kind, BigInt(v.amount), v.wallet as any, v.backend ?? undefined)
+      const label = JSON.stringify(v)
+      if (v.expect.startsWith('refuse:')) {
+        expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7) })
+      } else {
+        expect(got.ok, label).toBe(true)
+        expect(got.ok && got.wallet, label).toBe(v.expect)
+        expect(got.ok && got.warning !== null, label).toBe(v.warn === true)
+      }
+    }
+  })
+
+  const ISO = { ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }
+  const P2A = { FUNDER_TIERS_ENABLED: 'true', FUNDER_T1_ADDRESS: T1, FUNDER_T2_ADDRESS: T2, FUNDER_T3_BACKEND: 'legacy' }
+
+  it('flag off: always the legacy funder, receiver ignored', () => {
+    expect(resolvePayingFunder({}, 'coinbase', USD(230), T2)).toEqual({
+      ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: undefined, nominal: null, warning: null,
+    })
+  })
+
+  it('T2 destination + $230 -> T2 with a warning; T3A destination + $50 -> T3A', () => {
+    const a = resolvePayingFunder(ISO, 'coinbase', USD(230), T2.toLowerCase())
+    expect(a).toMatchObject({ ok: true, tier: 'T2', address: T2, expectedFunder: T2, nominal: 'T3A' })
+    expect(a.ok && a.warning).toMatch(/amount_outside_nominal_range/)
+    const b = resolvePayingFunder(ISO, 'coinbase', USD(50), T3A)
+    expect(b).toMatchObject({ ok: true, tier: 'T3A', address: T3A, nominal: 'T2' })
+  })
+
+  it('phase 2a: the legacy funder is a paying wallet ($50 -> legacy with a warning); in 2b it is not', () => {
+    expect(resolvePayingFunder(P2A, 'coinbase', USD(50), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, nominal: 'T2' })
+    expect(resolvePayingFunder(ISO, 'coinbase', USD(50), BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
+    // A T3 address left over in 2a is not a paying wallet (T3 is the legacy funder).
+    expect(resolvePayingFunder({ ...P2A, FUNDER_T3A_ADDRESS: T3A }, 'coinbase', USD(300), T3A)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
+  })
+
+  it('hard refusals: non-tier / retired / blocklisted / missing destination, T1 for order money, x402 not T1, over the cap', () => {
+    for (const r of ['0x9999999999999999999999999999999999999999', RETIRED_FUNDER_ADDRESS_20261124, '0x235248a78985cb2166c2d5b43d527ea09fc31739', undefined, '', 'nope']) {
+      expect(resolvePayingFunder(ISO, 'coinbase', USD(50), r).ok, String(r)).toBe(false)
+    }
+    expect(resolvePayingFunder(ISO, 'coinbase', USD(1), T1)).toEqual({ ok: false, reason: 'wrong_wallet_for_kind', tier: null })
+    expect(resolvePayingFunder(ISO, 'x402', USD(1), T2)).toEqual({ ok: false, reason: 'wrong_wallet_for_kind', tier: null })
+    expect(resolvePayingFunder(ISO, 'coinbase', USD(1200) + 1n, T3A)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolvePayingFunder({ ...ISO, FUNDER_T3A_ADDRESS: undefined }, 'coinbase', USD(300), T3A)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
   })
 })
 

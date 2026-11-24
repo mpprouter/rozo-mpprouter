@@ -625,7 +625,8 @@ describe('Coinbase settle: tiered funders', () => {
     const { env, kv } = makeEnv(TIERS)
     await handleRozoWebhook(await signed(ev('20.00')), env)
     expect(seen.payBodies).toEqual([])
-    expect(rec(kv).failureReason).toMatch(/alpha_paused/)
+    // Phase 2b: the legacy funder is not a paying wallet.
+    expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
   })
 
   it('non-alpha phase 2a $20 Coinbase settle never carries payment_kind', async () => {
@@ -635,12 +636,56 @@ describe('Coinbase settle: tiered funders', () => {
     expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T2, rozo_payment_id: ROZO_ID }])
   })
 
-  it('phase 2a: $199.99 still uses T2 and refuses an order paid to the legacy funder', async () => {
+  it('phase 2a: a $199.99 order that paid out to the legacy funder is paid by the legacy funder (warning, not blocked)', async () => {
     const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '199.99', chainId: '8453', receiverAddress: LEGACY } }), '199.99')
     const { env, kv } = makeEnv({ ...TIERS, FUNDER_T3A_ADDRESS: undefined, FUNDER_T3B_ADDRESS: undefined, FUNDER_T3_BACKEND: 'legacy' })
     await handleRozoWebhook(await signed(ev('199.99')), env)
-    expect(seen.payBodies).toEqual([])
-    expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: LEGACY, rozo_payment_id: ROZO_ID }])
+    expect(seen.balanceOf).toEqual([LEGACY.toLowerCase()])
+    expect(rec(kv).status).toBe('paid')
+  })
+
+  it('receiving wallet pays: T2 destination + $230 order -> paid by T2 with a range warning and ops alert', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '230.00', chainId: '8453', receiverAddress: T2 } }), '230.00')
+    const alerts: string[] = []
+    const inner = globalThis.fetch as any
+    vi.stubGlobal('fetch', async (input: any, init?: any) => {
+      const u = String(input instanceof Request ? input.url : input)
+      if (u.includes('oapi.dingtalk.com')) alerts.push(JSON.parse(String(init?.body)).text.content)
+      return inner(input, init)
+    })
+    const { env, kv } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('230.00')), env)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T2, rozo_payment_id: ROZO_ID }])
+    expect(seen.balanceOf).toEqual([T2.toLowerCase()])
+    expect(rec(kv).status).toBe('paid')
+    expect(rec(kv).funderAddress).toBe(T2)
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('"event":"funder_tier_range_warning"'))).toBe(true)
+    expect(alerts.some((a) => a.includes('Funder tier range') && a.includes('T2') && a.includes('230.00') && a.includes('nominal wallet T3A'))).toBe(true)
+  })
+
+  it('receiving wallet pays: T3A destination + $50 order -> paid by T3A', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '50.00', chainId: '8453', receiverAddress: T3A } }), '50.00')
+    const { env, kv } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('50.00')), env)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T3A, rozo_payment_id: ROZO_ID }])
+    expect(rec(kv).status).toBe('paid')
+  })
+
+  it('receiving wallet pays: a destination that is not a tier wallet, T1, or above the cap is refused', async () => {
+    for (const [dest, amount] of [
+      ['0x9999999999999999999999999999999999999999', '50.00'],
+      [T1, '1.00'],
+      [T3A, '1200.01'],
+    ] as const) {
+      const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount, chainId: '8453', receiverAddress: dest } }), amount)
+      const { env, kv } = makeEnv(TIERS)
+      await handleRozoWebhook(await signed(ev(amount)), env)
+      expect(seen.payBodies, dest).toEqual([])
+      expect(rec(kv).status, dest).toBe('order_binding_failed')
+    }
   })
 
   it('flag on: an order paid out to another wallet is refused, nothing paid', async () => {
@@ -658,7 +703,8 @@ describe('Coinbase settle: tiered funders', () => {
     await handleRozoWebhook(await signed(ev('250.00')), env)
     expect(seen.payBodies).toEqual([])
     expect(rec(kv).status).toBe('order_binding_failed')
-    expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_REFUSED: tier_address_missing/)
+    // T3A not configured: its address is not a paying wallet.
+    expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
   })
 
   it('flag on: a 409 funder_tier_mismatch is a definite refusal (failed_pay_invoice, not unknown)', async () => {

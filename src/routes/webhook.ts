@@ -5,10 +5,9 @@ import {
   FUNDER_ALPHA_KIND,
   FUNDER_TIER_REFUSED_CODE,
   coinbaseOrderKind,
-  funderTiersEnabled,
-  resolveFunder,
-  sameEvmAddress,
+  resolvePayingFunder,
 } from '../funder-address'
+import { reportFunderRangeWarning } from '../utils/funder-range-warning'
 import { watchSignedCollector, type PayLine } from './coinbase-collector-watch'
 import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, isTestPaymentId } from './native-sources'
 import { isBitrefillOrderId } from './bitrefill-invoice'
@@ -1221,20 +1220,36 @@ export async function settleCoinbaseEvent(
   rec.invoiceAmountAtomic = invoiceAtomic.toString()
 
   // 7e. Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder, no
-  // extra check). The tier wallet pays this invoice, so the order must have
-  // paid out to exactly that wallet. Any refusal or mismatch: nothing is
-  // paid, terminal, a human checks (same handling as an order mismatch).
-  // An order the TRON / TON alpha route created routes as kind tron_ton_alpha
-  // (its destination is the digest-bound alpha wallet); every other order on
-  // this line is a plain Coinbase invoice.
+  // extra check). The wallet the order actually paid out to pays this
+  // invoice (resolvePayingFunder): an amount outside that wallet's nominal
+  // range only warns. Refused (nothing paid, terminal, a human checks): the
+  // destination is not a configured paying wallet, or a hard rule (order cap,
+  // kind) fails. An order the TRON / TON alpha route created is kind
+  // tron_ton_alpha; every other order on this line is a plain Coinbase invoice.
   const payKind = coinbaseOrderKind(binding.order)
-  const funder = resolveFunder(env, payKind, invoiceAtomic)
+  const funder = resolvePayingFunder(
+    env,
+    payKind,
+    invoiceAtomic,
+    binding.order?.destination?.receiverAddress ?? binding.order?.destination_receiver_address,
+  )
   const tierRefusal = !funder.ok
-    ? `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason}`
-    : funderTiersEnabled(env) &&
-        !sameEvmAddress(binding.order?.destination?.receiverAddress ?? binding.order?.destination_receiver_address, funder.address)
-      ? `${FUNDER_TIER_RECEIVER_MISMATCH_CODE}: order destination is not the ${funder.tier} funder`
-      : null
+    ? funder.reason === 'receiver_not_tier_wallet'
+      ? `${FUNDER_TIER_RECEIVER_MISMATCH_CODE}: order destination is not a configured funder wallet`
+      : `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason}`
+    : null
+  if (funder.ok && funder.warning) {
+    await reportFunderRangeWarning(env, {
+      site: 'coinbase_settle',
+      orderId: rozoPaymentId ?? null,
+      invoiceId: plId,
+      wallet: funder.tier,
+      address: funder.address,
+      amountAtomic: invoiceAtomic,
+      nominal: funder.nominal,
+      warning: funder.warning,
+    })
+  }
   if (tierRefusal || !funder.ok) {
     rec.status = 'order_binding_failed'
     rec.failureReason = `funder tier: ${tierRefusal}`

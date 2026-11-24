@@ -36,9 +36,11 @@ import {
 import {
   ALPHA_ORDER_SOURCE,
   FUNDER_ALPHA_KIND,
+  coinbaseOrderKind,
+  configuredFunderWallets,
   funderTiersEnabled,
-  isTronTonAlphaOrder,
   resolveFunder,
+  resolvePayingFunder,
 } from '../funder-address'
 import { buildCheckoutTitle, type CheckoutPricing } from './checkout-web-pricing'
 import { withForwardedClientHint } from './client-hint-forward'
@@ -154,22 +156,22 @@ export async function ensureAlphaBusinessOrder(
   const tierOn = funderTiersEnabled(env)
   const alphaFunder = resolveFunder(env, FUNDER_ALPHA_KIND, a.pricing.originalAtomic)
   if (!alphaFunder.ok) return { ok: false, reason: 'funder_tier' }
-  // Flag on, an existing order must pay out to the wallet its settlement
-  // will select: an alpha-created order to the alpha wallet, a main-checkout
-  // order to the Coinbase tier for this invoice amount (an order created
-  // before the switch may pay another wallet; no instructions lead into it).
-  const coinbaseFunder = resolveFunder(env, 'coinbase', a.pricing.originalAtomic)
-  const wrongAlphaReceiver = (row: unknown) => {
+  // Flag on, an existing order is settled by the wallet it actually pays out
+  // to (resolvePayingFunder, kind by creator), whatever the amount's nominal
+  // tier; it must be a configured paying wallet, otherwise no instructions
+  // lead into it (its settlement would be refused).
+  const wrongAlphaReceiver = (row: any) => {
     if (!tierOn) return false
-    if (isTronTonAlphaOrder(row)) return paysOtherThanTier(row, alphaFunder.expectedFunder)
-    return !coinbaseFunder.ok || paysOtherThanTier(row, coinbaseFunder.expectedFunder)
+    const receiver = row?.destination?.receiverAddress ?? row?.destination_receiver_address
+    return !resolvePayingFunder(env, coinbaseOrderKind(row), a.pricing.originalAtomic, receiver).ok
   }
-  // Flag on: a separate marker bound to the wallets the check used, so a
-  // marker cached while the flag was off, or before a tier address changed,
-  // cannot skip the check above.
-  const marker = alphaOrderMarkerKey(a.invoiceKey) + (tierOn
-    ? `:tiers:${String(alphaFunder.expectedFunder).toLowerCase()}:${String(coinbaseFunder.ok ? coinbaseFunder.expectedFunder : 'none').toLowerCase()}`
-    : '')
+  // Flag on: a separate marker bound to the paying-wallet configuration the
+  // check used, so a marker cached while the flag was off, or before a tier
+  // address or the T3 backend changed, cannot skip the check above.
+  const walletFingerprint = configuredFunderWallets(env)
+    .map((w) => `${w.tier}=${(w.address ?? 'none').toLowerCase()}`)
+    .join(',') + `;${env.FUNDER_T3_BACKEND ?? ''}`
+  const marker = alphaOrderMarkerKey(a.invoiceKey) + (tierOn ? `:tiers:${walletFingerprint}` : '')
   const cached = await env.MPP_STORE.get(marker).catch(() => null)
   if (cached) return { ok: true, state: 'cached' }
   // The order exists: store its link, and cache that only once the link is in.

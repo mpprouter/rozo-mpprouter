@@ -2,11 +2,11 @@ import type { Env } from '../index'
 import {
   BASE_FUNDER_ADDRESS,
   RETIRED_FUNDER_ADDRESS_20261124,
-  FUNDER_ALPHA_KIND,
+  coinbaseOrderKind,
   funderRefusalMessage,
   funderRefusalStatus,
-  isTronTonAlphaOrder,
   resolveFunder,
+  resolvePayingFunder,
   sameEvmAddress,
   type FunderRefusalReason,
 } from '../funder-address'
@@ -2308,16 +2308,17 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   if (!funder.ok) return funderRefusedResponse(funder.reason, { normalized_input: normalized, link_id_detected })
   const settlementReceiver = funder.address
   const tierReceiver = funder.expectedFunder
-  // A reusable order the TRON / TON alpha route created pays out to the alpha
-  // wallet (routeFunder kind tron_ton_alpha: the legacy funder in phase 2a,
-  // refused in 2b), not to this invoice's Coinbase tier. Flag off: undefined.
-  const alphaFunder = resolveFunder(env, FUNDER_ALPHA_KIND, invoiceAtomic)
-  const expectedReceiverFor = (row: any): string | undefined =>
-    tierReceiver === undefined
-      ? undefined
-      : isTronTonAlphaOrder(row)
-        ? alphaFunder.ok ? alphaFunder.expectedFunder : 'alpha-refused'
-        : tierReceiver
+  // A reusable order is settled by the wallet it actually pays out to
+  // (resolvePayingFunder, kind by creator: tron_ton_alpha or coinbase), so it
+  // is reusable when that destination is a configured paying wallet, whatever
+  // the amount's nominal tier. Otherwise it is never handed out. Flag off:
+  // undefined (no check).
+  const expectedReceiverFor = (row: any): string | undefined => {
+    if (tierReceiver === undefined) return undefined
+    const receiver = row?.destination?.receiverAddress ?? row?.destination_receiver_address
+    const payer = resolvePayingFunder(env, coinbaseOrderKind(row), invoiceAtomic, receiver)
+    return payer.ok ? payer.address : 'not-a-paying-wallet'
+  }
   // Shielded ZEC orders have their own cap (ZEC_SHIELDED_MAX_USD, default
   // $1,200 = intents ZEC_SHIELD_CAPS.max_order_usd), checked right before a
   // FRESH shielded create (shieldedCapBlock below) so that an existing order

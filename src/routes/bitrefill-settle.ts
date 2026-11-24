@@ -58,7 +58,8 @@ import {
   reportDeliveredToRozo,
   saveRecordGuarded,
 } from './webhook'
-import { FUNDER_TIER_REFUSED_CODE, resolveFunder } from '../funder-address'
+import { FUNDER_TIER_REFUSED_CODE, resolvePayingFunder } from '../funder-address'
+import { reportFunderRangeWarning } from '../utils/funder-range-warning'
 
 import { celoSettlementGate } from './celo-finality'
 
@@ -135,6 +136,8 @@ export type BitrefillOrderCheck =
       funderAddress?: string
       // `expected_funder` for pay-invoice; undefined while the flag is off.
       expectedFunder?: string
+      // Flag on: the amount is outside the paying wallet's nominal range (never blocks).
+      rangeWarning?: { tier: string; nominal: string | null; warning: string }
     }
   | { ok: false; terminal: boolean; reason: string }
 
@@ -176,9 +179,14 @@ export async function verifyBitrefillOrder(
   if (!ORDER_PAID_OUT.has(status)) return { ok: false, terminal: false, reason: `order status ${status || 'missing'} is not paid out yet` }
   const dest = order.destination ?? {}
   // The wallet that will pay: the legacy funder while FUNDER_TIERS_ENABLED is
-  // off, else the tier selected for this invoice amount (T3B).
-  const funder = resolveFunder(env, 'bitrefill', facts.amountAtomic)
-  if (!funder.ok) return { ok: false, terminal: true, reason: `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason}` }
+  // off; else the wallet the order actually paid out to (resolvePayingFunder),
+  // an amount outside its nominal range only warns.
+  const funder = resolvePayingFunder(env, 'bitrefill', facts.amountAtomic, dest.receiverAddress)
+  if (!funder.ok) {
+    return funder.reason === 'receiver_not_tier_wallet'
+      ? { ok: false, terminal: true, reason: 'order destination is not the funder' }
+      : { ok: false, terminal: true, reason: `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason}` }
+  }
   if (String(dest.receiverAddress ?? '').toLowerCase() !== funder.address.toLowerCase()) {
     return { ok: false, terminal: true, reason: 'order destination is not the funder' }
   }
@@ -199,7 +207,14 @@ export async function verifyBitrefillOrder(
   if (delivered < facts.callerPaysAtomic) {
     return { ok: false, terminal: true, reason: `payout ${delivered} below invoice + fee ${facts.callerPaysAtomic}` }
   }
-  return { ok: true, facts, order, funderAddress: funder.address, expectedFunder: funder.expectedFunder }
+  return {
+    ok: true,
+    facts,
+    order,
+    funderAddress: funder.address,
+    expectedFunder: funder.expectedFunder,
+    ...(funder.warning ? { rangeWarning: { tier: funder.tier, nominal: funder.nominal, warning: funder.warning } } : {}),
+  }
 }
 
 // ── pay-invoice call ────────────────────────────────────────────────────────
@@ -564,6 +579,18 @@ export async function settleBitrefillFunderEvent(
   }
 
   // From here the gate is never released.
+  if (check.rangeWarning) {
+    await reportFunderRangeWarning(env, {
+      site: 'bitrefill_settle',
+      orderId: rozoPaymentId ?? null,
+      invoiceId: plId,
+      wallet: check.rangeWarning.tier,
+      address: funderAddress,
+      amountAtomic: facts.amountAtomic,
+      nominal: check.rangeWarning.nominal,
+      warning: check.rangeWarning.warning,
+    })
+  }
   const payload = {
     provider: 'bitrefill',
     bitrefill_invoice_id: facts.invoiceId,

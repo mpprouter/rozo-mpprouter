@@ -59,6 +59,28 @@ admin pay have no order and send none.
 `X402_TOPUP_RECEIVER`, when set, still overrides the x402 top-up receiver;
 otherwise it defaults to T1 while the flag is on.
 
+## Paying out: the receiving wallet pays (flag on)
+
+The tier amounts route NEW orders (`routeFunder`, unchanged). When an order's
+money has landed, the wallet it actually paid out to pays the invoice,
+whatever the amount (`resolvePayingFunder` -> mirrored
+`payFromReceivingWallet`). This applies to the Coinbase webhook settle
+(including TRON / TON alpha orders), Stripe settle, Bitrefill settle and its
+existing-order / concurrent-conflict paths, order reuse in create-invoice and
+the alpha option, and the sweep (which uses the wallet stored at send time).
+Balance check, `expected_funder` and the expected signer follow that wallet.
+
+- An amount outside the wallet's nominal range is a warning only: a
+  `funder_tier_range_warning` log line and an ops alert (order, wallet,
+  amount, nominal wallet). It never blocks the payout.
+- Still refused: a destination that is not a configured paying wallet
+  (unknown, retired, blocklisted, unconfigured tier, or the legacy funder
+  outside phase 2a), amount above the $1,200 order cap or not positive, an
+  unknown kind, order money in T1, x402 outside T1 or above $5.
+- Balance caps (T1 50, T2 200, T3B 2,000 USDC) are alert-only in the router
+  (balance watch); nothing refuses a payout for a balance above a cap. The
+  "enough balance to pay" check stays.
+
 ## Fail-closed behaviour (flag on)
 
 `resolveFunder(env, kind, amountAtomic)` refuses, with no fallback to another

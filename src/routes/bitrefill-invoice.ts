@@ -46,6 +46,7 @@ import {
   funderRefusalStatus,
   isAnyConfiguredFunderTier,
   resolveFunder,
+  resolvePayingFunder,
   sameEvmAddress,
 } from '../funder-address'
 
@@ -654,10 +655,14 @@ export async function handleBitrefillFunderCreate(
   // legacy funder in phase 2a) is never resumed: its settlement would be
   // refused, so no deposit instructions (`source`) lead into it. Direct-model
   // orders (wallet_bitrefillpay, paid straight to Bitrefill) are unaffected.
+  // The settle side pays from the wallet the order actually pays out to
+  // (resolvePayingFunder), so an order whose destination is any configured
+  // paying wallet is resumable whatever the amount; only a destination that
+  // is not a paying wallet (or a hard refusal) blocks it.
   const funderOrderPaysOtherWallet = (row: any) =>
     funder.expectedFunder !== undefined &&
     (row?.appId === OPENROUTER_APP_ID || readBitrefillFacts(row) !== null) &&
-    !sameEvmAddress(row?.destination?.receiverAddress ?? row?.destination_receiver_address, funder.expectedFunder)
+    !resolvePayingFunder(env, 'bitrefill', invoiceAtomic, row?.destination?.receiverAddress ?? row?.destination_receiver_address).ok
   const duplicate = (row: any) =>
     !row?.id
       ? fail(503, 'RETRY_LATER', 'A payment for this Bitrefill invoice is being created. Retry in a few seconds to get its id; do not pay yet.')

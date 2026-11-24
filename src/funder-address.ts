@@ -17,10 +17,13 @@ import { EVM_BLOCKED_ADDRESSES } from './evm-blocked-addresses'
 import {
   ALPHA_KIND,
   FUNDER_TIERS,
+  T3_LEGACY_BACKEND,
+  payFromReceivingWallet,
   routeFunder,
   servedByLegacyFunder,
   type FunderTier,
   type FunderTierRefusal,
+  type FunderWallet,
 } from './funder-tiers'
 
 export const BASE_FUNDER_ADDRESS = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
@@ -190,6 +193,78 @@ export function resolveFunder(
   const addr = funderTierAddress(env, route.wallet)
   if (!addr.ok) return { ok: false, reason: addr.reason, tier: route.wallet }
   return { ok: true, tier: route.wallet, address: addr.address, expectedFunder: addr.address }
+}
+
+export type PayingFunderResolution =
+  | (Extract<FunderResolution, { ok: true }> & {
+      /** Where routeFunder would have sent a new order of this kind/amount. */
+      nominal: FunderWallet | null
+      /** Non-null = amount outside the receiving wallet's nominal range (never blocks). */
+      warning: string | null
+    })
+  | { ok: false; reason: FunderRefusalReason | 'wrong_wallet_for_kind' | 'receiver_not_tier_wallet'; tier: FunderTier | null }
+
+/** Error code when an order's payout destination is not a configured paying wallet. */
+export const FUNDER_RECEIVER_NOT_TIER_WALLET_CODE = 'FUNDER_RECEIVER_NOT_TIER_WALLET'
+
+/**
+ * Map an order's actual payout destination to a configured paying wallet
+ * (flag on only): a validated tier address, or the legacy funder while it is
+ * a paying wallet (phase 2a). Anything else (unknown, retired, blocklisted,
+ * missing): null.
+ */
+export function receivingFunderWallet(
+  env: FunderTierEnv | null | undefined,
+  receiver: unknown,
+): { wallet: FunderWallet; address: string } | null {
+  if (typeof receiver !== 'string' || !EVM_RE.test(receiver.trim())) return null
+  const r = receiver.trim().toLowerCase()
+  if (BLOCKED.has(r) || r === ZERO || r === RETIRED_FUNDER_ADDRESS_20261124.toLowerCase()) return null
+  if (r === BASE_FUNDER_ADDRESS.toLowerCase()) {
+    return env?.FUNDER_T3_BACKEND === T3_LEGACY_BACKEND ? { wallet: 'LEGACY', address: BASE_FUNDER_ADDRESS } : null
+  }
+  for (const tier of FUNDER_TIERS) {
+    if (servedByLegacyFunder(tier, env?.FUNDER_T3_BACKEND)) continue
+    const a = funderTierAddress(env, tier)
+    if (a.ok && a.address.toLowerCase() === r) return { wallet: tier, address: a.address }
+  }
+  return null
+}
+
+/**
+ * Which wallet pays out an order whose money already landed (founder
+ * 2026-11-24: tier amounts route NEW orders; they never block paying out money
+ * that arrived). The paying wallet is the order's actual payout destination
+ * (`receiver`), never one recomputed from the amount. An amount outside that
+ * wallet's nominal range returns `warning` (log + alert, never a refusal).
+ *
+ * Refused (fail closed): destination not a configured paying wallet, amount
+ * not positive or above the order cap, unknown kind, x402 rules (T1 only, <=
+ * $5), non-x402 money in T1 (payFromReceivingWallet).
+ *
+ * Flag off: exactly resolveFunder's legacy answer (receiver not consulted).
+ */
+export function resolvePayingFunder(
+  env: FunderTierEnv | null | undefined,
+  kind: string,
+  amountAtomic: bigint,
+  receiver: unknown,
+): PayingFunderResolution {
+  if (!funderTiersEnabled(env)) {
+    return { ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: undefined, nominal: null, warning: null }
+  }
+  const recv = receivingFunderWallet(env, receiver)
+  if (!recv) return { ok: false, reason: 'receiver_not_tier_wallet', tier: null }
+  const d = payFromReceivingWallet(kind, amountAtomic, recv.wallet, env?.FUNDER_T3_BACKEND)
+  if (!d.ok) return { ok: false, reason: d.reason, tier: null }
+  return {
+    ok: true,
+    tier: recv.wallet === 'LEGACY' ? 'legacy' : recv.wallet,
+    address: recv.address,
+    expectedFunder: recv.address,
+    nominal: d.nominal,
+    warning: d.warning,
+  }
 }
 
 /**
