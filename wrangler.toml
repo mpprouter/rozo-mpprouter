@@ -171,7 +171,7 @@ FUNDER_T2_ADDRESS = "0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3"   # Coinbase in
 # fixed $200 boundary. Orders already created are always paid by their
 # recorded destination. Lowering: set the signer project's FUNDER_T2_MAX_USD
 # first, then deploy this. Rollback: set back to "200" and deploy.
-FUNDER_T2_MAX_USD = "2"
+FUNDER_T2_MAX_USD = "200"
 # Phase 2b (infra/tier-signer CUTOVER-2B.md in shawn-local-skills): T3A / T3B
 # are the AWS KMS wallets signed by the rozo-tier-signer Lambda. Deploy this
 # ONLY after the signer project runs FUNDER_T3_BACKEND=isolated (signer first:
@@ -181,7 +181,7 @@ FUNDER_T2_MAX_USD = "2"
 # Rollback: FUNDER_T3_BACKEND = "legacy", re-comment the two addresses, deploy.
 FUNDER_T3A_ADDRESS = "0xE6EB895a29BACF821BD092B4aEBEcEb3480CE4DB"  # Coinbase invoices and TRON / TON alpha from FUNDER_T2_MAX_USD (KMS, alias/rozo-funder-t3a)
 FUNDER_T3B_ADDRESS = "0xa83cf24b0ccfA23d080E2045cc44ac4616aB8132"  # Bitrefill and other (KMS, alias/rozo-funder-t3b); not Stripe
-FUNDER_T3_BACKEND = "isolated"  # phase 2b: KMS T3 signer (signer project must already be on "isolated"). Fallback used 2026-11-24: "legacy" (new T3 orders to the legacy funder; orders already on T3 stay payable).
+FUNDER_T3_BACKEND = "legacy"  # TEMPORARY 2026-11-24: KMS signer refuses Coinbase v3 typed data (DOMAIN, empty salt); T3 payments back on the legacy funder until the signer fix is live. Signer project stays on "isolated". Set back to "isolated" to restore 2b.
 # Hostname suffix for router-hosted paywalls (services/provider-hosting.ts).
 PROVIDER_HOSTED_SUFFIX = "-pay.mpprouter.dev"
 # Default checkout fee. checkout.rozo.ai and the existing agent.rozo.ai use
