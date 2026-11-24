@@ -33,8 +33,9 @@ signer only signs against a paid-out intents order received by its wallet.
 Tier bands have no upper bound (founder 2026-11-24). The order cap is a
 separate refuse-check (`over_order_cap`) applied after the band to every
 non-x402 payment. Its single source here is `ORDER_CAP_USD` in
-`src/routes/native-sources.ts` (currently $1,200; the signer reads its own
-env `ORDER_CAP_USD`, default $1,200 when unset or unparsable). Raising the
+`src/routes/native-sources.ts` (currently $3,500 since 2026-11-24, $1,200
+before; the signer reads its own env `ORDER_CAP_USD`, set to 3500, and falls
+back to $1,200 when it is unset or unparsable). Raising the
 cap needs no change to `funder-tiers.ts` or the vectors; raise the signer env
 together with (or before) the router constant.
 

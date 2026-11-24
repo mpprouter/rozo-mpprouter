@@ -54,7 +54,7 @@ export const RETIRED_FUNDER_ADDRESS_20261124 = '0x2352Fa2970dBadD12d21808DB0F56C
 // the remote signer shares byte for byte):
 //   T1  x402 only (sign-x402)             FUNDER_T1_ADDRESS
 //   T2  Coinbase invoices below $200      FUNDER_T2_ADDRESS
-//   T3A Coinbase invoices $200 to $1,200  FUNDER_T3A_ADDRESS
+//   T3A Coinbase invoices $200 and above  FUNDER_T3A_ADDRESS (up to ORDER_CAP_USD)
 //   T3B Stripe / Bitrefill / other        FUNDER_T3B_ADDRESS
 //
 // Only the exact string "true" in FUNDER_TIERS_ENABLED turns this on. Off

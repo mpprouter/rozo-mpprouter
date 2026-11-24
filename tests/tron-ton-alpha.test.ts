@@ -31,7 +31,7 @@ import { checkCreateInvoiceGate } from '../src/routes/create-invoice-gate'
 import { readCheckoutIntake, resumeCheckoutIntake, stopCheckout, stopCheckoutIntake } from '../src/routes/checkout-control'
 import { pendingPricingMatches } from '../src/routes/create-invoice'
 import { resolveCheckoutPricing } from '../src/routes/checkout-web-pricing'
-import { signTestPaymentId } from '../src/routes/native-sources'
+import { ORDER_CAP_USD, signTestPaymentId } from '../src/routes/native-sources'
 import { alphaOrderMarkerKey, buildAlphaBusinessOrderBody } from '../src/routes/tron-ton-alpha-order'
 import { DatabaseSync } from 'node:sqlite'
 import { readFileSync } from 'node:fs'
@@ -1146,8 +1146,8 @@ describe('tron-ton-alpha with tiered funders', () => {
     expect({ ...r.onCreates[0], destination: { ...r.onCreates[0].destination, receiverAddress: BASE_FUNDER_ADDRESS } }).toEqual(r.offCreates[0])
   })
 
-  it('phase 2a: $199.99 -> T2; $200.00 and $1,200 -> legacy funder (identical to flag off)', async () => {
-    for (const [amount, want] of [['199.99', T2], ['200.00', BASE_FUNDER_ADDRESS], ['1200.00', BASE_FUNDER_ADDRESS]] as const) {
+  it('phase 2a: $199.99 -> T2; $200.00 and the order cap -> legacy funder (identical to flag off)', async () => {
+    for (const [amount, want] of [['199.99', T2], ['200.00', BASE_FUNDER_ADDRESS], [ORDER_CAP_USD.toFixed(2), BASE_FUNDER_ADDRESS]] as const) {
       resetTronTonAlphaCapabilityCache()
       ;(fakeAllocate as any).orders = new Map()
       ;(fakeAllocate as any).seq = 0
@@ -1162,8 +1162,8 @@ describe('tron-ton-alpha with tiered funders', () => {
     }
   })
 
-  it('phase 2a: above the $1,200 cap no alpha option is opened (nothing created)', async () => {
-    quoteAmount = '1200.01'
+  it('phase 2a: above the order cap no alpha option is opened (nothing created)', async () => {
+    quoteAmount = (ORDER_CAP_USD + 0.01).toFixed(2)
     const r = await run(makeEnv(P2A))
     expect(r.status).not.toBe(200)
     expect(r.body.receivingAddress).toBeUndefined()

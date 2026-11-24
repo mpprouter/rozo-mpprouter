@@ -53,11 +53,20 @@ const TEST_CAP = BigInt((vectors as any).testCap)
 const capOf = (v: { cap?: string }) => (v.cap === undefined ? TEST_CAP : BigInt(v.cap))
 /**
  * Rows checked through resolveFunder, whose cap is the live ORDER_CAP_USD
- * (FUNDER_ORDER_CAP_ATOMIC): only rows whose cap equals it. Raising the live
- * cap later just skips the testCap rows here; the pure selector tests above
- * keep covering every row with its own cap.
+ * (FUNDER_ORDER_CAP_ATOMIC): rows whose cap equals it, plus rows whose
+ * decision does not depend on which of the two caps applies (x402 ignores the
+ * order cap; otherwise the amount is within both caps or above both). The
+ * pure selector tests above keep covering every row with its own cap.
  */
-const LIVE_CAP_VECS = VECS.filter((v) => capOf(v) === FUNDER_ORDER_CAP_ATOMIC)
+const LIVE = FUNDER_ORDER_CAP_ATOMIC
+const capIndependent = (v: Vec) => {
+  const a = BigInt(v.amount)
+  const c = capOf(v)
+  return v.kind === 'x402' || (a <= c && a <= LIVE) || (a > c && a > LIVE)
+}
+const LIVE_CAP_VECS = VECS.filter((v) => capOf(v) === LIVE || capIndependent(v))
+/** The live order cap in USD, for boundary checks through the resolvers. */
+const CAP = ORDER_CAP_USD
 
 describe('mirrored selector vs shared vectors', () => {
   it('selectFunderTier (band only) and routeFunder (band + the row cap) match every vector', () => {
@@ -101,7 +110,7 @@ describe('mirrored selector vs shared vectors', () => {
 
 describe('resolveFunder, flag off (parity)', () => {
   const kinds = ['x402', 'coinbase', 'stripe', 'bitrefill', 'other', 'upi', '']
-  const amounts = [0n, -1n, 1n, USD(5), USD(5) + 1n, USD(199.999999), USD(200), USD(1200), USD(1200) + 1n, USD(5000)]
+  const amounts = [0n, -1n, 1n, USD(5), USD(5) + 1n, USD(199.999999), USD(200), USD(1200), USD(CAP) + 1n, USD(5000)]
   const offEnvs: Array<Record<string, string | undefined> | undefined | null> = [
     undefined,
     null,
@@ -147,12 +156,12 @@ describe('resolveFunder, flag on', () => {
     }
   })
 
-  it('boundaries: $199.999999 -> T2, $200 -> T3A, $1,200 -> T3A, $1,200.000001 refused', () => {
+  it('boundaries: $199.999999 -> T2, $200 -> T3A, the cap -> T3A, a micro-dollar above the cap refused', () => {
     expect(resolveFunder(TIER_ENV, 'coinbase', USD(199.999999))).toMatchObject({ ok: true, tier: 'T2', address: T2 })
     expect(resolveFunder(TIER_ENV, 'coinbase', USD(200))).toMatchObject({ ok: true, tier: 'T3A', address: T3A })
-    expect(resolveFunder(TIER_ENV, 'coinbase', USD(1200))).toMatchObject({ ok: true, tier: 'T3A' })
-    expect(resolveFunder(TIER_ENV, 'coinbase', USD(1200) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
-    expect(resolveFunder(TIER_ENV, 'stripe', USD(1200) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolveFunder(TIER_ENV, 'coinbase', USD(CAP))).toMatchObject({ ok: true, tier: 'T3A' })
+    expect(resolveFunder(TIER_ENV, 'coinbase', USD(CAP) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolveFunder(TIER_ENV, 'stripe', USD(CAP) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
     expect(resolveFunder(TIER_ENV, 'x402', USD(5) + 1n)).toEqual({ ok: false, reason: 'over_tier_cap', tier: null })
   })
 
@@ -276,21 +285,21 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
     }
   })
 
-  it('alpha (new order) in 2a: below $200 -> T2, $200 to $1,200 -> legacy, above refused; 2b: like Coinbase (T3A from $200)', () => {
+  it('alpha (new order) in 2a: below $200 -> T2, $200 to the cap -> legacy, above refused; 2b: like Coinbase (T3A from $200)', () => {
     expect(resolveFunder(P2A, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
     expect(resolveFunder(P2A, 'tron_ton_alpha', USD(199.99))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
     expect(resolveFunder(P2A, 'tron_ton_alpha', USD(200))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
     expect(resolveFunder(P2A, 'tron_ton_alpha', USD(900))).toMatchObject({ ok: true, address: BASE_FUNDER_ADDRESS })
-    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(1200))).toMatchObject({ ok: true, address: BASE_FUNDER_ADDRESS })
-    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(1200) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(CAP))).toMatchObject({ ok: true, address: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(CAP) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
     // T2 not configured: an alpha order below $200 is refused (no fallback to legacy).
     expect(resolveFunder({ ...P2A, FUNDER_T2_ADDRESS: undefined }, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'tier_address_missing', tier: 'T2' })
     expect(resolveFunder(P2A, 'coinbase', USD(20))).toMatchObject({ ok: true, address: T2 })
     const ISO2B = { ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }
     expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
     expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(200))).toEqual({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A })
-    expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(1200))).toMatchObject({ ok: true, address: T3A })
-    expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(1200) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(CAP))).toMatchObject({ ok: true, address: T3A })
+    expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(CAP) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
     expect(resolveFunder({ ...ISO2B, FUNDER_T3A_ADDRESS: undefined }, 'tron_ton_alpha', USD(300))).toEqual({ ok: false, reason: 'tier_address_missing', tier: 'T3A' })
     expect(resolveFunder(TIER_ENV, 'tron_ton_alpha', USD(20))).toMatchObject({ ok: true, address: T2 })
     // Flag off: legacy as always.
@@ -311,10 +320,10 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
     expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(199.99), T2)).toEqual({
       ok: true, tier: 'T2', address: T2, expectedFunder: T2, nominal: 'T2', warning: null,
     })
-    // $200 and $1,200 on legacy: no warning. Above the cap: refused.
+    // $200 and the cap on legacy: no warning. Above the cap: refused.
     expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(200), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', warning: null })
-    expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(1200), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', warning: null })
-    expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(1200) + 1n, BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(CAP), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', warning: null })
+    expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(CAP) + 1n, BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
   })
 
   it('isTronTonAlphaOrder / coinbaseOrderKind read the creator marker', () => {
@@ -391,17 +400,17 @@ describe('paying from the receiving wallet', () => {
   it('the legacy funder is a paying wallet in 2a and, for orders created before the switch, in 2b (drain)', () => {
     expect(resolvePayingFunder(P2A, 'coinbase', USD(50), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, nominal: 'T2' })
     for (const kind of ['coinbase', 'stripe', 'bitrefill', 'tron_ton_alpha']) {
-      for (const amt of [USD(50), USD(250), USD(1200)]) {
+      for (const amt of [USD(50), USD(250), USD(CAP)]) {
         const r = resolvePayingFunder(ISO, kind, amt, BASE_FUNDER_ADDRESS)
         expect(r, `${kind} ${amt}`).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
         // 2b routes a NEW order to legacy only for Stripe (Permit): a warning for every other kind.
         expect(r.ok && (kind === 'stripe' ? r.warning === null : typeof r.warning === 'string'), `${kind} ${amt}`).toBe(true)
       }
     }
-    expect(resolvePayingFunder(ISO, 'coinbase', USD(1200) + 1n, BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolvePayingFunder(ISO, 'coinbase', USD(CAP) + 1n, BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
     // 2b never routes a NEW Coinbase / Bitrefill / alpha order to the legacy funder (Stripe: below).
     for (const kind of ['coinbase', 'bitrefill', 'tron_ton_alpha']) {
-      for (const amt of [USD(50), USD(250), USD(1200)]) {
+      for (const amt of [USD(50), USD(250), USD(CAP)]) {
         const n = resolveFunder(ISO, kind, amt)
         expect(n.ok && n.address !== BASE_FUNDER_ADDRESS, `${kind} ${amt}`).toBe(true)
       }
@@ -418,7 +427,7 @@ describe('paying from the receiving wallet', () => {
     }
     expect(resolvePayingFunder(ISO, 'coinbase', USD(1), T1)).toEqual({ ok: false, reason: 'wrong_wallet_for_kind', tier: null })
     expect(resolvePayingFunder(ISO, 'x402', USD(1), T2)).toEqual({ ok: false, reason: 'wrong_wallet_for_kind', tier: null })
-    expect(resolvePayingFunder(ISO, 'coinbase', USD(1200) + 1n, T3A)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolvePayingFunder(ISO, 'coinbase', USD(CAP) + 1n, T3A)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
     expect(resolvePayingFunder({ ...ISO, FUNDER_T3A_ADDRESS: undefined }, 'coinbase', USD(300), T3A)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
   })
 })
@@ -437,7 +446,7 @@ describe('payments with no intents order (coupon, UPI, admin pay)', () => {
     expect(resolveNoOrderFunder(ISO, 'coinbase', USD(250))).toEqual(LEG)
     expect(resolveNoOrderFunder(ISO, 'stripe', USD(20))).toEqual(LEG)
     expect(resolveNoOrderFunder(ISO, 'coinbase', USD(20))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
-    expect(resolveNoOrderFunder(ISO, 'coinbase', USD(1200) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolveNoOrderFunder(ISO, 'coinbase', USD(CAP) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
     // The T3 addresses are not needed for no-order payments.
     expect(resolveNoOrderFunder({ ...ISO, FUNDER_T3A_ADDRESS: undefined }, 'coinbase', USD(250))).toEqual(LEG)
     const P2A = { ...TIER_ENV, FUNDER_T3_BACKEND: 'legacy' }

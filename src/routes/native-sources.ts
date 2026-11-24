@@ -104,10 +104,11 @@ export interface NativeSourceDef {
  * checkout (rozo-rescue-landing site/assets/js/caps.js) and rozo-checkout-mcp
  * src/coins.ts. Native: amount <= cap. ZEC: strictly below (ZEC_MAX_USD).
  * The NATIVE_MAX_USD env var still overrides the native default.
- * History: 1200 from 2026-11-24 (founder "maybe update to 1200 first"),
- * native 12750 / ZEC 11699.99 from 2026-11-18.
+ * History: 3500 from 2026-11-24 after both funder tier phases went live
+ * (founder "3500"), 1200 earlier on 2026-11-24 (founder "maybe update to
+ * 1200 first"), native 12750 / ZEC 11699.99 from 2026-11-18.
  */
-export const ORDER_CAP_USD = 1200
+export const ORDER_CAP_USD = 3500
 /** ZEC: intents refuses at >= NATIVE_MAX_ORDER_USD_ZEC, so the router stops a cent below. */
 export const ZEC_MAX_USD = ORDER_CAP_USD - 0.01
 

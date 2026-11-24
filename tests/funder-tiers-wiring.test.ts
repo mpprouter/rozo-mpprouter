@@ -13,6 +13,7 @@ import { handleCreateInvoice } from '../src/routes/create-invoice'
 import { handleTronTonAlphaCapability, handleTronTonAlphaOption } from '../src/routes/tron-ton-alpha'
 import { checkFunderBalance, FUNDER_TIER_WATCH_PROFILES, watchStateKey } from '../src/utils/funder-balance-watch'
 import { BASE_FUNDER_ADDRESS } from '../src/funder-address'
+import { ORDER_CAP_USD } from '../src/routes/native-sources'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
@@ -144,7 +145,7 @@ describe('Coinbase create-invoice', () => {
   })
 
   it('flag on: above the order cap or with a missing tier, nothing is created', async () => {
-    quoteAmount = '1200.000001'
+    quoteAmount = `${ORDER_CAP_USD}.000001`
     let r = await create({ payment_id: PAYMENT_ID }, makeEnv(TIERS))
     expect(r.status).toBe(400)
     expect(r.json.code).toBe('FUNDER_TIER_REFUSED')
