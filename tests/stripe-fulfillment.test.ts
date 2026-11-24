@@ -541,22 +541,26 @@ describe('handleStripeWebhookEvent: tiered funders', () => {
       rozoPaymentId: 'rp-tier',
     })
   }
-  const evt = (eventId: string) => ({
-    eventId, eventType: 'payment_payout_completed',
+  const evt = (eventId: string, eventType = 'payment_payout_completed') => ({
+    eventId, eventType,
     orderId: 'stripe_crypto_cpis_tier', rozoPaymentId: 'rp-tier', invoiceAmountStr: '10.00', sourceChainId: '8453',
   })
-  function upstream(receiver: string | null) {
+  function upstream(
+    receiver: string | null,
+    orderStatus = 'payment_payout_completed',
+    pay: { status: number; body: unknown } = { status: 200, body: { success: true } },
+  ) {
     const seen = { payBodies: [] as any[], balanceOf: [] as string[] }
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
       const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
       if (u.includes('pay-invoice')) {
         seen.payBodies.push(JSON.parse(String(init?.body)))
-        return new Response(JSON.stringify({ success: true }), { status: 200 })
+        return new Response(JSON.stringify(pay.body), { status: pay.status })
       }
       if (/\/payments\/rp-tier$/.test(u)) {
         return receiver === null
           ? new Response('nf', { status: 404 })
-          : Response.json({ id: 'rp-tier', source: { chainId: '8453' }, destination: { chainId: '8453', receiverAddress: receiver } })
+          : Response.json({ id: 'rp-tier', status: orderStatus, source: { chainId: '8453' }, destination: { chainId: '8453', receiverAddress: receiver } })
       }
       const data: string = JSON.parse(String(init?.body ?? '{}'))?.params?.[0]?.data ?? ''
       if (data.startsWith('0x70a08231')) seen.balanceOf.push('0x' + data.slice(-40))
@@ -636,5 +640,63 @@ describe('handleStripeWebhookEvent: tiered funders', () => {
       stripeUrl: 'https://crypto.stripe.com/pay/X', expectedMerchantAccount: 'acct', expectedAmountAtomic: '1', spentTodayAtomic: '0', expectedFunder: T3B,
     })
     expect(r).toMatchObject({ ok: false, status: 409, ambiguous: false, disabled: false })
+  })
+
+  // ── Pay only after the order paid out (2026-11-24 stranded orders) ─────────
+
+  it('flag on, payin_completed while the order is not paid out: no pay, pre-pay status, re-drive queued; payout_completed then pays once', async () => {
+    const env = makeEnv({ extra: TIERS })
+    await seed(env)
+    const day = new Date(Date.UTC(2026, 6, 12))
+    let seen = upstream(T3B, 'payment_payin_completed')
+    const s1 = await handleStripeWebhookEvent(env, evt('t-payin', 'payment_payin_completed'), day)
+    expect(s1.deferred).toBe('awaiting_payout')
+    expect(seen.payBodies).toHaveLength(0)
+    expect((await loadRec(env, 'cpis_tier')).status).toBe('payin_seen')
+    expect(await readDailySpentAtomic(env, day)).toBe(0n)
+    const queued = await casRead(env, 'celo-retry:v1:stripe_crypto_cpis_tier')
+    expect(JSON.parse(queued.value!).provider).toBe('stripe')
+    vi.restoreAllMocks()
+    seen = upstream(T3B, 'payment_payout_completed')
+    const s2 = await handleStripeWebhookEvent(env, evt('t-payout'), day)
+    expect(s2.status).toBe('provider_submitted')
+    expect(seen.payBodies).toHaveLength(1)
+    expect(seen.payBodies[0].rozo_payment_id).toBe('rp-tier')
+  })
+
+  it('flag off, payin_completed: pays on the payin event exactly as before (order not read)', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const seen = upstream(LEGACY, 'payment_payin_completed')
+    const s = await handleStripeWebhookEvent(env, evt('t-off-payin', 'payment_payin_completed'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.status).toBe('provider_submitted')
+    expect(seen.payBodies).toHaveLength(1)
+    expect('expected_funder' in seen.payBodies[0]).toBe(false)
+  })
+
+  it('flag on: a signer 409 ORDER_NOT_PAID_OUT (signed:false) is not ready: claim stepped back, spend released, no alert', async () => {
+    const env = makeEnv({ extra: { ...TIERS, DINGTALK_ACCESS_TOKEN: 'dt' } as Partial<Env> })
+    await seed(env)
+    const day = new Date(Date.UTC(2026, 6, 12))
+    const seen = upstream(T3B, 'payment_payout_completed', {
+      status: 409,
+      body: { error: 'order payout has no Base tx hash', code: 'ORDER_NOT_PAID_OUT', signed: false },
+    })
+    const s = await handleStripeWebhookEvent(env, evt('t-npo'), day)
+    expect(s.deferred).toBe('awaiting_payout')
+    expect(seen.payBodies).toHaveLength(1)
+    const r = await loadRec(env, 'cpis_tier')
+    expect(r.status).toBe('payout_seen')
+    expect(await readDailySpentAtomic(env, day)).toBe(0n)
+    const calls = (globalThis.fetch as any).mock.calls.map((c: any[]) => String(typeof c[0] === 'string' ? c[0] : c[0].url ?? c[0]))
+    expect(calls.some((u: string) => u.includes('dingtalk'))).toBe(false)
+  })
+
+  it('flag on: a signer 409 funder_tier_mismatch is still a terminal failed_provider', async () => {
+    const env = makeEnv({ extra: TIERS })
+    await seed(env)
+    upstream(T3B, 'payment_payout_completed', { status: 409, body: { code: 'funder_tier_mismatch', signed: false } })
+    const s = await handleStripeWebhookEvent(env, evt('t-mm409'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.status).toBe('failed_provider')
   })
 })

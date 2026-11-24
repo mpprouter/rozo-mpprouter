@@ -23,6 +23,8 @@ import {
   FUNDER_TIER_RECEIVER_MISMATCH_CODE,
   FUNDER_TIER_REFUSED_CODE,
   funderTiersEnabled,
+  isSignerNotPaidOutYet,
+  orderPaidOutForSigner,
   resolvePayingFunder,
 } from '../funder-address'
 import { reportFunderRangeWarning } from '../utils/funder-range-warning'
@@ -893,6 +895,34 @@ export async function handleStripeWebhookEvent(
     return { ok: true, deferred: 'checkout_paused', provider: 'stripe_crypto' }
   }
 
+  // Tiers on, the order has not paid out yet: step the claim back to its
+  // pre-pay status (nothing signed) and queue the automatic re-drive
+  // (celo-retry.ts, this same path) as the backstop for a payout webhook that
+  // never arrives. The payout webhook normally pays it. No alert.
+  async function deferStripeAwaitingPayout(why: string): Promise<Record<string, unknown>> {
+    const reason = `awaiting payout (${why})`.slice(0, 200)
+    await releaseClaim(
+      env,
+      invoiceKey,
+      orderId,
+      nowIso,
+      input.eventType === 'payment_payout_completed' ? 'payout_seen' : 'payin_seen',
+      null,
+      { kind: 'awaiting_payout', detail: { reason } },
+    )
+    // Nothing was decided for this event: a resend or replay is processed again.
+    await forgetWebhookEvent(env, input.eventId)
+    const queued = await enqueueCeloRetry(env, {
+      provider: 'stripe',
+      ref: orderId,
+      rozoPaymentId: input.rozoPaymentId,
+      eventType: input.eventType,
+      reason,
+    })
+    if (!queued) return { ok: false, provider: 'stripe_crypto', deferred: 'awaiting_payout', reason, retryQueueFailed: true }
+    return { ok: true, provider: 'stripe_crypto', deferred: 'awaiting_payout', reason, retryable: true, celoQueued: true }
+  }
+
   async function settleClaimedStripeInvoice(): Promise<Record<string, unknown>> {
   // Checkout emergency stop (checkout-control.ts): nothing signed yet, so step
   // the claim back to payout_seen and index it for `resume` to re-drive.
@@ -903,6 +933,7 @@ export async function handleStripeWebhookEvent(
   // amount outside its nominal range only warns. Nothing is claimed,
   // reserved or signed on any refusal.
   let receiver: unknown = undefined
+  let tierOrder: any = null
   if (funderTiersEnabled(env)) {
     const order = input.rozoPaymentId ? await fetchRozoPaymentForSettle(env, input.rozoPaymentId) : null
     receiver = order?.destination?.receiverAddress ?? order?.destination_receiver_address ?? null
@@ -914,6 +945,7 @@ export async function handleStripeWebhookEvent(
       })
       return { ok: true, provider: 'stripe_crypto', deferred: 'funder_tier_order_unreadable', retryable: true }
     }
+    tierOrder = order
   }
   const funder = resolvePayingFunder(env, 'stripe', invoiceAtomic, receiver)
   if (!funder.ok) {
@@ -924,6 +956,13 @@ export async function handleStripeWebhookEvent(
       event: { kind: 'funder_tier_refused', detail: { reason: funder.reason } },
     })
     return { ok: true, provider: 'stripe_crypto', status: 'manual_review', reason: code }
+  }
+  // Tiers on: the signer refuses an order that has not paid out yet (409
+  // ORDER_NOT_PAID_OUT), and the payin_completed event arrives seconds before
+  // the payout. Nothing reserved, claimed across channels or signed: step back
+  // and wait for the payout webhook. Flag off: tierOrder is null, skipped.
+  if (tierOrder && !orderPaidOutForSigner(tierOrder)) {
+    return deferStripeAwaitingPayout(`order status ${String(tierOrder.status ?? 'unknown')}`.slice(0, 120))
   }
   if (funder.warning) {
     // Not awaited: the alert runs in the background and never blocks the pay.
@@ -1118,6 +1157,13 @@ export async function handleStripeWebhookEvent(
   // move → release the daily reservation. This IS retryable (a later corrected
   // event can retry), so return to payout_seen rather than a stuck state.
   await releaseDailySpend(env, now, invoiceAtomic)
+  // Tiers on: the signer read the order before signing and found it not paid
+  // out yet (409, signed:false). Not a failure: step the claim back and wait
+  // for the payout, no alert. The next attempt claims and is checked again.
+  if (funder.expectedFunder && isSignerNotPaidOutYet(payResult.status, payResult.body)) {
+    const code = String((payResult.body as Record<string, unknown>).code)
+    return deferStripeAwaitingPayout(`signer ${code}`)
+  }
   const refusalCode = (() => {
     const b = payResult.body as Record<string, unknown> | null
     return b && typeof b === 'object' && typeof b.code === 'string' ? b.code.slice(0, 64) : null

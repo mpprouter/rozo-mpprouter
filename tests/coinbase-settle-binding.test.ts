@@ -16,6 +16,8 @@ import {
 } from '../src/routes/webhook'
 import { readDailySpentAtomic, reserveDailySpend } from '../src/routes/stripe-fulfillment'
 import { readCoinbaseExecGate } from '../src/routes/coinbase-exec-gate'
+import { casRead } from '../src/routes/stripe-atomic'
+import { sweepCeloRetries } from '../src/routes/celo-retry-run'
 import { timingSafeEqualStr } from '../src/utils/timing-safe'
 import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
@@ -735,5 +737,177 @@ describe('Coinbase settle: tiered funders', () => {
     await handleRozoWebhook(await signed(ev('250.00')), env)
     expect(rec(kv).status).toBe('failed_pay_invoice')
     expect(rec(kv).failureReason).toMatch(/funder_tier_mismatch/)
+  })
+
+  // ── Pay only after the order paid out (2026-11-24 stranded orders) ─────────
+  // The signer refuses an order-backed pay request until the order is paid
+  // out; payin_completed arrives seconds before the payout.
+
+  const NOT_PAID_OUT = { error: 'order status payment_payin_completed is not paid out', code: 'ORDER_NOT_PAID_OUT', signed: false }
+
+  // Mutable upstream: the order status and the signer answers can change
+  // between events, like the real payout landing a few seconds later.
+  function raceStub(receiver: string, invoiceAmount: string) {
+    const state = {
+      orderStatus: 'payment_payin_completed',
+      payAnswers: [] as Array<{ status: number; body: unknown }>,
+      payBodies: [] as any[],
+      dingtalk: [] as string[],
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input)
+        if (url.includes('oapi.dingtalk.com')) {
+          state.dingtalk.push(JSON.parse(String(init?.body)).text.content)
+          return Response.json({ errcode: 0 })
+        }
+        if (url.includes('agentapi.rozo.ai/pay-invoice')) {
+          state.payBodies.push(JSON.parse(String(init?.body)))
+          const a = state.payAnswers.shift() ?? { status: 200, body: CAPTURED }
+          return new Response(JSON.stringify(a.body), { status: a.status })
+        }
+        if (url.includes('payments.coinbase.com/next-api/')) return Response.json(boundCoinbaseLink(PL, invoiceAmount))
+        if (url.includes('intentapiv4.rozo.ai') && url.endsWith('/delivered')) return new Response('{}', { status: 200 })
+        if (url.includes('intentapiv4.rozo.ai')) {
+          return Response.json(
+            boundRozoOrder(ROZO_ID, PL, {
+              status: state.orderStatus,
+              destination: { amount: invoiceAmount, chainId: '8453', receiverAddress: receiver },
+            }),
+          )
+        }
+        return Response.json({ jsonrpc: '2.0', id: 1, result: '0x' + (10_000_000_000n).toString(16) })
+      }),
+    )
+    return state
+  }
+  const payinEv = (amount: string) =>
+    event('payment_payin_completed', { status: 'payment_payin_completed', destination: { amount, chainId: '8453', txHash: null } })
+
+  it('flag on + payin_completed (order not paid out): no pay attempt, record stays payin_seen, gate free, re-drive queued, no alert', async () => {
+    const st = raceStub(T2, '105.00')
+    const { env, kv } = makeEnv(TIERS)
+    const res = await handleRozoWebhook(await signed(payinEv('105.00')), env)
+    expect(res.status).toBe(200)
+    expect((await res.json() as any).deferred).toBe('awaiting_payout')
+    expect(st.payBodies).toEqual([])
+    expect(rec(kv).status).toBe('payin_seen')
+    expect(rec(kv).events.some((e) => e.kind === 'awaiting_payout')).toBe(true)
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+    expect(await readDailySpentAtomic(env, new Date(), 'coinbase')).toBe(0n)
+    const queued = await casRead(env, `celo-retry:v1:${PL}`)
+    expect(JSON.parse(queued.value!).rozoPaymentId).toBe(ROZO_ID)
+    expect(st.dingtalk).toEqual([])
+  })
+
+  it('flag on: payin_completed waits, then payout_completed pays exactly once', async () => {
+    const st = raceStub(T2, '105.00')
+    const { env, kv } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(payinEv('105.00')), env)
+    expect(st.payBodies).toEqual([])
+    st.orderStatus = 'payment_payout_completed'
+    await handleRozoWebhook(await signed(ev('105.00')), env)
+    expect(st.payBodies).toEqual([{ payment_id: PL, expected_funder: T2, rozo_payment_id: ROZO_ID }])
+    expect(rec(kv).status).toBe('paid')
+    // A third (replayed / re-driven) event never pays again.
+    await handleRozoWebhook(await signed(ev('105.00')), env)
+    expect(st.payBodies).toHaveLength(1)
+  })
+
+  it('flag on: if the payout webhook never arrives, the queued re-drive pays once after the payout lands', async () => {
+    const st = raceStub(T2, '105.00')
+    const { env, kv } = makeEnv({ ...TIERS, CELO_FULFILLMENT_PAUSED: 'off' })
+    await handleRozoWebhook(await signed(payinEv('105.00')), env)
+    expect(st.payBodies).toEqual([])
+    // Still not paid out at the first re-drive: kept, nothing sent.
+    const later = (min: number) => new Date(Date.now() + min * 60_000)
+    expect((await sweepCeloRetries(env, later(3)))[0].outcome).toBe('still_deferred')
+    expect(st.payBodies).toEqual([])
+    st.orderStatus = 'payment_payout_completed'
+    const run = await sweepCeloRetries(env, later(10))
+    expect(run[0].outcome).toBe('handed_back')
+    expect(st.payBodies).toHaveLength(1)
+    expect(rec(kv).status).toBe('paid')
+    expect(await sweepCeloRetries(env, later(30))).toEqual([])
+    expect(st.payBodies).toHaveLength(1)
+  })
+
+  it('flag on: a late payin_completed for an order that already paid out pays (decided by the order, not the event)', async () => {
+    const st = raceStub(T2, '105.00')
+    st.orderStatus = 'payment_payout_completed'
+    const { env, kv } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(payinEv('105.00')), env)
+    expect(st.payBodies).toHaveLength(1)
+    expect(rec(kv).status).toBe('paid')
+  })
+
+  it('flag off + payin_completed: pays on the payin event with the legacy body (unchanged)', async () => {
+    const st = raceStub(LEGACY, '105.00')
+    const { env, kv } = makeEnv()
+    await handleRozoWebhook(await signed(payinEv('105.00')), env)
+    expect(st.payBodies).toEqual([{ payment_id: PL }])
+    expect(rec(kv).status).toBe('paid')
+  })
+
+  it('flag on: signer 409 ORDER_NOT_PAID_OUT is not ready: retryable, gate and reservation released, no alert; payout_completed then pays once', async () => {
+    const st = raceStub(T2, '105.00')
+    // The router's order read already shows the payout, the signer's does not yet.
+    st.orderStatus = 'payment_payout_completed'
+    st.payAnswers.push({ status: 409, body: NOT_PAID_OUT })
+    const { env, kv } = makeEnv({ ...TIERS, COINBASE_SETTLE_DAILY_CAP_USD: '5000' })
+    const first = await handleRozoWebhook(await signed(ev('105.00')), env)
+    expect((await first.json() as any).deferred).toBe('awaiting_payout')
+    expect(st.payBodies).toHaveLength(1)
+    expect(rec(kv).status).toBe('payin_seen')
+    expect(rec(kv).payingAt).toBeNull()
+    expect(rec(kv).events.some((e) => e.kind === 'pay_invoice_not_paid_out_yet')).toBe(true)
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+    expect(await readDailySpentAtomic(env, new Date(), 'coinbase')).toBe(0n)
+    expect(st.dingtalk).toEqual([])
+    expect(JSON.parse((await casRead(env, `celo-retry:v1:${PL}`)).value!).ref).toBe(PL)
+
+    await handleRozoWebhook(await signed(ev('105.00')), env)
+    expect(st.payBodies).toHaveLength(2)
+    expect(rec(kv).status).toBe('paid')
+    expect(await readDailySpentAtomic(env, new Date(), 'coinbase')).toBe(105_000_000n)
+    await handleRozoWebhook(await signed(ev('105.00')), env)
+    expect(st.payBodies).toHaveLength(2)
+  })
+
+  it('flag on: ALPHA_ORDER_NOT_PAID_OUT is not ready too', async () => {
+    const st = raceStub(LEGACY, '20.00')
+    st.orderStatus = 'payment_payout_completed'
+    st.payAnswers.push({ status: 409, body: { code: 'ALPHA_ORDER_NOT_PAID_OUT', signed: false } })
+    const { env, kv } = makeEnv({ ...TIERS, FUNDER_T3A_ADDRESS: undefined, FUNDER_T3B_ADDRESS: undefined, FUNDER_T3_BACKEND: 'legacy' })
+    await handleRozoWebhook(await signed(ev('20.00')), env)
+    expect(rec(kv).status).toBe('payin_seen')
+    expect(await readCoinbaseExecGate(env, PL)).toBeNull()
+  })
+
+  it('a not-paid-out code without signed:false, or a different 409 code, stays a terminal refusal', async () => {
+    for (const body of [
+      { code: 'ORDER_NOT_PAID_OUT' },
+      { code: 'ORDER_NOT_PAID_OUT', signed: true },
+      { code: 'funder_tier_mismatch', signed: false },
+      { code: 'ORDER_UNDERPAID', signed: false },
+    ]) {
+      const st = raceStub(T2, '105.00')
+      st.orderStatus = 'payment_payout_completed'
+      st.payAnswers.push({ status: 409, body })
+      const { env, kv } = makeEnv(TIERS)
+      await handleRozoWebhook(await signed(ev('105.00')), env)
+      expect(rec(kv).status, JSON.stringify(body)).toBe('failed_pay_invoice')
+      expect(await readCoinbaseExecGate(env, PL), JSON.stringify(body)).not.toBeNull()
+    }
+  })
+
+  it('flag off: a 409 ORDER_NOT_PAID_OUT body is a terminal refusal as before', async () => {
+    const st = raceStub(LEGACY, '105.00')
+    st.orderStatus = 'payment_payout_completed'
+    st.payAnswers.push({ status: 409, body: NOT_PAID_OUT })
+    const { env, kv } = makeEnv()
+    await handleRozoWebhook(await signed(ev('105.00')), env)
+    expect(rec(kv).status).toBe('failed_pay_invoice')
   })
 })
