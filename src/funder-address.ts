@@ -4,7 +4,8 @@
  * It receives caller USDC (every Coinbase / Bitrefill / TRON / TON order's
  * settlement destination) and pays Coinbase invoices through agentapi's
  * remote signer. This module imports only leaf modules (funder-tiers.ts,
- * evm-blocked-addresses.ts) and viem, so webhook.ts, stripe-fulfillment.ts,
+ * evm-blocked-addresses.ts, routes/native-sources.ts whose only import is
+ * bech32.ts) and viem, so webhook.ts, stripe-fulfillment.ts,
  * create-invoice.ts, bitrefill-binding.ts and tron-ton-alpha.ts can all read
  * it without an import cycle.
  *
@@ -14,10 +15,12 @@
  */
 import { getAddress } from 'viem'
 import { EVM_BLOCKED_ADDRESSES } from './evm-blocked-addresses'
+import { ORDER_CAP_USD } from './routes/native-sources'
 import {
   ALPHA_KIND,
   FUNDER_TIERS,
   T3_LEGACY_BACKEND,
+  orderCapAtomicFromUsd,
   payFromReceivingWallet,
   routeFunder,
   servedByLegacyFunder,
@@ -27,6 +30,14 @@ import {
 } from './funder-tiers'
 
 export const BASE_FUNDER_ADDRESS = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
+
+/**
+ * The order cap the tier selector enforces, in USDC atomic units. Single
+ * source: ORDER_CAP_USD (src/routes/native-sources.ts), the same per-order
+ * cap the checkout uses. Raising it needs no change to funder-tiers.ts or the
+ * vectors; tier bands ("below $200" / "$200 and above") do not depend on it.
+ */
+export const FUNDER_ORDER_CAP_ATOMIC: bigint = orderCapAtomicFromUsd(ORDER_CAP_USD)
 
 /**
  * The compromised funder (2026-11-24). NEVER a payout target, a balance to
@@ -181,11 +192,12 @@ export function resolveFunder(
   }
   // routeFunder (mirrored with the signer) is the single routing rule.
   // LEGACY = phase 2a (FUNDER_T3_BACKEND="legacy"): T3A / T3B payments and
-  // every TRON / TON alpha order are served by the legacy funder exactly as
-  // with the flag off (receiver, balance), and the signer serves them with the
-  // same wallet, so expected_funder is that wallet too. FUNDER_T3A_ADDRESS /
+  // TRON / TON alpha orders from $200 are served by the legacy funder exactly
+  // as with the flag off (receiver, balance), and the signer serves them with
+  // the same wallet, so expected_funder is that wallet too. Alpha orders
+  // below $200 route to T2 like plain Coinbase ones. FUNDER_T3A_ADDRESS /
   // FUNDER_T3B_ADDRESS are not read then.
-  const route = routeFunder(kind, amountAtomic, env?.FUNDER_T3_BACKEND)
+  const route = routeFunder(kind, amountAtomic, env?.FUNDER_T3_BACKEND, FUNDER_ORDER_CAP_ATOMIC)
   if (!route.ok) return { ok: false, reason: route.reason, tier: null }
   if (route.wallet === 'LEGACY') {
     return { ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS }
@@ -255,7 +267,7 @@ export function resolvePayingFunder(
   }
   const recv = receivingFunderWallet(env, receiver)
   if (!recv) return { ok: false, reason: 'receiver_not_tier_wallet', tier: null }
-  const d = payFromReceivingWallet(kind, amountAtomic, recv.wallet, env?.FUNDER_T3_BACKEND)
+  const d = payFromReceivingWallet(kind, amountAtomic, recv.wallet, env?.FUNDER_T3_BACKEND, FUNDER_ORDER_CAP_ATOMIC)
   if (!d.ok) return { ok: false, reason: d.reason, tier: null }
   return {
     ok: true,
@@ -350,7 +362,8 @@ export const ALPHA_ORDER_SOURCE = 'mpprouter-tron-ton-alpha'
 
 /**
  * True when an intents order row was created by the TRON / TON alpha route
- * (its destination is the digest-bound legacy funder, whatever the amount).
+ * (its destination is the funder routed for kind tron_ton_alpha when it was
+ * created: the legacy funder before 2026-11-24's T2 rule, then T2 below $200).
  * An order created by the main checkout is a Coinbase order even if a TRON /
  * TON payment later lands on it.
  */

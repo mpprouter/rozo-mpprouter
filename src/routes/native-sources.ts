@@ -95,7 +95,10 @@ export interface NativeSourceDef {
 
 /**
  * Single-order customer cap in USD, our fee included (callerPays), for the
- * native coins and ZEC. ONE place to change it in this repo (README "How to
+ * native coins and ZEC. Also the funder tiers' order cap (funder-address.ts
+ * FUNDER_ORDER_CAP_ATOMIC, applied there to the invoice amount the funder
+ * signs for); the signer reads its own env ORDER_CAP_USD, keep it >= this
+ * value. ONE place to change it in this repo (README "How to
  * change the order cap"); keep it equal to rozo-intents-api app_config
  * NATIVE_MAX_ORDER_USD_merchant_openrouter and NATIVE_MAX_ORDER_USD_ZEC, the
  * checkout (rozo-rescue-landing site/assets/js/caps.js) and rozo-checkout-mcp

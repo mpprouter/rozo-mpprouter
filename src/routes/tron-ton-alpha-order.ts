@@ -102,8 +102,13 @@ export interface AlphaOrderArgs {
   attributionField?: { attribution?: Record<string, unknown> }
 }
 
-/** The payment-api create body. Pure; mirrors create-invoice's default (Base USDC, exactIn) order. */
-export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs): Record<string, unknown> {
+/**
+ * The payment-api create body. Pure; mirrors create-invoice's default (Base
+ * USDC, exactIn) order. `receiver` is the wallet that will receive and pay
+ * this order: resolveFunder(env, tron_ton_alpha, invoice amount).address
+ * (flag off: always SETTLEMENT_RECEIVER, the legacy funder, as before).
+ */
+export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs, receiver: string = SETTLEMENT_RECEIVER): Record<string, unknown> {
   const priced = pricingFields(a.pricing)
   return {
     appId: OPENROUTER_APP_ID,
@@ -123,7 +128,7 @@ export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs): Record<string, u
     },
     destination: {
       chainId: '8453',
-      receiverAddress: SETTLEMENT_RECEIVER,
+      receiverAddress: receiver,
       tokenSymbol: 'USDC',
       tokenAddress: BASE_USDC_ADDRESS,
     },
@@ -149,17 +154,19 @@ export async function ensureAlphaBusinessOrder(
   forwardedHint: string | null,
   fetchImpl: typeof fetch = fetch,
 ): Promise<EnsureAlphaOrderResult> {
-  // Tiered funders (FUNDER_TIERS_ENABLED only; off = no check). An alpha
-  // order is received and paid by the wallet routeFunder picks for kind
-  // tron_ton_alpha (phase 2a: the legacy funder, the same address as the
-  // upstream digest's destination). A refusal opens nothing.
+  // Tiered funders (FUNDER_TIERS_ENABLED only; off = no check, legacy
+  // funder). A NEW alpha order is received and paid by the wallet routeFunder
+  // picks for kind tron_ton_alpha (phase 2a: T2 below $200, the legacy funder
+  // from $200 to the cap); that address is the order's payout destination.
+  // A refusal opens nothing.
   const tierOn = funderTiersEnabled(env)
   const alphaFunder = resolveFunder(env, FUNDER_ALPHA_KIND, a.pricing.originalAtomic)
   if (!alphaFunder.ok) return { ok: false, reason: 'funder_tier' }
-  // Flag on, an existing order is settled by the wallet it actually pays out
-  // to (resolvePayingFunder, kind by creator), whatever the amount's nominal
-  // tier; it must be a configured paying wallet, otherwise no instructions
-  // lead into it (its settlement would be refused).
+  // Flag on, an EXISTING order (created before this deploy with the legacy
+  // destination, or by the main checkout) is settled by the wallet it actually
+  // pays out to (resolvePayingFunder, kind by creator), never by one
+  // recomputed from the amount; it must be a configured paying wallet,
+  // otherwise no instructions lead into it (its settlement would be refused).
   const wrongAlphaReceiver = (row: any) => {
     if (!tierOn) return false
     const receiver = row?.destination?.receiverAddress ?? row?.destination_receiver_address
@@ -201,7 +208,7 @@ export async function ensureAlphaBusinessOrder(
         { 'content-type': 'application/json', 'X-API-Key': env.ROZO_INTENTS_API_KEY },
         forwardedHint,
       ),
-      body: JSON.stringify(buildAlphaBusinessOrderBody(a)),
+      body: JSON.stringify(buildAlphaBusinessOrderBody(a, alphaFunder.address)),
       signal: AbortSignal.timeout(ORDER_TIMEOUT_MS),
     })
   } catch {

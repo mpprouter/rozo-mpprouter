@@ -49,11 +49,11 @@ import { T3_LEGACY_BACKEND } from '../funder-tiers'
 export const ALPHA_FUNDER_TIERS_PAUSED = 'ALPHA_FUNDER_TIERS_PAUSED'
 
 /**
- * Tiered funders: the alpha destination is part of the upstream order digest
- * and is the legacy funder. Phase 2a (FUNDER_T3_BACKEND="legacy") routes every
- * alpha order to that same wallet (routeFunder, kind tron_ton_alpha), so alpha
- * runs exactly as with the flag off. Any other backend (phase 2b) refuses
- * alpha orders ("alpha_paused"): no option is opened or re-read.
+ * Tiered funders: phase 2a (FUNDER_T3_BACKEND="legacy") routes a new alpha
+ * order's business order (its payout destination) by routeFunder, kind
+ * tron_ton_alpha: T2 below $200, the legacy funder from $200 to the cap
+ * (tron-ton-alpha-order.ts). Any other backend (phase 2b) refuses alpha orders
+ * ("alpha_paused"): no option is opened or re-read.
  */
 export function alphaPausedByFunderTiers(env: { FUNDER_TIERS_ENABLED?: string; FUNDER_T3_BACKEND?: string }): boolean {
   return funderTiersEnabled(env) && env.FUNDER_T3_BACKEND !== T3_LEGACY_BACKEND
@@ -75,8 +75,18 @@ export const TRON_TON_ALPHA_GATE = {
   label: 'tron-ton-alpha option',
 } as const
 
-// Same settlement destination create-invoice uses for every Coinbase order.
-// Part of the upstream order digest: it must be byte-identical on every call.
+// Part of the upstream order digest: it must be byte-identical on every call
+// for one payment link, including calls made after a deploy for an option
+// allocated before it. It is a digest fact ONLY: merchant_openrouter is on
+// the upstream legacy list (TRON_TON_ALPHA_APPS), whose lane hashes
+// `destination` and never pays out to it. The money goes to the intents
+// business order's destination (tron-ton-alpha-order.ts: the routed funder
+// wallet, T2 below $200 with tiers on), and the funder that pays the invoice
+// is derived from that recorded destination (webhook.ts resolvePayingFunder).
+// It is therefore deliberately NOT tier-routed: changing it would make every
+// option allocated before a change answer order_conflict on its next re-read.
+// It is also the destination already sent today when the main checkout
+// created a T2 order and the payer then picked TRON / TON.
 export const ALPHA_DESTINATION = Object.freeze({
   chainId: '8453',
   tokenSymbol: 'USDC',

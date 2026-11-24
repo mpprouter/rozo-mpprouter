@@ -14,23 +14,34 @@
 //
 // Tiers (Base USDC):
 //   T1   x402 only. Per payment <= $5. Hot key, balance <= 50 USDC.
-//   T2   OpenRouter Coinbase invoices below $200. Hot key, balance <= 200 USDC.
-//   T3A  OpenRouter Coinbase invoices from $200 up to the order cap ($1,200).
+//   T2   OpenRouter Coinbase invoices below $200 (plain, and TRON / TON alpha
+//        in phase 2a, see routeFunder). Hot key, balance <= 200 USDC.
+//   T3A  OpenRouter Coinbase invoices of $200 and above.
 //        CDP Server Wallet, policy allowlists only the Coinbase collectors.
-//   T3B  Stripe crypto links, Bitrefill and any other merchant, up to the
-//        order cap ($1,200). CDP Server Wallet, no contract allowlist.
+//   T3B  Stripe crypto links, Bitrefill and any other merchant, any amount.
+//        CDP Server Wallet, no contract allowlist.
 //
-// Rules, in order (amount = the USDC the funder will sign for, in 6-decimal
-// atomic units, i.e. the invoice amount, NOT the caller's fee-inclusive price):
+// Tier bands have NO upper bound (founder 2026-11-24: "below $200" and "$200
+// and above"). The order cap is a SEPARATE refuse-check with its own setting,
+// passed in by the caller (`orderCapAtomic`): rozo-mpprouter ORDER_CAP_USD
+// (src/routes/native-sources.ts), the signer env ORDER_CAP_USD. Raising the
+// cap needs no change to this file or the vectors. A cap that is not a
+// positive amount falls back to DEFAULT_ORDER_CAP_ATOMIC (fail closed, never
+// "no cap").
+//
+// Band rules (selectFunderTier; amount = the USDC the funder will sign for, in
+// 6-decimal atomic units, i.e. the invoice amount, NOT the caller's
+// fee-inclusive price):
 //   1. amount must be a positive integer, else refuse "invalid_amount".
-//   2. kind "x402":      amount <= T1_MAX_ATOMIC            -> T1, else refuse.
-//   3. kind "coinbase":  amount <  T2_MAX_EXCLUSIVE_ATOMIC  -> T2
-//                        amount <= ORDER_CAP_ATOMIC         -> T3A, else refuse.
-//   4. kind "stripe" | "bitrefill" | "other":
-//                        amount <= ORDER_CAP_ATOMIC         -> T3B, else refuse.
+//   2. kind "x402":      amount <= T1_MAX_ATOMIC            -> T1, else refuse
+//                        "over_tier_cap" (T1's own per-payment cap).
+//   3. kind "coinbase":  amount <  T2_MAX_EXCLUSIVE_ATOMIC  -> T2, else T3A.
+//   4. kind "stripe" | "bitrefill" | "other":               -> T3B.
 //   5. any other kind: refuse "unknown_kind".
-// The boundary $200.00 exactly goes to T3A. There is no fallback between
-// tiers: a refusal means "do not pay / do not create the order".
+// Then (routeFunder / payFromReceivingWallet) every non-x402 payment above the
+// order cap is refused "over_order_cap". The boundary $200.00 exactly goes to
+// T3A. There is no fallback between tiers: a refusal means "do not pay / do
+// not create the order".
 //
 // No imports, no env, no I/O: pure and identical in Deno and Node.
 
@@ -57,11 +68,36 @@ export type FunderTierDecision =
 export const T1_MAX_ATOMIC = 5_000_000n;
 /** $200: Coinbase invoices strictly below this go to T2. */
 export const T2_MAX_EXCLUSIVE_ATOMIC = 200_000_000n;
-/** $1,200: order cap (rozo-mpprouter ORDER_CAP_USD). Inclusive. */
-export const ORDER_CAP_ATOMIC = 1_200_000_000n;
+/**
+ * Fail-closed fallback for the order cap ONLY: used when the configured cap
+ * is unset, unparsable or not positive. The live cap is the caller's setting
+ * (orderCapAtomicFromUsd); this is not the tier boundary of anything.
+ */
+export const DEFAULT_ORDER_CAP_ATOMIC = 1_200_000_000n;
 
 export const FUNDER_TIERS: readonly FunderTier[] = ["T1", "T2", "T3A", "T3B"];
 
+/**
+ * The order cap from a configured USD value (number, or decimal string such
+ * as "1200" / "1200.50"). Anything else (unset, empty, garbage, exponent,
+ * zero, negative, more than 6 decimals) -> DEFAULT_ORDER_CAP_ATOMIC.
+ */
+export function orderCapAtomicFromUsd(raw: unknown): bigint {
+  let s: string | null = null;
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) s = String(raw);
+  else if (typeof raw === "string") s = raw;
+  const a = s === null ? null : parseUsdcAtomic(s);
+  return a !== null && a > 0n ? a : DEFAULT_ORDER_CAP_ATOMIC;
+}
+
+/** A usable cap: a positive bigint, else the fail-closed default. */
+function effectiveOrderCap(orderCapAtomic: bigint): bigint {
+  return typeof orderCapAtomic === "bigint" && orderCapAtomic > 0n
+    ? orderCapAtomic
+    : DEFAULT_ORDER_CAP_ATOMIC;
+}
+
+/** Tier band only (no order cap): which tier a payment of this kind/amount belongs to. */
 export function selectFunderTier(
   kind: string,
   amountAtomic: bigint,
@@ -75,16 +111,13 @@ export function selectFunderTier(
         ? { ok: true, tier: "T1" }
         : { ok: false, reason: "over_tier_cap" };
     case "coinbase":
-      if (amountAtomic < T2_MAX_EXCLUSIVE_ATOMIC) return { ok: true, tier: "T2" };
-      return amountAtomic <= ORDER_CAP_ATOMIC
-        ? { ok: true, tier: "T3A" }
-        : { ok: false, reason: "over_order_cap" };
+      return amountAtomic < T2_MAX_EXCLUSIVE_ATOMIC
+        ? { ok: true, tier: "T2" }
+        : { ok: true, tier: "T3A" };
     case "stripe":
     case "bitrefill":
     case "other":
-      return amountAtomic <= ORDER_CAP_ATOMIC
-        ? { ok: true, tier: "T3B" }
-        : { ok: false, reason: "over_order_cap" };
+      return { ok: true, tier: "T3B" };
     default:
       return { ok: false, reason: "unknown_kind" };
   }
@@ -108,13 +141,21 @@ export function servedByLegacyFunder(
 }
 
 /**
- * TRON / TON alpha orders: Coinbase invoices whose Base USDC destination is
- * baked into the upstream order digest and is the legacy single funder. They
- * can only ever be received and paid by the legacy funder, whatever the
- * amount, so they bypass the tier bands:
- *   phase 2a (t3Backend "legacy"): every alpha order <= ORDER_CAP_ATOMIC -> LEGACY
- *   any other backend (phase 2b):  refuse "alpha_paused" until alpha
- *                                  destinations are handled.
+ * TRON / TON alpha orders: Coinbase invoices paid with TRON / TON. Their
+ * intents business order is created by rozo-mpprouter's alpha route, and its
+ * payout destination is the wallet chosen here for a NEW order (founder
+ * 2026-11-24: alpha below $200 is received and paid by T2, exactly like an
+ * ordinary Coinbase order below $200):
+ *   above the order cap: refuse "over_order_cap" (any backend)
+ *   phase 2a (t3Backend "legacy"):
+ *     amount <  T2_MAX_EXCLUSIVE_ATOMIC  -> T2
+ *     amount >= T2_MAX_EXCLUSIVE_ATOMIC  -> LEGACY
+ *   any other backend (phase 2b): refuse "alpha_paused" until alpha
+ *                                 destinations are handled.
+ * This only routes NEW orders. An order whose money already landed is paid by
+ * the wallet it actually paid out to (payFromReceivingWallet), so an alpha
+ * order created before this rule (legacy destination, any amount) is still
+ * paid by LEGACY.
  */
 export const ALPHA_KIND = "tron_ton_alpha";
 
@@ -128,23 +169,30 @@ export type FunderRoute =
  * The one routing function both repos use with FUNDER_TIERS_ENABLED on:
  * which wallet receives and pays this payment. LEGACY = the legacy single
  * funder (phase 2a interim). Refusals are final; there is no fallback.
+ * `orderCapAtomic` is the caller's configured order cap (inclusive), applied
+ * to every non-x402 payment after the band; it never changes which wallet a
+ * payment under the cap routes to.
  */
 export function routeFunder(
   kind: string,
   amountAtomic: bigint,
   t3Backend: string | undefined,
+  orderCapAtomic: bigint,
 ): FunderRoute {
+  const cap = effectiveOrderCap(orderCapAtomic);
   if (kind === ALPHA_KIND) {
     if (typeof amountAtomic !== "bigint" || amountAtomic <= 0n) {
       return { ok: false, reason: "invalid_amount" };
     }
-    if (amountAtomic > ORDER_CAP_ATOMIC) return { ok: false, reason: "over_order_cap" };
-    return t3Backend === T3_LEGACY_BACKEND
-      ? { ok: true, wallet: "LEGACY" }
-      : { ok: false, reason: "alpha_paused" };
+    if (amountAtomic > cap) return { ok: false, reason: "over_order_cap" };
+    if (t3Backend !== T3_LEGACY_BACKEND) return { ok: false, reason: "alpha_paused" };
+    return amountAtomic < T2_MAX_EXCLUSIVE_ATOMIC
+      ? { ok: true, wallet: "T2" }
+      : { ok: true, wallet: "LEGACY" };
   }
   const d = selectFunderTier(kind, amountAtomic);
   if (!d.ok) return d;
+  if (d.tier !== "T1" && amountAtomic > cap) return { ok: false, reason: "over_order_cap" };
   return servedByLegacyFunder(d.tier, t3Backend)
     ? { ok: true, wallet: "LEGACY" }
     : { ok: true, wallet: d.tier };
@@ -160,7 +208,8 @@ export function routeFunder(
  * alert), not a refusal.
  *
  * Still refused (fail closed):
- *   - amount not a positive integer, or above ORDER_CAP_ATOMIC (global cap);
+ *   - amount not a positive integer, or above `orderCapAtomic` (the caller's
+ *     configured global order cap);
  *   - kind x402: only T1, only up to T1_MAX_ATOMIC (not order money);
  *   - non-x402 money in T1 (T1 is x402 only);
  *   - an unknown kind.
@@ -176,6 +225,7 @@ export function payFromReceivingWallet(
   amountAtomic: bigint,
   receivingWallet: FunderWallet,
   t3Backend: string | undefined,
+  orderCapAtomic: bigint,
 ): PayDecision {
   if (typeof amountAtomic !== "bigint" || amountAtomic <= 0n) {
     return { ok: false, reason: "invalid_amount" };
@@ -189,9 +239,9 @@ export function payFromReceivingWallet(
   if (kind !== ALPHA_KIND && kind !== "coinbase" && kind !== "stripe" && kind !== "bitrefill" && kind !== "other") {
     return { ok: false, reason: "unknown_kind" };
   }
-  if (amountAtomic > ORDER_CAP_ATOMIC) return { ok: false, reason: "over_order_cap" };
+  if (amountAtomic > effectiveOrderCap(orderCapAtomic)) return { ok: false, reason: "over_order_cap" };
   if (receivingWallet === "T1") return { ok: false, reason: "wrong_wallet_for_kind" };
-  const route = routeFunder(kind, amountAtomic, t3Backend);
+  const route = routeFunder(kind, amountAtomic, t3Backend, orderCapAtomic);
   const nominal = route.ok ? route.wallet : null;
   const warning = nominal === receivingWallet
     ? null

@@ -25,7 +25,7 @@ import {
   CAPABILITY_STALE_MAX_MS,
 } from '../src/routes/tron-ton-alpha'
 import type { Env } from '../src/index'
-import { RETIRED_FUNDER_ADDRESS_20261124 } from '../src/funder-address'
+import { BASE_FUNDER_ADDRESS, RETIRED_FUNDER_ADDRESS_20261124 } from '../src/funder-address'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import { checkCreateInvoiceGate } from '../src/routes/create-invoice-gate'
 import { readCheckoutIntake, resumeCheckoutIntake, stopCheckout, stopCheckoutIntake } from '../src/routes/checkout-control'
@@ -87,6 +87,8 @@ let tonNativeOn = false
 let quoteLinkId = PL
 let quoteStatus = 200
 let linkExpiresAt: string | null = null
+/** Invoice amount the fake quote-invoice returns. */
+let quoteAmount = '20.00'
 const firstQuote = '2026-10-27T10:00:00.000Z'
 
 /** PR #854 allocate semantics, reduced to what the proxy can observe. */
@@ -137,6 +139,7 @@ beforeEach(() => {
   quoteLinkId = PL
   quoteStatus = 200
   linkExpiresAt = null
+  quoteAmount = '20.00'
   vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
     const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     if (u.includes('/functions/v1/tron-ton-alpha')) {
@@ -174,7 +177,7 @@ beforeEach(() => {
     }
     if (u.includes('/quote-invoice')) {
       if (quoteStatus !== 200) return new Response('payment session is not payable: PAYMENT_SESSION_STATUS_CAPTURE_SUCCEEDED', { status: quoteStatus })
-      return new Response(JSON.stringify({ invoice: { amount: '20.00' }, merchant: 'OpenRouter, Inc', linkId: quoteLinkId }), { status: 200 })
+      return new Response(JSON.stringify({ invoice: { amount: quoteAmount }, merchant: 'OpenRouter, Inc', linkId: quoteLinkId }), { status: 200 })
     }
     if (u.includes('payments.coinbase.com/next-api/')) {
       return linkExpiresAt
@@ -1104,8 +1107,10 @@ describe('tron-ton-alpha with tiered funders', () => {
     return { status: r.status, body: (await r.json()) as any }
   }
 
-  it('phase 2a: the $20 option is identical to flag off (same upstream body, same business order, same response)', async () => {
-    intents.create = withDest(ALPHA_DESTINATION.receiverAddress)
+  const T2 = TIERS.FUNDER_T2_ADDRESS
+  /** Run flag off, then with `onEnv`; returns both results and what each sent. */
+  async function offThenOn(onEnv: Partial<Env>, offDest: string, onDest: string) {
+    intents.create = withDest(offDest)
     const off = await run(makeEnv())
     const offUp = up.calls.filter((c) => c.body.network).map((c) => c.body)
     const offCreates = [...intents.creates]
@@ -1114,12 +1119,84 @@ describe('tron-ton-alpha with tiered funders', () => {
     ;(fakeAllocate as any).seq = 0
     up.calls.length = 0
     intents.creates.length = 0
-    const on = await run(makeEnv(P2A))
-    expect(on.status).toBe(200)
-    expect(on.body).toEqual(off.body)
-    expect(up.calls.filter((c) => c.body.network).map((c) => c.body)).toEqual(offUp)
-    expect(intents.creates).toEqual(offCreates)
-    expect(intents.creates[0].destination.receiverAddress).toBe(ALPHA_DESTINATION.receiverAddress)
+    intents.create = withDest(onDest)
+    const on = await run(makeEnv(onEnv))
+    const onUp = up.calls.filter((c) => c.body.network).map((c) => c.body)
+    return { off, on, offUp, onUp, offCreates, onCreates: [...intents.creates] }
+  }
+
+  it('flag off: a $20 alpha business order pays out to the legacy funder (unchanged)', async () => {
+    const r = await run(makeEnv())
+    expect(r.status).toBe(200)
+    expect(intents.creates).toHaveLength(1)
+    expect(intents.creates[0].destination.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
+  })
+
+  it('phase 2a: a $20 alpha order pays out to T2; the upstream body (digest) and the response are identical to flag off', async () => {
+    const r = await offThenOn(P2A, BASE_FUNDER_ADDRESS, T2)
+    expect(r.on.status).toBe(200)
+    expect(r.on.body).toEqual(r.off.body)
+    // Upstream allocation facts unchanged: ALPHA_DESTINATION stays the legacy funder.
+    expect(r.onUp).toEqual(r.offUp)
+    expect(r.onUp[0].destination).toEqual(ALPHA_DESTINATION)
+    expect(ALPHA_DESTINATION.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
+    // Business order: only the payout destination differs.
+    expect(r.offCreates[0].destination.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
+    expect(r.onCreates[0].destination.receiverAddress).toBe(T2)
+    expect({ ...r.onCreates[0], destination: { ...r.onCreates[0].destination, receiverAddress: BASE_FUNDER_ADDRESS } }).toEqual(r.offCreates[0])
+  })
+
+  it('phase 2a: $199.99 -> T2; $200.00 and $1,200 -> legacy funder (identical to flag off)', async () => {
+    for (const [amount, want] of [['199.99', T2], ['200.00', BASE_FUNDER_ADDRESS], ['1200.00', BASE_FUNDER_ADDRESS]] as const) {
+      resetTronTonAlphaCapabilityCache()
+      ;(fakeAllocate as any).orders = new Map()
+      ;(fakeAllocate as any).seq = 0
+      up.calls.length = 0
+      intents.creates.length = 0
+      quoteAmount = amount
+      const r = await offThenOn(P2A, BASE_FUNDER_ADDRESS, want)
+      expect(r.on.status, amount).toBe(200)
+      expect(r.onUp, amount).toEqual(r.offUp)
+      expect(r.onCreates[0].destination.receiverAddress, amount).toBe(want)
+      if (want === BASE_FUNDER_ADDRESS) expect(r.onCreates, amount).toEqual(r.offCreates)
+    }
+  })
+
+  it('phase 2a: above the $1,200 cap no alpha option is opened (nothing created)', async () => {
+    quoteAmount = '1200.01'
+    const r = await run(makeEnv(P2A))
+    expect(r.status).not.toBe(200)
+    expect(r.body.receivingAddress).toBeUndefined()
+    expect(intents.creates).toHaveLength(0)
+  })
+
+  it('phase 2a: T2 not configured -> a $20 alpha option is refused, never sent to the legacy funder', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const r = await run(makeEnv({ ...P2A, FUNDER_T2_ADDRESS: undefined } as Partial<Env>))
+    expect(r.status).toBe(502)
+    expect(r.body.receivingAddress).toBeUndefined()
+    expect(intents.creates).toHaveLength(0)
+  })
+
+  it('phase 2a in-flight: an alpha order created before the deploy with the legacy destination keeps its option and is not re-created', async () => {
+    // Pre-deploy option: the old rule created a legacy-destination order and
+    // sent the same upstream facts as flag off (ALPHA_DESTINATION unchanged).
+    intents.create = withDest(BASE_FUNDER_ADDRESS)
+    const before = await run(makeEnv())
+    expect(before.status).toBe(200)
+    // After the deploy: the business order exists with the legacy destination.
+    resetTronTonAlphaCapabilityCache()
+    intents.creates.length = 0
+    intents.lookup = () => new Response(JSON.stringify({
+      id: 'b0000000-0000-4000-8000-000000000003', orderId: PL, status: 'payment_unpaid',
+      destination: { chainId: '8453', receiverAddress: BASE_FUNDER_ADDRESS }, metadata: { source: 'mpprouter-tron-ton-alpha' },
+    }), { status: 200 })
+    const after = await run(makeEnv(P2A))
+    expect(after.status).toBe(200)
+    // Same allocation (no order_conflict), same amount, nothing created.
+    expect(after.body.reused).toBe(true)
+    expect(after.body.expectedAmount).toBe(before.body.expectedAmount)
+    expect(intents.creates).toHaveLength(0)
   })
 
   it('phase 2a capability is the same as flag off', async () => {
@@ -1184,9 +1261,20 @@ describe('tron-ton-alpha with tiered funders', () => {
   it('phase 2a: a created business order paying another wallet shows no instructions', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
-    intents.create = withDest('0x2000000000000000000000000000000000000002')
-    const r = await run(makeEnv(P2A))
-    expect(r.status).toBe(502)
-    expect(r.body.receivingAddress).toBeUndefined()
+    // $20 routes to T2: a created order paying the legacy funder (or anyone else) is refused.
+    for (const dest of [BASE_FUNDER_ADDRESS, '0x9999999999999999999999999999999999999999']) {
+      resetTronTonAlphaCapabilityCache()
+      intents.create = withDest(dest)
+      const r = await run(makeEnv(P2A))
+      expect(r.status, dest).toBe(502)
+      expect(r.body.receivingAddress, dest).toBeUndefined()
+    }
+    // $900 routes to the legacy funder: a created order paying T2 is refused.
+    resetTronTonAlphaCapabilityCache()
+    quoteAmount = '900.00'
+    ;(fakeAllocate as any).orders = new Map()
+    intents.create = withDest(T2)
+    const big = await run(makeEnv(P2A))
+    expect(big.status).toBe(502)
   })
 })
