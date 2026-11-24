@@ -20,6 +20,7 @@ import { casRead } from '../src/routes/stripe-atomic'
 import { sweepCeloRetries } from '../src/routes/celo-retry-run'
 import { timingSafeEqualStr } from '../src/utils/timing-safe'
 import type { Env } from '../src/index'
+import { ORDER_CAP_USD } from '../src/routes/native-sources'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import { boundCoinbaseLink, boundRozoOrder } from './helpers/coinbase-binding'
 
@@ -706,7 +707,7 @@ describe('Coinbase settle: tiered funders', () => {
     for (const [dest, amount] of [
       ['0x9999999999999999999999999999999999999999', '50.00'],
       [T1, '1.00'],
-      [T3A, '1200.01'],
+      [T3A, (ORDER_CAP_USD + 0.01).toFixed(2)],
     ] as const) {
       const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount, chainId: '8453', receiverAddress: dest } }), amount)
       const { env, kv } = makeEnv(TIERS)

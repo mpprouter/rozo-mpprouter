@@ -198,8 +198,8 @@ describe('create-invoice with a native source', () => {
     expect(createdIntent).toBeNull()
   })
 
-  it('defaults the native cap to ORDER_CAP_USD incl. fee (founder 2026-11-24: 1200)', () => {
-    expect(ORDER_CAP_USD).toBe(1200)
+  it('defaults the native cap to ORDER_CAP_USD incl. fee (founder 2026-11-24: 3500)', () => {
+    expect(ORDER_CAP_USD).toBe(3500)
     expect(ZEC_MAX_USD).toBe(ORDER_CAP_USD - 0.01)
     expect(nativeMaxUsd(undefined)).toBe(ORDER_CAP_USD)
     expect(nativeMaxUsd('')).toBe(ORDER_CAP_USD)

@@ -199,7 +199,7 @@ CHECKOUT_AGENT_BETA_FEE_BPS = "0"
 # (NATIVE_DAILY_CAP_USD_merchant_openrouter); both go to $20,000 at step 7 of
 # the 2026-11-18 ZEC/native 13,500 design (intents app_config, not here).
 # Per order: router cap ORDER_CAP_USD incl. fee (src/routes/native-sources.ts,
-# $1,200 from 2026-11-24, was $12,750 from 2026-11-18; POL keeps its own
+# $3,500 from 2026-11-24, briefly $1,200 the same day, $12,750 from 2026-11-18; POL keeps its own
 # $3,500 ceiling, so min(3500, cap)). Backend hard cap MAX_NATIVE_PAYIN_USD
 # $13,500; intents app_config NATIVE_MAX_ORDER_USD_* is the customer cap.
 # Rollback: set NATIVE_SOURCES = "" and redeploy.
