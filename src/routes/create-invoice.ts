@@ -1,5 +1,5 @@
 import type { Env } from '../index'
-import { BASE_FUNDER_ADDRESS } from '../funder-address'
+import { BASE_FUNDER_ADDRESS, RETIRED_FUNDER_ADDRESS_20261124 } from '../funder-address'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
 import { handleBitrefillCreateInvoice } from './bitrefill-invoice'
 import {
@@ -122,6 +122,12 @@ export const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 const SETTLEMENT_CHAIN_ID = BASE_CHAIN_ID
 const SETTLEMENT_TOKEN_ADDRESS = BASE_USDC_ADDRESS
 export const SETTLEMENT_RECEIVER = BASE_FUNDER_ADDRESS
+
+/** True when an intents order row's destination is the compromised pre-2026-11-24 funder. */
+export function paysRetiredFunder(row: any): boolean {
+  const r = row?.destination?.receiverAddress ?? row?.destination_receiver_address ?? row?.data?.destination?.receiverAddress
+  return typeof r === 'string' && r.toLowerCase() === RETIRED_FUNDER_ADDRESS_20261124.toLowerCase()
+}
 
 // ── Source override support (caller picks which chain/token to pay with) ──────
 // Agents may optionally specify `source` to pay from a non-Base chain. Settlement
@@ -1468,6 +1474,9 @@ function readMetadataObject(row: any): Record<string, unknown> | null {
  * fee is enabled, missing/partial pricing metadata fails closed.
  */
 export function pendingPricingMatches(row: any, pricing: CheckoutPricing): boolean {
+  // An order created before the 2026-11-24 funder rotation pays out to the
+  // compromised funder: never hand it out again (fail closed until it expires).
+  if (paysRetiredFunder(row)) return false
   const source = readRowSource(row)
   // exactOut rows (Lightning, native coins) carry the USD price on the
   // destination; their source amount is in BTC / coin units.

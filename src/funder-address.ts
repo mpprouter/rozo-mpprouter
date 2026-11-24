@@ -17,9 +17,7 @@ export const BASE_FUNDER_ADDRESS = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
  * The compromised funder (2026-11-24). NEVER a payout target, a balance to
  * check or a receiver for a new order: anything sent there is swept.
  *
- * Kept for one reason only: TRON / TON alpha orders created before the
- * rotation froze it inside their upstream order digest. tron-ton-alpha.ts
- * replays such an existing order with it (upstream refuses to create a new
- * order from a replay that conflicts, so this never opens one).
+ * Kept only so the Bitrefill receiver blocklist refuses it and a test can pin
+ * that no funder constant equals it.
  */
 export const RETIRED_FUNDER_ADDRESS_20261124 = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
