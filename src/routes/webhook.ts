@@ -551,12 +551,17 @@ export function isFunderTierMismatch(status: number, body: any): boolean {
   )
 }
 
-/** Adds `expected_funder` only when a tier wallet was selected (flag on). */
+/**
+ * Adds `expected_funder` (and `rozo_payment_id` when given) only when a tier
+ * wallet was selected (flag on). Flag off: the body is returned unchanged.
+ */
 export function withExpectedFunder<T extends Record<string, unknown>>(
   body: T,
   expectedFunder: string | undefined,
-): T | (T & { expected_funder: string }) {
-  return expectedFunder ? { ...body, expected_funder: expectedFunder } : body
+  rozoPaymentId?: string,
+): T | (T & { expected_funder: string; rozo_payment_id?: string }) {
+  if (!expectedFunder) return body
+  return { ...body, expected_funder: expectedFunder, ...(rozoPaymentId ? { rozo_payment_id: rozoPaymentId } : {}) }
 }
 
 export async function callAgentApiPayInvoice(
@@ -568,6 +573,10 @@ export async function callAgentApiPayInvoice(
   // `expected_funder`; the signer refuses (409 funder_tier_mismatch) if its
   // own selection differs. Undefined = field not sent (legacy body).
   expectedFunder?: string,
+  // FUNDER_TIERS_ENABLED only (sent only together with expectedFunder): the
+  // intents order whose payout went to that wallet, so a T3 signer can verify
+  // it read-only. Absent for paths without an order (coupon, UPI, admin).
+  rozoPaymentId?: string,
 ): Promise<{ ok: boolean; status: number; body: any }> {
   // Hard fund-safety guard: a test order is paid by nobody. Thrown (not a
   // soft failure) so no caller can mistake it for a retryable error.
@@ -583,6 +592,7 @@ export async function callAgentApiPayInvoice(
       withExpectedFunder(
         expectedBinding ? { payment_id: plId, expected_binding: expectedBinding } : { payment_id: plId },
         expectedFunder,
+        rozoPaymentId,
       ),
     ),
   })
@@ -1418,7 +1428,15 @@ export async function settleCoinbaseEvent(
   // 10. Trigger pay-invoice. From here the gate is never released.
   let payResult: { ok: boolean; status: number; body: any }
   try {
-    payResult = await callAgentApiPayInvoice(env, plId, undefined, { line: 'checkout', waitUntil }, funder.expectedFunder)
+    payResult = await callAgentApiPayInvoice(
+      env,
+      plId,
+      undefined,
+      { line: 'checkout', waitUntil },
+      funder.expectedFunder,
+      // The order the binding re-read (its destination is the tier wallet).
+      typeof binding.order?.id === 'string' ? binding.order.id : rozoPaymentId ?? undefined,
+    )
   } catch (err: any) {
     payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }
   }

@@ -615,6 +615,8 @@ export interface Env {
   FUNDER_T2_ADDRESS?: string
   FUNDER_T3A_ADDRESS?: string
   FUNDER_T3B_ADDRESS?: string
+  // Phase 2a: exactly "legacy" = T3A / T3B served by the legacy funder.
+  FUNDER_T3_BACKEND?: string
 
   // Stuck-order Intercom tickets (utils/intercom-ticket.ts). The token is a
   // private-app token with only "Write tickets"; set via

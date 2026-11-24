@@ -90,6 +90,23 @@ export function selectFunderTier(
 }
 
 /**
+ * Phased rollout (phase 2a): the T3 backend may be "legacy", meaning T3A and
+ * T3B are NOT separate wallets yet and their payments are served exactly as
+ * with the flag off, by the legacy single funder (receiving and paying).
+ * Both repos read the same variable, FUNDER_T3_BACKEND. Only the exact
+ * string "legacy" selects this; T1 and T2 are never served by legacy, and
+ * selectFunderTier refusals are unaffected (a refused payment stays refused).
+ */
+export const T3_LEGACY_BACKEND = "legacy";
+
+export function servedByLegacyFunder(
+  tier: FunderTier,
+  t3Backend: string | undefined,
+): boolean {
+  return (tier === "T3A" || tier === "T3B") && t3Backend === T3_LEGACY_BACKEND;
+}
+
+/**
  * Parse a decimal USDC string ("199.99", "200", "0.000001") into atomic units.
  * Returns null for anything that is not a plain non-negative decimal with at
  * most 6 fractional digits (no exponent, no sign, no rounding).

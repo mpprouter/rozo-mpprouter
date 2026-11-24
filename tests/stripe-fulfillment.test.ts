@@ -582,7 +582,19 @@ describe('handleStripeWebhookEvent: tiered funders', () => {
     const s = await handleStripeWebhookEvent(env, evt('t-on'), new Date(Date.UTC(2026, 6, 12)))
     expect(s.status).toBe('provider_submitted')
     expect(seen.payBodies[0].expected_funder).toBe(T3B)
+    expect(seen.payBodies[0].rozo_payment_id).toBe('rp-tier')
     expect(seen.balanceOf).toEqual([T3B.toLowerCase()])
+  })
+
+  it('phase 2a (FUNDER_T3_BACKEND=legacy): Stripe settles on the legacy funder, expected_funder = legacy', async () => {
+    const env = makeEnv({ extra: { ...TIERS, FUNDER_T3B_ADDRESS: undefined, FUNDER_T3_BACKEND: 'legacy' } as Partial<Env> })
+    await seed(env)
+    const seen = upstream(LEGACY)
+    const s = await handleStripeWebhookEvent(env, evt('t-2a'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.status).toBe('provider_submitted')
+    expect(seen.payBodies[0].expected_funder).toBe(LEGACY)
+    expect(seen.payBodies[0].rozo_payment_id).toBe('rp-tier')
+    expect(seen.balanceOf).toEqual([LEGACY.toLowerCase()])
   })
 
   it('flag on: order paid to the legacy funder -> manual_review, nothing signed', async () => {

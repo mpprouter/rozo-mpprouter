@@ -186,6 +186,26 @@ describe('Coinbase create-invoice', () => {
   })
 })
 
+describe('phase 2a create-invoice (FUNDER_T3_BACKEND=legacy)', () => {
+  const P2A = { ...TIERS, FUNDER_T3A_ADDRESS: undefined, FUNDER_T3B_ADDRESS: undefined, FUNDER_T3_BACKEND: 'legacy' }
+  it('Coinbase >= $200 and Stripe go to the legacy funder; Coinbase < $200 to T2', async () => {
+    quoteAmount = '250'
+    let r = await create({ payment_id: PAYMENT_ID }, makeEnv(P2A))
+    expect(r.status).toBe(200)
+    expect(createdIntent.destination.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
+    quoteAmount = '10.5'
+    r = await create({ payment_id: PAYMENT_ID }, makeEnv(P2A))
+    expect(createdIntent.destination.receiverAddress).toBe(T2)
+    r = await create({ url: STRIPE_URL }, makeEnv(P2A))
+    expect(r.status).toBe(200)
+    expect(createdIntent.destination.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
+  })
+  it('TRON / TON alpha stays paused in phase 2a', async () => {
+    const cap = await handleTronTonAlphaCapability(new Request('https://mpp.test/cap'), makeEnv(P2A))
+    expect(((await cap.json()) as any).enabled).toBe(false)
+  })
+})
+
 describe('Stripe create-invoice', () => {
   it('flag off: receiver is the legacy funder; flag on: T3B', async () => {
     let r = await create({ url: STRIPE_URL })

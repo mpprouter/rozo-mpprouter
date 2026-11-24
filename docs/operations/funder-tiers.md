@@ -35,6 +35,27 @@ All plain `[vars]` (public addresses), commented out in `wrangler.toml`:
 | `FUNDER_T3A_ADDRESS` | Coinbase invoices $200 to $1,200. |
 | `FUNDER_T3B_ADDRESS` | Stripe, Bitrefill and other merchants, up to $1,200. |
 
+| `FUNDER_T3_BACKEND` | Exactly `legacy` = phase 2a (below). Same variable the signer reads. |
+
+## Phases
+
+- **Phase 2a** (`FUNDER_TIERS_ENABLED=true`, `FUNDER_T3_BACKEND=legacy`): T1
+  (x402) and T2 (Coinbase below $200) use their own wallets. Every payment the
+  selector puts in T3A or T3B (Coinbase $200 to $1,200, Stripe, Bitrefill,
+  other) is served by the legacy funder `BASE_FUNDER_ADDRESS` exactly as with
+  the flag off: same receiver, same balance check; `expected_funder` is the
+  legacy funder so the signer cross-check agrees (the signer serves legacy-mode
+  T3 with the same wallet). `FUNDER_T3A_ADDRESS` / `FUNDER_T3B_ADDRESS` are not
+  read or required. T1 / T2 may still not equal the legacy funder. Refusals
+  (unknown kind, non-positive, above the cap) are unchanged.
+- **Phase 2b** (`FUNDER_T3_BACKEND` anything else, e.g. unset): T3A / T3B are
+  their own wallets and must be configured.
+
+With the flag on, Coinbase and Stripe settles also send `rozo_payment_id`
+(the intents order whose payout went to the selected wallet) so a T3 signer
+can verify the order read-only. Bitrefill already sends it; coupon, UPI and
+admin pay have no order and send none.
+
 `X402_TOPUP_RECEIVER`, when set, still overrides the x402 top-up receiver;
 otherwise it defaults to T1 while the flag is on.
 
@@ -70,9 +91,10 @@ Cross-checks:
 3. Drain or pause in-flight orders that pay out to the legacy funder: after
    the switch their settlement is refused (receiver mismatch) and needs a
    human.
-4. TRON / TON alpha is not offered while the flag is on
-   (`ALPHA_FUNDER_TIERS_PAUSED`): its destination is part of an upstream order
-   digest and cannot follow the per-amount tier yet.
+4. TRON / TON alpha is not offered while the flag is on, phase 2a included
+   (`ALPHA_FUNDER_TIERS_PAUSED`): its destination (the legacy funder) is part
+   of an upstream order digest, and alpha orders are Coinbase invoices that are
+   often below $200, which resolve to T2, so the receiver would not match.
 5. Manual `/admin/pay-invoice` accepts only Coinbase ids while the flag is on.
 
 Rollback: unset `FUNDER_TIERS_ENABLED` (or set it to anything but `true`) and

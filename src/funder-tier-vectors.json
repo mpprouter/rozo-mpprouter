@@ -26,6 +26,18 @@
     { "kind": "", "amount": "1000000", "expect": "refuse:unknown_kind" },
     { "kind": "COINBASE", "amount": "1000000", "expect": "refuse:unknown_kind" }
   ],
+  "legacy": [
+    { "tier": "T1", "backend": "legacy", "legacy": false },
+    { "tier": "T2", "backend": "legacy", "legacy": false },
+    { "tier": "T3A", "backend": "legacy", "legacy": true },
+    { "tier": "T3B", "backend": "legacy", "legacy": true },
+    { "tier": "T3A", "backend": "isolated", "legacy": false },
+    { "tier": "T3B", "backend": "cdp", "legacy": false },
+    { "tier": "T3A", "backend": "", "legacy": false },
+    { "tier": "T3A", "backend": null, "legacy": false },
+    { "tier": "T3A", "backend": "LEGACY", "legacy": false },
+    { "tier": "T3B", "backend": " legacy", "legacy": false }
+  ],
   "parse": [
     { "in": "199.99", "out": "199990000" },
     { "in": "200", "out": "200000000" },

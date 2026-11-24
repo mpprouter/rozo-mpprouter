@@ -570,7 +570,7 @@ describe('Coinbase settle: tiered funders', () => {
     const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: T3A } }), '250.00')
     const { env, kv } = makeEnv(TIERS)
     await handleRozoWebhook(await signed(ev('250.00')), env)
-    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T3A }])
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T3A, rozo_payment_id: ROZO_ID }])
     expect(seen.balanceOf).toEqual([T3A.toLowerCase()])
     expect(rec(kv).status).toBe('paid')
     expect(rec(kv).funderAddress).toBe(T3A)
@@ -580,7 +580,24 @@ describe('Coinbase settle: tiered funders', () => {
     const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '199.99', chainId: '8453', receiverAddress: T2 } }), '199.99')
     const { env } = makeEnv(TIERS)
     await handleRozoWebhook(await signed(ev('199.99')), env)
-    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T2 }])
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T2, rozo_payment_id: ROZO_ID }])
+  })
+
+  it('phase 2a (FUNDER_T3_BACKEND=legacy): $250 settles on the legacy funder exactly as today, plus the cross-check fields', async () => {
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: LEGACY } }), '250.00')
+    const { env, kv } = makeEnv({ ...TIERS, FUNDER_T3A_ADDRESS: undefined, FUNDER_T3B_ADDRESS: undefined, FUNDER_T3_BACKEND: 'legacy' })
+    await handleRozoWebhook(await signed(ev('250.00')), env)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: LEGACY, rozo_payment_id: ROZO_ID }])
+    expect(seen.balanceOf).toEqual([LEGACY.toLowerCase()])
+    expect(rec(kv).status).toBe('paid')
+  })
+
+  it('phase 2a: $199.99 still uses T2 and refuses an order paid to the legacy funder', async () => {
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '199.99', chainId: '8453', receiverAddress: LEGACY } }), '199.99')
+    const { env, kv } = makeEnv({ ...TIERS, FUNDER_T3A_ADDRESS: undefined, FUNDER_T3B_ADDRESS: undefined, FUNDER_T3_BACKEND: 'legacy' })
+    await handleRozoWebhook(await signed(ev('199.99')), env)
+    expect(seen.payBodies).toEqual([])
+    expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
   })
 
   it('flag on: an order paid out to another wallet is refused, nothing paid', async () => {

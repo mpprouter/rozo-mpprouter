@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import vectors from '../src/funder-tier-vectors.json'
-import { parseUsdcAtomic, selectFunderTier } from '../src/funder-tiers'
+import { parseUsdcAtomic, selectFunderTier, servedByLegacyFunder } from '../src/funder-tiers'
 import {
   BASE_FUNDER_ADDRESS,
   RETIRED_FUNDER_ADDRESS_20261124,
@@ -166,6 +166,64 @@ describe('resolveFunder, flag on', () => {
     })
     expect(isAnyConfiguredFunderTier(TIER_ENV, T3B.toUpperCase().replace('0X', '0x'))).toBe(true)
     expect(isAnyConfiguredFunderTier(TIER_ENV, BASE_FUNDER_ADDRESS)).toBe(false)
+  })
+})
+
+describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
+  const P2A = { FUNDER_TIERS_ENABLED: 'true', FUNDER_T1_ADDRESS: T1, FUNDER_T2_ADDRESS: T2, FUNDER_T3_BACKEND: 'legacy' }
+
+  it('servedByLegacyFunder matches every legacy vector', () => {
+    expect((vectors as any).legacy.length).toBeGreaterThan(5)
+    for (const v of (vectors as any).legacy) {
+      expect(servedByLegacyFunder(v.tier, v.backend ?? undefined), JSON.stringify(v)).toBe(v.legacy)
+    }
+  })
+
+  it('every vector: coinbase/stripe/bitrefill/other -> T2 wallet or legacy funder, x402 -> T1, refusals unchanged', () => {
+    for (const v of vectors.vectors) {
+      const got = resolveFunder(P2A, v.kind, BigInt(v.amount))
+      const label = `${v.kind} ${v.amount}`
+      if (v.expect.startsWith('refuse:')) {
+        expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7), tier: null })
+        continue
+      }
+      const want = v.expect === 'T1' ? T1 : v.expect === 'T2' ? T2 : BASE_FUNDER_ADDRESS
+      expect(got, label).toEqual({ ok: true, tier: v.expect, address: want, expectedFunder: want })
+      if (v.kind === 'x402') expect(want).toBe(T1)
+    }
+  })
+
+  it('T3A / T3B addresses are not required; T1 / T2 still may not be the legacy funder', () => {
+    expect(resolveFunder(P2A, 'coinbase', USD(200))).toMatchObject({ ok: true, address: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder(P2A, 'stripe', USD(10))).toMatchObject({ ok: true, address: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder({ ...P2A, FUNDER_T2_ADDRESS: BASE_FUNDER_ADDRESS }, 'coinbase', USD(10))).toEqual({
+      ok: false, reason: 'tier_address_legacy', tier: 'T2',
+    })
+    expect(resolveFunder({ ...P2A, FUNDER_T1_ADDRESS: BASE_FUNDER_ADDRESS }, 'x402', 1n)).toEqual({
+      ok: false, reason: 'tier_address_legacy', tier: 'T1',
+    })
+  })
+
+  it('any other backend value keeps T3 tier wallets (and their checks)', () => {
+    for (const b of ['LEGACY', ' legacy', 'cdp', '']) {
+      expect(resolveFunder({ ...P2A, FUNDER_T3_BACKEND: b }, 'coinbase', USD(200))).toEqual({
+        ok: false, reason: 'tier_address_missing', tier: 'T3A',
+      })
+    }
+  })
+
+  it('backend legacy without the flag is still the plain legacy funder', () => {
+    expect(resolveFunder({ FUNDER_T3_BACKEND: 'legacy' }, 'coinbase', USD(10))).toEqual({
+      ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: undefined,
+    })
+  })
+
+  it('watch list: T1, T2 and the legacy funder once', () => {
+    expect(configuredFunderWallets(P2A)).toEqual([
+      { tier: 'T1', address: T1 },
+      { tier: 'T2', address: T2 },
+      { tier: 'legacy', address: BASE_FUNDER_ADDRESS },
+    ])
   })
 })
 

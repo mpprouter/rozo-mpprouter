@@ -164,6 +164,7 @@ BITREFILL_ENABLED = "true"
 # FUNDER_T2_ADDRESS = "0x..."   # Coinbase invoices below $200
 # FUNDER_T3A_ADDRESS = "0x..."  # Coinbase invoices $200 to $1,200
 # FUNDER_T3B_ADDRESS = "0x..."  # Stripe, Bitrefill, other, up to $1,200
+# FUNDER_T3_BACKEND = "legacy"  # phase 2a: T3A/T3B served by the legacy funder (T3 addresses not needed)
 # Hostname suffix for router-hosted paywalls (services/provider-hosting.ts).
 PROVIDER_HOSTED_SUFFIX = "-pay.mpprouter.dev"
 # Default checkout fee. checkout.rozo.ai and the existing agent.rozo.ai use

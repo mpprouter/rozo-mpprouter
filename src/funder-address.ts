@@ -17,6 +17,7 @@ import { EVM_BLOCKED_ADDRESSES } from './evm-blocked-addresses'
 import {
   FUNDER_TIERS,
   selectFunderTier,
+  servedByLegacyFunder,
   type FunderTier,
   type FunderTierRefusal,
 } from './funder-tiers'
@@ -56,6 +57,11 @@ export interface FunderTierEnv {
   FUNDER_T2_ADDRESS?: string
   FUNDER_T3A_ADDRESS?: string
   FUNDER_T3B_ADDRESS?: string
+  /**
+   * Phase 2a: exactly "legacy" = T3A / T3B are served by the legacy funder
+   * (same variable the signer reads). Anything else: T3 tier wallets.
+   */
+  FUNDER_T3_BACKEND?: string
 }
 
 export type FunderConfigRefusal =
@@ -168,6 +174,13 @@ export function resolveFunder(
   }
   const decision = selectFunderTier(kind, amountAtomic)
   if (!decision.ok) return { ok: false, reason: decision.reason, tier: null }
+  // Phase 2a (FUNDER_T3_BACKEND="legacy"): T3A / T3B are served by the legacy
+  // funder exactly as with the flag off (receiver, balance), and the signer
+  // serves them with the same wallet, so expected_funder is that wallet too.
+  // FUNDER_T3A_ADDRESS / FUNDER_T3B_ADDRESS are not read.
+  if (servedByLegacyFunder(decision.tier, env?.FUNDER_T3_BACKEND)) {
+    return { ok: true, tier: decision.tier, address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS }
+  }
   const addr = funderTierAddress(env, decision.tier)
   if (!addr.ok) return { ok: false, reason: addr.reason, tier: decision.tier }
   return { ok: true, tier: decision.tier, address: addr.address, expectedFunder: addr.address }
@@ -181,10 +194,19 @@ export function configuredFunderWallets(
   env: FunderTierEnv | null | undefined,
 ): Array<{ tier: FunderTier | 'legacy'; address: string | null; reason?: FunderConfigRefusal }> {
   if (!funderTiersEnabled(env)) return [{ tier: 'legacy', address: BASE_FUNDER_ADDRESS }]
-  return FUNDER_TIERS.map((tier) => {
+  const out: Array<{ tier: FunderTier | 'legacy'; address: string | null; reason?: FunderConfigRefusal }> = []
+  let legacyListed = false
+  for (const tier of FUNDER_TIERS) {
+    if (servedByLegacyFunder(tier, env?.FUNDER_T3_BACKEND)) {
+      // Phase 2a: T3A / T3B are the legacy funder; watch it once.
+      if (!legacyListed) out.push({ tier: 'legacy', address: BASE_FUNDER_ADDRESS })
+      legacyListed = true
+      continue
+    }
     const r = funderTierAddress(env, tier)
-    return r.ok ? { tier, address: r.address } : { tier, address: null, reason: r.reason }
-  })
+    out.push(r.ok ? { tier, address: r.address } : { tier, address: null, reason: r.reason })
+  }
+  return out
 }
 
 /** True when `address` equals the configured, valid address of any tier (flag on only). */

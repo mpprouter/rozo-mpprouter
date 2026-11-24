@@ -597,6 +597,9 @@ export async function callStripePayInvoice(
     // FUNDER_TIERS_ENABLED only: the selected tier wallet, sent as
     // `expected_funder`. Undefined = field not sent (legacy body).
     expectedFunder?: string
+    // FUNDER_TIERS_ENABLED only, sent only together with expectedFunder: the
+    // intents order whose payout went to that wallet.
+    rozoPaymentId?: string
   },
 ): Promise<StripePayInvoiceResult> {
   const url = env.STRIPE_PAY_INVOICE_URL ?? STRIPE_PAY_INVOICE_DEFAULT_URL
@@ -614,6 +617,7 @@ export async function callStripePayInvoice(
         expected_amount_atomic: args.expectedAmountAtomic,
         spent_today_atomic: args.spentTodayAtomic,
         ...(args.expectedFunder ? { expected_funder: args.expectedFunder } : {}),
+        ...(args.expectedFunder && args.rozoPaymentId ? { rozo_payment_id: args.rozoPaymentId } : {}),
       }),
     })
   } catch (err: any) {
@@ -926,6 +930,8 @@ export async function handleStripeWebhookEvent(
     }
   }
   const funderAddress = funder.address
+  // The order re-read above (flag on); undefined while the flag is off.
+  const tierOrderId = funderTiersEnabled(env) ? input.rozoPaymentId ?? undefined : undefined
 
   // Cross-channel claim (invoice-claim.ts): the UPI fiat channel may already be
   // settling this session. The per-record CAS above serializes Stripe-vs-Stripe;
@@ -1036,6 +1042,7 @@ export async function handleStripeWebhookEvent(
       expectedAmountAtomic: claimed.invoiceAmountAtomic,
       spentTodayAtomic: spentBefore.toString(),
       expectedFunder: funder.expectedFunder,
+      rozoPaymentId: tierOrderId,
     })
   } catch {
     // Defensive: callStripePayInvoice does not throw (it maps transport errors
