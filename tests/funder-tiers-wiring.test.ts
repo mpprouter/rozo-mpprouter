@@ -237,19 +237,20 @@ describe('phase 2a create-invoice (FUNDER_T3_BACKEND=legacy)', () => {
 })
 
 describe('Stripe create-invoice', () => {
-  it('flag off: receiver is the legacy funder; flag on: T3B', async () => {
+  it('flag off and flag on (every backend): receiver is the legacy funder (the KMS T3B does not sign Stripe Permits)', async () => {
     let r = await create({ url: STRIPE_URL })
     expect(r.status).toBe(200)
     expect(createdIntent.destination.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
     r = await create({ url: STRIPE_URL }, makeEnv(TIERS))
     expect(r.status).toBe(200)
-    expect(createdIntent.destination.receiverAddress).toBe(T3B)
+    expect(createdIntent.destination.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
+    expect(createdIntent.destination.receiverAddress).not.toBe(T3B)
   })
 
-  it('flag on: a missing T3B refuses before any create; a mismatching order is not handed out', async () => {
+  it('flag on: T3B is not needed for Stripe; a mismatching order is not handed out', async () => {
     let r = await create({ url: STRIPE_URL }, makeEnv({ ...TIERS, FUNDER_T3B_ADDRESS: undefined }))
-    expect(r.json.code).toBe('FUNDER_TIER_REFUSED')
-    expect(creates).toBe(0)
+    expect(r.status).toBe(200)
+    expect(createdIntent.destination.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
     createReceiver = () => T2
     r = await create({ url: STRIPE_URL }, makeEnv(TIERS))
     expect(r.status).toBe(503)

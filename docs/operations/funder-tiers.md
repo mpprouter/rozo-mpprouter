@@ -20,7 +20,8 @@ Bitrefill invoice amount, 6 decimals), not the caller's fee-inclusive price.
 | `x402` | <= $5 | T1 |
 | `coinbase` | < $200 | T2 |
 | `coinbase` | >= $200 | T3A |
-| `stripe`, `bitrefill`, `other` | any | T3B |
+| `bitrefill`, `other` | any | T3B |
+| `stripe` | any | legacy funder on every backend (band T3B; the KMS T3B signs no EIP-2612 Permit yet) |
 | `tron_ton_alpha` | < $200 / >= $200 | T2 / T3A (legacy funder in phase 2a) |
 | anything else | | refused |
 

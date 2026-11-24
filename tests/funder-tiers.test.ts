@@ -139,6 +139,8 @@ describe('resolveFunder, flag on', () => {
       const label = `${v.kind} ${v.amount}`
       if (v.expect.startsWith('refuse:')) {
         expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7), tier: null })
+      } else if (v.expect === 'LEGACY') {
+        expect(got, label).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
       } else {
         expect(got, label).toEqual({ ok: true, tier: v.expect, address: ADDR[v.expect], expectedFunder: ADDR[v.expect] })
       }
@@ -392,18 +394,20 @@ describe('paying from the receiving wallet', () => {
       for (const amt of [USD(50), USD(250), USD(1200)]) {
         const r = resolvePayingFunder(ISO, kind, amt, BASE_FUNDER_ADDRESS)
         expect(r, `${kind} ${amt}`).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
-        // Never the nominal wallet of a NEW order (2b never routes to legacy): always a warning.
-        expect(r.ok && typeof r.warning === 'string', `${kind} ${amt}`).toBe(true)
+        // 2b routes a NEW order to legacy only for Stripe (Permit): a warning for every other kind.
+        expect(r.ok && (kind === 'stripe' ? r.warning === null : typeof r.warning === 'string'), `${kind} ${amt}`).toBe(true)
       }
     }
     expect(resolvePayingFunder(ISO, 'coinbase', USD(1200) + 1n, BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
-    // 2b never routes a NEW order to the legacy funder.
-    for (const kind of ['coinbase', 'stripe', 'bitrefill', 'tron_ton_alpha']) {
+    // 2b never routes a NEW Coinbase / Bitrefill / alpha order to the legacy funder (Stripe: below).
+    for (const kind of ['coinbase', 'bitrefill', 'tron_ton_alpha']) {
       for (const amt of [USD(50), USD(250), USD(1200)]) {
         const n = resolveFunder(ISO, kind, amt)
         expect(n.ok && n.address !== BASE_FUNDER_ADDRESS, `${kind} ${amt}`).toBe(true)
       }
     }
+    // Stripe stays on the legacy funder on every backend (the KMS T3B signs no EIP-2612 Permit).
+    expect(resolveFunder(ISO, 'stripe', USD(50))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
     // A T3 address left over in 2a is not a paying wallet (T3 is the legacy funder).
     expect(resolvePayingFunder({ ...P2A, FUNDER_T3A_ADDRESS: T3A }, 'coinbase', USD(300), T3A)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
   })

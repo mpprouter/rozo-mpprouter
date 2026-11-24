@@ -688,7 +688,7 @@ describe('handleStripeWebhookEvent: tiered funders', () => {
     const env = makeEnv({ extra: { ...TIERS, DINGTALK_ACCESS_TOKEN: 'dt' } as Partial<Env> })
     await seed(env)
     const day = new Date(Date.UTC(2026, 6, 12))
-    const seen = upstream(T3B, 'payment_payout_completed', {
+    const seen = upstream(LEGACY, 'payment_payout_completed', {
       status: 409,
       body: { error: 'order payout has no Base tx hash', code: 'ORDER_NOT_PAID_OUT', signed: false },
     })

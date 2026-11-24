@@ -19,7 +19,9 @@
 //   T3A  OpenRouter Coinbase invoices of $200 and above.
 //        CDP Server Wallet, policy allowlists only the Coinbase collectors.
 //   T3B  Stripe crypto links, Bitrefill and any other merchant, any amount.
-//        CDP Server Wallet, no contract allowlist.
+//        CDP Server Wallet, no contract allowlist. Exception (routeFunder):
+//        Stripe is routed to LEGACY on every backend until the KMS T3B
+//        signer can sign EIP-2612 Permits safely.
 //
 // Tier bands have NO upper bound (founder 2026-11-24: "below $200" and "$200
 // and above"). The order cap is a SEPARATE refuse-check with its own setting,
@@ -180,6 +182,12 @@ export function routeFunder(
   const d = selectFunderTier(kind === ALPHA_KIND ? "coinbase" : kind, amountAtomic);
   if (!d.ok) return d;
   if (d.tier !== "T1" && amountAtomic > cap) return { ok: false, reason: "over_order_cap" };
+  // Stripe crypto links are paid with an EIP-2612 Permit: sequential nonces
+  // and a fresh deadline on every Stripe prepare. The phase 2b KMS T3B signer
+  // does not sign Permits yet (a signed but never-submitted Permit would hold
+  // its nonce and block every later one), so Stripe stays on the legacy
+  // funder on every backend for now. Its band is still T3B.
+  if (kind === "stripe") return { ok: true, wallet: "LEGACY" };
   return servedByLegacyFunder(d.tier, t3Backend)
     ? { ok: true, wallet: "LEGACY" }
     : { ok: true, wallet: d.tier };
