@@ -146,7 +146,7 @@ export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs, receiver: string 
 
 export type EnsureAlphaOrderResult =
   | { ok: true; state: 'cached' | 'existing' | 'created' | 'raced' }
-  | { ok: false; reason: 'lookup_failed' | 'create_failed' | 'retired_funder' | 'funder_tier' }
+  | { ok: false; reason: 'lookup_failed' | 'create_failed' | 'retired_funder' | 'funder_tier'; upstreamStatus?: number }
 
 export async function ensureAlphaBusinessOrder(
   env: Env,
@@ -239,5 +239,5 @@ export async function ensureAlphaBusinessOrder(
     return { ok: true, state: 'raced' }
   }
   console.warn('[tron-ton-alpha] business order create refused', res.status)
-  return { ok: false, reason: 'create_failed' }
+  return { ok: false, reason: 'create_failed', upstreamStatus: res.status }
 }

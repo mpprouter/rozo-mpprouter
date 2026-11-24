@@ -39,6 +39,7 @@ import { checkoutIntakePaused, checkoutIntakePausedResponse } from './checkout-c
 import { resolveCoinbaseLinkExpiry } from './create-invoice'
 import { isTestPaymentId, TEST_MERCHANT_NAME, verifyTestPaymentId } from './native-sources'
 import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
+import type { CreateFailureNote } from './create-failure-alert'
 import { forwardedClientHintHeader } from './client-hint-forward'
 import { readDeviceId } from './device-id-forward'
 import { attributionMetadata, buildOrderAttribution, forwardedAttributionField } from './order-attribution'
@@ -528,7 +529,13 @@ function listedShown(option: AlphaOptionDef, data: Record<string, any>): ShownOp
   }
 }
 
-export async function handleTronTonAlphaOption(request: Request, env: Env): Promise<Response> {
+export async function handleTronTonAlphaOption(
+  request: Request,
+  env: Env,
+  // Filled for the create-failure alert (create-failure-alert.ts); never
+  // changes the response.
+  note: CreateFailureNote = {},
+): Promise<Response> {
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.ROZO_INTENTS_API_KEY || !env.PAYINVOICE_ADMIN_SECRET) {
     return fail(500, 'SERVER_MISCONFIGURED', 'Router is not configured for TRON / TON payments.')
@@ -561,6 +568,10 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
 
   const option = findAlphaOption(parsed.network, parsed.token)
   const native = option === TON_NATIVE_OPTION
+  if (option) {
+    note.chainId = option.network
+    note.tokenSymbol = option.token
+  }
   if (!option) {
     return fail(400, 'UNSUPPORTED_SOURCE', 'Unsupported network or token.', {
       supported: ALPHA_OPTIONS.map((o) => ({ network: o.network, token: o.token })),
@@ -637,6 +648,7 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     return fail(502, 'QUOTE_FETCH_FAILED', 'Quote response is missing the invoice id, merchant or amount.')
   }
   const pricing = resolveCheckoutPricing(parseUsdcAtomic(amount), merchant, env.CHECKOUT_WEB_FEE_BPS)
+  note.invoiceAtomic = pricing.originalAtomic
   const upstreamBody = buildAlphaUpstreamBody(invoiceKey, pricing.originalAtomic, pricing.serviceFeeAtomic, option)
 
   const linkExpiresAtPromise: Promise<string | null> = testId !== null
@@ -660,6 +672,7 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     const mapped = (native ? NATIVE_UPSTREAM_ERRORS[reason] : undefined) ?? UPSTREAM_ERRORS[reason] ?? UPSTREAM_FALLBACK
     // Reason code only: never the upstream body, the link or the key.
     console.warn('[tron-ton-alpha] option refused', upstream.status, reason || 'unknown')
+    note.detail = `option_${upstream.status}_${reason || 'unknown'}`
     const message = native && reason === 'price_unavailable' ? TON_PRICE_UNAVAILABLE_MESSAGE : mapped.message
     return fail(mapped.status, mapped.code, message)
   }
@@ -704,6 +717,7 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   ).catch(() => ({ ok: false as const, reason: 'create_failed' as const }))
   if (!order.ok) {
     console.warn('[tron-ton-alpha] business order not ensured', order.reason)
+    note.detail = `business_order_${order.reason}${'upstreamStatus' in order && order.upstreamStatus ? `_${order.upstreamStatus}` : ''}`
     return fail(UPSTREAM_FALLBACK.status, UPSTREAM_FALLBACK.code, UPSTREAM_FALLBACK.message)
   }
 

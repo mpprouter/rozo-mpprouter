@@ -8,12 +8,20 @@
  * construction for the first mark). Uses Date.now(): in Workers the clock only
  * advances across I/O, which is exactly what these stages measure.
  */
+import type { CreateFailureNote } from '../routes/create-failure-alert'
+
 export class StageTimer {
   private readonly start: number
   private last: number
   private readonly entries: Array<[string, number]> = []
   /** `Server-Timing` of the upstream intents response, if it sent one. */
   upstreamServerTiming: string | null = null
+  /**
+   * What the request resolved to (source, invoice amount, provider), for the
+   * create-failure alert (routes/create-failure-alert.ts). Rides on the timer
+   * because the timer already reaches every create branch; never rendered.
+   */
+  readonly alertNote: CreateFailureNote = {}
 
   constructor(now: number = Date.now()) {
     this.start = now

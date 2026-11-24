@@ -31,6 +31,7 @@ import { indexStripeSession } from './stripe-session-index'
 import { checkCreateInvoiceGate } from './create-invoice-gate'
 import { checkoutIntakePaused, checkoutIntakePausedResponse } from './checkout-control'
 import { StageTimer } from '../utils/stage-timer'
+import { scheduleCreateFailureAlert } from './create-failure-alert'
 import { relayUpstreamRateLimit } from './upstream-rate-limit'
 import { intentsReadBase } from './intents-base'
 import { deviceIdField, readDeviceId } from './device-id-forward'
@@ -1649,6 +1650,9 @@ export async function handleCreateInvoice(request: Request, env: Env, ctx?: Exec
   }
   const upstreamTiming = relayableUpstreamTiming(timer.upstreamServerTiming)
   if (upstreamTiming) res.headers.set('X-Upstream-Server-Timing', upstreamTiming)
+  // System-side create failures alert Rozo Ops (deduped, after the response
+  // via waitUntil; the response is not changed).
+  scheduleCreateFailureAlert(env, ctx, 'create-invoice', res, timer.alertNote)
   return res
 }
 
@@ -1754,6 +1758,23 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     parsed && typeof parsed === 'object' && !Array.isArray(parsed) &&
     (parsed as Record<string, unknown>).provider === 'bitrefill'
   ) {
+    // For the create-failure alert only: the validated source (never raw
+    // input) and the amount, when they parse. The Bitrefill handler resolves
+    // and validates them itself.
+    timer.alertNote.provider = 'bitrefill'
+    try {
+      const brSource = resolveSource((parsed as Record<string, unknown>).source, ALL_NATIVE_SOURCES)
+      if (brSource.resolved) {
+        timer.alertNote.chainId = brSource.resolved.chainId
+        timer.alertNote.tokenSymbol = brSource.resolved.tokenSymbol
+      }
+      const brAmount = ((parsed as Record<string, any>).bitrefill as Record<string, unknown> | undefined)?.amount
+      if (typeof brAmount === 'string' && /^\d{1,12}(\.\d{1,6})?$/.test(brAmount)) {
+        timer.alertNote.invoiceAtomic = parseUsdc(brAmount)
+      }
+    } catch {
+      // Alert context only; the handler below answers the request.
+    }
     return handleBitrefillCreateInvoice(
       request,
       env,
@@ -1862,6 +1883,9 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
     } as CreateInvoiceError & { supported_sources?: Record<string, string[]> })
   }
   const source = sourceResult.resolved
+  timer.alertNote.chainId = source.chainId
+  timer.alertNote.tokenSymbol = source.tokenSymbol
+  timer.alertNote.provider = provider_detected === 'stripe_crypto' ? 'stripe_crypto' : 'coinbase'
   const nativeSource = isNativeSymbol(source.chainId, source.tokenSymbol)
   // On-chain BTC (chain 9000, Beta). Lightning BTC has chainId 'lightning' and
   // is never this; both are tokenSymbol 'BTC', so never branch on the symbol alone.
@@ -2268,6 +2292,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   let invoiceAtomic: bigint
   try {
     invoiceAtomic = parseUsdc(invoiceAmount)
+    timer.alertNote.invoiceAtomic = invoiceAtomic
   } catch (e: any) {
     return errorResponse(502, {
       code: 'QUOTE_FETCH_FAILED',
@@ -3565,6 +3590,7 @@ export async function handleStripeCreateInvoice(
   let invoiceAtomic: bigint
   try {
     invoiceAtomic = BigInt(invoice.stablecoinAmountAtomic)
+    if (timer) timer.alertNote.invoiceAtomic = invoiceAtomic
   } catch {
     return json(502, { ok: false, provider: 'stripe_crypto', error: 'Unparseable invoice amount.' })
   }
