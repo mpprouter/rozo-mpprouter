@@ -438,6 +438,24 @@ describe('paying from the receiving wallet', () => {
     expect(b).toMatchObject({ ok: true, tier: 'T3A', address: T3A, nominal: 'T2' })
   })
 
+  it('T2 boundary above the order cap (FUNDER_T2_MAX_USD="3500.000001", legacy backend): every order-backed Coinbase / alpha order goes to T2', () => {
+    const ALL_T2 = { ...TIER_ENV, FUNDER_T3_BACKEND: 'legacy', FUNDER_T2_MAX_USD: '3500.000001' }
+    for (const kind of ['coinbase', 'tron_ton_alpha']) {
+      for (const amt of [USD(2), USD(199.99), USD(200), USD(265.13), USD(CAP)]) {
+        expect(resolveFunder(ALL_T2, kind, amt), `${kind} ${amt}`).toMatchObject({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+        const pay = resolvePayingFunder(ALL_T2, kind, amt, T2)
+        expect(pay, `${kind} ${amt}`).toMatchObject({ ok: true, tier: 'T2', address: T2, warning: null })
+      }
+      expect(resolveFunder(ALL_T2, kind, USD(CAP) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    }
+    // Not order-backed Coinbase: unchanged (Bitrefill and Stripe on the legacy funder).
+    expect(resolveFunder(ALL_T2, 'bitrefill', USD(50))).toMatchObject({ ok: true, tier: 'legacy' })
+    expect(resolveFunder(ALL_T2, 'stripe', USD(50))).toMatchObject({ ok: true, tier: 'legacy' })
+    // Orders created earlier on the legacy funder or on T3A are still paid by them.
+    expect(resolvePayingFunder(ALL_T2, 'coinbase', USD(250), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy' })
+    expect(resolvePayingFunder(ALL_T2, 'coinbase', USD(265.13), T3A)).toMatchObject({ ok: true, tier: 'T3A' })
+  })
+
   it('router back on legacy with T3 addresses still configured: orders already on T3A / T3B are still paid by them; new orders route to legacy', () => {
     const FALLBACK = { ...TIER_ENV, FUNDER_T3_BACKEND: 'legacy' }
     const a = resolvePayingFunder(FALLBACK, 'coinbase', USD(265), T3A)
