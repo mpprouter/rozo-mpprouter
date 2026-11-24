@@ -1053,8 +1053,8 @@ describe('sweep adoption reads the tier wallet (FUNDER_TIERS_ENABLED)', () => {
 
   for (const [name, over, rec, want] of [
     ['flag off: legacy funder', {}, {}, '0x282be0c42e5c944b0285cec363117ab077cc084a'],
-    ['flag on: the tier for the charge ($1 -> T2)', TIERS, {}, T2.toLowerCase()],
-    ['flag on: the wallet stored on the record wins', TIERS, { funderAddress: '0x3000000000000000000000000000000000000003' }, '0x3000000000000000000000000000000000000003'],
+    ['flag on: the wallet stored on the record at send time', TIERS, { funderAddress: T2 }, T2.toLowerCase()],
+    ['flag off: a stored tier wallet still wins', {}, { funderAddress: '0x3000000000000000000000000000000000000003' }, '0x3000000000000000000000000000000000000003'],
   ] as const) {
     it(name, async () => {
       stubFetch({ coinbase: settledLink, rozo: payoutDone, funderTransfers: [1_000_000n] })
@@ -1067,9 +1067,9 @@ describe('sweep adoption reads the tier wallet (FUNDER_TIERS_ENABLED)', () => {
     })
   }
 
-  it('flag on with the tier missing: no chain read, left alone', async () => {
+  it('flag on, no wallet stored on the record (unknown payer): no chain read, left alone', async () => {
     stubFetch({ coinbase: settledLink, rozo: payoutDone, funderTransfers: [1_000_000n] })
-    const { env, kv } = makeEnv({ ...TIERS, FUNDER_T2_ADDRESS: undefined })
+    const { env, kv } = makeEnv(TIERS)
     await acquireCoinbaseExecGate(env, PL, 'evt-lost-write', new Date(Date.now() - 2 * MIN), ROZO_ID)
     seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
     await sweepCoinbaseFulfillments(env)

@@ -31,7 +31,7 @@ import { casUpdate } from './stripe-atomic'
 import { readCoinbaseExecGate } from './coinbase-exec-gate'
 import { funderTransferExists } from '../utils/funder-transfer'
 import { decimalToAtomic } from './invoice-provider'
-import { resolveFunder } from '../funder-address'
+import { funderTiersEnabled } from '../funder-address'
 import {
   type FulfillmentRecord,
   FUNDER_WALLET,
@@ -375,15 +375,16 @@ async function adoptLostSettlement(env: Env, plId: string, rec: FulfillmentRecor
   }
   if (amount <= 0n) return
   // The wallet that was asked to pay: the tier stored on the record at send
-  // time (FUNDER_TIERS_ENABLED), else the tier for this charge (legacy funder
-  // while the flag is off). No resolvable wallet: no adoption.
+  // time (written only while FUNDER_TIERS_ENABLED is on), else the legacy
+  // funder while the flag is off. Flag on and no stored wallet: the paying
+  // wallet is unknown (the record may predate the switch, or the write that
+  // stored it is exactly what was lost), so never infer it from the current
+  // config: no adoption, a human resolves it.
   let payer: string = FUNDER_WALLET
   if (rec.funderAddress && /^0x[0-9a-fA-F]{40}$/.test(rec.funderAddress)) {
     payer = rec.funderAddress
-  } else {
-    const funder = resolveFunder(env, 'coinbase', amount)
-    if (!funder.ok) return
-    payer = funder.address
+  } else if (funderTiersEnabled(env)) {
+    return
   }
   const paid = await funderTransferExists(payer, amount, gateMs, GATE_TRANSFER_WINDOW_MS, env.BASE_RPC_URL)
   if (paid !== true) return
