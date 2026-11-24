@@ -21,8 +21,13 @@ Bitrefill invoice amount, 6 decimals), not the caller's fee-inclusive price.
 | `coinbase` | < $200 | T2 |
 | `coinbase` | >= $200 | T3A |
 | `stripe`, `bitrefill`, `other` | any | T3B |
-| `tron_ton_alpha` (phase 2a) | < $200 / >= $200 | T2 / legacy funder |
+| `tron_ton_alpha` | < $200 / >= $200 | T2 / T3A (legacy funder in phase 2a) |
 | anything else | | refused |
+
+Payments with no intents order (coupon, UPI, admin pay) use
+`resolveNoOrderFunder` (`routeNoOrderFunder`, mirrored): the same table,
+except that T3A / T3B become the legacy funder, because the phase 2b KMS T3
+signer only signs against a paid-out intents order received by its wallet.
 
 Tier bands have no upper bound (founder 2026-11-24). The order cap is a
 separate refuse-check (`over_order_cap`) applied after the band to every
@@ -58,7 +63,11 @@ All plain `[vars]` (public addresses), commented out in `wrangler.toml`:
   read or required. T1 / T2 may still not equal the legacy funder. Refusals
   (unknown kind, non-positive, above the cap) are unchanged.
 - **Phase 2b** (`FUNDER_T3_BACKEND` anything else, e.g. unset): T3A / T3B are
-  their own wallets and must be configured.
+  their own wallets and must be configured. The legacy funder is never a new
+  order's destination, but stays a paying wallet: orders created before the
+  switch with the legacy destination are paid by it until they drain, and
+  no-order T3-sized payments are paid by it (signer: while its `PRIVATE_KEY`
+  is set). It stays in the balance watch.
 
 With the flag on, Coinbase and Stripe settles also send `rozo_payment_id`
 (the intents order whose payout went to the selected wallet) so a T3 signer
@@ -83,8 +92,7 @@ Balance check, `expected_funder` and the expected signer follow that wallet.
   `funder_tier_range_warning` log line and an ops alert (order, wallet,
   amount, nominal wallet). It never blocks the payout.
 - Still refused: a destination that is not a configured paying wallet
-  (unknown, retired, blocklisted, unconfigured tier, or the legacy funder
-  outside phase 2a), amount above the order cap (`ORDER_CAP_USD`) or not positive, an
+  (unknown, retired, blocklisted, or an unconfigured tier), amount above the order cap (`ORDER_CAP_USD`) or not positive, an
   unknown kind, order money in T1, x402 outside T1 or above $5.
 - Balance caps (T1 50, T2 200, T3B 2,000 USDC) are alert-only in the router
   (balance watch); nothing refuses a payout for a balance above a cap. The
@@ -119,9 +127,9 @@ Cross-checks:
    merchant row. It must route per amount to T2 / T3A (and Stripe / Bitrefill
    to T3B) before this flag is on, otherwise every order is refused by the
    receiver cross-check (fail closed, but nothing can be paid).
-3. Drain or pause in-flight orders that pay out to the legacy funder: after
-   the switch their settlement is refused (receiver mismatch) and needs a
-   human.
+3. In-flight orders that pay out to the legacy funder keep being paid by it
+   after the switch (recorded destination decides). Keep the signer's
+   `PRIVATE_KEY` and the legacy funder's balance until they have drained.
 4. TRON / TON alpha: routed with kind `tron_ton_alpha` (`routeFunder`). An
    order the alpha route created (`metadata.source` =
    `mpprouter-tron-ton-alpha`) is, in phase 2a, created with the payout
@@ -133,13 +141,13 @@ Cross-checks:
    by the legacy funder (a range warning, not a refusal). Its settle sends
    `payment_kind: "tron_ton_alpha"` with `expected_funder` (that wallet) and
    `rozo_payment_id`; the signer's `verifyAlphaOrder` accepts an alpha order
-   paying out to the legacy funder or T2. The upstream allocation digest's
+   paying out to the legacy funder, T2 or T3A. The upstream allocation digest's
    `destination` (`ALPHA_DESTINATION`) stays the legacy funder on purpose:
    merchant_openrouter is on the upstream legacy list, where it is a digest
    fact only, and changing it would break re-reads of options allocated
    before a deploy. A main-checkout order that a TRON / TON payment lands on
-   stays a plain Coinbase order. In phase 2b alpha is refused
-   (`ALPHA_FUNDER_TIERS_PAUSED`, reason `alpha_paused`). If merchant_openrouter
+   stays a plain Coinbase order. In phase 2b alpha is routed like Coinbase
+   (T2 below $200, T3A from $200; no longer paused). If merchant_openrouter
    ever leaves the upstream legacy list (bound lane or Base route), those
    lanes compare `destination` with the business order's receiver, and
    `ALPHA_DESTINATION` must then follow the order instead.

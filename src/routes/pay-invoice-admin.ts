@@ -32,7 +32,7 @@ import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead, casUpdate } from './stripe-atomic'
 import { fetchRozoPaymentById, isFunderTierMismatch, loadRecord } from './webhook'
-import { funderRefusalMessage, funderRefusalStatus, funderTiersEnabled, resolveFunder } from '../funder-address'
+import { funderRefusalMessage, funderRefusalStatus, funderTiersEnabled, resolveNoOrderFunder } from '../funder-address'
 import {
   fetchCoinbasePayment as fetchCoinbaseInvoicePayload,
   normalizeCoinbasePayment,
@@ -698,7 +698,8 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
         link_id_detected,
       })
     }
-    const funder = resolveFunder(env, 'coinbase', chargeAtomic)
+    // No intents order: resolveNoOrderFunder (phase 2b: T3-sized -> legacy funder).
+    const funder = resolveNoOrderFunder(env, 'coinbase', chargeAtomic)
     if (!funder.ok) {
       return errorResponse(funderRefusalStatus(funder.reason), {
         code: 'FUNDER_TIER_REFUSED',

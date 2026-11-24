@@ -169,7 +169,7 @@ describe('Coinbase create-invoice', () => {
     expect(r.json.code).toBe('FUNDER_TIER_RECEIVER_MISMATCH')
   })
 
-  it('flag on: a reusable order paying the legacy funder is never reused', async () => {
+  it('flag on, 2b: an unpaid order created before the switch (legacy destination) is still reused; the legacy funder pays it', async () => {
     existingRow = {
       id: 'rozo-old',
       orderId: PAYMENT_ID,
@@ -180,6 +180,19 @@ describe('Coinbase create-invoice', () => {
     }
     const off = await create({ payment_id: PAYMENT_ID })
     expect(off.json.reused).toBe(true)
+    const on = await create({ payment_id: PAYMENT_ID }, makeEnv(TIERS))
+    expect(on.json.reused).toBe(true)
+  })
+
+  it('flag on: a reusable order paying a non-funder wallet is never reused', async () => {
+    existingRow = {
+      id: 'rozo-old',
+      orderId: PAYMENT_ID,
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10.5' },
+      destination: { chainId: '8453', receiverAddress: '0x9999999999999999999999999999999999999999' },
+    }
     const on = await create({ payment_id: PAYMENT_ID }, makeEnv(TIERS))
     expect(on.json.reused).not.toBe(true)
     expect(on.json.paymentLink ?? null).not.toBe('rozo-old')
@@ -245,19 +258,14 @@ describe('Stripe create-invoice', () => {
 })
 
 describe('TRON / TON alpha', () => {
-  it('flag on: capability lists nothing and option is refused before anything upstream', async () => {
+  it('flag on, phase 2b: alpha is no longer paused (a bad request is judged on its merits, not refused as paused)', async () => {
     const env = makeEnv(TIERS)
-    const cap = await handleTronTonAlphaCapability(new Request('https://mpp.test/cap'), env)
-    expect(await cap.json()).toEqual({ ok: true, enabled: false, options: [] })
-    const fetchSpy = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
-    const before = fetchSpy.mock.calls.length
     const opt = await handleTronTonAlphaOption(
       new Request('https://mpp.test/opt', { method: 'POST', body: '{}', headers: { 'content-type': 'application/json' } }),
       env,
     )
-    expect(opt.status).toBe(503)
-    expect(((await opt.json()) as any).code).toBe('ALPHA_FUNDER_TIERS_PAUSED')
-    expect(fetchSpy.mock.calls.length).toBe(before)
+    expect(((await opt.json()) as any).code).not.toBe('ALPHA_FUNDER_TIERS_PAUSED')
+    expect(opt.status).not.toBe(503)
   })
 })
 

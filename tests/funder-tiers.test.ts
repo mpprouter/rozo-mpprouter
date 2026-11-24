@@ -10,6 +10,7 @@ import {
   parseUsdcAtomic,
   payFromReceivingWallet,
   routeFunder,
+  routeNoOrderFunder,
   selectFunderTier,
   servedByLegacyFunder,
 } from '../src/funder-tiers'
@@ -25,6 +26,7 @@ import {
   funderTiersEnabled,
   isAnyConfiguredFunderTier,
   resolveFunder,
+  resolveNoOrderFunder,
   resolvePayingFunder,
 } from '../src/funder-address'
 import { EVM_BLOCKED_ADDRESSES } from '../src/evm-blocked-addresses'
@@ -197,18 +199,21 @@ describe('resolveFunder, flag on', () => {
     expect(resolveFunder(env, 'coinbase', USD(50))).toMatchObject({ ok: true, address: T2 })
   })
 
-  it('configuredFunderWallets lists all four tiers, gaps with a reason', () => {
+  it('configuredFunderWallets lists all four tiers, gaps with a reason, and the legacy funder (phase 2b drain)', () => {
     expect(configuredFunderWallets(TIER_ENV)).toEqual([
       { tier: 'T1', address: T1 },
       { tier: 'T2', address: T2 },
       { tier: 'T3A', address: T3A },
       { tier: 'T3B', address: T3B },
+      // Still pays legacy-destination orders and no-order T3-sized payments: watched.
+      { tier: 'legacy', address: BASE_FUNDER_ADDRESS },
     ])
     expect(configuredFunderWallets({ ...TIER_ENV, FUNDER_T1_ADDRESS: undefined })[0]).toEqual({
       tier: 'T1', address: null, reason: 'tier_address_missing',
     })
     expect(isAnyConfiguredFunderTier(TIER_ENV, T3B.toUpperCase().replace('0X', '0x'))).toBe(true)
-    expect(isAnyConfiguredFunderTier(TIER_ENV, BASE_FUNDER_ADDRESS)).toBe(false)
+    // The legacy funder is a funder wallet too: never a Bitrefill receiver.
+    expect(isAnyConfiguredFunderTier(TIER_ENV, BASE_FUNDER_ADDRESS)).toBe(true)
   })
 })
 
@@ -269,7 +274,7 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
     }
   })
 
-  it('alpha (new order) in 2a: below $200 -> T2, $200 to $1,200 -> legacy, above refused; paused when the backend is not legacy', () => {
+  it('alpha (new order) in 2a: below $200 -> T2, $200 to $1,200 -> legacy, above refused; 2b: like Coinbase (T3A from $200)', () => {
     expect(resolveFunder(P2A, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
     expect(resolveFunder(P2A, 'tron_ton_alpha', USD(199.99))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
     expect(resolveFunder(P2A, 'tron_ton_alpha', USD(200))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
@@ -279,8 +284,13 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
     // T2 not configured: an alpha order below $200 is refused (no fallback to legacy).
     expect(resolveFunder({ ...P2A, FUNDER_T2_ADDRESS: undefined }, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'tier_address_missing', tier: 'T2' })
     expect(resolveFunder(P2A, 'coinbase', USD(20))).toMatchObject({ ok: true, address: T2 })
-    expect(resolveFunder({ ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'alpha_paused', tier: null })
-    expect(resolveFunder(TIER_ENV, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'alpha_paused', tier: null })
+    const ISO2B = { ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }
+    expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+    expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(200))).toEqual({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A })
+    expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(1200))).toMatchObject({ ok: true, address: T3A })
+    expect(resolveFunder(ISO2B, 'tron_ton_alpha', USD(1200) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    expect(resolveFunder({ ...ISO2B, FUNDER_T3A_ADDRESS: undefined }, 'tron_ton_alpha', USD(300))).toEqual({ ok: false, reason: 'tier_address_missing', tier: 'T3A' })
+    expect(resolveFunder(TIER_ENV, 'tron_ton_alpha', USD(20))).toMatchObject({ ok: true, address: T2 })
     // Flag off: legacy as always.
     expect(resolveFunder({}, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: undefined })
     expect(resolveFunder({ FUNDER_T2_ADDRESS: T2, FUNDER_T3_BACKEND: 'legacy' }, 'tron_ton_alpha', USD(20))).toEqual({
@@ -376,9 +386,24 @@ describe('paying from the receiving wallet', () => {
     expect(b).toMatchObject({ ok: true, tier: 'T3A', address: T3A, nominal: 'T2' })
   })
 
-  it('phase 2a: the legacy funder is a paying wallet ($50 -> legacy with a warning); in 2b it is not', () => {
+  it('the legacy funder is a paying wallet in 2a and, for orders created before the switch, in 2b (drain)', () => {
     expect(resolvePayingFunder(P2A, 'coinbase', USD(50), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, nominal: 'T2' })
-    expect(resolvePayingFunder(ISO, 'coinbase', USD(50), BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
+    for (const kind of ['coinbase', 'stripe', 'bitrefill', 'tron_ton_alpha']) {
+      for (const amt of [USD(50), USD(250), USD(1200)]) {
+        const r = resolvePayingFunder(ISO, kind, amt, BASE_FUNDER_ADDRESS)
+        expect(r, `${kind} ${amt}`).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
+        // Never the nominal wallet of a NEW order (2b never routes to legacy): always a warning.
+        expect(r.ok && typeof r.warning === 'string', `${kind} ${amt}`).toBe(true)
+      }
+    }
+    expect(resolvePayingFunder(ISO, 'coinbase', USD(1200) + 1n, BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    // 2b never routes a NEW order to the legacy funder.
+    for (const kind of ['coinbase', 'stripe', 'bitrefill', 'tron_ton_alpha']) {
+      for (const amt of [USD(50), USD(250), USD(1200)]) {
+        const n = resolveFunder(ISO, kind, amt)
+        expect(n.ok && n.address !== BASE_FUNDER_ADDRESS, `${kind} ${amt}`).toBe(true)
+      }
+    }
     // A T3 address left over in 2a is not a paying wallet (T3 is the legacy funder).
     expect(resolvePayingFunder({ ...P2A, FUNDER_T3A_ADDRESS: T3A }, 'coinbase', USD(300), T3A)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
   })
@@ -391,6 +416,31 @@ describe('paying from the receiving wallet', () => {
     expect(resolvePayingFunder(ISO, 'x402', USD(1), T2)).toEqual({ ok: false, reason: 'wrong_wallet_for_kind', tier: null })
     expect(resolvePayingFunder(ISO, 'coinbase', USD(1200) + 1n, T3A)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
     expect(resolvePayingFunder({ ...ISO, FUNDER_T3A_ADDRESS: undefined }, 'coinbase', USD(300), T3A)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
+  })
+})
+
+describe('payments with no intents order (coupon, UPI, admin pay)', () => {
+  it('mirrored noOrder vectors', () => {
+    for (const v of (vectors as any).noOrder as Array<{ kind: string; amount: string; backend: string | null; expect: string; cap?: string }>) {
+      const r = routeNoOrderFunder(v.kind, BigInt(v.amount), v.backend ?? undefined, v.cap === undefined ? TEST_CAP : BigInt(v.cap))
+      expect(r.ok ? r.wallet : `refuse:${r.reason}`, JSON.stringify(v)).toBe(v.expect)
+    }
+  })
+
+  it('resolveNoOrderFunder: 2b T3-sized -> legacy funder (KMS T3 needs an order); T2 unchanged; 2a and flag off = resolveFunder', () => {
+    const ISO = { ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }
+    const LEG = { ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS }
+    expect(resolveNoOrderFunder(ISO, 'coinbase', USD(250))).toEqual(LEG)
+    expect(resolveNoOrderFunder(ISO, 'stripe', USD(20))).toEqual(LEG)
+    expect(resolveNoOrderFunder(ISO, 'coinbase', USD(20))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+    expect(resolveNoOrderFunder(ISO, 'coinbase', USD(1200) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    // The T3 addresses are not needed for no-order payments.
+    expect(resolveNoOrderFunder({ ...ISO, FUNDER_T3A_ADDRESS: undefined }, 'coinbase', USD(250))).toEqual(LEG)
+    const P2A = { ...TIER_ENV, FUNDER_T3_BACKEND: 'legacy' }
+    for (const [k, a] of [['coinbase', USD(250)], ['coinbase', USD(20)], ['stripe', USD(20)]] as const) {
+      expect(resolveNoOrderFunder(P2A, k, a)).toEqual(resolveFunder(P2A, k, a))
+      expect(resolveNoOrderFunder({}, k, a)).toEqual(resolveFunder({}, k, a))
+    }
   })
 })
 

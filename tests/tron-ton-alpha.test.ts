@@ -1206,11 +1206,10 @@ describe('tron-ton-alpha with tiered funders', () => {
     expect(on).toEqual(off)
   })
 
-  it('phase 2b (backend not legacy): option refused before anything upstream', async () => {
+  it('phase 2b (backend not legacy): alpha is offered again (not paused)', async () => {
     const r = await run(makeEnv({ ...TIERS, FUNDER_T3_BACKEND: 'isolated' } as Partial<Env>))
-    expect(r.status).toBe(503)
-    expect(r.body.code).toBe('ALPHA_FUNDER_TIERS_PAUSED')
-    expect(up.calls).toHaveLength(0)
+    expect(r.body.code).not.toBe('ALPHA_FUNDER_TIERS_PAUSED')
+    expect(up.calls.length).toBeGreaterThan(0)
   })
 
   it('phase 2a: an existing main-checkout $20 order paying any paying wallet (legacy or T2) is used; a non-tier receiver shows no instructions', async () => {

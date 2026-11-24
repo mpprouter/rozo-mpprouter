@@ -29,6 +29,7 @@ import {
 import { handleStripeWebhookEvent, seedStripeRecord } from '../src/routes/stripe-fulfillment'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 import type { Env } from '../src/index'
+import { BASE_FUNDER_ADDRESS } from '../src/funder-address'
 import { boundRozoOrder } from './helpers/coinbase-binding'
 
 // ── Fixtures ────────────────────────────────────────────────────────────────
@@ -850,11 +851,12 @@ describe('verified-pay-in — tiered funders', () => {
     expect(world.payCalls[0].body).toEqual({ payment_id: 'paymentSession_xyz789', expected_funder: T2 })
   })
 
-  it('flag on, Stripe: expected_funder is T3B', async () => {
+  it('flag on, Stripe: expected_funder is the legacy funder (no intents order; the KMS T3B signer needs one)', async () => {
     const env = makeEnv(TIERS)
     const { body: q } = await resolve(env, STRIPE_URL)
     await payIn(env, payInBody(q))
-    expect(world.payCalls[0].body.expected_funder).toBe(T3B)
+    expect(world.payCalls[0].body.expected_funder).toBe(BASE_FUNDER_ADDRESS)
+    expect(T3B).not.toBe(BASE_FUNDER_ADDRESS)
   })
 
   it('flag on, missing tier: definite failure, executor never called', async () => {

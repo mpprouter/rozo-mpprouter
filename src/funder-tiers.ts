@@ -57,8 +57,7 @@ export type FunderTierRefusal =
   | "invalid_amount"
   | "unknown_kind"
   | "over_tier_cap"
-  | "over_order_cap"
-  | "alpha_paused";
+  | "over_order_cap";
 
 export type FunderTierDecision =
   | { ok: true; tier: FunderTier }
@@ -143,19 +142,16 @@ export function servedByLegacyFunder(
 /**
  * TRON / TON alpha orders: Coinbase invoices paid with TRON / TON. Their
  * intents business order is created by rozo-mpprouter's alpha route, and its
- * payout destination is the wallet chosen here for a NEW order (founder
- * 2026-11-24: alpha below $200 is received and paid by T2, exactly like an
- * ordinary Coinbase order below $200):
+ * payout destination is the wallet chosen here for a NEW order. It is routed
+ * exactly like an ordinary Coinbase invoice of the same amount (founder
+ * 2026-11-24: alpha below $200 -> T2; phase 2b: alpha from $200 -> T3A):
  *   above the order cap: refuse "over_order_cap" (any backend)
- *   phase 2a (t3Backend "legacy"):
- *     amount <  T2_MAX_EXCLUSIVE_ATOMIC  -> T2
- *     amount >= T2_MAX_EXCLUSIVE_ATOMIC  -> LEGACY
- *   any other backend (phase 2b): refuse "alpha_paused" until alpha
- *                                 destinations are handled.
+ *   amount <  T2_MAX_EXCLUSIVE_ATOMIC  -> T2
+ *   amount >= T2_MAX_EXCLUSIVE_ATOMIC  -> T3A (LEGACY while t3Backend "legacy")
  * This only routes NEW orders. An order whose money already landed is paid by
  * the wallet it actually paid out to (payFromReceivingWallet), so an alpha
- * order created before this rule (legacy destination, any amount) is still
- * paid by LEGACY.
+ * order created with the legacy destination is still paid by LEGACY after the
+ * switch to phase 2b.
  */
 export const ALPHA_KIND = "tron_ton_alpha";
 
@@ -180,22 +176,33 @@ export function routeFunder(
   orderCapAtomic: bigint,
 ): FunderRoute {
   const cap = effectiveOrderCap(orderCapAtomic);
-  if (kind === ALPHA_KIND) {
-    if (typeof amountAtomic !== "bigint" || amountAtomic <= 0n) {
-      return { ok: false, reason: "invalid_amount" };
-    }
-    if (amountAtomic > cap) return { ok: false, reason: "over_order_cap" };
-    if (t3Backend !== T3_LEGACY_BACKEND) return { ok: false, reason: "alpha_paused" };
-    return amountAtomic < T2_MAX_EXCLUSIVE_ATOMIC
-      ? { ok: true, wallet: "T2" }
-      : { ok: true, wallet: "LEGACY" };
-  }
-  const d = selectFunderTier(kind, amountAtomic);
+  // Alpha routes exactly like a Coinbase invoice of the same amount.
+  const d = selectFunderTier(kind === ALPHA_KIND ? "coinbase" : kind, amountAtomic);
   if (!d.ok) return d;
   if (d.tier !== "T1" && amountAtomic > cap) return { ok: false, reason: "over_order_cap" };
   return servedByLegacyFunder(d.tier, t3Backend)
     ? { ok: true, wallet: "LEGACY" }
     : { ok: true, wallet: d.tier };
+}
+
+/**
+ * Payments that have NO intents order (coupon, UPI, admin pay): company money
+ * paid out against an invoice, not order money that landed in a wallet. The
+ * T3 wallets of phase 2b are signed by a KMS signer that only signs against a
+ * paid-out intents order received by that wallet, so they cannot pay these.
+ * Same as routeFunder, except that a T3A / T3B result becomes LEGACY (the
+ * legacy single funder keeps paying them, exactly as in phase 2a). Refusals
+ * and T1 / T2 results are unchanged. Phase 2a: identical to routeFunder.
+ * Never use this to pick a NEW order's destination (that is routeFunder).
+ */
+export function routeNoOrderFunder(
+  kind: string,
+  amountAtomic: bigint,
+  t3Backend: string | undefined,
+  orderCapAtomic: bigint,
+): FunderRoute {
+  const r = routeFunder(kind, amountAtomic, t3Backend, orderCapAtomic);
+  return r.ok && (r.wallet === "T3A" || r.wallet === "T3B") ? { ok: true, wallet: "LEGACY" } : r;
 }
 
 /**

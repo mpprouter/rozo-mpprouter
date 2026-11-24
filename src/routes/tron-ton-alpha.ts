@@ -42,22 +42,13 @@ import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
 import { forwardedClientHintHeader } from './client-hint-forward'
 import { readDeviceId } from './device-id-forward'
 import { attributionMetadata, buildOrderAttribution, forwardedAttributionField } from './order-attribution'
-import { BASE_FUNDER_ADDRESS, funderTiersEnabled } from '../funder-address'
-import { T3_LEGACY_BACKEND } from '../funder-tiers'
+import { BASE_FUNDER_ADDRESS } from '../funder-address'
 
-/** Error code of every TRON / TON option in phase 2b (see alphaPausedByFunderTiers). */
-export const ALPHA_FUNDER_TIERS_PAUSED = 'ALPHA_FUNDER_TIERS_PAUSED'
-
-/**
- * Tiered funders: phase 2a (FUNDER_T3_BACKEND="legacy") routes a new alpha
- * order's business order (its payout destination) by routeFunder, kind
- * tron_ton_alpha: T2 below $200, the legacy funder from $200 to the cap
- * (tron-ton-alpha-order.ts). Any other backend (phase 2b) refuses alpha orders
- * ("alpha_paused"): no option is opened or re-read.
- */
-export function alphaPausedByFunderTiers(env: { FUNDER_TIERS_ENABLED?: string; FUNDER_T3_BACKEND?: string }): boolean {
-  return funderTiersEnabled(env) && env.FUNDER_T3_BACKEND !== T3_LEGACY_BACKEND
-}
+// Tiered funders: a new alpha order's business order (its payout destination)
+// is routed by routeFunder, kind tron_ton_alpha, exactly like a Coinbase
+// invoice of the same amount: T2 below $200; from $200 the legacy funder in
+// phase 2a (FUNDER_T3_BACKEND="legacy") and T3A in phase 2b
+// (tron-ton-alpha-order.ts). Alpha is offered on every backend.
 
 export const TRON_TON_ALPHA_CAPABILITY_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/capability'
 export const TRON_TON_ALPHA_OPTION_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/option'
@@ -384,8 +375,6 @@ export function probeTonNative(env: Env, fetchImpl: typeof fetch = fetch): Promi
 export async function handleTronTonAlphaCapability(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'GET') return json(405, { error: 'Method not allowed' })
   if (!env.ROZO_INTENTS_API_KEY) return json(200, { ok: true, enabled: false, options: [] })
-  // Tiered funders, phase 2b: TRON / TON are not offered (alphaPausedByFunderTiers).
-  if (alphaPausedByFunderTiers(env)) return json(200, { ok: true, enabled: false, options: [] })
   const [enabled, tonNative] = await Promise.all([probeTronTonAlpha(env), probeTonNative(env)])
   const options: Array<AlphaOptionDef & { beta?: true }> = enabled ? ALPHA_OPTIONS.map((o) => ({ ...o })) : []
   // Native TON is listed last, marked Beta, and only inside an open alpha.
@@ -544,13 +533,6 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   if (!env.ROZO_INTENTS_API_KEY || !env.PAYINVOICE_ADMIN_SECRET) {
     return fail(500, 'SERVER_MISCONFIGURED', 'Router is not configured for TRON / TON payments.')
   }
-  // Tiered funders, phase 2b: no TRON / TON option is opened or re-read
-  // (alphaPausedByFunderTiers). Phase 2a and flag off: unchanged. Before
-  // anything upstream.
-  if (alphaPausedByFunderTiers(env)) {
-    return fail(503, ALPHA_FUNDER_TIERS_PAUSED, 'TRON / TON payments are temporarily unavailable. Pay with another coin.')
-  }
-
   // Coarse per-IP / global volume cap with its OWN counters (codex P2): the
   // pages re-read the option every 30 s while waiting, and those reads must
   // never spend create-invoice's hourly budget. A new option still allocates

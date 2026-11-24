@@ -601,14 +601,24 @@ describe('handleStripeWebhookEvent: tiered funders', () => {
     expect(seen.balanceOf).toEqual([LEGACY.toLowerCase()])
   })
 
-  it('flag on: order paid to the legacy funder -> manual_review, nothing signed', async () => {
+  it('flag on: order paid to a non-funder wallet -> manual_review, nothing signed', async () => {
     const env = makeEnv({ extra: TIERS })
     await seed(env)
-    const seen = upstream(LEGACY)
+    const seen = upstream('0x9999999999999999999999999999999999999999')
     const s = await handleStripeWebhookEvent(env, evt('t-mm'), new Date(Date.UTC(2026, 6, 12)))
     expect(s.status).toBe('manual_review')
     expect(seen.payBodies).toHaveLength(0)
     expect((await loadRec(env, 'cpis_tier')).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
+  })
+
+  it('flag on, phase 2b: an order created before the switch (legacy destination) is paid by the legacy funder', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const env = makeEnv({ extra: TIERS })
+    await seed(env)
+    const seen = upstream(LEGACY)
+    const s = await handleStripeWebhookEvent(env, evt('t-leg'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.status).toBe('provider_submitted')
+    expect(seen.payBodies[0].expected_funder).toBe(LEGACY)
   })
 
   it('flag on: a Stripe order that paid out to T2 is paid by T2 (range warning, not blocked)', async () => {
