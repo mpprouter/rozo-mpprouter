@@ -154,11 +154,19 @@ export async function ensureAlphaBusinessOrder(
   const tierOn = funderTiersEnabled(env)
   const alphaFunder = resolveFunder(env, FUNDER_ALPHA_KIND, a.pricing.originalAtomic)
   if (!alphaFunder.ok) return { ok: false, reason: 'funder_tier' }
-  // An alpha-created order must pay out to that wallet. An order the main
-  // checkout created is a plain Coinbase order and carries its own tier.
-  const wrongAlphaReceiver = (row: unknown) =>
-    tierOn && isTronTonAlphaOrder(row) && paysOtherThanTier(row, alphaFunder.expectedFunder)
-  const marker = alphaOrderMarkerKey(a.invoiceKey)
+  // Flag on, an existing order must pay out to the wallet its settlement
+  // will select: an alpha-created order to the alpha wallet, a main-checkout
+  // order to the Coinbase tier for this invoice amount (an order created
+  // before the switch may pay another wallet; no instructions lead into it).
+  const coinbaseFunder = resolveFunder(env, 'coinbase', a.pricing.originalAtomic)
+  const wrongAlphaReceiver = (row: unknown) => {
+    if (!tierOn) return false
+    if (isTronTonAlphaOrder(row)) return paysOtherThanTier(row, alphaFunder.expectedFunder)
+    return !coinbaseFunder.ok || paysOtherThanTier(row, coinbaseFunder.expectedFunder)
+  }
+  // Flag on: a separate marker, so a marker cached while the flag was off
+  // (whose order was never receiver-checked) cannot skip the check above.
+  const marker = alphaOrderMarkerKey(a.invoiceKey) + (tierOn ? ':tiers' : '')
   const cached = await env.MPP_STORE.get(marker).catch(() => null)
   if (cached) return { ok: true, state: 'cached' }
   // The order exists: store its link, and cache that only once the link is in.

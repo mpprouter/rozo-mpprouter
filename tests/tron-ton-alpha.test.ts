@@ -1136,6 +1136,34 @@ describe('tron-ton-alpha with tiered funders', () => {
     expect(up.calls).toHaveLength(0)
   })
 
+  it('phase 2a: an existing main-checkout $20 order paying the legacy funder shows no instructions; one paying T2 does', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const row = (receiver: string) => ({
+      id: 'b0000000-0000-4000-8000-000000000002', orderId: PL, status: 'payment_unpaid',
+      destination: { chainId: '8453', receiverAddress: receiver }, metadata: { source: 'mpprouter-create-invoice' },
+    })
+    intents.lookup = () => new Response(JSON.stringify(row(ALPHA_DESTINATION.receiverAddress)), { status: 200 })
+    let r = await run(makeEnv(P2A))
+    expect(r.status).toBe(502)
+    expect(r.body.receivingAddress).toBeUndefined()
+    resetTronTonAlphaCapabilityCache()
+    intents.lookup = () => new Response(JSON.stringify(row('0x2000000000000000000000000000000000000002')), { status: 200 })
+    r = await run(makeEnv(P2A))
+    expect(r.status).toBe(200)
+  })
+
+  it('phase 2a: a marker cached while the flag was off does not skip the receiver check', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const env = makeEnv(P2A)
+    await env.MPP_STORE.put(alphaOrderMarkerKey(PL), '1')
+    intents.lookup = () => new Response(JSON.stringify({
+      id: 'b0000000-0000-4000-8000-000000000002', orderId: PL, status: 'payment_unpaid',
+      destination: { chainId: '8453', receiverAddress: ALPHA_DESTINATION.receiverAddress }, metadata: { source: 'mpprouter-create-invoice' },
+    }), { status: 200 })
+    const r = await run(env)
+    expect(r.status).toBe(502)
+  })
+
   it('phase 2a: a created business order paying another wallet shows no instructions', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
