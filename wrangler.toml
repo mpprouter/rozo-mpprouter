@@ -165,9 +165,16 @@ BITREFILL_ENABLED = "true"
 FUNDER_TIERS_ENABLED = "true"
 FUNDER_T1_ADDRESS = "0xCf7d0149De9d57C1B5c5fc52B917aA6817E50242"   # x402 only (sign-x402), <= $5 per payment
 FUNDER_T2_ADDRESS = "0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3"   # Coinbase invoices below $200
-# FUNDER_T3A_ADDRESS = "0x..."  # phase 2b only: Coinbase invoices $200 to $1,200
-# FUNDER_T3B_ADDRESS = "0x..."  # phase 2b only: Stripe, Bitrefill, other, up to $1,200
-FUNDER_T3_BACKEND = "legacy"  # phase 2a: T3A/T3B served by the legacy funder (T3 addresses not needed)
+# Phase 2b (infra/tier-signer CUTOVER-2B.md in shawn-local-skills): T3A / T3B
+# are the AWS KMS wallets signed by the rozo-tier-signer Lambda. Deploy this
+# ONLY after the signer project runs FUNDER_T3_BACKEND=isolated (signer first:
+# a router on 2b with a signer still on legacy would route money to T3A that
+# nobody can pay). Stripe stays on the legacy funder on every backend. Orders
+# created before the switch keep their legacy destination and are paid by it.
+# Rollback: FUNDER_T3_BACKEND = "legacy", re-comment the two addresses, deploy.
+FUNDER_T3A_ADDRESS = "0xE6EB895a29BACF821BD092B4aEBEcEb3480CE4DB"  # Coinbase invoices and TRON / TON alpha from $200 (KMS, alias/rozo-funder-t3a)
+FUNDER_T3B_ADDRESS = "0xa83cf24b0ccfA23d080E2045cc44ac4616aB8132"  # Bitrefill and other (KMS, alias/rozo-funder-t3b); not Stripe
+FUNDER_T3_BACKEND = "isolated"  # phase 2b: KMS T3 signer (signer project must already be on "isolated")
 # Hostname suffix for router-hosted paywalls (services/provider-hosting.ts).
 PROVIDER_HOSTED_SUFFIX = "-pay.mpprouter.dev"
 # Default checkout fee. checkout.rozo.ai and the existing agent.rozo.ai use
