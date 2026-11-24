@@ -13,7 +13,9 @@ import { handleCreateInvoice, nativeQuoteFields, resolveSource } from '../src/ro
 import { handleQuoteInvoice } from '../src/routes/pay-invoice-admin'
 import {
   ALL_NATIVE_SOURCES,
+  ORDER_CAP_USD,
   STABLE_SOURCES,
+  ZEC_MAX_USD,
   nativeMaxUsd,
   nativeMaxUsdBySource,
   nativeMaxUsdFor,
@@ -196,42 +198,46 @@ describe('create-invoice with a native source', () => {
     expect(createdIntent).toBeNull()
   })
 
-  it('defaults the native cap to $12,750 incl. fee (founder 2026-11-18, 12,000 credits)', () => {
-    expect(nativeMaxUsd(undefined)).toBe(12750)
-    expect(nativeMaxUsd('')).toBe(12750)
-    expect(nativeMaxUsd('garbage')).toBe(12750)
-    expect(nativeMaxUsd('0')).toBe(12750)
+  it('defaults the native cap to ORDER_CAP_USD incl. fee (founder 2026-11-24: 1200)', () => {
+    expect(ORDER_CAP_USD).toBe(1200)
+    expect(ZEC_MAX_USD).toBe(ORDER_CAP_USD - 0.01)
+    expect(nativeMaxUsd(undefined)).toBe(ORDER_CAP_USD)
+    expect(nativeMaxUsd('')).toBe(ORDER_CAP_USD)
+    expect(nativeMaxUsd('garbage')).toBe(ORDER_CAP_USD)
+    expect(nativeMaxUsd('0')).toBe(ORDER_CAP_USD)
     expect(nativeMaxUsd('10')).toBe(10)
   })
 
-  it('per-coin caps: ETH/BNB/SOL 12,750, POL stays 3,500, ZEC below 11,700, BTC on its own band', () => {
-    for (const c of ['8453', '1', '42161', '56', '900']) expect(nativeMaxUsdFor(c, undefined)).toBe(12750)
-    expect(nativeMaxUsdFor('137', undefined)).toBe(3500)
+  it('per-coin caps: ETH/BNB/SOL and POL at ORDER_CAP_USD (POL ceiling 3,500), ZEC a cent below, BTC on its own band', () => {
+    for (const c of ['8453', '1', '42161', '56', '900']) expect(nativeMaxUsdFor(c, undefined)).toBe(ORDER_CAP_USD)
+    expect(nativeMaxUsdFor('137', undefined)).toBe(Math.min(3500, ORDER_CAP_USD))
     expect(nativeMaxUsdFor('137', '20000')).toBe(3500)
     expect(nativeMaxUsdFor('137', '100')).toBe(100)
-    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(11699.99)
-    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(11699.99)
-    expect(nativeMaxUsdFor('9000', undefined)).toBe(1200)
+    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(ZEC_MAX_USD)
+    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(ZEC_MAX_USD)
+    expect(nativeMaxUsdFor('9000', undefined)).toBe(Math.min(1200, ORDER_CAP_USD))
+    const cap = ORDER_CAP_USD
     expect(nativeMaxUsdBySource(parseNativeSources('ETH@8453,ETH@1,BNB@56,SOL@900,ETH@42161,POL@137'), undefined)).toEqual({
-      '8453': { ETH: 12750 }, '1': { ETH: 12750 }, '56': { BNB: 12750 }, '900': { SOL: 12750 },
-      '42161': { ETH: 12750 }, '137': { POL: 3500 },
+      '8453': { ETH: cap }, '1': { ETH: cap }, '56': { BNB: cap }, '900': { SOL: cap },
+      '42161': { ETH: cap }, '137': { POL: Math.min(3500, cap) },
     })
     expect(nativeMaxUsdBySource(new Set(['ZEC@9133', 'BTC@9000']), undefined, 'custody')).toEqual({
-      '9133': { ZEC: 11699.99 }, '9000': { BTC: 1 },
+      '9133': { ZEC: ZEC_MAX_USD }, '9000': { BTC: 1 },
     })
-    expect(nativeMaxUsdBySource(new Set(['BTC@9000']), undefined, 'near', undefined, 'beta')).toEqual({ '9000': { BTC: 1200 } })
+    expect(nativeMaxUsdBySource(new Set(['BTC@9000']), undefined, 'near', undefined, 'beta')).toEqual({ '9000': { BTC: Math.min(1200, cap) } })
   })
 
   it('quote-invoice reports nativeMaxUsd per open coin', async () => {
     const { status, json } = await post(handleQuoteInvoice as any, { payment_id: 'paymentSession_native_test' }, makeEnv({ NATIVE_SOURCES: 'ETH@8453,BNB@56,SOL@900,POL@137' }))
     expect(status).toBe(200)
-    expect(json.nativeMaxUsd).toEqual({ '8453': { ETH: 12750 }, '56': { BNB: 12750 }, '900': { SOL: 12750 }, '137': { POL: 3500 } })
+    const cap = ORDER_CAP_USD
+    expect(json.nativeMaxUsd).toEqual({ '8453': { ETH: cap }, '56': { BNB: cap }, '900': { SOL: cap }, '137': { POL: Math.min(3500, cap) } })
   })
 
-  // POL keeps its own $3,500 through create-invoice.
+  // POL: the lower of its own $3,500 and the default cap, through create-invoice.
   it.each([
-    ['3500', 200],
-    ['3500.01', 400],
+    [String(Math.min(3500, ORDER_CAP_USD)), 200],
+    [(Math.min(3500, ORDER_CAP_USD) + 0.01).toFixed(2), 400],
   ])('POL cap: callerPays %s -> %i', async (amount, expected) => {
     quoteAmount = amount
     const { status, json } = await post(handleCreateInvoice, {
@@ -240,18 +246,18 @@ describe('create-invoice with a native source', () => {
     expect(status).toBe(expected)
     if (expected === 400) {
       expect(json.code).toBe('UNSUPPORTED_SOURCE')
-      expect(json.message).toContain('$3500')
+      expect(json.message).toContain('$' + Math.min(3500, ORDER_CAP_USD))
       expect(createdIntent).toBeNull()
     }
   })
 
   // Boundary at the default cap: callerPays > cap is rejected, == cap passes.
   it.each([
-    ['3500.01', 200],
-    ['12749.99', 200],
-    ['12750', 200],
-    ['12750.00', 200],
-    ['12750.01', 400],
+    [(ORDER_CAP_USD - 0.01).toFixed(2), 200],
+    [String(ORDER_CAP_USD), 200],
+    [ORDER_CAP_USD.toFixed(2), 200],
+    [(ORDER_CAP_USD + 0.01).toFixed(2), 400],
+    ['12750', 400],
   ])('default cap: callerPays %s -> %i', async (amount, expected) => {
     quoteAmount = amount
     const { status, json } = await post(handleCreateInvoice, {
@@ -260,7 +266,7 @@ describe('create-invoice with a native source', () => {
     expect(status).toBe(expected)
     if (expected === 400) {
       expect(json.code).toBe('UNSUPPORTED_SOURCE')
-      expect(json.message).toContain('$12750')
+      expect(json.message).toContain('$' + ORDER_CAP_USD)
       expect(createdIntent).toBeNull()
     } else {
       expect(Number(json.callerPays)).toBe(Number(amount))

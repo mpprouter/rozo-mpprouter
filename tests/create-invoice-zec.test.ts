@@ -25,8 +25,10 @@ import { handleQuoteInvoice } from '../src/routes/pay-invoice-admin'
 import { zecQuoteExpiredUnfunded } from '../src/routes/relink-guard'
 import {
   ALL_NATIVE_SOURCES,
+  ORDER_CAP_USD,
   STABLE_SOURCES,
   ZEC_CUSTODY_MAX_CONFIRMATIONS,
+  ZEC_MAX_USD,
   betaParamSymbols,
   nativeMaxUsdFor,
   parseNativeSources,
@@ -193,10 +195,10 @@ describe('ZEC source table', () => {
     })
   })
 
-  it('caps ZEC below $11,700 even if NATIVE_MAX_USD is higher', () => {
-    expect(nativeMaxUsdFor('9133', '20000')).toBe(11699.99)
-    expect(nativeMaxUsdFor('9133', undefined)).toBe(11699.99)
-    expect(nativeMaxUsdFor('8453', undefined)).toBe(12750)
+  it('caps ZEC a cent below ORDER_CAP_USD even if NATIVE_MAX_USD is higher', () => {
+    expect(nativeMaxUsdFor('9133', '20000')).toBe(ZEC_MAX_USD)
+    expect(nativeMaxUsdFor('9133', undefined)).toBe(ZEC_MAX_USD)
+    expect(nativeMaxUsdFor('8453', undefined)).toBe(ORDER_CAP_USD)
     expect(nativeMaxUsdFor('9133', '100')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000')).toBe(5000)
   })
@@ -565,7 +567,7 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(JSON.stringify(sourceMeta(open, 'near'))).toBe(
       '{"ZEC@9133":{"eta_seconds":480,"refund_address_required":true,"beta":true,"address_single_use":true}}',
     )
-    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(11699.99)
+    expect(nativeMaxUsdFor('9133', undefined, 'near')).toBe(ZEC_MAX_USD)
     expect(zecMinLinkLifeMs('near')).toBe(ZEC_MIN_LINK_LIFE_MS)
   })
 
@@ -576,25 +578,26 @@ describe('ZEC_RAIL=custody (Rozo self-custody rail)', () => {
     expect(sourceMeta(parseNativeSources(PROD_NATIVE), 'custody')).toEqual({})
   })
 
-  it('custody caps ZEC below $11,700 and leaves other coins alone', () => {
-    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(11699.99)
-    expect(nativeMaxUsdFor('9133', '20000', 'custody')).toBe(11699.99)
-    expect(nativeMaxUsdFor('8453', undefined, 'custody')).toBe(12750)
+  it('custody caps ZEC a cent below ORDER_CAP_USD and leaves other coins alone', () => {
+    expect(nativeMaxUsdFor('9133', undefined, 'custody')).toBe(ZEC_MAX_USD)
+    expect(nativeMaxUsdFor('9133', '20000', 'custody')).toBe(ZEC_MAX_USD)
+    expect(nativeMaxUsdFor('8453', undefined, 'custody')).toBe(ORDER_CAP_USD)
     expect(nativeMaxUsdFor('9133', '100', 'custody')).toBe(100)
     expect(nativeMaxUsdFor('8453', '5000', 'custody')).toBe(5000)
   })
 
   // Boundary at the ZEC caps through create-invoice: callerPays > cap is rejected.
+  const zecAt = (d: number) => (ORDER_CAP_USD + d).toFixed(2)
   it.each([
-    ['near', '3200', 200],
-    ['near', '11699.99', 200],
-    ['near', '11700', 400],
+    ['near', '100', 200],
+    ['near', zecAt(-0.01), 200],
+    ['near', zecAt(0), 400],
     ['near', '12750', 400],
-    ['custody', '3200', 200],
-    ['custody', '11699.98', 200],
-    ['custody', '11699.99', 200],
-    ['custody', '11700', 400],
-    ['custody', '11750', 400],
+    ['custody', '100', 200],
+    ['custody', zecAt(-0.02), 200],
+    ['custody', zecAt(-0.01), 200],
+    ['custody', zecAt(0), 400],
+    ['custody', zecAt(50), 400],
     ['custody', '12750', 400],
   ] as const)('ZEC %s rail: callerPays %s -> %i', async (rail, amount, expected) => {
     quoteAmount = amount
@@ -905,15 +908,16 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(eth.json.warnings.join(' ')).toContain('source.shielded was ignored')
   })
 
-  // Shielded stays $1,200 although the transparent and native caps rose (2026-11-18).
+  // Shielded: its own $1,200 (ZEC_SHIELD_CAPS), but never above the transparent
+  // ZEC cap (ZEC_MAX_USD, a cent below ORDER_CAP_USD); the shielded message only
+  // when the shielded cap is the lower one.
   it.each([
-    ['1200', undefined, 200],
-    ['1200.01', undefined, 400],
-    ['3200', undefined, 400],
-    ['11699.99', undefined, 400],
-    ['50', '50', 200],
-    ['50.01', '50', 400],
-  ] as const)('shielded cap: callerPays %s with ZEC_SHIELDED_MAX_USD=%s -> %i', async (amount, cap, expected) => {
+    [String(Math.min(1200, ZEC_MAX_USD)), undefined, 200, ''],
+    [(Math.min(1200, ZEC_MAX_USD) + 0.01).toFixed(2), undefined, 400, ''],
+    ['3200', undefined, 400, ''],
+    ['50', '50', 200, ''],
+    ['50.01', '50', 400, 'Shielded ZEC'],
+  ] as const)('shielded cap: callerPays %s with ZEC_SHIELDED_MAX_USD=%s -> %i', async (amount, cap, expected, msg) => {
     quoteAmount = amount
     createAnswer = shieldedCreate
     const env = custodyEnv(cap ? { ZEC_SHIELDED_MAX_USD: cap } : {})
@@ -921,14 +925,14 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
     expect(status).toBe(expected)
     if (expected === 400) {
       expect(json.code).toBe('UNSUPPORTED_SOURCE')
-      expect(json.message).toContain('Shielded ZEC')
+      if (msg) expect(json.message).toContain(msg)
       expect(createCalls).toBe(0)
     }
   })
 
   it('the shielded cap does not touch transparent custody orders', async () => {
-    quoteAmount = '1500'
-    const { status } = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    quoteAmount = '1000'
+    const { status } = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv({ ZEC_SHIELDED_MAX_USD: '500' }), query: BOTH })
     expect(status).toBe(200)
   })
 
@@ -976,14 +980,15 @@ describe('shielded ZEC pay-in (source.shielded, ?beta=zec_shielded)', () => {
   })
 
   it('an existing transparent order above the shielded cap is reported as a mode mismatch, not a cap error', async () => {
-    quoteAmount = '1500'
+    quoteAmount = '1000'
     createAnswer = transparentCreate
-    await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env: custodyEnv(), query: BOTH })
+    const env = custodyEnv({ ZEC_SHIELDED_MAX_USD: '500' })
+    await post(handleCreateInvoice, { payment_id: SESSION_ID, source: ZEC }, { env, query: BOTH })
     const row = { ...rowFrom(createdIntent), provider: 'rozo', quoteExpiresAt: '2999-01-01T01:00:00.000Z',
       source: { chainId: '9133', tokenSymbol: 'ZEC', amount: '0.1', receiverAddress: T1, zec: { rail: 'zec_custody', receive: 'transparent' } } }
     createCalls = 0
     existingOrder = row
-    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env: custodyEnv(), query: BOTH })
+    const r = await post(handleCreateInvoice, { payment_id: SESSION_ID, source: SHIELDED }, { env, query: BOTH })
     expect(r.status).toBe(200)
     expect(r.json.reused).toBe(true)
     expect(r.json.sourceMismatchCode).toBe('ZEC_RECEIVE_MODE_MISMATCH')
