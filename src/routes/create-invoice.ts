@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { BASE_FUNDER_ADDRESS } from '../funder-address'
 import { forwardedClientHintHeader, withForwardedClientHint } from './client-hint-forward'
 import { handleBitrefillCreateInvoice } from './bitrefill-invoice'
 import {
@@ -120,7 +121,7 @@ export const BASE_USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 // (same-chain). The receiver below is the merchant/API-developer wallet.
 const SETTLEMENT_CHAIN_ID = BASE_CHAIN_ID
 const SETTLEMENT_TOKEN_ADDRESS = BASE_USDC_ADDRESS
-export const SETTLEMENT_RECEIVER = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
+export const SETTLEMENT_RECEIVER = BASE_FUNDER_ADDRESS
 
 // ── Source override support (caller picks which chain/token to pay with) ──────
 // Agents may optionally specify `source` to pay from a non-Base chain. Settlement

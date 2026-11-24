@@ -835,7 +835,7 @@ describe('handleCreateInvoice — OpenRouter/Coinbase line', () => {
     // destination pins the full USDC the merchant receives.
     expect(createBody.destination.amount).toBe('105')
     expect(createBody.destination.chainId).toBe('8453')
-    expect(createBody.destination.receiverAddress).toBe('0x2352Fa2970dBadD12d21808DB0F56CDEC8141739')
+    expect(createBody.destination.receiverAddress).toBe('0x282bE0C42E5c944b0285CEc363117AB077cC084A')
     expect(createBody.destination.tokenSymbol).toBe('USDC')
   })
 

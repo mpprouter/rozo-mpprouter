@@ -12,6 +12,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   ALPHA_DESTINATION,
+  LEGACY_ALPHA_DESTINATION_20261124,
   buildAlphaUpstreamBody,
   findAlphaOption,
   handleTronTonAlphaCapability,
@@ -350,6 +351,37 @@ describe('tron-ton-alpha option: one order per Coinbase invoice', () => {
       expect(call.body.existingAppFeeUsd).toBe(0.2)
       expect(call.body.destination).toEqual(ALPHA_DESTINATION)
     }
+  })
+
+  it('a pre-rotation order (old funder frozen in its digest) is replayed once with the legacy destination', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    // Order allocated before the 2026-11-24 rotation, with the old destination.
+    fakeAllocate({ merchantOrderId: PL, providerInvoiceKey: PL, baseServiceUsd: 20, existingAppFeeUsd: 0.2, destination: LEGACY_ALPHA_DESTINATION_20261124, network: 'tron', token: 'USDT' })
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), makeEnv())
+    const j: any = await r.json()
+    expect(j.ok).toBe(true)
+    expect(j.reused).toBe(true)
+    const sent = up.calls.filter((c) => c.body.network).map((c) => c.body.destination.receiverAddress)
+    expect(sent).toEqual([ALPHA_DESTINATION.receiverAddress, LEGACY_ALPHA_DESTINATION_20261124.receiverAddress])
+    // The business order (where the payout goes) is created with the new funder only.
+    for (const b of intents.creates) expect(b.destination.receiverAddress).toBe(ALPHA_DESTINATION.receiverAddress)
+  })
+
+  it('a new order never sends the legacy destination', async () => {
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), makeEnv())
+    expect(((await r.json()) as any).ok).toBe(true)
+    const sent = up.calls.filter((c) => c.body.network).map((c) => c.body.destination.receiverAddress)
+    expect(sent).toEqual([ALPHA_DESTINATION.receiverAddress])
+    expect(ALPHA_DESTINATION.receiverAddress).not.toBe(LEGACY_ALPHA_DESTINATION_20261124.receiverAddress)
+  })
+
+  it('a conflict the legacy replay cannot resolve keeps the order_conflict answer', async () => {
+    fakeAllocate({ merchantOrderId: PL, providerInvoiceKey: PL, baseServiceUsd: 99, existingAppFeeUsd: 0.2, destination: ALPHA_DESTINATION, network: 'tron', token: 'USDT' })
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), makeEnv())
+    expect(r.status).toBe(409)
+    expect(((await r.json()) as any).code).toBe('ALPHA_ORDER_CONFLICT')
+    expect(intents.creates).toHaveLength(0)
   })
 
   it('ignores any order id the caller sends', async () => {

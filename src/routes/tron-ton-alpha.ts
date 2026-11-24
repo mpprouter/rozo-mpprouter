@@ -42,6 +42,7 @@ import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
 import { forwardedClientHintHeader } from './client-hint-forward'
 import { readDeviceId } from './device-id-forward'
 import { attributionMetadata, buildOrderAttribution, forwardedAttributionField } from './order-attribution'
+import { BASE_FUNDER_ADDRESS, RETIRED_FUNDER_ADDRESS_20261124 } from '../funder-address'
 
 export const TRON_TON_ALPHA_CAPABILITY_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/capability'
 export const TRON_TON_ALPHA_OPTION_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/option'
@@ -64,7 +65,19 @@ export const TRON_TON_ALPHA_GATE = {
 export const ALPHA_DESTINATION = Object.freeze({
   chainId: '8453',
   tokenSymbol: 'USDC',
-  receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739',
+  receiverAddress: BASE_FUNDER_ADDRESS,
+})
+
+// The destination orders created before the 2026-11-24 funder rotation froze
+// into their digest. Sent ONLY as a one-time replay after upstream answered
+// order_conflict for the current destination, i.e. an order already exists for
+// this invoice: a matching frozen order is returned as is, anything else
+// conflicts again. It never opens a new order and is never a payout target
+// (the payout goes to the intents business order, see tron-ton-alpha-order.ts).
+export const LEGACY_ALPHA_DESTINATION_20261124 = Object.freeze({
+  chainId: '8453',
+  tokenSymbol: 'USDC',
+  receiverAddress: RETIRED_FUNDER_ADDRESS_20261124,
 })
 
 export interface AlphaOptionDef {
@@ -403,7 +416,7 @@ export interface AlphaUpstreamBody {
   providerInvoiceKey: string
   baseServiceUsd: number
   existingAppFeeUsd: number
-  destination: typeof ALPHA_DESTINATION
+  destination: typeof ALPHA_DESTINATION | typeof LEGACY_ALPHA_DESTINATION_20261124
   network: string
   token: string
 }
@@ -622,18 +635,35 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
     ? Promise.resolve(null)
     : resolveCoinbaseLinkExpiry(invoiceKey)
 
+  const postUpstream = (body: AlphaUpstreamBody) => fetch(TRON_TON_ALPHA_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-api-key': env.ROZO_INTENTS_API_KEY },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+  })
   let upstream: Response
   try {
-    upstream = await fetch(TRON_TON_ALPHA_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': env.ROZO_INTENTS_API_KEY },
-      body: JSON.stringify(upstreamBody),
-      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-    })
+    upstream = await postUpstream(upstreamBody)
   } catch {
     return fail(UPSTREAM_FALLBACK.status, UPSTREAM_FALLBACK.code, UPSTREAM_FALLBACK.message)
   }
-  const data = (await upstream.json().catch(() => null)) as Record<string, any> | null
+  let data = (await upstream.json().catch(() => null)) as Record<string, any> | null
+  // An order created before the 2026-11-24 funder rotation froze the old
+  // destination into its digest: replay it once with that destination so the
+  // existing order is still found (see LEGACY_ALPHA_DESTINATION_20261124).
+  if (upstream.status === 409 && data?.error === 'order_conflict') {
+    try {
+      const legacy = await postUpstream({ ...upstreamBody, destination: LEGACY_ALPHA_DESTINATION_20261124 })
+      const legacyData = (await legacy.json().catch(() => null)) as Record<string, any> | null
+      if (legacy.ok && legacyData?.alpha === true) {
+        console.warn('[tron-ton-alpha] pre-rotation order replayed with legacy destination')
+        upstream = legacy
+        data = legacyData
+      }
+    } catch {
+      // Keep the original order_conflict answer.
+    }
+  }
   if (!upstream.ok || !data || data.alpha !== true) {
     const reason = typeof data?.error === 'string' ? data.error : ''
     const mapped = (native ? NATIVE_UPSTREAM_ERRORS[reason] : undefined) ?? UPSTREAM_ERRORS[reason] ?? UPSTREAM_FALLBACK

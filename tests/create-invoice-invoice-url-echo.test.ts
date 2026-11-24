@@ -17,7 +17,7 @@ import type { Env } from '../src/index'
 import { makeAtomicStoreMock } from './helpers/atomic-store-mock'
 
 const STRIPE_URL = 'https://crypto.stripe.com/pay/CDMTestBlob_ABC123xyz'
-const SETTLEMENT_RECEIVER = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
+const SETTLEMENT_RECEIVER = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
 const BASE_USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'
 
 function makeKvStub() {

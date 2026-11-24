@@ -34,7 +34,7 @@ function makeEnv(): Env {
     INVOICE_CAPABILITY_ENCRYPTION_KEY: TEST_CAP_KEY } as unknown as Env
 }
 
-const FUNDER = '0x2352fa2970dbadd12d21808db0f56cdec8141739'
+const FUNDER = '0x282be0c42e5c944b0285cec363117ab077cc084a'
 const PAYOUT_TX = '0x' + '11'.repeat(32)
 const PULL_TX = '0x' + '22'.repeat(32)
 const PAYOUT_BLOCK = 50786086

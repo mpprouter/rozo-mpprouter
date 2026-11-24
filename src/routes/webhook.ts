@@ -1,4 +1,5 @@
 import type { Env } from '../index'
+import { BASE_FUNDER_ADDRESS } from '../funder-address'
 import { watchSignedCollector, type PayLine } from './coinbase-collector-watch'
 import { TEST_MERCHANT_NAME, TestInvoiceFundGuardError, containsTestPaymentId, isTestPaymentId } from './native-sources'
 import { isBitrefillOrderId } from './bitrefill-invoice'
@@ -35,8 +36,8 @@ import { enqueueCeloRetry, type CeloRetryProvider } from './celo-retry'
 // Coinbase invoices via agentapi's admin-bypass. Configured in
 // Rozo merchant `wallet_rozopay` and used as `destination.receiverAddress`
 // in create-invoice.ts. Exported for the coupon redemption path, which
-// gates on the same funder balance.
-export const FUNDER_WALLET = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
+// gates on the same funder balance. Address lives in src/funder-address.ts.
+export const FUNDER_WALLET = BASE_FUNDER_ADDRESS
 
 const AGENTAPI_PAY_INVOICE_URL = 'https://agentapi.rozo.ai/pay-invoice'
 

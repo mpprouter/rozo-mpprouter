@@ -18,6 +18,7 @@
 // separate provider-qualified namespace so the two never collide.
 
 import type { Env } from '../index'
+import { BASE_FUNDER_ADDRESS } from '../funder-address'
 import {
   deliveredReportEnabled,
   deliveredReportStillPending,
@@ -1142,9 +1143,9 @@ async function finalizeClaim(
   })
 }
 
-// Funder wallet — re-declared here (not imported) to avoid a webhook.ts import
-// cycle; must match webhook.ts FUNDER_WALLET.
-export const FUNDER_WALLET = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
+// Funder wallet — read from the leaf module src/funder-address.ts (not from
+// webhook.ts, which would be an import cycle); equals webhook.ts FUNDER_WALLET.
+export const FUNDER_WALLET = BASE_FUNDER_ADDRESS
 
 // ── Status (design §11) ─────────────────────────────────────────────────────
 
