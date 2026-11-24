@@ -19,9 +19,18 @@ Bitrefill invoice amount, 6 decimals), not the caller's fee-inclusive price.
 | --- | --- | --- |
 | `x402` | <= $5 | T1 |
 | `coinbase` | < $200 | T2 |
-| `coinbase` | $200 to $1,200 | T3A |
-| `stripe`, `bitrefill`, `other` | <= $1,200 | T3B |
-| anything else, or above the cap | | refused |
+| `coinbase` | >= $200 | T3A |
+| `stripe`, `bitrefill`, `other` | any | T3B |
+| `tron_ton_alpha` (phase 2a) | < $200 / >= $200 | T2 / legacy funder |
+| anything else | | refused |
+
+Tier bands have no upper bound (founder 2026-11-24). The order cap is a
+separate refuse-check (`over_order_cap`) applied after the band to every
+non-x402 payment. Its single source here is `ORDER_CAP_USD` in
+`src/routes/native-sources.ts` (currently $1,200; the signer reads its own
+env `ORDER_CAP_USD`, default $1,200 when unset or unparsable). Raising the
+cap needs no change to `funder-tiers.ts` or the vectors; raise the signer env
+together with (or before) the router constant.
 
 ## Variables
 
@@ -32,8 +41,8 @@ All plain `[vars]` (public addresses), commented out in `wrangler.toml`:
 | `FUNDER_TIERS_ENABLED` | Only the exact string `true` enables tiers. |
 | `FUNDER_T1_ADDRESS` | x402 signer wallet (sign-x402). |
 | `FUNDER_T2_ADDRESS` | Coinbase invoices below $200. |
-| `FUNDER_T3A_ADDRESS` | Coinbase invoices $200 to $1,200. |
-| `FUNDER_T3B_ADDRESS` | Stripe, Bitrefill and other merchants, up to $1,200. |
+| `FUNDER_T3A_ADDRESS` | Coinbase invoices $200 and above (up to the order cap). |
+| `FUNDER_T3B_ADDRESS` | Stripe, Bitrefill and other merchants (up to the order cap). |
 
 | `FUNDER_T3_BACKEND` | Exactly `legacy` = phase 2a (below). Same variable the signer reads. |
 
@@ -41,7 +50,7 @@ All plain `[vars]` (public addresses), commented out in `wrangler.toml`:
 
 - **Phase 2a** (`FUNDER_TIERS_ENABLED=true`, `FUNDER_T3_BACKEND=legacy`): T1
   (x402) and T2 (Coinbase below $200) use their own wallets. Every payment the
-  selector puts in T3A or T3B (Coinbase $200 to $1,200, Stripe, Bitrefill,
+  selector puts in T3A or T3B (Coinbase $200 and above, Stripe, Bitrefill,
   other) is served by the legacy funder `BASE_FUNDER_ADDRESS` exactly as with
   the flag off: same receiver, same balance check; `expected_funder` is the
   legacy funder so the signer cross-check agrees (the signer serves legacy-mode
@@ -75,7 +84,7 @@ Balance check, `expected_funder` and the expected signer follow that wallet.
   amount, nominal wallet). It never blocks the payout.
 - Still refused: a destination that is not a configured paying wallet
   (unknown, retired, blocklisted, unconfigured tier, or the legacy funder
-  outside phase 2a), amount above the $1,200 order cap or not positive, an
+  outside phase 2a), amount above the order cap (`ORDER_CAP_USD`) or not positive, an
   unknown kind, order money in T1, x402 outside T1 or above $5.
 - Balance caps (T1 50, T2 200, T3B 2,000 USDC) are alert-only in the router
   (balance watch); nothing refuses a payout for a balance above a cap. The
@@ -115,14 +124,25 @@ Cross-checks:
    human.
 4. TRON / TON alpha: routed with kind `tron_ton_alpha` (`routeFunder`). An
    order the alpha route created (`metadata.source` =
-   `mpprouter-tron-ton-alpha`) is received and paid by the legacy funder in
-   phase 2a whatever the amount, so capability, options, order creation and
-   settlement work exactly as with the flag off; its settle sends
-   `payment_kind: "tron_ton_alpha"` with `expected_funder` (legacy) and
-   `rozo_payment_id`. A main-checkout order that a TRON / TON payment lands on
+   `mpprouter-tron-ton-alpha`) is, in phase 2a, created with the payout
+   destination `routeFunder` picks (founder 2026-11-24): T2 when the invoice
+   is below $200, the legacy funder from $200 up to the order cap, refused
+   above. It is then paid by the wallet its recorded destination names
+   (`resolvePayingFunder`), never one recomputed from the amount: alpha orders
+   created before this rule keep their legacy destination and are still paid
+   by the legacy funder (a range warning, not a refusal). Its settle sends
+   `payment_kind: "tron_ton_alpha"` with `expected_funder` (that wallet) and
+   `rozo_payment_id`; the signer's `verifyAlphaOrder` accepts an alpha order
+   paying out to the legacy funder or T2. The upstream allocation digest's
+   `destination` (`ALPHA_DESTINATION`) stays the legacy funder on purpose:
+   merchant_openrouter is on the upstream legacy list, where it is a digest
+   fact only, and changing it would break re-reads of options allocated
+   before a deploy. A main-checkout order that a TRON / TON payment lands on
    stays a plain Coinbase order. In phase 2b alpha is refused
-   (`ALPHA_FUNDER_TIERS_PAUSED`, reason `alpha_paused`). rozo-intents-api must
-   keep alpha-created orders on the legacy destination.
+   (`ALPHA_FUNDER_TIERS_PAUSED`, reason `alpha_paused`). If merchant_openrouter
+   ever leaves the upstream legacy list (bound lane or Base route), those
+   lanes compare `destination` with the business order's receiver, and
+   `ALPHA_DESTINATION` must then follow the order instead.
 5. Manual `/admin/pay-invoice` accepts only Coinbase ids while the flag is on.
 
 Rollback: unset `FUNDER_TIERS_ENABLED` (or set it to anything but `true`) and

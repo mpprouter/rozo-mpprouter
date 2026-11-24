@@ -4,10 +4,20 @@
  */
 import { describe, expect, it } from 'vitest'
 import vectors from '../src/funder-tier-vectors.json'
-import { parseUsdcAtomic, payFromReceivingWallet, routeFunder, selectFunderTier, servedByLegacyFunder } from '../src/funder-tiers'
+import {
+  DEFAULT_ORDER_CAP_ATOMIC,
+  orderCapAtomicFromUsd,
+  parseUsdcAtomic,
+  payFromReceivingWallet,
+  routeFunder,
+  selectFunderTier,
+  servedByLegacyFunder,
+} from '../src/funder-tiers'
+import { ORDER_CAP_USD } from '../src/routes/native-sources'
 import {
   coinbaseOrderKind,
   BASE_FUNDER_ADDRESS,
+  FUNDER_ORDER_CAP_ATOMIC,
   RETIRED_FUNDER_ADDRESS_20261124,
   checksumFunderAddress,
   configuredFunderWallets,
@@ -35,18 +45,48 @@ export const TIER_ENV = {
 const ADDR: Record<string, string> = { T1, T2, T3A, T3B }
 const USD = (n: number) => BigInt(Math.round(n * 1e6))
 
+type Vec = { kind: string; amount: string; expect: string; band?: string; cap?: string }
+const VECS = (vectors as any).vectors as Vec[]
+const TEST_CAP = BigInt((vectors as any).testCap)
+const capOf = (v: { cap?: string }) => (v.cap === undefined ? TEST_CAP : BigInt(v.cap))
+/**
+ * Rows checked through resolveFunder, whose cap is the live ORDER_CAP_USD
+ * (FUNDER_ORDER_CAP_ATOMIC): only rows whose cap equals it. Raising the live
+ * cap later just skips the testCap rows here; the pure selector tests above
+ * keep covering every row with its own cap.
+ */
+const LIVE_CAP_VECS = VECS.filter((v) => capOf(v) === FUNDER_ORDER_CAP_ATOMIC)
+
 describe('mirrored selector vs shared vectors', () => {
-  it('selectFunderTier matches every vector', () => {
-    expect(vectors.vectors.length).toBeGreaterThan(10)
-    for (const v of vectors.vectors) {
+  it('selectFunderTier (band only) and routeFunder (band + the row cap) match every vector', () => {
+    expect(VECS.length).toBeGreaterThan(10)
+    for (const v of VECS) {
+      const band = v.band ?? v.expect
       const got = selectFunderTier(v.kind, BigInt(v.amount))
-      const label = `${v.kind} ${v.amount}`
-      if (v.expect.startsWith('refuse:')) {
-        expect(got, label).toEqual({ ok: false, reason: v.expect.slice('refuse:'.length) })
+      const label = `${v.kind} ${v.amount} cap ${v.cap ?? 'test'}`
+      if (band.startsWith('refuse:')) {
+        expect(got, label).toEqual({ ok: false, reason: band.slice('refuse:'.length) })
       } else {
-        expect(got, label).toEqual({ ok: true, tier: v.expect })
+        expect(got, label).toEqual({ ok: true, tier: band })
       }
+      const r = routeFunder(v.kind, BigInt(v.amount), 'isolated', capOf(v))
+      expect(r.ok ? r.wallet : `refuse:${r.reason}`, label).toBe(v.expect)
     }
+  })
+
+  it('order cap setting: one source (ORDER_CAP_USD), garbage fails closed to $1,200, bands never move', () => {
+    expect(FUNDER_ORDER_CAP_ATOMIC).toBe(orderCapAtomicFromUsd(ORDER_CAP_USD))
+    for (const c of (vectors as any).capParse as Array<{ in: unknown; out: string }>) {
+      expect(orderCapAtomicFromUsd(c.in).toString(), JSON.stringify(c.in)).toBe(c.out)
+    }
+    expect(DEFAULT_ORDER_CAP_ATOMIC).toBe(1_200_000_000n)
+    // Cap 10,000: $5,000 Coinbase -> T3A, $199.99 -> T2 (bands unchanged).
+    expect(routeFunder('coinbase', USD(5000), 'isolated', USD(10000))).toEqual({ ok: true, wallet: 'T3A' })
+    expect(routeFunder('coinbase', USD(199.99), 'isolated', USD(10000))).toEqual({ ok: true, wallet: 'T2' })
+    // Cap 1,200: $1,200.01 refused with the distinct cap reason.
+    expect(routeFunder('coinbase', USD(1200.01), 'isolated', USD(1200))).toEqual({ ok: false, reason: 'over_order_cap' })
+    // A non-positive cap is the $1,200 default, never "no cap".
+    expect(routeFunder('coinbase', USD(1200.01), 'isolated', 0n)).toEqual({ ok: false, reason: 'over_order_cap' })
   })
 
   it('parseUsdcAtomic matches every parse case', () => {
@@ -91,7 +131,8 @@ describe('resolveFunder, flag off (parity)', () => {
 
 describe('resolveFunder, flag on', () => {
   it('picks the configured address of the vector tier, refuses with the vector reason', () => {
-    for (const v of vectors.vectors) {
+    expect(LIVE_CAP_VECS.length).toBeGreaterThan(10)
+    for (const v of LIVE_CAP_VECS) {
       const got = resolveFunder(TIER_ENV, v.kind, BigInt(v.amount))
       const label = `${v.kind} ${v.amount}`
       if (v.expect.startsWith('refuse:')) {
@@ -182,7 +223,7 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
   })
 
   it('every vector: coinbase/stripe/bitrefill/other -> T2 wallet or legacy funder, x402 -> T1, refusals unchanged', () => {
-    for (const v of vectors.vectors) {
+    for (const v of LIVE_CAP_VECS) {
       const got = resolveFunder(P2A, v.kind, BigInt(v.amount))
       const label = `${v.kind} ${v.amount}`
       if (v.expect.startsWith('refuse:')) {
@@ -208,17 +249,19 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
   })
 
   it('routeFunder matches every route vector, and resolveFunder agrees', () => {
-    const route = (vectors as any).route as Array<{ kind: string; amount: string; backend: string | null; expect: string }>
+    const route = (vectors as any).route as Array<{ kind: string; amount: string; backend: string | null; expect: string; cap?: string }>
     expect(route.length).toBeGreaterThan(10)
     for (const v of route) {
       const backend = v.backend ?? undefined
-      const got = routeFunder(v.kind, BigInt(v.amount), backend)
+      const got = routeFunder(v.kind, BigInt(v.amount), backend, capOf(v))
       const label = `${v.kind} ${v.amount} ${v.backend}`
       if (v.expect.startsWith('refuse:')) {
         expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7) })
       } else {
         expect(got, label).toEqual({ ok: true, wallet: v.expect })
       }
+      // resolveFunder uses the live cap; only rows at that cap are comparable.
+      if (capOf(v) !== FUNDER_ORDER_CAP_ATOMIC) continue
       const env = { ...TIER_ENV, FUNDER_T3_BACKEND: backend }
       const r = resolveFunder(env, v.kind, BigInt(v.amount))
       if (v.expect.startsWith('refuse:')) expect(r.ok, label).toBe(false)
@@ -226,14 +269,40 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
     }
   })
 
-  it('alpha: $20 and $900 -> legacy in 2a; non-alpha Coinbase $20 -> T2; alpha paused when the backend is not legacy', () => {
-    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
+  it('alpha (new order) in 2a: below $200 -> T2, $200 to $1,200 -> legacy, above refused; paused when the backend is not legacy', () => {
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(199.99))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(200))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
     expect(resolveFunder(P2A, 'tron_ton_alpha', USD(900))).toMatchObject({ ok: true, address: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(1200))).toMatchObject({ ok: true, address: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(1200) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    // T2 not configured: an alpha order below $200 is refused (no fallback to legacy).
+    expect(resolveFunder({ ...P2A, FUNDER_T2_ADDRESS: undefined }, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'tier_address_missing', tier: 'T2' })
     expect(resolveFunder(P2A, 'coinbase', USD(20))).toMatchObject({ ok: true, address: T2 })
     expect(resolveFunder({ ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'alpha_paused', tier: null })
     expect(resolveFunder(TIER_ENV, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'alpha_paused', tier: null })
     // Flag off: legacy as always.
-    expect(resolveFunder({}, 'tron_ton_alpha', USD(20))).toMatchObject({ ok: true, tier: 'legacy', expectedFunder: undefined })
+    expect(resolveFunder({}, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: undefined })
+    expect(resolveFunder({ FUNDER_T2_ADDRESS: T2, FUNDER_T3_BACKEND: 'legacy' }, 'tron_ton_alpha', USD(20))).toEqual({
+      ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: undefined,
+    })
+  })
+
+  it('alpha (order already created): paid by the recorded destination, never the amount (in-flight legacy orders)', () => {
+    // Created before the T2 rule: legacy destination below $200 -> legacy pays, warning only.
+    for (const amt of [USD(20), USD(199.99)]) {
+      const r = resolvePayingFunder(P2A, 'tron_ton_alpha', amt, BASE_FUNDER_ADDRESS.toLowerCase())
+      expect(r).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS, nominal: 'T2' })
+      expect(r.ok && typeof r.warning).toBe('string')
+    }
+    // Created after it: T2 destination, no warning.
+    expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(199.99), T2)).toEqual({
+      ok: true, tier: 'T2', address: T2, expectedFunder: T2, nominal: 'T2', warning: null,
+    })
+    // $200 and $1,200 on legacy: no warning. Above the cap: refused.
+    expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(200), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', warning: null })
+    expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(1200), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', warning: null })
+    expect(resolvePayingFunder(P2A, 'tron_ton_alpha', USD(1200) + 1n, BASE_FUNDER_ADDRESS)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
   })
 
   it('isTronTonAlphaOrder / coinbaseOrderKind read the creator marker', () => {
@@ -275,10 +344,10 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
 
 describe('paying from the receiving wallet', () => {
   it('payFromReceivingWallet matches every pay vector', () => {
-    const pay = (vectors as any).pay as Array<{ kind: string; amount: string; wallet: string; backend: string | null; expect: string; warn?: boolean }>
+    const pay = (vectors as any).pay as Array<{ kind: string; amount: string; wallet: string; backend: string | null; expect: string; warn?: boolean; cap?: string }>
     expect(pay.length).toBeGreaterThan(10)
     for (const v of pay) {
-      const got = payFromReceivingWallet(v.kind, BigInt(v.amount), v.wallet as any, v.backend ?? undefined)
+      const got = payFromReceivingWallet(v.kind, BigInt(v.amount), v.wallet as any, v.backend ?? undefined, capOf(v))
       const label = JSON.stringify(v)
       if (v.expect.startsWith('refuse:')) {
         expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7) })
