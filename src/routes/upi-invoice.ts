@@ -54,7 +54,7 @@ import {
   sendInvoiceFailureAlert,
   type PayInvoiceExpectedBinding,
 } from './webhook'
-import { resolveFunder } from '../funder-address'
+import { resolveNoOrderFunder } from '../funder-address'
 import {
   callStripePayInvoice,
   reserveDailySpend,
@@ -902,7 +902,8 @@ async function executeFulfillment(
   // funder as the final gate.
   // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder). A
   // refusal is definite: nothing was sent, the caller refunds the capture.
-  const funder = resolveFunder(env, provider === 'stripe_crypto' ? 'stripe' : 'coinbase', invoiceAtomic)
+  // No intents order: resolveNoOrderFunder (phase 2b: T3-sized -> legacy funder).
+  const funder = resolveNoOrderFunder(env, provider === 'stripe_crypto' ? 'stripe' : 'coinbase', invoiceAtomic)
   if (!funder.ok) {
     await transition(env, orderId, 'failed', {
       kind: 'funder_tier_refused',
@@ -1613,8 +1614,9 @@ async function runV2(
 
   // 5. Wallet inventory gate, as v1. Unreadable → attempt (executor re-checks).
   const invoiceAtomic = BigInt(g2.inv.stablecoinAmountAtomic)
-  // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder).
-  const funder = resolveFunder(env, 'coinbase', invoiceAtomic)
+  // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder). No
+  // intents order: resolveNoOrderFunder (phase 2b: T3-sized -> legacy funder).
+  const funder = resolveNoOrderFunder(env, 'coinbase', invoiceAtomic)
   if (!funder.ok) return refuse('funder_tier_refused', { extra: { reason: funder.reason } })
   const balance = (await getBaseUsdcBalance(funder.address, env.BASE_RPC_URL)).balance
   if (balance !== null && balance < invoiceAtomic) {

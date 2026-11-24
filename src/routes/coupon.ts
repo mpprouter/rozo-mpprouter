@@ -72,7 +72,7 @@ import {
   FUNDER_TIER_REFUSED_CODE,
   funderRefusalMessage,
   funderRefusalStatus,
-  resolveFunder,
+  resolveNoOrderFunder,
 } from '../funder-address'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import {
@@ -1649,9 +1649,11 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // webhook path; agentapi re-checks the funder balance as the final gate.
   // The reservation is for the INVOICE amount (what is actually paid).
   // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder). No
-  // order is involved here: the selected tier wallet just pays. A refusal
-  // gives the coupon back before anything is reserved, claimed or sent.
-  const funder = resolveFunder(env, isStripe ? 'stripe' : 'coinbase', invoiceAtomic)
+  // order is involved here: the selected wallet just pays (resolveNoOrderFunder:
+  // in phase 2b T3-sized payments stay on the legacy funder, the KMS T3
+  // signer needs an intents order). A refusal gives the coupon back before
+  // anything is reserved, claimed or sent.
+  const funder = resolveNoOrderFunder(env, isStripe ? 'stripe' : 'coinbase', invoiceAtomic)
   if (!funder.ok) {
     await rollbackToIssued(`funder tier refused: ${funder.reason}`)
     return done(

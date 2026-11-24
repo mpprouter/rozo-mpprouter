@@ -19,10 +19,10 @@ import { ORDER_CAP_USD } from './routes/native-sources'
 import {
   ALPHA_KIND,
   FUNDER_TIERS,
-  T3_LEGACY_BACKEND,
   orderCapAtomicFromUsd,
   payFromReceivingWallet,
   routeFunder,
+  routeNoOrderFunder,
   servedByLegacyFunder,
   type FunderTier,
   type FunderTierRefusal,
@@ -207,6 +207,30 @@ export function resolveFunder(
   return { ok: true, tier: route.wallet, address: addr.address, expectedFunder: addr.address }
 }
 
+/**
+ * Which wallet pays a payment that has NO intents order (coupon, UPI, admin
+ * pay): routeNoOrderFunder, mirrored with the signer. Same as resolveFunder,
+ * except that T3A / T3B become the legacy funder: the phase 2b KMS signer only
+ * signs against a paid-out intents order received by its wallet, so it cannot
+ * pay these. Phase 2a and flag off: identical to resolveFunder. Never use it
+ * for a new order's destination (that is resolveFunder).
+ */
+export function resolveNoOrderFunder(
+  env: FunderTierEnv | null | undefined,
+  kind: string,
+  amountAtomic: bigint,
+): FunderResolution {
+  if (!funderTiersEnabled(env)) return resolveFunder(env, kind, amountAtomic)
+  const route = routeNoOrderFunder(kind, amountAtomic, env?.FUNDER_T3_BACKEND, FUNDER_ORDER_CAP_ATOMIC)
+  if (!route.ok) return { ok: false, reason: route.reason, tier: null }
+  if (route.wallet === 'LEGACY') {
+    return { ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS }
+  }
+  const addr = funderTierAddress(env, route.wallet)
+  if (!addr.ok) return { ok: false, reason: addr.reason, tier: route.wallet }
+  return { ok: true, tier: route.wallet, address: addr.address, expectedFunder: addr.address }
+}
+
 export type PayingFunderResolution =
   | (Extract<FunderResolution, { ok: true }> & {
       /** Where routeFunder would have sent a new order of this kind/amount. */
@@ -232,9 +256,13 @@ export function receivingFunderWallet(
   if (typeof receiver !== 'string' || !EVM_RE.test(receiver.trim())) return null
   const r = receiver.trim().toLowerCase()
   if (BLOCKED.has(r) || r === ZERO || r === RETIRED_FUNDER_ADDRESS_20261124.toLowerCase()) return null
-  if (r === BASE_FUNDER_ADDRESS.toLowerCase()) {
-    return env?.FUNDER_T3_BACKEND === T3_LEGACY_BACKEND ? { wallet: 'LEGACY', address: BASE_FUNDER_ADDRESS } : null
-  }
+  // The legacy funder stays a PAYING wallet on every backend: in phase 2a it
+  // is T3A / T3B; in phase 2b it is never a new order's destination
+  // (routeFunder never returns LEGACY then), but orders created before the
+  // switch with the legacy destination must still be paid by it until they
+  // drain (founder 2026-11-24: the wallet that received the money pays it).
+  // The signer pays them only while its PRIVATE_KEY is configured.
+  if (r === BASE_FUNDER_ADDRESS.toLowerCase()) return { wallet: 'LEGACY', address: BASE_FUNDER_ADDRESS }
   for (const tier of FUNDER_TIERS) {
     if (servedByLegacyFunder(tier, env?.FUNDER_T3_BACKEND)) continue
     const a = funderTierAddress(env, tier)
@@ -299,6 +327,10 @@ export function configuredFunderWallets(
     const r = funderTierAddress(env, tier)
     out.push(r.ok ? { tier, address: r.address } : { tier, address: null, reason: r.reason })
   }
+  // Phase 2b: the legacy funder still pays legacy-destination orders (drain)
+  // and T3-sized payments with no intents order (resolveNoOrderFunder), so it
+  // is still watched.
+  if (!legacyListed) out.push({ tier: 'legacy', address: BASE_FUNDER_ADDRESS })
   return out
 }
 
@@ -403,8 +435,6 @@ export function funderRefusalMessage(reason: FunderRefusalReason): string {
       return 'This payment is above the per-payment limit. Nothing was created or paid.'
     case 'invalid_amount':
       return 'The invoice amount is not a positive USDC amount. Nothing was created or paid.'
-    case 'alpha_paused':
-      return 'TRON / TON payments are temporarily unavailable. Nothing was created or paid; pay with another coin.'
     default:
       return 'Payments are temporarily unavailable (funder wallet not configured). Nothing was created or paid; try again later.'
   }

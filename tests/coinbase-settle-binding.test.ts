@@ -618,17 +618,26 @@ describe('Coinbase settle: tiered funders', () => {
     expect(seen.payBodies).toEqual([{ payment_id: PL }])
   })
 
-  it('alpha-created order, phase 2b: refused before any send (alpha_paused)', async () => {
+  it('alpha-created order with the legacy destination, phase 2b: still paid by the legacy funder (drain)', async () => {
     const order = boundRozoOrder(ROZO_ID, PL, {
       destination: { amount: '20.00', chainId: '8453', receiverAddress: LEGACY },
       metadata: { source: 'mpprouter-tron-ton-alpha' },
     })
     const seen = tierStub(order, '20.00')
-    const { env, kv } = makeEnv(TIERS)
+    const { env } = makeEnv(TIERS)
     await handleRozoWebhook(await signed(ev('20.00')), env)
-    expect(seen.payBodies).toEqual([])
-    // Phase 2b: the legacy funder is not a paying wallet.
-    expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: LEGACY, rozo_payment_id: ROZO_ID, payment_kind: 'tron_ton_alpha' }])
+  })
+
+  it('alpha-created order with the T3A destination, phase 2b: paid by T3A', async () => {
+    const order = boundRozoOrder(ROZO_ID, PL, {
+      destination: { amount: '250.00', chainId: '8453', receiverAddress: T3A },
+      metadata: { source: 'mpprouter-tron-ton-alpha' },
+    })
+    const seen = tierStub(order, '250.00')
+    const { env } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('250.00')), env)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T3A, rozo_payment_id: ROZO_ID, payment_kind: 'tron_ton_alpha' }])
   })
 
   it('non-alpha phase 2a $20 Coinbase settle never carries payment_kind', async () => {
@@ -708,12 +717,21 @@ describe('Coinbase settle: tiered funders', () => {
   })
 
   it('flag on: an order paid out to another wallet is refused, nothing paid', async () => {
-    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: LEGACY } }), '250.00')
+    const other = '0x9999999999999999999999999999999999999999'
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: other } }), '250.00')
     const { env, kv } = makeEnv(TIERS)
     await handleRozoWebhook(await signed(ev('250.00')), env)
     expect(seen.payBodies).toEqual([])
     expect(rec(kv).status).toBe('order_binding_failed')
     expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
+  })
+
+  it('flag on, phase 2b: a $250 order created before the switch (legacy destination) is paid by the legacy funder', async () => {
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: LEGACY } }), '250.00')
+    const { env } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('250.00')), env)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: LEGACY, rozo_payment_id: ROZO_ID }])
+    expect(seen.balanceOf).toEqual([LEGACY.toLowerCase()])
   })
 
   it('flag on: a missing tier address refuses, nothing paid', async () => {

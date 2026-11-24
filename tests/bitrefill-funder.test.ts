@@ -1669,12 +1669,13 @@ describe('tiered funders (Bitrefill = T3B)', () => {
     expect(rec(kv).bitrefill?.funder).toBe(T2)
   })
 
-  it('settle, flag on: an order paid to the legacy funder is refused before any send', async () => {
-    const { env, kv } = makeEnv(TIERS)
+  it('settle, flag on, phase 2b: an order created before the switch (legacy destination) is paid by the legacy funder', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { env } = makeEnv(TIERS)
     const { calls } = stub({ order: await frozenOrder() })
     await run(await signedEvent(), env)
-    expect(calls.pay).toBe(0)
-    expect(rec(kv).status).toBe('order_binding_failed')
+    expect(calls.pay).toBe(1)
+    expect(calls.payBodies[0].expected_funder).toBe(BASE_FUNDER_ADDRESS)
   })
 
   // Existing-order and concurrent-conflict return paths.
@@ -1729,12 +1730,15 @@ describe('tiered funders (Bitrefill = T3B)', () => {
       expect(r.json.source).toBeUndefined()
       expect(r.json.rozoPaymentId).toBeUndefined()
     })
-    it(`${mode} order, phase 2b: T3B receiver resumes; legacy receiver refused without instructions`, async () => {
+    it(`${mode} order, phase 2b: T3B and (created before the switch) legacy receivers resume; a non-funder receiver is refused without instructions`, async () => {
       vi.spyOn(console, 'error').mockImplementation(() => {})
       const t3bOrder = await frozenOrder({ status: 'payment_unpaid', destination: { chainId: '8453', receiverAddress: T3B, tokenSymbol: 'USDC', amount: '206.04' } })
       let r = await resumeWith(makeEnv(TIERS).env, t3bOrder, mode)
       expect(r.json.error).toBe('DUPLICATE_INVOICE')
       r = await resumeWith(makeEnv(TIERS).env, await frozenOrder({ status: 'payment_unpaid' }), mode)
+      expect(r.json.error).toBe('DUPLICATE_INVOICE')
+      const otherOrder = await frozenOrder({ status: 'payment_unpaid', destination: { chainId: '8453', receiverAddress: '0x9999999999999999999999999999999999999999', tokenSymbol: 'USDC', amount: '206.04' } })
+      r = await resumeWith(makeEnv(TIERS).env, otherOrder, mode)
       expect(r.status).toBe(503)
       expect(r.json.error).toBe('FUNDER_TIER_RECEIVER_MISMATCH')
       expect(r.json.source).toBeUndefined()
