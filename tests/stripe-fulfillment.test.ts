@@ -517,3 +517,100 @@ describe('handleStripeWebhookEvent', () => {
     expect(rec.providerResult.state).toBe('purchase_complete')
   })
 })
+
+describe('handleStripeWebhookEvent: tiered funders', () => {
+  afterEach(() => vi.restoreAllMocks())
+  const T3B = '0x4000000000000000000000000000000000000004'
+  const TIERS = {
+    FUNDER_TIERS_ENABLED: 'true',
+    FUNDER_T1_ADDRESS: '0x1000000000000000000000000000000000000001',
+    FUNDER_T2_ADDRESS: '0x2000000000000000000000000000000000000002',
+    FUNDER_T3A_ADDRESS: '0x3000000000000000000000000000000000000003',
+    FUNDER_T3B_ADDRESS: T3B,
+  } as Partial<Env>
+  const LEGACY = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
+
+  async function seed(env: Env) {
+    await seedStripeRecord(env, {
+      invoiceKey: 'cpis_tier',
+      merchantAccount: 'acct_tier',
+      invoiceAmountAtomic: '10000000',
+      invoiceCurrency: 'usd',
+      lockFingerprint: 'sha256:tt',
+      stripeUrl: 'https://crypto.stripe.com/pay/TIERBLOB',
+      rozoPaymentId: 'rp-tier',
+    })
+  }
+  const evt = (eventId: string) => ({
+    eventId, eventType: 'payment_payout_completed',
+    orderId: 'stripe_crypto_cpis_tier', rozoPaymentId: 'rp-tier', invoiceAmountStr: '10.00', sourceChainId: '8453',
+  })
+  function upstream(receiver: string | null) {
+    const seen = { payBodies: [] as any[], balanceOf: [] as string[] }
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : (input instanceof URL ? input.href : input.url)
+      if (u.includes('pay-invoice')) {
+        seen.payBodies.push(JSON.parse(String(init?.body)))
+        return new Response(JSON.stringify({ success: true }), { status: 200 })
+      }
+      if (/\/payments\/rp-tier$/.test(u)) {
+        return receiver === null
+          ? new Response('nf', { status: 404 })
+          : Response.json({ id: 'rp-tier', source: { chainId: '8453' }, destination: { chainId: '8453', receiverAddress: receiver } })
+      }
+      const data: string = JSON.parse(String(init?.body ?? '{}'))?.params?.[0]?.data ?? ''
+      if (data.startsWith('0x70a08231')) seen.balanceOf.push('0x' + data.slice(-40))
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x' + (1_000_000_000n).toString(16).padStart(64, '0') }), { status: 200 })
+    })
+    return seen
+  }
+
+  it('flag off: legacy pay body (no expected_funder), legacy balance address', async () => {
+    const env = makeEnv()
+    await seed(env)
+    const seen = upstream(LEGACY)
+    const s = await handleStripeWebhookEvent(env, evt('t-off'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.status).toBe('provider_submitted')
+    expect(Object.keys(seen.payBodies[0]).sort()).toEqual(['expected_amount_atomic', 'expected_merchant_account', 'spent_today_atomic', 'url'])
+    expect(seen.balanceOf).toEqual([LEGACY.toLowerCase()])
+  })
+
+  it('flag on: order paid to T3B -> T3B balance and expected_funder T3B', async () => {
+    const env = makeEnv({ extra: TIERS })
+    await seed(env)
+    const seen = upstream(T3B)
+    const s = await handleStripeWebhookEvent(env, evt('t-on'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.status).toBe('provider_submitted')
+    expect(seen.payBodies[0].expected_funder).toBe(T3B)
+    expect(seen.balanceOf).toEqual([T3B.toLowerCase()])
+  })
+
+  it('flag on: order paid to the legacy funder -> manual_review, nothing signed', async () => {
+    const env = makeEnv({ extra: TIERS })
+    await seed(env)
+    const seen = upstream(LEGACY)
+    const s = await handleStripeWebhookEvent(env, evt('t-mm'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.status).toBe('manual_review')
+    expect(seen.payBodies).toHaveLength(0)
+    expect((await loadRec(env, 'cpis_tier')).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
+  })
+
+  it('flag on: order unreadable -> deferred and re-drivable, nothing signed', async () => {
+    const env = makeEnv({ extra: TIERS })
+    await seed(env)
+    const seen = upstream(null)
+    const s = await handleStripeWebhookEvent(env, evt('t-ur'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.deferred).toBe('funder_tier_order_unreadable')
+    expect(seen.payBodies).toHaveLength(0)
+    expect((await loadRec(env, 'cpis_tier')).status).toBe('payout_seen')
+  })
+
+  it('flag on: a 409 funder_tier_mismatch is a definite refusal, not ambiguous', async () => {
+    const r409 = new Response(JSON.stringify({ signed: false, code: 'funder_tier_mismatch' }), { status: 409 })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(r409)
+    const r = await callStripePayInvoice(makeEnv({ extra: TIERS }), {
+      stripeUrl: 'https://crypto.stripe.com/pay/X', expectedMerchantAccount: 'acct', expectedAmountAtomic: '1', spentTodayAtomic: '0', expectedFunder: T3B,
+    })
+    expect(r).toMatchObject({ ok: false, status: 409, ambiguous: false, disabled: false })
+  })
+})
