@@ -164,7 +164,14 @@ BITREFILL_ENABLED = "true"
 # Rollback: delete FUNDER_TIERS_ENABLED (or set it to "false") and redeploy.
 FUNDER_TIERS_ENABLED = "true"
 FUNDER_T1_ADDRESS = "0xCf7d0149De9d57C1B5c5fc52B917aA6817E50242"   # x402 only (sign-x402), <= $5 per payment
-FUNDER_T2_ADDRESS = "0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3"   # Coinbase invoices below $200
+FUNDER_T2_ADDRESS = "0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3"   # Coinbase invoices below FUNDER_T2_MAX_USD
+# Order-backed T2 boundary in USD (exclusive): OpenRouter Coinbase and TRON /
+# TON alpha orders below it are received and paid by T2, at or above by T3A.
+# Unset or invalid = 200. Coupon / UPI / admin pay (no intents order) keep a
+# fixed $200 boundary. Orders already created are always paid by their
+# recorded destination. Lowering: set the signer project's FUNDER_T2_MAX_USD
+# first, then deploy this. Rollback: set back to "200" and deploy.
+FUNDER_T2_MAX_USD = "200"
 # Phase 2b (infra/tier-signer CUTOVER-2B.md in shawn-local-skills): T3A / T3B
 # are the AWS KMS wallets signed by the rozo-tier-signer Lambda. Deploy this
 # ONLY after the signer project runs FUNDER_T3_BACKEND=isolated (signer first:
@@ -172,7 +179,7 @@ FUNDER_T2_ADDRESS = "0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3"   # Coinbase in
 # nobody can pay). Stripe stays on the legacy funder on every backend. Orders
 # created before the switch keep their legacy destination and are paid by it.
 # Rollback: FUNDER_T3_BACKEND = "legacy", re-comment the two addresses, deploy.
-FUNDER_T3A_ADDRESS = "0xE6EB895a29BACF821BD092B4aEBEcEb3480CE4DB"  # Coinbase invoices and TRON / TON alpha from $200 (KMS, alias/rozo-funder-t3a)
+FUNDER_T3A_ADDRESS = "0xE6EB895a29BACF821BD092B4aEBEcEb3480CE4DB"  # Coinbase invoices and TRON / TON alpha from FUNDER_T2_MAX_USD (KMS, alias/rozo-funder-t3a)
 FUNDER_T3B_ADDRESS = "0xa83cf24b0ccfA23d080E2045cc44ac4616aB8132"  # Bitrefill and other (KMS, alias/rozo-funder-t3b); not Stripe
 FUNDER_T3_BACKEND = "isolated"  # phase 2b: KMS T3 signer (signer project must already be on "isolated")
 # Hostname suffix for router-hosted paywalls (services/provider-hosting.ts).

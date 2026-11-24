@@ -1,5 +1,25 @@
 {
-  "_comment": "MIRRORED: identical copy in mpprouter/rozo-mpprouter src/funder-tier-vectors.json and shawnmuggle/shawn-local-skills supabase/functions/_shared/funder-tier-vectors.json. amount is USDC atomic (6 decimals) as a decimal string. expect is a tier or refuse:<reason>, the full decision (band, then order cap). band (when present) is the cap-free tier band selectFunderTier returns where expect differs. cap is the order cap for that row (USDC atomic); absent = testCap, a TEST value, not the live cap (the live cap is each repo's ORDER_CAP_USD setting). capParse: orderCapAtomicFromUsd input -> atomic output (garbage falls back to the default).",
+  "_comment": "MIRRORED: identical copy in mpprouter/rozo-mpprouter src/funder-tier-vectors.json and shawnmuggle/shawn-local-skills supabase/functions/_shared/funder-tier-vectors.json. amount is USDC atomic (6 decimals) as a decimal string. expect is a tier or refuse:<reason>, the full decision (band, then order cap). band (when present) is the cap-free tier band selectFunderTier returns where expect differs. cap is the order cap for that row (USDC atomic); absent = testCap, a TEST value, not the live cap (the live cap is each repo's ORDER_CAP_USD setting). capParse: orderCapAtomicFromUsd input -> atomic output (garbage falls back to the default). t2max is the order-backed T2 boundary for that row (USDC atomic, passed to selectFunderTier / routeFunder / payFromReceivingWallet); absent = defaultT2Max, today's $200. In noOrder rows t2max is the order-backed setting in force, which routeNoOrderFunder must IGNORE (it has no boundary parameter; expect is always the fixed $200 answer). t2maxParse: t2MaxAtomicFromUsd input -> atomic output (garbage, 0 and negatives fall back to $200).",
+  "defaultT2Max": "200000000",
+  "t2maxParse": [
+    { "in": "200", "out": "200000000" },
+    { "in": "2", "out": "2000000" },
+    { "in": "10.50", "out": "10500000" },
+    { "in": " 2 ", "out": "2000000" },
+    { "in": "0.000001", "out": "1" },
+    { "in": "5000", "out": "5000000000" },
+    { "in": "", "out": "200000000" },
+    { "in": "abc", "out": "200000000" },
+    { "in": "0", "out": "200000000" },
+    { "in": "0.0", "out": "200000000" },
+    { "in": "-2", "out": "200000000" },
+    { "in": "2e0", "out": "200000000" },
+    { "in": "2.0000001", "out": "200000000" },
+    { "in": null, "out": "200000000" },
+    { "in": 2, "out": "2000000" },
+    { "in": 0, "out": "200000000" },
+    { "in": -1, "out": "200000000" }
+  ],
   "testCap": "1200000000",
   "capParse": [
     { "in": "1200", "out": "1200000000" },
@@ -49,7 +69,21 @@
     { "kind": "other", "amount": "300000000", "expect": "T3B" },
     { "kind": "upi", "amount": "1000000", "expect": "refuse:unknown_kind" },
     { "kind": "", "amount": "1000000", "expect": "refuse:unknown_kind" },
-    { "kind": "COINBASE", "amount": "1000000", "expect": "refuse:unknown_kind" }
+    { "kind": "COINBASE", "amount": "1000000", "expect": "refuse:unknown_kind" },
+    { "kind": "coinbase", "amount": "10500000", "t2max": "2000000", "expect": "T3A" },
+    { "kind": "coinbase", "amount": "2000000", "t2max": "2000000", "expect": "T3A" },
+    { "kind": "coinbase", "amount": "1999999", "t2max": "2000000", "expect": "T2" },
+    { "kind": "coinbase", "amount": "1990000", "t2max": "2000000", "expect": "T2" },
+    { "kind": "coinbase", "amount": "199999999", "t2max": "2000000", "expect": "T3A" },
+    { "kind": "coinbase", "amount": "1200000001", "t2max": "2000000", "band": "T3A", "expect": "refuse:over_order_cap" },
+    { "kind": "coinbase", "amount": "1200000000", "t2max": "5000000000", "expect": "T2" },
+    { "kind": "coinbase", "amount": "1200000001", "t2max": "5000000000", "band": "T2", "expect": "refuse:over_order_cap" },
+    { "kind": "coinbase", "amount": "10500000", "t2max": "0", "expect": "T2" },
+    { "kind": "coinbase", "amount": "200000000", "t2max": "0", "expect": "T3A" },
+    { "kind": "coinbase", "amount": "10500000", "t2max": "-2000000", "expect": "T2" },
+    { "kind": "x402", "amount": "1000000", "t2max": "2000000", "expect": "T1" },
+    { "kind": "bitrefill", "amount": "1000000", "t2max": "2000000", "expect": "T3B" },
+    { "kind": "stripe", "amount": "1000000", "t2max": "2000000", "band": "T3B", "expect": "LEGACY" }
   ],
   "legacy": [
     { "tier": "T1", "backend": "legacy", "legacy": false },
@@ -98,7 +132,15 @@
     { "kind": "bitrefill", "amount": "1200000001", "backend": "legacy", "expect": "refuse:over_order_cap" },
     { "kind": "x402", "amount": "1000000", "backend": "legacy", "expect": "T1" },
     { "kind": "x402", "amount": "5000001", "backend": "legacy", "expect": "refuse:over_tier_cap" },
-    { "kind": "upi", "amount": "1000000", "backend": "legacy", "expect": "refuse:unknown_kind" }
+    { "kind": "upi", "amount": "1000000", "backend": "legacy", "expect": "refuse:unknown_kind" },
+    { "kind": "coinbase", "amount": "10500000", "backend": "isolated", "t2max": "2000000", "expect": "T3A" },
+    { "kind": "coinbase", "amount": "1990000", "backend": "isolated", "t2max": "2000000", "expect": "T2" },
+    { "kind": "tron_ton_alpha", "amount": "10500000", "backend": "isolated", "t2max": "2000000", "expect": "T3A" },
+    { "kind": "tron_ton_alpha", "amount": "1990000", "backend": "isolated", "t2max": "2000000", "expect": "T2" },
+    { "kind": "tron_ton_alpha", "amount": "10500000", "backend": "legacy", "t2max": "2000000", "expect": "LEGACY" },
+    { "kind": "coinbase", "amount": "10500000", "backend": "legacy", "t2max": "2000000", "expect": "LEGACY" },
+    { "kind": "stripe", "amount": "10500000", "backend": "isolated", "t2max": "2000000", "expect": "LEGACY" },
+    { "kind": "coinbase", "amount": "1200000000", "backend": "isolated", "t2max": "5000000000", "expect": "T2" }
   ],
   "noOrder": [
     { "kind": "coinbase", "amount": "20000000", "backend": "isolated", "expect": "T2" },
@@ -116,7 +158,14 @@
     { "kind": "x402", "amount": "1000000", "backend": "isolated", "expect": "T1" },
     { "kind": "x402", "amount": "5000001", "backend": "isolated", "expect": "refuse:over_tier_cap" },
     { "kind": "coinbase", "amount": "0", "backend": "isolated", "expect": "refuse:invalid_amount" },
-    { "kind": "upi", "amount": "1000000", "backend": "isolated", "expect": "refuse:unknown_kind" }
+    { "kind": "upi", "amount": "1000000", "backend": "isolated", "expect": "refuse:unknown_kind" },
+    { "kind": "coinbase", "amount": "10000000", "backend": "isolated", "t2max": "2000000", "expect": "T2" },
+    { "kind": "coinbase", "amount": "10500000", "backend": "isolated", "t2max": "2000000", "expect": "T2" },
+    { "kind": "coinbase", "amount": "199999999", "backend": "isolated", "t2max": "2000000", "expect": "T2" },
+    { "kind": "coinbase", "amount": "200000000", "backend": "isolated", "t2max": "2000000", "expect": "LEGACY" },
+    { "kind": "coinbase", "amount": "250000000", "backend": "isolated", "t2max": "2000000", "expect": "LEGACY" },
+    { "kind": "coinbase", "amount": "250000000", "backend": "isolated", "t2max": "5000000000", "expect": "LEGACY" },
+    { "kind": "coinbase", "amount": "10000000", "backend": "legacy", "t2max": "2000000", "expect": "T2" }
   ],
   "pay": [
     { "kind": "coinbase", "amount": "250000000", "wallet": "LEGACY", "backend": "isolated", "expect": "LEGACY", "warn": true },
@@ -151,7 +200,17 @@
     { "kind": "x402", "amount": "1000000", "wallet": "T1", "backend": "isolated", "expect": "T1", "warn": false },
     { "kind": "x402", "amount": "5000001", "wallet": "T1", "backend": "isolated", "expect": "refuse:over_tier_cap" },
     { "kind": "x402", "amount": "1000000", "wallet": "T2", "backend": "isolated", "expect": "refuse:wrong_wallet_for_kind" },
-    { "kind": "upi", "amount": "1000000", "wallet": "T2", "backend": "isolated", "expect": "refuse:unknown_kind" }
+    { "kind": "upi", "amount": "1000000", "wallet": "T2", "backend": "isolated", "expect": "refuse:unknown_kind" },
+    { "kind": "coinbase", "amount": "10500000", "wallet": "T3A", "backend": "isolated", "t2max": "2000000", "expect": "T3A", "warn": false },
+    { "kind": "tron_ton_alpha", "amount": "10500000", "wallet": "T3A", "backend": "isolated", "t2max": "2000000", "expect": "T3A", "warn": false },
+    { "kind": "coinbase", "amount": "1990000", "wallet": "T2", "backend": "isolated", "t2max": "2000000", "expect": "T2", "warn": false },
+    { "kind": "coinbase", "amount": "50000000", "wallet": "T2", "backend": "isolated", "t2max": "2000000", "expect": "T2", "warn": true },
+    { "kind": "coinbase", "amount": "2000000", "wallet": "T2", "backend": "isolated", "t2max": "2000000", "expect": "T2", "warn": true },
+    { "kind": "tron_ton_alpha", "amount": "50000000", "wallet": "T2", "backend": "isolated", "t2max": "2000000", "expect": "T2", "warn": true },
+    { "kind": "coinbase", "amount": "50000000", "wallet": "LEGACY", "backend": "isolated", "t2max": "2000000", "expect": "LEGACY", "warn": true },
+    { "kind": "coinbase", "amount": "50000000", "wallet": "T3A", "backend": "isolated", "t2max": "200000000", "expect": "T3A", "warn": true },
+    { "kind": "tron_ton_alpha", "amount": "50000000", "wallet": "T3A", "backend": "isolated", "t2max": "200000000", "expect": "T3A", "warn": true },
+    { "kind": "coinbase", "amount": "1200000001", "wallet": "T3A", "backend": "isolated", "t2max": "2000000", "expect": "refuse:over_order_cap" }
   ],
   "parse": [
     { "in": "199.99", "out": "199990000" },

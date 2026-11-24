@@ -18,17 +18,30 @@ Bitrefill invoice amount, 6 decimals), not the caller's fee-inclusive price.
 | Kind | Amount | Tier |
 | --- | --- | --- |
 | `x402` | <= $5 | T1 |
-| `coinbase` | < $200 | T2 |
-| `coinbase` | >= $200 | T3A |
+| `coinbase` | < boundary | T2 |
+| `coinbase` | >= boundary | T3A |
 | `bitrefill`, `other` | any | T3B |
 | `stripe` | any | legacy funder on every backend (band T3B; the KMS T3B signs no EIP-2612 Permit yet) |
-| `tron_ton_alpha` | < $200 / >= $200 | T2 / T3A (legacy funder in phase 2a) |
+| `tron_ton_alpha` | < boundary / >= boundary | T2 / T3A (legacy funder in phase 2a) |
 | anything else | | refused |
 
+The boundary is the setting `FUNDER_T2_MAX_USD` (plain var here, env in the
+signer; unset, unparsable or not positive = $200). It routes NEW orders only:
+an order already created is paid by its recorded payout destination, and an
+amount outside that wallet's nominal range only warns (`resolvePayingFunder`,
+range warning computed with the same setting).
+
 Payments with no intents order (coupon, UPI, admin pay) use
-`resolveNoOrderFunder` (`routeNoOrderFunder`, mirrored): the same table,
+`resolveNoOrderFunder` (`routeNoOrderFunder`, mirrored): the same table at a
+FIXED $200 boundary (`NO_ORDER_T2_MAX_EXCLUSIVE_ATOMIC`, never the setting),
 except that T3A / T3B become the legacy funder, because the phase 2b KMS T3
 signer only signs against a paid-out intents order received by its wallet.
+
+Changing the boundary: lowering (e.g. to "2"), set the signer env first, then
+deploy the router; raising back, either order. Every intermediate state is
+safe because the signer pays an order-backed payment from the order's
+recorded destination (the boundary there only decides the warning), and the
+router only requests payment after the order paid out.
 
 Tier bands have no upper bound (founder 2026-11-24). The order cap is a
 separate refuse-check (`over_order_cap`) applied after the band to every
@@ -47,8 +60,9 @@ All plain `[vars]` (public addresses), commented out in `wrangler.toml`:
 | --- | --- |
 | `FUNDER_TIERS_ENABLED` | Only the exact string `true` enables tiers. |
 | `FUNDER_T1_ADDRESS` | x402 signer wallet (sign-x402). |
-| `FUNDER_T2_ADDRESS` | Coinbase invoices below $200. |
-| `FUNDER_T3A_ADDRESS` | Coinbase invoices $200 and above (up to the order cap). |
+| `FUNDER_T2_ADDRESS` | Coinbase invoices below the boundary. |
+| `FUNDER_T3A_ADDRESS` | Coinbase invoices at or above the boundary (up to the order cap). |
+| `FUNDER_T2_MAX_USD` | The order-backed T2 boundary in USD, exclusive (default and invalid = 200). |
 | `FUNDER_T3B_ADDRESS` | Stripe, Bitrefill and other merchants (up to the order cap). |
 
 | `FUNDER_T3_BACKEND` | Exactly `legacy` = phase 2a (below). Same variable the signer reads. |

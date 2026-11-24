@@ -618,6 +618,10 @@ export interface Env {
   FUNDER_T3B_ADDRESS?: string
   // Phase 2a: exactly "legacy" = T3A / T3B served by the legacy funder.
   FUNDER_T3_BACKEND?: string
+  // Order-backed T2 boundary in USD (exclusive): Coinbase / TRON-TON alpha
+  // orders below it -> T2, at or above -> T3A. Unset or invalid = "200".
+  // No-order payments (coupon, UPI, admin pay) keep a fixed $200.
+  FUNDER_T2_MAX_USD?: string
 
   // Stuck-order Intercom tickets (utils/intercom-ticket.ts). The token is a
   // private-app token with only "Write tickets"; set via

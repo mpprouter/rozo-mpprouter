@@ -24,6 +24,7 @@ import {
   routeFunder,
   routeNoOrderFunder,
   servedByLegacyFunder,
+  t2MaxAtomicFromUsd,
   type FunderTier,
   type FunderTierRefusal,
   type FunderWallet,
@@ -40,6 +41,20 @@ export const BASE_FUNDER_ADDRESS = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
 export const FUNDER_ORDER_CAP_ATOMIC: bigint = orderCapAtomicFromUsd(ORDER_CAP_USD)
 
 /**
+ * The order-backed T2 boundary (exclusive), in USDC atomic units, from the
+ * plain var FUNDER_T2_MAX_USD (wrangler.toml). Coinbase / TRON-TON alpha
+ * orders below it are received and paid by T2, at or above it by T3A.
+ * Unset, unparsable or not positive = $200 (t2MaxAtomicFromUsd, mirrored with
+ * the signer); a value above the order cap = every such order to T2.
+ * Used by resolveFunder (a NEW order's destination) and resolvePayingFunder
+ * (only the nominal wallet for the range warning: the recorded destination
+ * always pays). NOT used by resolveNoOrderFunder (fixed $200).
+ */
+export function funderT2MaxAtomic(env: FunderTierEnv | null | undefined): bigint {
+  return t2MaxAtomicFromUsd(env?.FUNDER_T2_MAX_USD)
+}
+
+/**
  * The compromised funder (2026-11-24). NEVER a payout target, a balance to
  * check or a receiver for a new order: anything sent there is swept.
  *
@@ -53,8 +68,9 @@ export const RETIRED_FUNDER_ADDRESS_20261124 = '0x2352Fa2970dBadD12d21808DB0F56C
 // Four Base USDC wallets instead of one (rules in src/funder-tiers.ts, which
 // the remote signer shares byte for byte):
 //   T1  x402 only (sign-x402)             FUNDER_T1_ADDRESS
-//   T2  Coinbase invoices below $200      FUNDER_T2_ADDRESS
-//   T3A Coinbase invoices $200 and above  FUNDER_T3A_ADDRESS (up to ORDER_CAP_USD)
+//   T2  Coinbase invoices below the T2 boundary      FUNDER_T2_ADDRESS
+//   T3A Coinbase invoices at or above the boundary   FUNDER_T3A_ADDRESS (up to ORDER_CAP_USD)
+//   (boundary: FUNDER_T2_MAX_USD, default $200; no-order payments: fixed $200)
 //   T3B Stripe / Bitrefill / other        FUNDER_T3B_ADDRESS
 //
 // Only the exact string "true" in FUNDER_TIERS_ENABLED turns this on. Off
@@ -77,6 +93,11 @@ export interface FunderTierEnv {
    * (same variable the signer reads). Anything else: T3 tier wallets.
    */
   FUNDER_T3_BACKEND?: string
+  /**
+   * Order-backed T2 boundary in USD (exclusive), e.g. "200" or "2". Unset or
+   * invalid = $200. See funderT2MaxAtomic.
+   */
+  FUNDER_T2_MAX_USD?: string
 }
 
 export type FunderConfigRefusal =
@@ -192,12 +213,13 @@ export function resolveFunder(
   }
   // routeFunder (mirrored with the signer) is the single routing rule.
   // LEGACY = phase 2a (FUNDER_T3_BACKEND="legacy"): T3A / T3B payments and
-  // TRON / TON alpha orders from $200 are served by the legacy funder exactly
-  // as with the flag off (receiver, balance), and the signer serves them with
-  // the same wallet, so expected_funder is that wallet too. Alpha orders
-  // below $200 route to T2 like plain Coinbase ones. FUNDER_T3A_ADDRESS /
-  // FUNDER_T3B_ADDRESS are not read then.
-  const route = routeFunder(kind, amountAtomic, env?.FUNDER_T3_BACKEND, FUNDER_ORDER_CAP_ATOMIC)
+  // TRON / TON alpha orders from the T2 boundary are served by the legacy
+  // funder exactly as with the flag off (receiver, balance), and the signer
+  // serves them with the same wallet, so expected_funder is that wallet too.
+  // Alpha orders below the boundary route to T2 like plain Coinbase ones.
+  // FUNDER_T3A_ADDRESS / FUNDER_T3B_ADDRESS are not read then. The boundary
+  // is FUNDER_T2_MAX_USD (funderT2MaxAtomic, default $200).
+  const route = routeFunder(kind, amountAtomic, env?.FUNDER_T3_BACKEND, FUNDER_ORDER_CAP_ATOMIC, funderT2MaxAtomic(env))
   if (!route.ok) return { ok: false, reason: route.reason, tier: null }
   if (route.wallet === 'LEGACY') {
     return { ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS }
@@ -212,8 +234,11 @@ export function resolveFunder(
  * pay): routeNoOrderFunder, mirrored with the signer. Same as resolveFunder,
  * except that T3A / T3B become the legacy funder: the phase 2b KMS signer only
  * signs against a paid-out intents order received by its wallet, so it cannot
- * pay these. Phase 2a and flag off: identical to resolveFunder. Never use it
- * for a new order's destination (that is resolveFunder).
+ * pay these. Phase 2a and flag off: identical to resolveFunder at the $200
+ * boundary. Never use it for a new order's destination (that is resolveFunder).
+ * FUNDER_T2_MAX_USD is deliberately NOT applied here: below $200 stays on T2
+ * and from $200 goes to the legacy funder whatever that setting is (else
+ * lowering it would move UPI / coupon / admin pay to the legacy wallet).
  */
 export function resolveNoOrderFunder(
   env: FunderTierEnv | null | undefined,
@@ -295,7 +320,15 @@ export function resolvePayingFunder(
   }
   const recv = receivingFunderWallet(env, receiver)
   if (!recv) return { ok: false, reason: 'receiver_not_tier_wallet', tier: null }
-  const d = payFromReceivingWallet(kind, amountAtomic, recv.wallet, env?.FUNDER_T3_BACKEND, FUNDER_ORDER_CAP_ATOMIC)
+  // The boundary only picks `nominal` (the range warning); recv.wallet pays.
+  const d = payFromReceivingWallet(
+    kind,
+    amountAtomic,
+    recv.wallet,
+    env?.FUNDER_T3_BACKEND,
+    FUNDER_ORDER_CAP_ATOMIC,
+    funderT2MaxAtomic(env),
+  )
   if (!d.ok) return { ok: false, reason: d.reason, tier: null }
   return {
     ok: true,
