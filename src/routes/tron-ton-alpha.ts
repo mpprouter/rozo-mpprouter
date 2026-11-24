@@ -42,7 +42,10 @@ import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
 import { forwardedClientHintHeader } from './client-hint-forward'
 import { readDeviceId } from './device-id-forward'
 import { attributionMetadata, buildOrderAttribution, forwardedAttributionField } from './order-attribution'
-import { BASE_FUNDER_ADDRESS } from '../funder-address'
+import { BASE_FUNDER_ADDRESS, funderTiersEnabled } from '../funder-address'
+
+/** Error code of every TRON / TON option while FUNDER_TIERS_ENABLED is on. */
+export const ALPHA_FUNDER_TIERS_PAUSED = 'ALPHA_FUNDER_TIERS_PAUSED'
 
 export const TRON_TON_ALPHA_CAPABILITY_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/capability'
 export const TRON_TON_ALPHA_OPTION_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/option'
@@ -359,6 +362,8 @@ export function probeTonNative(env: Env, fetchImpl: typeof fetch = fetch): Promi
 export async function handleTronTonAlphaCapability(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'GET') return json(405, { error: 'Method not allowed' })
   if (!env.ROZO_INTENTS_API_KEY) return json(200, { ok: true, enabled: false, options: [] })
+  // Tiered funders: TRON / TON are not offered (see ALPHA_FUNDER_TIERS_PAUSED).
+  if (funderTiersEnabled(env)) return json(200, { ok: true, enabled: false, options: [] })
   const [enabled, tonNative] = await Promise.all([probeTronTonAlpha(env), probeTonNative(env)])
   const options: Array<AlphaOptionDef & { beta?: true }> = enabled ? ALPHA_OPTIONS.map((o) => ({ ...o })) : []
   // Native TON is listed last, marked Beta, and only inside an open alpha.
@@ -516,6 +521,14 @@ export async function handleTronTonAlphaOption(request: Request, env: Env): Prom
   if (request.method !== 'POST') return json(405, { error: 'Method not allowed' })
   if (!env.ROZO_INTENTS_API_KEY || !env.PAYINVOICE_ADMIN_SECRET) {
     return fail(500, 'SERVER_MISCONFIGURED', 'Router is not configured for TRON / TON payments.')
+  }
+  // Tiered funders (FUNDER_TIERS_ENABLED="true"): the alpha destination is
+  // part of the upstream order digest and is the single legacy funder, so it
+  // cannot follow the per-amount tier. Rather than open orders that pay out
+  // to a wallet that no longer pays invoices, no TRON / TON option is opened
+  // or re-read while the flag is on. Before anything upstream.
+  if (funderTiersEnabled(env)) {
+    return fail(503, ALPHA_FUNDER_TIERS_PAUSED, 'TRON / TON payments are temporarily unavailable. Pay with another coin.')
   }
 
   // Coarse per-IP / global volume cap with its OWN counters (codex P2): the

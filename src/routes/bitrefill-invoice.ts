@@ -34,12 +34,20 @@ import { claimInvoiceKey } from './invoice-claim'
 import { isCeloChain } from './celo-finality'
 import {
   BITREFILL_FEE_BPS,
-  BITREFILL_FUNDER,
   bitrefillMetadataBlock,
   bitrefillReceiverRefusal,
   isBitrefillUuid,
   readBitrefillFacts,
 } from './bitrefill-binding'
+import {
+  FUNDER_TIER_RECEIVER_MISMATCH_CODE,
+  FUNDER_TIER_REFUSED_CODE,
+  funderRefusalMessage,
+  funderRefusalStatus,
+  isAnyConfiguredFunderTier,
+  resolveFunder,
+  sameEvmAddress,
+} from '../funder-address'
 
 const ROZO_INTENTS_URL = 'https://intentapiv4.rozo.ai/functions/v1/payment-api/'
 // Dedicated WALLET-type account. It must not be a merchant account: payment-api
@@ -179,6 +187,10 @@ export async function handleBitrefillCreateInvoice(
     return receiverRefusal === null || receiverRefusal.startsWith('not a')
       ? fail(400, 'INVALID_ADDRESS', 'bitrefill.address must be a 0x-prefixed 40-hex Base address.')
       : fail(400, 'BLOCKED_ADDRESS', 'This receiving address is not allowed.')
+  }
+  // FUNDER_TIERS_ENABLED only: a tier wallet is never a Bitrefill receiver.
+  if (isAnyConfiguredFunderTier(env, address)) {
+    return fail(400, 'BLOCKED_ADDRESS', 'This receiving address is not allowed.')
   }
   if (typeof amount !== 'string' || !AMOUNT_RE.test(amount) || Number(amount) <= 0) {
     return fail(400, 'INVALID_AMOUNT', 'bitrefill.amount must be a positive decimal string with at most 6 decimals.')
@@ -577,6 +589,17 @@ export async function handleBitrefillFunderCreate(
   if (invoiceAtomic > BigInt(BITREFILL_MAX_USDC) * 1_000_000n) {
     return fail(400, 'AMOUNT_OUT_OF_RANGE', `bitrefill.amount (the invoice amount) must be at most ${BITREFILL_MAX_USDC} USDC.`)
   }
+  // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder, same
+  // receiver as before). The T3B wallet receives the order and pays Bitrefill.
+  // A tier wallet is never accepted as the Bitrefill receiving address.
+  const funder = resolveFunder(env, 'bitrefill', invoiceAtomic)
+  if (!funder.ok) {
+    return fail(funderRefusalStatus(funder.reason), FUNDER_TIER_REFUSED_CODE, funderRefusalMessage(funder.reason), { reason: funder.reason })
+  }
+  if (isAnyConfiguredFunderTier(env, address as string)) {
+    return fail(400, 'BLOCKED_ADDRESS', 'This receiving address is not allowed.')
+  }
+  const funderReceiver = funder.address
   const t = typeof expiresAt === 'string' ? Date.parse(expiresAt) : NaN
   if (!Number.isFinite(t)) {
     return fail(400, 'INVALID_INPUT', 'bitrefill.expiresAt is required and must be an ISO-8601 timestamp.')
@@ -684,7 +707,7 @@ export async function handleBitrefillFunderCreate(
       : { chainId: source.chainId, tokenSymbol: source.tokenSymbol },
     destination: {
       chainId: BASE_CHAIN_ID,
-      receiverAddress: BITREFILL_FUNDER,
+      receiverAddress: funderReceiver,
       tokenSymbol: 'USDC',
       tokenAddress: BASE_USDC_TOKEN,
       amount: callerPays,
@@ -746,6 +769,12 @@ export async function handleBitrefillFunderCreate(
     created = JSON.parse(text)
   } catch {
     return fail(502, 'INTENTS_API_FAILED', 'Rozo intents API returned a malformed body.')
+  }
+  // FUNDER_TIERS_ENABLED only: an order that does not pay out to the selected
+  // tier wallet is not handed out (the settle side refuses it too).
+  if (funder.expectedFunder && !sameEvmAddress(created?.destination?.receiverAddress, funder.expectedFunder)) {
+    console.error('[bitrefill] intents order destination is not the selected funder tier wallet')
+    return fail(503, FUNDER_TIER_RECEIVER_MISMATCH_CODE, 'Bitrefill payment is temporarily unavailable. Do not pay this order; try again later.')
   }
 
   return ok({

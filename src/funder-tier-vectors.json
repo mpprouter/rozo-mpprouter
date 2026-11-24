@@ -1,0 +1,41 @@
+{
+  "_comment": "MIRRORED: identical copy in mpprouter/rozo-mpprouter src/funder-tier-vectors.json and shawnmuggle/shawn-local-skills supabase/functions/_shared/funder-tier-vectors.json. amount is USDC atomic (6 decimals) as a decimal string. expect is a tier or refuse:<reason>.",
+  "vectors": [
+    { "kind": "x402", "amount": "1", "expect": "T1" },
+    { "kind": "x402", "amount": "5000000", "expect": "T1" },
+    { "kind": "x402", "amount": "5000001", "expect": "refuse:over_tier_cap" },
+    { "kind": "x402", "amount": "0", "expect": "refuse:invalid_amount" },
+    { "kind": "coinbase", "amount": "1", "expect": "T2" },
+    { "kind": "coinbase", "amount": "5000000", "expect": "T2" },
+    { "kind": "coinbase", "amount": "199999999", "expect": "T2" },
+    { "kind": "coinbase", "amount": "200000000", "expect": "T3A" },
+    { "kind": "coinbase", "amount": "200000001", "expect": "T3A" },
+    { "kind": "coinbase", "amount": "1200000000", "expect": "T3A" },
+    { "kind": "coinbase", "amount": "1200000001", "expect": "refuse:over_order_cap" },
+    { "kind": "coinbase", "amount": "2121000000", "expect": "refuse:over_order_cap" },
+    { "kind": "coinbase", "amount": "0", "expect": "refuse:invalid_amount" },
+    { "kind": "coinbase", "amount": "-1", "expect": "refuse:invalid_amount" },
+    { "kind": "stripe", "amount": "1", "expect": "T3B" },
+    { "kind": "stripe", "amount": "199999999", "expect": "T3B" },
+    { "kind": "stripe", "amount": "1200000000", "expect": "T3B" },
+    { "kind": "stripe", "amount": "1200000001", "expect": "refuse:over_order_cap" },
+    { "kind": "bitrefill", "amount": "50000000", "expect": "T3B" },
+    { "kind": "bitrefill", "amount": "1200000001", "expect": "refuse:over_order_cap" },
+    { "kind": "other", "amount": "300000000", "expect": "T3B" },
+    { "kind": "upi", "amount": "1000000", "expect": "refuse:unknown_kind" },
+    { "kind": "", "amount": "1000000", "expect": "refuse:unknown_kind" },
+    { "kind": "COINBASE", "amount": "1000000", "expect": "refuse:unknown_kind" }
+  ],
+  "parse": [
+    { "in": "199.99", "out": "199990000" },
+    { "in": "200", "out": "200000000" },
+    { "in": "200.000000", "out": "200000000" },
+    { "in": "0.000001", "out": "1" },
+    { "in": "1200.00", "out": "1200000000" },
+    { "in": "1.0000001", "out": null },
+    { "in": "-1", "out": null },
+    { "in": "1e3", "out": null },
+    { "in": "", "out": null },
+    { "in": "abc", "out": null }
+  ]
+}

@@ -602,8 +602,18 @@ export interface Env {
   // Intents API key bound to app merchant_x402_topup (top-up orders).
   //   wrangler secret put ROZO_X402_TOPUP_API_KEY
   ROZO_X402_TOPUP_API_KEY?: string
-  // Base USDC receiver for top-ups. Default: FUNDER_WALLET.
+  // Base USDC receiver for top-ups. Default: FUNDER_WALLET (T1 while
+  // FUNDER_TIERS_ENABLED="true").
   X402_TOPUP_RECEIVER?: string
+
+  // Tiered Base USDC funder wallets (src/funder-address.ts, rules in
+  // src/funder-tiers.ts). Only the exact string "true" enables them; anything
+  // else keeps the single legacy funder. Plain [vars] (public addresses).
+  FUNDER_TIERS_ENABLED?: string
+  FUNDER_T1_ADDRESS?: string
+  FUNDER_T2_ADDRESS?: string
+  FUNDER_T3A_ADDRESS?: string
+  FUNDER_T3B_ADDRESS?: string
 
   // Stuck-order Intercom tickets (utils/intercom-ticket.ts). The token is a
   // private-app token with only "Write tickets"; set via
