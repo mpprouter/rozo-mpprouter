@@ -159,12 +159,15 @@ BITREFILL_ENABLED = "true"
 # enables tiers, and every address must be a real, distinct, checksummed EVM
 # address or the resolver refuses (no order created, nothing paid). Enabling
 # adds new payout destinations: founder approval required first.
-# FUNDER_TIERS_ENABLED = "true"
-# FUNDER_T1_ADDRESS = "0x..."   # x402 only (sign-x402), <= $5 per payment
-# FUNDER_T2_ADDRESS = "0x..."   # Coinbase invoices below $200
-# FUNDER_T3A_ADDRESS = "0x..."  # Coinbase invoices $200 to $1,200
-# FUNDER_T3B_ADDRESS = "0x..."  # Stripe, Bitrefill, other, up to $1,200
-# FUNDER_T3_BACKEND = "legacy"  # phase 2a: T3A/T3B served by the legacy funder (T3 addresses not needed)
+# Phase 2a (founder-approved cutover, 2026-11-24): T1 + T2 live, T3A/T3B
+# still served by the legacy funder BASE_FUNDER_ADDRESS (0x282bE0...084A).
+# Rollback: delete FUNDER_TIERS_ENABLED (or set it to "false") and redeploy.
+FUNDER_TIERS_ENABLED = "true"
+FUNDER_T1_ADDRESS = "0xCf7d0149De9d57C1B5c5fc52B917aA6817E50242"   # x402 only (sign-x402), <= $5 per payment
+FUNDER_T2_ADDRESS = "0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3"   # Coinbase invoices below $200
+# FUNDER_T3A_ADDRESS = "0x..."  # phase 2b only: Coinbase invoices $200 to $1,200
+# FUNDER_T3B_ADDRESS = "0x..."  # phase 2b only: Stripe, Bitrefill, other, up to $1,200
+FUNDER_T3_BACKEND = "legacy"  # phase 2a: T3A/T3B served by the legacy funder (T3 addresses not needed)
 # Hostname suffix for router-hosted paywalls (services/provider-hosting.ts).
 PROVIDER_HOSTED_SUFFIX = "-pay.mpprouter.dev"
 # Default checkout fee. checkout.rozo.ai and the existing agent.rozo.ai use
