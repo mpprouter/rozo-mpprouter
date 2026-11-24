@@ -164,9 +164,12 @@ export async function ensureAlphaBusinessOrder(
     if (isTronTonAlphaOrder(row)) return paysOtherThanTier(row, alphaFunder.expectedFunder)
     return !coinbaseFunder.ok || paysOtherThanTier(row, coinbaseFunder.expectedFunder)
   }
-  // Flag on: a separate marker, so a marker cached while the flag was off
-  // (whose order was never receiver-checked) cannot skip the check above.
-  const marker = alphaOrderMarkerKey(a.invoiceKey) + (tierOn ? ':tiers' : '')
+  // Flag on: a separate marker bound to the wallets the check used, so a
+  // marker cached while the flag was off, or before a tier address changed,
+  // cannot skip the check above.
+  const marker = alphaOrderMarkerKey(a.invoiceKey) + (tierOn
+    ? `:tiers:${String(alphaFunder.expectedFunder).toLowerCase()}:${String(coinbaseFunder.ok ? coinbaseFunder.expectedFunder : 'none').toLowerCase()}`
+    : '')
   const cached = await env.MPP_STORE.get(marker).catch(() => null)
   if (cached) return { ok: true, state: 'cached' }
   // The order exists: store its link, and cache that only once the link is in.

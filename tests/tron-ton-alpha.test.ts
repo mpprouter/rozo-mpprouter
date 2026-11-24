@@ -1164,6 +1164,20 @@ describe('tron-ton-alpha with tiered funders', () => {
     expect(r.status).toBe(502)
   })
 
+  it('phase 2a: changing the T2 address invalidates the cached business-order marker', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const row = {
+      id: 'b0000000-0000-4000-8000-000000000002', orderId: PL, status: 'payment_unpaid',
+      destination: { chainId: '8453', receiverAddress: '0x2000000000000000000000000000000000000002' }, metadata: { source: 'mpprouter-create-invoice' },
+    }
+    intents.lookup = () => new Response(JSON.stringify(row), { status: 200 })
+    const env = makeEnv(P2A)
+    expect((await run(env)).status).toBe(200)
+    resetTronTonAlphaCapabilityCache()
+    ;(env as any).FUNDER_T2_ADDRESS = '0x5000000000000000000000000000000000000005'
+    expect((await run(env)).status).toBe(502)
+  })
+
   it('phase 2a: a created business order paying another wallet shows no instructions', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => {})
     vi.spyOn(console, 'warn').mockImplementation(() => {})
