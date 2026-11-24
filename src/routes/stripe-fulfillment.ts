@@ -23,9 +23,9 @@ import {
   FUNDER_TIER_RECEIVER_MISMATCH_CODE,
   FUNDER_TIER_REFUSED_CODE,
   funderTiersEnabled,
-  resolveFunder,
-  sameEvmAddress,
+  resolvePayingFunder,
 } from '../funder-address'
+import { reportFunderRangeWarning } from '../utils/funder-range-warning'
 import {
   deliveredReportEnabled,
   deliveredReportStillPending,
@@ -899,19 +899,13 @@ export async function handleStripeWebhookEvent(
   if (await checkoutDeliveryPaused(env)) return deferForCheckoutPause()
 
   // Funder tier (FUNDER_TIERS_ENABLED only; off = the legacy funder, no read).
-  // The selected tier wallet pays, so the order must have paid out to exactly
-  // that wallet. Nothing is claimed, reserved or signed on any refusal.
-  const funder = resolveFunder(env, 'stripe', invoiceAtomic)
-  if (!funder.ok) {
-    await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
-      failureReason: `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason} (nothing signed)`,
-      event: { kind: 'funder_tier_refused', detail: { reason: funder.reason } },
-    })
-    return { ok: true, provider: 'stripe_crypto', status: 'manual_review', reason: FUNDER_TIER_REFUSED_CODE }
-  }
+  // The wallet the order actually paid out to pays (resolvePayingFunder); an
+  // amount outside its nominal range only warns. Nothing is claimed,
+  // reserved or signed on any refusal.
+  let receiver: unknown = undefined
   if (funderTiersEnabled(env)) {
     const order = input.rozoPaymentId ? await fetchRozoPaymentForSettle(env, input.rozoPaymentId) : null
-    const receiver = order?.destination?.receiverAddress ?? order?.destination_receiver_address ?? null
+    receiver = order?.destination?.receiverAddress ?? order?.destination_receiver_address ?? null
     if (!order || typeof receiver !== 'string') {
       // Could not read the order right now: not a decision. Step back so a
       // later event (or the retry sweep) re-runs this path.
@@ -920,14 +914,29 @@ export async function handleStripeWebhookEvent(
       })
       return { ok: true, provider: 'stripe_crypto', deferred: 'funder_tier_order_unreadable', retryable: true }
     }
-    if (!sameEvmAddress(receiver, funder.address)) {
-      console.error(`[stripe] order destination is not the ${funder.tier} funder for ${maskInvoiceKey(invoiceKey)}`)
-      await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
-        failureReason: `${FUNDER_TIER_RECEIVER_MISMATCH_CODE}: order destination is not the ${funder.tier} funder (nothing signed)`,
-        event: { kind: 'funder_tier_receiver_mismatch', detail: { tier: funder.tier } },
-      })
-      return { ok: true, provider: 'stripe_crypto', status: 'manual_review', reason: FUNDER_TIER_RECEIVER_MISMATCH_CODE }
-    }
+  }
+  const funder = resolvePayingFunder(env, 'stripe', invoiceAtomic, receiver)
+  if (!funder.ok) {
+    const code = funder.reason === 'receiver_not_tier_wallet' ? FUNDER_TIER_RECEIVER_MISMATCH_CODE : FUNDER_TIER_REFUSED_CODE
+    console.error(`[stripe] funder tier refused (${funder.reason}) for ${maskInvoiceKey(invoiceKey)}`)
+    await finalizeClaim(env, invoiceKey, orderId, nowIso, 'manual_review', {
+      failureReason: `${code}: ${funder.reason} (nothing signed)`,
+      event: { kind: 'funder_tier_refused', detail: { reason: funder.reason } },
+    })
+    return { ok: true, provider: 'stripe_crypto', status: 'manual_review', reason: code }
+  }
+  if (funder.warning) {
+    // Not awaited: the alert runs in the background and never blocks the pay.
+    reportFunderRangeWarning(env, {
+      site: 'stripe_settle',
+      orderId: input.rozoPaymentId ?? null,
+      invoiceId: maskInvoiceKey(invoiceKey),
+      wallet: funder.tier,
+      address: funder.address,
+      amountAtomic: invoiceAtomic,
+      nominal: funder.nominal,
+      warning: funder.warning,
+    })
   }
   const funderAddress = funder.address
   // The order re-read above (flag on); undefined while the flag is off.
@@ -1109,10 +1118,31 @@ export async function handleStripeWebhookEvent(
   // move → release the daily reservation. This IS retryable (a later corrected
   // event can retry), so return to payout_seen rather than a stuck state.
   await releaseDailySpend(env, now, invoiceAtomic)
+  const refusalCode = (() => {
+    const b = payResult.body as Record<string, unknown> | null
+    return b && typeof b === 'object' && typeof b.code === 'string' ? b.code.slice(0, 64) : null
+  })()
   await finalizeClaim(env, invoiceKey, orderId, nowIso, 'failed_provider', {
-    failureReason: `pay-invoice ${payResult.status}`,
+    // Flag off: the same text as before. Flag on: the signer's code is kept
+    // (order-check refusals like ORDER_UNDERPAID, all signed:false).
+    failureReason: funderTiersEnabled(env) && refusalCode
+      ? `pay-invoice ${payResult.status} ${refusalCode} (nothing signed)`
+      : `pay-invoice ${payResult.status}`,
     event: { kind: 'stripe_fulfillment_failed', detail: { status: payResult.status } },
   })
+  // Flag on: a definite signer refusal (order check, tier cross-check) pages
+  // ops; nothing was signed. Never blocks; flag off unchanged.
+  if (funderTiersEnabled(env) && alertSinkConfigured(env)) {
+    await sendAlert(
+      env,
+      redactForAlert(
+        `[MPP Router] 🚨 Stripe invoice NOT paid: pay-invoice refused before signing\n` +
+          `Invoice: ${maskInvoiceKey(invoiceKey)}, Rozo payment ${(input.rozoPaymentId ?? '?').slice(0, 8)}\n` +
+          `Reason: pay-invoice ${payResult.status} ${refusalCode ?? ''}\n` +
+          `Nothing was signed. Check the order against the invoice before any manual payment.`,
+      ),
+    ).catch(() => false)
+  }
   return { ok: true, provider: 'stripe_crypto', status: 'failed_provider' }
   }
 }

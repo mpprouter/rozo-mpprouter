@@ -1657,6 +1657,18 @@ describe('tiered funders (Bitrefill = T3B)', () => {
     expect(rec(kv).bitrefill?.funder).toBe(T3B)
   })
 
+  it('settle, flag on: an order that paid out to T2 is paid by T2 (range warning, not blocked)', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const T2 = '0x2000000000000000000000000000000000000002'
+    const { env, kv } = makeEnv(TIERS)
+    const order = await frozenOrder({ destination: { chainId: '8453', receiverAddress: T2, tokenSymbol: 'USDC', amount: '206.04', txHash: TX } })
+    const { calls } = stub({ order })
+    await run(await signedEvent(), env)
+    expect(calls.pay).toBe(1)
+    expect(calls.payBodies[0].expected_funder).toBe(T2)
+    expect(rec(kv).bitrefill?.funder).toBe(T2)
+  })
+
   it('settle, flag on: an order paid to the legacy funder is refused before any send', async () => {
     const { env, kv } = makeEnv(TIERS)
     const { calls } = stub({ order: await frozenOrder() })

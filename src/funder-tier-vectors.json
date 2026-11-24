@@ -56,6 +56,26 @@
     { "kind": "x402", "amount": "5000001", "backend": "legacy", "expect": "refuse:over_tier_cap" },
     { "kind": "upi", "amount": "1000000", "backend": "legacy", "expect": "refuse:unknown_kind" }
   ],
+  "pay": [
+    { "kind": "coinbase", "amount": "230000000", "wallet": "T2", "backend": "isolated", "expect": "T2", "warn": true },
+    { "kind": "coinbase", "amount": "50000000", "wallet": "T3A", "backend": "isolated", "expect": "T3A", "warn": true },
+    { "kind": "coinbase", "amount": "50000000", "wallet": "T2", "backend": "isolated", "expect": "T2", "warn": false },
+    { "kind": "coinbase", "amount": "50000000", "wallet": "T3B", "backend": "isolated", "expect": "T3B", "warn": true },
+    { "kind": "coinbase", "amount": "230000000", "wallet": "T2", "backend": "legacy", "expect": "T2", "warn": true },
+    { "kind": "coinbase", "amount": "230000000", "wallet": "LEGACY", "backend": "legacy", "expect": "LEGACY", "warn": false },
+    { "kind": "coinbase", "amount": "50000000", "wallet": "LEGACY", "backend": "legacy", "expect": "LEGACY", "warn": true },
+    { "kind": "stripe", "amount": "50000000", "wallet": "T3B", "backend": "isolated", "expect": "T3B", "warn": false },
+    { "kind": "stripe", "amount": "50000000", "wallet": "T2", "backend": "isolated", "expect": "T2", "warn": true },
+    { "kind": "tron_ton_alpha", "amount": "20000000", "wallet": "LEGACY", "backend": "legacy", "expect": "LEGACY", "warn": false },
+    { "kind": "tron_ton_alpha", "amount": "20000000", "wallet": "T2", "backend": "legacy", "expect": "T2", "warn": true },
+    { "kind": "coinbase", "amount": "1200000001", "wallet": "T3A", "backend": "isolated", "expect": "refuse:over_order_cap" },
+    { "kind": "coinbase", "amount": "0", "wallet": "T2", "backend": "isolated", "expect": "refuse:invalid_amount" },
+    { "kind": "coinbase", "amount": "1000000", "wallet": "T1", "backend": "isolated", "expect": "refuse:wrong_wallet_for_kind" },
+    { "kind": "x402", "amount": "1000000", "wallet": "T1", "backend": "isolated", "expect": "T1", "warn": false },
+    { "kind": "x402", "amount": "5000001", "wallet": "T1", "backend": "isolated", "expect": "refuse:over_tier_cap" },
+    { "kind": "x402", "amount": "1000000", "wallet": "T2", "backend": "isolated", "expect": "refuse:wrong_wallet_for_kind" },
+    { "kind": "upi", "amount": "1000000", "wallet": "T2", "backend": "isolated", "expect": "refuse:unknown_kind" }
+  ],
   "parse": [
     { "in": "199.99", "out": "199990000" },
     { "in": "200", "out": "200000000" },

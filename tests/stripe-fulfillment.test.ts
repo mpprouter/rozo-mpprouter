@@ -607,6 +607,18 @@ describe('handleStripeWebhookEvent: tiered funders', () => {
     expect((await loadRec(env, 'cpis_tier')).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
   })
 
+  it('flag on: a Stripe order that paid out to T2 is paid by T2 (range warning, not blocked)', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const T2 = '0x2000000000000000000000000000000000000002'
+    const env = makeEnv({ extra: TIERS })
+    await seed(env)
+    const seen = upstream(T2)
+    const s = await handleStripeWebhookEvent(env, evt('t-recv'), new Date(Date.UTC(2026, 6, 12)))
+    expect(s.status).toBe('provider_submitted')
+    expect(seen.payBodies[0].expected_funder).toBe(T2)
+    expect(seen.balanceOf).toEqual([T2.toLowerCase()])
+  })
+
   it('flag on: order unreadable -> deferred and re-drivable, nothing signed', async () => {
     const env = makeEnv({ extra: TIERS })
     await seed(env)

@@ -151,6 +151,55 @@ export function routeFunder(
 }
 
 /**
+ * Paying an order whose money already landed in a wallet (founder 2026-11-24:
+ * tier amounts are a ROUTING rule for new orders, not a restriction on paying
+ * out money that already arrived). The paying wallet is the wallet that
+ * received the order's funds (`receivingWallet`, resolved from the intents
+ * order's payout destination by the caller), never one recomputed from the
+ * amount. An amount outside that wallet's nominal range is a WARNING (log and
+ * alert), not a refusal.
+ *
+ * Still refused (fail closed):
+ *   - amount not a positive integer, or above ORDER_CAP_ATOMIC (global cap);
+ *   - kind x402: only T1, only up to T1_MAX_ATOMIC (not order money);
+ *   - non-x402 money in T1 (T1 is x402 only);
+ *   - an unknown kind.
+ * The caller separately refuses a destination that is not a configured tier
+ * wallet, and keeps where-money-may-go rules (T3A collector allowlist).
+ */
+export type PayDecision =
+  | { ok: true; wallet: FunderWallet; nominal: FunderWallet | null; warning: string | null }
+  | { ok: false; reason: FunderTierRefusal | "wrong_wallet_for_kind" };
+
+export function payFromReceivingWallet(
+  kind: string,
+  amountAtomic: bigint,
+  receivingWallet: FunderWallet,
+  t3Backend: string | undefined,
+): PayDecision {
+  if (typeof amountAtomic !== "bigint" || amountAtomic <= 0n) {
+    return { ok: false, reason: "invalid_amount" };
+  }
+  if (kind === "x402") {
+    if (receivingWallet !== "T1") return { ok: false, reason: "wrong_wallet_for_kind" };
+    return amountAtomic <= T1_MAX_ATOMIC
+      ? { ok: true, wallet: "T1", nominal: "T1", warning: null }
+      : { ok: false, reason: "over_tier_cap" };
+  }
+  if (kind !== ALPHA_KIND && kind !== "coinbase" && kind !== "stripe" && kind !== "bitrefill" && kind !== "other") {
+    return { ok: false, reason: "unknown_kind" };
+  }
+  if (amountAtomic > ORDER_CAP_ATOMIC) return { ok: false, reason: "over_order_cap" };
+  if (receivingWallet === "T1") return { ok: false, reason: "wrong_wallet_for_kind" };
+  const route = routeFunder(kind, amountAtomic, t3Backend);
+  const nominal = route.ok ? route.wallet : null;
+  const warning = nominal === receivingWallet
+    ? null
+    : `amount_outside_nominal_range: ${kind} ${amountAtomic} would route to ${nominal ?? "none"}, received by ${receivingWallet}`;
+  return { ok: true, wallet: receivingWallet, nominal, warning };
+}
+
+/**
  * Parse a decimal USDC string ("199.99", "200", "0.000001") into atomic units.
  * Returns null for anything that is not a plain non-negative decimal with at
  * most 6 fractional digits (no exponent, no sign, no rounding).
