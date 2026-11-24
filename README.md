@@ -156,6 +156,24 @@ provider's 403 in `detail`, payment auto-refunded). Details in `/llms.txt`.
 - [OpenClaw / Claude Code skill](https://github.com/mpprouter/stellar-agent-wallet-skill)
   — the same protocol packaged as a skill.
 
+## How to change the order cap
+
+The single-order customer cap for native coins and ZEC on the checkout route
+is one constant: `ORDER_CAP_USD` in `src/routes/native-sources.ts` (native:
+amount <= cap; ZEC: `ZEC_MAX_USD` = cap - 0.01; POL keeps its own 3,500
+ceiling, so min(3500, cap)). quote-invoice returns the result per coin as
+`nativeMaxUsd`. The `NATIVE_MAX_USD` env var still overrides the native default.
+
+All layers move together, backend first (a page must never promise more
+than the backend takes):
+1. rozo-intents-api `app_config`: `NATIVE_MAX_ORDER_USD_merchant_openrouter`
+   (native) and `NATIVE_MAX_ORDER_USD_ZEC` (ZEC, refused at >= value).
+2. Here: `ORDER_CAP_USD`, tests, `CLOUDFLARE_ACCOUNT_ID=2d3f34ca0a1426b30a7d07cf79bdac90 npx wrangler deploy`.
+3. rozo-checkout-mcp `src/coins.ts` `ORDER_CAP_USD` (fallback; it reads
+   quote-invoice `nativeMaxUsd` live).
+4. rozo-rescue-landing `site/assets/js/caps.js` `ORDER_CAP_USD`, `npm run build`.
+5. ainative ops-patrol W42 `CAP_DECIDED`.
+
 ## Secret scanning
 
 Enable the local gitleaks pre-commit hook once per clone: `brew install gitleaks pre-commit && pre-commit install` (config in `.pre-commit-config.yaml`). CI also runs a report-only scan in `.github/workflows/secret-scan.yml`.

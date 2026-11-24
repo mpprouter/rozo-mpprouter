@@ -93,6 +93,21 @@ export interface NativeSourceDef {
   beta?: boolean
 }
 
+/**
+ * Single-order customer cap in USD, our fee included (callerPays), for the
+ * native coins and ZEC. ONE place to change it in this repo (README "How to
+ * change the order cap"); keep it equal to rozo-intents-api app_config
+ * NATIVE_MAX_ORDER_USD_merchant_openrouter and NATIVE_MAX_ORDER_USD_ZEC, the
+ * checkout (rozo-rescue-landing site/assets/js/caps.js) and rozo-checkout-mcp
+ * src/coins.ts. Native: amount <= cap. ZEC: strictly below (ZEC_MAX_USD).
+ * The NATIVE_MAX_USD env var still overrides the native default.
+ * History: 1200 from 2026-11-24 (founder "maybe update to 1200 first"),
+ * native 12750 / ZEC 11699.99 from 2026-11-18.
+ */
+export const ORDER_CAP_USD = 1200
+/** ZEC: intents refuses at >= NATIVE_MAX_ORDER_USD_ZEC, so the router stops a cent below. */
+export const ZEC_MAX_USD = ORDER_CAP_USD - 0.01
+
 export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
   '8453': { symbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' },
   '1': { symbol: 'ETH', tokenAddress: '0x0000000000000000000000000000000000000000' },
@@ -112,11 +127,11 @@ export const NATIVE_SOURCE_DEFS: Record<string, NativeSourceDef> = {
     symbol: 'ZEC',
     tokenAddress: '',
     provider: 'near',
-    // Strictly below $11,700 like the custody rail: customer cap 11,000
-    // credits incl. fee (founder 2026-11-18, intents NATIVE_MAX_ORDER_USD_ZEC
-    // 11700 under the 13,500 hard cap). Was 3199.99 from 2026-11-14, 3500
-    // from 2026-10-23, 3200 from 2026-10-21, 2000 before.
-    maxUsd: 11699.99,
+    // Strictly below ORDER_CAP_USD like the custody rail (intents
+    // NATIVE_MAX_ORDER_USD_ZEC under the 13,500 hard cap). Was 11699.99 from
+    // 2026-11-18, 3199.99 from 2026-11-14, 3500 from 2026-10-23, 3200 from
+    // 2026-10-21, 2000 before.
+    maxUsd: ZEC_MAX_USD,
     etaSeconds: 480,
     refundAddressRequired: true,
     beta: true,
@@ -289,16 +304,15 @@ export const ZEC_BLOCK_TARGET_SECONDS = 75
 
 /**
  * ZEC def overrides when ZEC_RAIL = custody. G must stay strictly below the
- * customer cap $11,700 (founder 2026-11-18: 11,000 credits incl. fee; intents
- * NATIVE_MAX_ORDER_USD_ZEC = 11700 under the 13,500 hard cap). Until intents
- * app_config is raised it still refuses from $3,200 and stays the final gate.
- * Was 3199.99 from 2026-11-14, 3499.99 from 2026-10-23, $1100 before 2026-10-21.
+ * customer cap ORDER_CAP_USD (intents NATIVE_MAX_ORDER_USD_ZEC under the
+ * 13,500 hard cap); intents stays the final gate. Was 11699.99 from
+ * 2026-11-18, 3199.99 from 2026-11-14, 3499.99 from 2026-10-23, $1100 before 2026-10-21.
  * No arrival estimate: block times vary and the checkout must not promise one,
  * so sourceMeta omits eta_seconds for this rail.
  */
 const ZEC_CUSTODY_OVERRIDE: Partial<NativeSourceDef> = {
   provider: 'rozo',
-  maxUsd: 11699.99,
+  maxUsd: ZEC_MAX_USD,
   etaSeconds: undefined,
   // Founder 2026-10-13: the deposit address is our own wallet, so the payer's
   // refund address is optional (late or short payments handled manually).
@@ -566,14 +580,15 @@ export function isNativeSymbol(chainId: string, tokenSymbol: string): boolean {
   return !!def && def.symbol === tokenSymbol.toUpperCase()
 }
 
-/** Upper bound on callerPays for a native source: the customer cap $12,750
- *  incl. fee (12,000 OpenRouter credits; founder 2026-11-18, intents
- *  NATIVE_MAX_ORDER_USD_merchant_openrouter 12750 under the MAX_NATIVE_PAYIN_USD
- *  13,500 hard cap). Coins with their own lower maxUsd (POL, ZEC, BTC) keep it
- *  through nativeMaxUsdFor. Was $3,500 from 2026-10-23, $3,200 from 2026-10-20, $2,000 before. */
+/** Upper bound on callerPays for a native source: ORDER_CAP_USD incl. fee
+ *  (intents NATIVE_MAX_ORDER_USD_merchant_openrouter under the
+ *  MAX_NATIVE_PAYIN_USD 13,500 hard cap), unless the NATIVE_MAX_USD env var
+ *  sets another value. Coins with their own lower maxUsd (POL, ZEC, BTC) keep
+ *  it through nativeMaxUsdFor. Was $12,750 from 2026-11-18, $3,500 from
+ *  2026-10-23, $3,200 from 2026-10-20, $2,000 before. */
 export function nativeMaxUsd(raw: string | undefined): number {
   const n = Number(raw)
-  return Number.isFinite(n) && n > 0 ? n : 12750
+  return Number.isFinite(n) && n > 0 ? n : ORDER_CAP_USD
 }
 
 /** Cap for one native coin: the lower of its own maxUsd and NATIVE_MAX_USD. */
