@@ -74,6 +74,7 @@ describe('classifyCreateFailure', () => {
     ['BTC below minimum', 400, { code: 'BTC_AMOUNT_TOO_LOW' }, false],
     ['intents amountTooLow', 502, intentsFailed(400, '{"error":{"code":"amountTooLow","message":"below minimum"}}'), false],
     ['bitrefill amount out of range', 400, { ok: false, error: 'AMOUNT_OUT_OF_RANGE' }, false],
+    ['bitrefill rejected invalidAmount', 400, { ok: false, error: 'INTENTS_API_REJECTED', upstream_code: 'invalidAmount' }, false],
     ['unsupported coin', 400, { code: 'UNSUPPORTED_SOURCE' }, false],
     ['router rate limit', 429, { code: 'RATE_LIMITED' }, false],
     ['relayed upstream rate limit', 429, { error: { code: 'rate_limited' } }, false],
@@ -101,6 +102,28 @@ describe('classifyCreateFailure', () => {
     const v = classifyCreateFailure(502, intentsFailed(400, TODAY_UPSTREAM_400))
     expect(v.reason).toBe('INTENTS_API_FAILED:create_http_error:400:invalidRequest')
     expect(v.upstreamCode).toBe('invalidRequest')
+  })
+})
+
+describe('only listed values are shown or keyed', () => {
+  it('an unknown upstream string (could be a coupon code) is shown as otherUpstreamCode', () => {
+    const v = classifyCreateFailure(502, intentsFailed(400, '{"error":"ABCD1234"}'))
+    expect(v.alert).toBe(true)
+    expect(v.upstreamCode).toBe('otherUpstreamCode')
+    expect(v.reason).not.toContain('ABCD1234')
+    const text = createFailureAlertText('create-invoice', 502, v, {}, null)
+    expect(text).not.toContain('ABCD1234')
+  })
+
+  it('an unknown router code alerts as OTHER_CODE', () => {
+    const v = classifyCreateFailure(409, { code: 'WXYZ9876' })
+    expect(v.alert).toBe(true)
+    expect(v.reason).toBe('OTHER_CODE')
+  })
+
+  it('an unlisted alpha detail is shown as other_detail', () => {
+    const v = classifyCreateFailure(502, { code: 'ALPHA_UPSTREAM_FAILED' }, { detail: 'option_502_COUPON42' })
+    expect(v.reason).toBe('ALPHA_UPSTREAM_FAILED:other_detail')
   })
 })
 

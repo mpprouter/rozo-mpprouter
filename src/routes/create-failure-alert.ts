@@ -96,13 +96,52 @@ export const USER_CAUSED_CODES: ReadonlySet<string> = new Set([
 export const UPSTREAM_USER_CODES: ReadonlySet<string> = new Set([
   'amountTooLow', 'amountTooHigh', 'AMOUNT_TOO_SMALL', 'BELOW_MIN_PAYOUT', 'FEE_EXCEEDS_AMOUNT',
   'EXCEEDS_LIMIT', 'invalidEmail', 'emailNotAcceptable', 'rateLimited', 'rate_limited',
-  'invalidTokenSymbol', 'unsupportedCurrency', 'unsupported',
+  'invalidTokenSymbol', 'unsupportedCurrency', 'unsupported', 'invalidAmount',
+])
+
+/** Router codes that are system-side (they alert). Listed so they can be shown. */
+export const SYSTEM_CODES: ReadonlySet<string> = new Set([
+  'INTENTS_API_FAILED', 'INTENTS_API_REJECTED', 'QUOTE_FETCH_FAILED', 'QUOTE_UNAVAILABLE', 'UPSTREAM_ERROR',
+  'SERVER_MISCONFIGURED', 'FUNDER_TIER_REFUSED', 'FUNDER_TIER_RECEIVER_MISMATCH', 'FUNDER_TIER_MISMATCH',
+  'FUNDER_RECEIVER_NOT_TIER_WALLET', 'SEED_FAILED', 'BTC_RESERVE_FAILED', 'BTC_UNAVAILABLE',
+  'BTC_MONITOR_STALE', 'ZEC_MONITOR_STALE', 'BITREFILL_NOT_CONFIGURED', 'RETRY_LATER',
+  'ALPHA_UPSTREAM_FAILED', 'ALPHA_PRICE_UNAVAILABLE',
 ])
 
 /**
- * Alpha upstream reasons behind ALPHA_CAPACITY that are configuration, not
- * load. The note detail is `option_<status>_<reason>`.
+ * payment-api codes that may be shown in an alert (rozo-intents-api
+ * payment-api vocabulary, 2026-11-24). Any other upstream value is shown and
+ * keyed as `otherUpstreamCode`: a raw upstream string can be a coupon code or
+ * an address redactForAlert does not mask, so only listed values leave.
  */
+const KNOWN_UPSTREAM_CODES: ReadonlySet<string> = new Set([
+  ...UPSTREAM_USER_CODES,
+  'invalidRequest', 'checkoutNotAllowed', 'databaseError', 'providerUnavailable', 'providerError',
+  'configError', 'NEAR_QUOTE_FAILED', 'NEAR_QUOTE_UNREADABLE', 'NEAR_HUB_UNCONFIGURED',
+  'NEAR_DEPOSIT_PERSIST_FAILED', 'INVALID_PROVIDER', 'ROUTE_NOT_SUPPORTED_BY_PROVIDER',
+  'insufficientLiquidity', 'INSUFFICIENT_LIQUIDITY', 'priceCheckUnavailable', 'rateLimitUnavailable',
+  'destinationTierUnavailable', 'NEGATIVE_ROUTE_ECONOMICS', 'SOLANA_ATA_UNDETERMINED', 'UNAUTHORIZED',
+  'unsupportedField', 'invalidChainId', 'orderIdConflict', 'paymentNotFound', 'statusChanged',
+  'ZEC_REQUIRES_EXACT_OUT', 'ZEC_CAPACITY_BUSY', 'BTC_REQUIRES_EXACT_OUT',
+])
+
+const KNOWN_STAGES: ReadonlySet<string> = new Set([
+  'order_lookup', 'create_unreachable', 'create_http_error', 'create_non_json', 'btc_rail_mismatch',
+])
+
+/**
+ * Alpha note details (tron-ton-alpha.ts): `option_<status>_<upstream reason>`
+ * or `business_order_<reason>[_<status>]`. Only listed reasons are shown.
+ */
+const ALPHA_DETAIL_RE = new RegExp(
+  '^(?:option_\\d{3}_(?:alpha_disabled|app_not_allowed|unsupported_asset|order_conflict|' +
+  'provider_invoice_conflict|order_not_open|order_expired|order_cap_exceeded|daily_budget_exhausted|' +
+  'amount_space_exhausted|payment_reference_exhausted|increment_budget_unset|price_unavailable|' +
+  'ton_native_disabled|order_already_fulfilled|exposure_full|unknown)' +
+  '|business_order_(?:lookup_failed|create_failed|retired_funder|funder_tier)(?:_\\d{3})?)$',
+)
+
+/** Alpha upstream reasons behind ALPHA_CAPACITY that are configuration, not load. */
 const ALPHA_CONFIG_DETAIL_RE = /_increment_budget_unset$/
 
 export interface CreateFailureVerdict {
@@ -153,15 +192,25 @@ export function classifyCreateFailure(
   const upstreamStatus = typeof b.upstream_status === 'number' ? b.upstream_status : null
   const upstreamCode = safeCode(b.upstream_code) ?? parseUpstreamCode(b.hint)
   const detail = safeCode(note.detail)
+  // Classification reads the raw values; display and the dedupe key use only
+  // listed values, so no caller- or upstream-chosen string leaves the Worker
+  // and the key space stays bounded.
+  const shownCode = code === null ? null : USER_CAUSED_CODES.has(code) || SYSTEM_CODES.has(code) ? code : 'OTHER_CODE'
+  const shownStage = stage === null ? null : KNOWN_STAGES.has(stage) ? stage : 'other_stage'
+  const shownUpstream = upstreamCode === null ? null : KNOWN_UPSTREAM_CODES.has(upstreamCode) ? upstreamCode : 'otherUpstreamCode'
+  const shownDetail = detail === null ? null : ALPHA_DETAIL_RE.test(detail) ? detail : 'other_detail'
+  const shownUpstreamStatus = upstreamStatus !== null && Number.isInteger(upstreamStatus) && upstreamStatus >= 100 && upstreamStatus <= 599
+    ? upstreamStatus
+    : null
   const reason = [
-    code ?? `HTTP_${status}`,
-    stage,
-    upstreamStatus !== null ? String(upstreamStatus) : null,
-    upstreamCode,
-    detail,
+    shownCode ?? `HTTP_${status}`,
+    shownStage,
+    shownUpstreamStatus !== null ? String(shownUpstreamStatus) : null,
+    shownUpstream,
+    shownDetail,
   ].filter(Boolean).join(':')
   const verdict = (alert: boolean): CreateFailureVerdict => ({
-    alert, reason, code, stage, upstreamStatus, upstreamCode,
+    alert, reason, code: shownCode, stage: shownStage, upstreamStatus: shownUpstreamStatus, upstreamCode: shownUpstream,
   })
 
   if (status < 400) return verdict(false)
