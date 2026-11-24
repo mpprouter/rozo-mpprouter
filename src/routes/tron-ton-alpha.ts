@@ -42,6 +42,7 @@ import { ensureAlphaBusinessOrder } from './tron-ton-alpha-order'
 import { forwardedClientHintHeader } from './client-hint-forward'
 import { readDeviceId } from './device-id-forward'
 import { attributionMetadata, buildOrderAttribution, forwardedAttributionField } from './order-attribution'
+import { BASE_FUNDER_ADDRESS } from '../funder-address'
 
 export const TRON_TON_ALPHA_CAPABILITY_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/capability'
 export const TRON_TON_ALPHA_OPTION_PATH = '/v1/services/rozo-agent-api/tron-ton-alpha/option'
@@ -64,8 +65,13 @@ export const TRON_TON_ALPHA_GATE = {
 export const ALPHA_DESTINATION = Object.freeze({
   chainId: '8453',
   tokenSymbol: 'USDC',
-  receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739',
+  receiverAddress: BASE_FUNDER_ADDRESS,
 })
+// Funder rotation 2026-11-24: an alpha order allocated before it froze the old
+// (compromised) funder into its digest, and its intents business order pays
+// out to that old address. Such an order is deliberately NOT replayed with the
+// old destination: upstream answers order_conflict and the page shows
+// ALPHA_ORDER_CONFLICT, so no new payment can be steered into it.
 
 export interface AlphaOptionDef {
   network: 'tron' | 'ton'

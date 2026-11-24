@@ -354,7 +354,7 @@ describe('checkout test mode: $0.10 test order on BNB Chain USDC', () => {
       type: 'exactIn',
       source: { chainId: '56', tokenSymbol: 'USDC', amount: '0.1' },
       // Unchanged by test mode: Base USDC to the funder/settlement wallet.
-      destination: { chainId: '8453', receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739', tokenSymbol: 'USDC' },
+      destination: { chainId: '8453', receiverAddress: '0x282bE0C42E5c944b0285CEc363117AB077cC084A', tokenSymbol: 'USDC' },
       metadata: { testMode: true },
     })
   })

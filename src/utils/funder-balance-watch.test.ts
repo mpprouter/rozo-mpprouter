@@ -9,7 +9,7 @@ import {
   type FunderWatchState,
 } from './funder-balance-watch'
 
-const ADDR = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
+const ADDR = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
 const usd = (n: number) => BigInt(Math.round(n * 100)) * 10_000n
 
 function st(p: Partial<FunderWatchState> = {}): FunderWatchState {

@@ -8,6 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { handleCreateInvoice, SETTLEMENT_RECEIVER } from '../src/routes/create-invoice'
 import { FUNDER_WALLET, handleRozoWebhook, type FulfillmentRecord } from '../src/routes/webhook'
 import { FUNDER_WALLET as STRIPE_FUNDER } from '../src/routes/stripe-fulfillment'
+import { ALPHA_DESTINATION } from '../src/routes/tron-ton-alpha'
+import { RETIRED_FUNDER_ADDRESS_20261124 } from '../src/funder-address'
 import {
   BITREFILL_FUNDER,
   bitrefillNonce,
@@ -128,6 +130,14 @@ describe('funder constants', () => {
     expect(BITREFILL_FUNDER).toBe(FUNDER_WALLET)
     expect(BITREFILL_FUNDER).toBe(SETTLEMENT_RECEIVER)
     expect(BITREFILL_FUNDER).toBe(STRIPE_FUNDER)
+    expect(ALPHA_DESTINATION.receiverAddress).toBe(FUNDER_WALLET)
+  })
+  it('every funder constant is the rotated 2026-11-24 funder, never the compromised one', () => {
+    expect(FUNDER_WALLET).toBe('0x282bE0C42E5c944b0285CEc363117AB077cC084A')
+    for (const a of [FUNDER_WALLET, SETTLEMENT_RECEIVER, STRIPE_FUNDER, BITREFILL_FUNDER, ALPHA_DESTINATION.receiverAddress]) {
+      expect(a.toLowerCase()).not.toBe(RETIRED_FUNDER_ADDRESS_20261124.toLowerCase())
+    }
+    expect(bitrefillReceiverRefusal(RETIRED_FUNDER_ADDRESS_20261124)).toMatch(/blocked/)
   })
   it('refuses the funder lookalike, the funder, zero and the USDC contract', () => {
     expect(bitrefillReceiverRefusal('0x235248a78985cb2166c2d5b43d527ea09fc31739')).toMatch(/blocked/)

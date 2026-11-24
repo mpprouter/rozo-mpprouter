@@ -644,7 +644,7 @@ describe('topup', () => {
       return new Response(JSON.stringify({
         id: '6f1c6c7e-1111-4222-8333-944455556666',
         source: { chainId: '900', tokenSymbol: 'USDT', receiverAddress: 'DepositAddr111', amount: '20' },
-        destination: { receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739', amount: '19.80' },
+        destination: { receiverAddress: '0x282bE0C42E5c944b0285CEc363117AB077cC084A', amount: '19.80' },
         expiresAt: '2999-01-01T00:00:00Z',
       }), { status: 200 })
     }) as any
@@ -653,7 +653,7 @@ describe('topup', () => {
     expect(sent.apiKey).toBe('topup-key')
     expect(sent.body.appId).toBe('merchant_x402_topup')
     expect(sent.body.metadata.merchant_handle).toBe('x402_topup')
-    expect(sent.body.destination.receiverAddress).toBe('0x2352Fa2970dBadD12d21808DB0F56CDEC8141739')
+    expect(sent.body.destination.receiverAddress).toBe('0x282bE0C42E5c944b0285CEc363117AB077cC084A')
     expect(ledger.topups[0]).toMatchObject({ payment_id: '6f1c6c7e-1111-4222-8333-944455556666', requested_usd: '20' })
     expect(r.body.deposit.address).toBe('DepositAddr111')
     expect(r.body.creditUsd).toBe('19.80')
@@ -705,7 +705,7 @@ describe('topup', () => {
       return new Response(JSON.stringify({
         id: '6f1c6c7e-1111-4222-8333-944455556667',
         source: { chainId: '900', tokenSymbol: 'USDT', receiverAddress: 'DepositAddr222', amount: '20' },
-        destination: { receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739', amount: '19.80' },
+        destination: { receiverAddress: '0x282bE0C42E5c944b0285CEc363117AB077cC084A', amount: '19.80' },
         expiresAt: '2999-01-01T00:00:00Z',
       }), { status: 200 })
     }) as any
@@ -726,7 +726,7 @@ describe('topup', () => {
     deps.fetchImpl = (async () => new Response(JSON.stringify({
       id: '6f1c6c7e-1111-4222-8333-944455556668',
       source: { chainId: '8453', tokenSymbol: 'USDC', receiverAddress: '0xabc' },
-      destination: { receiverAddress: '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739' },
+      destination: { receiverAddress: '0x282bE0C42E5c944b0285CEc363117AB077cC084A' },
     }), { status: 200 })) as any
     const r = await call('/v1/x402/topup', { method: 'POST', key, body: JSON.stringify({ amount: '20', token: 'USDT', chain: 'solana' }) })
     expect(r.body.code).toBe('X402_TOPUP_MISCONFIGURED')

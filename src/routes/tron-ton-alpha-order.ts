@@ -29,6 +29,7 @@ import {
   BASE_USDC_ADDRESS,
   pricingFields,
   ROZO_INTENTS_URL,
+  paysRetiredFunder,
   SETTLEMENT_RECEIVER,
 } from './create-invoice'
 import { buildCheckoutTitle, type CheckoutPricing } from './checkout-web-pricing'
@@ -45,8 +46,10 @@ const ORDER_TIMEOUT_MS = 8_000
 // stored get one more lookup, which writes their row.
 const ORDER_MARKER_TTL_S = 2 * 24 * 60 * 60
 
+// v3 (2026-11-24 funder rotation): bumped so invoices marked before it are
+// looked up once more and an order paying the old funder is refused.
 export function alphaOrderMarkerKey(invoiceKey: string): string {
-  return `tta:order:v2:${invoiceKey}`
+  return `tta:order:v3:${invoiceKey}`
 }
 
 function rozoPaymentIdOf(row: unknown): string | null {
@@ -128,7 +131,7 @@ export function buildAlphaBusinessOrderBody(a: AlphaOrderArgs): Record<string, u
 
 export type EnsureAlphaOrderResult =
   | { ok: true; state: 'cached' | 'existing' | 'created' | 'raced' }
-  | { ok: false; reason: 'lookup_failed' | 'create_failed' }
+  | { ok: false; reason: 'lookup_failed' | 'create_failed' | 'retired_funder' }
 
 export async function ensureAlphaBusinessOrder(
   env: Env,
@@ -150,6 +153,9 @@ export async function ensureAlphaBusinessOrder(
   const found = await lookupIntentsOrder(env, OPENROUTER_APP_ID, a.invoiceKey, AbortSignal.timeout(ORDER_TIMEOUT_MS))
   if (found.state === 'error') return { ok: false, reason: 'lookup_failed' }
   if (found.state === 'found') {
+    // Pre-rotation (2026-11-24) order: it pays out to the compromised funder,
+    // so no TRON / TON instructions may lead into it.
+    if (paysRetiredFunder(found.row)) return { ok: false, reason: 'retired_funder' }
     await mark(found.row)
     return { ok: true, state: 'existing' }
   }
@@ -180,6 +186,7 @@ export async function ensureAlphaBusinessOrder(
   if (res.status === 409 && /orderIdConflict/i.test(text)) {
     const again = await lookupIntentsOrder(env, OPENROUTER_APP_ID, a.invoiceKey, AbortSignal.timeout(ORDER_TIMEOUT_MS))
     if (again.state !== 'found') return { ok: false, reason: 'create_failed' }
+    if (paysRetiredFunder(again.row)) return { ok: false, reason: 'retired_funder' }
     await mark(again.row)
     return { ok: true, state: 'raced' }
   }

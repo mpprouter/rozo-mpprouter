@@ -12,6 +12,7 @@
  *   nonce   = keccak256(utf8("rozo:bitrefill:v1:" + invoiceId))
  */
 import { keccak256, stringToHex, type Hex } from 'viem'
+import { BASE_FUNDER_ADDRESS, RETIRED_FUNDER_ADDRESS_20261124 } from '../funder-address'
 
 export const BITREFILL_BINDING_VERSION = 'rozo-bitrefill-binding-v1'
 export const BITREFILL_METADATA_VERSION = 1
@@ -23,9 +24,9 @@ const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
 const BASE_USDC = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913'
 // The Base USDC funder (webhook.ts FUNDER_WALLET, create-invoice.ts
-// SETTLEMENT_RECEIVER); a test pins all three equal. Local copy avoids an
-// import cycle with webhook.ts.
-export const BITREFILL_FUNDER = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
+// SETTLEMENT_RECEIVER); a test pins all three equal. Read from the leaf module
+// src/funder-address.ts to avoid an import cycle with webhook.ts.
+export const BITREFILL_FUNDER = BASE_FUNDER_ADDRESS
 
 // Compromised / attacker / lookalike EVM addresses from the ainative charter
 // blacklist (ainative/CLAUDE.md). No shared blocklist exists in this repo.
@@ -48,6 +49,7 @@ export const BITREFILL_BLOCKED_RECEIVERS: ReadonlySet<string> = new Set([
   '0x235248a78985cb2166c2d5b43d527ea09fc31739', // lookalike of the funder 0x2352...1739
   '0xaa5fe55b5e1225e9ba4d594c8b57eef61fce3d36',
   '0x4374b2072ff9bc5c0e263cae7866a41a4c601d29',
+  RETIRED_FUNDER_ADDRESS_20261124.toLowerCase(), // compromised funder, swept 2026-11-24
 ])
 
 /** Why a Bitrefill receiving address is refused, or null when acceptable. */

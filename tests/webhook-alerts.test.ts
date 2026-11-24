@@ -24,8 +24,8 @@ import { bindingUpstream } from './helpers/coinbase-binding'
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
-const FUNDER_FULL = '0x2352Fa2970dBadD12d21808DB0F56CDEC8141739'
-const FUNDER_MASKED = '0x2352…1739'
+const FUNDER_FULL = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
+const FUNDER_MASKED = '0x282b…084A'
 
 async function hmacSha256Hex(secret: string, message: string): Promise<string> {
   const enc = new TextEncoder()
