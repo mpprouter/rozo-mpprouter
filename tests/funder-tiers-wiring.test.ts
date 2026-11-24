@@ -200,9 +200,22 @@ describe('phase 2a create-invoice (FUNDER_T3_BACKEND=legacy)', () => {
     expect(r.status).toBe(200)
     expect(createdIntent.destination.receiverAddress).toBe(BASE_FUNDER_ADDRESS)
   })
-  it('TRON / TON alpha stays paused in phase 2a', async () => {
-    const cap = await handleTronTonAlphaCapability(new Request('https://mpp.test/cap'), makeEnv(P2A))
-    expect(((await cap.json()) as any).enabled).toBe(false)
+  it('a reusable alpha-created $20 order (legacy receiver) is reused in 2a; a plain one paying legacy is not', async () => {
+    const row = (source: string) => ({
+      id: 'rozo-alpha',
+      orderId: PAYMENT_ID,
+      status: 'payment_unpaid',
+      expiresAt: '2999-01-01T00:00:00.000Z',
+      source: { chainId: '8453', tokenSymbol: 'USDC', amount: '10.5' },
+      destination: { chainId: '8453', receiverAddress: BASE_FUNDER_ADDRESS },
+      metadata: { source },
+    })
+    existingRow = row('mpprouter-tron-ton-alpha')
+    let r = await create({ payment_id: PAYMENT_ID }, makeEnv(P2A))
+    expect(r.json.reused).toBe(true)
+    existingRow = row('mpprouter-create-invoice')
+    r = await create({ payment_id: PAYMENT_ID }, makeEnv(P2A))
+    expect(r.json.reused).not.toBe(true)
   })
 })
 

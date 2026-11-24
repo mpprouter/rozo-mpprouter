@@ -91,10 +91,16 @@ Cross-checks:
 3. Drain or pause in-flight orders that pay out to the legacy funder: after
    the switch their settlement is refused (receiver mismatch) and needs a
    human.
-4. TRON / TON alpha is not offered while the flag is on, phase 2a included
-   (`ALPHA_FUNDER_TIERS_PAUSED`): its destination (the legacy funder) is part
-   of an upstream order digest, and alpha orders are Coinbase invoices that are
-   often below $200, which resolve to T2, so the receiver would not match.
+4. TRON / TON alpha: routed with kind `tron_ton_alpha` (`routeFunder`). An
+   order the alpha route created (`metadata.source` =
+   `mpprouter-tron-ton-alpha`) is received and paid by the legacy funder in
+   phase 2a whatever the amount, so capability, options, order creation and
+   settlement work exactly as with the flag off; its settle sends
+   `payment_kind: "tron_ton_alpha"` with `expected_funder` (legacy) and
+   `rozo_payment_id`. A main-checkout order that a TRON / TON payment lands on
+   stays a plain Coinbase order. In phase 2b alpha is refused
+   (`ALPHA_FUNDER_TIERS_PAUSED`, reason `alpha_paused`). rozo-intents-api must
+   keep alpha-created orders on the legacy destination.
 5. Manual `/admin/pay-invoice` accepts only Coinbase ids while the flag is on.
 
 Rollback: unset `FUNDER_TIERS_ENABLED` (or set it to anything but `true`) and

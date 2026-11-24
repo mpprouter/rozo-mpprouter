@@ -15,8 +15,9 @@
 import { getAddress } from 'viem'
 import { EVM_BLOCKED_ADDRESSES } from './evm-blocked-addresses'
 import {
+  ALPHA_KIND,
   FUNDER_TIERS,
-  selectFunderTier,
+  routeFunder,
   servedByLegacyFunder,
   type FunderTier,
   type FunderTierRefusal,
@@ -175,18 +176,20 @@ export function resolveFunder(
   if (!funderTiersEnabled(env)) {
     return { ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: undefined }
   }
-  const decision = selectFunderTier(kind, amountAtomic)
-  if (!decision.ok) return { ok: false, reason: decision.reason, tier: null }
-  // Phase 2a (FUNDER_T3_BACKEND="legacy"): T3A / T3B are served by the legacy
-  // funder exactly as with the flag off (receiver, balance), and the signer
-  // serves them with the same wallet, so expected_funder is that wallet too.
-  // FUNDER_T3A_ADDRESS / FUNDER_T3B_ADDRESS are not read.
-  if (servedByLegacyFunder(decision.tier, env?.FUNDER_T3_BACKEND)) {
-    return { ok: true, tier: decision.tier, address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS }
+  // routeFunder (mirrored with the signer) is the single routing rule.
+  // LEGACY = phase 2a (FUNDER_T3_BACKEND="legacy"): T3A / T3B payments and
+  // every TRON / TON alpha order are served by the legacy funder exactly as
+  // with the flag off (receiver, balance), and the signer serves them with the
+  // same wallet, so expected_funder is that wallet too. FUNDER_T3A_ADDRESS /
+  // FUNDER_T3B_ADDRESS are not read then.
+  const route = routeFunder(kind, amountAtomic, env?.FUNDER_T3_BACKEND)
+  if (!route.ok) return { ok: false, reason: route.reason, tier: null }
+  if (route.wallet === 'LEGACY') {
+    return { ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS }
   }
-  const addr = funderTierAddress(env, decision.tier)
-  if (!addr.ok) return { ok: false, reason: addr.reason, tier: decision.tier }
-  return { ok: true, tier: decision.tier, address: addr.address, expectedFunder: addr.address }
+  const addr = funderTierAddress(env, route.wallet)
+  if (!addr.ok) return { ok: false, reason: addr.reason, tier: route.wallet }
+  return { ok: true, tier: route.wallet, address: addr.address, expectedFunder: addr.address }
 }
 
 /**
@@ -219,6 +222,35 @@ export function isAnyConfiguredFunderTier(env: FunderTierEnv | null | undefined,
   return configuredFunderWallets(env).some((w) => w.address !== null && w.address.toLowerCase() === a)
 }
 
+/** Payment kind of a TRON / TON alpha business order (mirrored selector). */
+export const FUNDER_ALPHA_KIND = ALPHA_KIND
+
+/** metadata.source the TRON / TON alpha route writes on the business order it creates. */
+export const ALPHA_ORDER_SOURCE = 'mpprouter-tron-ton-alpha'
+
+/**
+ * True when an intents order row was created by the TRON / TON alpha route
+ * (its destination is the digest-bound legacy funder, whatever the amount).
+ * An order created by the main checkout is a Coinbase order even if a TRON /
+ * TON payment later lands on it.
+ */
+export function isTronTonAlphaOrder(row: any): boolean {
+  let metadata = row?.metadata ?? row?.data?.metadata
+  if (typeof metadata === 'string') {
+    try {
+      metadata = JSON.parse(metadata)
+    } catch {
+      return false
+    }
+  }
+  return !!metadata && typeof metadata === 'object' && (metadata as any).source === ALPHA_ORDER_SOURCE
+}
+
+/** Payment kind for a Coinbase-invoice order row: alpha business order or plain Coinbase. */
+export function coinbaseOrderKind(row: any): string {
+  return isTronTonAlphaOrder(row) ? ALPHA_KIND : 'coinbase'
+}
+
 /** Same address, case-insensitive. Non-strings never match. */
 export function sameEvmAddress(a: unknown, b: unknown): boolean {
   return typeof a === 'string' && typeof b === 'string' && a.length > 0 && a.toLowerCase() === b.toLowerCase()
@@ -238,6 +270,8 @@ export function funderRefusalMessage(reason: FunderRefusalReason): string {
       return 'This payment is above the per-payment limit. Nothing was created or paid.'
     case 'invalid_amount':
       return 'The invoice amount is not a positive USDC amount. Nothing was created or paid.'
+    case 'alpha_paused':
+      return 'TRON / TON payments are temporarily unavailable. Nothing was created or paid; pay with another coin.'
     default:
       return 'Payments are temporarily unavailable (funder wallet not configured). Nothing was created or paid; try again later.'
   }

@@ -2,8 +2,10 @@ import type { Env } from '../index'
 import {
   BASE_FUNDER_ADDRESS,
   RETIRED_FUNDER_ADDRESS_20261124,
+  FUNDER_ALPHA_KIND,
   funderRefusalMessage,
   funderRefusalStatus,
+  isTronTonAlphaOrder,
   resolveFunder,
   sameEvmAddress,
   type FunderRefusalReason,
@@ -2306,6 +2308,16 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
   if (!funder.ok) return funderRefusedResponse(funder.reason, { normalized_input: normalized, link_id_detected })
   const settlementReceiver = funder.address
   const tierReceiver = funder.expectedFunder
+  // A reusable order the TRON / TON alpha route created pays out to the alpha
+  // wallet (routeFunder kind tron_ton_alpha: the legacy funder in phase 2a,
+  // refused in 2b), not to this invoice's Coinbase tier. Flag off: undefined.
+  const alphaFunder = resolveFunder(env, FUNDER_ALPHA_KIND, invoiceAtomic)
+  const expectedReceiverFor = (row: any): string | undefined =>
+    tierReceiver === undefined
+      ? undefined
+      : isTronTonAlphaOrder(row)
+        ? alphaFunder.ok ? alphaFunder.expectedFunder : 'alpha-refused'
+        : tierReceiver
   // Shielded ZEC orders have their own cap (ZEC_SHIELDED_MAX_USD, default
   // $1,200 = intents ZEC_SHIELD_CAPS.max_order_usd), checked right before a
   // FRESH shielded create (shieldedCapBlock below) so that an existing order
@@ -2665,7 +2677,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
           })
         }
       }
-      if (!pendingPricingMatches(existing, pricing, tierReceiver)) {
+      if (!pendingPricingMatches(existing, pricing, expectedReceiverFor(existing))) {
         return pricingMismatchResponse({ linkId }, existing)
       }
       // A shielded ZEC row binds no refund address (none exists on that
@@ -3182,7 +3194,7 @@ async function handleCreateInvoiceTimed(request: Request, env: Env, timer: Stage
               linkId,
             })
           }
-          if (!pendingPricingMatches(winner, pricing, tierReceiver)) {
+          if (!pendingPricingMatches(winner, pricing, expectedReceiverFor(winner))) {
             return pricingMismatchResponse({ linkId }, winner)
           }
           const winnerSource = readRowSource(winner)

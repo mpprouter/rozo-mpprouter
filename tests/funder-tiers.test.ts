@@ -4,8 +4,9 @@
  */
 import { describe, expect, it } from 'vitest'
 import vectors from '../src/funder-tier-vectors.json'
-import { parseUsdcAtomic, selectFunderTier, servedByLegacyFunder } from '../src/funder-tiers'
+import { parseUsdcAtomic, routeFunder, selectFunderTier, servedByLegacyFunder } from '../src/funder-tiers'
 import {
+  coinbaseOrderKind,
   BASE_FUNDER_ADDRESS,
   RETIRED_FUNDER_ADDRESS_20261124,
   checksumFunderAddress,
@@ -188,7 +189,8 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
         continue
       }
       const want = v.expect === 'T1' ? T1 : v.expect === 'T2' ? T2 : BASE_FUNDER_ADDRESS
-      expect(got, label).toEqual({ ok: true, tier: v.expect, address: want, expectedFunder: want })
+      const tier = v.expect === 'T1' || v.expect === 'T2' ? v.expect : 'legacy'
+      expect(got, label).toEqual({ ok: true, tier, address: want, expectedFunder: want })
       if (v.kind === 'x402') expect(want).toBe(T1)
     }
   })
@@ -202,6 +204,42 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
     expect(resolveFunder({ ...P2A, FUNDER_T1_ADDRESS: BASE_FUNDER_ADDRESS }, 'x402', 1n)).toEqual({
       ok: false, reason: 'tier_address_legacy', tier: 'T1',
     })
+  })
+
+  it('routeFunder matches every route vector, and resolveFunder agrees', () => {
+    const route = (vectors as any).route as Array<{ kind: string; amount: string; backend: string | null; expect: string }>
+    expect(route.length).toBeGreaterThan(10)
+    for (const v of route) {
+      const backend = v.backend ?? undefined
+      const got = routeFunder(v.kind, BigInt(v.amount), backend)
+      const label = `${v.kind} ${v.amount} ${v.backend}`
+      if (v.expect.startsWith('refuse:')) {
+        expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7) })
+      } else {
+        expect(got, label).toEqual({ ok: true, wallet: v.expect })
+      }
+      const env = { ...TIER_ENV, FUNDER_T3_BACKEND: backend }
+      const r = resolveFunder(env, v.kind, BigInt(v.amount))
+      if (v.expect.startsWith('refuse:')) expect(r.ok, label).toBe(false)
+      else expect(r.ok && r.address, label).toBe(v.expect === 'LEGACY' ? BASE_FUNDER_ADDRESS : ADDR[v.expect])
+    }
+  })
+
+  it('alpha: $20 and $900 -> legacy in 2a; non-alpha Coinbase $20 -> T2; alpha paused when the backend is not legacy', () => {
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(20))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder(P2A, 'tron_ton_alpha', USD(900))).toMatchObject({ ok: true, address: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder(P2A, 'coinbase', USD(20))).toMatchObject({ ok: true, address: T2 })
+    expect(resolveFunder({ ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'alpha_paused', tier: null })
+    expect(resolveFunder(TIER_ENV, 'tron_ton_alpha', USD(20))).toEqual({ ok: false, reason: 'alpha_paused', tier: null })
+    // Flag off: legacy as always.
+    expect(resolveFunder({}, 'tron_ton_alpha', USD(20))).toMatchObject({ ok: true, tier: 'legacy', expectedFunder: undefined })
+  })
+
+  it('isTronTonAlphaOrder / coinbaseOrderKind read the creator marker', () => {
+    expect(coinbaseOrderKind({ metadata: { source: 'mpprouter-tron-ton-alpha' } })).toBe('tron_ton_alpha')
+    expect(coinbaseOrderKind({ metadata: JSON.stringify({ source: 'mpprouter-tron-ton-alpha' }) })).toBe('tron_ton_alpha')
+    expect(coinbaseOrderKind({ metadata: { source: 'mpprouter-create-invoice' } })).toBe('coinbase')
+    expect(coinbaseOrderKind(null)).toBe('coinbase')
   })
 
   it('a leftover T3 address equal to T2 does not block T2 in phase 2a (still does in 2b)', () => {

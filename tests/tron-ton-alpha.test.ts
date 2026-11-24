@@ -1088,3 +1088,60 @@ describe('tron-ton-alpha option: TON USDT per-order address flag', () => {
     expect('addressPerOrder' in body).toBe(false)
   })
 })
+
+describe('tron-ton-alpha with tiered funders', () => {
+  const TIERS = {
+    FUNDER_TIERS_ENABLED: 'true',
+    FUNDER_T1_ADDRESS: '0x1000000000000000000000000000000000000001',
+    FUNDER_T2_ADDRESS: '0x2000000000000000000000000000000000000002',
+  }
+  const P2A = { ...TIERS, FUNDER_T3_BACKEND: 'legacy' } as Partial<Env>
+  const withDest = (receiver: string) => () =>
+    new Response(JSON.stringify({ id: 'b0000000-0000-4000-8000-000000000001', status: 'payment_unpaid', destination: { chainId: '8453', receiverAddress: receiver } }), { status: 201 })
+
+  async function run(env: Env) {
+    const r = await handleTronTonAlphaOption(optionReq({ payment_id: PL, network: 'tron', token: 'USDT' }), env)
+    return { status: r.status, body: (await r.json()) as any }
+  }
+
+  it('phase 2a: the $20 option is identical to flag off (same upstream body, same business order, same response)', async () => {
+    intents.create = withDest(ALPHA_DESTINATION.receiverAddress)
+    const off = await run(makeEnv())
+    const offUp = up.calls.filter((c) => c.body.network).map((c) => c.body)
+    const offCreates = [...intents.creates]
+    resetTronTonAlphaCapabilityCache()
+    ;(fakeAllocate as any).orders = new Map()
+    ;(fakeAllocate as any).seq = 0
+    up.calls.length = 0
+    intents.creates.length = 0
+    const on = await run(makeEnv(P2A))
+    expect(on.status).toBe(200)
+    expect(on.body).toEqual(off.body)
+    expect(up.calls.filter((c) => c.body.network).map((c) => c.body)).toEqual(offUp)
+    expect(intents.creates).toEqual(offCreates)
+    expect(intents.creates[0].destination.receiverAddress).toBe(ALPHA_DESTINATION.receiverAddress)
+  })
+
+  it('phase 2a capability is the same as flag off', async () => {
+    const off = await (await handleTronTonAlphaCapability(new Request('https://mpp.test/cap'), makeEnv())).json()
+    resetTronTonAlphaCapabilityCache()
+    const on = await (await handleTronTonAlphaCapability(new Request('https://mpp.test/cap'), makeEnv(P2A))).json()
+    expect(on).toEqual(off)
+  })
+
+  it('phase 2b (backend not legacy): option refused before anything upstream', async () => {
+    const r = await run(makeEnv({ ...TIERS, FUNDER_T3_BACKEND: 'isolated' } as Partial<Env>))
+    expect(r.status).toBe(503)
+    expect(r.body.code).toBe('ALPHA_FUNDER_TIERS_PAUSED')
+    expect(up.calls).toHaveLength(0)
+  })
+
+  it('phase 2a: a created business order paying another wallet shows no instructions', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    intents.create = withDest('0x2000000000000000000000000000000000000002')
+    const r = await run(makeEnv(P2A))
+    expect(r.status).toBe(502)
+    expect(r.body.receivingAddress).toBeUndefined()
+  })
+})

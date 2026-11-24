@@ -38,6 +38,24 @@
     { "tier": "T3A", "backend": "LEGACY", "legacy": false },
     { "tier": "T3B", "backend": " legacy", "legacy": false }
   ],
+  "route": [
+    { "kind": "tron_ton_alpha", "amount": "20000000", "backend": "legacy", "expect": "LEGACY" },
+    { "kind": "tron_ton_alpha", "amount": "900000000", "backend": "legacy", "expect": "LEGACY" },
+    { "kind": "tron_ton_alpha", "amount": "1200000000", "backend": "legacy", "expect": "LEGACY" },
+    { "kind": "tron_ton_alpha", "amount": "1200000001", "backend": "legacy", "expect": "refuse:over_order_cap" },
+    { "kind": "tron_ton_alpha", "amount": "0", "backend": "legacy", "expect": "refuse:invalid_amount" },
+    { "kind": "tron_ton_alpha", "amount": "20000000", "backend": "isolated", "expect": "refuse:alpha_paused" },
+    { "kind": "tron_ton_alpha", "amount": "900000000", "backend": null, "expect": "refuse:alpha_paused" },
+    { "kind": "coinbase", "amount": "20000000", "backend": "legacy", "expect": "T2" },
+    { "kind": "coinbase", "amount": "900000000", "backend": "legacy", "expect": "LEGACY" },
+    { "kind": "coinbase", "amount": "900000000", "backend": "isolated", "expect": "T3A" },
+    { "kind": "stripe", "amount": "20000000", "backend": "legacy", "expect": "LEGACY" },
+    { "kind": "stripe", "amount": "20000000", "backend": "isolated", "expect": "T3B" },
+    { "kind": "bitrefill", "amount": "1200000001", "backend": "legacy", "expect": "refuse:over_order_cap" },
+    { "kind": "x402", "amount": "1000000", "backend": "legacy", "expect": "T1" },
+    { "kind": "x402", "amount": "5000001", "backend": "legacy", "expect": "refuse:over_tier_cap" },
+    { "kind": "upi", "amount": "1000000", "backend": "legacy", "expect": "refuse:unknown_kind" }
+  ],
   "parse": [
     { "in": "199.99", "out": "199990000" },
     { "in": "200", "out": "200000000" },

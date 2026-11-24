@@ -2,7 +2,9 @@ import type { Env } from '../index'
 import {
   BASE_FUNDER_ADDRESS,
   FUNDER_TIER_RECEIVER_MISMATCH_CODE,
+  FUNDER_ALPHA_KIND,
   FUNDER_TIER_REFUSED_CODE,
+  coinbaseOrderKind,
   funderTiersEnabled,
   resolveFunder,
   sameEvmAddress,
@@ -559,9 +561,15 @@ export function withExpectedFunder<T extends Record<string, unknown>>(
   body: T,
   expectedFunder: string | undefined,
   rozoPaymentId?: string,
-): T | (T & { expected_funder: string; rozo_payment_id?: string }) {
+  paymentKind?: string,
+): T | (T & { expected_funder: string; rozo_payment_id?: string; payment_kind?: string }) {
   if (!expectedFunder) return body
-  return { ...body, expected_funder: expectedFunder, ...(rozoPaymentId ? { rozo_payment_id: rozoPaymentId } : {}) }
+  return {
+    ...body,
+    expected_funder: expectedFunder,
+    ...(rozoPaymentId ? { rozo_payment_id: rozoPaymentId } : {}),
+    ...(paymentKind ? { payment_kind: paymentKind } : {}),
+  }
 }
 
 export async function callAgentApiPayInvoice(
@@ -577,6 +585,9 @@ export async function callAgentApiPayInvoice(
   // intents order whose payout went to that wallet, so a T3 signer can verify
   // it read-only. Absent for paths without an order (coupon, UPI, admin).
   rozoPaymentId?: string,
+  // FUNDER_TIERS_ENABLED only, alpha business orders only: `payment_kind`
+  // ("tron_ton_alpha"), sent only together with expectedFunder.
+  paymentKind?: string,
 ): Promise<{ ok: boolean; status: number; body: any }> {
   // Hard fund-safety guard: a test order is paid by nobody. Thrown (not a
   // soft failure) so no caller can mistake it for a retryable error.
@@ -593,6 +604,7 @@ export async function callAgentApiPayInvoice(
         expectedBinding ? { payment_id: plId, expected_binding: expectedBinding } : { payment_id: plId },
         expectedFunder,
         rozoPaymentId,
+        paymentKind,
       ),
     ),
   })
@@ -1212,7 +1224,11 @@ export async function settleCoinbaseEvent(
   // extra check). The tier wallet pays this invoice, so the order must have
   // paid out to exactly that wallet. Any refusal or mismatch: nothing is
   // paid, terminal, a human checks (same handling as an order mismatch).
-  const funder = resolveFunder(env, 'coinbase', invoiceAtomic)
+  // An order the TRON / TON alpha route created routes as kind tron_ton_alpha
+  // (its destination is the digest-bound alpha wallet); every other order on
+  // this line is a plain Coinbase invoice.
+  const payKind = coinbaseOrderKind(binding.order)
+  const funder = resolveFunder(env, payKind, invoiceAtomic)
   const tierRefusal = !funder.ok
     ? `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason}`
     : funderTiersEnabled(env) &&
@@ -1436,6 +1452,8 @@ export async function settleCoinbaseEvent(
       funder.expectedFunder,
       // The order the binding re-read (its destination is the tier wallet).
       typeof binding.order?.id === 'string' ? binding.order.id : rozoPaymentId ?? undefined,
+      // Alpha orders only (flag on): the signer routes by this field.
+      payKind === FUNDER_ALPHA_KIND ? payKind : undefined,
     )
   } catch (err: any) {
     payResult = { ok: false, status: 0, body: { error: err?.message ?? 'fetch threw' } }

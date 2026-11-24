@@ -46,7 +46,8 @@ export type FunderTierRefusal =
   | "invalid_amount"
   | "unknown_kind"
   | "over_tier_cap"
-  | "over_order_cap";
+  | "over_order_cap"
+  | "alpha_paused";
 
 export type FunderTierDecision =
   | { ok: true; tier: FunderTier }
@@ -104,6 +105,49 @@ export function servedByLegacyFunder(
   t3Backend: string | undefined,
 ): boolean {
   return (tier === "T3A" || tier === "T3B") && t3Backend === T3_LEGACY_BACKEND;
+}
+
+/**
+ * TRON / TON alpha orders: Coinbase invoices whose Base USDC destination is
+ * baked into the upstream order digest and is the legacy single funder. They
+ * can only ever be received and paid by the legacy funder, whatever the
+ * amount, so they bypass the tier bands:
+ *   phase 2a (t3Backend "legacy"): every alpha order <= ORDER_CAP_ATOMIC -> LEGACY
+ *   any other backend (phase 2b):  refuse "alpha_paused" until alpha
+ *                                  destinations are handled.
+ */
+export const ALPHA_KIND = "tron_ton_alpha";
+
+export type FunderWallet = FunderTier | "LEGACY";
+
+export type FunderRoute =
+  | { ok: true; wallet: FunderWallet }
+  | { ok: false; reason: FunderTierRefusal };
+
+/**
+ * The one routing function both repos use with FUNDER_TIERS_ENABLED on:
+ * which wallet receives and pays this payment. LEGACY = the legacy single
+ * funder (phase 2a interim). Refusals are final; there is no fallback.
+ */
+export function routeFunder(
+  kind: string,
+  amountAtomic: bigint,
+  t3Backend: string | undefined,
+): FunderRoute {
+  if (kind === ALPHA_KIND) {
+    if (typeof amountAtomic !== "bigint" || amountAtomic <= 0n) {
+      return { ok: false, reason: "invalid_amount" };
+    }
+    if (amountAtomic > ORDER_CAP_ATOMIC) return { ok: false, reason: "over_order_cap" };
+    return t3Backend === T3_LEGACY_BACKEND
+      ? { ok: true, wallet: "LEGACY" }
+      : { ok: false, reason: "alpha_paused" };
+  }
+  const d = selectFunderTier(kind, amountAtomic);
+  if (!d.ok) return d;
+  return servedByLegacyFunder(d.tier, t3Backend)
+    ? { ok: true, wallet: "LEGACY" }
+    : { ok: true, wallet: d.tier };
 }
 
 /**
