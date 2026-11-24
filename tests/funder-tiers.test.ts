@@ -204,6 +204,13 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
     })
   })
 
+  it('a leftover T3 address equal to T2 does not block T2 in phase 2a (still does in 2b)', () => {
+    expect(resolveFunder({ ...P2A, FUNDER_T3A_ADDRESS: T2 }, 'coinbase', USD(10))).toMatchObject({ ok: true, address: T2 })
+    expect(resolveFunder({ ...P2A, FUNDER_T3_BACKEND: undefined, FUNDER_T3A_ADDRESS: T2 }, 'coinbase', USD(10))).toEqual({
+      ok: false, reason: 'tier_address_duplicate', tier: 'T2',
+    })
+  })
+
   it('any other backend value keeps T3 tier wallets (and their checks)', () => {
     for (const b of ['LEGACY', ' legacy', 'cdp', '']) {
       expect(resolveFunder({ ...P2A, FUNDER_T3_BACKEND: b }, 'coinbase', USD(200))).toEqual({

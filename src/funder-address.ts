@@ -148,6 +148,9 @@ export function funderTierAddress(
   if (BLOCKED.has(lower)) return { ok: false, reason: 'tier_address_blocked' }
   for (const other of FUNDER_TIERS) {
     if (other === tier) continue
+    // Phase 2a: a T3 served by the legacy funder has no wallet of its own; a
+    // leftover FUNDER_T3A/T3B_ADDRESS value must not block T1 / T2.
+    if (servedByLegacyFunder(other, env?.FUNDER_T3_BACKEND)) continue
     const raw = env?.[TIER_VAR[other]]
     if (typeof raw === 'string' && raw.trim().toLowerCase() === lower) {
       return { ok: false, reason: 'tier_address_duplicate' }
