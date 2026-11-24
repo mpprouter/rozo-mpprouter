@@ -22,9 +22,9 @@
  * work to ctx.waitUntil. Every failure inside is swallowed.
  *
  * Alert content: route, chain id and token, an amount band (not the amount),
- * HTTP statuses, error codes, a short redacted upstream message with URLs
- * removed and a masked invoice id. Never a payment link, coupon, address or
- * secret (redactForAlert also masks addresses and secrets as a backstop).
+ * HTTP statuses, error codes (format-checked identifiers only, never upstream
+ * free text) and a masked invoice id. Never a payment link, coupon, address
+ * or secret (redactForAlert also runs over the text as a backstop).
  */
 
 import type { Env } from '../index'
@@ -113,7 +113,6 @@ export interface CreateFailureVerdict {
   stage: string | null
   upstreamStatus: number | null
   upstreamCode: string | null
-  upstreamMessage: string | null
 }
 
 const CODE_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/
@@ -122,27 +121,21 @@ function safeCode(v: unknown): string | null {
   return typeof v === 'string' && CODE_RE.test(v) ? v : null
 }
 
-/** The upstream code and message from a relayed payment-api body (possibly truncated). */
-function parseUpstreamHint(hint: unknown): { code: string | null; message: string | null } {
-  if (typeof hint !== 'string' || !hint) return { code: null, message: null }
+/**
+ * The upstream code from a relayed payment-api body (possibly truncated).
+ * Only the code: upstream free text can carry coupon codes or addresses that
+ * redactForAlert does not recognise (TRON, Solana, BTC, TON), so no message
+ * text ever reaches an alert.
+ */
+function parseUpstreamCode(hint: unknown): string | null {
+  if (typeof hint !== 'string' || !hint) return null
   try {
     const j: any = JSON.parse(hint)
-    const code = safeCode(j?.error?.code) ?? safeCode(j?.code) ?? safeCode(j?.error)
-    const message = j?.error?.message ?? j?.message
-    return { code, message: typeof message === 'string' ? message : null }
+    return safeCode(j?.error?.code) ?? safeCode(j?.code) ?? safeCode(j?.error)
   } catch {
-    // Truncated at 500 chars: read the fields directly.
-    const code = /"code"\s*:\s*"([A-Za-z][A-Za-z0-9_]{0,63})"/.exec(hint)?.[1] ?? null
-    const message = /"message"\s*:\s*"([^"]{0,300})/.exec(hint)?.[1] ?? null
-    return { code, message }
+    // Truncated at 500 chars: read the field directly.
+    return /"code"\s*:\s*"([A-Za-z][A-Za-z0-9_]{0,63})"/.exec(hint)?.[1] ?? null
   }
-}
-
-/** Short, URL-free upstream message. redactForAlert runs over the whole alert later. */
-function cleanMessage(m: string | null): string | null {
-  if (!m) return null
-  const s = m.replace(/https?:\/\/\S+/gi, '[url]').replace(/\s+/g, ' ').trim().slice(0, 160)
-  return s || null
 }
 
 /**
@@ -158,9 +151,7 @@ export function classifyCreateFailure(
   const code = safeCode(b.code) ?? safeCode(b.error?.code) ?? (typeof b.error === 'string' && /^[A-Z][A-Z0-9_]+$/.test(b.error) ? b.error : null)
   const stage = safeCode(b.stage)
   const upstreamStatus = typeof b.upstream_status === 'number' ? b.upstream_status : null
-  const hint = parseUpstreamHint(b.hint)
-  const upstreamCode = safeCode(b.upstream_code) ?? hint.code
-  const upstreamMessage = cleanMessage(typeof b.upstream_message === 'string' ? b.upstream_message : hint.message)
+  const upstreamCode = safeCode(b.upstream_code) ?? parseUpstreamCode(b.hint)
   const detail = safeCode(note.detail)
   const reason = [
     code ?? `HTTP_${status}`,
@@ -170,7 +161,7 @@ export function classifyCreateFailure(
     detail,
   ].filter(Boolean).join(':')
   const verdict = (alert: boolean): CreateFailureVerdict => ({
-    alert, reason, code, stage, upstreamStatus, upstreamCode, upstreamMessage,
+    alert, reason, code, stage, upstreamStatus, upstreamCode,
   })
 
   if (status < 400) return verdict(false)
@@ -182,7 +173,10 @@ export function classifyCreateFailure(
   // Alpha capacity is load, except a budget that was never configured.
   if (code === 'ALPHA_CAPACITY') return verdict(detail !== null && ALPHA_CONFIG_DETAIL_RE.test(detail))
   if (code && USER_CAUSED_CODES.has(code)) return verdict(false)
-  if ((code === 'INTENTS_API_FAILED' || code === 'INTENTS_API_REJECTED') && upstreamCode && UPSTREAM_USER_CODES.has(upstreamCode)) {
+  // A relayed payment-api refusal that is the caller's. Also when the router
+  // body has no code of its own (the Stripe branch relays a codeless 502 with
+  // the upstream body in `hint`).
+  if ((code === null || code === 'INTENTS_API_FAILED' || code === 'INTENTS_API_REJECTED') && upstreamCode && UPSTREAM_USER_CODES.has(upstreamCode)) {
     return verdict(false)
   }
   // A router 4xx without any code is a request-shape refusal (wrong method,
@@ -231,7 +225,7 @@ export function createFailureAlertText(
     `[MPP Router] 🚨 Order creation failing: ${route} ${chain}/${token} (${verdict.reason})`,
     `Route: ${route}${note.provider ? ` (provider ${displayPart(note.provider)})` : ''}; source chain ${chain}, token ${token}; amount band ${amountBand(note.invoiceAtomic)}`,
     `Customer got HTTP ${status}, code ${verdict.code ?? 'none'}${verdict.stage ? `, stage ${verdict.stage}` : ''}`,
-    `Upstream: HTTP ${verdict.upstreamStatus ?? 'none'}, code ${verdict.upstreamCode ?? 'none'}${verdict.upstreamMessage ? `, message "${verdict.upstreamMessage}"` : ''}`,
+    `Upstream: HTTP ${verdict.upstreamStatus ?? 'none'}, code ${verdict.upstreamCode ?? 'none'}`,
     `Invoice: ${maskId(linkId)}`,
     `At: ${now.toISOString()}`,
     `Customers on this path get an error instead of an order until it is fixed. Same route, reason, chain and token re-alert at most every ${CREATE_FAILURE_ALERT_WINDOW_S / 60} min.`,

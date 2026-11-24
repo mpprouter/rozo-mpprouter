@@ -58,6 +58,9 @@ describe('classifyCreateFailure', () => {
     ['bitrefill rejected invalidRequest', 400, { ok: false, error: 'INTENTS_API_REJECTED', upstream_code: 'invalidRequest', upstream_message: 'payout address is fixed server-side' }, true],
     ['unknown code (fail towards alerting)', 409, { code: 'SOMETHING_NEW' }, true],
     ['5xx without a code', 502, { ok: false, provider: 'stripe_crypto', error: 'Unparseable invoice amount.' }, true],
+    ['Stripe codeless 502 relaying intents invalidRequest', 502, { ok: false, provider: 'stripe_crypto', error: 'Rozo intents API returned 400.', hint: TODAY_UPSTREAM_400 }, true],
+    ['Stripe codeless 502 relaying intents amountTooLow', 502, { ok: false, provider: 'stripe_crypto', error: 'Rozo intents API returned 400.', hint: '{"error":{"code":"amountTooLow","message":"m"}}' }, false],
+    ['Stripe codeless 502 relaying intents amountTooHigh', 502, { ok: false, provider: 'stripe_crypto', error: 'Rozo intents API returned 400.', hint: '{"error":{"code":"amountTooHigh","message":"m"}}' }, false],
     ['unknown upstream code in a relayed 4xx', 502, intentsFailed(422, '{"error":{"code":"brandNew"}}'), true],
     ['truncated upstream hint still read', 502, intentsFailed(400, '{"error":{"code":"invalidRequest","message":"payout address is fix'), true],
     ['alpha upstream failed', 502, { ok: false, code: 'ALPHA_UPSTREAM_FAILED' }, true, { detail: 'business_order_funder_tier' }],
@@ -97,14 +100,14 @@ describe('classifyCreateFailure', () => {
   it('names the upstream status and code for today\'s incident', () => {
     const v = classifyCreateFailure(502, intentsFailed(400, TODAY_UPSTREAM_400))
     expect(v.reason).toBe('INTENTS_API_FAILED:create_http_error:400:invalidRequest')
-    expect(v.upstreamMessage).toBe('payout address is fixed server-side')
+    expect(v.upstreamCode).toBe('invalidRequest')
   })
 })
 
 describe('alert text', () => {
   it('carries route, chain, token, band, statuses and a masked id; no URL or address', () => {
     const v = classifyCreateFailure(502, intentsFailed(400, JSON.stringify({
-      error: { code: 'invalidRequest', message: 'payout https://pay.example/secret to 0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3 refused' },
+      error: { code: 'invalidRequest', message: 'coupon ABCD1234 to TTestOnlyFakeTronAddr000000000000 via https://pay.example/secret refused' },
     })))
     const text = redactForAlert(createFailureAlertText(
       'create-invoice', 502, v,
@@ -119,7 +122,9 @@ describe('alert text', () => {
     expect(text).toContain('Invoice: paymentS...7890')
     expect(text).not.toContain('https://')
     expect(text).not.toContain('abcdef1234567890')
-    expect(text).not.toContain('0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3')
+    // No upstream free text at all: no coupon code, no TRON address.
+    expect(text).not.toContain('ABCD1234')
+    expect(text).not.toContain('TTestOnlyFake')
   })
 
   it('amount bands and id masking', () => {
@@ -222,7 +227,9 @@ describe('create-invoice end to end', () => {
     expect(larkMessages[0].chat).toBe('oc_ops')
     expect(larkMessages[0].text).toContain('Order creation failing: create-invoice lightning/BTC')
     expect(larkMessages[0].text).toContain('amount band under $50')
-    expect(larkMessages[0].text).toContain('payout address is fixed server-side')
+    expect(larkMessages[0].text).toContain('Upstream: HTTP 400, code invalidRequest')
+    // Upstream free text never reaches the alert.
+    expect(larkMessages[0].text).not.toContain('payout address is fixed')
   })
 
   it('dedupes per reason, chain and token within 30 minutes', async () => {
