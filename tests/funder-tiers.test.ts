@@ -6,6 +6,8 @@ import { describe, expect, it } from 'vitest'
 import vectors from '../src/funder-tier-vectors.json'
 import {
   DEFAULT_ORDER_CAP_ATOMIC,
+  DEFAULT_T2_MAX_EXCLUSIVE_ATOMIC,
+  NO_ORDER_T2_MAX_EXCLUSIVE_ATOMIC,
   orderCapAtomicFromUsd,
   parseUsdcAtomic,
   payFromReceivingWallet,
@@ -13,6 +15,7 @@ import {
   routeNoOrderFunder,
   selectFunderTier,
   servedByLegacyFunder,
+  t2MaxAtomicFromUsd,
 } from '../src/funder-tiers'
 import { ORDER_CAP_USD } from '../src/routes/native-sources'
 import {
@@ -22,6 +25,7 @@ import {
   RETIRED_FUNDER_ADDRESS_20261124,
   checksumFunderAddress,
   configuredFunderWallets,
+  funderT2MaxAtomic,
   funderTierAddress,
   funderTiersEnabled,
   isAnyConfiguredFunderTier,
@@ -47,10 +51,20 @@ export const TIER_ENV = {
 const ADDR: Record<string, string> = { T1, T2, T3A, T3B }
 const USD = (n: number) => BigInt(Math.round(n * 1e6))
 
-type Vec = { kind: string; amount: string; expect: string; band?: string; cap?: string }
+type Vec = { kind: string; amount: string; expect: string; band?: string; cap?: string; t2max?: string }
 const VECS = (vectors as any).vectors as Vec[]
 const TEST_CAP = BigInt((vectors as any).testCap)
 const capOf = (v: { cap?: string }) => (v.cap === undefined ? TEST_CAP : BigInt(v.cap))
+const DEFAULT_T2MAX = BigInt((vectors as any).defaultT2Max)
+const t2maxOf = (v: { t2max?: string }) => (v.t2max === undefined ? DEFAULT_T2MAX : BigInt(v.t2max))
+/** Atomic -> the decimal USD string a FUNDER_T2_MAX_USD var would carry ("2.000000"; negatives keep the sign). */
+const usdOfAtomic = (a: bigint) => {
+  const m = a < 0n ? -a : a
+  return `${a < 0n ? '-' : ''}${m / 1_000_000n}.${(m % 1_000_000n).toString().padStart(6, '0')}`
+}
+/** The env var that reproduces a row's t2max through the resolvers (absent row value = var unset). */
+const t2Env = (v: { t2max?: string }): { FUNDER_T2_MAX_USD?: string } =>
+  v.t2max === undefined ? {} : { FUNDER_T2_MAX_USD: usdOfAtomic(BigInt(v.t2max)) }
 /**
  * Rows checked through resolveFunder, whose cap is the live ORDER_CAP_USD
  * (FUNDER_ORDER_CAP_ATOMIC): rows whose cap equals it, plus rows whose
@@ -73,15 +87,42 @@ describe('mirrored selector vs shared vectors', () => {
     expect(VECS.length).toBeGreaterThan(10)
     for (const v of VECS) {
       const band = v.band ?? v.expect
-      const got = selectFunderTier(v.kind, BigInt(v.amount))
-      const label = `${v.kind} ${v.amount} cap ${v.cap ?? 'test'}`
+      const got = selectFunderTier(v.kind, BigInt(v.amount), t2maxOf(v))
+      const label = JSON.stringify(v)
       if (band.startsWith('refuse:')) {
         expect(got, label).toEqual({ ok: false, reason: band.slice('refuse:'.length) })
       } else {
         expect(got, label).toEqual({ ok: true, tier: band })
       }
-      const r = routeFunder(v.kind, BigInt(v.amount), 'isolated', capOf(v))
+      const r = routeFunder(v.kind, BigInt(v.amount), 'isolated', capOf(v), t2maxOf(v))
       expect(r.ok ? r.wallet : `refuse:${r.reason}`, label).toBe(v.expect)
+    }
+  })
+
+  it('T2 boundary setting parse: garbage, 0 and negatives fall back to $200', () => {
+    expect(DEFAULT_T2_MAX_EXCLUSIVE_ATOMIC).toBe(200_000_000n)
+    expect(DEFAULT_T2MAX).toBe(DEFAULT_T2_MAX_EXCLUSIVE_ATOMIC)
+    expect(NO_ORDER_T2_MAX_EXCLUSIVE_ATOMIC).toBe(200_000_000n)
+    for (const c of (vectors as any).t2maxParse as Array<{ in: unknown; out: string }>) {
+      expect(t2MaxAtomicFromUsd(c.in).toString(), JSON.stringify(c.in)).toBe(c.out)
+    }
+    expect(t2MaxAtomicFromUsd(undefined)).toBe(DEFAULT_T2_MAX_EXCLUSIVE_ATOMIC)
+    for (const raw of [undefined, '', 'abc', '0', '-2', '2e0']) {
+      expect(funderT2MaxAtomic({ FUNDER_T2_MAX_USD: raw }), String(raw)).toBe(200_000_000n)
+    }
+    expect(funderT2MaxAtomic(undefined)).toBe(200_000_000n)
+    expect(funderT2MaxAtomic({ FUNDER_T2_MAX_USD: '2' })).toBe(2_000_000n)
+  })
+
+  it('T2 boundary unset is today behaviour on every default row; non-positive boundary is $200', () => {
+    const unset = t2MaxAtomicFromUsd(undefined)
+    for (const v of VECS.filter((x) => x.t2max === undefined)) {
+      expect(routeFunder(v.kind, BigInt(v.amount), 'isolated', capOf(v), unset), JSON.stringify(v))
+        .toEqual(routeFunder(v.kind, BigInt(v.amount), 'isolated', capOf(v), 200_000_000n))
+    }
+    for (const bad of [0n, -1n, undefined as unknown as bigint]) {
+      expect(routeFunder('coinbase', USD(10.5), 'isolated', TEST_CAP, bad)).toEqual({ ok: true, wallet: 'T2' })
+      expect(routeFunder('coinbase', USD(200), 'isolated', TEST_CAP, bad)).toEqual({ ok: true, wallet: 'T3A' })
     }
   })
 
@@ -144,8 +185,8 @@ describe('resolveFunder, flag on', () => {
   it('picks the configured address of the vector tier, refuses with the vector reason', () => {
     expect(LIVE_CAP_VECS.length).toBeGreaterThan(10)
     for (const v of LIVE_CAP_VECS) {
-      const got = resolveFunder(TIER_ENV, v.kind, BigInt(v.amount))
-      const label = `${v.kind} ${v.amount}`
+      const got = resolveFunder({ ...TIER_ENV, ...t2Env(v) }, v.kind, BigInt(v.amount))
+      const label = JSON.stringify(v)
       if (v.expect.startsWith('refuse:')) {
         expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7), tier: null })
       } else if (v.expect === 'LEGACY') {
@@ -240,8 +281,8 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
 
   it('every vector: coinbase/stripe/bitrefill/other -> T2 wallet or legacy funder, x402 -> T1, refusals unchanged', () => {
     for (const v of LIVE_CAP_VECS) {
-      const got = resolveFunder(P2A, v.kind, BigInt(v.amount))
-      const label = `${v.kind} ${v.amount}`
+      const got = resolveFunder({ ...P2A, ...t2Env(v) }, v.kind, BigInt(v.amount))
+      const label = JSON.stringify(v)
       if (v.expect.startsWith('refuse:')) {
         expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7), tier: null })
         continue
@@ -265,12 +306,12 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
   })
 
   it('routeFunder matches every route vector, and resolveFunder agrees', () => {
-    const route = (vectors as any).route as Array<{ kind: string; amount: string; backend: string | null; expect: string; cap?: string }>
+    const route = (vectors as any).route as Array<{ kind: string; amount: string; backend: string | null; expect: string; cap?: string; t2max?: string }>
     expect(route.length).toBeGreaterThan(10)
     for (const v of route) {
       const backend = v.backend ?? undefined
-      const got = routeFunder(v.kind, BigInt(v.amount), backend, capOf(v))
-      const label = `${v.kind} ${v.amount} ${v.backend}`
+      const got = routeFunder(v.kind, BigInt(v.amount), backend, capOf(v), t2maxOf(v))
+      const label = JSON.stringify(v)
       if (v.expect.startsWith('refuse:')) {
         expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7) })
       } else {
@@ -278,7 +319,7 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
       }
       // resolveFunder uses the live cap; only rows at that cap are comparable.
       if (capOf(v) !== FUNDER_ORDER_CAP_ATOMIC) continue
-      const env = { ...TIER_ENV, FUNDER_T3_BACKEND: backend }
+      const env = { ...TIER_ENV, FUNDER_T3_BACKEND: backend, ...t2Env(v) }
       const r = resolveFunder(env, v.kind, BigInt(v.amount))
       if (v.expect.startsWith('refuse:')) expect(r.ok, label).toBe(false)
       else expect(r.ok && r.address, label).toBe(v.expect === 'LEGACY' ? BASE_FUNDER_ADDRESS : ADDR[v.expect])
@@ -365,10 +406,10 @@ describe('phase 2a: FUNDER_T3_BACKEND=legacy', () => {
 
 describe('paying from the receiving wallet', () => {
   it('payFromReceivingWallet matches every pay vector', () => {
-    const pay = (vectors as any).pay as Array<{ kind: string; amount: string; wallet: string; backend: string | null; expect: string; warn?: boolean; cap?: string }>
+    const pay = (vectors as any).pay as Array<{ kind: string; amount: string; wallet: string; backend: string | null; expect: string; warn?: boolean; cap?: string; t2max?: string }>
     expect(pay.length).toBeGreaterThan(10)
     for (const v of pay) {
-      const got = payFromReceivingWallet(v.kind, BigInt(v.amount), v.wallet as any, v.backend ?? undefined, capOf(v))
+      const got = payFromReceivingWallet(v.kind, BigInt(v.amount), v.wallet as any, v.backend ?? undefined, capOf(v), t2maxOf(v))
       const label = JSON.stringify(v)
       if (v.expect.startsWith('refuse:')) {
         expect(got, label).toEqual({ ok: false, reason: v.expect.slice(7) })
@@ -453,6 +494,83 @@ describe('payments with no intents order (coupon, UPI, admin pay)', () => {
     for (const [k, a] of [['coinbase', USD(250)], ['coinbase', USD(20)], ['stripe', USD(20)]] as const) {
       expect(resolveNoOrderFunder(P2A, k, a)).toEqual(resolveFunder(P2A, k, a))
       expect(resolveNoOrderFunder({}, k, a)).toEqual(resolveFunder({}, k, a))
+    }
+  })
+
+  it('FUNDER_T2_MAX_USD=2 does not move no-order payments: $10 -> T2, $199.99 -> T2, $250 -> legacy', () => {
+    const LOW = { ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated', FUNDER_T2_MAX_USD: '2' }
+    const LEG = { ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS }
+    expect(resolveNoOrderFunder(LOW, 'coinbase', USD(10))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+    expect(resolveNoOrderFunder(LOW, 'coinbase', USD(199.99))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+    expect(resolveNoOrderFunder(LOW, 'coinbase', USD(250))).toEqual(LEG)
+    expect(resolveNoOrderFunder(LOW, 'stripe', USD(10))).toEqual(LEG)
+    // Same answers as with the setting unset.
+    const UNSET = { ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }
+    for (const a of [USD(1), USD(10), USD(199.99), USD(200), USD(250), USD(CAP), USD(CAP) + 1n]) {
+      expect(resolveNoOrderFunder(LOW, 'coinbase', a), String(a)).toEqual(resolveNoOrderFunder(UNSET, 'coinbase', a))
+    }
+    // While a NEW order-backed $10 with the same env goes to T3A.
+    expect(resolveFunder(LOW, 'coinbase', USD(10))).toEqual({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A })
+  })
+})
+
+describe('FUNDER_T2_MAX_USD (order-backed T2 boundary)', () => {
+  const ISO = { ...TIER_ENV, FUNDER_T3_BACKEND: 'isolated' }
+  const LOW = { ...ISO, FUNDER_T2_MAX_USD: '2' }
+
+  it('boundary 2: new Coinbase / alpha $10.50 -> T3A, $1.99 -> T2, exactly $2 -> T3A', () => {
+    expect(resolveFunder(LOW, 'coinbase', USD(10.5))).toEqual({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A })
+    expect(resolveFunder(LOW, 'tron_ton_alpha', USD(10.5))).toEqual({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A })
+    expect(resolveFunder(LOW, 'coinbase', USD(1.99))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+    expect(resolveFunder(LOW, 'tron_ton_alpha', USD(1.99))).toEqual({ ok: true, tier: 'T2', address: T2, expectedFunder: T2 })
+    expect(resolveFunder(LOW, 'coinbase', USD(2))).toMatchObject({ ok: true, tier: 'T3A' })
+    expect(resolveFunder(LOW, 'coinbase', USD(CAP) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+    // Other kinds are not affected.
+    expect(resolveFunder(LOW, 'x402', USD(1))).toMatchObject({ ok: true, tier: 'T1' })
+    expect(resolveFunder(LOW, 'bitrefill', USD(1))).toMatchObject({ ok: true, tier: 'T3B' })
+    expect(resolveFunder(LOW, 'stripe', USD(10))).toMatchObject({ ok: true, tier: 'legacy' })
+    // Phase 2a with the boundary at 2: a $10.50 order goes to the legacy funder (T3A served by legacy).
+    expect(resolveFunder({ ...TIER_ENV, FUNDER_T3_BACKEND: 'legacy', FUNDER_T2_MAX_USD: '2' }, 'coinbase', USD(10.5)))
+      .toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS })
+  })
+
+  it('unset / "200" / garbage / 0 / negative behave exactly as today for every kind and amount', () => {
+    const kinds = ['x402', 'coinbase', 'tron_ton_alpha', 'stripe', 'bitrefill', 'other', 'upi']
+    const amounts = [0n, 1n, USD(1.99), USD(2), USD(10.5), USD(199.999999), USD(200), USD(CAP), USD(CAP) + 1n]
+    for (const raw of ['200', '200.00', '', 'abc', '0', '-2', '2e0', ' ']) {
+      for (const k of kinds) {
+        for (const a of amounts) {
+          expect(resolveFunder({ ...ISO, FUNDER_T2_MAX_USD: raw }, k, a), `${raw} ${k} ${a}`).toEqual(resolveFunder(ISO, k, a))
+        }
+      }
+    }
+  })
+
+  it('above the order cap: every order-backed Coinbase payment routes to T2', () => {
+    const HIGH = { ...ISO, FUNDER_T2_MAX_USD: '100000' }
+    expect(resolveFunder(HIGH, 'coinbase', USD(CAP))).toMatchObject({ ok: true, tier: 'T2' })
+    expect(resolveFunder(HIGH, 'coinbase', USD(CAP) + 1n)).toEqual({ ok: false, reason: 'over_order_cap', tier: null })
+  })
+
+  it('in-flight: lowered to 2, a $50 order recorded on T2 is still paid by T2 (warning only); a $10.50 on T3A has no warning', () => {
+    const t2Old = resolvePayingFunder(LOW, 'coinbase', USD(50), T2)
+    expect(t2Old).toMatchObject({ ok: true, tier: 'T2', address: T2, expectedFunder: T2, nominal: 'T3A' })
+    expect(t2Old.ok && t2Old.warning).toMatch(/amount_outside_nominal_range/)
+    const t2OldAlpha = resolvePayingFunder(LOW, 'tron_ton_alpha', USD(50), T2)
+    expect(t2OldAlpha).toMatchObject({ ok: true, tier: 'T2', address: T2, nominal: 'T3A' })
+    const t3aNew = resolvePayingFunder(LOW, 'coinbase', USD(10.5), T3A)
+    expect(t3aNew).toEqual({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A, nominal: 'T3A', warning: null })
+    const t3aNewAlpha = resolvePayingFunder(LOW, 'tron_ton_alpha', USD(10.5), T3A)
+    expect(t3aNewAlpha).toEqual({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A, nominal: 'T3A', warning: null })
+  })
+
+  it('in-flight: restored to 200, a $50 order recorded on T3A is still paid by T3A (warning only)', () => {
+    for (const env of [ISO, { ...ISO, FUNDER_T2_MAX_USD: '200' }]) {
+      const r = resolvePayingFunder(env, 'coinbase', USD(50), T3A)
+      expect(r).toMatchObject({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A, nominal: 'T2' })
+      expect(r.ok && r.warning).toMatch(/amount_outside_nominal_range/)
+      const a = resolvePayingFunder(env, 'tron_ton_alpha', USD(50), T3A)
+      expect(a).toMatchObject({ ok: true, tier: 'T3A', address: T3A, nominal: 'T2' })
     }
   })
 })
