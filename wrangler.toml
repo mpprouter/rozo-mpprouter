@@ -171,7 +171,7 @@ FUNDER_T2_ADDRESS = "0x963bd9c6F6d18c816f6DDBB75456E499c0CF7Fc3"   # Coinbase in
 # fixed $200 boundary. Orders already created are always paid by their
 # recorded destination. Lowering: set the signer project's FUNDER_T2_MAX_USD
 # first, then deploy this. Rollback: set back to "200" and deploy.
-FUNDER_T2_MAX_USD = "200"
+FUNDER_T2_MAX_USD = "2"  # founder 2026-11-24: temporary, almost every OpenRouter order via T3A (KMS); restore "200"
 # Phase 2b (infra/tier-signer CUTOVER-2B.md in shawn-local-skills): T3A / T3B
 # are the AWS KMS wallets signed by the rozo-tier-signer Lambda. Deploy this
 # ONLY after the signer project runs FUNDER_T3_BACKEND=isolated (signer first:
