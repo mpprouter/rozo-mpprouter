@@ -926,7 +926,8 @@ export async function handleStripeWebhookEvent(
     return { ok: true, provider: 'stripe_crypto', status: 'manual_review', reason: code }
   }
   if (funder.warning) {
-    await reportFunderRangeWarning(env, {
+    // Not awaited: the alert runs in the background and never blocks the pay.
+    reportFunderRangeWarning(env, {
       site: 'stripe_settle',
       orderId: input.rozoPaymentId ?? null,
       invoiceId: maskInvoiceKey(invoiceKey),
@@ -1117,10 +1118,31 @@ export async function handleStripeWebhookEvent(
   // move → release the daily reservation. This IS retryable (a later corrected
   // event can retry), so return to payout_seen rather than a stuck state.
   await releaseDailySpend(env, now, invoiceAtomic)
+  const refusalCode = (() => {
+    const b = payResult.body as Record<string, unknown> | null
+    return b && typeof b === 'object' && typeof b.code === 'string' ? b.code.slice(0, 64) : null
+  })()
   await finalizeClaim(env, invoiceKey, orderId, nowIso, 'failed_provider', {
-    failureReason: `pay-invoice ${payResult.status}`,
+    // Flag off: the same text as before. Flag on: the signer's code is kept
+    // (order-check refusals like ORDER_UNDERPAID, all signed:false).
+    failureReason: funderTiersEnabled(env) && refusalCode
+      ? `pay-invoice ${payResult.status} ${refusalCode} (nothing signed)`
+      : `pay-invoice ${payResult.status}`,
     event: { kind: 'stripe_fulfillment_failed', detail: { status: payResult.status } },
   })
+  // Flag on: a definite signer refusal (order check, tier cross-check) pages
+  // ops; nothing was signed. Never blocks; flag off unchanged.
+  if (funderTiersEnabled(env) && alertSinkConfigured(env)) {
+    await sendAlert(
+      env,
+      redactForAlert(
+        `[MPP Router] 🚨 Stripe invoice NOT paid: pay-invoice refused before signing\n` +
+          `Invoice: ${maskInvoiceKey(invoiceKey)}, Rozo payment ${(input.rozoPaymentId ?? '?').slice(0, 8)}\n` +
+          `Reason: pay-invoice ${payResult.status} ${refusalCode ?? ''}\n` +
+          `Nothing was signed. Check the order against the invoice before any manual payment.`,
+      ),
+    ).catch(() => false)
+  }
   return { ok: true, provider: 'stripe_crypto', status: 'failed_provider' }
   }
 }

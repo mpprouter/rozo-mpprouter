@@ -662,7 +662,24 @@ describe('Coinbase settle: tiered funders', () => {
     expect(rec(kv).status).toBe('paid')
     expect(rec(kv).funderAddress).toBe(T2)
     expect(warn.mock.calls.some((c) => String(c[0]).includes('"event":"funder_tier_range_warning"'))).toBe(true)
-    expect(alerts.some((a) => a.includes('Funder tier range') && a.includes('T2') && a.includes('230.00') && a.includes('nominal wallet T3A'))).toBe(true)
+    await vi.waitFor(() =>
+      expect(alerts.some((a) => a.includes('Funder tier range') && a.includes('T2') && a.includes('230.00') && a.includes('nominal wallet T3A'))).toBe(true),
+    )
+  })
+
+  it('a hung ops alert channel never blocks the payment', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '230.00', chainId: '8453', receiverAddress: T2 } }), '230.00')
+    const inner = globalThis.fetch as any
+    vi.stubGlobal('fetch', (input: any, init?: any) => {
+      const u = String(input instanceof Request ? input.url : input)
+      if (u.includes('oapi.dingtalk.com')) return new Promise(() => {}) // never answers
+      return inner(input, init)
+    })
+    const { env, kv } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('230.00')), env)
+    expect(seen.payBodies).toHaveLength(1)
+    expect(rec(kv).status).toBe('paid')
   })
 
   it('receiving wallet pays: T3A destination + $50 order -> paid by T3A', async () => {

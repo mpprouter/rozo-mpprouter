@@ -1239,7 +1239,8 @@ export async function settleCoinbaseEvent(
       : `${FUNDER_TIER_REFUSED_CODE}: ${funder.reason}`
     : null
   if (funder.ok && funder.warning) {
-    await reportFunderRangeWarning(env, {
+    // Not awaited: the alert runs in the background and never blocks the pay.
+    reportFunderRangeWarning(env, {
       site: 'coinbase_settle',
       orderId: rozoPaymentId ?? null,
       invoiceId: plId,
@@ -1248,7 +1249,7 @@ export async function settleCoinbaseEvent(
       amountAtomic: invoiceAtomic,
       nominal: funder.nominal,
       warning: funder.warning,
-    })
+    }, waitUntil)
   }
   if (tierRefusal || !funder.ok) {
     rec.status = 'order_binding_failed'

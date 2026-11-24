@@ -23,7 +23,40 @@ function mask(addr: string): string {
   return /^0x[0-9a-fA-F]{40}$/.test(addr) ? `${addr.slice(0, 6)}...${addr.slice(-4)}` : addr
 }
 
-export async function reportFunderRangeWarning(env: AlertEnv, w: FunderRangeWarning): Promise<void> {
+/** Upper bound on the background alert (it is never on the payment path). */
+export const FUNDER_RANGE_ALERT_TIMEOUT_MS = 5_000
+
+/**
+ * Synchronous and non-blocking: the log line is written now; the ops alert is
+ * sent in the background (handed to `waitUntil` when the caller has one) and
+ * bounded by FUNDER_RANGE_ALERT_TIMEOUT_MS. Callers never await it, so a hung
+ * alert channel can never delay or block the payment.
+ */
+export function reportFunderRangeWarning(
+  env: AlertEnv,
+  w: FunderRangeWarning,
+  waitUntil?: (p: Promise<unknown>) => void,
+): void {
+  let p: Promise<void>
+  try {
+    p = sendRangeWarning(env, w)
+  } catch {
+    return
+  }
+  const bounded = Promise.race([
+    p,
+    new Promise<void>((resolve) => setTimeout(resolve, FUNDER_RANGE_ALERT_TIMEOUT_MS)),
+  ]).catch(() => undefined)
+  if (waitUntil) {
+    try {
+      waitUntil(bounded)
+    } catch {
+      // never affects the payment
+    }
+  }
+}
+
+async function sendRangeWarning(env: AlertEnv, w: FunderRangeWarning): Promise<void> {
   try {
     console.warn(
       JSON.stringify({

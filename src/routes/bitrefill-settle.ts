@@ -580,7 +580,8 @@ export async function settleBitrefillFunderEvent(
 
   // From here the gate is never released.
   if (check.rangeWarning) {
-    await reportFunderRangeWarning(env, {
+    // Not awaited: the alert runs in the background and never blocks the pay.
+    reportFunderRangeWarning(env, {
       site: 'bitrefill_settle',
       orderId: rozoPaymentId ?? null,
       invoiceId: plId,
