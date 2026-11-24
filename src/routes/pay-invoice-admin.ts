@@ -31,7 +31,12 @@ import { timingSafeEqualStr } from '../utils/timing-safe'
 import { claimInvoiceKey, releaseInvoiceClaim } from './invoice-claim'
 import { acquireCoinbaseExecGate, releaseCoinbaseExecGate } from './coinbase-exec-gate'
 import { casRead, casUpdate } from './stripe-atomic'
-import { fetchRozoPaymentById, loadRecord } from './webhook'
+import { fetchRozoPaymentById, isFunderTierMismatch, loadRecord } from './webhook'
+import { funderRefusalMessage, funderRefusalStatus, funderTiersEnabled, resolveFunder } from '../funder-address'
+import {
+  fetchCoinbasePayment as fetchCoinbaseInvoicePayload,
+  normalizeCoinbasePayment,
+} from './invoice-provider'
 import { listLinkOrderRows, listOrderRows, readPaymentStatus } from './existing-order'
 import { celoSettlementGate, hasChain, isCeloChain, orderSourceChain } from './celo-finality'
 import { lookupStripeSession } from './stripe-session-index'
@@ -145,6 +150,9 @@ export type PayInvoiceErrorCode =
   | 'UPSTREAM_ERROR'
   | 'LINK_CLAIMED'
   | 'CELO_NOT_VERIFIED'
+  // Tiered funders (FUNDER_TIERS_ENABLED only).
+  | 'FUNDER_TIER_REFUSED'
+  | 'FUNDER_TIER_MISMATCH'
 
 export interface PayInvoiceError {
   code: PayInvoiceErrorCode
@@ -661,6 +669,48 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
     }
   }
 
+  // Funder tier (FUNDER_TIERS_ENABLED only; off = no read, legacy body). The
+  // tier is chosen by the Coinbase charge, read here before any claim, gate
+  // or send. Stripe and other ids cannot be tiered here: refused while the
+  // flag is on (pay them through their normal fulfillment path).
+  let expectedFunder: string | undefined
+  if (funderTiersEnabled(env)) {
+    if (!coinbaseId) {
+      return errorResponse(409, {
+        code: 'FUNDER_TIER_REFUSED',
+        message: 'Manual pay of a non-Coinbase invoice is disabled while tiered funders are on. Nothing was paid.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    let chargeAtomic: bigint | null = null
+    try {
+      const payload = await fetchCoinbaseInvoicePayload(coinbaseId, AbortSignal.timeout(5000))
+      chargeAtomic = BigInt((await normalizeCoinbasePayment(payload)).stablecoinAmountAtomic)
+    } catch {
+      chargeAtomic = null
+    }
+    if (chargeAtomic === null) {
+      return errorResponse(503, {
+        code: 'UPSTREAM_ERROR',
+        message: 'Could not read the Coinbase charge to select the funder wallet. Nothing was paid; retry later.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    const funder = resolveFunder(env, 'coinbase', chargeAtomic)
+    if (!funder.ok) {
+      return errorResponse(funderRefusalStatus(funder.reason), {
+        code: 'FUNDER_TIER_REFUSED',
+        message: funderRefusalMessage(funder.reason),
+        hint: funder.reason,
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
+    expectedFunder = funder.expectedFunder
+  }
+
   let attemptRef: string | null = null
   if (coinbaseId) {
     const ref = repayRef || `admin-pay:${crypto.randomUUID()}`
@@ -720,7 +770,8 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
         'content-type': 'application/json',
         'x-admin-secret': env.PAYINVOICE_ADMIN_SECRET,
       },
-      body: JSON.stringify(normalized),
+      // Flag off: exactly the normalized body, as before.
+      body: JSON.stringify(expectedFunder ? { ...normalized, expected_funder: expectedFunder } : normalized),
     })
   } catch (err: any) {
     if (coinbaseId && attemptRef) {
@@ -763,6 +814,24 @@ export async function handleAdminPayInvoice(request: Request, env: Env): Promise
       at: new Date().toISOString(),
       upstreamStatus: upstream.status,
     })
+  }
+
+  // The signer's tier cross-check refused (nothing signed): not a used link.
+  if (upstream.status === 409 && expectedFunder) {
+    let body: unknown = null
+    try {
+      body = JSON.parse(upstreamText)
+    } catch {
+      body = null
+    }
+    if (isFunderTierMismatch(upstream.status, body)) {
+      return errorResponse(409, {
+        code: 'FUNDER_TIER_MISMATCH',
+        message: 'The signer selected a different funder wallet than the router. Nothing was signed.',
+        normalized_input: normalized,
+        link_id_detected,
+      })
+    }
   }
 
   // Detect deterministic link states from upstream status codes

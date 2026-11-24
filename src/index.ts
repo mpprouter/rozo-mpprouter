@@ -49,7 +49,7 @@ import { handleCapabilities, handleServiceSelect } from './routes/service-select
 import { hostedProviderIdFor } from './services/provider-hosting'
 import { handleSearch } from './routes/search'
 import { handleLedger } from './routes/ledger'
-import { X402_PATHS, handleX402Payer } from './x402payer/routes'
+import { X402_PATHS, handleX402Payer, x402BaseFunder } from './x402payer/routes'
 import { supabaseLedger } from './x402payer/ledger'
 import { reconcileX402Payer, runX402Ops } from './x402payer/reconcile'
 import { handleX402Supported } from './routes/x402-supported'
@@ -138,7 +138,8 @@ import { handleRefundAdmin, handleRefundStatus } from './routes/refunds'
 import { checkGasSponsor } from './utils/stellar-gas-balance'
 import { checkTempoChannels, precompileStateReader } from './utils/tempo-channel-watch'
 import { getTempoClient } from './mpp/tempo-rpc'
-import { checkFunderBalance } from './utils/funder-balance-watch'
+import { checkFunderBalance, FUNDER_TIER_WATCH_PROFILES, watchStateKey } from './utils/funder-balance-watch'
+import { configuredFunderWallets } from './funder-address'
 import { alertSinkConfigured, sendAlert } from './utils/alert'
 import { redactForAlert } from './utils/alert-redaction'
 import { handleChatCompletions, handleModels } from './routes/chat-completions'
@@ -864,19 +865,27 @@ export default {
     // Intents DB) and alert reversed top-ups; hourly, funder vs ledger
     // liability. Each swallows its own errors like the watches above.
     {
+      // Base x402 wallet: FUNDER_WALLET, or T1 while FUNDER_TIERS_ENABLED is
+      // on (null = T1 not configured: the liability reconcile is skipped
+      // rather than compared against another wallet).
+      const x402Funder = x402BaseFunder(env)
       const x402Jobs = {
         kv: env.MPP_STORE,
         ledger: supabaseLedger(env),
         alertEnv: env,
         baseRpcUrl: env.BASE_RPC_URL,
-        funder: FUNDER_WALLET,
+        funder: x402Funder ?? FUNDER_WALLET,
       }
       ctx.waitUntil(runX402Ops(x402Jobs).then(() => undefined, (err) => {
         console.warn(`[x402-ops] skipped: ${(err as Error).message}`)
       }))
-      ctx.waitUntil(reconcileX402Payer(x402Jobs).then(() => undefined, (err) => {
-        console.warn(`[x402-reconcile] skipped: ${(err as Error).message}`)
-      }))
+      if (x402Funder) {
+        ctx.waitUntil(reconcileX402Payer(x402Jobs).then(() => undefined, (err) => {
+          console.warn(`[x402-reconcile] skipped: ${(err as Error).message}`)
+        }))
+      } else {
+        console.warn('[x402-reconcile] skipped: funder T1 not configured')
+      }
     }
     // UPI rewards (v2) config self-check: v2 on but the merchant approval
     // check cannot run → alert (KV-deduped to once per 6h). Never throws.
@@ -903,18 +912,32 @@ async function watchFunderBalance(env: Env): Promise<void> {
       console.warn('[funder-balance-watch] no alert channel configured — funder wallet is NOT being monitored')
       return
     }
-    const result = await checkFunderBalance({
-      kv: env.MPP_STORE,
-      address: FUNDER_WALLET,
-      rpcUrl: env.BASE_RPC_URL,
-    })
-    if (!result) return
-    // Commit only if every message was confirmed delivered; otherwise the
-    // next tick re-decides from the old state and sends again.
-    for (const message of result.messages) {
-      if (!(await sendAlert(env, redactForAlert(message)))) return
+    // Flag off: exactly the legacy funder with the legacy state key. Flag on
+    // (FUNDER_TIERS_ENABLED="true"): every tier wallet, own state and bands.
+    for (const w of configuredFunderWallets(env)) {
+      if (!w.address) {
+        console.warn(`[funder-balance-watch] funder ${w.tier} not configured (${w.reason}): not monitored`)
+        continue
+      }
+      const tier = w.tier === 'legacy' ? null : w.tier
+      const result = await checkFunderBalance({
+        kv: env.MPP_STORE,
+        address: w.address,
+        rpcUrl: env.BASE_RPC_URL,
+        ...(tier ? { stateKey: watchStateKey(tier), profile: FUNDER_TIER_WATCH_PROFILES[tier] } : {}),
+      })
+      if (!result) continue
+      // Commit only if every message was confirmed delivered; otherwise the
+      // next tick re-decides from the old state and sends again.
+      let delivered = true
+      for (const message of result.messages) {
+        if (!(await sendAlert(env, redactForAlert(message)))) {
+          delivered = false
+          break
+        }
+      }
+      if (delivered) await result.commit()
     }
-    await result.commit()
   } catch (err) {
     console.warn(`[funder-balance-watch] skipped: ${(err as Error).message}`)
   }

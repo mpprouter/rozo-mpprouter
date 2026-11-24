@@ -31,6 +31,7 @@ import { casUpdate } from './stripe-atomic'
 import { readCoinbaseExecGate } from './coinbase-exec-gate'
 import { funderTransferExists } from '../utils/funder-transfer'
 import { decimalToAtomic } from './invoice-provider'
+import { resolveFunder } from '../funder-address'
 import {
   type FulfillmentRecord,
   FUNDER_WALLET,
@@ -373,7 +374,18 @@ async function adoptLostSettlement(env: Env, plId: string, rec: FulfillmentRecor
     return
   }
   if (amount <= 0n) return
-  const paid = await funderTransferExists(FUNDER_WALLET, amount, gateMs, GATE_TRANSFER_WINDOW_MS, env.BASE_RPC_URL)
+  // The wallet that was asked to pay: the tier stored on the record at send
+  // time (FUNDER_TIERS_ENABLED), else the tier for this charge (legacy funder
+  // while the flag is off). No resolvable wallet: no adoption.
+  let payer: string = FUNDER_WALLET
+  if (rec.funderAddress && /^0x[0-9a-fA-F]{40}$/.test(rec.funderAddress)) {
+    payer = rec.funderAddress
+  } else {
+    const funder = resolveFunder(env, 'coinbase', amount)
+    if (!funder.ok) return
+    payer = funder.address
+  }
+  const paid = await funderTransferExists(payer, amount, gateMs, GATE_TRANSFER_WINDOW_MS, env.BASE_RPC_URL)
   if (paid !== true) return
   const nowIso = new Date(now).toISOString()
   const from = rec.status
