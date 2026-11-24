@@ -520,3 +520,97 @@ describe('timingSafeEqualStr', () => {
     expect(timingSafeEqualStr(null, 'x')).toBe(false)
   })
 })
+
+// ── E. tiered funders (FUNDER_TIERS_ENABLED) ────────────────────────────────
+
+describe('Coinbase settle: tiered funders', () => {
+  const T1 = '0x1000000000000000000000000000000000000001'
+  const T2 = '0x2000000000000000000000000000000000000002'
+  const T3A = '0x3000000000000000000000000000000000000003'
+  const T3B = '0x4000000000000000000000000000000000000004'
+  const TIERS = { FUNDER_TIERS_ENABLED: 'true', FUNDER_T1_ADDRESS: T1, FUNDER_T2_ADDRESS: T2, FUNDER_T3A_ADDRESS: T3A, FUNDER_T3B_ADDRESS: T3B }
+  const LEGACY = '0x282bE0C42E5c944b0285CEc363117AB077cC084A'
+
+  function tierStub(order: Record<string, unknown>, invoiceAmount: string, payStatus = 200, payBody: unknown = CAPTURED) {
+    const seen = { payBodies: [] as any[], balanceOf: [] as string[] }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input instanceof Request ? input.url : input)
+        if (url.includes('oapi.dingtalk.com')) return Response.json({ errcode: 0 })
+        if (url.includes('agentapi.rozo.ai/pay-invoice')) {
+          seen.payBodies.push(JSON.parse(String(init?.body)))
+          return new Response(JSON.stringify(payBody), { status: payStatus })
+        }
+        if (url.includes('payments.coinbase.com/next-api/')) return Response.json(boundCoinbaseLink(PL, invoiceAmount))
+        if (url.includes('intentapiv4.rozo.ai') && url.endsWith('/delivered')) return new Response('{}', { status: 200 })
+        if (url.includes('intentapiv4.rozo.ai')) return Response.json(order)
+        const body = JSON.parse(String(init?.body ?? '{}'))
+        const data: string = body?.params?.[0]?.data ?? ''
+        if (data.startsWith('0x70a08231')) seen.balanceOf.push('0x' + data.slice(-40))
+        return Response.json({ jsonrpc: '2.0', id: 1, result: '0x' + (10_000_000_000n).toString(16) })
+      }),
+    )
+    return seen
+  }
+  const ev = (amount: string) =>
+    event('payment_payout_completed', { destination: { amount, chainId: '8453', txHash: '0xdeadbeef' } })
+
+  it('flag off: legacy body { payment_id } and legacy balance address (unchanged)', async () => {
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: LEGACY } }), '250.00')
+    const { env, kv } = makeEnv()
+    await handleRozoWebhook(await signed(ev('250.00')), env)
+    expect(seen.payBodies).toEqual([{ payment_id: PL }])
+    expect(seen.balanceOf).toEqual([LEGACY.toLowerCase()])
+    expect(rec(kv).status).toBe('paid')
+    expect('funderAddress' in rec(kv)).toBe(false)
+  })
+
+  it('flag on, $250 invoice: order paid to T3A, balance of T3A, expected_funder T3A', async () => {
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: T3A } }), '250.00')
+    const { env, kv } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('250.00')), env)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T3A }])
+    expect(seen.balanceOf).toEqual([T3A.toLowerCase()])
+    expect(rec(kv).status).toBe('paid')
+    expect(rec(kv).funderAddress).toBe(T3A)
+  })
+
+  it('flag on, $199.99 invoice uses T2', async () => {
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '199.99', chainId: '8453', receiverAddress: T2 } }), '199.99')
+    const { env } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('199.99')), env)
+    expect(seen.payBodies).toEqual([{ payment_id: PL, expected_funder: T2 }])
+  })
+
+  it('flag on: an order paid out to another wallet is refused, nothing paid', async () => {
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: LEGACY } }), '250.00')
+    const { env, kv } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('250.00')), env)
+    expect(seen.payBodies).toEqual([])
+    expect(rec(kv).status).toBe('order_binding_failed')
+    expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_RECEIVER_MISMATCH/)
+  })
+
+  it('flag on: a missing tier address refuses, nothing paid', async () => {
+    const seen = tierStub(boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: T3A } }), '250.00')
+    const { env, kv } = makeEnv({ ...TIERS, FUNDER_T3A_ADDRESS: undefined })
+    await handleRozoWebhook(await signed(ev('250.00')), env)
+    expect(seen.payBodies).toEqual([])
+    expect(rec(kv).status).toBe('order_binding_failed')
+    expect(rec(kv).failureReason).toMatch(/FUNDER_TIER_REFUSED: tier_address_missing/)
+  })
+
+  it('flag on: a 409 funder_tier_mismatch is a definite refusal (failed_pay_invoice, not unknown)', async () => {
+    tierStub(
+      boundRozoOrder(ROZO_ID, PL, { destination: { amount: '250.00', chainId: '8453', receiverAddress: T3A } }),
+      '250.00',
+      409,
+      { signed: false, code: 'funder_tier_mismatch' },
+    )
+    const { env, kv } = makeEnv(TIERS)
+    await handleRozoWebhook(await signed(ev('250.00')), env)
+    expect(rec(kv).status).toBe('failed_pay_invoice')
+    expect(rec(kv).failureReason).toMatch(/funder_tier_mismatch/)
+  })
+})
