@@ -5,6 +5,7 @@ import {
   FUNDER_ALPHA_KIND,
   FUNDER_TIER_REFUSED_CODE,
   coinbaseOrderKind,
+  funderTiersEnabled,
   isSignerNotPaidOutYet,
   orderPaidOutForSigner,
   resolvePayingFunder,
@@ -1172,6 +1173,17 @@ export async function settleCoinbaseEvent(
   // Already in-flight? Don't double-fire. (Advisory only: KV is not atomic.
   // The exec gate below is the real at-most-once guard.)
   if (rec.status === 'paying') {
+    // Tiers on: the attempt this event raced may meanwhile have stepped the
+    // record back to pre-pay after a "not paid out yet" refusal (nothing
+    // signed). Never write its stale `paying` back over that, or every later
+    // event and re-drive would stop here. Flag off: unchanged.
+    if (funderTiersEnabled(env)) {
+      const stored = await loadRecord(env, plId)
+      if (stored && stored.status !== 'paying' && !TERMINAL_STATUSES.has(stored.status)) {
+        rec.status = stored.status
+        rec.payingAt = stored.payingAt ?? null
+      }
+    }
     await saveRecordGuarded(env, plId, rec)
     return { ok: true, already_paying: true, plId }
   }

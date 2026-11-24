@@ -875,6 +875,26 @@ describe('Coinbase settle: tiered funders', () => {
     expect(st.payBodies).toHaveLength(2)
   })
 
+  it('flag on: an event that raced a stepped-back attempt never writes the stale paying status back', async () => {
+    const st = raceStub(T2, '105.00')
+    st.orderStatus = 'payment_payout_completed'
+    const { env, kv } = makeEnv(TIERS)
+    const base = { ...JSON.parse(JSON.stringify({ status: 'paying', pl_id: PL, rozoPaymentId: ROZO_ID })), invoiceAmountAtomic: null, funderBalanceAtomic: null, paidAt: null, payingAt: '2026-11-24T09:00:00.000Z', coinbaseResult: null, failureReason: null, webhookEventIds: [], events: [] }
+    kv._store.set(KEY, JSON.stringify(base))
+    // The first read (this event's load) still sees `paying`; the racing
+    // attempt then steps the record back before this event saves.
+    const realGet = kv.get
+    let reads = 0
+    kv.get = async (k: string) => {
+      if (k === KEY && ++reads === 2) kv._store.set(KEY, JSON.stringify({ ...base, status: 'payin_seen', payingAt: null }))
+      return realGet(k)
+    }
+    const res = await handleRozoWebhook(await signed(ev('105.00')), env)
+    expect((await res.json() as any).already_paying).toBe(true)
+    expect(st.payBodies).toEqual([])
+    expect(rec(kv).status).toBe('payin_seen')
+  })
+
   it('flag on: ALPHA_ORDER_NOT_PAID_OUT is not ready too', async () => {
     const st = raceStub(LEGACY, '20.00')
     st.orderStatus = 'payment_payout_completed'
