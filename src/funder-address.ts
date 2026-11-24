@@ -300,6 +300,51 @@ export function isAnyConfiguredFunderTier(env: FunderTierEnv | null | undefined,
 /** Payment kind of a TRON / TON alpha business order (mirrored selector). */
 export const FUNDER_ALPHA_KIND = ALPHA_KIND
 
+// ── Pay only after the order paid out (FUNDER_TIERS_ENABLED) ────────────────
+//
+// With tiers on, every order-backed pay request carries `rozo_payment_id`, and
+// the signer (pay-invoice order-destination.ts / alpha-verify.ts) refuses to
+// sign until that order is paid out: status in its PAID_OUT_STATUSES and a
+// Base payout tx hash. The payin_completed webhook arrives seconds before the
+// payout lands, so paying on it is always refused (2026-11-24: three orders
+// stranded as failed_pay_invoice). Callers therefore wait for the payout, and
+// treat the signer's "not paid out yet" answer as not ready, never terminal.
+
+/** Order statuses the signer accepts as paid out (mirrors its PAID_OUT_STATUSES). */
+export const SIGNER_PAID_OUT_STATUSES: ReadonlySet<string> = new Set([
+  'payment_payout_completed',
+  'payment_completed',
+])
+
+/** True when the intents order row shows a status the signer accepts as paid out. */
+export function orderPaidOutForSigner(order: any): boolean {
+  const status = order?.status ?? order?.payment_status
+  return typeof status === 'string' && SIGNER_PAID_OUT_STATUSES.has(status)
+}
+
+/** Signer refusal codes that mean "the order has not paid out yet" (nothing signed). */
+export const SIGNER_NOT_PAID_OUT_CODES: ReadonlySet<string> = new Set([
+  'ORDER_NOT_PAID_OUT',
+  'ALPHA_ORDER_NOT_PAID_OUT',
+])
+
+/**
+ * The signer refused only because the order has not paid out yet: HTTP 409,
+ * an explicit `signed: false`, and a not-paid-out code. Nothing was signed, so
+ * the attempt may be retried once the payout lands. Anything else (any other
+ * code, `signed` missing or true, another status) is NOT this.
+ */
+export function isSignerNotPaidOutYet(status: number, body: any): boolean {
+  return (
+    status === 409 &&
+    body !== null &&
+    typeof body === 'object' &&
+    body.signed === false &&
+    typeof body.code === 'string' &&
+    SIGNER_NOT_PAID_OUT_CODES.has(body.code)
+  )
+}
+
 /** metadata.source the TRON / TON alpha route writes on the business order it creates. */
 export const ALPHA_ORDER_SOURCE = 'mpprouter-tron-ton-alpha'
 

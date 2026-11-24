@@ -5,6 +5,9 @@ import {
   FUNDER_ALPHA_KIND,
   FUNDER_TIER_REFUSED_CODE,
   coinbaseOrderKind,
+  funderTiersEnabled,
+  isSignerNotPaidOutYet,
+  orderPaidOutForSigner,
   resolvePayingFunder,
 } from '../funder-address'
 import { reportFunderRangeWarning } from '../utils/funder-range-warning'
@@ -934,6 +937,63 @@ export async function deferForCeloGate(
   return { ok: true, deferred: 'celo_finality', reason: gate.reason, plId, celoQueued: true }
 }
 
+/**
+ * Tiers on, the order has not paid out yet (step 7f, or the signer said so):
+ * keep the record in its pre-pay status, note why, forget the event's dedup
+ * marker so a resend or replay is processed again, and queue the automatic
+ * re-drive (celo-retry.ts, the same settle path with every guard) as the
+ * backstop for a payout webhook that never arrives. No alert: waiting for the
+ * payout is the normal flow. Nothing was sent. `rec` null = already saved.
+ */
+async function deferAwaitingPayout(
+  env: Env,
+  plId: string,
+  rec: FulfillmentRecord | null,
+  eventId: string,
+  eventType: string,
+  rozoPaymentId: string | null,
+  orderStatus: string | null,
+): Promise<Record<string, unknown>> {
+  const reason = `awaiting payout (order status ${orderStatus || 'unknown'})`
+  if (rec) {
+    rec.events.push({ kind: 'awaiting_payout', at: new Date().toISOString(), event_id: eventId, detail: { reason } })
+    await saveRecordGuarded(env, plId, rec)
+  }
+  await forgetWebhookEvent(env, eventId)
+  const queued = await enqueueCeloRetry(env, {
+    provider: 'coinbase',
+    ref: plId,
+    rozoPaymentId: rozoPaymentId ?? rec?.settlingRozoPaymentId ?? rec?.rozoPaymentId ?? null,
+    eventType,
+    reason,
+  })
+  if (!queued) return { ok: false, deferred: 'awaiting_payout', reason, plId, retryQueueFailed: true }
+  return { ok: true, deferred: 'awaiting_payout', reason, plId, celoQueued: true }
+}
+
+/**
+ * Moves a record this handler put in `paying` back to `payin_seen` after a
+ * definite "not paid out yet" refusal (nothing signed). saveRecordGuarded never
+ * lowers a status, so this writes directly, but only while the stored record
+ * is still `paying` (ours: this handler holds the exec gate until just before
+ * this call). Any other stored status wins through the guarded save. Money
+ * safety does not rely on this write: every later attempt takes the exec gate
+ * again and the signer re-checks the order.
+ */
+async function stepBackFromPaying(env: Env, plId: string, rec: FulfillmentRecord): Promise<FulfillmentRecord> {
+  rec.status = 'payin_seen'
+  rec.payingAt = null
+  const stored = await loadRecord(env, plId)
+  if (!stored || stored.status !== 'paying') return saveRecordGuarded(env, plId, rec)
+  const out: FulfillmentRecord = {
+    ...rec,
+    events: mergeEvents(stored.events, rec.events),
+    webhookEventIds: Array.from(new Set([...(stored.webhookEventIds ?? []), ...(rec.webhookEventIds ?? [])])),
+  }
+  await saveRecord(env, plId, out)
+  return out
+}
+
 /** HTTP status for a webhook whose Celo deferral could not be queued. */
 export const CELO_RETRY_QUEUE_FAILED_STATUS = 503
 
@@ -1023,7 +1083,8 @@ export async function settleCoinbaseEvent(
 
   // 7. Decide whether to attempt pay-invoice for this event.
   // - payin_completed: optimistic. Check balance and fire only if the
-  //   funder already has enough.
+  //   funder already has enough. Tiers on: never fired before the order paid
+  //   out (step 7f), because the signer refuses until then.
   // - payout_completed: confirmed. The destination tx landed, the wallet
   //   definitely has the funds (or had them just now). Fire.
   const shouldAttempt =
@@ -1112,6 +1173,17 @@ export async function settleCoinbaseEvent(
   // Already in-flight? Don't double-fire. (Advisory only: KV is not atomic.
   // The exec gate below is the real at-most-once guard.)
   if (rec.status === 'paying') {
+    // Tiers on: the attempt this event raced may meanwhile have stepped the
+    // record back to pre-pay after a "not paid out yet" refusal (nothing
+    // signed). Never write its stale `paying` back over that, or every later
+    // event and re-drive would stop here. Flag off: unchanged.
+    if (funderTiersEnabled(env)) {
+      const stored = await loadRecord(env, plId)
+      if (stored && stored.status !== 'paying' && !TERMINAL_STATUSES.has(stored.status)) {
+        rec.status = stored.status
+        rec.payingAt = stored.payingAt ?? null
+      }
+    }
     await saveRecordGuarded(env, plId, rec)
     return { ok: true, already_paying: true, plId }
   }
@@ -1273,6 +1345,17 @@ export async function settleCoinbaseEvent(
   }
   const funderAddress = funder.address
   if (funder.expectedFunder) rec.funderAddress = funder.expectedFunder
+
+  // 7f. Tiers on: pay only once the order paid out (the signer refuses before
+  // that, see orderPaidOutForSigner). Decided from the order re-read above,
+  // not from the event type, so a late payin event for an order that already
+  // paid out still pays. Nothing is reserved, claimed, gated or sent; the
+  // record keeps its pre-pay status and no human is paged. The payout webhook
+  // pays it; the re-drive queue (celo-retry.ts, same settle path) is the
+  // backstop if that webhook never arrives. Flag off: never reached.
+  if (funder.expectedFunder && !orderPaidOutForSigner(binding.order)) {
+    return deferAwaitingPayout(env, plId, rec, eventId, eventType, rozoPaymentId, readPaymentStatus(binding.order))
+  }
 
   const balanceResult = await getBaseUsdcBalance(funderAddress, env.BASE_RPC_URL)
   const balance = balanceResult.balance
@@ -1499,6 +1582,25 @@ export async function settleCoinbaseEvent(
         session_status: payResult.body?.coinbase?.session?.status ?? null,
       },
     })
+  } else if (funder.expectedFunder && isSignerNotPaidOutYet(payResult.status, payResult.body)) {
+    // Tiers on: the signer read the order before signing anything and found
+    // it not paid out yet (409, signed:false). Not a decision: give back the
+    // reservation and the exec gate (nothing was signed, so this is the
+    // definite pre-send case where release is allowed), step the record back
+    // to its pre-pay status and wait for the payout, exactly like 7f. The next
+    // attempt goes through the claim, the exec gate and the signer again.
+    // A concurrent event that raced this attempt saw `paying` / the held gate
+    // and stopped; the re-drive queued below picks the order up.
+    await releaseReservation()
+    rec.events.push({
+      kind: 'pay_invoice_not_paid_out_yet',
+      at: new Date().toISOString(),
+      event_id: eventId,
+      detail: { status: payResult.status, code: payResult.body?.code ?? null },
+    })
+    await stepBackFromPaying(env, plId, rec)
+    await releaseCoinbaseExecGate(env, plId, eventId).catch(() => false)
+    return deferAwaitingPayout(env, plId, null, eventId, eventType, rozoPaymentId, readPaymentStatus(binding.order))
   } else if (payInvoiceRefusedBeforeSend(payResult.status)) {
     // A definite 4xx refusal means nothing was paid: give the day's headroom
     // back. Terminal, needs a human (the exec gate stays held; only the
