@@ -1665,6 +1665,70 @@ describe('tiered funders (Bitrefill = T3B)', () => {
     expect(rec(kv).status).toBe('order_binding_failed')
   })
 
+  // Existing-order and concurrent-conflict return paths.
+  async function resumeWith(env: Env, row: any, mode: 'existing' | 'raced') {
+    let posts = 0
+    vi.spyOn(globalThis, 'fetch').mockImplementation((async (input: any, init?: any) => {
+      const u = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (u.includes('/payments/order/')) {
+        // existing: visible from the first lookup; raced: only after the create conflicted.
+        const show = u.includes('/merchant_openrouter/') && (mode === 'existing' || posts > 0)
+        return show ? Response.json(row) : new Response('{"error":{"code":"paymentNotFound"}}', { status: 404 })
+      }
+      if (u.includes('/payment-api') && init?.method === 'POST') {
+        posts++
+        return new Response('{"error":{"code":"orderIdConflict"}}', { status: 409 })
+      }
+      return new Response('{}', { status: 200 })
+    }) as typeof fetch)
+    const res = await handleCreateInvoice(
+      new Request('https://mpp.test/v1/services/rozo-agent-api/create-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          provider: 'bitrefill',
+          bitrefill: { invoiceId: INVOICE, address: RECEIVER, amount: '204', expiresAt: inMinutes(40) },
+          source: { chainId: '8453', tokenSymbol: 'USDC' },
+        }),
+      }),
+      env,
+    )
+    // The path under test was really taken.
+    expect(posts).toBe(mode === 'raced' ? 1 : 0)
+    return { status: res.status, json: (await res.json()) as any }
+  }
+  const P2A ={ ...TIERS, FUNDER_T3B_ADDRESS: undefined, FUNDER_T3_BACKEND: 'legacy' }
+  for (const mode of ['existing', 'raced'] as const) {
+    it(`${mode} order: flag off unchanged (409 DUPLICATE_INVOICE with source)`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const r = await resumeWith(makeEnv().env, await frozenOrder({ status: 'payment_unpaid' }), mode)
+      expect(r.status).toBe(409)
+      expect(r.json.error).toBe('DUPLICATE_INVOICE')
+      expect(r.json.source).toBeDefined()
+    })
+    it(`${mode} order, phase 2a: legacy receiver resumes; T3B receiver refused without instructions`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      let r = await resumeWith(makeEnv(P2A).env, await frozenOrder({ status: 'payment_unpaid' }), mode)
+      expect(r.json.error).toBe('DUPLICATE_INVOICE')
+      const t3bOrder = await frozenOrder({ status: 'payment_unpaid', destination: { chainId: '8453', receiverAddress: T3B, tokenSymbol: 'USDC', amount: '206.04' } })
+      r = await resumeWith(makeEnv(P2A).env, t3bOrder, mode)
+      expect(r.status).toBe(503)
+      expect(r.json.error).toBe('FUNDER_TIER_RECEIVER_MISMATCH')
+      expect(r.json.source).toBeUndefined()
+      expect(r.json.rozoPaymentId).toBeUndefined()
+    })
+    it(`${mode} order, phase 2b: T3B receiver resumes; legacy receiver refused without instructions`, async () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {})
+      const t3bOrder = await frozenOrder({ status: 'payment_unpaid', destination: { chainId: '8453', receiverAddress: T3B, tokenSymbol: 'USDC', amount: '206.04' } })
+      let r = await resumeWith(makeEnv(TIERS).env, t3bOrder, mode)
+      expect(r.json.error).toBe('DUPLICATE_INVOICE')
+      r = await resumeWith(makeEnv(TIERS).env, await frozenOrder({ status: 'payment_unpaid' }), mode)
+      expect(r.status).toBe(503)
+      expect(r.json.error).toBe('FUNDER_TIER_RECEIVER_MISMATCH')
+      expect(r.json.source).toBeUndefined()
+    })
+  }
+
   it('a 409 funder_tier_mismatch (signed:false) is a definite refusal', () => {
     expect(classifyBitrefillPayResult({ status: 409, body: { signed: false, code: 'funder_tier_mismatch' } })).toBe('refused')
     expect(classifyBitrefillPayResult({ status: 409, body: { provider: 'bitrefill', ok: false, signed: false, code: 'funder_tier_mismatch' } })).toBe('refused')

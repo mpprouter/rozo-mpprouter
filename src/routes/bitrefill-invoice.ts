@@ -649,10 +649,22 @@ export async function handleBitrefillFunderCreate(
   }
 
   const orderId = bitrefillOrderId(invoiceId)
+  // FUNDER_TIERS_ENABLED only: an existing (or raced) funder-model order that
+  // does not pay out to the wallet selected for this payment (T3B, or the
+  // legacy funder in phase 2a) is never resumed: its settlement would be
+  // refused, so no deposit instructions (`source`) lead into it. Direct-model
+  // orders (wallet_bitrefillpay, paid straight to Bitrefill) are unaffected.
+  const funderOrderPaysOtherWallet = (row: any) =>
+    funder.expectedFunder !== undefined &&
+    (row?.appId === OPENROUTER_APP_ID || readBitrefillFacts(row) !== null) &&
+    !sameEvmAddress(row?.destination?.receiverAddress ?? row?.destination_receiver_address, funder.expectedFunder)
   const duplicate = (row: any) =>
     !row?.id
       ? fail(503, 'RETRY_LATER', 'A payment for this Bitrefill invoice is being created. Retry in a few seconds to get its id; do not pay yet.')
-      : fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
+      : funderOrderPaysOtherWallet(row)
+        ? (console.error('[bitrefill] existing order destination is not the selected funder tier wallet'),
+          fail(503, FUNDER_TIER_RECEIVER_MISMATCH_CODE, 'A payment for this Bitrefill invoice exists but cannot be completed right now. Do not pay it; contact support.', { invoiceId }))
+        : fail(409, 'DUPLICATE_INVOICE', 'A payment already exists for this Bitrefill invoice. Resume it instead of paying again.', {
         invoiceId,
         rozoPaymentId: row?.id ?? null,
         expiresAt: earlierIso(row?.metadata?.bitrefillExpiresAt, row?.expiresAt),
