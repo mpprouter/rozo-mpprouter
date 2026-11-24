@@ -66,6 +66,7 @@ import { handleStripeFulfillmentResolve, handleStripeFulfillmentRetry } from './
 import { handleCoinbaseExecGateClear } from './routes/coinbase-exec-gate-admin'
 import { handleCheckoutControl } from './routes/checkout-control-admin'
 import { handleCreateInvoice } from './routes/create-invoice'
+import { scheduleCreateFailureAlert, type CreateFailureNote } from './routes/create-failure-alert'
 import { AC_PREFIX, handleAgentCheckout } from './agent-checkout/routes'
 import { withAgentCheckoutLink } from './agent-checkout/link-order'
 import { CLIENT_REPORT_PATH, handleClientReport } from './routes/client-report'
@@ -1408,7 +1409,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext): Promise
         return handleTronTonAlphaCapability(request, env)
       }
       if (url.pathname === TRON_TON_ALPHA_OPTION_PATH) {
-        return handleTronTonAlphaOption(request, env)
+        const note: CreateFailureNote = {}
+        const res = await handleTronTonAlphaOption(request, env, note)
+        scheduleCreateFailureAlert(env, ctx, 'tron-ton-alpha', res, note)
+        return res
       }
 
       // Public create-invoice endpoint — quotes a Coinbase Payment Link,
