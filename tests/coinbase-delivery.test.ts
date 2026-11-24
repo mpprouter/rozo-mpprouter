@@ -1031,3 +1031,49 @@ describe('funder-reserved-atomic is gone', () => {
     expect(kv._touched).not.toContain('funder-reserved-atomic')
   })
 })
+
+describe('sweep adoption reads the tier wallet (FUNDER_TIERS_ENABLED)', () => {
+  const T2 = '0x2000000000000000000000000000000000000002'
+  const TIERS = {
+    FUNDER_TIERS_ENABLED: 'true',
+    FUNDER_T1_ADDRESS: '0x1000000000000000000000000000000000000001',
+    FUNDER_T2_ADDRESS: T2,
+    FUNDER_T3A_ADDRESS: '0x3000000000000000000000000000000000000003',
+    FUNDER_T3B_ADDRESS: '0x4000000000000000000000000000000000000004',
+  }
+  const settledLink = { id: PL, status: 'COMPLETED', usageCount: 1, maxUsage: 1, maxAmount: '1.00' }
+  const payoutDone = { id: ROZO_ID, status: 'payment_payout_completed', destination: { confirmedAt: ago(15) } }
+  function logFroms(): string[] {
+    const f = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    return f.mock.calls
+      .map((c) => (c[1] as RequestInit | undefined)?.body)
+      .filter((b): b is string => typeof b === 'string' && b.includes('eth_getLogs'))
+      .map((b) => '0x' + String(JSON.parse(b).params[0].topics[1]).slice(-40))
+  }
+
+  for (const [name, over, rec, want] of [
+    ['flag off: legacy funder', {}, {}, '0x282be0c42e5c944b0285cec363117ab077cc084a'],
+    ['flag on: the tier for the charge ($1 -> T2)', TIERS, {}, T2.toLowerCase()],
+    ['flag on: the wallet stored on the record wins', TIERS, { funderAddress: '0x3000000000000000000000000000000000000003' }, '0x3000000000000000000000000000000000000003'],
+  ] as const) {
+    it(name, async () => {
+      stubFetch({ coinbase: settledLink, rozo: payoutDone, funderTransfers: [1_000_000n] })
+      const { env, kv } = makeEnv(over)
+      await acquireCoinbaseExecGate(env, PL, 'evt-lost-write', new Date(Date.now() - 2 * MIN), ROZO_ID)
+      seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }], ...rec })
+      await sweepCoinbaseFulfillments(env)
+      expect(logFroms()).toEqual([want])
+      expect(readRec(kv).status).toBe('paid')
+    })
+  }
+
+  it('flag on with the tier missing: no chain read, left alone', async () => {
+    stubFetch({ coinbase: settledLink, rozo: payoutDone, funderTransfers: [1_000_000n] })
+    const { env, kv } = makeEnv({ ...TIERS, FUNDER_T2_ADDRESS: undefined })
+    await acquireCoinbaseExecGate(env, PL, 'evt-lost-write', new Date(Date.now() - 2 * MIN), ROZO_ID)
+    seedRec(kv, { status: 'payin_seen', events: [{ kind: 'payment_payin_completed', at: ago(20) }] })
+    await sweepCoinbaseFulfillments(env)
+    expect(logFroms()).toEqual([])
+    expect(readRec(kv).status).toBe('payin_seen')
+  })
+})

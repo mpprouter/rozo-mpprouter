@@ -9,7 +9,8 @@ import { handleCreateInvoice, SETTLEMENT_RECEIVER } from '../src/routes/create-i
 import { FUNDER_WALLET, handleRozoWebhook, type FulfillmentRecord } from '../src/routes/webhook'
 import { FUNDER_WALLET as STRIPE_FUNDER } from '../src/routes/stripe-fulfillment'
 import { ALPHA_DESTINATION } from '../src/routes/tron-ton-alpha'
-import { RETIRED_FUNDER_ADDRESS_20261124 } from '../src/funder-address'
+import { BASE_FUNDER_ADDRESS, RETIRED_FUNDER_ADDRESS_20261124, resolveFunder } from '../src/funder-address'
+import { x402BaseFunder } from '../src/x402payer/routes'
 import {
   BITREFILL_FUNDER,
   bitrefillNonce,
@@ -131,6 +132,21 @@ describe('funder constants', () => {
     expect(BITREFILL_FUNDER).toBe(SETTLEMENT_RECEIVER)
     expect(BITREFILL_FUNDER).toBe(STRIPE_FUNDER)
     expect(ALPHA_DESTINATION.receiverAddress).toBe(FUNDER_WALLET)
+  })
+  it('with FUNDER_TIERS_ENABLED off, every funder constant and every resolved funder equals BASE_FUNDER_ADDRESS', () => {
+    for (const a of [FUNDER_WALLET, SETTLEMENT_RECEIVER, STRIPE_FUNDER, BITREFILL_FUNDER, ALPHA_DESTINATION.receiverAddress]) {
+      expect(a).toBe(BASE_FUNDER_ADDRESS)
+    }
+    for (const env of [{}, { FUNDER_TIERS_ENABLED: 'false', FUNDER_T2_ADDRESS: '0x2000000000000000000000000000000000000002' }]) {
+      for (const kind of ['x402', 'coinbase', 'stripe', 'bitrefill', 'other']) {
+        for (const amount of [1n, 199_999_999n, 200_000_000n, 1_200_000_000n, 5_000_000_000n]) {
+          const r = resolveFunder(env, kind, amount)
+          expect(r.ok && r.address).toBe(BASE_FUNDER_ADDRESS)
+          expect(r.ok && r.expectedFunder).toBeUndefined()
+        }
+      }
+    }
+    expect(x402BaseFunder({})).toBe(BASE_FUNDER_ADDRESS)
   })
   it('every funder constant is the rotated 2026-11-24 funder, never the compromised one', () => {
     expect(FUNDER_WALLET).toBe('0x282bE0C42E5c944b0285CEc363117AB077cC084A')

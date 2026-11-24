@@ -830,3 +830,38 @@ describe('queued records never become paid', () => {
     expect(world.payCalls.length).toBe(0)
   })
 })
+
+describe('verified-pay-in — tiered funders', () => {
+  const T2 = '0x2000000000000000000000000000000000000002'
+  const T3B = '0x4000000000000000000000000000000000000004'
+  const TIERS = {
+    FUNDER_TIERS_ENABLED: 'true',
+    FUNDER_T1_ADDRESS: '0x1000000000000000000000000000000000000001',
+    FUNDER_T2_ADDRESS: T2,
+    FUNDER_T3A_ADDRESS: '0x3000000000000000000000000000000000000003',
+    FUNDER_T3B_ADDRESS: T3B,
+  } as Partial<Env>
+
+  it('flag on, Coinbase: expected_funder is the tier for the invoice amount', async () => {
+    const env = makeEnv(TIERS)
+    const { body: q } = await resolve(env, PS_URL)
+    const r = await payIn(env, payInBody(q))
+    expect(r.status).toBe(202)
+    expect(world.payCalls[0].body).toEqual({ payment_id: 'paymentSession_xyz789', expected_funder: T2 })
+  })
+
+  it('flag on, Stripe: expected_funder is T3B', async () => {
+    const env = makeEnv(TIERS)
+    const { body: q } = await resolve(env, STRIPE_URL)
+    await payIn(env, payInBody(q))
+    expect(world.payCalls[0].body.expected_funder).toBe(T3B)
+  })
+
+  it('flag on, missing tier: definite failure, executor never called', async () => {
+    const env = makeEnv({ ...TIERS, FUNDER_T2_ADDRESS: undefined })
+    const { body: q } = await resolve(env, PS_URL)
+    const r = await payIn(env, payInBody(q))
+    expect(r.body.state).toBe('failed')
+    expect(world.payCalls.length).toBe(0)
+  })
+})

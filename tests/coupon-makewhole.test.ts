@@ -762,3 +762,70 @@ describe('manual pay keeps a verified recovery path (codex P1)', () => {
     expect(await readInvoiceClaim(env, PL)).toBeNull()
   })
 })
+
+describe('/admin/pay-invoice with tiered funders', () => {
+  const T2 = '0x2000000000000000000000000000000000000002'
+  const TIERS = {
+    FUNDER_TIERS_ENABLED: 'true',
+    FUNDER_T1_ADDRESS: '0x1000000000000000000000000000000000000001',
+    FUNDER_T2_ADDRESS: T2,
+    FUNDER_T3A_ADDRESS: '0x3000000000000000000000000000000000000003',
+    FUNDER_T3B_ADDRESS: '0x4000000000000000000000000000000000000004',
+  }
+  function payBodies(): any[] {
+    const f = globalThis.fetch as unknown as ReturnType<typeof vi.fn>
+    return f.mock.calls
+      .filter((c) => String(c[0]).includes('agentapi.rozo.ai/pay-invoice'))
+      .map((c) => JSON.parse(String((c[1] as RequestInit).body)))
+  }
+
+  it('flag off: the normalized body only (no expected_funder)', async () => {
+    const { env } = setup()
+    const r = await handleAdminPayInvoice(adminPayReq(PL), env)
+    expect(r.status).toBe(200)
+    expect(payBodies()).toHaveLength(1)
+    expect('expected_funder' in payBodies()[0]).toBe(false)
+  })
+
+  it('flag on: $20 charge -> expected_funder T2', async () => {
+    const { env } = setup({}, TIERS)
+    const r = await handleAdminPayInvoice(adminPayReq(PL), env)
+    expect(r.status).toBe(200)
+    expect(payBodies()[0].expected_funder).toBe(T2)
+  })
+
+  it('flag on: unreadable charge or missing tier refuses before any claim; nothing sent', async () => {
+    let s = setup({ coinbase: null }, TIERS)
+    let r = await handleAdminPayInvoice(adminPayReq(PL), s.env)
+    expect(r.status).toBe(503)
+    expect(s.calls.pay).toBe(0)
+    expect(await readInvoiceClaim(s.env, PL)).toBeNull()
+    s = setup({}, { ...TIERS, FUNDER_T2_ADDRESS: undefined })
+    r = await handleAdminPayInvoice(adminPayReq(PL), s.env)
+    expect(((await r.json()) as any).code).toBe('FUNDER_TIER_REFUSED')
+    expect(s.calls.pay).toBe(0)
+  })
+
+  it('flag on: a non-Coinbase id is refused', async () => {
+    const { env, calls } = setup({}, TIERS)
+    const r = await handleAdminPayInvoice(
+      new Request('https://router.test/admin/pay-invoice', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-admin-secret': 'test-pay-secret' },
+        body: JSON.stringify({ url: 'https://crypto.stripe.com/pay/TIERBLOB' }),
+      }),
+      env,
+    )
+    // Refused before any send (the Celo gate or the tier gate, whichever runs first).
+    expect(r.status).toBe(409)
+    expect(['FUNDER_TIER_REFUSED', 'CELO_NOT_VERIFIED']).toContain(((await r.json()) as any).code)
+    expect(calls.pay).toBe(0)
+  })
+
+  it('flag on: the signer 409 funder_tier_mismatch is reported as such, not as a used link', async () => {
+    const { env } = setup({ payStatus: 409, payBody: { signed: false, code: 'funder_tier_mismatch' } }, TIERS)
+    const r = await handleAdminPayInvoice(adminPayReq(PL), env)
+    expect(r.status).toBe(409)
+    expect(((await r.json()) as any).code).toBe('FUNDER_TIER_MISMATCH')
+  })
+})
