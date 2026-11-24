@@ -289,7 +289,12 @@ export function receivingFunderWallet(
   // The signer pays them only while its PRIVATE_KEY is configured.
   if (r === BASE_FUNDER_ADDRESS.toLowerCase()) return { wallet: 'LEGACY', address: BASE_FUNDER_ADDRESS }
   for (const tier of FUNDER_TIERS) {
-    if (servedByLegacyFunder(tier, env?.FUNDER_T3_BACKEND)) continue
+    // A T3 wallet whose address is still configured stays a PAYING wallet
+    // when new orders are routed back to the legacy funder (router
+    // FUNDER_T3_BACKEND="legacy" while the signer stays "isolated", the
+    // 2026-11-24 fallback): orders already created on T3A / T3B must still be
+    // paid by the wallet that received their money. In a plain phase 2a
+    // (addresses unset) nothing matches here, as before.
     const a = funderTierAddress(env, tier)
     if (a.ok && a.address.toLowerCase() === r) return { wallet: tier, address: a.address }
   }

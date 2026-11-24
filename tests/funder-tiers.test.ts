@@ -438,6 +438,22 @@ describe('paying from the receiving wallet', () => {
     expect(b).toMatchObject({ ok: true, tier: 'T3A', address: T3A, nominal: 'T2' })
   })
 
+  it('router back on legacy with T3 addresses still configured: orders already on T3A / T3B are still paid by them; new orders route to legacy', () => {
+    const FALLBACK = { ...TIER_ENV, FUNDER_T3_BACKEND: 'legacy' }
+    const a = resolvePayingFunder(FALLBACK, 'coinbase', USD(265), T3A)
+    expect(a).toMatchObject({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A, nominal: 'LEGACY' })
+    expect(a.ok && a.warning).toMatch(/amount_outside_nominal_range/)
+    expect(resolvePayingFunder(FALLBACK, 'coinbase', USD(10.5), T3A.toLowerCase())).toMatchObject({ ok: true, tier: 'T3A', address: T3A })
+    expect(resolvePayingFunder(FALLBACK, 'bitrefill', USD(50), T3B)).toMatchObject({ ok: true, tier: 'T3B', address: T3B })
+    expect(resolvePayingFunder(FALLBACK, 'coinbase', USD(250), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', warning: null })
+    // New orders: from the T2 boundary to the legacy funder, never to T3.
+    expect(resolveFunder(FALLBACK, 'coinbase', USD(250))).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder(FALLBACK, 'bitrefill', USD(50))).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS })
+    expect(resolveFunder(FALLBACK, 'coinbase', USD(50))).toMatchObject({ ok: true, tier: 'T2', address: T2 })
+    // Plain phase 2a (T3 addresses unset): a T3 address is still not a paying wallet.
+    expect(resolvePayingFunder(P2A, 'coinbase', USD(250), T3A)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
+  })
+
   it('the legacy funder is a paying wallet in 2a and, for orders created before the switch, in 2b (drain)', () => {
     expect(resolvePayingFunder(P2A, 'coinbase', USD(50), BASE_FUNDER_ADDRESS)).toMatchObject({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, nominal: 'T2' })
     for (const kind of ['coinbase', 'stripe', 'bitrefill', 'tron_ton_alpha']) {
@@ -458,8 +474,9 @@ describe('paying from the receiving wallet', () => {
     }
     // Stripe stays on the legacy funder on every backend (the KMS T3B signs no EIP-2612 Permit).
     expect(resolveFunder(ISO, 'stripe', USD(50))).toEqual({ ok: true, tier: 'legacy', address: BASE_FUNDER_ADDRESS, expectedFunder: BASE_FUNDER_ADDRESS })
-    // A T3 address left over in 2a is not a paying wallet (T3 is the legacy funder).
-    expect(resolvePayingFunder({ ...P2A, FUNDER_T3A_ADDRESS: T3A }, 'coinbase', USD(300), T3A)).toEqual({ ok: false, reason: 'receiver_not_tier_wallet', tier: null })
+    // A T3 address still configured while the router is on legacy stays a paying wallet (2026-11-24 fallback:
+    // orders already created on T3A must still be paid by it; a signer on legacy refuses, fail closed).
+    expect(resolvePayingFunder({ ...P2A, FUNDER_T3A_ADDRESS: T3A }, 'coinbase', USD(300), T3A)).toMatchObject({ ok: true, tier: 'T3A', address: T3A, expectedFunder: T3A, nominal: 'LEGACY' })
   })
 
   it('hard refusals: non-tier / retired / blocklisted / missing destination, T1 for order money, x402 not T1, over the cap', () => {
