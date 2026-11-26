@@ -1166,6 +1166,86 @@ describe('POST /coupon/redeem — Stripe Crypto links', () => {
     expect(hits.pay).toBe(1)
   })
 
+  // ── Make-whole coupons bound to a Stripe cpis_ session (2026-11-26) ──
+  async function issueStripeMw(env: Env, cpis = CPIS): Promise<string> {
+    const resp = await handleIssueCoupon(
+      issueReq({ kind: 'makewhole', idempotencyKey: `MW-1:${cpis}`, amountUsd: '20', paymentProof: 'stripe order test' }),
+      env,
+    )
+    expect(resp.status).toBe(200)
+    const body: any = await resp.json()
+    return body.code
+  }
+
+  it('make-whole cpis_: issues idempotently and redeems its own Stripe link once', async () => {
+    const { env, hits, payBodies } = makeStripeEnv({ cents: 2000 })
+    const code = await issueStripeMw(env)
+    expect(await issueStripeMw(env)).toBe(code)
+    const body: any = await (await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)).json()
+    expect(body.status).toBe('redeemed')
+    expect(hits.pay).toBe(1)
+    expect(payBodies[0].expected_amount_atomic).toBe('20000000')
+    const rec = await record(env, code)
+    expect(rec).toMatchObject({ kind: 'makewhole', makewholeInvoiceId: CPIS, invoiceKey: CPIS, status: 'redeemed' })
+    expect(await readInvoiceClaim(env, CPIS)).toMatchObject({ ref: `coupon:${code}` })
+    expect(stripeDump(env)).not.toContain(BLOB)
+  })
+
+  it('make-whole cpis_: a Stripe link resolving to another session is refused, pays nothing, coupon stays issued', async () => {
+    const { env, hits } = makeStripeEnv({ cents: 2000 })
+    const code = await issueStripeMw(env, 'cpis_1OtherSession')
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(resp.status).toBe(400)
+    expect(((await resp.json()) as any).error).toBe('INVALID_COUPON')
+    expect(hits.pay).toBe(0)
+    expect((await record(env, code)).status).toBe('issued')
+  })
+
+  it('make-whole cpis_: a Coinbase link is refused before any Stripe call', async () => {
+    const { env, hits } = makeStripeEnv({ cents: 2000 })
+    const code = await issueStripeMw(env)
+    const resp = await handleRedeemCoupon(redeemReq(code), env)
+    expect(((await resp.json()) as any).error).toBe('INVALID_COUPON')
+    expect(hits.stripe).toBe(0)
+    expect(hits.pay).toBe(0)
+  })
+
+  it('make-whole cpis_: session already paid (succeeded) → refused, pays nothing', async () => {
+    const { env, hits } = makeStripeEnv({ cents: 2000, state: 'succeeded' })
+    const code = await issueStripeMw(env)
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(resp.status).toBe(410)
+    expect(hits.pay).toBe(0)
+    expect((await record(env, code)).status).toBe('issued')
+  })
+
+  it('make-whole cpis_: session flips to paid between quote and the pre-pay re-read → refused', async () => {
+    const { env, cfg, hits } = makeStripeEnv({ cents: 2000 })
+    const code = await issueStripeMw(env)
+    let sessionReads = 0
+    const inner = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+      if (url.includes('payin_session') && !url.includes('resume_payin_session')) {
+        sessionReads++
+        if (sessionReads >= 2) cfg.state = 'processing'
+      }
+      return inner(input, init)
+    }) as any
+    const resp = await handleRedeemCoupon(redeemReq(code, STRIPE_URL), env)
+    expect(resp.status).toBe(409)
+    expect(sessionReads).toBe(2)
+    expect(hits.pay).toBe(0)
+    expect((await record(env, code)).status).toBe('issued')
+  })
+
+  it('a standard coupon whose proof names a cpis_ id must be issued as make-whole', async () => {
+    const { env } = makeStripeEnv()
+    const r = await handleIssueCoupon(issueReq({ amountUsd: '20', paymentProof: `stuck ${CPIS}` }), env)
+    expect(r.status).toBe(400)
+    expect(((await r.json()) as any).error).toBe('MAKEWHOLE_KEY_REQUIRED')
+  })
+
   it('http:// Stripe link is canonicalised to https before resolve/pay', async () => {
     const { env, payBodies } = makeStripeEnv({ cents: 2000 })
     const code = await issueCoupon(env, '20')
