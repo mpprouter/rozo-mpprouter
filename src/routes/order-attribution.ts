@@ -35,6 +35,12 @@
  *    account id or API key; the raw value is never sent) were added
  *    2026-10-09 for payer-entity grouping. They must match the contract regex
  *    exactly or they are dropped silently; they are never normalized.
+ *  - `cs` (lowercase UUID, the Checkout Chat / homepage agent conversation id)
+ *    and `src` (exact enum, currently only "rozo_homepage") were added
+ *    2026-11-26 so admin33 can join an agent conversation to the order its
+ *    pay link created. Exact-match only, dropped silently otherwise. `cs` is a
+ *    join key, not a credential: the conversation itself is readable only with
+ *    the visitor's session cookie, never by id alone.
  *
  * Telemetry rules, same as the rest of the money path: this never throws, and
  * it never influences pricing, routing, validation or error codes. Anything it
@@ -55,6 +61,10 @@ export interface OrderAttribution {
   install_id?: string
   /** sha256("rozo-acct-v1:" + account id or API key), lowercase hex. */
   account_hash?: string
+  /** Agent conversation id (lowercase UUID) that produced the pay link. */
+  cs?: string
+  /** Agent surface that produced the pay link; enum, see SRC_VALUES. */
+  src?: string
 }
 
 const CLIENT_MAX = 64
@@ -77,6 +87,10 @@ const NOT_A_COUNTRY = new Set(['XX', 'T1'])
 // never repaired, so a raw API key can never be stored by accident.
 const INSTALL_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const ACCOUNT_HASH_RE = /^[0-9a-f]{64}$/
+// Conversation join key (contract 2026-11-26). Any UUID version, lowercase.
+const CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+// Agent surfaces allowed to label an order. Add a value deliberately, never echo.
+const SRC_VALUES = new Set(['rozo_homepage'])
 
 function exactMatch(raw: unknown, re: RegExp): string | null {
   return typeof raw === 'string' && re.test(raw) ? raw : null
@@ -180,6 +194,9 @@ export function sanitizeOrderAttribution(raw: unknown): OrderAttribution | null 
     if (installId) out.install_id = installId
     const accountHash = exactMatch(src.account_hash, ACCOUNT_HASH_RE)
     if (accountHash) out.account_hash = accountHash
+    const cs = exactMatch(src.cs, CONVERSATION_ID_RE)
+    if (cs) out.cs = cs
+    if (typeof src.src === 'string' && SRC_VALUES.has(src.src)) out.src = src.src
     return Object.keys(out).length ? out : null
   } catch {
     return null
