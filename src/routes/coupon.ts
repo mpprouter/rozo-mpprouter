@@ -264,7 +264,7 @@ export interface CouponRecord {
    *   kind              : 'makewhole' for a coupon that compensates one
    *                        specific unpaid merchant invoice
    *   makewholeKey      : `MW-1:<invoice id>`, the issuance idempotency key
-   *   makewholeInvoiceId: the Coinbase pl_/paymentSession_ id this coupon
+   *   makewholeInvoiceId: the Coinbase pl_/paymentSession_ or Stripe cpis_ id this coupon
    *                        may pay; redeem refuses any other link
    *   issueSource       : informational: which caller issued it
    *   voidedFromStatus  : status the coupon had when an admin voided it
@@ -698,10 +698,15 @@ function adminAuthorized(request: Request, env: Env): Response | null {
 // (coinbase-exec-gate.ts); neither is released once a pay request was sent.
 
 export const MAKEWHOLE_KEY_PREFIX = 'MW-1:'
-const MAKEWHOLE_INVOICE_ID_RE = /^(?:pl_[A-Za-z0-9_-]{1,128}|paymentSession_[A-Za-z0-9_-]{1,128})$/
-// Free-text proof that names a Coinbase invoice or an MW-1 key is a make-whole
+// Coinbase pl_ / paymentSession_ ids, and Stripe Crypto cpis_ session ids
+// (2026-11-26). A cpis_ coupon is redeemed with the crypto.stripe.com/pay link
+// whose session resolves to that cpis_ id.
+const MAKEWHOLE_INVOICE_ID_RE =
+  /^(?:pl_[A-Za-z0-9_-]{1,128}|paymentSession_[A-Za-z0-9_-]{1,128}|cpis_[A-Za-z0-9_]{1,128})$/
+// Free-text proof that names a merchant invoice or an MW-1 key is a make-whole
 // request in disguise: it must go through the keyed path.
-const MAKEWHOLE_LIKE_PROOF_RE = /MW-1:|\bpl_[A-Za-z0-9_-]{6,}|\bpaymentSession_[A-Za-z0-9_-]{6,}/
+const MAKEWHOLE_LIKE_PROOF_RE =
+  /MW-1:|\bpl_[A-Za-z0-9_-]{6,}|\bpaymentSession_[A-Za-z0-9_-]{6,}|\bcpis_[A-Za-z0-9_]{6,}/
 const MAX_PROOF_CHARS = 500
 const MAX_SOURCE_CHARS = 64
 
@@ -997,7 +1002,7 @@ export async function handleIssueCoupon(request: Request, env: Env): Promise<Res
     if (!invoiceId) {
       return json(400, {
         error: 'INVALID_IDEMPOTENCY_KEY',
-        message: 'idempotencyKey must be "MW-1:" followed by a Coinbase pl_… or paymentSession_… id',
+        message: 'idempotencyKey must be "MW-1:" followed by a Coinbase pl_… / paymentSession_… id or a Stripe cpis_… id',
       })
     }
     if (body?.invoiceId !== undefined && body.invoiceId !== invoiceId) {
@@ -1363,8 +1368,13 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     if (!rec) return { op: 'noop', result: { kind: 'rejected' } }
     // A make-whole coupon pays exactly its own invoice. Any other link gets
     // the uniform error (it must not reveal that the code is live).
-    if (rec.kind === 'makewhole' && rec.makewholeInvoiceId !== plId) {
-      return { op: 'noop', result: { kind: 'rejected' } }
+    // Stripe-bound (cpis_) coupons only accept a Stripe link here; the blob is
+    // resolved to its cpis_ id after the claim and must equal the binding.
+    if (rec.kind === 'makewhole') {
+      const boundStripe = (rec.makewholeInvoiceId ?? '').startsWith('cpis_')
+      if (boundStripe ? !isStripe : rec.makewholeInvoiceId !== plId) {
+        return { op: 'noop', result: { kind: 'rejected' } }
+      }
     }
 
     const now = Date.now()
@@ -1503,6 +1513,13 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
     }
 
     const inv = stripeInv
+    // A make-whole coupon bound to a Stripe session pays exactly that cpis_
+    // session: the pasted blob must resolve to it. Uniform error otherwise.
+    if (rec.kind === 'makewhole' && inv.invoiceKey !== rec.makewholeInvoiceId) {
+      await rollbackToIssued('makewhole: stripe session mismatch')
+      await codeFailBump(env, code)
+      return done(invalidCoupon(), 'failure', 'makewhole_invoice_mismatch')
+    }
     const entryState = inv.state === 'initialized' || inv.state === 'checkout'
     if (!entryState) {
       // Terminal or already in flight (someone else is paying / has paid).
@@ -1616,7 +1633,28 @@ export async function handleRedeemCoupon(request: Request, env: Env): Promise<Re
   // coupon back to issued. This is a second gate beside the per-invoice claim
   // and exec gate below: a normal fulfillment that already captured the
   // invoice must stop the coupon here even if its gate was cleared.
-  if (rec.kind === 'makewhole') {
+  //
+  // Stripe make-whole: re-resolve the session read-only and pay only while it
+  // is still the bound cpis_ session in an entry state (initialized /
+  // checkout). Anything else (paid, in flight, expired, unreadable) fails
+  // closed with the coupon back to issued.
+  if (rec.kind === 'makewhole' && isStripe) {
+    let again: NormalizedInvoice
+    try {
+      again = await resolveStripeInvoice(stripeUrl!)
+    } catch {
+      await rollbackToIssued('makewhole: stripe status unreadable')
+      return done(quoteUnavailable(), 'rejected', 'stripe_status_unreadable')
+    }
+    if (again.invoiceKey !== rec.makewholeInvoiceId) {
+      await rollbackToIssued('makewhole: stripe session changed')
+      return done(invalidCoupon(), 'failure', 'makewhole_invoice_mismatch')
+    }
+    if (again.state !== 'initialized' && again.state !== 'checkout') {
+      await rollbackToIssued('makewhole: stripe session not explicitly unpaid')
+      return done(linkUsedOrExpired(409), 'rejected', 'stripe_not_unpaid')
+    }
+  } else if (rec.kind === 'makewhole') {
     const raw = await fetchCoinbasePayment(plId)
     if (!raw) {
       await rollbackToIssued('makewhole: coinbase status unreadable')

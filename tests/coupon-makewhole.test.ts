@@ -322,10 +322,11 @@ afterEach(() => {
 // ── Key grammar ──────────────────────────────────────────────────────────────
 
 describe('parseMakewholeKey', () => {
-  it('accepts MW-1 keys for Coinbase v1 and v3 ids only', () => {
+  it('accepts MW-1 keys for Coinbase v1/v3 ids and Stripe cpis_ ids only', () => {
     expect(parseMakewholeKey('MW-1:pl_abc123')).toBe('pl_abc123')
     expect(parseMakewholeKey('MW-1:paymentSession_a5306b93-e4b7')).toBe('paymentSession_a5306b93-e4b7')
-    for (const bad of ['pl_abc', 'MW-1:', 'MW-1:cpis_123', 'MW-2:pl_abc', 'MW-1:pl_abc/../x', 42, null]) {
+    expect(parseMakewholeKey('MW-1:cpis_1TestSessionAbC')).toBe('cpis_1TestSessionAbC')
+    for (const bad of ['pl_abc', 'MW-1:', 'MW-1:cpis_', 'MW-1:cpis_ab-c', 'MW-1:https://crypto.stripe.com/pay/x', 'MW-2:pl_abc', 'MW-1:pl_abc/../x', 42, null]) {
       expect(parseMakewholeKey(bad), String(bad)).toBeNull()
     }
   })
@@ -344,7 +345,7 @@ describe('POST /admin/coupon/issue, make-whole', () => {
 
   it('rejects a malformed key, an invoiceId that disagrees with the key, and a missing proof', async () => {
     const { env } = setup()
-    expect((await issueMw(env, { idempotencyKey: 'MW-1:cpis_x' })).body.error).toBe('INVALID_IDEMPOTENCY_KEY')
+    expect((await issueMw(env, { idempotencyKey: 'MW-1:cs_x' })).body.error).toBe('INVALID_IDEMPOTENCY_KEY')
     expect((await issueMw(env, { invoiceId: OTHER_PL })).body.error).toBe('INVALID_IDEMPOTENCY_KEY')
     expect((await issueMw(env, { paymentProof: '  ' })).body.error).toBe('PAYMENT_PROOF_REQUIRED')
     expect((await issueMw(env, { kind: 'standard' })).body.error).toBe('INVALID_IDEMPOTENCY_KEY')
@@ -481,7 +482,7 @@ describe('POST /admin/coupon/issue, standard coupons stay backward compatible', 
 
   it('a standard request whose proof names an invoice or an MW-1 key is refused', async () => {
     const { env } = setup()
-    for (const proof of [`make-whole for ${PL}`, `MW-1:${PL}`, 'see paymentSession_a5306b93e4b7']) {
+    for (const proof of [`make-whole for ${PL}`, `MW-1:${PL}`, 'see paymentSession_a5306b93e4b7', 'stripe cpis_1TestSessionAbC']) {
       const r = await handleIssueCoupon(issueReq({ amountUsd: '20', paymentProof: proof }), env)
       expect(r.status, proof).toBe(400)
       expect(((await r.json()) as any).error).toBe('MAKEWHOLE_KEY_REQUIRED')
