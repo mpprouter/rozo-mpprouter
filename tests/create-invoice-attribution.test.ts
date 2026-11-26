@@ -147,6 +147,19 @@ describe('sanitizeOrderAttribution — identity fields', () => {
   })
 })
 
+describe('sanitizeOrderAttribution — agent conversation join (cs, src)', () => {
+  const CS = '3f2b6c1e-9a4d-4e7b-8c21-0d5e6f7a8b9c'
+  it('keeps a lowercase UUID cs and the rozo_homepage src', () => {
+    expect(sanitizeOrderAttribution({ cs: CS, src: 'rozo_homepage' })).toEqual({ cs: CS, src: 'rozo_homepage' })
+  })
+  it('drops malformed cs and unknown src values silently', () => {
+    const badCs: unknown[] = [CS.toUpperCase(), CS.slice(1), `${CS} `, `{${CS}}`, 'x', 7, ['a']]
+    for (const cs of badCs) expect(sanitizeOrderAttribution({ cs })).toBeNull()
+    const badSrc: unknown[] = ['checkout', 'ROZO_HOMEPAGE', 'rozo_homepage ', '<b>', 1]
+    for (const src of badSrc) expect(sanitizeOrderAttribution({ src })).toBeNull()
+  })
+})
+
 describe('clientFromUserAgent', () => {
   it('recognizes the checkout skill', () => {
     expect(clientFromUserAgent('rozo-checkout-skill/0.1.12 node/22')).toBe('rozo-checkout-skill/0.1.12')
