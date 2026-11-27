@@ -1609,6 +1609,14 @@ export async function handleProxy(
       headers: forwardHeaders(request, { keepAuthorization: true }),
       body: requestBody,
     })
+    // Same v1 response contract as the router-paid path (codex P2).
+    if (passthroughResponse.status === 200 && isFirecrawlCompatRoute(route.id)) {
+      const text = await passthroughResponse.text()
+      const headers = new Headers(passthroughResponse.headers)
+      headers.delete('content-length')
+      headers.delete('content-encoding')
+      return new Response(translateFirecrawlResponse(route.id, text), { status: 200, headers })
+    }
     return passthroughResponse
   }
 
