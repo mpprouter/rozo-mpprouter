@@ -34,6 +34,11 @@ import { bumpCumulative, getTempoChannel, sessionChannelKeyFor } from '../mpp/ch
 import { parseTempoChallengesStrict, selectChargeChallenge, selectSessionChallenge, tokenSymbol } from '../mpp/tempo-challenges'
 import { buildIdempotencyKey, buildX402ReplayKey, parseX402CachedResult, type X402CachedResult } from '../mpp/idempotency'
 import { isEnvelopeLiftedRoute, presentMerchantEnvelope } from './merchant-envelope'
+import {
+  isFirecrawlCompatRoute,
+  translateFirecrawlRequest,
+  translateFirecrawlResponse,
+} from './firecrawl-v1-compat'
 import { doAtomicParams } from '../mpp/kv-atomic-store'
 import {
   createStellarPayment,
@@ -704,6 +709,16 @@ async function payMerchantAndGetBody(
     isEnvelopeLiftedRoute(route.id)
   ) {
     result = { ...result, body: presentMerchantEnvelope(result.body, result.contentType) }
+  }
+
+  // Firecrawl v2 -> v1 response shape, only on a delivered sync 200.
+  if (
+    result.kind === 'ok' &&
+    result.merchantStatus === 200 &&
+    !asyncInfo.isAsync &&
+    isFirecrawlCompatRoute(route.id)
+  ) {
+    result = { ...result, body: translateFirecrawlResponse(route.id, result.body) }
   }
 
   recordRouteCall(env, ctx, {
@@ -1496,7 +1511,12 @@ export async function handleProxy(
 
   // Read the body once; we may need to send it twice (merchant 402 probe + real paid call).
   const hasBody = request.method !== 'GET' && request.method !== 'HEAD'
-  const requestBody = hasBody ? await request.text() : undefined
+  // Firecrawl routes: public contract is v1, upstream is v2 (see
+  // firecrawl-v1-compat.ts). Body-only rewrite; pricing and payment untouched.
+  const requestBody = translateFirecrawlRequest(
+    route.id,
+    hasBody ? await request.text() : undefined,
+  )
 
   // 0. Wallet-type gate. Router only represents Stellar wallets. If the
   // agent sent any other kind of Authorization header (Bearer, Basic,
