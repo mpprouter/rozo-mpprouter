@@ -47,9 +47,21 @@ accepts the charge settlement.
 | Service ID | Public Path | Price | Verified By | Verified Date | Notes |
 |---|---|---|---|---|---|
 | `exa_search` | `/v1/services/exa/search` | $0.005 | muggledev | 2026-04-11 | Web search. First service verified on charge path |
-| `firecrawl_scrape` | `/v1/services/firecrawl/scrape` | $0.002 | muggledev | 2026-04-11 | URL scraping |
+| `firecrawl_scrape` | `/v1/services/firecrawl/scrape` | $0.002 | muggledev | 2026-04-11 | URL scraping. Upstream is Firecrawl v2 since 2026-11-27; the router accepts and returns the Firecrawl v1 shape (see note below) |
 | `parallel_search` | `/v1/services/parallel/search` | $0.010 | muggledev | 2026-04-10 | Web search. Original test service from day 1 |
 | `alchemy_rpc` | `/v1/services/alchemy/rpc` | $0.000 | muggledev | 2026-04-11 | JSON-RPC. mpp.dev catalog says session, but merchant actually accepts charge. Overlay overrides `upstreamPaymentMethod: 'tempo.charge'` |
+
+**Firecrawl v1 compatibility (2026-11-27).** Tempo's Firecrawl merchant
+serves only `/v2/{scrape,crawl,map,search,extract}`. The public paths stay
+`/v1/services/firecrawl/*` and keep the Firecrawl v1 contract:
+`src/routes/firecrawl-v1-compat.ts` rewrites v1 request fields to v2
+(`jsonOptions`/`extract` format, `screenshot@fullPage`, `changeTrackingOptions`,
+`parsePDF`, `geolocation`, crawl `allowBackwardLinks`/`ignoreSitemap`/`maxDepth`,
+map `sitemapOnly`/`ignoreSitemap`, search default `limit` 5) and reshapes
+delivered 200 bodies back to v1 (map `links` as URL strings, search results in
+`data` with `news`/`images` at the top level, scrape `data.json` mirrored to
+`data.extract`). Extract is passed through unchanged. Mapping follows
+https://docs.firecrawl.dev/migrate-to-v2. Payment and pricing are not touched.
 
 ### Session Mode (verified working)
 
