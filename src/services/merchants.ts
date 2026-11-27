@@ -149,8 +149,10 @@ export const OPERATOR_OVERLAY: Record<string, PublicServiceRouteOverlay> = {
     chargeVerified: true,
     chargeVerifiedAt: '2026-04-11T00:00:00Z',
   },
-  // Firecrawl Scrape
-  'firecrawl::/v1/scrape': {
+  // Firecrawl Scrape. Upstream moved /v1/* to /v2/* (2026-11-27; /v1/scrape
+  // now 404s). Key follows the upstream path; publicPath stays /v1/... so
+  // existing client URLs keep working.
+  'firecrawl::/v2/scrape': {
     id: 'firecrawl_scrape',
     publicPath: '/v1/services/firecrawl/scrape',
     verifiedMode: 'charge',
