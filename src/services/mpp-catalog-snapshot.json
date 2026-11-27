@@ -2094,7 +2094,7 @@
       "endpoints": [
         {
           "method": "POST",
-          "path": "/v1/scrape",
+          "path": "/v2/scrape",
           "description": "Scrape a URL",
           "payment": {
             "intent": "charge",
@@ -2108,7 +2108,7 @@
         },
         {
           "method": "POST",
-          "path": "/v1/crawl",
+          "path": "/v2/crawl",
           "description": "Crawl a website",
           "payment": {
             "intent": "charge",
@@ -2116,13 +2116,13 @@
             "currency": "0x20c000000000000000000000b9537d11c60e8b50",
             "decimals": 6,
             "description": "Crawl a website",
-            "amount": "5000"
+            "amount": "2000"
           },
           "docs": "https://context7.com/websites/firecrawl_dev/llms.txt?topic=POST%20%2Fv1%2Fcrawl"
         },
         {
           "method": "POST",
-          "path": "/v1/map",
+          "path": "/v2/map",
           "description": "Map website URLs",
           "payment": {
             "intent": "charge",
@@ -2136,7 +2136,7 @@
         },
         {
           "method": "POST",
-          "path": "/v1/search",
+          "path": "/v2/search",
           "description": "Search the web",
           "payment": {
             "intent": "charge",
@@ -2150,7 +2150,7 @@
         },
         {
           "method": "POST",
-          "path": "/v1/extract",
+          "path": "/v2/extract",
           "description": "Extract structured data",
           "payment": {
             "intent": "charge",
